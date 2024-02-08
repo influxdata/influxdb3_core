@@ -1,0 +1,15 @@
+**/target
+**/*.rs.bk
+.idea/
+.env
+.gdb_history
+*.tsm
+**/.DS_Store
+**/.vscode
+heaptrack.*
+massif.out.*
+perf.data*
+perf.svg
+perf.txt
+valgrind-out.txt
+*.pending-snap

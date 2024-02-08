@@ -1,0 +1,146 @@
+[workspace]
+# In alphabetical order
+members = [
+    "arrow_util",
+    "backoff",
+    "cache_system",
+    "clap_blocks",
+    "client_util",
+    "data_types",
+    "datafusion_util",
+    "dml",
+    "executor",
+    "flightsql",
+    "generated_types",
+    "grpc-binary-logger-proto",
+    "grpc-binary-logger-test-proto",
+    "grpc-binary-logger",
+    "import_export",
+    "influxdb_influxql_parser",
+    "influxdb_iox_client",
+    "influxdb_line_protocol",
+    "influxdb_storage_client",
+    "influxdb_tsm",
+    "influxdb2_client",
+    "influxrpc_parser",
+    "iox_catalog",
+    "iox_data_generator",
+    "iox_query_influxql",
+    "iox_query_influxrpc",
+    "iox_query",
+    "iox_tests",
+    "iox_time",
+    "ioxd_common",
+    "ioxd_test",
+    "logfmt",
+    "metric_exporters",
+    "metric",
+    "mutable_batch_lp",
+    "mutable_batch_pb",
+    "mutable_batch_tests",
+    "mutable_batch",
+    "object_store_metrics",
+    "observability_deps",
+    "panic_logging",
+    "parquet_file",
+    "parquet_to_line_protocol",
+    "predicate",
+    "query_functions",
+    "schema",
+    "service_common",
+    "service_grpc_flight",
+    "service_grpc_testing",
+    "sharder",
+    "sqlx-hotswap-pool",
+    "test_helpers_end_to_end",
+    "tokio_metrics_bridge",
+    "trace_exporters",
+    "trace_http",
+    "trace",
+    "tracker",
+    "trogging",
+    "wal_inspect",
+    "wal",
+    "workspace-hack",
+]
+
+resolver = "2"
+
+exclude = [
+    "*.md",
+    "*.txt",
+    ".git*",
+    ".github/",
+    "LICENSE*",
+    "massif.out.*",
+    "test_bench/",
+    "test_fixtures/",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["IOx Project Developers"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+arrow = { version = "49.0.0", features = ["prettyprint", "chrono-tz"] }
+arrow-buffer = { version = "49.0.0" }
+arrow-flight = { version = "49.0.0", features = ["flight-sql-experimental"] }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "0e53c6d816f3a9d3d27c6ebb6d25b1699e5553e7" }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "0e53c6d816f3a9d3d27c6ebb6d25b1699e5553e7" }
+hashbrown = { version = "0.14.3" }
+object_store = { version = "0.8.0" }
+parquet = { version = "49.0.0", features = ["object_store"] }
+pbjson = { version = "0.6.0" }
+pbjson-build = { version = "0.6.2" }
+pbjson-types = { version = "0.6.0" }
+prost = { version = "0.12.3" }
+prost-build = { version = "0.12.2" }
+prost-types = { version = "0.12.3" }
+sqlparser = { version = "0.41.0" }
+tonic = { version = "0.10.2", features = ["tls", "tls-roots"] }
+tonic-build = { version = "0.10.2" }
+tonic-health = { version = "0.10.2" }
+tonic-reflection = { version = "0.10.2" }
+
+[workspace.lints.rust]
+rust_2018_idioms = "deny"
+unreachable_pub = "deny"
+missing_debug_implementations = "deny"
+missing_copy_implementations = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+clone_on_ref_ptr = "deny"
+future_not_send = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+bare_urls = "deny"
+
+# This profile optimizes for runtime performance and small binary size at the expense of longer
+# build times. It's most suitable for final release builds.
+[profile.release]
+codegen-units = 16
+debug = true
+lto = "thin"
+
+[profile.bench]
+debug = true
+
+# This profile optimizes for short build times at the expense of larger binary size and slower
+# runtime performance. It's most suitable for development iterations.
+[profile.quick-release]
+inherits = "release"
+codegen-units = 16
+lto = false
+incremental = true
+
+# Per insta docs: https://insta.rs/docs/quickstart/#optional-faster-runs
+[profile.dev.package.insta]
+opt-level = 3
+
+[profile.dev.package.similar]
+opt-level = 3
