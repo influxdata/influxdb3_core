@@ -2,8 +2,6 @@ use std::{path::Path, sync::Arc, task::Poll};
 
 use arc_swap::ArcSwap;
 use futures::Future;
-use http::{Method, Request};
-use hyper::Body;
 use mpchash::HashRing;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use observability_deps::tracing::error;
@@ -12,8 +10,8 @@ use tower::{Layer, Service};
 
 use crate::{
     data_types::{
-        InstanceState, KeyspaceResponseBody, KeyspaceVersion, ParquetCacheInstanceSet, ServiceNode,
-        ServiceNodeHostname, ServiceNodeId,
+        InstanceState, KeyspaceResponseBody, KeyspaceVersion, ParquetCacheInstanceSet, Request,
+        ServiceNode, ServiceNodeHostname, ServiceNodeId, WriteHintRequestBody,
     },
     server::response::Response,
 };
@@ -69,7 +67,7 @@ impl<S: Clone> Clone for KeyspaceService<S> {
     }
 }
 
-impl<S: Service<Request<Body>> + Clone + Send + Sync + 'static> KeyspaceService<S> {
+impl<S: Service<Request> + Clone + Send + Sync + 'static> KeyspaceService<S> {
     fn new(inner: S, configfile_path: String, node_hostname: String) -> Result<Self, Error> {
         let path = configfile_path.clone();
 
@@ -147,9 +145,9 @@ impl<S: Service<Request<Body>> + Clone + Send + Sync + 'static> KeyspaceService<
     }
 }
 
-impl<S> Service<Request<Body>> for KeyspaceService<S>
+impl<S> Service<Request> for KeyspaceService<S>
 where
-    S: Service<Request<Body>, Future = PinnedFuture, Error = Error> + Clone + Send + Sync + 'static,
+    S: Service<Request, Future = PinnedFuture, Error = Error> + Clone + Send + Sync + 'static,
 {
     type Response = super::response::Response;
     type Error = Error;
@@ -162,9 +160,9 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        match (req.method(), req.uri().path()) {
-            (&Method::GET, "/state") => {
+    fn call(&mut self, req: Request) -> Self::Future {
+        match req {
+            Request::GetState => {
                 let this = self.clone();
                 Box::pin(async move {
                     // return the version we have loaded
@@ -174,38 +172,31 @@ where
                     ))
                 })
             }
-            (&Method::PATCH, "/warmed") => {
+            Request::Warmed => {
                 let this = self.clone();
                 Box::pin(async move {
                     this.keyspace.set_to_running();
                     Ok(Response::Ready)
                 })
             }
-            (&Method::GET, "/keyspace") => {
+            Request::GetKeyspace => {
                 let this = self.clone();
                 Box::pin(async move {
                     let (_, _, keyspace) = this.keyspace.read_definition().await;
                     Ok(Response::Keyspace(keyspace))
                 })
             }
-            (&Method::GET, "/metadata")
-            | (&Method::GET, "/object")
-            | (&Method::POST, "/write-hint") => {
+            Request::GetMetadata(ref obj_location, _)
+            | Request::GetObject(ref obj_location, _)
+            | Request::WriteHint(WriteHintRequestBody {
+                location: ref obj_location,
+                ..
+            }) => {
                 let clone = self.inner.clone();
                 let mut inner = std::mem::replace(&mut self.inner, clone);
                 let this = self.clone();
+                let obj_location = obj_location.clone();
                 Box::pin(async move {
-                    let as_url = url::Url::parse(req.uri().to_string().as_str())
-                        .expect("should be already validated path & query");
-                    let obj_location = match as_url.query_pairs().find(|(k, _v)| k.eq("location")) {
-                        None => {
-                            return Err(Error::Keyspace(
-                                "invalid or missing object location".into(),
-                            ));
-                        }
-                        Some((_key, location)) => location.to_string(),
-                    };
-
                     // when keyspace is invalid (being re-built), return error such that
                     // cache client decides to (1) re-fetch keyspace, and/or (2) uses fallback
                     match this.keyspace.in_keyspace(&obj_location) {
@@ -216,10 +207,6 @@ where
                         ))),
                     }
                 })
-            }
-            (any_method, any_path) => {
-                let msg = format!("invalid path: {} {}", any_method, any_path);
-                Box::pin(async { Err(Error::BadRequest(msg)) })
             }
         }
     }
@@ -350,9 +337,21 @@ impl Keyspace {
             }
         });
 
-        if InstanceState::from(&prev_data.version) == InstanceState::Pending && self.ready() {
-            // Let anyone waiting on poll_ready know that we're no longer pending.
-            ready.notify_waiters();
+        // handle any communication/updates
+        match (
+            InstanceState::from(&prev_data.version),
+            InstanceState::from(&self.data.load().version),
+        ) {
+            (InstanceState::Pending, _) if self.ready() => {
+                // Let anyone waiting on poll_ready know that we're no longer pending.
+                ready.notify_waiters();
+            }
+            (InstanceState::Running, InstanceState::Running)
+            | (InstanceState::Running, InstanceState::Cooling) => {
+                // make sure the curr version == next, since we are not waiting for warming to signal done
+                self.set_to_running();
+            }
+            _ => {}
         }
     }
 }
@@ -362,7 +361,7 @@ pub struct BuildKeyspaceService {
     pub node_hostname: String,
 }
 
-impl<S: Service<Request<Body>> + Clone + Send + Sync + 'static> Layer<S> for BuildKeyspaceService {
+impl<S: Service<Request> + Clone + Send + Sync + 'static> Layer<S> for BuildKeyspaceService {
     type Service = KeyspaceService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
@@ -378,7 +377,7 @@ impl<S: Service<Request<Body>> + Clone + Send + Sync + 'static> Layer<S> for Bui
 #[cfg(test)]
 mod test {
     use std::{
-        io::{Seek, Write},
+        io::Write,
         sync::atomic::{AtomicU32, Ordering},
         task::Context,
         time::Duration,
@@ -409,7 +408,7 @@ mod test {
         poll_ready: Arc<AtomicU32>,
     }
 
-    impl Service<Request<Body>> for MockInnermostService {
+    impl Service<Request> for MockInnermostService {
         type Response = Response;
         type Error = Error;
         type Future = PinnedFuture;
@@ -421,58 +420,38 @@ mod test {
             self.poll_ready.fetch_add(1, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
-        fn call(&mut self, _req: Request<Body>) -> Self::Future {
+        fn call(&mut self, _req: Request) -> Self::Future {
             self.call.fetch_add(1, Ordering::SeqCst);
             Box::pin(future::ok(Response::Ready))
         }
     }
 
-    fn metadata_req() -> Request<Body> {
-        Request::builder()
-            .method(Method::GET)
-            .uri("http://foo.io/metadata?location=bar")
-            .body(Body::empty())
-            .unwrap()
+    fn metadata_req() -> Request {
+        Request::GetMetadata("bar".into(), Default::default())
     }
 
-    fn object_req() -> Request<Body> {
-        Request::builder()
-            .method(Method::GET)
-            .uri("http://foo.io/object?location=bar")
-            .body(Body::empty())
-            .unwrap()
+    fn object_req() -> Request {
+        Request::GetObject("bar".into(), Default::default())
     }
 
-    fn write_hint_req() -> Request<Body> {
-        Request::builder()
-            .method(Method::POST)
-            .uri("http://foo.io/write-hint?location=bar")
-            .body(Body::empty())
-            .unwrap()
+    fn write_hint_req() -> Request {
+        Request::WriteHint(WriteHintRequestBody {
+            location: "bar".into(),
+            ack_setting: Default::default(),
+            hint: Default::default(),
+        })
     }
 
-    fn state_req() -> Request<Body> {
-        Request::builder()
-            .method(Method::GET)
-            .uri("/state")
-            .body(Body::empty())
-            .unwrap()
+    fn state_req() -> Request {
+        Request::GetState
     }
 
-    fn warmed_req() -> Request<Body> {
-        Request::builder()
-            .method(Method::PATCH)
-            .uri("/warmed")
-            .body(Body::empty())
-            .unwrap()
+    fn warmed_req() -> Request {
+        Request::Warmed
     }
 
-    fn keyspace_defn_req() -> Request<Body> {
-        Request::builder()
-            .method(Method::GET)
-            .uri("/keyspace")
-            .body(Body::empty())
-            .unwrap()
+    fn keyspace_defn_req() -> Request {
+        Request::GetKeyspace
     }
 
     async fn write_defn_to_file(defn: &[u8], configfile_path: &Path) {
@@ -523,15 +502,12 @@ mod test {
             instances: vec!["another-node"].into_iter().map(String::from).collect(),
         })
         .to_string();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(file.path())
-            .unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).unwrap(); // move pointer to start, to overwrite
-        writeln!(file, "{}", new_keyspace_definition.as_str())
+        let mut next_configmap = NamedTempFile::new().unwrap();
+        writeln!(next_configmap, "{}", new_keyspace_definition.as_str())
             .expect("should write keyspace definition to configfile");
-        file.sync_all().unwrap();
+        next_configmap
+            .persist(file.path())
+            .expect("should overwrite with new configmap");
 
         // should no longer be in keyspace
         keyspace.update(Arc::clone(&notify)).await;
@@ -574,15 +550,12 @@ mod test {
             instances: vec!["another-node"].into_iter().map(String::from).collect(),
         })
         .to_string();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(file.path())
-            .unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).unwrap(); // move pointer to start, to overwrite
-        writeln!(file, "{}", new_keyspace_definition.as_str())
+        let mut next_configmap = NamedTempFile::new().unwrap();
+        writeln!(next_configmap, "{}", new_keyspace_definition.as_str())
             .expect("should write keyspace definition to configfile");
-        file.sync_all().unwrap();
+        next_configmap
+            .persist(file.path())
+            .expect("should overwrite with new configmap");
 
         // cooling phase
         keyspace.update(notify).await;
@@ -691,15 +664,12 @@ mod test {
             instances: vec!["another-node"].into_iter().map(String::from).collect(),
         })
         .to_string();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&configfile_path)
-            .unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).unwrap(); // move pointer to start, to overwrite
-        writeln!(file, "{}", new_keyspace_definition.as_str())
+        let mut next_configmap = NamedTempFile::new().unwrap();
+        writeln!(next_configmap, "{}", new_keyspace_definition.as_str())
             .expect("should write keyspace definition to configfile");
-        file.sync_all().unwrap();
+        next_configmap
+            .persist(configfile_path)
+            .expect("should overwrite with new configmap");
 
         // waiting for new_keyspace_definition to load
         // cannot use poll_ready, as it is already returning ready (to accept `GET /state` requests)

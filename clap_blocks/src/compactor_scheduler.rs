@@ -1,7 +1,8 @@
 //! Compactor-Scheduler-related configs.
 
 use crate::socket_addr::SocketAddr;
-use std::str::FromStr;
+use humantime::parse_duration;
+use std::{fmt::Debug, str::FromStr, time::Duration};
 
 /// Compaction Scheduler type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -190,6 +191,28 @@ pub struct CompactorSchedulerConfig {
     )]
     pub max_desired_file_size_bytes: u64,
 
+    /// max row count of compacted parquet files.
+    #[clap(
+        long = "compaction-max-file-rows",
+        env = "INFLUXDB_IOX_COMPACTION_MAX_FILE_ROWS",
+        default_value = "200000000",
+        action
+    )]
+    pub max_file_rows: usize,
+
+    /// Minimum number of L0 files to compact to L1.
+    ///
+    /// Setting this value higher in general results in fewer overall
+    /// resources spent on compaction but more files per partition (and
+    /// thus less optimal query performance).
+    #[clap(
+        long = "compaction-min-num-l0-files-to-compact",
+        env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L0_FILES_TO_COMPACT",
+        default_value = "4",
+        action
+    )]
+    pub min_num_l0_files_to_compact: usize,
+
     /// Minimum number of L1 files to compact to L2.
     ///
     /// If there are more than this many L1 (by definition non
@@ -206,6 +229,31 @@ pub struct CompactorSchedulerConfig {
         action
     )]
     pub min_num_l1_files_to_compact: usize,
+
+    /// When identifying undersized L2s for recompaction on a hot partition,
+    /// if a large window size of files totals less than the per file target size,
+    /// they're recompacted.
+    ///
+    /// The large window size will be the greater of the number of files
+    /// per compaction plan, or this value.
+    #[clap(
+        long = "compaction-undersized-l2-large-window-min",
+        env = "INFLUXDB_IOX_COMPACTION_UNDERSIZED_L2_LARGE_WINDOW_MIN",
+        default_value = "12",
+        action
+    )]
+    pub undersized_l2_large_window_min: usize,
+
+    /// When identifying undersized L2s for recompaction on a hot partition,
+    /// if this many files total less than half the per file target size,
+    /// they're recompacted.
+    #[clap(
+        long = "compaction-undersized-l2-small-window",
+        env = "INFLUXDB_IOX_COMPACTION_UNDERSIZED_L2_SMALL_WINDOW",
+        default_value = "4",
+        action
+    )]
+    pub undersized_l2_small_window: usize,
 
     /// Maximum number of columns in a table of a partition that
     /// will be able to considered to get compacted
@@ -290,6 +338,19 @@ pub struct CompactorSchedulerConfig {
         action
     )]
     pub split_percentage: u16,
+
+    /// How long since the last new file was written to a partition, in order for it
+    /// to be considered cold.
+    ///
+    /// If not specified, defaults to 0s ago  (Off).
+    /// After cold compaction is tested & stable, the default will be something like 2h.
+    #[clap(
+        long,
+        default_value = "0s",
+        value_parser = parse_duration,
+        env = "INFLUXDB_IOX_COMPACTION_COLD_THRESHOLD"
+    )]
+    pub cold_threshold: Option<Duration>,
 
     /// Partition source config used by the local scheduler.
     #[clap(flatten)]

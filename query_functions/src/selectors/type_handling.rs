@@ -1,8 +1,10 @@
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use datafusion::common::scalar::ScalarStructBuilder;
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     scalar::ScalarValue,
 };
+use std::sync::Arc;
 
 /// Name of the output struct field that holds the value that was the main input into the selector, i.e. from which we
 /// have selected the first/last/min/max value.
@@ -65,19 +67,21 @@ pub fn make_struct_scalar<'a>(
     value: &'a ScalarValue,
     time: &'a ScalarValue,
     other: impl IntoIterator<Item = &'a ScalarValue>,
-) -> ScalarValue {
-    let data_fields: Vec<_> = [value.clone(), time.clone()]
+) -> DataFusionResult<ScalarValue> {
+    let scalars: Vec<_> = [value.clone(), time.clone()]
         .into_iter()
         .chain(other.into_iter().cloned())
         .collect();
-    let value_type = value.data_type();
-    let time_type = time.data_type();
-    let other_types: Vec<_> = data_fields[2..].iter().map(|s| s.data_type()).collect();
 
-    ScalarValue::Struct(
-        Some(data_fields),
-        make_struct_fields(&value_type, &time_type, &other_types),
-    )
+    let other_types: Vec<_> = scalars[2..].iter().map(|s| s.data_type()).collect();
+    let fields = make_struct_fields(&value.data_type(), &time.data_type(), &other_types);
+    let mut builder = ScalarStructBuilder::new();
+
+    for (field, scalar) in fields.iter().zip(scalars) {
+        builder = builder.with_scalar(Arc::clone(field), scalar);
+    }
+
+    builder.build()
 }
 
 /// Contains types of the aggregator.

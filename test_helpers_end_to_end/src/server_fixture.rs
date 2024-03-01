@@ -70,7 +70,7 @@ impl ServerFixture {
         // ensure the server is ready
         let connections = server.wait_until_ready().await;
 
-        ServerFixture {
+        Self {
             server,
             connections,
         }
@@ -164,6 +164,11 @@ impl ServerFixture {
     /// Return the http base URL for the querier gRPC API
     pub fn querier_grpc_base(&self) -> Arc<str> {
         self.server.addrs().querier_grpc_api().client_base()
+    }
+
+    /// Return the http base URL for the parquet_cache HTTP API
+    pub fn parquet_cache_http_base(&self) -> Arc<str> {
+        self.server.addrs().parquet_cache_http_api().client_base()
     }
 
     /// Return the http base URL for the catalog HTTP API
@@ -621,7 +626,8 @@ impl TestServer {
                     }
                 }
                 ServerType::ParquetCache => {
-                    unimplemented!("ParquetCache server should not use grpc, only http");
+                    info!("ParquetCache server does not use grpc, only http");
+                    return;
                 }
                 ServerType::Router => {
                     if check_catalog_service_health(

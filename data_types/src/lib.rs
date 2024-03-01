@@ -2,18 +2,8 @@
 
 // `clippy::use_self` is deliberately excluded from the lints this crate uses.
 // See <https://github.com/rust-lang/rust-clippy/issues/6902>.
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+#![allow(clippy::use_self)]
+#![warn(missing_docs)]
 
 use thiserror::Error;
 // Workaround for "unused crate" lint false positives.
@@ -126,7 +116,7 @@ impl CompactionLevel {
 }
 
 /// Unique ID for a `Namespace`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type, sqlx::FromRow)]
 #[sqlx(transparent)]
 pub struct NamespaceId(i64);
 
@@ -225,8 +215,8 @@ impl From<iox_time::Time> for Timestamp {
 }
 
 impl From<Timestamp> for iox_time::Time {
-    fn from(time: Timestamp) -> iox_time::Time {
-        iox_time::Time::from_timestamp_nanos(time.get())
+    fn from(time: Timestamp) -> Self {
+        Self::from_timestamp_nanos(time.get())
     }
 }
 
@@ -320,6 +310,35 @@ impl std::str::FromStr for ObjectStoreId {
     }
 }
 
+/// A monotonically increasing `i64` counter tracking the version of its
+/// corresponding [`Namespace`].
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct NamespaceVersion(i64);
+
+impl NamespaceVersion {
+    /// Initialises a version counter for non-schema [`Namespace`] metadata,
+    /// set at `v`.
+    pub const fn new(v: i64) -> Self {
+        Self(v)
+    }
+
+    /// Returns the inner version value as its primitive type.
+    pub fn get(&self) -> i64 {
+        self.0
+    }
+
+    /// Increments the version counter of the non-schema [`Namespace`] metadata
+    /// by one.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if incrementing the version would cause wrap-around.
+    pub fn inc(&mut self) {
+        self.0 = self.0.checked_add(1).expect("namespace version overflow");
+    }
+}
+
 /// Data object for a namespace
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Namespace {
@@ -338,6 +357,8 @@ pub struct Namespace {
     /// The partition template to use for new tables in this namespace either created implicitly or
     /// created without specifying a partition template.
     pub partition_template: NamespacePartitionTemplateOverride,
+    /// The router-managed version associated with this instance of the namespace data object.
+    pub router_version: NamespaceVersion,
 }
 
 /// Schema collection for a namespace. This is an in-memory object useful for a schema
@@ -434,7 +455,7 @@ pub struct Table {
 /// Serialise a [`Table`] object into its protobuf representation.
 impl From<Table> for generated_types::influxdata::iox::table::v1::Table {
     fn from(value: Table) -> Self {
-        generated_types::influxdata::iox::table::v1::Table {
+        Self {
             id: value.id.get(),
             name: value.name,
             namespace_id: value.namespace_id.get(),
@@ -834,6 +855,42 @@ pub struct ParquetFileParams {
     pub max_l0_created_at: Timestamp,
 }
 
+impl From<ParquetFile> for ParquetFileParams {
+    fn from(value: ParquetFile) -> Self {
+        let ParquetFile {
+            namespace_id,
+            table_id,
+            partition_id,
+            partition_hash_id,
+            object_store_id,
+            min_time,
+            max_time,
+            file_size_bytes,
+            row_count,
+            compaction_level,
+            created_at,
+            column_set,
+            max_l0_created_at,
+            ..
+        } = value;
+        Self {
+            namespace_id,
+            table_id,
+            partition_id,
+            partition_hash_id,
+            object_store_id,
+            min_time,
+            max_time,
+            file_size_bytes,
+            row_count,
+            compaction_level,
+            created_at,
+            column_set,
+            max_l0_created_at,
+        }
+    }
+}
+
 /// ID of a chunk.
 ///
 /// This ID is unique within a single partition.
@@ -1069,15 +1126,15 @@ impl Scalar {
 impl std::fmt::Display for Scalar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Scalar::Bool(value) => value.fmt(f),
-            Scalar::I64(value) => value.fmt(f),
-            Scalar::F64(value) => match value.classify() {
+            Self::Bool(value) => value.fmt(f),
+            Self::I64(value) => value.fmt(f),
+            Self::F64(value) => match value.classify() {
                 FpCategory::Nan => write!(f, "'NaN'"),
                 FpCategory::Infinite if *value.as_ref() < 0.0 => write!(f, "'-Infinity'"),
                 FpCategory::Infinite => write!(f, "'Infinity'"),
                 _ => write!(f, "{:?}", value.as_ref()),
             },
-            Scalar::String(value) => {
+            Self::String(value) => {
                 write!(f, "'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
             }
         }

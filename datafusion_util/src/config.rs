@@ -31,10 +31,6 @@ pub fn iox_session_config() -> SessionConfig {
         .with_default_catalog_and_schema(DEFAULT_CATALOG, DEFAULT_SCHEMA)
         // Tell the datafusion optimizer to avoid repartitioning sorted inputs
         .with_prefer_existing_sort(true)
-        // Avoid repartitioning file scans as it destroys existing sort orders
-        // see https://github.com/influxdata/influxdb_iox/issues/9450
-        // see https://github.com/apache/arrow-datafusion/issues/8451
-        .with_repartition_file_scans(false)
 }
 
 /// Register the "IOx" object store provider for URLs of the form "iox://{id}

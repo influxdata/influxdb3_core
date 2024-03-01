@@ -43,6 +43,18 @@ pub enum Statement {
     ShowFieldKeys(Box<ShowFieldKeysStatement>),
 }
 
+impl Statement {
+    /// Is this a `SHOW DATABASES` statement
+    pub fn is_show_databases(&self) -> bool {
+        matches!(self, Self::ShowDatabases(_))
+    }
+
+    /// Is this a `SHOW RETENTION POLICIES` statement
+    pub fn is_show_retention_policies(&self) -> bool {
+        matches!(self, Self::ShowRetentionPolicies(_))
+    }
+}
+
 impl Display for Statement {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -103,5 +115,23 @@ mod test {
         // show_statement combinator
         let (got, _) = statement("SHOW TAG KEYS").unwrap();
         assert_eq!(got, "");
+    }
+
+    #[test]
+    fn statement_helpers() {
+        let (_, got) = statement("SHOW DATABASES").unwrap();
+        assert_eq!(got.to_string(), "SHOW DATABASES");
+        assert!(got.is_show_databases());
+        assert!(!got.is_show_retention_policies());
+
+        let (_, got) = statement("SHOW RETENTION POLICIES ON \"foo\"").unwrap();
+        assert_eq!(got.to_string(), "SHOW RETENTION POLICIES ON foo");
+        assert!(got.is_show_retention_policies());
+        assert!(!got.is_show_databases());
+
+        let (_, got) = statement("SHOW RETENTION POLICIES").unwrap();
+        assert_eq!(got.to_string(), "SHOW RETENTION POLICIES");
+        assert!(got.is_show_retention_policies());
+        assert!(!got.is_show_databases());
     }
 }

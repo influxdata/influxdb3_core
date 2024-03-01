@@ -8,6 +8,7 @@ use self::{
         dedup_null_columns::DedupNullColumns, dedup_sort_order::DedupSortOrder,
         partition_split::PartitionSplit, remove_dedup::RemoveDedup, time_split::TimeSplit,
     },
+    limits::CheckLimits,
     predicate_pushdown::PredicatePushdown,
     projection_pushdown::ProjectionPushdown,
     sort::{order_union_sorted_inputs::OrderUnionSortedInputs, parquet_sortness::ParquetSortness},
@@ -17,6 +18,7 @@ use self::{
 mod chunk_extraction;
 mod combine_chunks;
 mod dedup;
+mod limits;
 mod predicate_pushdown;
 mod projection_pushdown;
 mod sort;
@@ -46,11 +48,15 @@ pub fn register_iox_physical_optimizers(state: SessionState) -> SessionState {
         Arc::new(OneUnion),
     ];
 
-    // Append DataFUsion physical rules to the IOx-specific rules
+    // Append DataFusion physical rules to the IOx-specific rules
     optimizers.append(&mut state.physical_optimizers().to_vec());
 
     // Add a rule to optimize plan with limit
     optimizers.push(Arc::new(OrderUnionSortedInputs));
+
+    // Perform the limits check last giving the other rules the best chance
+    // to keep the under the limit.
+    optimizers.push(Arc::new(CheckLimits));
 
     state.with_physical_optimizer_rules(optimizers)
 }

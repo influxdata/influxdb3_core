@@ -41,7 +41,6 @@ impl Planner {
         let planner = SqlQueryPlanner::new();
         let query = query.as_ref();
         let ctx = self.ctx.child_ctx("planner sql");
-        let params = params.into_df_param_values();
 
         planner.query(query, params, &ctx).await
     }
@@ -56,7 +55,6 @@ impl Planner {
         let planner = InfluxQLQueryPlanner::new();
         let query = query.as_ref();
         let ctx = self.ctx.child_ctx("planner influxql");
-        let params = params.into();
 
         planner.query(query, params, &ctx).await
     }
@@ -68,13 +66,11 @@ impl Planner {
         namespace_name: impl AsRef<str> + Send,
         namespace: Arc<dyn QueryNamespace>,
         cmd: FlightSQLCommand,
-        params: StatementParams,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let namespace_name = namespace_name.as_ref();
         let ctx = self.ctx.child_ctx("planner flight_sql_do_get");
-        let params = params.into_df_param_values();
 
-        FlightSQLPlanner::do_get(namespace_name, namespace, cmd, params, &ctx)
+        FlightSQLPlanner::do_get(namespace_name, namespace, cmd, &ctx)
             .await
             .map_err(DataFusionError::from)
     }
@@ -88,7 +84,7 @@ impl Planner {
         cmd: FlightSQLCommand,
     ) -> Result<Bytes> {
         let namespace_name = namespace_name.into();
-        let ctx = self.ctx.child_ctx("planner flight_sql_do_get");
+        let ctx = self.ctx.child_ctx("planner flight_sql_do_action");
 
         FlightSQLPlanner::do_action(namespace_name, namespace, cmd, &ctx)
             .await

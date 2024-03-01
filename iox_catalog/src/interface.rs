@@ -1,7 +1,9 @@
 //! Traits and data types for the IOx Catalog API.
 
 use async_trait::async_trait;
+use data_types::snapshot::namespace::NamespaceSnapshot;
 use data_types::snapshot::partition::PartitionSnapshot;
+use data_types::snapshot::root::RootSnapshot;
 use data_types::snapshot::table::TableSnapshot;
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
@@ -17,6 +19,7 @@ use std::{
     fmt::{Debug, Display},
     sync::Arc,
 };
+use trace::ctx::SpanContext;
 
 /// An error wrapper detailing the reason for a compare-and-swap failure.
 #[derive(Debug)]
@@ -28,6 +31,15 @@ pub enum CasFailure<T> {
     ValueMismatch(T),
     /// A query error occurred.
     QueryError(Error),
+}
+
+impl<T> std::fmt::Display for CasFailure<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ValueMismatch(_) => write!(f, "value mismatch"),
+            Self::QueryError(e) => write!(f, "query error: {e}"),
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -47,6 +59,9 @@ pub enum Error {
 
     #[snafu(display("not found: {descr}"))]
     NotFound { descr: String },
+
+    #[snafu(display("malformed request: {descr}"))]
+    Malformed { descr: String },
 }
 
 impl From<sqlx::Error> for Error {
@@ -73,6 +88,22 @@ impl From<data_types::snapshot::partition::Error> for Error {
 
 impl From<data_types::snapshot::table::Error> for Error {
     fn from(e: data_types::snapshot::table::Error) -> Self {
+        Self::External {
+            source: Box::new(e),
+        }
+    }
+}
+
+impl From<data_types::snapshot::namespace::Error> for Error {
+    fn from(e: data_types::snapshot::namespace::Error) -> Self {
+        Self::External {
+            source: Box::new(e),
+        }
+    }
+}
+
+impl From<data_types::snapshot::root::Error> for Error {
+    fn from(e: data_types::snapshot::root::Error) -> Self {
         Self::External {
             source: Box::new(e),
         }
@@ -175,6 +206,9 @@ pub trait Catalog: Send + Sync + Debug + Display {
 /// from one or more SQL tables over key-value key spaces to simple in-memory vectors. The user
 /// should and must not care how these are implemented.
 pub trait RepoCollection: Send + Sync + Debug {
+    /// Repository for root information.
+    fn root(&mut self) -> &mut dyn RootRepo;
+
     /// Repository for [namespaces](data_types::Namespace).
     fn namespaces(&mut self) -> &mut dyn NamespaceRepo;
 
@@ -189,6 +223,16 @@ pub trait RepoCollection: Send + Sync + Debug {
 
     /// Repository for [Parquet files](data_types::ParquetFile).
     fn parquet_files(&mut self) -> &mut dyn ParquetFileRepo;
+
+    /// Set span context for all operations performed.
+    fn set_span_context(&mut self, span_ctx: Option<SpanContext>);
+}
+
+/// Functions for working with root of the catalog
+#[async_trait]
+pub trait RootRepo: Send + Sync {
+    /// Obtain a root snapshot
+    async fn snapshot(&mut self) -> Result<RootSnapshot>;
 }
 
 /// Functions for working with namespaces in the catalog
@@ -230,7 +274,7 @@ pub trait NamespaceRepo: Send + Sync {
     ) -> Result<Option<Namespace>>;
 
     /// Soft-delete a namespace by name
-    async fn soft_delete(&mut self, name: &str) -> Result<()>;
+    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId>;
 
     /// Update the limit on the number of tables that can exist per namespace.
     async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace>;
@@ -241,6 +285,9 @@ pub trait NamespaceRepo: Send + Sync {
         name: &str,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace>;
+
+    /// Obtain a namespace snapshot
+    async fn snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot>;
 }
 
 /// Functions for working with tables in the catalog
@@ -405,6 +452,23 @@ pub trait PartitionRepo: Send + Sync {
         maximum_time: Option<Timestamp>,
     ) -> Result<Vec<PartitionId>>;
 
+    /// Select next batch of partitions needing cold compaction up through `maximum_time`
+    /// A partition needs cold compaction if its `new_file_at` is less than or equal to the maximum time
+    /// and its either never been cold compacted (`cold_compact_at`` == 0) or the last cold compaction
+    /// has been invalided by a new file (`new_file_at` > `cold_compact_at`).
+    async fn partitions_needing_cold_compact(
+        &mut self,
+        maximum_time: Timestamp,
+        n: usize,
+    ) -> Result<Vec<PartitionId>>;
+
+    /// Update the time of the last cold compaction for the specified partition.
+    async fn update_cold_compact(
+        &mut self,
+        partition_id: PartitionId,
+        cold_compact_at: Timestamp,
+    ) -> Result<()>;
+
     /// Return all partitions that do not have deterministic hash IDs in the catalog. Used in
     /// the ingester's `OldPartitionBloomFilter` to determine whether a catalog query is necessary.
     /// Can be removed when all partitions have hash IDs and support for old-style partitions is no
@@ -420,6 +484,13 @@ pub trait PartitionRepo: Send + Sync {
 pub trait ParquetFileRepoExt {
     /// create the parquet file
     async fn create(self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
+
+    /// Attempt to upsert the parquet file
+    ///
+    /// Unlike [`Self::create`] this will not return an error if an entry already exists
+    /// with the same parameters. However, [`Error::AlreadyExists`] will still be returned
+    /// if an entry already exists with different parameters
+    async fn upsert(self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
 }
 
 #[async_trait]
@@ -437,6 +508,39 @@ impl ParquetFileRepoExt for &mut dyn ParquetFileRepo {
             .await?;
         let id = files.into_iter().next().unwrap();
         Ok(ParquetFile::from_params(params, id))
+    }
+
+    async fn upsert(mut self, params: ParquetFileParams) -> Result<ParquetFile> {
+        // We can't use `self.create` here as the lifetime bounds cause issues
+        let r = self
+            .create_upgrade_delete(
+                params.partition_id,
+                &[],
+                &[],
+                &[params.clone()],
+                CompactionLevel::Initial,
+            )
+            .await;
+
+        match r {
+            Ok(files) => {
+                let id = files.into_iter().next().unwrap();
+                Ok(ParquetFile::from_params(params, id))
+            }
+            Err(Error::AlreadyExists { .. }) => {
+                let id = params.object_store_id;
+                if let Some(existing) = self.get_by_object_store_id(id).await? {
+                    let expected = ParquetFile::from_params(params, existing.id);
+                    if expected == existing {
+                        return Ok(existing);
+                    }
+                }
+                Err(Error::AlreadyExists {
+                    descr: format!("conflicting parquet file with object store id {id}"),
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

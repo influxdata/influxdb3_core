@@ -1,5 +1,7 @@
 //! Querier-related configs.
 
+use url::Url;
+
 use crate::{
     ingester_address::IngesterAddress,
     memory_size::MemorySize,
@@ -128,6 +130,39 @@ pub struct QuerierConfig {
     /// See <https://github.com/influxdata/influxdb_iox/issues/8169>.
     #[clap(long = "v2-ingester-api", env = "INFLUXDB_IOX_V2_INGESTER_API", action)]
     pub v2_ingester_api: bool,
+
+    /// Optimize catalog access pattern for centralized catalog cache service.
+    ///
+    /// See:
+    /// - <https://github.com/influxdata/influxdb_iox/issues/10046>
+    /// - <https://github.com/influxdata/influxdb_iox/issues/9182>
+    #[clap(
+        long = "optimize-for-catalog-cache",
+        env = "INFLUXDB_IOX_V2_OPTIMIZE_FOR_CATALOG_CACHE",
+        action
+    )]
+    pub optimize_for_catalog_cache: bool,
+
+    /// Optimize catalog access pattern for centralized data cache service.
+    #[clap(
+        long = "optimize-for-data-cache",
+        env = "INFLUXDB_IOX_V2_OPTIMIZE_FOR_DATA_CACHE",
+        action
+    )]
+    pub optimize_for_data_cache: bool,
+
+    /// Enable object store caching by specifying one or more cache endpoints as
+    /// a comma delimited string.
+    ///
+    /// NOTE: this value should be consistent (in content and order) across all
+    /// IOx instances.
+    #[clap(
+        long = "object-store-cache-endpoints",
+        env = "INFLUXDB_IOX_OBJECT_STORE_CACHE_ENDPOINTS",
+        num_args=1..,
+        value_delimiter = ','
+    )]
+    pub object_store_cache_endpoints: Option<Vec<Url>>,
 }
 
 fn parse_datafusion_config(

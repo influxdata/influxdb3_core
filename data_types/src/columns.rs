@@ -388,9 +388,32 @@ impl From<ColumnType> for proto::ColumnType {
 /// This is internally implemented as a sorted vector. The sorting allows for fast [`PartialEq`]/[`Eq`]/[`Hash`] and
 /// ensures that the PostgreSQL data is deterministic. Note that PostgreSQL does NOT have a set type at the moment, so
 /// this is stored as an array.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, sqlx::encode::Encode)]
 #[sqlx(transparent, no_pg_array)]
 pub struct ColumnSet(Vec<ColumnId>);
+
+// Manual implementation to workaround (#9833)
+impl<'r, DB: ::sqlx::Database> ::sqlx::decode::Decode<'r, DB> for ColumnSet
+where
+    Vec<ColumnId>: ::sqlx::decode::Decode<'r, DB>,
+{
+    fn decode(
+        value: <DB as ::sqlx::database::HasValueRef<'r>>::ValueRef,
+    ) -> Result<Self, Box<dyn ::std::error::Error + 'static + Send + Sync>> {
+        <Vec<ColumnId> as ::sqlx::decode::Decode<'r, DB>>::decode(value).map(Self::new)
+    }
+}
+impl<DB: ::sqlx::Database> ::sqlx::Type<DB> for ColumnSet
+where
+    Vec<ColumnId>: ::sqlx::Type<DB>,
+{
+    fn type_info() -> DB::TypeInfo {
+        <Vec<ColumnId> as ::sqlx::Type<DB>>::type_info()
+    }
+    fn compatible(ty: &DB::TypeInfo) -> bool {
+        <Vec<ColumnId> as ::sqlx::Type<DB>>::compatible(ty)
+    }
+}
 
 impl ColumnSet {
     /// Create new column set.
@@ -530,7 +553,7 @@ impl SortKeyIds {
         // This validates an invariant in debug builds, skipping the cost
         // for release builds.
         if cfg!(debug_assertions) {
-            SortKeyIds::check_for_deplicates(&columns);
+            Self::check_for_deplicates(&columns);
         }
 
         // Must continue with columns in original order
@@ -566,7 +589,7 @@ impl SortKeyIds {
         if new_columns.peek().is_none() {
             None
         } else {
-            Some(SortKeyIds::new(
+            Some(Self::new(
                 existing_columns_without_time
                     .chain(new_columns)
                     .chain(std::iter::once(time_column_id)),
@@ -686,7 +709,7 @@ impl From<&SortKeyIds> for Vec<i64> {
 
 impl From<&SortKeyIds> for generated_types::influxdata::iox::catalog::v1::SortKeyIds {
     fn from(val: &SortKeyIds) -> Self {
-        generated_types::influxdata::iox::catalog::v1::SortKeyIds {
+        Self {
             array_sort_key_ids: val.into(),
         }
     }

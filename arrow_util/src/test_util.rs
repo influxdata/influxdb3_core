@@ -170,6 +170,11 @@ pub fn equalize_batch_schemas(batches: Vec<RecordBatch>) -> Result<Vec<RecordBat
         batches.iter().map(|batch| batch.schema().as_ref().clone()),
     )?);
 
+    // Sort the feilds to keep the schema order deterministic
+    let mut fields = common_schema.all_fields().clone();
+    fields.sort_by_key(|field| field.name().to_string());
+    let common_schema = Arc::new(Schema::new(fields.into_iter().cloned().collect::<Vec<_>>()));
+
     Ok(batches
         .into_iter()
         .map(|batch| {

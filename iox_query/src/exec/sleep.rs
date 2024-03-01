@@ -49,14 +49,7 @@ impl SleepNode {
         let duration = self
             .duration
             .iter()
-            .map(|e| {
-                planner.create_physical_expr(
-                    e,
-                    logical_inputs[0].schema(),
-                    &physical_inputs[0].schema(),
-                    session_state,
-                )
-            })
+            .map(|e| planner.create_physical_expr(e, logical_inputs[0].schema(), session_state))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SleepExpr::new(Arc::clone(&physical_inputs[0]), duration))
     }

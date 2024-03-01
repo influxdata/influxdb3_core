@@ -13,7 +13,7 @@ workspace = true
 clap = { version = "4", features = ["derive", "env"], optional = true }
 logfmt = { path = "../logfmt" }
 observability_deps = { path = "../observability_deps" }
-thiserror = "1.0.56"
+thiserror = "1.0.57"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

@@ -10,7 +10,7 @@ use crate::{
         serialize_partition, serialize_skipped_compaction, serialize_sort_key_ids, serialize_table,
         ContextExt, ConvertExt, ConvertOptExt, RequiredExt,
     },
-    interface::{CasFailure, Catalog},
+    interface::{CasFailure, Catalog, RepoCollection},
 };
 use async_trait::async_trait;
 use data_types::{
@@ -19,7 +19,6 @@ use data_types::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::catalog::v2 as proto;
-use generated_types::influxdata::iox::catalog::v2::{TableSnapshotRequest, TableSnapshotResponse};
 use tonic::{Request, Response, Status};
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
@@ -42,6 +41,15 @@ impl GrpcCatalogServer {
             catalog: Arc::clone(&self.catalog),
         };
         proto::catalog_service_server::CatalogServiceServer::new(this)
+    }
+
+    /// Pre-process request by extracting tracing information and setting up the [`RepoCollection`].
+    fn preprocess_request<T>(&self, req: Request<T>) -> (Box<dyn RepoCollection>, T) {
+        let mut repos = self.catalog.repositories();
+
+        repos.set_span_context(req.extensions().get().cloned());
+
+        (repos, req.into_inner())
     }
 }
 
@@ -67,6 +75,8 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         TonicStream<proto::PartitionListSkippedCompactionsResponse>;
     type PartitionMostRecentNStream = TonicStream<proto::PartitionMostRecentNResponse>;
     type PartitionNewFileBetweenStream = TonicStream<proto::PartitionNewFileBetweenResponse>;
+    type PartitionNeedingColdCompactStream =
+        TonicStream<proto::PartitionNeedingColdCompactResponse>;
     type PartitionListOldStyleStream = TonicStream<proto::PartitionListOldStyleResponse>;
 
     type ParquetFileFlagForDeleteByRetentionStream =
@@ -78,15 +88,31 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     type ParquetFileExistsByObjectStoreIdBatchStream =
         TonicStream<proto::ParquetFileExistsByObjectStoreIdBatchResponse>;
 
+    async fn root_snapshot(
+        &self,
+        request: Request<proto::RootSnapshotRequest>,
+    ) -> Result<Response<proto::RootSnapshotResponse>, Status> {
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let snapshot = repos
+            .root()
+            .snapshot()
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::RootSnapshotResponse {
+            generation: snapshot.generation(),
+            root: Some(snapshot.into()),
+        }))
+    }
+
     async fn namespace_create(
         &self,
         request: Request<proto::NamespaceCreateRequest>,
     ) -> Result<Response<proto::NamespaceCreateResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let ns = self
-            .catalog
-            .repositories()
+        let ns = repos
             .namespaces()
             .create(
                 &req.name.convert().ctx("name")?,
@@ -121,11 +147,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceUpdateRetentionPeriodRequest>,
     ) -> Result<Response<proto::NamespaceUpdateRetentionPeriodResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let ns = self
-            .catalog
-            .repositories()
+        let ns = repos
             .namespaces()
             .update_retention_period(&req.name, req.retention_period_ns)
             .await
@@ -144,12 +168,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceListRequest>,
     ) -> Result<Response<Self::NamespaceListStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let deleted = deserialize_soft_deleted_rows(req.deleted)?;
 
-        let ns_list = self
-            .catalog
-            .repositories()
+        let ns_list = repos
             .namespaces()
             .list(deleted)
             .await
@@ -171,12 +194,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceGetByIdRequest>,
     ) -> Result<Response<proto::NamespaceGetByIdResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let deleted = deserialize_soft_deleted_rows(req.deleted)?;
 
-        let maybe_ns = self
-            .catalog
-            .repositories()
+        let maybe_ns = repos
             .namespaces()
             .get_by_id(NamespaceId::new(req.id), deleted)
             .await
@@ -193,12 +215,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceGetByNameRequest>,
     ) -> Result<Response<proto::NamespaceGetByNameResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let deleted = deserialize_soft_deleted_rows(req.deleted)?;
 
-        let maybe_ns = self
-            .catalog
-            .repositories()
+        let maybe_ns = repos
             .namespaces()
             .get_by_name(&req.name, deleted)
             .await
@@ -215,27 +236,26 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceSoftDeleteRequest>,
     ) -> Result<Response<proto::NamespaceSoftDeleteResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        self.catalog
-            .repositories()
+        let id = repos
             .namespaces()
             .soft_delete(&req.name)
             .await
             .map_err(catalog_error_to_status)?;
 
-        Ok(Response::new(proto::NamespaceSoftDeleteResponse {}))
+        Ok(Response::new(proto::NamespaceSoftDeleteResponse {
+            namespace_id: id.get(),
+        }))
     }
 
     async fn namespace_update_table_limit(
         &self,
         request: Request<proto::NamespaceUpdateTableLimitRequest>,
     ) -> Result<Response<proto::NamespaceUpdateTableLimitResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let ns = self
-            .catalog
-            .repositories()
+        let ns = repos
             .namespaces()
             .update_table_limit(&req.name, req.new_max.convert().ctx("new_max")?)
             .await
@@ -252,11 +272,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceUpdateColumnLimitRequest>,
     ) -> Result<Response<proto::NamespaceUpdateColumnLimitResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let ns = self
-            .catalog
-            .repositories()
+        let ns = repos
             .namespaces()
             .update_column_limit(&req.name, req.new_max.convert().ctx("new_max")?)
             .await
@@ -269,15 +287,31 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         }))
     }
 
+    async fn namespace_snapshot(
+        &self,
+        request: Request<proto::NamespaceSnapshotRequest>,
+    ) -> Result<Response<proto::NamespaceSnapshotResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let snapshot = repos
+            .namespaces()
+            .snapshot(NamespaceId::new(req.namespace_id))
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::NamespaceSnapshotResponse {
+            generation: snapshot.generation(),
+            namespace: Some(snapshot.into()),
+        }))
+    }
+
     async fn table_create(
         &self,
         request: Request<proto::TableCreateRequest>,
     ) -> Result<Response<proto::TableCreateResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let table = self
-            .catalog
-            .repositories()
+        let table = repos
             .tables()
             .create(
                 &req.name,
@@ -298,11 +332,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::TableGetByIdRequest>,
     ) -> Result<Response<proto::TableGetByIdResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let maybe_table = self
-            .catalog
-            .repositories()
+        let maybe_table = repos
             .tables()
             .get_by_id(TableId::new(req.id))
             .await
@@ -317,11 +349,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::TableGetByNamespaceAndNameRequest>,
     ) -> Result<Response<proto::TableGetByNamespaceAndNameResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let maybe_table = self
-            .catalog
-            .repositories()
+        let maybe_table = repos
             .tables()
             .get_by_namespace_and_name(NamespaceId::new(req.namespace_id), &req.name)
             .await
@@ -336,11 +366,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::TableListByNamespaceIdRequest>,
     ) -> Result<Response<Self::TableListByNamespaceIdStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let table_list = self
-            .catalog
-            .repositories()
+        let table_list = repos
             .tables()
             .list_by_namespace_id(NamespaceId::new(req.namespace_id))
             .await
@@ -357,11 +385,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn table_list(
         &self,
-        _request: Request<proto::TableListRequest>,
+        request: Request<proto::TableListRequest>,
     ) -> Result<Response<Self::TableListStream>, tonic::Status> {
-        let table_list = self
-            .catalog
-            .repositories()
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let table_list = repos
             .tables()
             .list()
             .await
@@ -378,18 +406,17 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn table_snapshot(
         &self,
-        request: Request<TableSnapshotRequest>,
-    ) -> Result<Response<TableSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let snapshot = self
-            .catalog
-            .repositories()
+        request: Request<proto::TableSnapshotRequest>,
+    ) -> Result<Response<proto::TableSnapshotResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let snapshot = repos
             .tables()
             .snapshot(TableId::new(req.table_id))
             .await
             .map_err(catalog_error_to_status)?;
 
-        Ok(Response::new(TableSnapshotResponse {
+        Ok(Response::new(proto::TableSnapshotResponse {
             generation: snapshot.generation(),
             table: Some(snapshot.into()),
         }))
@@ -399,12 +426,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ColumnCreateOrGetRequest>,
     ) -> Result<Response<proto::ColumnCreateOrGetResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let column_type = deserialize_column_type(req.column_type)?;
 
-        let column = self
-            .catalog
-            .repositories()
+        let column = repos
             .columns()
             .create_or_get(&req.name, TableId::new(req.table_id), column_type)
             .await
@@ -421,7 +447,8 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ColumnCreateOrGetManyUncheckedRequest>,
     ) -> Result<Response<Self::ColumnCreateOrGetManyUncheckedStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let columns = req
             .columns
             .iter()
@@ -431,9 +458,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             })
             .collect::<Result<_, tonic::Status>>()?;
 
-        let column_list = self
-            .catalog
-            .repositories()
+        let column_list = repos
             .columns()
             .create_or_get_many_unchecked(TableId::new(req.table_id), columns)
             .await
@@ -454,11 +479,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ColumnListByNamespaceIdRequest>,
     ) -> Result<Response<Self::ColumnListByNamespaceIdStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let column_list = self
-            .catalog
-            .repositories()
+        let column_list = repos
             .columns()
             .list_by_namespace_id(NamespaceId::new(req.namespace_id))
             .await
@@ -479,11 +502,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ColumnListByTableIdRequest>,
     ) -> Result<Response<Self::ColumnListByTableIdStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let column_list = self
-            .catalog
-            .repositories()
+        let column_list = repos
             .columns()
             .list_by_table_id(TableId::new(req.table_id))
             .await
@@ -502,11 +523,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn column_list(
         &self,
-        _request: Request<proto::ColumnListRequest>,
+        request: Request<proto::ColumnListRequest>,
     ) -> Result<Response<Self::ColumnListStream>, tonic::Status> {
-        let column_list = self
-            .catalog
-            .repositories()
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let column_list = repos
             .columns()
             .list()
             .await
@@ -527,11 +548,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionCreateOrGetRequest>,
     ) -> Result<Response<proto::PartitionCreateOrGetResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let partition = self
-            .catalog
-            .repositories()
+        let partition = repos
             .partitions()
             .create_or_get(PartitionKey::from(req.key), TableId::new(req.table_id))
             .await
@@ -548,16 +567,15 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionGetByIdBatchRequest>,
     ) -> Result<Response<Self::PartitionGetByIdBatchStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let partition_ids = req
             .partition_ids
             .into_iter()
             .map(PartitionId::new)
             .collect::<Vec<_>>();
 
-        let partition_list = self
-            .catalog
-            .repositories()
+        let partition_list = repos
             .partitions()
             .get_by_id_batch(&partition_ids)
             .await
@@ -578,11 +596,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionListByTableIdRequest>,
     ) -> Result<Response<Self::PartitionListByTableIdStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let partition_list = self
-            .catalog
-            .repositories()
+        let partition_list = repos
             .partitions()
             .list_by_table_id(TableId::new(req.table_id))
             .await
@@ -601,11 +617,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn partition_list_ids(
         &self,
-        _request: Request<proto::PartitionListIdsRequest>,
+        request: Request<proto::PartitionListIdsRequest>,
     ) -> Result<Response<Self::PartitionListIdsStream>, tonic::Status> {
-        let id_list = self
-            .catalog
-            .repositories()
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let id_list = repos
             .partitions()
             .list_ids()
             .await
@@ -625,11 +641,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionCasSortKeyRequest>,
     ) -> Result<Response<proto::PartitionCasSortKeyResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let res = self
-            .catalog
-            .repositories()
+        let res = repos
             .partitions()
             .cas_sort_key(
                 PartitionId::new(req.partition_id),
@@ -659,10 +673,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionRecordSkippedCompactionRequest>,
     ) -> Result<Response<proto::PartitionRecordSkippedCompactionResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        self.catalog
-            .repositories()
+        repos
             .partitions()
             .record_skipped_compaction(
                 PartitionId::new(req.partition_id),
@@ -685,16 +698,15 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionGetInSkippedCompactionsRequest>,
     ) -> Result<Response<Self::PartitionGetInSkippedCompactionsStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let partition_ids = req
             .partition_ids
             .into_iter()
             .map(PartitionId::new)
             .collect::<Vec<_>>();
 
-        let skipped_compaction_list = self
-            .catalog
-            .repositories()
+        let skipped_compaction_list = repos
             .partitions()
             .get_in_skipped_compactions(&partition_ids)
             .await
@@ -713,11 +725,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn partition_list_skipped_compactions(
         &self,
-        _request: Request<proto::PartitionListSkippedCompactionsRequest>,
+        request: Request<proto::PartitionListSkippedCompactionsRequest>,
     ) -> Result<Response<Self::PartitionListSkippedCompactionsStream>, tonic::Status> {
-        let skipped_compaction_list = self
-            .catalog
-            .repositories()
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let skipped_compaction_list = repos
             .partitions()
             .list_skipped_compactions()
             .await
@@ -738,11 +750,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionDeleteSkippedCompactionsRequest>,
     ) -> Result<Response<proto::PartitionDeleteSkippedCompactionsResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let maybe_skipped_compaction = self
-            .catalog
-            .repositories()
+        let maybe_skipped_compaction = repos
             .partitions()
             .delete_skipped_compactions(PartitionId::new(req.partition_id))
             .await
@@ -761,11 +771,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionMostRecentNRequest>,
     ) -> Result<Response<Self::PartitionMostRecentNStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let partition_list = self
-            .catalog
-            .repositories()
+        let partition_list = repos
             .partitions()
             .most_recent_n(req.n as usize)
             .await
@@ -786,11 +794,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionNewFileBetweenRequest>,
     ) -> Result<Response<Self::PartitionNewFileBetweenStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let id_list = self
-            .catalog
-            .repositories()
+        let id_list = repos
             .partitions()
             .partitions_new_file_between(
                 Timestamp::new(req.minimum_time),
@@ -809,13 +815,53 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         ))
     }
 
+    async fn partition_update_cold_compact(
+        &self,
+        request: Request<proto::PartitionUpdateColdCompactRequest>,
+    ) -> Result<Response<proto::PartitionUpdateColdCompactResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        repos
+            .partitions()
+            .update_cold_compact(
+                PartitionId::new(req.partition_id),
+                Timestamp::new(req.cold_compact_at),
+            )
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::PartitionUpdateColdCompactResponse {}))
+    }
+
+    async fn partition_needing_cold_compact(
+        &self,
+        request: Request<proto::PartitionNeedingColdCompactRequest>,
+    ) -> Result<Response<Self::PartitionNeedingColdCompactStream>, tonic::Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let id_list = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(req.maximum_time), req.n as usize)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(id_list.into_iter().map(|id| {
+                Ok(proto::PartitionNeedingColdCompactResponse {
+                    partition_id: id.get(),
+                })
+            }))
+            .boxed(),
+        ))
+    }
+
     async fn partition_list_old_style(
         &self,
-        _request: Request<proto::PartitionListOldStyleRequest>,
+        request: Request<proto::PartitionListOldStyleRequest>,
     ) -> Result<Response<Self::PartitionListOldStyleStream>, tonic::Status> {
-        let partition_list = self
-            .catalog
-            .repositories()
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let partition_list = repos
             .partitions()
             .list_old_style()
             .await
@@ -836,10 +882,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::PartitionSnapshotRequest>,
     ) -> Result<Response<proto::PartitionSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let snapshot = self
-            .catalog
-            .repositories()
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let snapshot = repos
             .partitions()
             .snapshot(PartitionId::new(req.partition_id))
             .await
@@ -853,11 +898,11 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn parquet_file_flag_for_delete_by_retention(
         &self,
-        _request: Request<proto::ParquetFileFlagForDeleteByRetentionRequest>,
+        request: Request<proto::ParquetFileFlagForDeleteByRetentionRequest>,
     ) -> Result<Response<Self::ParquetFileFlagForDeleteByRetentionStream>, tonic::Status> {
-        let id_list = self
-            .catalog
-            .repositories()
+        let (mut repos, _req) = self.preprocess_request(request);
+
+        let id_list = repos
             .parquet_files()
             .flag_for_delete_by_retention()
             .await
@@ -879,11 +924,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ParquetFileDeleteOldIdsOnlyRequest>,
     ) -> Result<Response<Self::ParquetFileDeleteOldIdsOnlyStream>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let id_list = self
-            .catalog
-            .repositories()
+        let id_list = repos
             .parquet_files()
             .delete_old_ids_only(Timestamp::new(req.older_than))
             .await
@@ -905,16 +948,15 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         request: Request<proto::ParquetFileListByPartitionNotToDeleteBatchRequest>,
     ) -> Result<Response<Self::ParquetFileListByPartitionNotToDeleteBatchStream>, tonic::Status>
     {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let partition_ids = req
             .partition_ids
             .into_iter()
             .map(PartitionId::new)
             .collect::<Vec<_>>();
 
-        let file_list = self
-            .catalog
-            .repositories()
+        let file_list = repos
             .parquet_files()
             .list_by_partition_not_to_delete_batch(partition_ids)
             .await
@@ -935,11 +977,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ParquetFileGetByObjectStoreIdRequest>,
     ) -> Result<Response<proto::ParquetFileGetByObjectStoreIdResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
 
-        let maybe_file = self
-            .catalog
-            .repositories()
+        let maybe_file = repos
             .parquet_files()
             .get_by_object_store_id(deserialize_object_store_id(
                 req.object_store_id.required().ctx("object_store_id")?,
@@ -958,8 +998,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<tonic::Streaming<proto::ParquetFileExistsByObjectStoreIdBatchRequest>>,
     ) -> Result<Response<Self::ParquetFileExistsByObjectStoreIdBatchStream>, tonic::Status> {
-        let object_store_ids = request
-            .into_inner()
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let object_store_ids = req
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))
             .and_then(|req| async move {
                 Ok(deserialize_object_store_id(
@@ -969,9 +1010,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let id_list = self
-            .catalog
-            .repositories()
+        let id_list = repos
             .parquet_files()
             .exists_by_object_store_id_batch(object_store_ids)
             .await
@@ -992,7 +1031,8 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::ParquetFileCreateUpgradeDeleteRequest>,
     ) -> Result<Response<proto::ParquetFileCreateUpgradeDeleteResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let (mut repos, req) = self.preprocess_request(request);
+
         let delete = req
             .delete
             .into_iter()
@@ -1009,9 +1049,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             .map(deserialize_parquet_file_params)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let id_list = self
-            .catalog
-            .repositories()
+        let id_list = repos
             .parquet_files()
             .create_upgrade_delete(
                 PartitionId::new(req.partition_id),

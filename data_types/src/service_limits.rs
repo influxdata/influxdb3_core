@@ -223,12 +223,10 @@ impl TryFrom<Option<LimitUpdate>> for ServiceLimitUpdate {
 
     fn try_from(limit_update: Option<LimitUpdate>) -> Result<Self, Self::Error> {
         match limit_update {
-            Some(LimitUpdate::MaxTables(n)) => {
-                Ok(ServiceLimitUpdate::MaxTables(MaxTables::try_from(n)?))
+            Some(LimitUpdate::MaxTables(n)) => Ok(Self::MaxTables(MaxTables::try_from(n)?)),
+            Some(LimitUpdate::MaxColumnsPerTable(n)) => {
+                Ok(Self::MaxColumnsPerTable(MaxColumnsPerTable::try_from(n)?))
             }
-            Some(LimitUpdate::MaxColumnsPerTable(n)) => Ok(ServiceLimitUpdate::MaxColumnsPerTable(
-                MaxColumnsPerTable::try_from(n)?,
-            )),
             None => Err(ServiceLimitError::NoValueSpecified),
         }
     }

@@ -40,6 +40,9 @@ pub enum ParseError {
         missing: String,
     },
 
+    #[snafu(display("Object store not specified"))]
+    UnspecifiedObjectStore,
+
     // Creating a new S3 object store can fail if the region is *specified* but
     // not *parseable* as a rusoto `Region`. The other object store constructors
     // don't return `Result`.
@@ -395,7 +398,8 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
     }
 
     let remote_store: Arc<DynObjectStore> = match &config.object_store {
-        Some(ObjectStoreType::Memory) | None => {
+        None => return Err(ParseError::UnspecifiedObjectStore),
+        Some(ObjectStoreType::Memory) => {
             info!(object_store_type = "Memory", "Object Store");
             Arc::new(InMemory::new())
         }
@@ -510,11 +514,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn default_object_store_is_memory() {
+    fn object_store_flag_is_required() {
         let config = ObjectStoreConfig::try_parse_from(["server"]).unwrap();
-
-        let object_store = make_object_store(&config).unwrap();
-        assert_eq!(&object_store.to_string(), "InMemory")
+        let err = make_object_store(&config).unwrap_err().to_string();
+        assert_eq!(err, "Object store not specified");
     }
 
     #[test]

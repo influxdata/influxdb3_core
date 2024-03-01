@@ -2,9 +2,11 @@
 
 use crate::interface::{
     CasFailure, ColumnRepo, NamespaceRepo, ParquetFileRepo, PartitionRepo, RepoCollection, Result,
-    SoftDeletedRows, TableRepo,
+    RootRepo, SoftDeletedRows, TableRepo,
 };
 use async_trait::async_trait;
+use data_types::snapshot::namespace::NamespaceSnapshot;
+use data_types::snapshot::root::RootSnapshot;
 use data_types::snapshot::table::TableSnapshot;
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
@@ -17,6 +19,10 @@ use data_types::{
 use iox_time::TimeProvider;
 use metric::{DurationHistogram, Metric};
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use trace::{
+    ctx::SpanContext,
+    span::{SpanExt, SpanRecorder},
+};
 
 /// Decorates a implementation of the catalog's [`RepoCollection`] (and the
 /// transactional variant) with instrumentation that emits latency histograms
@@ -25,31 +31,37 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 /// Values are recorded under the `catalog_op_duration` metric, labelled by
 /// operation name and result (success/error).
 #[derive(Debug)]
-pub struct MetricDecorator<T> {
-    inner: T,
+pub struct MetricDecorator {
+    inner: Box<dyn RepoCollection>,
     time_provider: Arc<dyn TimeProvider>,
-    metrics: Arc<metric::Registry>,
+    observer: Metric<DurationHistogram>,
+    catalog_type: &'static str,
+    span_ctx: Option<SpanContext>,
 }
 
-impl<T> MetricDecorator<T> {
-    /// Wrap `T` with instrumentation recording operation latency in `metrics`.
+impl MetricDecorator {
+    /// Wrap `inner` with instrumentation recording operation latency in `metrics`.
     pub fn new(
-        inner: T,
+        inner: Box<dyn RepoCollection>,
         metrics: Arc<metric::Registry>,
         time_provider: Arc<dyn TimeProvider>,
+        catalog_type: &'static str,
     ) -> Self {
         Self {
             inner,
             time_provider,
-            metrics,
+            observer: metrics.register_metric("catalog_op_duration", "catalog call duration"),
+            catalog_type,
+            span_ctx: None,
         }
     }
 }
 
-impl<T> RepoCollection for MetricDecorator<T>
-where
-    T: NamespaceRepo + TableRepo + ColumnRepo + PartitionRepo + ParquetFileRepo + Debug,
-{
+impl RepoCollection for MetricDecorator {
+    fn root(&mut self) -> &mut dyn RootRepo {
+        self
+    }
+
     fn namespaces(&mut self) -> &mut dyn NamespaceRepo {
         self
     }
@@ -69,6 +81,10 @@ where
     fn parquet_files(&mut self) -> &mut dyn ParquetFileRepo {
         self
     }
+
+    fn set_span_context(&mut self, span_ctx: Option<SpanContext>) {
+        self.span_ctx = span_ctx;
+    }
 }
 
 /// Emit a trait impl for `impl_trait` that delegates calls to the inner
@@ -79,6 +95,7 @@ where
 /// ```ignore
 ///     decorate!(
 ///         impl_trait = <trait name>,
+///         repo = <repo name>,
 ///         methods = [
 ///             "<metric name>" = <method signature>;
 ///             "<metric name>" = <method signature>;
@@ -93,6 +110,7 @@ where
 macro_rules! decorate {
     (
         impl_trait = $trait:ident,
+        repo = $repo:ident,
         methods = [$(
             $metric:literal = $method:ident(
                 &mut self $(,)?
@@ -101,7 +119,7 @@ macro_rules! decorate {
         )+]
     ) => {
         #[async_trait]
-        impl<T:$trait> $trait for MetricDecorator<T> {
+        impl $trait for MetricDecorator {
             /// NOTE: if you're seeing an error here about "not all trait items
             /// implemented" or something similar, one or more methods are
             /// missing from / incorrectly defined in the decorate!() blocks
@@ -109,22 +127,32 @@ macro_rules! decorate {
 
             $(
                 async fn $method(&mut self, $($arg : $t),*) -> Result<$out$(, $err)?> {
-                    let observer: Metric<DurationHistogram> = self.metrics.register_metric(
-                        "catalog_op_duration",
-                        "catalog call duration",
-                    );
-
                     let t = self.time_provider.now();
-                    let res = self.inner.$method($($arg),*).await;
+
+                    let mut span_recorder = SpanRecorder::new(self.span_ctx.child_span($metric));
+                    span_recorder.set_metadata("catalog_type", self.catalog_type);
+                    self.inner
+                        .set_span_context(span_recorder.span().map(|s| s.ctx.clone()));
+
+                    let res = self.inner.$repo()
+                        .$method($($arg),*)
+                        .await;
+
+                    let tag = match &res {
+                        Ok(_) => {
+                            span_recorder.ok("done");
+                            "success"
+                        }
+                        Err(e) => {
+                            span_recorder.error(e.to_string());
+                            "error"
+                        }
+                    };
 
                     // Avoid exploding if time goes backwards - simply drop the
                     // measurement if it happens.
                     if let Some(delta) = self.time_provider.now().checked_duration_since(t) {
-                        let tag = match &res {
-                            Ok(_) => "success",
-                            Err(_) => "error",
-                        };
-                        observer.recorder(&[("op", $metric), ("result", tag)]).record(delta);
+                        self.observer.recorder(&[("type", self.catalog_type), ("op", $metric), ("result", tag)]).record(delta);
                     }
 
                     res
@@ -135,21 +163,32 @@ macro_rules! decorate {
 }
 
 decorate!(
+    impl_trait = RootRepo,
+    repo = root,
+    methods = [
+        "root_snapshot" = snapshot(&mut self) -> Result<RootSnapshot>;
+    ]
+);
+
+decorate!(
     impl_trait = NamespaceRepo,
+    repo = namespaces,
     methods = [
         "namespace_create" = create(&mut self, name: &NamespaceName<'_>, partition_template: Option<NamespacePartitionTemplateOverride>, retention_period_ns: Option<i64>, service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>) -> Result<Namespace>;
         "namespace_update_retention_period" = update_retention_period(&mut self, name: &str, retention_period_ns: Option<i64>) -> Result<Namespace>;
         "namespace_list" = list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
         "namespace_get_by_id" = get_by_id(&mut self, id: NamespaceId, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
         "namespace_get_by_name" = get_by_name(&mut self, name: &str, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
-        "namespace_soft_delete" = soft_delete(&mut self, name: &str) -> Result<()>;
+        "namespace_soft_delete" = soft_delete(&mut self, name: &str) -> Result<NamespaceId>;
         "namespace_update_table_limit" = update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace>;
         "namespace_update_column_limit" = update_column_limit(&mut self, name: &str, new_max: MaxColumnsPerTable) -> Result<Namespace>;
+        "namespace_snapshot" = snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot>;
     ]
 );
 
 decorate!(
     impl_trait = TableRepo,
+    repo = tables,
     methods = [
         "table_create" = create(&mut self, name: &str, partition_template: TablePartitionTemplateOverride, namespace_id: NamespaceId) -> Result<Table>;
         "table_get_by_id" = get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
@@ -162,6 +201,7 @@ decorate!(
 
 decorate!(
     impl_trait = ColumnRepo,
+    repo = columns,
     methods = [
         "column_create_or_get" = create_or_get(&mut self, name: &str, table_id: TableId, column_type: ColumnType) -> Result<Column>;
         "column_list_by_namespace_id" = list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Column>>;
@@ -173,6 +213,7 @@ decorate!(
 
 decorate!(
     impl_trait = PartitionRepo,
+    repo = partitions,
     methods = [
         "partition_create_or_get" = create_or_get(&mut self, key: PartitionKey, table_id: TableId) -> Result<Partition>;
         "partition_get_by_id_batch" = get_by_id_batch(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<Partition>>;
@@ -184,6 +225,8 @@ decorate!(
         "partition_delete_skipped_compactions" = delete_skipped_compactions(&mut self, partition_id: PartitionId) -> Result<Option<SkippedCompaction>>;
         "partition_most_recent_n" = most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>>;
         "partition_partitions_new_file_between" = partitions_new_file_between(&mut self, minimum_time: Timestamp, maximum_time: Option<Timestamp>) -> Result<Vec<PartitionId>>;
+        "partition_partitions_needing_cold_compact" = partitions_needing_cold_compact(&mut self, maximum_time: Timestamp, n: usize) -> Result<Vec<PartitionId>>;
+        "partition_update_cold_compact" = update_cold_compact(&mut self, partition_id: PartitionId, cold_compact_at: Timestamp) -> Result<()>;
         "partition_get_in_skipped_compactions" = get_in_skipped_compactions(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<SkippedCompaction>>;
         "partition_list_old_style" = list_old_style(&mut self) -> Result<Vec<Partition>>;
         "partition_snapshot" = snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
@@ -192,6 +235,7 @@ decorate!(
 
 decorate!(
     impl_trait = ParquetFileRepo,
+    repo = parquet_files,
     methods = [
         "parquet_flag_for_delete_by_retention" = flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
         "parquet_delete_old_ids_only" = delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;

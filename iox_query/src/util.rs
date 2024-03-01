@@ -117,7 +117,7 @@ pub fn df_physical_expr(
     let expr = simplifier.coerce(expr, Arc::clone(&df_schema))?;
     trace!(%expr, "coerced logical expression");
 
-    create_physical_expr(&expr, df_schema.as_ref(), schema.as_ref(), &props)
+    create_physical_expr(&expr, df_schema.as_ref(), &props)
 }
 
 /// Return min and max for column `time` of the given set of record batches by

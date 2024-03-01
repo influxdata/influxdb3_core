@@ -51,7 +51,7 @@ impl<S> SetRequestHeadersService<S> {
     ///
     /// The can be used to call [`new`](Self::new) again.
     pub fn into_parts(self) -> (S, Arc<Vec<(HeaderName, HeaderValue)>>) {
-        let SetRequestHeadersService { service, headers } = self;
+        let Self { service, headers } = self;
 
         (service, headers)
     }

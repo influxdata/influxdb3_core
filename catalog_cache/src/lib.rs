@@ -39,20 +39,8 @@
 //! [`CatalogCacheClient`]: api::client::CatalogCacheClient
 //! [`CatalogCacheService`]: api::server::CatalogCacheService
 //! [`QuorumCatalogCache`]: api::quorum::QuorumCatalogCache
-//!
-#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+
+#![warn(missing_docs)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -66,6 +54,8 @@ pub mod local;
 /// The types of catalog cache key
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub enum CacheKey {
+    /// Root key
+    Root,
     /// A catalog namespace
     Namespace(i64),
     /// A catalog table
@@ -80,6 +70,7 @@ impl CacheKey {
     /// This can be used for logging and metrics.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::Root => "root",
             Self::Namespace(_) => "namespace",
             Self::Table(_) => "table",
             Self::Partition(_) => "partition",
@@ -87,11 +78,12 @@ impl CacheKey {
     }
 
     /// Untyped ID.
-    pub fn id(&self) -> i64 {
+    pub fn id(&self) -> Option<i64> {
         match self {
-            Self::Namespace(id) => *id,
-            Self::Table(id) => *id,
-            Self::Partition(id) => *id,
+            Self::Root => None,
+            Self::Namespace(id) => Some(*id),
+            Self::Table(id) => Some(*id),
+            Self::Partition(id) => Some(*id),
         }
     }
 }

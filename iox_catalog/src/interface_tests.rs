@@ -11,7 +11,9 @@ use crate::{
 use ::test_helpers::assert_error;
 use assert_matches::assert_matches;
 use async_trait::async_trait;
-use data_types::snapshot::table::TableSnapshot;
+use data_types::snapshot::{
+    namespace::NamespaceSnapshot, root::RootSnapshot, table::TableSnapshot,
+};
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
@@ -22,7 +24,7 @@ use data_types::{snapshot::partition::PartitionSnapshot, Column, PartitionHashId
 use futures::{Future, StreamExt};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::TimeProvider;
-use metric::{Attributes, DurationHistogram, Metric};
+use metric::{Observation, RawReporter};
 use parking_lot::Mutex;
 use std::{any::Any, fmt::Display};
 use std::{
@@ -152,7 +154,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap();
     namespaces.sort_by_key(|ns| ns.name.clone());
-    assert_eq!(namespaces, vec![namespace, namespace2]);
+    assert_eq!(namespaces, vec![namespace.clone(), namespace2.clone()]);
 
     let new_table_limit = MaxTables::try_from(15_000).unwrap();
     let modified = repos
@@ -239,26 +241,36 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     assert_eq!(namespace5, lookup_namespace5);
 
     // remove namespace to avoid it from affecting later tests
-    repos
+    let id = repos
         .namespaces()
         .soft_delete("test_namespace")
         .await
         .expect("delete namespace should succeed");
-    repos
+    assert_eq!(namespace.id, id);
+    let id = repos
         .namespaces()
         .soft_delete("test_namespace2")
         .await
         .expect("delete namespace should succeed");
-    repos
+    assert_eq!(namespace2.id, id);
+    let id = repos
         .namespaces()
         .soft_delete("test_namespace3")
         .await
         .expect("delete namespace should succeed");
-    repos
+    assert_eq!(namespace3.id, id);
+    let id = repos
         .namespaces()
         .soft_delete("test_namespace4")
         .await
         .expect("delete namespace should succeed");
+    assert_eq!(namespace4.id, id);
+    let err = repos
+        .namespaces()
+        .soft_delete("does_not_exists")
+        .await
+        .expect_err("should errored");
+    assert_matches!(err, Error::NotFound { .. });
 }
 
 /// Construct a set of two namespaces:
@@ -271,8 +283,15 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
 async fn test_namespace_soft_deletion(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
 
+    let s1 = repos.root().snapshot().await.unwrap();
+    validate_root_snapshot(repos.as_mut(), &s1).await;
+
     let deleted_ns = arbitrary_namespace(&mut *repos, "deleted-ns").await;
     let active_ns = arbitrary_namespace(&mut *repos, "active-ns").await;
+
+    let s2 = repos.root().snapshot().await.unwrap();
+    assert_gt(s2.generation(), s1.generation());
+    validate_root_snapshot(repos.as_mut(), &s2).await;
 
     // Mark "deleted-ns" as soft-deleted.
     repos.namespaces().soft_delete("deleted-ns").await.unwrap();
@@ -281,6 +300,10 @@ async fn test_namespace_soft_deletion(catalog: Arc<dyn Catalog>) {
     // changing this to "soft delete" it was idempotent, so I am preserving
     // that).
     repos.namespaces().soft_delete("deleted-ns").await.unwrap();
+
+    let s3 = repos.root().snapshot().await.unwrap();
+    assert_ge(s3.generation(), s2.generation());
+    validate_root_snapshot(repos.as_mut(), &s3).await;
 
     // Listing should respect soft deletion.
     let got = repos
@@ -428,6 +451,9 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
     let namespace = arbitrary_namespace(&mut *repos, "namespace_table_test").await;
 
+    let ts1 = repos.namespaces().snapshot(namespace.id).await.unwrap();
+    validate_namespace_snapshot(repos.as_mut(), &ts1).await;
+
     // test we can create a table
     let t = arbitrary_table(&mut *repos, "test_table", &namespace).await;
     assert!(t.id > TableId::new(0));
@@ -435,6 +461,10 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         t.partition_template,
         TablePartitionTemplateOverride::default()
     );
+
+    let ts2 = repos.namespaces().snapshot(namespace.id).await.unwrap();
+    validate_namespace_snapshot(repos.as_mut(), &ts2).await;
+    assert_gt(ts2.generation(), ts1.generation());
 
     // The default template doesn't use any tag values, so no columns need to be created.
     let table_columns = repos.columns().list_by_table_id(t.id).await.unwrap();
@@ -471,12 +501,22 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(vec![t.clone()], tables);
 
+    assert!(repos
+        .tables()
+        .list_by_namespace_id(NamespaceId::new(i64::MAX))
+        .await
+        .unwrap()
+        .is_empty());
+
     // test we can create a table of the same name in a different namespace
     let namespace2 = arbitrary_namespace(&mut *repos, "two").await;
     assert_ne!(namespace, namespace2);
     let test_table = arbitrary_table(&mut *repos, "test_table", &namespace2).await;
     assert_ne!(t.id, test_table.id);
     assert_eq!(test_table.namespace_id, namespace2.id);
+
+    let ts3 = repos.namespaces().snapshot(namespace2.id).await.unwrap();
+    validate_namespace_snapshot(repos.as_mut(), &ts3).await;
 
     // test get by namespace and name
     let foo_table = arbitrary_table(&mut *repos, "foo", &namespace2).await;
@@ -692,7 +732,7 @@ async fn test_column(catalog: Arc<dyn Catalog>) {
     let ts2 = repos.tables().snapshot(table.id).await.unwrap();
     validate_table_snapshot(repos.as_mut(), &ts2).await;
 
-    assert_gt(ts2.generation(), ts1.generation());
+    assert_ge(ts2.generation(), ts1.generation());
 
     // test that attempting to create an already defined column of a different type returns
     // error
@@ -802,6 +842,7 @@ async fn test_partition(catalog: Arc<dyn Catalog>) {
     let table = arbitrary_table(&mut *repos, "test_table", &namespace).await;
 
     let mut created = BTreeMap::new();
+
     // partition to use
     let partition = repos
         .partitions()
@@ -811,6 +852,15 @@ async fn test_partition(catalog: Arc<dyn Catalog>) {
     // Test: sort_key_ids from create_or_get
     assert!(partition.sort_key_ids().is_none());
     created.insert(partition.id, partition.clone());
+
+    // can re-create same partition
+    let partition_v2 = repos
+        .partitions()
+        .create_or_get("foo".into(), table.id)
+        .await
+        .expect("failed to create partition");
+    assert_eq!(partition, partition_v2);
+
     // partition to use
     let partition_bar = repos
         .partitions()
@@ -1345,6 +1395,67 @@ async fn validate_table_snapshot(repos: &mut dyn RepoCollection, snapshot: &Tabl
     assert!(eq, "expected {expected:?} got {actual:?}");
 }
 
+async fn validate_namespace_snapshot(repos: &mut dyn RepoCollection, snapshot: &NamespaceSnapshot) {
+    let ns = snapshot.namespace().unwrap();
+
+    let expected = repos
+        .namespaces()
+        .get_by_id(ns.id, SoftDeletedRows::AllRows)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ns, expected);
+
+    // compare tables
+    let mut expected = repos.tables().list_by_namespace_id(ns.id).await.unwrap();
+    expected.sort_unstable_by_key(|x| x.id);
+    let actual = snapshot.tables().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(expected.len(), actual.len());
+
+    // test table lookup
+    assert!(snapshot
+        .lookup_table_by_name("does_not_exist")
+        .unwrap()
+        .is_none());
+    for expected in expected {
+        let actual = snapshot
+            .lookup_table_by_name(&expected.name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.id(), expected.id);
+        assert_eq!(actual.name(), expected.name.as_bytes());
+    }
+}
+
+async fn validate_root_snapshot(repos: &mut dyn RepoCollection, snapshot: &RootSnapshot) {
+    // compare namespaces
+    let mut expected = repos
+        .namespaces()
+        .list(SoftDeletedRows::AllRows)
+        .await
+        .unwrap();
+    expected.sort_unstable_by_key(|x| x.id);
+    let actual = snapshot
+        .namespaces()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(expected.len(), actual.len());
+
+    // test namespace lookup
+    assert!(snapshot
+        .lookup_namespace_by_name("does_not_exist")
+        .unwrap()
+        .is_none());
+    for expected in expected {
+        let actual = snapshot
+            .lookup_namespace_by_name(&expected.name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.id(), expected.id);
+        assert_eq!(actual.name(), expected.name.as_bytes());
+    }
+}
+
 /// List all parquet files in given namespace.
 async fn list_parquet_files_by_namespace_not_to_delete(
     catalog: Arc<dyn Catalog>,
@@ -1579,6 +1690,30 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     let files =
         list_parquet_files_by_namespace_not_to_delete(Arc::clone(&catalog), namespace2.id).await;
     assert_eq!(vec![f1.clone(), f2.clone()], files);
+
+    // Cannot create duplicate
+    let err = repos
+        .parquet_files()
+        .create(f2_params.clone())
+        .await
+        .unwrap_err();
+    assert_matches!(err, Error::AlreadyExists { .. });
+
+    // But can upsert duplicate
+    let f2_upsert = repos
+        .parquet_files()
+        .upsert(f2_params.clone())
+        .await
+        .unwrap();
+    assert_eq!(f2, f2_upsert);
+
+    // But cannot upsert conflict
+    let f2_conflict = ParquetFileParams {
+        row_count: 200,
+        ..f2_params.clone()
+    };
+    let err = repos.parquet_files().create(f2_conflict).await.unwrap_err();
+    assert_matches!(err, Error::AlreadyExists { .. });
 
     let f3_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
@@ -2977,14 +3112,31 @@ async fn test_partition_create_or_get_idempotent(catalog: Arc<dyn Catalog>) {
 
 #[track_caller]
 fn assert_metric_hit(metrics: &metric::Registry, name: &'static str) {
-    let histogram = metrics
-        .get_instrument::<Metric<DurationHistogram>>("catalog_op_duration")
-        .expect("failed to read metric")
-        .get_observer(&Attributes::from(&[("op", name), ("result", "success")]))
-        .expect("failed to get observer")
-        .fetch();
+    let mut reporter = RawReporter::default();
+    metrics.report(&mut reporter);
 
-    let hit_count = histogram.sample_count();
+    let metric = reporter
+        .metric("catalog_op_duration")
+        .expect("failed to read metric");
+
+    let hit_count = metric
+        .observations
+        .iter()
+        .filter(|(attr, _obs)| {
+            attr.iter().any(|(k, v)| (*k == "op") && (v == name))
+                && attr
+                    .iter()
+                    .any(|(k, v)| (*k == "result") && (v == "success"))
+        })
+        .map(|(_attr, obs)| {
+            if let Observation::DurationHistogram(hist) = obs {
+                hist.sample_count()
+            } else {
+                panic!("invalid metric type: {obs:?}")
+            }
+        })
+        .sum::<u64>();
+
     assert!(hit_count > 0, "metric did not record any calls");
 }
 
@@ -3138,14 +3290,14 @@ async fn test_column_create_or_get_many_unchecked_sub<F>(
 
 /// [`Catalog`] wrapper that is helpful for testing.
 #[derive(Debug)]
-pub(crate) struct TestCatalog {
+pub(crate) struct TestCatalog<T> {
     hold_onto: Mutex<Vec<Box<dyn Any + Send>>>,
-    inner: Arc<dyn Catalog>,
+    inner: T,
 }
 
-impl TestCatalog {
+impl<T: Catalog> TestCatalog<T> {
     /// Create new test catalog.
-    pub(crate) fn new(inner: Arc<dyn Catalog>) -> Self {
+    pub(crate) fn new(inner: T) -> Self {
         Self {
             hold_onto: Mutex::new(vec![]),
             inner,
@@ -3153,22 +3305,26 @@ impl TestCatalog {
     }
 
     /// Hold onto given value til dropped.
-    pub(crate) fn hold_onto<T>(&self, o: T)
+    pub(crate) fn hold_onto<H>(&self, o: H)
     where
-        T: Send + 'static,
+        H: Send + 'static,
     {
         self.hold_onto.lock().push(Box::new(o) as _)
     }
+
+    pub(crate) fn inner(&self) -> &T {
+        &self.inner
+    }
 }
 
-impl Display for TestCatalog {
+impl<T: Catalog> Display for TestCatalog<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "test({})", self.inner)
     }
 }
 
 #[async_trait]
-impl Catalog for TestCatalog {
+impl<T: Catalog> Catalog for TestCatalog<T> {
     async fn setup(&self) -> Result<(), Error> {
         self.inner.setup().await
     }

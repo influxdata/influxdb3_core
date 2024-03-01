@@ -237,6 +237,7 @@ impl PartitionBuilder {
                 key,
                 Default::default(),
                 None,
+                Default::default(),
             ),
         }
     }

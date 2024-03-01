@@ -113,6 +113,7 @@ where
                 server_type_captured,
                 CancellationToken::new(),
                 trace_header_parser,
+                None,
             )
             .await
             .unwrap();

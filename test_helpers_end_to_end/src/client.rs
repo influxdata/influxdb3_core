@@ -3,7 +3,7 @@ use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use data_types::{NamespaceId, TableId};
 use dml::{DmlMeta, DmlWrite};
 use futures::TryStreamExt;
-use http::Response;
+use http::{Method, Response};
 use hyper::{Body, Client, Request};
 use influxdb_iox_client::{
     connection::Connection,
@@ -12,7 +12,7 @@ use influxdb_iox_client::{
 use iox_query_params::StatementParam;
 use mutable_batch_lp::lines_to_batches;
 use mutable_batch_pb::encode::encode_write;
-use std::fmt::Display;
+use std::{fmt::Display, time::Duration};
 use tonic::IntoRequest;
 
 /// Writes the line protocol to the write_base/api/v2/write endpoint (typically on the router)
@@ -77,6 +77,29 @@ pub async fn write_to_ingester(
         )
         .await
         .unwrap();
+}
+
+/// Performs http request to the specified endpoint.
+pub async fn try_request_http(
+    http_base: impl AsRef<str> + Send,
+    path_and_query: impl AsRef<str> + Send,
+    method: Method,
+    body: impl Into<Body> + Send,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send>> {
+    let client = Client::new();
+    let request = Request::builder()
+        .uri(format!("{}{}", http_base.as_ref(), path_and_query.as_ref(),))
+        .method(method)
+        .body(body.into())
+        .map_err(|e| Box::new(e) as Box<_>)?;
+
+    match tokio::time::timeout(Duration::from_secs(5), client.request(request)).await {
+        Ok(res) => res.map_err(|e| Box::new(e) as Box<_>),
+        Err(_) => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        ))),
+    }
 }
 
 /// Runs a SQL query using the flight API on the specified connection.

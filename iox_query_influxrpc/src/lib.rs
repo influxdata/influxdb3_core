@@ -1,19 +1,5 @@
 //! Query frontend for InfluxDB Storage gRPC requests
 
-#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
-#![warn(
-    clippy::clone_on_ref_ptr,
-    clippy::dbg_macro,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::todo,
-    clippy::use_self,
-    missing_copy_implementations,
-    missing_debug_implementations,
-    unused_crate_dependencies
-)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -2001,7 +1987,7 @@ mod tests {
         let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let meta = NamespaceMeta::new(&ctx).await;
 
         // predicate has no field_columns
@@ -2041,7 +2027,7 @@ mod tests {
 
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
             .try_collect::<Vec<_>>()
             .await
@@ -2079,7 +2065,7 @@ mod tests {
         let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let meta = NamespaceMeta::new(&ctx).await;
 
         // empty predicate
@@ -2115,7 +2101,7 @@ mod tests {
         let need_fields = false;
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
             .try_collect::<Vec<_>>()
             .await
@@ -2147,7 +2133,7 @@ mod tests {
         let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let meta = NamespaceMeta::new(&ctx).await;
 
         // predicate on a tag column `foo`
@@ -2194,7 +2180,7 @@ mod tests {
         let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let meta = NamespaceMeta::new(&ctx).await;
 
         let need_fields = false;
@@ -2238,7 +2224,7 @@ mod tests {
 
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
             .try_collect::<Vec<_>>()
             .await
@@ -2277,7 +2263,7 @@ mod tests {
         let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
-        let ctx = test_db.new_query_context(None);
+        let ctx = test_db.new_query_context(None, None);
         let meta = NamespaceMeta::new(&ctx).await;
 
         // predicate on unknown column
@@ -2312,7 +2298,7 @@ mod tests {
     async fn test_predicate_rewrite_table_names() {
         run_test(|test_db, rpc_predicate| {
             async move {
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .table_names(test_db, rpc_predicate)
                     .await
@@ -2327,7 +2313,7 @@ mod tests {
     async fn test_predicate_rewrite_tag_keys() {
         run_test(|test_db, rpc_predicate| {
             async move {
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .tag_keys(test_db, rpc_predicate)
                     .await
@@ -2342,7 +2328,7 @@ mod tests {
     async fn test_predicate_rewrite_tag_values() {
         run_test(|test_db, rpc_predicate| {
             async move {
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .tag_values(test_db, "foo", rpc_predicate)
                     .await
@@ -2357,7 +2343,7 @@ mod tests {
     async fn test_predicate_rewrite_field_columns() {
         run_test(|test_db, rpc_predicate| {
             async move {
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .field_columns(test_db, rpc_predicate)
                     .await
@@ -2372,7 +2358,7 @@ mod tests {
     async fn test_predicate_rewrite_read_filter() {
         run_test(|test_db, rpc_predicate| {
             async move {
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .read_filter(test_db, rpc_predicate)
                     .await
@@ -2389,7 +2375,7 @@ mod tests {
             async move {
                 let agg = Aggregate::None;
                 let group_columns = &["foo"];
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .read_group(test_db, rpc_predicate, agg, group_columns)
                     .await
@@ -2429,7 +2415,7 @@ mod tests {
 
         let agg = Aggregate::None;
         let group_columns = &["foo"];
-        let res = InfluxRpcPlanner::new(test_db.new_query_context(None))
+        let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
             .await
             .read_group(Arc::clone(&test_db) as _, rpc_predicate, agg, group_columns)
             .await
@@ -2437,9 +2423,9 @@ mod tests {
         assert_eq!(res.plans.len(), 1);
         let ssplan = res.plans.first().unwrap();
         insta::assert_snapshot!(ssplan.plan.display_indent_schema().to_string(), @r###"
-        Projection: h2o.foo, CASE WHEN h2o.foo.bar = Float64(1.2) THEN h2o.foo.bar END AS foo.bar, h2o.time [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, None)]
-          Sort: h2o.foo ASC NULLS FIRST, h2o.time ASC NULLS FIRST [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, None)]
-            TableScan: h2o [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, None)]
+        Projection: h2o.foo, CASE WHEN h2o.foo.bar = Float64(1.2) THEN h2o.foo.bar END AS foo.bar, h2o.time [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
+          Sort: h2o.foo ASC NULLS FIRST, h2o.time ASC NULLS FIRST [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
+            TableScan: h2o [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
         "###);
     }
 
@@ -2450,7 +2436,7 @@ mod tests {
                 let agg = Aggregate::First;
                 let every = WindowDuration::from_months(1, false);
                 let offset = WindowDuration::from_months(1, false);
-                InfluxRpcPlanner::new(test_db.new_query_context(None))
+                InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
                     .read_window_aggregate(test_db, rpc_predicate, agg, every, offset)
                     .await
@@ -2483,7 +2469,7 @@ mod tests {
 
         let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
 
-        let res = InfluxRpcPlanner::new(test_db.new_query_context(None))
+        let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
             .await
             .read_filter(Arc::clone(&test_db) as _, rpc_predicate)
             .await
@@ -2495,10 +2481,10 @@ mod tests {
         //       into a physical plan (which uses the IOx table provider code).
         let ssplan = res.plans.first().unwrap();
         insta::assert_snapshot!(ssplan.plan.display_indent_schema().to_string(), @r###"
-        Projection: table.tag, table.field AS field, table.time [tag:Dictionary(Int32, Utf8);N, field:Float64;N, time:Timestamp(Nanosecond, None)]
-          Sort: table.tag ASC NULLS FIRST, table.time ASC NULLS FIRST [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None)]
-            Filter: table.tag = Dictionary(Int32, Utf8("MA")) AND table.time > TimestampNanosecond(1, None) [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None)]
-              TableScan: table [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None)]
+        Projection: table.tag, table.field AS field, table.time [tag:Dictionary(Int32, Utf8);N, field:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
+          Sort: table.tag ASC NULLS FIRST, table.time ASC NULLS FIRST [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+            Filter: table.tag = Dictionary(Int32, Utf8("MA")) AND table.time > TimestampNanosecond(1, Some("UTC")) [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+              TableScan: table [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
         "###);
     }
 

@@ -2,46 +2,65 @@ use crate::error;
 use arrow::array::{as_list_array, Array, ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use datafusion::common::{downcast_value, DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::{Accumulator, Signature, TypeSignature, Volatility};
-use once_cell::sync::Lazy;
+use datafusion::logical_expr::{
+    Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility,
+};
+use std::any::Any;
 use std::sync::Arc;
 
-/// The name of the percentile aggregate function.
-pub(super) const NAME: &str = "percentile";
-
-/// Valid signatures for the percentile aggregate function.
-pub(super) static SIGNATURE: Lazy<Signature> = Lazy::new(|| {
-    Signature::one_of(
-        crate::NUMERICS
-            .iter()
-            .flat_map(|dt| {
-                [
-                    TypeSignature::Exact(vec![dt.clone(), DataType::Int64]),
-                    TypeSignature::Exact(vec![dt.clone(), DataType::Float64]),
-                ]
-            })
-            .collect(),
-        Volatility::Immutable,
-    )
-});
-
-/// Calculate the return type given the function signature. Percentile
-/// always returns the same type as the input column.
-pub(super) fn return_type(signature: &[DataType]) -> Result<Arc<DataType>> {
-    Ok(Arc::new(signature[0].clone()))
+#[derive(Debug)]
+pub(super) struct PercentileUDF {
+    signature: Signature,
 }
 
-/// Create a new accumulator for the data type.
-pub(super) fn accumulator(dt: &DataType) -> Result<Box<dyn Accumulator>> {
-    Ok(Box::new(PercentileAccumulator::new(dt.clone())))
+impl PercentileUDF {
+    pub(super) fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                crate::NUMERICS
+                    .iter()
+                    .flat_map(|dt| {
+                        [
+                            TypeSignature::Exact(vec![dt.clone(), DataType::Int64]),
+                            TypeSignature::Exact(vec![dt.clone(), DataType::Float64]),
+                        ]
+                    })
+                    .collect(),
+                Volatility::Immutable,
+            ),
+        }
+    }
 }
 
-/// Calculate the intermediate merge state for the aggregator.
-pub(super) fn state_type(dt: &DataType) -> Result<Arc<Vec<DataType>>> {
-    Ok(Arc::new(vec![
-        DataType::List(Arc::new(Field::new("item", dt.clone(), true))),
-        DataType::Float64,
-    ]))
+impl AggregateUDFImpl for PercentileUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "percentile"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    /// Calculate the return type given the function signature. Percentile
+    /// always returns the same type as the input column.
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn accumulator(&self, arg: &DataType) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(PercentileAccumulator::new(arg.clone())))
+    }
+
+    fn state_type(&self, return_type: &DataType) -> Result<Vec<DataType>> {
+        Ok(vec![
+            DataType::List(Arc::new(Field::new("item", return_type.clone(), true))),
+            DataType::Float64,
+        ])
+    }
 }
 
 #[derive(Debug)]
@@ -99,7 +118,7 @@ impl Accumulator for PercentileAccumulator {
         self.update(Arc::clone(&values[0]))
     }
 
-    fn evaluate(&self) -> Result<ScalarValue> {
+    fn evaluate(&mut self) -> Result<ScalarValue> {
         let idx = self
             .percentile
             .and_then(|n| percentile_idx(self.data.len(), n));
@@ -119,7 +138,9 @@ impl Accumulator for PercentileAccumulator {
             + ScalarValue::size_of_vec(&self.data)
     }
 
-    fn state(&self) -> Result<Vec<ScalarValue>> {
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        // TODO could be more efficient by storing values using native Vec
+        // rather than ScalarValue and avoid the copy here
         let arr = ScalarValue::new_list(&self.data, &self.data_type);
         Ok(vec![
             ScalarValue::List(arr),

@@ -1,22 +1,22 @@
-use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::{ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
-use http::Method;
+use http::{HeaderMap, HeaderName, HeaderValue};
 use hyper::StatusCode;
 use hyper::{Body, Response};
 use object_store::{
-    path::Path, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartId,
-    ObjectMeta, ObjectStore, PutOptions, PutResult, Result,
+    path::Path, Error as ObjectStoreError, GetOptions, GetRange, GetResult, ListResult,
+    MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult, Result,
 };
 use tokio::io::AsyncWrite;
 use tower::{Service, ServiceExt};
 
 use crate::data_types::{
-    extract_usize_header, GetObjectMetaResponse, X_RANGE_END_HEADER, X_RANGE_START_HEADER,
+    extract_usize_header, GetObjectMetaResponse, Request, X_HEAD_HEADER, X_RANGE_END_HEADER,
+    X_RANGE_START_HEADER, X_VERSION_HEADER,
 };
 
 use super::cache_connector::{ClientCacheConnector, Error as CacheClientError};
@@ -69,14 +69,6 @@ impl ObjectStore for DataCacheObjectStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let object_meta: ObjectMeta = self.head(location).await?;
-
-        let key = location.to_string();
-
-        let uri_parts = format!("/object?location={}", key)
-            .parse::<http::Uri>()
-            .map(http::uri::Parts::from)
-            .expect("should be valid uri");
-
         let GetOptions {
             if_match,
             if_none_match,
@@ -86,24 +78,33 @@ impl ObjectStore for DataCacheObjectStore {
             version,
             head,
         } = &options;
-        let headers = Headers(&mut HashMap::new())
-            .add_header("If-Match", if_match)
-            .add_header("If-None-Match", if_none_match)
-            .add_header("If-Modified-Since", if_modified_since)
-            .add_header("If-Unmodified-Since", if_unmodified_since)
-            // Pass other options as non standard headers
-            .add_header("X-Version", version)
-            .add_header("X-Head", &Some(head))
-            .add_range(range)
-            .0
-            .to_owned();
+
+        let headers = convert_to_headermap(vec![
+            (http::header::IF_MATCH, if_match.clone()),
+            (http::header::IF_NONE_MATCH, if_none_match.clone()),
+            (
+                http::header::IF_MODIFIED_SINCE,
+                if_modified_since.map(|v| v.to_rfc2822()),
+            ),
+            (
+                http::header::IF_UNMODIFIED_SINCE,
+                if_unmodified_since.map(|v| v.to_rfc2822()),
+            ),
+            (HeaderName::from_static(X_VERSION_HEADER), version.clone()),
+            (
+                HeaderName::from_static(X_HEAD_HEADER),
+                head.then(|| "true".to_string()),
+            ),
+            (http::header::RANGE, convert_range(range)?),
+        ])
+        .map_err(|e| ObjectStoreError::Precondition {
+            path: location.to_string(),
+            source: Box::new(e),
+        })?;
 
         let req = RawRequest {
-            method: Method::GET,
-            uri_parts,
-            headers,
-            key: Some(key),
-            ..Default::default()
+            request: Request::GetObject(location.to_string(), headers),
+            authority: None,
         };
 
         let mut cache = self.cache.clone();
@@ -140,7 +141,7 @@ impl ObjectStore for DataCacheObjectStore {
         self.get_opts(
             location,
             GetOptions {
-                range: Some(range),
+                range: Some(range.into()),
                 ..Default::default()
             },
         )
@@ -150,18 +151,9 @@ impl ObjectStore for DataCacheObjectStore {
     }
 
     async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let key = location.to_string();
-
-        let uri_parts = format!("/metadata?location={}", key)
-            .parse::<http::Uri>()
-            .map(http::uri::Parts::from)
-            .expect("should be valid uri");
-
         let req = RawRequest {
-            method: Method::GET,
-            uri_parts,
-            key: Some(key),
-            ..Default::default()
+            request: Request::GetMetadata(location.to_string(), Default::default()),
+            authority: None,
         };
 
         let mut cache = self.cache.clone();
@@ -264,7 +256,7 @@ fn use_fallback(code: StatusCode) -> bool {
 fn transform_get_object_response(
     resp: Response<Body>,
     meta: ObjectMeta,
-    expected_range: &Option<Range<usize>>,
+    expected_range: &Option<GetRange>,
 ) -> Result<GetResult, CacheClientError> {
     let headers = resp.headers();
     let range = Range {
@@ -273,6 +265,11 @@ fn transform_get_object_response(
     };
 
     if let Some(expected_range) = expected_range {
+        let GetRange::Bounded(expected_range) = expected_range else {
+            return Err(CacheClientError::InternalUnsupportedRange(
+                expected_range.clone(),
+            ));
+        };
         if !expected_range.start.eq(&range.start) || !expected_range.end.eq(&range.end) {
             return Err(CacheClientError::ReadData(format!(
                 "expected range {:?} but found range {:?}",
@@ -296,29 +293,35 @@ fn transform_get_object_response(
     })
 }
 
-/// Newtype around headers, for convenience methods.
-struct Headers<'a>(pub &'a mut HashMap<&'static str, String>);
+fn convert_range(range: &Option<GetRange>) -> Result<Option<String>> {
+    let Some(range) = range else { return Ok(None) };
 
-impl<'a> Headers<'a> {
-    fn add_header<T: ToString>(&mut self, k: &'static str, v: &Option<T>) -> &mut Self {
-        if let Some(v) = v {
-            // let header_name = k.to_owned();
-            self.0.insert(k, v.to_string());
-        }
-        self
-    }
-
-    fn add_range(&mut self, range: &Option<Range<usize>>) -> &mut Self {
-        if let Some(v) = range {
-            self.0
-                .insert("Range", format!("bytes={}-{}", v.start, v.end));
-        }
-        self
+    match range {
+        GetRange::Bounded(v) => Ok(Some(format!("bytes={}-{}", v.start, v.end))),
+        GetRange::Offset(_) | GetRange::Suffix(_) => Err(ObjectStoreError::Generic {
+            store: DATA_CACHE,
+            source: Box::new(CacheClientError::InternalUnsupportedRange(range.clone())),
+        }),
     }
 }
 
+fn convert_to_headermap(
+    headers: Vec<(HeaderName, Option<String>)>,
+) -> Result<HeaderMap<HeaderValue>, http::Error> {
+    let mut header_map = HeaderMap::new();
+    for (k, v) in headers {
+        if let Some(v) = v {
+            header_map.insert(k, HeaderValue::from_maybe_shared(v)?);
+        };
+    }
+    Ok(header_map)
+}
+
+/// Integration tests with the parquet cache client, behind the object store interface.
+///
+/// Isolated from the cache server -- only the client is used.
 #[cfg(test)]
-mod tests {
+mod object_store_client_integration_tests {
     use assert_matches::assert_matches;
 
     use crate::client::mock::{build_cache_server_client, MockDirectStore};
@@ -393,7 +396,7 @@ mod tests {
         let casted_object_store = Arc::clone(&direct_to_store) as Arc<dyn ObjectStore>;
         let (object_store, cache_server) = build_cache_server_client(casted_object_store).await;
 
-        object_store.list(Some(&Path::default()));
+        let _ = object_store.list(Some(&Path::default())).next().await;
         assert!(
             Arc::clone(&direct_to_store).was_called("list"),
             "list should be passed to direct store"

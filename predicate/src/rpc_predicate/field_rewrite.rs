@@ -137,7 +137,7 @@ impl FieldProjectionRewriter {
         let exprs = self
             .field_predicates
             .into_iter()
-            .map(|expr| create_physical_expr(&expr, &input_df_schema, &input_schema, &props))
+            .map(|expr| create_physical_expr(&expr, &input_df_schema, &props))
             .collect::<DataFusionResult<Vec<_>>>()
             .map_err(|e| DataFusionError::Internal(format!("Unsupported _field predicate: {e}")))?;
 

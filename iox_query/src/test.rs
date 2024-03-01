@@ -5,7 +5,7 @@
 use crate::{
     exec::{
         stringset::{StringSet, StringSetRef},
-        Executor, ExecutorType, IOxSessionContext,
+        Executor, ExecutorType, IOxSessionContext, QueryConfig,
     },
     pruning::prune_chunks,
     query_log::{QueryLog, StateReceived},
@@ -108,10 +108,10 @@ impl QueryNamespaceProvider for TestDatabaseStore {
         name: &str,
         _span: Option<Span>,
         _include_debug_info_tables: bool,
-    ) -> Option<Arc<dyn QueryNamespace>> {
+    ) -> Result<Option<Arc<dyn QueryNamespace>>, DataFusionError> {
         let databases = self.databases.lock();
 
-        databases.get(name).cloned().map(|ns| ns as _)
+        Ok(databases.get(name).cloned().map(|ns| ns as _))
     }
 
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit {
@@ -246,15 +246,23 @@ impl QueryNamespace for TestDatabase {
         )
     }
 
-    fn new_query_context(&self, span_ctx: Option<SpanContext>) -> IOxSessionContext {
+    fn new_query_context(
+        &self,
+        span_ctx: Option<SpanContext>,
+        query_config: Option<&QueryConfig>,
+    ) -> IOxSessionContext {
         // Note: unlike Db this does not register a catalog provider
-        self.executor
+        let mut cmd = self
+            .executor
             .new_execution_config(ExecutorType::Query)
             .with_default_catalog(Arc::new(TestDatabaseCatalogProvider::from_test_database(
                 self,
             )))
-            .with_span_context(span_ctx)
-            .build()
+            .with_span_context(span_ctx);
+        if let Some(query_config) = query_config {
+            cmd = cmd.with_query_config(query_config);
+        }
+        cmd.build()
     }
 }
 

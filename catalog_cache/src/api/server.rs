@@ -1,12 +1,12 @@
 //! Server for the cache HTTP API
 
 use crate::api::list::{ListEncoder, ListEntry};
-use crate::api::{RequestPath, GENERATION};
+use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH};
 use crate::local::CatalogCache;
 use crate::CacheValue;
 use futures::ready;
 use hyper::body::HttpBody;
-use hyper::header::ToStrError;
+use hyper::header::{HeaderValue, ToStrError};
 use hyper::http::request::Parts;
 use hyper::service::Service;
 use hyper::{Body, Method, Request, Response, StatusCode};
@@ -151,20 +151,23 @@ impl CatalogRequestFuture {
             },
             Some(RequestPath::Resource(key)) => match self.parts.method {
                 Method::GET => match self.state.cache.get(key) {
-                    Some(value) => {
-                        let response = Response::builder()
-                            .header(&GENERATION, value.generation)
-                            .body(value.data.into())?;
-                        return Ok(response);
-                    }
+                    Some(value) => match self.parts.headers.get(&GENERATION_NOT_MATCH) {
+                        Some(h) if parse_generation(h)? == value.generation => {
+                            StatusCode::NOT_MODIFIED
+                        }
+                        _ => {
+                            let response = Response::builder()
+                                .header(&GENERATION, value.generation)
+                                .body(value.data.into())?;
+                            return Ok(response);
+                        }
+                    },
                     None => StatusCode::NOT_FOUND,
                 },
                 Method::PUT => {
                     let headers = &self.parts.headers;
                     let generation = headers.get(&GENERATION).context(MissingGenerationSnafu)?;
-                    let generation = generation.to_str().context(BadHeaderSnafu)?;
-                    let generation = generation.parse().context(InvalidGenerationSnafu)?;
-                    let value = CacheValue::new(body.into(), generation);
+                    let value = CacheValue::new(body.into(), parse_generation(generation)?);
 
                     match self.state.cache.insert(key, value)? {
                         true => StatusCode::OK,
@@ -184,6 +187,11 @@ impl CatalogRequestFuture {
         *response.status_mut() = status;
         Ok(response)
     }
+}
+
+fn parse_generation(value: &HeaderValue) -> Result<u64, Error> {
+    let generation = value.to_str().context(BadHeaderSnafu)?;
+    generation.parse().context(InvalidGenerationSnafu)
 }
 
 /// Runs a [`CatalogCacheService`] in a background task
@@ -235,16 +243,17 @@ pub mod test_util {
         server: CatalogCacheServer,
         shutdown: CancellationToken,
         handle: Option<JoinHandle<()>>,
+        metric_registry: Arc<metric::Registry>,
     }
 
     impl TestCacheServer {
         /// Create a new [`TestCacheServer`] bound to an ephemeral port
-        pub fn bind_ephemeral() -> Self {
-            Self::bind(&SocketAddr::from(([127, 0, 0, 1], 0)))
+        pub fn bind_ephemeral(metric_registry: &Arc<metric::Registry>) -> Self {
+            Self::bind(&SocketAddr::from(([127, 0, 0, 1], 0)), metric_registry)
         }
 
         /// Create a new [`CatalogCacheServer`] bound to the provided [`SocketAddr`]
-        pub fn bind(addr: &SocketAddr) -> Self {
+        pub fn bind(addr: &SocketAddr, metric_registry: &Arc<metric::Registry>) -> Self {
             let server = CatalogCacheServer::new(Arc::new(CatalogCache::default()));
             let service = server.service();
             let make_service = make_service_fn(move |_conn| {
@@ -264,13 +273,17 @@ pub mod test_util {
                 server,
                 shutdown,
                 handle,
+                metric_registry: Arc::clone(metric_registry),
             }
         }
 
         /// Returns a [`CatalogCacheClient`] for communicating with this server
         pub fn client(&self) -> CatalogCacheClient {
-            let addr = format!("http://{}", self.addr);
-            CatalogCacheClient::try_new(addr.parse().unwrap()).unwrap()
+            // Use localhost to test DNS resolution
+            let addr = format!("http://localhost:{}", self.addr.port());
+            CatalogCacheClient::builder(addr.parse().unwrap(), Arc::clone(&self.metric_registry))
+                .build()
+                .unwrap()
         }
 
         /// Triggers and waits for graceful shutdown

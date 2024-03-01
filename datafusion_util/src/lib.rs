@@ -1,13 +1,3 @@
-#![deny(
-    clippy::future_not_send,
-    clippy::todo,
-    clippy::dbg_macro,
-    clippy::clone_on_ref_ptr,
-    rustdoc::broken_intra_doc_links,
-    rustdoc::bare_urls,
-    rust_2018_idioms,
-    unused_crate_dependencies
-)]
 #![allow(clippy::clone_on_ref_ptr)]
 
 //! This module contains various DataFusion utility functions.
@@ -414,7 +404,7 @@ pub fn create_physical_expr_from_schema(
     schema: &SchemaRef,
 ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
     let df_schema = Arc::clone(schema).to_dfschema_ref()?;
-    create_physical_expr(expr, df_schema.as_ref(), schema.as_ref(), props)
+    create_physical_expr(expr, df_schema.as_ref(), props)
 }
 
 /// Returns a [`PruningPredicate`] from the logical [`Expr`] and Arrow [`SchemaRef`]

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 // remap protobuf types for convenience
 mod proto {
-    pub(super) use generated_types::influxdata::iox::querier::v1::read_info::{
+    pub(super) use generated_types::influxdata::iox::querier::v1::{
         query_param::{NullValue, Value},
         QueryParam,
     };
@@ -49,7 +49,12 @@ pub struct StatementParams(HashMap<String, StatementParam>);
 
 impl StatementParams {
     /// Convert to internal representation.
-    pub fn into_inner(&self) -> &HashMap<String, StatementParam> {
+    pub fn into_inner(self) -> HashMap<String, StatementParam> {
+        self.0
+    }
+
+    /// Reference as a hashmap
+    pub fn as_hashmap(&self) -> &HashMap<String, StatementParam> {
         &self.0
     }
 
@@ -64,6 +69,17 @@ impl StatementParams {
     /// Convert to [datafusion::common::ParamValues] used by [datafusion::logical_expr::LogicalPlan]::with_param_values
     pub fn into_df_param_values(self) -> datafusion::common::ParamValues {
         self.into()
+    }
+}
+
+impl std::fmt::Display for StatementParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Params {{")?;
+        for (name, value) in &self.0 {
+            write!(f, " {name:?} => {value},")?;
+        }
+        write!(f, " }}")?;
+        Ok(())
     }
 }
 
@@ -140,6 +156,7 @@ impl From<StatementParams> for Vec<proto::QueryParam> {
 ///
 /// There is a [From] implementation to convert to DataFusion [ScalarValue]s. This
 /// allows params to be passed into the DataFusion [datafusion::logical_expr::LogicalPlan]
+///
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
 pub enum StatementParam {

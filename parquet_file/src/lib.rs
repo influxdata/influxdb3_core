@@ -1,20 +1,6 @@
 //! Parquet file generation, storage, and metadata implementations.
 
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    unreachable_pub,
-    missing_docs,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+#![warn(missing_docs)]
 #![allow(clippy::missing_docs_in_private_items)]
 
 use std::{path::PathBuf, str::FromStr};
@@ -57,6 +43,28 @@ impl ParquetFilePath {
             table_id,
             partition_id: partition_id.clone(),
             object_store_id,
+        }
+    }
+
+    /// Get namespace ID.
+    pub fn namespace_id(&self) -> NamespaceId {
+        self.namespace_id
+    }
+
+    /// Get table ID.
+    pub fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    /// Get partition ID.
+    ///
+    /// Returns a string to handle both deprecated and deterministic partition IDs.
+    pub fn raw_partition_id(&self) -> String {
+        match &self.partition_id {
+            TransitionPartitionId::Deprecated(partition_id) => partition_id.get().to_string(),
+            TransitionPartitionId::Deterministic(partition_hash_id) => {
+                partition_hash_id.to_string()
+            }
         }
     }
 
@@ -188,6 +196,18 @@ impl TryFrom<&String> for ParquetFilePath {
                 }
             })?,
         })
+    }
+}
+
+impl ToString for ParquetFilePath {
+    fn to_string(&self) -> String {
+        format!(
+            "{}/{}/{}/{}.parquet",
+            self.namespace_id.get(),
+            self.table_id.get(),
+            self.raw_partition_id(),
+            self.object_store_id.get_uuid()
+        )
     }
 }
 

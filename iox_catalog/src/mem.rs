@@ -7,13 +7,13 @@ use crate::{
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
-        PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
+        PartitionRepo, RepoCollection, Result, RootRepo, SoftDeletedRows, TableRepo,
     },
     metrics::MetricDecorator,
 };
 use async_trait::async_trait;
-use data_types::snapshot::partition::PartitionSnapshot;
-use data_types::snapshot::table::TableSnapshot;
+use data_types::snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot};
+use data_types::snapshot::{root::RootSnapshot, table::TableSnapshot};
 use data_types::{
     partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
@@ -33,6 +33,7 @@ use std::{
     ops::DerefMut,
     sync::Arc,
 };
+use trace::ctx::SpanContext;
 
 /// In-memory catalog that implements the `RepoCollection` and individual repo traits from
 /// the catalog interface.
@@ -96,14 +97,29 @@ impl<T> From<T> for Versioned<T> {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct MemCollections {
-    namespaces: Vec<Namespace>,
+    root: Versioned<()>,
+    namespaces: Vec<Versioned<Namespace>>,
     tables: Vec<Versioned<Table>>,
     columns: Vec<Column>,
     partitions: Vec<Versioned<Partition>>,
     skipped_compactions: Vec<SkippedCompaction>,
     parquet_files: Vec<ParquetFile>,
+}
+
+impl Default for MemCollections {
+    fn default() -> Self {
+        Self {
+            root: ().into(),
+            namespaces: Default::default(),
+            tables: Default::default(),
+            columns: Default::default(),
+            partitions: Default::default(),
+            skipped_compactions: Default::default(),
+            parquet_files: Default::default(),
+        }
+    }
 }
 
 /// transaction bound to an in-memory catalog.
@@ -128,12 +144,13 @@ impl Catalog for MemCatalog {
     fn repositories(&self) -> Box<dyn RepoCollection> {
         let collections = Arc::clone(&self.collections);
         Box::new(MetricDecorator::new(
-            MemTxn {
+            Box::new(MemTxn {
                 collections,
                 time_provider: self.time_provider(),
-            },
+            }),
             Arc::clone(&self.metrics),
             self.time_provider(),
+            "mem",
         ))
     }
 
@@ -148,6 +165,10 @@ impl Catalog for MemCatalog {
 }
 
 impl RepoCollection for MemTxn {
+    fn root(&mut self) -> &mut dyn RootRepo {
+        self
+    }
+
     fn namespaces(&mut self) -> &mut dyn NamespaceRepo {
         self
     }
@@ -166,6 +187,22 @@ impl RepoCollection for MemTxn {
 
     fn parquet_files(&mut self) -> &mut dyn ParquetFileRepo {
         self
+    }
+
+    fn set_span_context(&mut self, _span_ctx: Option<SpanContext>) {}
+}
+
+#[async_trait]
+impl RootRepo for MemTxn {
+    async fn snapshot(&mut self) -> Result<RootSnapshot> {
+        let mut guard = self.collections.lock();
+
+        let generation = guard.root.generation;
+        guard.root.generation += 1;
+
+        let namespaces = guard.namespaces.iter().map(|x| x.value.clone());
+
+        Ok(RootSnapshot::encode(namespaces, generation)?)
     }
 }
 
@@ -201,16 +238,17 @@ impl NamespaceRepo for MemTxn {
             retention_period_ns,
             deleted_at: None,
             partition_template: partition_template.unwrap_or_default(),
+            router_version: Default::default(),
         };
-        stage.namespaces.push(namespace);
-        Ok(stage.namespaces.last().unwrap().clone())
+        stage.namespaces.push(namespace.into());
+        Ok(stage.namespaces.last().unwrap().value.clone())
     }
 
     async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>> {
         let stage = self.collections.lock();
 
         Ok(filter_namespace_soft_delete(&stage.namespaces, deleted)
-            .cloned()
+            .map(|x| x.value.clone())
             .collect())
     }
 
@@ -223,7 +261,7 @@ impl NamespaceRepo for MemTxn {
 
         let res = filter_namespace_soft_delete(&stage.namespaces, deleted)
             .find(|n| n.id == id)
-            .cloned();
+            .map(|x| x.value.clone());
 
         Ok(res)
     }
@@ -237,21 +275,21 @@ impl NamespaceRepo for MemTxn {
 
         let res = filter_namespace_soft_delete(&stage.namespaces, deleted)
             .find(|n| n.name == name)
-            .cloned();
+            .map(|x| x.value.clone());
 
         Ok(res)
     }
 
     // performs a cascading delete of all things attached to the namespace, then deletes the
     // namespace
-    async fn soft_delete(&mut self, name: &str) -> Result<()> {
+    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
         let mut stage = self.collections.lock();
         let timestamp = self.time_provider.now();
         // get namespace by name
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.deleted_at = Some(Timestamp::from(timestamp));
-                Ok(())
+                Ok(n.id)
             }
             None => Err(Error::NotFound {
                 descr: name.to_string(),
@@ -264,7 +302,7 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.max_tables = new_max;
-                Ok(n.clone())
+                Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
                 descr: name.to_string(),
@@ -281,7 +319,7 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.max_columns_per_table = new_max;
-                Ok(n.clone())
+                Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
                 descr: name.to_string(),
@@ -298,12 +336,36 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.retention_period_ns = retention_period_ns;
-                Ok(n.clone())
+                Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
                 descr: name.to_string(),
             }),
         }
+    }
+
+    async fn snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot> {
+        let mut guard = self.collections.lock();
+
+        let (ns, generation) = {
+            let mut namespaces = guard.namespaces.iter_mut();
+            let search = namespaces.find(|x| x.id == namespace_id);
+            let ns = search.ok_or_else(|| Error::NotFound {
+                descr: namespace_id.to_string(),
+            })?;
+
+            let generation = ns.generation;
+            ns.generation += 1;
+            (ns.value.clone(), generation)
+        };
+
+        let tables = guard
+            .tables
+            .iter()
+            .filter(|x| x.namespace_id == namespace_id)
+            .map(|x| x.value.clone());
+
+        Ok(NamespaceSnapshot::encode(ns, tables, generation)?)
     }
 }
 
@@ -570,6 +632,7 @@ impl PartitionRepo for MemTxn {
                     key,
                     SortKeyIds::default(),
                     None,
+                    Default::default(),
                 );
                 stage.partitions.push(p.into());
                 stage.partitions.last().unwrap()
@@ -740,6 +803,56 @@ impl PartitionRepo for MemTxn {
             .collect();
 
         Ok(partitions)
+    }
+
+    async fn partitions_needing_cold_compact(
+        &mut self,
+        maximum_time: Timestamp,
+        n: usize,
+    ) -> Result<Vec<PartitionId>> {
+        let stage = self.collections.lock();
+
+        let mut partitions: Vec<_> = stage
+            .partitions
+            .iter()
+            .filter(|p| {
+                p.new_file_at != Some(Timestamp::new(0)) // non-empty partition
+                && p.new_file_at <= Some(maximum_time) // is cold
+                    && (p.cold_compact_at == Some(Timestamp::new(0))
+                    || p.cold_compact_at < p.new_file_at) // no valid cold compact
+            })
+            .collect();
+
+        partitions.sort_by(|a, b| a.new_file_at.cmp(&b.new_file_at));
+
+        let partitions: Vec<_> = partitions.iter().map(|p| p.id).collect();
+
+        if n >= partitions.len() {
+            Ok(partitions)
+        } else {
+            Ok(partitions[..n].to_vec())
+        }
+    }
+
+    async fn update_cold_compact(
+        &mut self,
+        partition_id: PartitionId,
+        cold_compact_at: Timestamp,
+    ) -> Result<()> {
+        let mut stage = self.collections.lock();
+
+        // Update the cold_compact_at field to the specified time
+        let partition = stage
+            .partitions
+            .iter_mut()
+            .find(|p| p.id == partition_id)
+            .ok_or(Error::NotFound {
+                descr: partition_id.to_string(),
+            })?;
+
+        partition.cold_compact_at = Some(cold_compact_at);
+
+        Ok(())
     }
 
     async fn list_old_style(&mut self) -> Result<Vec<Partition>> {
@@ -918,8 +1031,8 @@ impl ParquetFileRepo for MemTxn {
         let mut ids = Vec::with_capacity(create.len());
         for file in create {
             if file.partition_id != partition_id {
-                return Err(Error::External {
-                    source: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id).into(),
+                return Err(Error::Malformed {
+                    descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
                 });
             }
             let res = create_parquet_file(&mut stage, file.clone())?;
@@ -933,9 +1046,9 @@ impl ParquetFileRepo for MemTxn {
 }
 
 fn filter_namespace_soft_delete<'a>(
-    v: impl IntoIterator<Item = &'a Namespace>,
+    v: impl IntoIterator<Item = &'a Versioned<Namespace>>,
     deleted: SoftDeletedRows,
-) -> impl Iterator<Item = &'a Namespace> {
+) -> impl Iterator<Item = &'a Versioned<Namespace>> {
     v.into_iter().filter(move |v| match deleted {
         SoftDeletedRows::AllRows => true,
         SoftDeletedRows::ExcludeDeleted => v.deleted_at.is_none(),

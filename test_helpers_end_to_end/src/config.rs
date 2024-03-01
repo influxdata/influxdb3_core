@@ -66,7 +66,7 @@ impl TestConfig {
     }
 
     /// Creates a new TestConfig of `server_type` with the same catalog as `other`
-    fn new_with_existing_catalog(server_type: ServerType, other: &TestConfig) -> Self {
+    fn new_with_existing_catalog(server_type: ServerType, other: &Self) -> Self {
         Self::new(
             server_type,
             other.dsn.clone(),
@@ -113,11 +113,13 @@ impl TestConfig {
     /// `TestConfig` to `new_router`.
     pub fn router_only(dsn: impl Into<String>) -> Self {
         let dsn = Some(dsn.into());
-        Self::new(ServerType::Router, dsn, random_catalog_schema_name()).with_new_object_store()
+        Self::new(ServerType::Router, dsn, random_catalog_schema_name())
+            .with_new_object_store()
+            .with_no_router_upstream_wait()
     }
 
-    /// Create a minimal router2 configuration sharing configuration with the ingester2 config
-    pub fn new_router(ingester_config: &TestConfig) -> Self {
+    /// Create a minimal router configuration sharing configuration with the ingester config
+    pub fn new_router(ingester_config: &Self) -> Self {
         assert_eq!(ingester_config.server_type(), ServerType::Ingester);
 
         Self::new_with_existing_catalog(ServerType::Router, ingester_config)
@@ -135,6 +137,15 @@ impl TestConfig {
             .with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "1")
     }
 
+    /// Create minima ingester config, from another configuration which specifies
+    /// the existing catalog and object store.
+    pub fn new_ingester_from_config(other: &Self) -> Self {
+        Self::new_with_existing_catalog(ServerType::Ingester, other)
+            .with_existing_object_store(other)
+            .with_new_wal()
+            .with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "1")
+    }
+
     /// Create a minimal ingester configuration, using the dsn configuration specified. Set the
     /// persistence options such that it will likely never persist, to be able to test when data
     /// only exists in the ingester's memory.
@@ -147,9 +158,30 @@ impl TestConfig {
             .with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "86400")
     }
 
+    /// Create a minimal parquet cache configuration, using the dsn configuration specified.
+    /// Set the provided env for configmap path, local_store dir path, and hostname in order to
+    /// test different scenarios.
+    pub fn parquet_cache_server_only(
+        dsn: impl Into<String>,
+        configmap: impl Into<String>,
+        local_store: impl Into<String>,
+        hostname: impl Into<String>,
+    ) -> Self {
+        let dsn = Some(dsn.into());
+        Self::new(
+            ServerType::ParquetCache,
+            dsn.clone(),
+            random_catalog_schema_name(),
+        )
+        .with_new_object_store()
+        .with_env("INFLUXDB_IOX_PARQUET_CACHE_KEYSPACE_CONFIG_PATH", configmap)
+        .with_env("INFLUXDB_IOX_PARQUET_CACHE_LOCAL_DIR", local_store)
+        .with_env("HOSTNAME", hostname)
+    }
+
     /// Create another ingester with the same dsn, catalog schema name, and object store, but with
     /// its own WAL directory and own addresses.
-    pub fn another_ingester(ingester_config: &TestConfig) -> Self {
+    pub fn another_ingester(ingester_config: &Self) -> Self {
         Self {
             env: ingester_config.env.clone(),
             client_headers: ingester_config.client_headers.clone(),
@@ -168,7 +200,7 @@ impl TestConfig {
 
     /// Create a minimal querier configuration from the specified ingester configuration, using
     /// the same dsn and object store, and pointing at the specified ingester.
-    pub fn new_querier(ingester_config: &TestConfig) -> Self {
+    pub fn new_querier(ingester_config: &Self) -> Self {
         assert_eq!(ingester_config.server_type(), ServerType::Ingester);
 
         Self::new_querier_without_ingester(ingester_config)
@@ -176,14 +208,14 @@ impl TestConfig {
     }
 
     /// Create a minimal compactor configuration, using the dsn configuration from other
-    pub fn new_compactor(other: &TestConfig) -> Self {
+    pub fn new_compactor(other: &Self) -> Self {
         Self::new_with_existing_catalog(ServerType::Compactor, other)
             .with_existing_object_store(other)
     }
 
     /// Create a minimal querier configuration from the specified ingester configuration, using
     /// the same dsn and object store, but without specifying the ingester addresses
-    pub fn new_querier_without_ingester(ingester_config: &TestConfig) -> Self {
+    pub fn new_querier_without_ingester(ingester_config: &Self) -> Self {
         Self::new_with_existing_catalog(ServerType::Querier, ingester_config)
             .with_existing_object_store(ingester_config)
             // Hard code query threads so query plans do not vary based on environment
@@ -192,6 +224,8 @@ impl TestConfig {
                 "INFLUXDB_IOX_DATAFUSION_CONFIG",
                 "iox.influxql_metadata_cutoff:1990-01-01T00:00:00Z",
             )
+            // fixtures have central catalog cache (or it doesn't matter in the first place)
+            .with_env("INFLUXDB_IOX_V2_OPTIMIZE_FOR_CATALOG_CACHE", "true")
     }
 
     /// Create a minimal all in one configuration
@@ -258,6 +292,10 @@ impl TestConfig {
         )
     }
 
+    pub fn with_no_router_upstream_wait(self) -> Self {
+        self.with_env("INFLUXDB_IOX_NO_WAIT_RPC_UPSTREAMS", "true")
+    }
+
     pub fn with_ingester_never_persist(self) -> Self {
         self.with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "86400")
     }
@@ -312,7 +350,7 @@ impl TestConfig {
     ///
     /// Should not be called directly, but instead all mapping to
     /// environment variables should be done via this structure
-    fn copy_env(self, name: impl Into<String>, other: &TestConfig) -> Self {
+    fn copy_env(self, name: impl Into<String>, other: &Self) -> Self {
         let name = name.into();
         let value = match other.env.get(&name) {
             Some(v) => v.clone(),
@@ -354,7 +392,7 @@ impl TestConfig {
     }
 
     /// Configures this TestConfig to use the same object store as other
-    fn with_existing_object_store(mut self, other: &TestConfig) -> Self {
+    fn with_existing_object_store(mut self, other: &Self) -> Self {
         // copy a reference to the temp dir, if any
         self.object_store_dir = other.object_store_dir.clone();
         self.copy_env("INFLUXDB_IOX_OBJECT_STORE", other)

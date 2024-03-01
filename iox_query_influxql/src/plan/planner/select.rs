@@ -242,10 +242,7 @@ impl<'a> Selector<'a> {
         fields
             .iter()
             .enumerate()
-            .find_map(|(idx, f)| match &f.expr {
-                IQLExpr::Call(c) => Some((idx, c)),
-                _ => None,
-            })
+            .find_map(|(idx, f)| Self::find_call(idx, &f.expr))
             .map(|(idx, c)| {
                 Ok((
                     idx,
@@ -263,6 +260,17 @@ impl<'a> Selector<'a> {
                 ))
             })
             .ok_or_else(|| error::map::internal("expected Call expression"))?
+    }
+
+    fn find_call(idx: usize, expr: &'a IQLExpr) -> Option<(usize, &'a Call)> {
+        match expr {
+            IQLExpr::Call(c) => Some((idx, c)),
+            IQLExpr::Binary(b) => {
+                Self::find_call(idx, &b.lhs).or_else(|| Self::find_call(idx, &b.rhs))
+            }
+            IQLExpr::Nested(e) => Self::find_call(idx, e),
+            _ => None,
+        }
     }
 
     fn bottom(call: &'a Call) -> Result<Self> {

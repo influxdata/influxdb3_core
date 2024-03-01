@@ -130,14 +130,7 @@ impl ExtensionPlanner for IOxExtensionPlanner {
             let split_exprs = stream_split
                 .split_exprs()
                 .iter()
-                .map(|e| {
-                    planner.create_physical_expr(
-                        e,
-                        logical_inputs[0].schema(),
-                        &physical_inputs[0].schema(),
-                        session_state,
-                    )
-                })
+                .map(|e| planner.create_physical_expr(e, logical_inputs[0].schema(), session_state))
                 .collect::<Result<Vec<_>>>()?;
 
             Some(Arc::new(StreamSplitExec::new(
@@ -247,6 +240,23 @@ impl IOxSessionConfig {
         self
     }
 
+    /// Set query-specific configuration options.
+    pub fn with_query_config(mut self, config: &QueryConfig) -> Self {
+        let iox_config: &mut IoxConfigExt = self
+            .session_config
+            .options_mut()
+            .extensions
+            .get_mut()
+            .unwrap();
+        if let Some(partition_limit) = config.partition_limit {
+            iox_config.set_partition_limit(partition_limit);
+        };
+        if let Some(parquet_file_limit) = config.parquet_file_limit {
+            iox_config.set_parquet_file_limit(parquet_file_limit);
+        };
+        self
+    }
+
     /// Create an ExecutionContext suitable for executing DataFusion plans
     pub fn build(self) -> IOxSessionContext {
         let maybe_span = self.span_ctx.child_span("Query Execution");
@@ -271,6 +281,18 @@ impl IOxSessionConfig {
 
         IOxSessionContext::new(inner, self.exec, recorder)
     }
+}
+
+/// Configuration that may be applied differently for each query.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QueryConfig {
+    /// Limit the number of partitions to scan in a single query. This may only reduce any limit
+    /// set for the system.
+    pub partition_limit: Option<usize>,
+
+    /// Limit the number of parquet files to scan in a single query. This may only reduce any limit
+    /// set for the system.
+    pub parquet_file_limit: Option<usize>,
 }
 
 /// This is an execution context for planning in IOx.  It wraps a

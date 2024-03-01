@@ -2,7 +2,9 @@
 
 use std::num::NonZeroUsize;
 
-use crate::{gossip::GossipConfig, memory_size::MemorySize};
+use crate::{
+    gossip::GossipConfig, memory_size::MemorySize, parquet_write_hint::ParquetWriteHintConfig,
+};
 
 use super::compactor_scheduler::CompactorSchedulerConfig;
 
@@ -12,6 +14,10 @@ pub struct CompactorConfig {
     /// Gossip config.
     #[clap(flatten)]
     pub gossip_config: GossipConfig,
+
+    /// Parquet write hint config.
+    #[clap(flatten)]
+    pub parquet_write_hint_config: ParquetWriteHintConfig,
 
     /// Configuration for the compactor scheduler
     #[clap(flatten)]

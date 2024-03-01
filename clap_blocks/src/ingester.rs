@@ -2,7 +2,7 @@
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
-use crate::gossip::GossipConfig;
+use crate::{gossip::GossipConfig, parquet_write_hint::ParquetWriteHintConfig};
 
 /// CLI config for the ingester using the RPC write path
 #[derive(Debug, Clone, clap::Parser)]
@@ -11,6 +11,10 @@ pub struct IngesterConfig {
     /// Gossip config.
     #[clap(flatten)]
     pub gossip_config: GossipConfig,
+
+    /// Parquet write hint config.
+    #[clap(flatten)]
+    pub parquet_write_hint_config: ParquetWriteHintConfig,
 
     /// Where this ingester instance should store its write-ahead log files. Each ingester instance
     /// must have its own directory.

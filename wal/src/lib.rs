@@ -2,16 +2,6 @@
 //!
 //! This crate provides a local-disk WAL for the IOx ingestion pipeline.
 
-#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    unused_crate_dependencies
-)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -50,7 +40,10 @@ mod writer_thread;
 
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 
-// TODO: Should have more variants / error types to avoid reusing these
+// The collection of error types that external clients can expect to handle.
+//
+// WARNING: None of these enum variants have doc comments, because it will
+// be used as the error message and thus obfuscate the inner error details.
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 #[snafu(visibility(pub(crate)))]
@@ -110,8 +103,6 @@ pub enum Error {
         source: blocking::ReaderError,
     },
 
-    /// This error indicates that the next entry cannot be read from the
-    /// segment file.
     UnableToReadNextOps {
         source: blocking::ReaderError,
     },

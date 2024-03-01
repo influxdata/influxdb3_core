@@ -69,7 +69,7 @@ pub struct SortKey {
 impl SortKey {
     /// Create a new empty sort key
     pub fn empty() -> Self {
-        SortKey {
+        Self {
             columns: Default::default(),
         }
     }
@@ -135,8 +135,9 @@ impl SortKey {
     ///
     /// # Panics
     ///
-    /// Panics if any columns in the primary key are NOT present in this sort key.
-    pub fn filter_to(&self, primary_key: &[&str], partition_id: i64) -> SortKey {
+    /// Panics if any columns in the primary key are NOT present in this sort key with a panic
+    /// message containing the partition ID.
+    pub fn filter_to(&self, primary_key: &[&str], partition_id: i64) -> Self {
         let missing_from_catalog_key: Vec<_> = primary_key
             .iter()
             .filter(|col| !self.contains(col))
@@ -147,6 +148,15 @@ impl SortKey {
             )
         }
 
+        self.filter_to_unchecked(primary_key)
+    }
+
+    /// Filters this sort key to contain only the columns present in the primary key, in the order
+    /// that the columns appear in this sort key.
+    ///
+    /// Does not verify all columns in the primary key are present in `self`. If that behavior is
+    /// needed, call [`SortKey::filter_to()`] instead.
+    pub fn filter_to_unchecked(&self, primary_key: &[&str]) -> Self {
         Self::from_columns(
             self.iter()
                 .map(|(col, _opts)| col)
@@ -173,7 +183,7 @@ impl SortKey {
     ///        super key of (a, b, c) and any of { b, a), (c, a), (c, b), (b, a, c), (b, c, a), (c, a, b), (c, b, a) } is None
     ///
     ///  Note that the last column in the sort key must be time
-    pub fn try_merge_key<'a>(key1: &'a SortKey, key2: &'a SortKey) -> Option<&'a SortKey> {
+    pub fn try_merge_key<'a>(key1: &'a Self, key2: &'a Self) -> Option<&'a Self> {
         if key1.is_empty() || key2.is_empty() {
             panic!("Sort key cannot be empty");
         }
@@ -251,8 +261,8 @@ impl SortKey {
     }
 }
 
-impl From<SortKey> for Vec<String> {
-    fn from(val: SortKey) -> Self {
+impl From<&SortKey> for Vec<String> {
+    fn from(val: &SortKey) -> Self {
         val.columns.iter().map(|(id, _)| id.to_string()).collect()
     }
 }

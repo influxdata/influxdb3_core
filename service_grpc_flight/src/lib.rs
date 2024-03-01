@@ -2,19 +2,7 @@
 //! FlightSQL, based on Arrow Flight and gRPC. See [`FlightService`]
 //! for full detail.
 
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![allow(clippy::clone_on_ref_ptr)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
 
 use keep_alive::KeepAliveStream;
 use planner::Planner;
@@ -41,6 +29,7 @@ use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use flightsql::FlightSQLCommand;
 use futures::{ready, stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
+use iox_query::exec::QueryConfig;
 use iox_query::{
     exec::IOxSessionContext,
     query_log::{QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
@@ -78,6 +67,12 @@ const IOX_FLIGHT_SQL_DATABASE_REQUEST_HEADERS: [&str; 4] = [
     "iox-namespace-name", // deprecated
 ];
 
+/// Header that contains a query-specific partition limit.
+const IOX_FLIGHT_PARTITION_LIMIT_HEADER: &str = "x-influxdata-partition-limit";
+
+/// Header that contains a query-specific parquet file limit.
+const IOX_FLIGHT_PARQUET_FILE_LIMIT_HEADER: &str = "x-influxdata-parquet-file-limit";
+
 /// Trailer that describes the duration (in seconds) for which a query was queued due to concurrency limits.
 const IOX_FLIGHT_QUEUE_DURATION_RESPONSE_TRAILER: &str = "x-influxdata-queue-duration-seconds";
 
@@ -106,6 +101,9 @@ pub enum Error {
 
     #[snafu(display("Invalid handshake. No payload provided"))]
     InvalidHandshake {},
+
+    #[snafu(display("Cannot retrieve database: {}", source))]
+    Database { source: DataFusionError },
 
     #[snafu(display("Database '{}' not found", namespace_name))]
     DatabaseNotFound { namespace_name: String },
@@ -189,7 +187,8 @@ impl From<Error> for tonic::Status {
             | Error::PermissionDenied { .. }
             | Error::InvalidDatabaseName { .. }
             | Error::Query { .. } => info!(e=%err, %namespace, %query, msg),
-            Error::Optimize { .. }
+            Error::Database { .. }
+            | Error::Optimize { .. }
             | Error::EncodeSchema { .. }
             | Error::TooManyFlightSQLDatabases { .. }
             | Error::NoFlightSQLDatabase
@@ -222,13 +221,15 @@ impl Error {
             | Self::NoFlightSQLDatabase
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. } => tonic::Code::InvalidArgument,
-            Self::Planning { source, .. } | Self::Query { source, .. } => {
-                datafusion_error_to_tonic_code(&source)
-            }
+            Self::Database { source }
+            | Self::Planning { source, .. }
+            | Self::Query { source, .. } => datafusion_error_to_tonic_code(&source),
             Self::UnsupportedMessageType { .. } => tonic::Code::Unimplemented,
             Self::FlightSQL { source } => match source {
                 flightsql::Error::InvalidHandle { .. }
+                | flightsql::Error::InvalidTypeUrl { .. }
                 | flightsql::Error::Decode { .. }
+                | flightsql::Error::InvalidPreparedStatementParams { .. }
                 | flightsql::Error::Protocol { .. }
                 | flightsql::Error::UnsupportedMessageType { .. } => tonic::Code::InvalidArgument,
                 flightsql::Error::Flight { source: e } => return tonic::Status::from(e),
@@ -253,48 +254,50 @@ impl Error {
     /// returns the namespace name, if known, used for logging
     fn namespace(&self) -> &str {
         match self {
-            Error::InvalidTicket { .. }
-            | Error::InternalCreatingTicket { .. }
-            | Error::InvalidHandshake {}
-            | Error::TooManyFlightSQLDatabases { .. }
-            | Error::NoFlightSQLDatabase
-            | Error::InvalidDatabaseHeader { .. }
-            | Error::InvalidDatabaseName { .. }
-            | Error::Optimize { .. }
-            | Error::EncodeSchema { .. }
-            | Error::FlightSQL { .. }
-            | Error::Deserialization { .. }
-            | Error::UnsupportedMessageType { .. }
-            | Error::Unauthenticated
-            | Error::PermissionDenied
-            | Error::Authz { .. } => "<unknown>",
-            Error::DatabaseNotFound { namespace_name } => namespace_name,
-            Error::Query { namespace_name, .. } => namespace_name,
-            Error::Planning { namespace_name, .. } => namespace_name,
+            Self::Database { .. }
+            | Self::InvalidTicket { .. }
+            | Self::InternalCreatingTicket { .. }
+            | Self::InvalidHandshake {}
+            | Self::TooManyFlightSQLDatabases { .. }
+            | Self::NoFlightSQLDatabase
+            | Self::InvalidDatabaseHeader { .. }
+            | Self::InvalidDatabaseName { .. }
+            | Self::Optimize { .. }
+            | Self::EncodeSchema { .. }
+            | Self::FlightSQL { .. }
+            | Self::Deserialization { .. }
+            | Self::UnsupportedMessageType { .. }
+            | Self::Unauthenticated
+            | Self::PermissionDenied
+            | Self::Authz { .. } => "<unknown>",
+            Self::DatabaseNotFound { namespace_name } => namespace_name,
+            Self::Query { namespace_name, .. } => namespace_name,
+            Self::Planning { namespace_name, .. } => namespace_name,
         }
     }
 
     /// returns a query, if know, used for logging
     fn query(&self) -> &str {
         match self {
-            Error::InvalidTicket { .. }
-            | Error::InternalCreatingTicket { .. }
-            | Error::InvalidHandshake {}
-            | Error::TooManyFlightSQLDatabases { .. }
-            | Error::NoFlightSQLDatabase
-            | Error::InvalidDatabaseHeader { .. }
-            | Error::InvalidDatabaseName { .. }
-            | Error::Optimize { .. }
-            | Error::EncodeSchema { .. }
-            | Error::FlightSQL { .. }
-            | Error::Deserialization { .. }
-            | Error::UnsupportedMessageType { .. }
-            | Error::Unauthenticated
-            | Error::PermissionDenied
-            | Error::Authz { .. }
-            | Error::DatabaseNotFound { .. } => "NONE",
-            Error::Query { query, .. } => query,
-            Error::Planning { query, .. } => query,
+            Self::Database { .. }
+            | Self::InvalidTicket { .. }
+            | Self::InternalCreatingTicket { .. }
+            | Self::InvalidHandshake {}
+            | Self::TooManyFlightSQLDatabases { .. }
+            | Self::NoFlightSQLDatabase
+            | Self::InvalidDatabaseHeader { .. }
+            | Self::InvalidDatabaseName { .. }
+            | Self::Optimize { .. }
+            | Self::EncodeSchema { .. }
+            | Self::FlightSQL { .. }
+            | Self::Deserialization { .. }
+            | Self::UnsupportedMessageType { .. }
+            | Self::Unauthenticated
+            | Self::PermissionDenied
+            | Self::Authz { .. }
+            | Self::DatabaseNotFound { .. } => "NONE",
+            Self::Query { query, .. } => query,
+            Self::Planning { query, .. } => query,
         }
     }
 
@@ -515,6 +518,7 @@ where
         external_span_ctx: Option<RequestLogContext>,
         request: IoxGetRequest,
         log_entry: &mut Option<Arc<QueryLogEntry>>,
+        query_config: Option<&QueryConfig>,
     ) -> Result<TonicStream<FlightData>, tonic::Status> {
         let IoxGetRequest {
             database,
@@ -531,6 +535,7 @@ where
                 is_debug,
             )
             .await
+            .context(DatabaseSnafu)?
             .context(DatabaseNotFoundSnafu { namespace_name })?;
 
         //TODO: add structured logging for parameterized queries https://github.com/influxdata/influxdb_iox/issues/9626
@@ -551,31 +556,41 @@ where
             "DoGet request",
         );
 
-        let ctx = db.new_query_context(span_ctx);
-        let physical_plan = match &query {
+        let ctx = db.new_query_context(span_ctx, query_config);
+        let physical_plan_res = match &query {
             RunQuery::Sql(sql_query) => Planner::new(&ctx)
                 .sql(sql_query, params)
                 .await
                 .with_context(|_| PlanningSnafu {
                     namespace_name,
                     query: query.to_string(),
-                })?,
+                }),
             RunQuery::InfluxQL(sql_query) => Planner::new(&ctx)
                 .influxql(sql_query, params)
                 .await
                 .with_context(|_| PlanningSnafu {
-                namespace_name,
-                query: query.to_string(),
-            })?,
+                    namespace_name,
+                    query: query.to_string(),
+                }),
             RunQuery::FlightSQL(msg) => Planner::new(&ctx)
-                .flight_sql_do_get(namespace_name, db, msg.clone(), params)
+                .flight_sql_do_get(namespace_name, db, msg.clone())
                 .await
                 .with_context(|_| PlanningSnafu {
                     namespace_name,
                     query: query.to_string(),
-                })?,
+                }),
         };
-        let query_completed_token = query_completed_token.planned(Arc::clone(&physical_plan));
+        let (physical_plan, query_completed_token) = match physical_plan_res {
+            Ok(physical_plan) => {
+                let query_completed_token =
+                    query_completed_token.planned(Arc::clone(&physical_plan));
+                (physical_plan, query_completed_token)
+            }
+            Err(e) => {
+                query_completed_token.fail();
+                return Err(e.into());
+            }
+        };
 
         let output = GetStream::new(
             server,
@@ -639,6 +654,7 @@ where
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let authz_token = get_flight_authz(request.metadata());
         let debug_header = has_debug_header(request.metadata());
+        let query_config = get_query_config(request.metadata());
         let ticket = request.into_inner();
 
         // attempt to decode ticket
@@ -676,6 +692,7 @@ where
             external_span_ctx.clone(),
             request.clone(),
             &mut log_entry,
+            query_config.as_ref(),
         )
         .await;
 
@@ -792,11 +809,12 @@ where
                 is_debug,
             )
             .await
+            .context(DatabaseSnafu)?
             .context(DatabaseNotFoundSnafu {
                 namespace_name: &namespace_name,
             })?;
 
-        let ctx = db.new_query_context(span_ctx);
+        let ctx = db.new_query_context(span_ctx, None);
         let schema = Planner::new(&ctx)
             .flight_sql_get_flight_info_schema(&namespace_name, cmd.clone())
             .await
@@ -849,6 +867,7 @@ where
 
         let namespace_name = get_flightsql_namespace(request.metadata())?;
         let authz_token = get_flight_authz(request.metadata());
+        let query_config = get_query_config(request.metadata());
         let Action {
             r#type: action_type,
             body,
@@ -873,11 +892,12 @@ where
                 is_debug,
             )
             .await
+            .context(DatabaseSnafu)?
             .context(DatabaseNotFoundSnafu {
                 namespace_name: &namespace_name,
             })?;
 
-        let ctx = db.new_query_context(span_ctx);
+        let ctx = db.new_query_context(span_ctx, query_config.as_ref());
         let body = Planner::new(&ctx)
             .flight_sql_do_action(&namespace_name, db, cmd.clone())
             .await
@@ -998,6 +1018,28 @@ fn has_debug_header(metadata: &MetadataMap) -> bool {
         .map(|s| s.to_lowercase())
         .map(|s| matches!(s.as_str(), "1" | "on" | "yes" | "y" | "true" | "t"))
         .unwrap_or_default()
+}
+
+/// Extract the desired per-query configuration from the request metadata.
+fn get_query_config(metadata: &MetadataMap) -> Option<QueryConfig> {
+    let mut config: Option<QueryConfig> = None;
+    if let Some(partition_limit) = metadata
+        .get(IOX_FLIGHT_PARTITION_LIMIT_HEADER)
+        .and_then(|s| s.to_str().ok())
+        .and_then(|s| s.parse().ok())
+    {
+        config.get_or_insert(QueryConfig::default()).partition_limit = Some(partition_limit);
+    };
+    if let Some(parquet_file_limit) = metadata
+        .get(IOX_FLIGHT_PARQUET_FILE_LIMIT_HEADER)
+        .and_then(|s| s.to_str().ok())
+        .and_then(|s| s.parse().ok())
+    {
+        config
+            .get_or_insert(QueryConfig::default())
+            .parquet_file_limit = Some(parquet_file_limit);
+    };
+    config
 }
 
 struct PermitAndToken {

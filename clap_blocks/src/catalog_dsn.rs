@@ -1,4 +1,5 @@
 //! Catalog-DSN-related configs.
+use http::header::InvalidHeaderName;
 use http::uri::InvalidUri;
 use iox_catalog::grpc::client::GrpcCatalogClient;
 use iox_catalog::sqlite::{SqliteCatalog, SqliteConnectionOptions};
@@ -28,28 +29,25 @@ pub enum Error {
     Catalog {
         source: iox_catalog::interface::Error,
     },
+
+    #[snafu(display("Invalid trace header: {source}"))]
+    InvalidTraceHeader { source: InvalidHeaderName },
 }
 
-fn default_max_connections() -> &'static str {
-    let s = PostgresConnectionOptions::DEFAULT_MAX_CONNS.to_string();
-    Box::leak(Box::new(s))
+fn default_max_connections() -> String {
+    PostgresConnectionOptions::DEFAULT_MAX_CONNS.to_string()
 }
 
-fn default_connect_timeout() -> &'static str {
-    let s =
-        humantime::format_duration(PostgresConnectionOptions::DEFAULT_CONNECT_TIMEOUT).to_string();
-    Box::leak(Box::new(s))
+fn default_connect_timeout() -> String {
+    humantime::format_duration(PostgresConnectionOptions::DEFAULT_CONNECT_TIMEOUT).to_string()
 }
 
-fn default_idle_timeout() -> &'static str {
-    let s = humantime::format_duration(PostgresConnectionOptions::DEFAULT_IDLE_TIMEOUT).to_string();
-    Box::leak(Box::new(s))
+fn default_idle_timeout() -> String {
+    humantime::format_duration(PostgresConnectionOptions::DEFAULT_IDLE_TIMEOUT).to_string()
 }
 
-fn default_hotswap_poll_interval_timeout() -> &'static str {
-    let s = humantime::format_duration(PostgresConnectionOptions::DEFAULT_HOTSWAP_POLL_INTERVAL)
-        .to_string();
-    Box::leak(Box::new(s))
+fn default_hotswap_poll_interval_timeout() -> String {
+    humantime::format_duration(PostgresConnectionOptions::DEFAULT_HOTSWAP_POLL_INTERVAL).to_string()
 }
 
 /// CLI config for catalog DSN.
@@ -87,6 +85,15 @@ pub struct CatalogDsnConfig {
         action,
     )]
     pub postgres_schema_name: String,
+
+    /// Set the amount of time to attempt an operation on the database.
+    #[clap(
+        long = "catalog-timeout",
+        env = "INFLUXDB_IOX_CATALOG_TIMEOUT",
+        default_value = "20s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub timeout: Duration,
 
     /// Set the amount of time to attempt connecting to the database.
     #[clap(
@@ -126,6 +133,7 @@ impl CatalogDsnConfig {
         app_name: &'static str,
         metrics: Arc<metric::Registry>,
         time_provider: Arc<dyn TimeProvider>,
+        traces_jaeger_trace_context_header_name: String,
     ) -> Result<Arc<dyn Catalog>, Error> {
         let Some(dsn) = self.dsn.as_ref() else {
             return Err(Error::DsnNotSpecified {});
@@ -165,7 +173,15 @@ impl CatalogDsnConfig {
         } else if dsn.starts_with("http://") || dsn.starts_with("https://") {
             info!("Catalog: gRPC");
             let uri = dsn.parse().context(InvalidUriSnafu)?;
-            let grpc = GrpcCatalogClient::new(uri, metrics, time_provider);
+            let grpc = GrpcCatalogClient::builder(uri, metrics, time_provider)
+                .timeout(self.timeout)
+                .connect_timeout(self.connect_timeout)
+                .trace_header_name(
+                    traces_jaeger_trace_context_header_name
+                        .try_into()
+                        .context(InvalidTraceHeaderSnafu)?,
+                )
+                .build();
             Ok(Arc::new(grpc))
         } else {
             Err(Error::UnknownCatalogDsn {

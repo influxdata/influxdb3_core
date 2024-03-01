@@ -14,6 +14,10 @@ pub mod list;
 /// The header used to encode the generation in a get response
 static GENERATION: HeaderName = HeaderName::from_static("x-influx-generation");
 
+/// The header used to make a conditional get request
+static GENERATION_NOT_MATCH: HeaderName =
+    HeaderName::from_static("x-influx-if-generation-not-match");
+
 /// Defines the mapping to HTTP paths for given request types
 #[derive(Debug, Eq, PartialEq)]
 enum RequestPath {
@@ -26,16 +30,43 @@ enum RequestPath {
 impl RequestPath {
     fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('/').unwrap_or(s);
-        if s == "v1/" {
-            return Some(Self::List);
+        let mut parts = s.split('/');
+
+        let version = parts.next()?;
+        if version != "v1" {
+            return None;
         }
 
-        let (prefix, value) = s.rsplit_once('/')?;
-        let value = u64::from_str_radix(value, 16).ok()?;
-        match prefix {
-            "v1/n" => Some(Self::Resource(CacheKey::Namespace(value as i64))),
-            "v1/t" => Some(Self::Resource(CacheKey::Table(value as i64))),
-            "v1/p" => Some(Self::Resource(CacheKey::Partition(value as i64))),
+        let variant = parts.next()?;
+
+        let ensure_end = |mut parts: std::str::Split<'_, char>| {
+            if parts.next().is_some() {
+                // trailing information => unknown
+                None
+            } else {
+                Some(())
+            }
+        };
+        let parse_value = |mut parts: std::str::Split<'_, char>| {
+            let s = parts.next()?;
+
+            ensure_end(parts)?;
+
+            u64::from_str_radix(s, 16).map(|v| v as i64).ok()
+        };
+
+        match variant {
+            "" => {
+                ensure_end(parts)?;
+                Some(Self::List)
+            }
+            "r" => {
+                ensure_end(parts)?;
+                Some(Self::Resource(CacheKey::Root))
+            }
+            "n" => Some(Self::Resource(CacheKey::Namespace(parse_value(parts)?))),
+            "t" => Some(Self::Resource(CacheKey::Table(parse_value(parts)?))),
+            "p" => Some(Self::Resource(CacheKey::Partition(parse_value(parts)?))),
             _ => None,
         }
     }
@@ -45,6 +76,9 @@ impl std::fmt::Display for RequestPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::List => write!(f, "v1/"),
+            Self::Resource(CacheKey::Root) => {
+                write!(f, "v1/r")
+            }
             Self::Resource(CacheKey::Namespace(v)) => write!(f, "v1/n/{v:016x}"),
             Self::Resource(CacheKey::Table(v)) => write!(f, "v1/t/{v:016x}"),
             Self::Resource(CacheKey::Partition(v)) => write!(f, "v1/p/{v:016x}"),
@@ -54,17 +88,20 @@ impl std::fmt::Display for RequestPath {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::client::Error;
     use crate::api::list::ListEntry;
     use crate::api::server::test_util::TestCacheServer;
     use crate::api::RequestPath;
     use crate::{CacheKey, CacheValue};
     use futures::TryStreamExt;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     #[test]
     fn test_request_path() {
         let paths = [
             RequestPath::List,
+            RequestPath::Resource(CacheKey::Root),
             RequestPath::Resource(CacheKey::Partition(12)),
             RequestPath::Resource(CacheKey::Partition(i64::MAX)),
             RequestPath::Resource(CacheKey::Partition(i64::MIN)),
@@ -78,6 +115,7 @@ mod tests {
 
         let mut set = HashSet::with_capacity(paths.len());
         for path in paths {
+            println!("test: {path:?}");
             let s = path.to_string();
             let back = RequestPath::parse(&s).unwrap();
             assert_eq!(back, path);
@@ -87,7 +125,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic() {
-        let serve = TestCacheServer::bind_ephemeral();
+        let metric_registry = Arc::new(metric::Registry::new());
+        let serve = TestCacheServer::bind_ephemeral(&metric_registry);
         let client = serve.client();
 
         let key = CacheKey::Partition(1);
@@ -106,6 +145,12 @@ mod tests {
         assert!(!client.put(key, &v2).await.unwrap());
 
         let returned = client.get(key).await.unwrap().unwrap();
+        assert_eq!(v1, returned);
+
+        let err = client.get_if_modified(key, Some(2)).await.unwrap_err();
+        assert!(matches!(err, Error::NotModified), "{err}");
+
+        let returned = client.get_if_modified(key, Some(1)).await.unwrap().unwrap();
         assert_eq!(v1, returned);
 
         let v3 = CacheValue::new("3".into(), 3);
@@ -128,7 +173,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_size() {
-        let serve = TestCacheServer::bind_ephemeral();
+        let metric_registry = Arc::new(metric::Registry::new());
+        let serve = TestCacheServer::bind_ephemeral(&metric_registry);
         let client = serve.client();
 
         let v1 = CacheValue::new("123".into(), 2);

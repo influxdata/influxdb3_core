@@ -1,15 +1,3 @@
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -18,7 +6,6 @@ use std::{
     sync::{Arc, Once},
 };
 pub use tempfile;
-#[cfg(feature = "future_timeout")]
 pub mod timeout;
 pub mod tracing;
 

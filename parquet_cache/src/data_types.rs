@@ -6,6 +6,8 @@ mod objects;
 pub use objects::*;
 mod policy;
 pub use policy::*;
+mod request;
+pub use request::*;
 mod state;
 pub use state::*;
 mod write_hints;

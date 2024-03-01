@@ -15,16 +15,16 @@ use kube::{Api, Client, Resource, ResourceExt};
 use observability_deps::tracing::{debug, error, info};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 
-/// Start a new controller task to reconcile [ParquetCacheSet] objects.
-pub fn spawn_controller(client: Client, ns: Option<String>) -> JoinHandle<Result<(), kube::Error>> {
-    tokio::spawn(run_controller(client, ns))
-}
-
-async fn run_controller(client: Client, ns: Option<String>) -> Result<(), kube::Error> {
+/// Run the controller to reconcile [ParquetCache] objects.
+pub(super) async fn run_controller(
+    shutdown: impl Future<Output = ()> + Send + Sync + 'static,
+    client: Client,
+    ns: Option<String>,
+) -> Result<(), kube::Error> {
     let parquet_cache_api = match &ns {
         Some(ns) => Api::<ParquetCache>::namespaced(client.clone(), ns),
         None => Api::<ParquetCache>::all(client.clone()),
@@ -36,6 +36,7 @@ async fn run_controller(client: Client, ns: Option<String>) -> Result<(), kube::
 
     Controller::new(parquet_cache_api, Default::default())
         .owns(parquet_cache_set_api, Default::default())
+        .graceful_shutdown_on(shutdown)
         .run(reconcile, error_policy, Arc::new(Context { client }))
         .for_each(|_| futures::future::ready(()))
         .await;

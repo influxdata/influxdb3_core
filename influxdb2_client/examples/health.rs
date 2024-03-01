@@ -1,3 +1,6 @@
+// This example doesn't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let influx_url = "some-url";

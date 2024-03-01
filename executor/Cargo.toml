@@ -16,7 +16,7 @@ once_cell = { version = "1.19", features = ["parking_lot"] }
 parking_lot = "0.12"
 pin-project = "1.1"
 snafu = "0.8"
-tokio = { version = "1.35" }
+tokio = { version = "1.36" }
 tokio-util = { version = "0.7.10" }
 tokio_metrics_bridge = { path = "../tokio_metrics_bridge" }
 tokio_watchdog = { path = "../tokio_watchdog" }

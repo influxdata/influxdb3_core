@@ -3,7 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::cache_connector::Error as CacheServerError;
 
+/// Custom request header to fulfill [`GetOptions`](object_store::GetOptions).version
+pub const X_VERSION_HEADER: &str = "x-version";
+/// Custom request header to fulfill [`GetOptions`](object_store::GetOptions).head
+pub const X_HEAD_HEADER: &str = "x-head";
+
+/// Custom response header, to denote start of range
 pub static X_RANGE_START_HEADER: &str = "x-object-range-start";
+/// Custom response header, to denote end of range
 pub static X_RANGE_END_HEADER: &str = "x-object-range-end";
 
 pub fn extract_usize_header(

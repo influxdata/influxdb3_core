@@ -5,10 +5,10 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use data_types::{
-    partition_template::TablePartitionTemplateOverride, Column, ColumnSet, ColumnType,
-    ColumnsByName, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceName,
-    NamespaceSchema, ObjectStoreId, ParquetFile, ParquetFileParams, Partition, PartitionId,
-    SortKeyIds, Table, TableSchema, Timestamp, TransitionPartitionId,
+    partition_template::TablePartitionTemplateOverride, snapshot::table::TableSnapshot, Column,
+    ColumnSet, ColumnType, ColumnsByName, CompactionLevel, MaxColumnsPerTable, MaxTables,
+    Namespace, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile, ParquetFileParams,
+    Partition, PartitionId, SortKeyIds, Table, TableSchema, Timestamp, TransitionPartitionId,
 };
 use datafusion::physical_plan::metrics::Count;
 use datafusion_util::{unbounded_memory_pool, MemoryStream};
@@ -405,6 +405,17 @@ impl TestTable {
             .await
             .unwrap()
     }
+
+    /// Get snapshot for this table.
+    pub async fn snapshot(&self) -> TableSnapshot {
+        self.catalog
+            .catalog
+            .repositories()
+            .tables()
+            .snapshot(self.table.id)
+            .await
+            .unwrap()
+    }
 }
 
 /// A test column.
@@ -754,6 +765,13 @@ impl TestParquetFileBuilder {
     /// Specify the size override to use for a CompactorParquetFile
     pub fn with_size_override(mut self, size_override: i64) -> Self {
         self.size_override = Some(size_override);
+        self
+    }
+
+    /// Specify the file row count to use for a CompactorParquetFile
+    pub fn with_file_row_count(mut self, row_count: usize) -> Self {
+        self.row_count = Some(row_count);
+        self.record_batch = None; // can't have both
         self
     }
 

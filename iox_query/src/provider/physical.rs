@@ -47,7 +47,7 @@ impl ParquetChunkList {
     /// Create a new chunk list with the specified chunk and overall
     /// sort order. If the desired output sort key is specified
     /// (e.g. the partition sort key) also computes compatibility with
-    /// with the chunk order.
+    /// the chunk order.
     fn new(
         object_store_url: ObjectStoreUrl,
         chunk: &Arc<dyn QueryChunk>,

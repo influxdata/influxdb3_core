@@ -21,16 +21,23 @@ port):
 INFLUXDB_IOX_CATALOG_DSN=postgres:///iox_shared
 ```
 
-You'll then need to create the database. You can do this via the sqlx command line.
+You'll then need to create the database. You can do this via the postgres
+client tool `createdb` or the sqlx command line.
 
 ```
+createdb iox_shared
+# Or if you don't want to install postgres:
 cargo install sqlx-cli
-DATABASE_URL=<dsn> sqlx database create
-cargo run -q -- catalog setup
+DATABASE_URL=postgres:///iox_shared sqlx database create
 ```
 
-This will set up the database based on the files in `./migrations` in this crate. SQLx also creates
+Next, set up the database based on the files in `./migrations` in this crate. SQLx also creates
 a table to keep track of which migrations have been run.
+
+```
+# Run from the workspace root:
+cargo run -q -- catalog setup --catalog-dsn postgres:///iox_shared
+```
 
 NOTE: **do not** use `sqlx database setup`, because that will create the migration table in the
 wrong schema (namespace). Our `catalog setup` code will do that part by using the same sqlx

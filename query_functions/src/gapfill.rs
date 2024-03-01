@@ -52,8 +52,17 @@ impl ScalarUDFImpl for DateBinGapFillUDF {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let timezone = if arg_types.len() > 1 {
+            if let DataType::Timestamp(_, timezone) = &arg_types[1] {
+                timezone.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(DataType::Timestamp(TimeUnit::Nanosecond, timezone))
     }
 
     fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {

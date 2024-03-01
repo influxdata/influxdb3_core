@@ -7,7 +7,7 @@ use crate::error::Error;
 
 /// Re-export generated_types
 pub mod generated_types {
-    pub use generated_types::influxdata::iox::schema::v1::*;
+    pub use generated_types::influxdata::iox::{column_type::v1::ColumnType, schema::v1::*};
 }
 
 /// A basic client for fetching the Schema for a Namespace.
@@ -35,6 +35,30 @@ impl Client {
             .get_schema(GetSchemaRequest {
                 namespace: namespace.to_string(),
                 table: table.map(ToString::to_string),
+            })
+            .await?;
+
+        Ok(response.into_inner().schema.unwrap_field("schema")?)
+    }
+
+    /// Upsert the schema for a namespace and table. Returns the schema for the specified table
+    /// after applying the upsert.
+    pub async fn upsert_schema(
+        &mut self,
+        namespace: &str,
+        table: &str,
+        columns: impl Iterator<Item = (&str, ColumnType)> + Send,
+    ) -> Result<NamespaceSchema, Error> {
+        let columns = columns
+            .map(|(name, column_type)| (name.to_string(), column_type as i32))
+            .collect();
+
+        let response = self
+            .inner
+            .upsert_schema(UpsertSchemaRequest {
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+                columns,
             })
             .await?;
 

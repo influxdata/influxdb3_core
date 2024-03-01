@@ -1,0 +1,3 @@
+ALTER TABLE 
+    IF EXISTS partition
+    ADD COLUMN cold_compact_at BIGINT NOT NULL DEFAULT 0; 

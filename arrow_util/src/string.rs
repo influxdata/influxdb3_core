@@ -65,7 +65,7 @@ impl<K: AsPrimitive<usize> + FromPrimitive + Zero> PackedStringArray<K> {
     }
 
     /// Extends this [`PackedStringArray`] by the contents of `other`
-    pub fn extend_from(&mut self, other: &PackedStringArray<K>) {
+    pub fn extend_from(&mut self, other: &Self) {
         let offset = self.storage.len();
         self.storage.push_str(other.storage.as_str());
         // Copy offsets skipping the first element as this string start delimiter is already
@@ -80,7 +80,7 @@ impl<K: AsPrimitive<usize> + FromPrimitive + Zero> PackedStringArray<K> {
     }
 
     /// Extends this [`PackedStringArray`] by `range` elements from `other`
-    pub fn extend_from_range(&mut self, other: &PackedStringArray<K>, range: Range<usize>) {
+    pub fn extend_from_range(&mut self, other: &Self, range: Range<usize>) {
         let first_offset: usize = other.offsets[range.start].as_();
         let end_offset: usize = other.offsets[range.end].as_();
 

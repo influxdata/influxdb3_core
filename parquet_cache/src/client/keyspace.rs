@@ -4,14 +4,16 @@ use arc_swap::ArcSwap;
 use backoff::{Backoff, BackoffConfig};
 use bytes::Buf;
 use http::uri::Authority;
-use hyper::{Body, Method, Response, StatusCode, Uri};
+use hyper::{Body, Response, StatusCode};
 use mpchash::HashRing;
 use observability_deps::tracing::warn;
 use tokio::sync::OnceCell;
 use tower::{Service, ServiceExt};
 
 use super::request::{PinnedFuture, RawRequest};
-use crate::data_types::{KeyspaceResponseBody, ServiceNode, ServiceNodeId};
+use crate::data_types::{
+    KeyspaceResponseBody, Request, ServiceNode, ServiceNodeId, WriteHintRequestBody,
+};
 
 /// Errors associated fetching data from the cache.
 #[derive(Debug, thiserror::Error)]
@@ -65,13 +67,16 @@ where
 {
     /// Primary goal of [`HostKeyspaceService`] is to add the host to the [`RawRequest`].
     async fn add_host_to_request(&mut self, mut req: RawRequest) -> Result<RawRequest, Error> {
-        let host = match &req.key {
-            Some(obj_key) => self.hostname(obj_key).await?,
-            None => self.dst.clone(), // k8s namespace service addr
+        let host = match &req.request {
+            Request::Warmed => panic!("should not add hostname to internal-only /warmed request"),
+            Request::GetState | Request::GetKeyspace => self.dst.clone(), // k8s namespace service addr,
+            Request::GetMetadata(location, _)
+            | Request::GetObject(location, _)
+            | Request::WriteHint(WriteHintRequestBody { location, .. }) => {
+                self.hostname(location).await?
+            }
         };
-
-        req.uri_parts.authority =
-            Some(Authority::from_maybe_shared(host).map_err(Error::InvalidAddr)?);
+        req.authority = Some(Authority::from_maybe_shared(host).map_err(Error::InvalidAddr)?);
 
         Ok(req)
     }
@@ -101,16 +106,12 @@ where
 
     /// Get list of [`ServiceNode`]s from cache service.
     async fn get_service_nodes(&mut self) -> Result<Vec<ServiceNode>, Error> {
-        // use the Namespace service addr (self.dst), and not an individual server, to fetch the keyspace.
-        let uri_parts = format!("{}/keyspace", &self.dst)
-            .parse::<Uri>()
-            .map(http::uri::Parts::from)
-            .map_err(Error::InvalidAddr)?;
-
+        // always use the Namespace service addr (self.dst), and not an individual server, to fetch the keyspace.
         let req = RawRequest {
-            uri_parts,
-            method: Method::GET,
-            ..Default::default()
+            request: Request::GetKeyspace,
+            authority: Some(
+                Authority::from_maybe_shared(self.dst.clone()).map_err(Error::InvalidAddr)?,
+            ),
         };
 
         let service = self.service.ready().await?;

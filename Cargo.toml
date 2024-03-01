@@ -84,21 +84,22 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "49.0.0", features = ["prettyprint", "chrono-tz"] }
-arrow-buffer = { version = "49.0.0" }
-arrow-flight = { version = "49.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "0e53c6d816f3a9d3d27c6ebb6d25b1699e5553e7" }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "0e53c6d816f3a9d3d27c6ebb6d25b1699e5553e7" }
+arrow = { version = "50.0.0", features = ["prettyprint", "chrono-tz"] }
+arrow-buffer = { version = "50.0.0" }
+arrow-flight = { version = "50.0.0", features = ["flight-sql-experimental"] }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "91f3eb2e5430d23e2b551e66732bec1a3a575971" }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "91f3eb2e5430d23e2b551e66732bec1a3a575971" }
 hashbrown = { version = "0.14.3" }
-object_store = { version = "0.8.0" }
-parquet = { version = "49.0.0", features = ["object_store"] }
+object_store = { version = "0.9.0" }
+parquet = { version = "50.0.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
 pbjson-types = { version = "0.6.0" }
 prost = { version = "0.12.3" }
 prost-build = { version = "0.12.2" }
 prost-types = { version = "0.12.3" }
-sqlparser = { version = "0.41.0" }
+smallvec = { version = "1.13.1", features = ["union"] }
+sqlparser = { version = "0.43.1" }
 tonic = { version = "0.10.2", features = ["tls", "tls-roots"] }
 tonic-build = { version = "0.10.2" }
 tonic-health = { version = "0.10.2" }

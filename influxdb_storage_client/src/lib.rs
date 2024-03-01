@@ -1,22 +1,5 @@
 //! An InfluxDB gRPC storage API client
-#![deny(
-    rustdoc::broken_intra_doc_links,
-    rustdoc::bare_urls,
-    rust_2018_idioms,
-    missing_debug_implementations,
-    unreachable_pub
-)]
-#![warn(
-    missing_docs,
-    clippy::todo,
-    clippy::dbg_macro,
-    clippy::clone_on_ref_ptr,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+#![warn(missing_docs)]
 #![allow(clippy::missing_docs_in_private_items)]
 
 // Workaround for "unused crate" lint false positives.

@@ -2,7 +2,7 @@
 
 mod limit;
 
-use crate::local::limit::MemoryLimiter;
+pub use crate::local::limit::{MemoryLimiter, OomNotify};
 use crate::{CacheEntry, CacheKey, CacheValue};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -54,9 +54,9 @@ pub struct CatalogCache {
 
 impl CatalogCache {
     /// Create a new `CatalogCache` with an optional memory limit
-    pub fn new(limit: Option<usize>) -> Self {
+    pub fn new(limit: Option<MemoryLimiter>) -> Self {
         Self {
-            limit: limit.map(MemoryLimiter::new),
+            limit,
             ..Default::default()
         }
     }
@@ -139,20 +139,40 @@ impl CatalogCache {
     /// the last call to this function
     ///
     /// Periodically calling this provides a Not-Recently-Used eviction policy
-    pub fn evict_unused(&self) {
+    pub fn evict_unused(&self) -> EvictionStats {
+        let mut stats = EvictionStats { count: 0, size: 0 };
+
         self.map.retain(|key, entry| {
             let retain = entry.used.swap(false, Ordering::Relaxed);
+
             if !retain {
+                let size = entry.value.data.len();
                 if let Some(v) = &self.observer {
                     v.evict(*key, &entry.value);
                 }
                 if let Some(l) = &self.limit {
-                    l.free(entry.value.data.len());
+                    l.free(size);
                 }
+                stats.count += 1;
+                stats.size += size;
             }
+
             retain
         });
+
+        stats
     }
+}
+
+/// Statistics produced by [cache eviction](CatalogCache::evict_unused).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_copy_implementations)] // may want to extend this later
+pub struct EvictionStats {
+    /// Number of evicted keys.
+    pub count: usize,
+
+    /// Number of evicted bytes.
+    pub size: usize,
 }
 
 /// Iterator for [`CatalogCache`]
@@ -271,7 +291,8 @@ mod tests {
         cache.insert(CacheKey::Partition(0), value.clone()).unwrap();
         cache.insert(CacheKey::Table(0), value.clone()).unwrap();
 
-        cache.evict_unused();
+        assert_eq!(cache.evict_unused(), EvictionStats { count: 0, size: 0 },);
+
         // Inserted records should only be evicted on the next pass
         assert_eq!(cache.list().count(), 3);
         assert_eq!(observer.keys.len(), 3);
@@ -287,7 +308,7 @@ mod tests {
         // Insert a new record is used
         cache.insert(CacheKey::Partition(1), value.clone()).unwrap();
 
-        cache.evict_unused();
+        assert_eq!(cache.evict_unused(), EvictionStats { count: 1, size: 1 },);
 
         // Namespace(0) evicted
         let mut values: Vec<_> = cache.list().map(|(k, _)| k).collect();
@@ -306,14 +327,14 @@ mod tests {
         // Listing does not preserve recently used
         assert_eq!(cache.list().count(), 3);
 
-        cache.evict_unused();
+        assert_eq!(cache.evict_unused(), EvictionStats { count: 3, size: 3 },);
         assert_eq!(cache.list().count(), 0);
         assert_eq!(observer.keys.len(), 0)
     }
 
     #[test]
     fn test_limit() {
-        let cache = CatalogCache::new(Some(200));
+        let cache = CatalogCache::new(Some(MemoryLimiter::new(200)));
 
         let k1 = CacheKey::Table(1);
         let k2 = CacheKey::Table(2);
@@ -335,7 +356,7 @@ mod tests {
         cache.insert(k3, CacheValue::new(v_20.clone(), 0)).unwrap();
 
         // Should evict nothing
-        cache.evict_unused();
+        assert_eq!(cache.evict_unused(), EvictionStats { count: 0, size: 0 },);
 
         // Cannot increase size of k3 to 100
         let r = cache.insert(k3, CacheValue::new(v_100.clone(), 1));
@@ -348,7 +369,7 @@ mod tests {
         assert_eq!(r.unwrap_err().to_string(), "Cannot reserve additional 100 bytes for cache containing 120 bytes as would exceed limit of 200 bytes");
 
         // Should evict everything apart from k3
-        cache.evict_unused();
+        assert_eq!(cache.evict_unused(), EvictionStats { count: 1, size: 20 },);
 
         cache.insert(k2, CacheValue::new(v_100.clone(), 1)).unwrap();
     }

@@ -16,8 +16,18 @@ pub enum Error {
     #[snafu(context(false))]
     Decode { source: DecodeError },
 
-    #[snafu(display("Invalid PreparedStatement handle (invalid UTF-8:) {}", source))]
-    InvalidHandle { source: FromUtf8Error },
+    #[snafu(display("Invalid PreparedStatement handle. Expected protobuf Any or UTF-8 query string\nnot protobuf Any: {}\nand not UTF-8: {}", proto_source, source))]
+    InvalidHandle {
+        proto_source: DecodeError,
+        source: FromUtf8Error,
+    },
+
+    #[snafu(display("Invalid Any type URL. Expected '{}' found '{}'", expected, actual))]
+    InvalidTypeUrl { expected: String, actual: String },
+
+    #[snafu(display("Invalid parameters in prepared statement: {}", source))]
+    #[snafu(context(false))]
+    InvalidPreparedStatementParams { source: iox_query_params::Error },
 
     #[snafu(display("{}", source))]
     #[snafu(context(false))]

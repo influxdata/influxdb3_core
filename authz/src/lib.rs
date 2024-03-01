@@ -3,27 +3,13 @@
 //! Authorization client interface to be used by IOx components to
 //! restrict access to authorized requests where required.
 
-#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
-#![allow(rustdoc::private_intra_doc_links)]
+#![warn(missing_docs)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
 use base64::{prelude::BASE64_STANDARD, Engine};
 use generated_types::influxdata::iox::authz::v1::{self as proto};
-use observability_deps::tracing::warn;
 
 mod authorizer;
 pub use authorizer::Authorizer;

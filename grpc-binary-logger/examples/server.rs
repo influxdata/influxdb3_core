@@ -1,3 +1,6 @@
+// This example doesn't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use futures::Stream;
 use grpc_binary_logger::{BinaryLoggerLayer, FileSink, NoReflection};
 use std::pin::Pin;

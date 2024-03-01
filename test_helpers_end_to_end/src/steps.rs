@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use crate::snapshot_comparison::Language;
 use crate::{
     check_flight_error, run_influxql, run_influxql_with_params, run_sql, run_sql_with_params,
@@ -10,9 +12,11 @@ use futures::future::BoxFuture;
 use http::StatusCode;
 use iox_query_params::StatementParam;
 use observability_deps::tracing::info;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::{path::PathBuf, time::Duration};
 use test_helpers::assert_contains;
+use tokio::time;
 
 const MAX_QUERY_RETRY_TIME_SEC: u64 = 20;
 
@@ -344,6 +348,42 @@ pub enum Step {
         expected: Vec<&'static str>,
     },
 
+    /// Runs an http request against the ParquetCache server, in order to check state.
+    ParquetCacheServerState {
+        expected_state: String,
+        expected_curr_version: usize,
+        expected_next_version: usize,
+    },
+
+    /// Expects a timeout on the state request
+    ///
+    /// This occurs when InstanceState::Pending.
+    ParquetCacheServerStateTimeout,
+
+    /// Set the contents of the ParquetCache instance configmap
+    ParquetCacheSetConfigmap {
+        path: String,
+        contents: serde_json::Value,
+    },
+
+    /// Wait until the warming is complete, and an instance is running.
+    ParquetCacheSetServerStateWaitUntilWarmingComplete,
+
+    /// Wait until specific version is current.
+    ParquetCacheSetServerStateWaitUntilVersion { version: usize },
+
+    /// Wait until the data cache write-back contains a certain number of files.
+    ParquetCacheWaitUntilFileCountExists {
+        count: usize,
+        cache_store_path: String,
+    },
+
+    /// Confirm the existence, or lack thereof, of an object key within the ParquetCache.
+    ParquetCacheExistenceCheck {
+        location: String,
+        expected: StatusCode,
+    },
+
     /// Read and verify partition keys for a given table
     PartitionKeys {
         table_name: String,
@@ -372,8 +412,8 @@ pub enum Step {
     Custom(FCustom),
 }
 
-impl AsRef<Step> for Step {
-    fn as_ref(&self) -> &Step {
+impl AsRef<Self> for Step {
+    fn as_ref(&self) -> &Self {
         self
     }
 }
@@ -803,6 +843,104 @@ where
                     assert_batches_sorted_eq!(expected, &batches);
                     info!("====Done running");
                 }
+                Step::ParquetCacheServerState {
+                    expected_state,
+                    expected_curr_version,
+                    expected_next_version,
+                } => {
+                    let resp = state
+                        .cluster
+                        .parquet_cache_state()
+                        .await
+                        .expect("should receive response from parquet_cache server");
+
+                    let response = String::from_utf8(
+                        hyper::body::to_bytes(resp.into_body())
+                            .await
+                            .expect("should read response body")
+                            .into(),
+                    )
+                    .expect("response body is invalid utf8");
+                    let response = serde_json::from_str::<Value>(&response)
+                        .expect("response body is invalid json");
+
+                    let state = response.get("state").expect("should have state");
+                    assert_matches::assert_matches!(
+                        state,
+                        Value::String(s) if s == expected_state,
+                        "expected state to be {}, but found {}",
+                        expected_state, state
+                    );
+
+                    let curr_ver = response
+                        .get("current_node_set_revision")
+                        .expect("should have current_node_set_revision")
+                        .to_string();
+                    assert_eq!(
+                        curr_ver,
+                        expected_curr_version.to_string(),
+                        "expected current_node_set_revision to be {}, but found {}",
+                        expected_curr_version,
+                        curr_ver
+                    );
+
+                    let next_ver = response
+                        .get("next_node_set_revision")
+                        .expect("should have next_node_set_revision")
+                        .to_string();
+                    assert_eq!(
+                        next_ver,
+                        expected_next_version.to_string(),
+                        "expected next_node_set_revision to be {}, but found {}",
+                        expected_next_version,
+                        next_ver
+                    );
+                }
+                Step::ParquetCacheServerStateTimeout => {
+                    let resp = state.cluster.parquet_cache_state().await;
+                    assert_matches::assert_matches!(
+                        resp,
+                        Err(e) if e.to_string().contains("timeout"),
+                        "expected timeout (due to failed poll_ready), but found {:?}",
+                        resp
+                    );
+                }
+                Step::ParquetCacheSetConfigmap { path, contents } => {
+                    let path = std::path::Path::new(path);
+                    let tempdir_path = path.parent().expect("should have parent");
+                    let mut new_configmap = tempfile::NamedTempFile::new_in(tempdir_path)
+                        .expect("should create tempfile");
+                    writeln!(new_configmap, "{}", contents)
+                        .expect("should write keyspace definition to configfile");
+                    std::fs::copy(new_configmap.path(), path)
+                        .expect("should overwrite configmap file");
+                }
+                Step::ParquetCacheSetServerStateWaitUntilWarmingComplete => {
+                    parquet_cache_server_wait_for_warming(&mut state).await;
+                }
+                Step::ParquetCacheSetServerStateWaitUntilVersion { version } => {
+                    parquet_cache_server_wait_for_version(version, &mut state).await;
+                }
+                Step::ParquetCacheWaitUntilFileCountExists {
+                    count,
+                    cache_store_path,
+                } => {
+                    parquet_cache_server_wait_for_writeback(count, cache_store_path).await;
+                }
+                Step::ParquetCacheExistenceCheck { location, expected } => {
+                    let resp = state
+                        .cluster
+                        .parquet_cache_fetch(location)
+                        .await
+                        .expect("should receive response from parquet_cache server");
+                    assert_eq!(
+                        resp.status(),
+                        *expected,
+                        "expected status code {}, but found {}",
+                        expected,
+                        resp.status()
+                    );
+                }
                 Step::PartitionKeys {
                     table_name,
                     namespace_name,
@@ -847,4 +985,101 @@ where
             }
         }
     }
+}
+
+async fn parquet_cache_server_wait_for_warming(state: &mut StepTestState<'_>) {
+    let now = tokio::time::Instant::now();
+
+    while now.elapsed().as_secs() < 10 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        if let Ok(resp) = state.cluster.parquet_cache_state().await {
+            let response = String::from_utf8(
+                hyper::body::to_bytes(resp.into_body())
+                    .await
+                    .expect("should read response body")
+                    .into(),
+            )
+            .expect("response body is invalid utf8");
+            let response =
+                serde_json::from_str::<Value>(&response).expect("response body is invalid json");
+
+            if let Value::String(state) = response.get("state").expect("should have state") {
+                match state.as_str() {
+                    "warming" => continue,
+                    "running" => return,
+                    other => panic!("unexpected state, found {}", other),
+                }
+            } else {
+                unreachable!("should only receive a valid state response");
+            }
+        };
+    }
+    panic!("parquet cache server never finished warming");
+}
+
+async fn parquet_cache_server_wait_for_version(version: &usize, state: &mut StepTestState<'_>) {
+    let now = tokio::time::Instant::now();
+
+    while now.elapsed().as_secs() < 5 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        if let Ok(resp) = state.cluster.parquet_cache_state().await {
+            let response = String::from_utf8(
+                hyper::body::to_bytes(resp.into_body())
+                    .await
+                    .expect("should read response body")
+                    .into(),
+            )
+            .expect("response body is invalid utf8");
+            let response =
+                serde_json::from_str::<Value>(&response).expect("response body is invalid json");
+
+            if let Value::Number(current_version) = response
+                .get("current_node_set_revision")
+                .expect("should have current_node_set_revision")
+            {
+                if current_version.as_u64().unwrap() == *version as u64 {
+                    return;
+                } else {
+                    continue;
+                }
+            } else {
+                unreachable!("should only receive a valid current_node_set_revision response");
+            }
+        };
+    }
+    panic!("parquet cache server never got the version {}", version);
+}
+
+async fn parquet_cache_server_wait_for_writeback(count: &usize, cache_store_path: &String) {
+    let retry_duration = time::Duration::from_secs(1);
+
+    time::timeout(retry_duration, async move {
+        let mut interval = time::interval(time::Duration::from_millis(10));
+        loop {
+            let mut file_count = 0;
+            let mut files =
+                std::fs::read_dir(cache_store_path).expect("local cache store path exists");
+            while let Some(Ok(patition_key_dir)) = files.next() {
+                let mut files = std::fs::read_dir(patition_key_dir.path().display().to_string())
+                    .expect("partition dir should exist");
+                while let Some(Ok(_object_location)) = files.next() {
+                    file_count += 1;
+                }
+            }
+
+            if &file_count == count {
+                return;
+            }
+            interval.tick().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "parquet cache server never got write-backs for {} number of objects",
+            count
+        )
+    });
 }

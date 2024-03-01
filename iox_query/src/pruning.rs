@@ -1,6 +1,8 @@
 //! Implementation of statistics based pruning
 
+use crate::pruning_oracle::{NoopPruningOracle, PruningOracle};
 use crate::QueryChunk;
+
 use arrow::{
     array::{ArrayRef, BooleanArray, UInt64Array},
     datatypes::{DataType, SchemaRef},
@@ -81,7 +83,10 @@ pub fn prune_chunks(
     debug!(num_chunks, ?filters, "Pruning chunks");
     let summaries: Vec<_> = chunks
         .iter()
-        .map(|c| (c.stats(), c.schema().as_arrow()))
+        .map(|c| Summary {
+            stats: c.stats(),
+            schema_ref: c.schema().as_arrow(),
+        })
         .collect();
 
     let filter_expr = match filters.iter().cloned().reduce(|a, b| a.and(b)) {
@@ -92,35 +97,40 @@ pub fn prune_chunks(
         }
     };
 
-    prune_summaries(table_schema, &summaries, &filter_expr)
+    prune_summaries(
+        ChunkPruningStatistics::new(table_schema, &summaries),
+        &filter_expr,
+    )
+}
+
+/// An opaque [`PruningStatistics`] implementation which exposes the associated table schema.
+pub trait SchemaPruningStatistics: PruningStatistics {
+    fn table_schema(&self) -> &Schema;
 }
 
 /// Given a `Vec` of pruning summaries, return a `Vec<bool>` where `false` indicates that the
 /// predicate can be proven to evaluate to `false` for every single row.
 pub fn prune_summaries(
-    table_schema: &Schema,
-    summaries: &[(Arc<Statistics>, SchemaRef)],
+    pruning_statistics: impl SchemaPruningStatistics,
     filter_expr: &Expr,
 ) -> Result<Vec<bool>, NotPrunedReason> {
     trace!(%filter_expr, "Filter_expr of pruning chunks");
 
     // no information about the queries here
     let props = ExecutionProps::new();
-    let pruning_predicate =
-        match create_pruning_predicate(&props, filter_expr, &table_schema.as_arrow()) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(%e, ?filter_expr, "Can not create pruning predicate");
-                return Err(NotPrunedReason::CanNotCreatePruningPredicate);
-            }
-        };
-
-    let statistics = ChunkPruningStatistics {
-        table_schema,
-        summaries,
+    let pruning_predicate = match create_pruning_predicate(
+        &props,
+        filter_expr,
+        &pruning_statistics.table_schema().as_arrow(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%e, ?filter_expr, "Can not create pruning predicate");
+            return Err(NotPrunedReason::CanNotCreatePruningPredicate);
+        }
     };
 
-    let results = match pruning_predicate.prune(&statistics) {
+    let results = match pruning_predicate.prune(&pruning_statistics) {
         Ok(results) => results,
         Err(e) => {
             warn!(%e, ?filter_expr, "DataFusion pruning failed");
@@ -130,14 +140,50 @@ pub fn prune_summaries(
     Ok(results)
 }
 
-/// Wraps a collection of [`QueryChunk`] and implements the [`PruningStatistics`]
-/// interface required for pruning
-struct ChunkPruningStatistics<'a> {
-    table_schema: &'a Schema,
-    summaries: &'a [(Arc<Statistics>, SchemaRef)],
+/// Summary of statistics and optional server-side bucketing info for pruning
+#[derive(Debug)]
+pub struct Summary {
+    pub stats: Arc<Statistics>,
+    pub schema_ref: SchemaRef,
+    // TODO chunchun: add pruning_oracle, something like:
+    // pub pruning_oracle: Option<Arc<BucketPartitionPruningOracle>>,
 }
 
-impl<'a> ChunkPruningStatistics<'a> {
+/// Wraps a collection of pruning summaries and implements the [`PruningStatistics`]
+/// interface required to use them for pruning [`QueryChunk`]s
+#[derive(Debug)]
+pub struct ChunkPruningStatistics<'a, T> {
+    table_schema: &'a Schema,
+    summaries: &'a [Summary],
+    pruning_oracle: T,
+}
+
+impl<'a> ChunkPruningStatistics<'a, NoopPruningOracle> {
+    /// A constructor for [`ChunkPruningStatistics`] when no [`PruningOracle`]
+    /// is to be provided.
+    pub fn new(table_schema: &'a Schema, summaries: &'a [Summary]) -> Self {
+        Self::new_with_pruning_oracle(table_schema, summaries, NoopPruningOracle)
+    }
+}
+
+impl<'a, T> ChunkPruningStatistics<'a, T>
+where
+    T: PruningOracle,
+{
+    /// Constructs the [`ChunkPruningStatistics`] to use `pruning_oracle` for the
+    /// implementation of [`PruningStatistics::contained()`].
+    pub fn new_with_pruning_oracle(
+        table_schema: &'a Schema,
+        summaries: &'a [Summary],
+        pruning_oracle: T,
+    ) -> Self {
+        Self {
+            table_schema,
+            summaries,
+            pruning_oracle,
+        }
+    }
+
     /// Returns the [`DataType`] for `column`
     fn column_type(&self, column: &Column) -> Option<&DataType> {
         let index = self.table_schema.find_index_of(&column.name)?;
@@ -150,14 +196,27 @@ impl<'a> ChunkPruningStatistics<'a> {
         &'c self,
         column: &'b Column,
     ) -> impl Iterator<Item = Option<&'a ColumnStatistics>> + 'a {
-        self.summaries.iter().map(|(stats, schema)| {
-            let idx = schema.index_of(&column.name).ok()?;
+        self.summaries.iter().map(|summary| {
+            let Summary { stats, schema_ref } = summary;
+            let idx = schema_ref.index_of(&column.name).ok()?;
             Some(&stats.column_statistics[idx])
         })
     }
 }
 
-impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
+impl<'a, T> SchemaPruningStatistics for ChunkPruningStatistics<'a, T>
+where
+    T: PruningOracle,
+{
+    fn table_schema(&self) -> &'a Schema {
+        self.table_schema
+    }
+}
+
+impl<'a, T> PruningStatistics for ChunkPruningStatistics<'a, T>
+where
+    T: PruningOracle,
+{
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let data_type = self.column_type(column)?;
         let summaries = self.column_summaries(column);
@@ -183,12 +242,14 @@ impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
         Some(Arc::new(UInt64Array::from_iter(null_counts)))
     }
 
-    fn contained(
-        &self,
-        _column: &datafusion::common::Column,
-        _values: &HashSet<ScalarValue>,
-    ) -> Option<BooleanArray> {
-        None
+    fn contained(&self, column: &Column, values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        // This type does not yet implement `contained()` for itself, so must
+        // rely on it's [`PruningOracle`] to provide any answers.
+        let contained = self.pruning_oracle.could_contain_values(column, values)?;
+        // Invariant: If the pruning oracle provides an answer, it must be the same length as the summaries
+        // this pruning statistics holds.
+        assert_eq!(contained.len(), self.summaries.len());
+        Some(contained)
     }
 }
 

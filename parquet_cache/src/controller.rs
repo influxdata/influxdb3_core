@@ -1,12 +1,13 @@
 //! The controller module contains the API and functionality
 //! used to implement the controller for a DataCacheSet.
 
-use futures::future::select;
 use kube::Client;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod error;
 pub use error::{Error, Result};
+
 mod kube_util;
 mod parquet_cache;
 pub use parquet_cache::{
@@ -38,16 +39,26 @@ const SHORT_WAIT: Duration = Duration::from_secs(60);
 /// the controller will be awoken by changes to owned objects.
 const LONG_WAIT: Duration = Duration::from_secs(3600);
 
-/// Run the controllers for ParquetCache and ParquetCacheSet resources to completion.
-pub async fn run(client: Client, namespace: Option<String>) -> Result<(), kube::Error> {
-    let parquet_cache_join_handle =
-        parquet_cache_controller::spawn_controller(client.clone(), namespace.clone());
-    let parquet_cache_set_join_handle =
-        parquet_cache_set_controller::spawn_controller(client.clone(), namespace.clone());
-
-    select(parquet_cache_join_handle, parquet_cache_set_join_handle)
+/// Run the controller for reconciling ParquetCache objects.
+pub async fn run_parquet_cache_controller(
+    shutdown: CancellationToken,
+    client: Client,
+    ns: Option<String>,
+) -> Result<(), kube::Error> {
+    parquet_cache_controller::run_controller(async move { shutdown.cancelled().await }, client, ns)
         .await
-        .factor_first()
-        .0
-        .unwrap()
+}
+
+/// Run the controller for reconciling ParquetCacheSet objects.
+pub async fn run_parquet_cache_set_controller(
+    shutdown: CancellationToken,
+    client: Client,
+    ns: Option<String>,
+) -> Result<(), kube::Error> {
+    parquet_cache_set_controller::run_controller(
+        async move { shutdown.cancelled().await },
+        client,
+        ns,
+    )
+    .await
 }

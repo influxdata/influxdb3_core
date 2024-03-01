@@ -49,7 +49,7 @@ impl<K: AsPrimitive<usize> + FromPrimitive + Zero> StringDictionary<K> {
         Default::default()
     }
 
-    pub fn with_capacity(keys: usize, values: usize) -> StringDictionary<K> {
+    pub fn with_capacity(keys: usize, values: usize) -> Self {
         Self {
             hash: Default::default(),
             dedup: HashMap::with_capacity_and_hasher(keys, ()),

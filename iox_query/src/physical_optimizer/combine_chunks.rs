@@ -34,7 +34,7 @@ use crate::{
 //
 /// Goals of this optimzation step:
 ///   i. Combine **possible** plans with_chunks into a single union
-///   ii. - Keep the the combined plan non-overlapped on time ranges. This will likely help later optimization steps.
+///   ii. - Keep the combined plan non-overlapped on time ranges. This will likely help later optimization steps.
 ///       - If time ranges cannot be computed, combine all plans with_chunks into a single union.
 ///
 /// Example: w = with_chunks, o = other_plans

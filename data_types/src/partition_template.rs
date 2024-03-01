@@ -701,9 +701,15 @@ pub enum ColumnValue<'a> {
         end: DateTime<Utc>,
     },
 
-    /// The inner value is the ID of the bucket selected through a modulo hash
-    /// of the input column value.
-    Bucket(u32),
+    /// Bucket information.
+    Bucket {
+        /// ID of the bucket selected through a modulo hash
+        /// of the input column value.
+        id: u32,
+
+        /// The divisor of the modulo hash specified in the partition template used to derive this `ColumnValue`.
+        num_buckets: u32,
+    },
 }
 
 impl<'a> ColumnValue<'a> {
@@ -718,7 +724,7 @@ impl<'a> ColumnValue<'a> {
         let this = match self {
             ColumnValue::Identity(v) => v.as_bytes(),
             ColumnValue::Prefix(v) => v.as_bytes(),
-            ColumnValue::Datetime { .. } | ColumnValue::Bucket(..) => {
+            ColumnValue::Datetime { .. } | ColumnValue::Bucket { .. } => {
                 return false;
             }
         };
@@ -736,7 +742,7 @@ where
             ColumnValue::Identity(v) => other.as_ref().eq(v.as_ref()),
             ColumnValue::Prefix(_) => false,
             ColumnValue::Datetime { .. } => false,
-            ColumnValue::Bucket(..) => false,
+            ColumnValue::Bucket { .. } => false,
         }
     }
 }
@@ -893,14 +899,14 @@ fn parse_part_time_format(value: &str, format: &str) -> Option<ColumnValue<'stat
 
 fn parse_part_bucket(value: &str, num_buckets: u32) -> Option<ColumnValue<'_>> {
     // Parse the bucket ID from the given value string.
-    let bucket_id = value
+    let id = value
         .parse::<u32>()
         .expect("invalid partition key bucket encoding");
     // Invariant: If the bucket ID (0 indexed) is greater than the number of
     // buckets to spread data across the partition key is invalid.
-    assert!(bucket_id < num_buckets);
+    assert!(id < num_buckets);
 
-    Some(ColumnValue::Bucket(bucket_id))
+    Some(ColumnValue::Bucket { id, num_buckets })
 }
 
 fn parsed_implicit_defaults(mut parsed: chrono::format::Parsed) -> Option<chrono::format::Parsed> {
@@ -1258,8 +1264,8 @@ mod tests {
         ColumnValue::Identity(s.into())
     }
 
-    fn bucket(bucket_id: u32) -> ColumnValue<'static> {
-        ColumnValue::Bucket(bucket_id)
+    fn bucket(id: u32, num_buckets: u32) -> ColumnValue<'static> {
+        ColumnValue::Bucket { id, num_buckets }
     }
 
     fn prefix<'a, T>(s: T) -> ColumnValue<'a>
@@ -1381,7 +1387,7 @@ mod tests {
             (TIME_COLUMN_NAME, year(2023)),
             ("a", identity("bananas")),
             ("b", identity("plátanos")),
-            ("c", bucket(5)),
+            ("c", bucket(5, 10)),
         ]
     );
 
@@ -1422,7 +1428,7 @@ mod tests {
             (TIME_COLUMN_NAME, year(2023)),
             ("a", identity("cat|dog")),
             ("b", identity("!")),
-            ("c", bucket(8)),
+            ("c", bucket(8, 10)),
         ]
     );
 
@@ -1438,7 +1444,7 @@ mod tests {
         want = [
             (TIME_COLUMN_NAME, year(2023)),
             ("a", identity("%50")),
-            ("c", bucket(9)),
+            ("c", bucket(9, 10)),
         ]
     );
 
@@ -1454,7 +1460,7 @@ mod tests {
         want = [
             (TIME_COLUMN_NAME, year(2023)),
             ("a", identity("")),
-            ("c", bucket(0)),
+            ("c", bucket(0, 10)),
         ]
     );
 
@@ -1623,7 +1629,11 @@ mod tests {
             TemplatePart::Bucket("c", 144)
         ],
         partition_key = "1|2|3",
-        want = [("a", bucket(1)), ("b", bucket(2)), ("c", bucket(3)),]
+        want = [
+            ("a", bucket(1, 41)),
+            ("b", bucket(2, 91)),
+            ("c", bucket(3, 144)),
+        ]
     );
 
     #[test]

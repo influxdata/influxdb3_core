@@ -269,7 +269,7 @@ impl Selector {
 }
 
 impl Accumulator for Selector {
-    fn state(&self) -> DataFusionResult<Vec<ScalarValue>> {
+    fn state(&mut self) -> DataFusionResult<Vec<ScalarValue>> {
         Ok([
             self.value.clone(),
             ScalarValue::TimestampNanosecond(self.time, self.timezone.clone()),
@@ -308,12 +308,12 @@ impl Accumulator for Selector {
         self.update_batch(states)
     }
 
-    fn evaluate(&self) -> DataFusionResult<ScalarValue> {
-        Ok(make_struct_scalar(
+    fn evaluate(&mut self) -> DataFusionResult<ScalarValue> {
+        make_struct_scalar(
             &self.value,
             &ScalarValue::TimestampNanosecond(self.time, self.timezone.clone()),
             self.other.iter(),
-        ))
+        )
     }
 
     fn size(&self) -> usize {

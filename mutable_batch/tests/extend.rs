@@ -1,3 +1,6 @@
+// Tests and benchmarks don't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
 use mutable_batch::{writer::Writer, MutableBatch};

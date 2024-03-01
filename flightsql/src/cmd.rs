@@ -9,6 +9,8 @@ use arrow_flight::sql::{
     CommandGetTables, CommandGetXdbcTypeInfo, CommandPreparedStatementQuery, CommandStatementQuery,
 };
 use bytes::Bytes;
+use generated_types::influxdata::iox::querier::v1::FlightSqlPreparedStatementHandle;
+use iox_query_params::StatementParams;
 use prost::Message;
 use snafu::ResultExt;
 
@@ -21,41 +23,98 @@ use crate::error::*;
 pub struct PreparedStatementHandle {
     /// The raw SQL query text
     query: String,
+    /// Any parameters supplied via DoPut(CommandPreparedStatementQuery)
+    params: StatementParams,
 }
 
 impl PreparedStatementHandle {
-    pub fn new(query: String) -> Self {
-        Self { query }
+    const PREPARED_STATEMENT_HANDLE_TYPE_URL: &'static str =
+        "type.googleapis.com/influxdata.iox.querier.v1.FlightSqlPreparedStatementHandle";
+
+    pub(crate) fn new(query: impl Into<String>) -> Self {
+        Self::new_with_params(query, StatementParams::default())
     }
 
-    /// return the query
+    pub(crate) fn new_with_params(query: impl Into<String>, params: StatementParams) -> Self {
+        Self {
+            query: query.into(),
+            params,
+        }
+    }
+
+    /// return a reference to the query
     pub fn query(&self) -> &str {
         self.query.as_ref()
     }
 
+    /// return a reference to the params
+    pub fn params(&self) -> &StatementParams {
+        &self.params
+    }
+
+    /// Consume the handle and return the query and parameters
+    pub(crate) fn into_parts(self) -> (String, StatementParams) {
+        (self.query, self.params)
+    }
+
     fn try_decode(handle: Bytes) -> Result<Self> {
-        // Note: in IOx  handles are the entire decoded query
-        // It will likely need to get more sophisticated as part of
-        // https://github.com/influxdata/influxdb_iox/issues/6699
-        let query = String::from_utf8(handle.to_vec()).context(InvalidHandleSnafu)?;
-        Ok(Self { query })
+        match Any::decode(&*handle) {
+            Ok(any) => {
+                if any.type_url == Self::PREPARED_STATEMENT_HANDLE_TYPE_URL {
+                    let decoded_handle = FlightSqlPreparedStatementHandle::decode(any.value)?;
+                    Ok(Self::new_with_params(
+                        decoded_handle.query,
+                        decoded_handle.params.try_into()?,
+                    ))
+                } else {
+                    InvalidTypeUrlSnafu {
+                        expected: Self::PREPARED_STATEMENT_HANDLE_TYPE_URL,
+                        actual: any.type_url,
+                    }
+                    .fail()
+                }
+            }
+            // initially the prepared statement handle was encoded as a raw UTF-8 string
+            // this is a fallback case to support the legacy behavior
+            Err(proto_source) => {
+                let query = String::from_utf8(handle.to_vec())
+                    .context(InvalidHandleSnafu { proto_source })?;
+                Ok(Self::new(query))
+            }
+        }
     }
 
     fn encode(self) -> Bytes {
-        Bytes::from(self.query.into_bytes())
+        let flightsql_handle = FlightSqlPreparedStatementHandle {
+            query: self.query,
+            params: self.params.into(),
+        };
+        let any = Any {
+            type_url: Self::PREPARED_STATEMENT_HANDLE_TYPE_URL.to_string(),
+            value: flightsql_handle.encode_to_vec().into(),
+        };
+        any.encode_to_vec().into()
     }
 }
 
 impl Display for PreparedStatementHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Pepared({})", self.query)
+        write!(f, "Pepared({}, {})", self.query, self.params)
     }
 }
 
 /// Encode a PreparedStatementHandle as Bytes
 impl From<PreparedStatementHandle> for Bytes {
     fn from(value: PreparedStatementHandle) -> Self {
-        Self::from(value.query.into_bytes())
+        value.encode()
+    }
+}
+
+/// Attempt to decode a sequence of Bytes into a PreparedStatementHandle
+impl TryFrom<Bytes> for PreparedStatementHandle {
+    type Error = crate::Error;
+    fn try_from(value: Bytes) -> Result<Self> {
+        Self::try_decode(value)
     }
 }
 
@@ -331,5 +390,23 @@ impl FlightSQLCommand {
             }
         }?;
         Ok(msg.encode_to_vec().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use iox_query_params::StatementParams;
+
+    use crate::PreparedStatementHandle;
+
+    /// Tests that the older UTF-8 encoded format for the FlightSQL prepared
+    /// statement handle can be decoded by the current implementation.
+    #[test]
+    fn prepared_statement_handle_decoding_compatibility() {
+        let handle_bytes = Bytes::from("SELECT 1");
+        let handle = PreparedStatementHandle::try_decode(handle_bytes).unwrap();
+        assert_eq!(handle.query, "SELECT 1");
+        assert_eq!(handle.params, StatementParams::default());
     }
 }

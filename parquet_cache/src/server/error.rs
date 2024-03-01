@@ -1,6 +1,6 @@
 use hyper::StatusCode;
 
-use crate::server::data::DataError;
+use crate::server::{cache::WarmingError, data::DataError, precondition::PreconditionError};
 
 /// Error type for the server.
 #[derive(Debug, thiserror::Error)]
@@ -10,14 +10,14 @@ pub enum Error {
     Keyspace(String),
     /// Error in the precondition layer.
     #[error("Precondition error: {0}")]
-    Precondition(String),
+    Precondition(#[from] PreconditionError),
     /// Error in the data layer.
     #[error("Data error: {0}")]
     Data(#[from] DataError),
 
     /// Error with warming.
     #[error("Warming error: {0}")]
-    Warming(String),
+    Warming(#[from] WarmingError),
     /// Cache miss.
     #[error("Cache miss")]
     CacheMiss,
@@ -41,8 +41,10 @@ impl Error {
             // If errors here, have the client return an error.
             Self::BadRequest(_)
             | Self::DoesNotExist
-            | Self::Data(DataError::BadRequest(_))
-            | Self::Data(DataError::DoesNotExist) => StatusCode::BAD_REQUEST,
+            | Self::Data(DataError::Write(crate::server::data::WriteError::BadRequest(_)))
+            | Self::Data(DataError::Write(crate::server::data::WriteError::DoesNotExist)) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::Precondition(_) => StatusCode::PRECONDITION_FAILED,
             // If errors below here, result in the client using the fallback.
             Self::CacheMiss => StatusCode::NOT_FOUND,

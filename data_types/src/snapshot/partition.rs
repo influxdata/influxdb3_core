@@ -44,6 +44,9 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A snapshot of a partition
+///
+/// # Soft Deletion
+/// This snapshot does NOT contains soft-deleted parquet files.
 #[derive(Debug, Clone)]
 pub struct PartitionSnapshot {
     /// The [`NamespaceId`]
@@ -68,6 +71,8 @@ pub struct PartitionSnapshot {
     new_file_at: Option<Timestamp>,
     /// Skipped compaction.
     skipped_compaction: Option<skipped_compaction_proto::SkippedCompaction>,
+    /// The time of the last cold compaction
+    cold_compact_at: Option<Timestamp>,
 }
 
 impl PartitionSnapshot {
@@ -121,6 +126,7 @@ impl PartitionSnapshot {
             table_id: partition.table_id,
             new_file_at: partition.new_file_at,
             skipped_compaction: skipped_compaction.map(|sc| sc.into()),
+            cold_compact_at: partition.cold_compact_at,
         })
     }
 
@@ -143,6 +149,7 @@ impl PartitionSnapshot {
             sort_key: SortKeyIds::new(proto.sort_key_ids.into_iter().map(ColumnId::new)),
             new_file_at: proto.new_file_at.map(Timestamp::new),
             skipped_compaction: proto.skipped_compaction,
+            cold_compact_at: proto.cold_compact_at.map(Timestamp::new),
         }
     }
 
@@ -211,6 +218,7 @@ impl PartitionSnapshot {
             key.into(),
             self.sort_key.clone(),
             self.new_file_at,
+            self.cold_compact_at,
         ))
     }
 
@@ -241,6 +249,7 @@ impl From<PartitionSnapshot> for proto::Partition {
             sort_key_ids: value.sort_key.iter().map(|x| x.get()).collect(),
             new_file_at: value.new_file_at.map(|x| x.get()),
             skipped_compaction: value.skipped_compaction,
+            cold_compact_at: value.cold_compact_at.map(|x| x.get()),
         }
     }
 }

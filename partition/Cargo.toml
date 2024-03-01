@@ -16,8 +16,8 @@ hashbrown = { workspace = true }
 mutable_batch = { path = "../mutable_batch" }
 percent-encoding = "2.3.1"
 schema = { path = "../schema" }
-thiserror = "1.0.56"
-unicode-segmentation = "1.10.1"
+thiserror = "1.0.57"
+unicode-segmentation = "1.11.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

@@ -6,6 +6,9 @@
 //!
 //! Verifies that the rows and statistics are as expected after a number of interleaved writes
 
+// Tests and benchmarks don't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use arrow::{
     array::{
         ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
@@ -105,7 +108,7 @@ fn compute_stats<T: PartialOrd + IsNan + ToOwned<Owned = T>>(data: &[Option<T>])
 
 impl Expected {
     /// Returns a filtered version of `self` based on the provided `ranges`
-    fn filter(self, ranges: &[Range<usize>]) -> Expected {
+    fn filter(self, ranges: &[Range<usize>]) -> Self {
         Self {
             time_expected: filter_vec(ranges, &self.time_expected),
             tag_expected: filter_vec(ranges, &self.tag_expected),
@@ -118,7 +121,7 @@ impl Expected {
     }
 
     /// Extends `self` with the writes from `other`
-    fn concat(&mut self, other: &Expected) {
+    fn concat(&mut self, other: &Self) {
         self.time_expected.extend_from_slice(&other.time_expected);
         self.tag_expected.extend_from_slice(&other.tag_expected);
         self.string_expected
@@ -420,7 +423,7 @@ fn test_partition_write() {
     let w = PartitionWrite::new(&batch).unwrap();
     assert_eq!(w.rows().get(), expected.tag_expected.len());
 
-    let verify_write = |write: &PartitionWrite<'_>| {
+    let verify_write = |write: &PartitionWrite<'_, MutableBatch>| {
         // Verify that the time and row statistics computed by the PartitionWrite
         // match what actually gets written to a MutableBatch
         let mut temp = MutableBatch::new();

@@ -1,5 +1,6 @@
 use crate::error;
 use arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::scalar::ScalarStructBuilder;
 use datafusion::common::tree_node::{Transformed, TreeNode, VisitRecursion};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::logical_expr::utils::expr_as_column_expr;
@@ -108,15 +109,14 @@ fn number_to_scalar(n: &Number, data_type: &DataType) -> Result<ScalarValue> {
         (Number::Float(v), DataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
             ScalarValue::TimestampNanosecond(Some(*v as i64), tz.clone())
         }
-        (n, DataType::Struct(fields)) => ScalarValue::Struct(
-            Some(
-                fields
-                    .iter()
-                    .map(|f| number_to_scalar(n, f.data_type()))
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            fields.clone(),
-        ),
+        (n, DataType::Struct(fields)) => {
+            let mut builder = ScalarStructBuilder::new();
+            for field in fields {
+                let value = number_to_scalar(n, field.data_type())?;
+                builder = builder.with_scalar(field, value);
+            }
+            builder.build()?
+        }
         (_, DataType::Null) => ScalarValue::Null,
         (n, data_type) => {
             // The only output data types expected are Int64, Float64 or UInt64

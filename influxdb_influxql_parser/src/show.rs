@@ -63,6 +63,18 @@ fn show_databases(i: &str) -> ParseResult<&str, ShowDatabasesStatement> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnClause(pub(crate) Identifier);
 
+impl OnClause {
+    fn into_inner(self) -> Identifier {
+        self.0
+    }
+}
+
+impl From<OnClause> for Identifier {
+    fn from(oc: OnClause) -> Self {
+        oc.into_inner()
+    }
+}
+
 impl_tuple_clause!(OnClause, Identifier);
 
 impl Display for OnClause {
@@ -135,5 +147,16 @@ mod test {
             show_statement("SHOW FOO"),
             "invalid SHOW statement, expected DATABASES, FIELD, MEASUREMENTS, TAG, or RETENTION following SHOW"
         );
+    }
+
+    #[test]
+    fn on_clause() {
+        let Ok((_, Statement::ShowRetentionPolicies(got))) =
+            show_statement("SHOW RETENTION POLICIES ON foo")
+        else {
+            panic!("did not get a SHOW RETENTION POLICIES statement");
+        };
+        let on_clause = got.database.expect("statement has an ON clause");
+        assert_eq!(on_clause.into_inner(), "foo".into());
     }
 }

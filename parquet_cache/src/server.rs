@@ -1,5 +1,43 @@
 #![allow(dead_code)]
 //! Contains the cache server.
+//!
+//! The cache server is divided into different tower service layers, as follows:
+//!
+//! ┌──────────────────────────────────────────────────┐
+//! │ CacheService                                     │
+//! │                                                  │
+//! │   Handles self-issued requests.                  │
+//! │   * prewarming of cache.                         │
+//! └────────────────────────┬─────────────────────────┘
+//!                          │
+//!                          │
+//! ┌────────────────────────▼─────────────────────────┐
+//! │ KeyspaceService                                  │
+//! │                                                  │
+//! │   Handles consistent hashing of keyspace.        │
+//! │   * reads the keyspace definition (configmap).   │
+//! │   * confirms request is within keyspace.         │
+//! │   * handle `GET /keyspace` requests              │
+//! └────────────────────────┬─────────────────────────┘
+//!                          │
+//!                          │
+//! ┌────────────────────────▼─────────────────────────┐
+//! │ PreconditionService                              │
+//! │                                                  │
+//! │   Handles preconditions applied per request.     │
+//! │   * object store GetOptions                      │
+//! └────────────────────────┬─────────────────────────┘
+//!                          │
+//!                          │
+//! ┌────────────────────────▼─────────────────────────┐
+//! │ DataService                                      │
+//! │                                                  │
+//! │   Handles the READ and WRITE of data.            │
+//! │   * cache management (insertion & eviction)      │
+//! │   * local store connection                       │
+//! │   * performs write-back                          │
+//! └──────────────────────────────────────────────────┘
+//!
 
 use std::sync::Arc;
 
@@ -34,7 +72,7 @@ pub(crate) mod mock;
 pub type ParquetCacheServer = CacheService<KeyspaceService<PreconditionService<DataService>>>;
 
 /// Config for cache server.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParquetCacheServerConfig {
     /// The path to the config file for the keyspace.
     pub keyspace_config_path: String,
@@ -44,6 +82,8 @@ pub struct ParquetCacheServerConfig {
     pub local_dir: String,
     /// The policy config for the cache eviction.
     pub policy_config: PolicyConfig,
+    /// Prewarming table concurrency (how many tables to concurrently perform catalog queries upon)
+    pub prewarming_table_concurrency: usize,
 }
 
 /// Build a cache server.
@@ -57,11 +97,12 @@ pub async fn build_cache_server(
         hostname: node_hostname,
         local_dir,
         policy_config,
-    } = config;
+        ..
+    } = config.clone();
 
     ServiceBuilder::new()
         // outermost layer 0
-        .layer(BuildCacheService)
+        .layer(BuildCacheService::new(catalog, config))
         // layer 1
         .layer(BuildKeyspaceService {
             configfile_path,
@@ -70,23 +111,22 @@ pub async fn build_cache_server(
         // layer 2
         .layer(BuildPreconditionService)
         // innermost layer 3
-        .service(DataService::new(direct_store, catalog, policy_config, Some(local_dir)).await)
+        .service(DataService::new(direct_store, policy_config, Some(local_dir)).await)
 }
 
 #[cfg(test)]
-mod integration_tests {
-    use std::{
-        fs::create_dir_all,
-        io::{Seek, Write},
-        path::Path,
-        time::Duration,
-    };
+mod server_integration_tests {
+    use std::path::PathBuf;
+    use std::{fs::create_dir_all, io::Write, path::Path, time::Duration};
 
-    use bytes::{Buf, BufMut, BytesMut};
-    use http::{Method, StatusCode};
-    use hyper::{Body, Request};
-    use iox_tests::{TestCatalog, TestParquetFileBuilder};
+    use bytes::Buf;
+    use chrono::Utc;
+    use data_types::{ColumnType, ObjectStoreId, ParquetFileParams};
+    use http::StatusCode;
+    use hyper::Body;
+    use iox_tests::TestParquetFileBuilder;
     use object_store::{local::LocalFileSystem, ObjectMeta};
+    use parquet_file::ParquetFilePath;
     use serde::Deserialize;
     use serde_json::Deserializer;
     use tempfile::{tempdir, NamedTempFile, TempDir};
@@ -94,11 +134,11 @@ mod integration_tests {
 
     use crate::data_types::{
         GetObjectMetaResponse, InstanceState, KeyspaceResponseBody, ParquetCacheInstanceSet,
-        ServiceNode, State, WriteHint, WriteHintRequestBody,
+        Request, ServiceNode, State, WriteHint, WriteHintRequestBody,
     };
     use crate::server::response::Response as ServerInternalResponse;
 
-    use super::*;
+    use super::{mock::create_mock_raw_parquet_file, *};
 
     fn create_fs_direct_store(local_dir: &Path) -> Arc<dyn ObjectStore> {
         create_dir_all(local_dir).unwrap();
@@ -116,11 +156,12 @@ mod integration_tests {
             hostname: "localhost".to_string(),
             local_dir: tmpdir.path().to_str().unwrap().to_string(),
             policy_config: PolicyConfig::default(),
+            prewarming_table_concurrency: 10,
         };
 
         let mut server = build_cache_server(config, direct_store, catalog.catalog()).await;
 
-        let req = Request::get("http://foo.io/invalid-path/")
+        let req = http::Request::get("http://example.com/invalid-path/")
             .body(Body::empty())
             .unwrap();
         let resp = server.call(req).await;
@@ -143,13 +184,12 @@ mod integration_tests {
     }
 
     const LOCATION: &str = "0/0/partition_key/00000000-0000-0000-0000-000000000001.parquet";
-    const DATA: &[u8] = b"all my pretty words";
 
     async fn setup_service_and_direct_store(
         direct_store: Arc<dyn ObjectStore>,
         cache_tmpdir: TempDir,
         file: &mut NamedTempFile,
-    ) -> (ParquetCacheServer, Arc<TestCatalog>, ObjectMeta) {
+    ) -> (ParquetCacheServer, ObjectMeta) {
         let catalog = iox_tests::TestCatalog::new();
 
         let policy_config = PolicyConfig {
@@ -167,13 +207,19 @@ mod integration_tests {
             hostname: VALID_HOSTNAME.to_string(),
             local_dir: cache_tmpdir.path().to_str().unwrap().to_string(),
             policy_config,
+            prewarming_table_concurrency: 10,
         };
 
         let server = build_cache_server(config, Arc::clone(&direct_store), catalog.catalog()).await;
 
+        // make properly formed object
+        let parquet_path = parquet_file::ParquetFilePath::try_from(&LOCATION.to_string())
+            .expect("should be valid parquet file path");
+        let (bytes, _) = create_mock_raw_parquet_file(parquet_path, chrono::Utc::now()).await;
+
         // add object to direct store
         direct_store
-            .put(&obj_store_path, DATA.into())
+            .put(&obj_store_path, bytes::Bytes::from(bytes))
             .await
             .expect("should write object to direct store");
         let expected_meta = direct_store
@@ -187,17 +233,16 @@ mod integration_tests {
             .await
             .expect("should not have failed");
 
-        (server, catalog, expected_meta)
+        (server, expected_meta)
     }
 
     async fn confirm_data_exists(expected_meta: ObjectMeta, server: &mut ParquetCacheServer) {
         // issue read metadata
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(format!("http://foo.io/metadata?location={}", LOCATION))
-            .body(Body::empty())
-            .unwrap();
-        let resp = server.call(req).await.expect("should get a response");
+        let req = Request::GetMetadata(expected_meta.location.to_string(), Default::default());
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
 
         // assert expected http response for metadata
         assert_eq!(
@@ -221,12 +266,11 @@ mod integration_tests {
         );
 
         // issue read object
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(format!("http://foo.io/object?location={}", LOCATION))
-            .body(Body::empty())
-            .unwrap();
-        let resp = server.call(req).await.expect("should get a response");
+        let req = Request::GetObject(expected_meta.location.to_string(), Default::default());
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
 
         // assert expected http response for object
         assert_eq!(
@@ -240,7 +284,7 @@ mod integration_tests {
             .expect("reading response body");
         assert_eq!(
             body.len(),
-            DATA.to_vec().len(),
+            expected_meta.size,
             "expected data in body, instead found {}",
             std::str::from_utf8(&body).unwrap()
         );
@@ -255,29 +299,22 @@ mod integration_tests {
         let direct_store = create_fs_direct_store(dir_store_tmpdir.path());
 
         // setup server
-        let (mut server, _, expected_meta) =
+        let (mut server, expected_meta) =
             setup_service_and_direct_store(direct_store, cache_tmpdir, &mut configfile).await;
 
         // issue write-hint
-        let mut buf = BytesMut::new().writer();
-        serde_json::to_writer(
-            &mut buf,
-            &WriteHintRequestBody {
-                location: LOCATION.into(),
-                hint: WriteHint {
-                    file_size_bytes: DATA.to_vec().len() as i64,
-                    ..Default::default()
-                },
-                ack_setting: crate::data_types::WriteHintAck::Completed,
+        let req = Request::WriteHint(WriteHintRequestBody {
+            location: LOCATION.into(),
+            hint: WriteHint {
+                file_size_bytes: expected_meta.size as i64,
+                ..Default::default()
             },
-        )
-        .expect("should write request body");
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(format!("http://foo.io/write-hint?location={}", LOCATION))
-            .body(hyper::Body::from(buf.into_inner().freeze()))
-            .unwrap();
-        let resp = server.call(req).await.expect("should get a response");
+            ack_setting: crate::data_types::WriteHintAck::Completed,
+        });
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
 
         // assert expected http response for write-hint
         let expected_resp = ServerInternalResponse::Written;
@@ -305,36 +342,17 @@ mod integration_tests {
         // keep in scope so they are not dropped
         let dir_store_tmpdir = tempdir().unwrap();
         let cache_tmpdir = tempdir().unwrap();
+        let local_store_path = PathBuf::from(cache_tmpdir.path());
         let mut configfile = NamedTempFile::new().unwrap();
         let direct_store = create_fs_direct_store(dir_store_tmpdir.path());
 
         // setup server
-        let (mut server, catalog, expected_meta) =
+        let (mut server, expected_meta) =
             setup_service_and_direct_store(direct_store, cache_tmpdir, &mut configfile).await;
 
-        // write-back requires catalog data, therefore insert into catalog
-        let namespace = catalog.create_namespace_1hr_retention("ns0").await;
-        let table = namespace.create_table("table0").await;
-        let partition = table.create_partition("partition_key").await;
-
-        // insert parquet file into catalog, with proper matching object store id
-        let parquet_file_path = parquet_file::ParquetFilePath::try_from(&LOCATION.to_string())
-            .expect("should be valid parquet file path");
-        let parquet_file = TestParquetFileBuilder::default()
-            .with_creation_time(iox_time::Time::from_date_time(expected_meta.last_modified))
-            .with_file_size_bytes(DATA.to_vec().len() as u64)
-            .with_object_store_id(parquet_file_path.object_store_id());
-        partition
-            .create_parquet_file_catalog_record(parquet_file)
-            .await;
-
         // trigger cache miss
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(format!("http://foo.io/metadata?location={}", LOCATION))
-            .body(Body::empty())
-            .unwrap();
-        let resp = server.call(req).await;
+        let req = Request::GetMetadata(LOCATION.into(), Default::default());
+        let resp = server.call(req.into()).await;
         assert_matches::assert_matches!(
             resp,
             Err(ServerError::CacheMiss),
@@ -343,7 +361,10 @@ mod integration_tests {
         );
 
         // wait for write-back to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let writeback_local_store_path = local_store_path.join(LOCATION);
+        crate::tests::wait_for_file_to_exist(writeback_local_store_path.as_path())
+            .await
+            .expect("should succeed on writeback");
 
         confirm_data_exists(expected_meta, &mut server).await;
     }
@@ -357,16 +378,20 @@ mod integration_tests {
         let direct_store = create_fs_direct_store(dir_store_tmpdir.path());
 
         // setup server
-        let (mut server, _, _meta) =
+        let (mut server, _meta) =
             setup_service_and_direct_store(direct_store, cache_tmpdir, &mut configfile).await;
 
-        // check keyspace status is running
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("http://foo.io/state")
-            .body(Body::empty())
-            .unwrap();
-        let resp = server.call(req).await.expect("should get a response");
+        // wait until finished warming
+        while get_state(&mut server.clone()).await != InstanceState::Running {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // check keyspace status is running, with version 0
+        let req = Request::GetState;
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -395,27 +420,23 @@ mod integration_tests {
             instances: vec!["another-node"].into_iter().map(String::from).collect(),
         })
         .to_string();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(configfile.path())
-            .unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).unwrap(); // move pointer to start, to overwrite
-        writeln!(file, "{}", new_keyspace_definition.as_str())
+        let mut next_configmap = NamedTempFile::new().unwrap();
+        writeln!(next_configmap, "{}", new_keyspace_definition.as_str())
             .expect("should write keyspace definition to configfile");
-        file.sync_all().unwrap();
+        next_configmap
+            .persist(configfile.path())
+            .expect("should overwrite with new configmap");
 
         // waiting for new_keyspace_definition to load
         // cannot use poll_ready, as it is already returning ready (to accept `GET /state` requests)
         tokio::time::sleep(Duration::from_secs(10)).await;
 
-        // check keyspace status is cooling
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("http://foo.io/state")
-            .body(Body::empty())
-            .unwrap();
-        let resp = server.call(req).await.expect("should get a response");
+        // check keyspace status is cooling, with version 1
+        let req = Request::GetState;
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -433,7 +454,7 @@ mod integration_tests {
             State {
                 state: InstanceState::Cooling,
                 state_changed: 0,
-                current_node_set_revision: 0,
+                current_node_set_revision: 1,
                 next_node_set_revision: 1,
             },
         );
@@ -448,16 +469,15 @@ mod integration_tests {
         let direct_store = create_fs_direct_store(dir_store_tmpdir.path());
 
         // setup server
-        let (mut server, _, _meta) =
+        let (mut server, _meta) =
             setup_service_and_direct_store(direct_store, cache_tmpdir, &mut configfile).await;
 
         // get keyspace nodes
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("http://foo.io/keyspace")
-            .body(Body::empty())
-            .unwrap();
-        let resp = server.call(req).await.expect("should get a response");
+        let req = Request::GetKeyspace;
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -478,5 +498,127 @@ mod integration_tests {
                 [ServiceNode { id: 0, hostname }] if hostname == VALID_HOSTNAME
             )
         );
+    }
+
+    async fn get_state(server: &mut ParquetCacheServer) -> InstanceState {
+        let req = Request::GetState;
+        let resp = server
+            .call(req.into())
+            .await
+            .expect("should get a response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "expected http 200, instead found {:?}",
+            resp
+        );
+        let resp_body_json = hyper::body::to_bytes(resp.into_body())
+            .await
+            .expect("should read response body");
+        let mut de = Deserializer::from_slice(&resp_body_json);
+        State::deserialize(&mut de)
+            .expect("valid State object")
+            .state
+    }
+
+    #[tokio::test]
+    async fn test_prewarming() {
+        // setup
+        let local_tmpdir = tempdir().unwrap();
+        let catalog = iox_tests::TestCatalog::new();
+        let direct_store = catalog.object_store();
+        let mut configfile = NamedTempFile::new().unwrap();
+        writeln!(configfile, "{}", serde_json::json!(*KEYSPACE_DEFINITION))
+            .expect("should write keyspace definition to configfile");
+
+        // create properly encoded parquet files, adding to catalog and remote/direct store
+        let mut obj_metas = Vec::new();
+        let mut summed_min_capacity = 0_u64;
+        for i in 0..100 {
+            let now = Utc::now();
+
+            // create a new namespace, table, and partition per object
+            let namespace = catalog
+                .create_namespace_1hr_retention(format!("ns{}", i).as_str())
+                .await;
+            let table = namespace.create_table(format!("table{}", i).as_str()).await;
+            table.create_column("time", ColumnType::Time).await;
+            table.create_column("field", ColumnType::String).await;
+            table.create_column("tag", ColumnType::Tag).await;
+            let partition = table
+                .create_partition(format!("{}", now.format("%Y-%m-%d")).as_str())
+                .await;
+
+            // obj store path
+            let obj_store_id = ObjectStoreId::new();
+            let parquet_file_path = ParquetFilePath::new(
+                namespace.namespace.id,
+                table.table.id,
+                &partition.partition.transition_partition_id(),
+                obj_store_id,
+            );
+
+            // create parquet file
+            let parquet_file = TestParquetFileBuilder::default()
+                .with_line_protocol(
+                    format!(
+                        r#"{},tag=tag field="bananas" {}"#,
+                        table.table.name,
+                        now.timestamp_nanos_opt().unwrap()
+                    )
+                    .as_str(),
+                )
+                .with_creation_time(iox_time::Time::from_date_time(now))
+                .with_object_store_id(obj_store_id);
+            let inserted_into_catalog = partition.create_parquet_file(parquet_file).await;
+            let inserted_into_catalog =
+                ParquetFilePath::from(&ParquetFileParams::from(inserted_into_catalog.parquet_file));
+            assert_eq!(
+                parquet_file_path,
+                inserted_into_catalog,
+                "should have inserted path {} into catalog, instead found {}",
+                parquet_file_path.object_store_path(),
+                inserted_into_catalog.object_store_path()
+            );
+
+            // add to remote store
+            let resp = direct_store
+                .get(&parquet_file_path.object_store_path())
+                .await;
+            assert!(resp.is_ok(), "should be readable from remote store");
+            let meta = resp.unwrap().meta;
+            summed_min_capacity = summed_min_capacity.checked_add(meta.size as u64).unwrap();
+            obj_metas.push(meta);
+        }
+
+        // make server
+        let config = ParquetCacheServerConfig {
+            keyspace_config_path: configfile.path().to_str().unwrap().to_string(),
+            hostname: VALID_HOSTNAME.to_string(),
+            local_dir: local_tmpdir.path().to_str().unwrap().to_string(),
+            policy_config: PolicyConfig {
+                max_capacity: summed_min_capacity + 1000,
+                event_recency_max_duration_nanoseconds: 1_000_000_000 * 5, // 5 seconds
+            },
+            prewarming_table_concurrency: 10,
+        };
+        let server = build_cache_server(config, direct_store, catalog.catalog()).await;
+
+        // poll_ready -- pending
+        assert_eq!(
+            get_state(&mut server.clone()).await,
+            InstanceState::Pending,
+            "should be pending"
+        );
+
+        // wait until finished warming (may already be done!)
+        while get_state(&mut server.clone()).await != InstanceState::Running {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // confirm all objects are present
+        for obj_meta in obj_metas {
+            confirm_data_exists(obj_meta, &mut server.clone()).await;
+        }
     }
 }

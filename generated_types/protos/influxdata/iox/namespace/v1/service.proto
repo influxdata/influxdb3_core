@@ -115,4 +115,8 @@ message Namespace {
   // The default partitioning scheme used for any new tables that are created
   // in this namespace, if any.
   optional influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 6;
+
+  // A monotonically increasing counter tracking the version of this namespace's
+  // metadata, as managed by the router.
+  int64 router_version = 7;
 }

@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -9,9 +10,13 @@ use futures::{
     stream::{BoxStream, StreamExt},
     FutureExt, TryStreamExt,
 };
+use parquet::{arrow::async_reader::AsyncFileReader, file::metadata::ParquetMetaData};
 use pin_project::pin_project;
-use tokio::fs::{create_dir_all, remove_dir, remove_file, File};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Error, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::{
+    fs::{create_dir_all, remove_dir, remove_file, File},
+    io::AsyncReadExt,
+};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 /// object_store expected stream IO type
@@ -19,6 +24,20 @@ pub type StreamedObject = BoxStream<'static, object_store::Result<Bytes>>;
 
 /// identifier for `object_store::Error::Generic`
 const DATA_CACHE: &str = "local store accessor";
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("IO error: {0}")]
+    IO(#[from] std::io::Error),
+    #[error("Parquet encoding error: {0}")]
+    ParquetEncoding(String),
+    #[error("Bad Request: {0}")]
+    BadRequest(String),
+    #[error("Direct object-store error: {0}")]
+    DirectStore(#[from] object_store::Error),
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Access to stored data.
 #[derive(Debug)]
@@ -39,18 +58,13 @@ impl LocalStore {
     }
 
     /// Move a given file location, into cache
-    pub async fn move_file_to_cache(&self, from: PathBuf, location: &String) -> Result<(), Error> {
+    pub async fn move_file_to_cache(&self, from: PathBuf, location: &String) -> Result<()> {
         let to = self.local_path(location);
         match to.parent() {
-            None => {
-                return Err(Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "object location is not valid",
-                ))
-            }
+            None => return Err(Error::BadRequest("object location is not valid".into())),
             Some(path) => create_dir_all(path).await?,
         };
-        std::fs::rename(from, to)
+        std::fs::rename(from, to).map_err(Error::IO)
     }
 
     /// Async write operation
@@ -60,29 +74,21 @@ impl LocalStore {
         size: i64,
         mut stream: StreamedObject,
     ) -> Result<(), Error> {
-        if location.starts_with('/') {
-            return Err(Error::new(
-                std::io::ErrorKind::InvalidData,
-                "object location cannot be an absolute path",
-            ));
-        }
+        validate_location(location)?;
         let path = self.local_path(location);
         let mut obj = AsyncStoreObject::new(path.as_path(), size).await?;
 
         while let Some(maybe_bytes) = stream.next().await {
-            if maybe_bytes.is_err() {
+            if let Err(e) = maybe_bytes {
                 let _ = obj.delete().await;
-                return Err(Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "error reading incoming byte stream",
-                ));
-            }
+                return Err(Error::from(e));
+            };
 
             match obj.write_all(&maybe_bytes.unwrap()).await {
                 Ok(_) => continue,
                 Err(e) => {
                     let _ = obj.delete().await;
-                    return Err(e);
+                    return Err(Error::from(e));
                 }
             }
         }
@@ -91,13 +97,8 @@ impl LocalStore {
     }
 
     /// Read `GET /object` returns a stream
-    pub async fn read_object(&self, location: &String) -> Result<StreamedObject, Error> {
-        if location.starts_with('/') {
-            return Err(Error::new(
-                std::io::ErrorKind::InvalidData,
-                "object location cannot be an absolute path",
-            ));
-        }
+    pub async fn read_object(&self, location: &String) -> Result<StreamedObject> {
+        validate_location(location)?;
 
         // Potential TODO: replace the StreamedObject with sendfile?
         // the the client can return a GetResultPayload::File() through the interface.
@@ -105,18 +106,33 @@ impl LocalStore {
         Ok(AsyncStoreObject::open(path.as_path()).await?.read_stream())
     }
 
+    /// Read metadata from parquet file footer
+    pub async fn read_parquet_metadata(&self, location: &String) -> Result<Arc<ParquetMetaData>> {
+        validate_location(location)?;
+
+        let path = self.dir.join(location);
+        AsyncStoreObject::open(path.as_path())
+            .await?
+            .parquet_metadata()
+            .await
+    }
+
     /// Delete object in local store, such as on cache eviction.
-    pub async fn delete_object(&self, location: &String) -> Result<(), Error> {
-        if location.starts_with('/') {
-            return Err(Error::new(
-                std::io::ErrorKind::InvalidData,
-                "object location cannot be an absolute path",
-            ));
-        }
+    pub async fn delete_object(&self, location: &String) -> Result<()> {
+        validate_location(location)?;
 
         let path = self.dir.join(location);
         AsyncStoreObject::open(path.as_path()).await?.delete().await
     }
+}
+
+fn validate_location(location: &str) -> Result<()> {
+    if location.starts_with('/') {
+        return Err(Error::BadRequest(
+            "object location cannot be an absolute path".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[pin_project]
@@ -128,7 +144,7 @@ pub struct AsyncStoreObject<'a> {
 
 impl<'a> AsyncStoreObject<'a> {
     /// Create a new AsyncStoreObject, honoring the path provided.
-    async fn new(path: &'a Path, size: i64) -> std::io::Result<Self> {
+    async fn new(path: &'a Path, size: i64) -> Result<Self> {
         // The path of the object (in the ObjectStore implementations) is:
         // <namespace_id>/<table_id>/<partition_id>/<object_store_id>.
         //
@@ -140,11 +156,19 @@ impl<'a> AsyncStoreObject<'a> {
         Ok(Self { inner: file, path })
     }
 
-    async fn open(path: &'a Path) -> std::io::Result<Self> {
+    async fn open(path: &'a Path) -> Result<Self> {
         Ok(Self {
             inner: File::open(path).await?,
             path,
         })
+    }
+
+    /// Read only the parquet file metadata footer
+    async fn parquet_metadata(&mut self) -> Result<Arc<ParquetMetaData>> {
+        self.inner
+            .get_metadata()
+            .await
+            .map_err(|e| Error::ParquetEncoding(e.to_string()))
     }
 
     fn read_stream(self) -> StreamedObject {
@@ -158,11 +182,21 @@ impl<'a> AsyncStoreObject<'a> {
         )
     }
 
-    async fn delete(&self) -> std::io::Result<()> {
+    async fn read_file(&mut self) -> Result<Bytes> {
+        let size = self.inner.metadata().await?.len() as usize;
+        let mut bytes = Vec::with_capacity(size);
+        self.inner
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(Error::IO)?;
+        Ok(Bytes::from(bytes))
+    }
+
+    async fn delete(&self) -> Result<()> {
         remove_file(self.path).await?;
         let dir = self.path.parent().unwrap_or(self.path);
         if dir.read_dir()?.next().is_none() {
-            remove_dir(dir).await
+            remove_dir(dir).await.map_err(Error::IO)
         } else {
             Ok(())
         }
@@ -443,7 +477,7 @@ mod test {
             .await;
         assert_matches!(
             write_res,
-            Err(e) if e.to_string().contains("error reading incoming byte stream"),
+            Err(e) if e.to_string().contains("error in bytes stream from remote object store"),
             "expected write to error, instead found {:?}",
             write_res
         );
@@ -473,7 +507,7 @@ mod test {
             .await;
         assert_matches!(
             write_res,
-            Err(e) if e.to_string().contains("error reading incoming byte stream"),
+            Err(e) if e.to_string().contains("error in bytes stream from remote object store"),
             "expected write to error, instead found {:?}",
             write_res
         );

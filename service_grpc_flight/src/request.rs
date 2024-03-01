@@ -181,7 +181,7 @@ impl IoxGetRequest {
     /// try to decode a ReadInfo structure from a Token
     pub(crate) fn try_decode(ticket: Ticket) -> Result<Self> {
         // decode ticket
-        IoxGetRequest::decode_protobuf_any(ticket.ticket.clone())
+        Self::decode_protobuf_any(ticket.ticket.clone())
             .or_else(|e| {
                 match e {
                     // If the ticket decoded as an Any with a type_url that was recognised
@@ -190,14 +190,14 @@ impl IoxGetRequest {
                     AnyError::InvalidValue { source } => Err(source),
                     e => {
                         trace!(%e, "Error decoding ticket as Any, trying as ReadInfo");
-                        IoxGetRequest::decode_protobuf(ticket.ticket.clone())
+                        Self::decode_protobuf(ticket.ticket.clone())
                     }
                 }
             })
             .or_else(|e| {
                 trace!(%e, ticket=%String::from_utf8_lossy(&ticket.ticket),
                        "Error decoding ticket as ProtoBuf, trying as JSON");
-                IoxGetRequest::decode_json(ticket.ticket.clone())
+                Self::decode_json(ticket.ticket.clone())
             })
             .map_err(|e| {
                 trace!(%e, "Error decoding ticket as JSON");
@@ -214,7 +214,7 @@ impl IoxGetRequest {
             is_debug,
         } = self;
 
-        let params: Vec<proto::read_info::QueryParam> = params.into();
+        let params: Vec<proto::QueryParam> = params.into();
 
         let read_info = match query {
             RunQuery::Sql(sql_query) => proto::ReadInfo {

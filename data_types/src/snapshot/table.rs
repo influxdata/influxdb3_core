@@ -1,7 +1,8 @@
 //! Snapshot definition for tables
 use crate::snapshot::list::MessageList;
 use crate::{
-    Column, ColumnId, ColumnTypeProtoError, NamespaceId, Partition, PartitionId, Table, TableId,
+    Column, ColumnId, ColumnTypeProtoError, NamespaceId, Partition, PartitionId, PartitionKey,
+    Table, TableId,
 };
 use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
@@ -158,9 +159,31 @@ impl TableSnapshot {
         })
     }
 
+    /// Lookup a [`TableSnapshotPartition`] by [`PartitionKey`]
+    ///
+    /// This currently performs a linear scan of the partitions in this snapshot, but could
+    /// in future be accelerated with a hash lookup
+    pub fn lookup_partition_by_key(
+        &self,
+        key: &PartitionKey,
+    ) -> Result<Option<TableSnapshotPartition>> {
+        for p in self.partitions() {
+            let p = p?;
+            if key.as_bytes() == p.key {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
+    }
+
     /// Returns the generation of this snapshot
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns the [`TableId`] of this snapshot
+    pub fn table_id(&self) -> TableId {
+        self.table_id
     }
 }
 
