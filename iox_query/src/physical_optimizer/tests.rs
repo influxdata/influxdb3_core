@@ -48,7 +48,7 @@ async fn test_parquet_should_not_be_resorted() {
     let c_mem = c.clone().with_may_contain_pk_duplicates(true);
     let c_file = c
         .clone()
-        .with_dummy_parquet_file()
+        .with_dummy_parquet_file_and_size(1000)
         .with_may_contain_pk_duplicates(false)
         .with_sort_key(SortKey::from_columns([Arc::from("tag"), Arc::from("time")]));
     let schema = c.schema().clone();
@@ -100,11 +100,9 @@ async fn test_parquet_should_not_be_resorted() {
     - "                     FilterExec: time@2 > 0 AND time@2 > 2"
     - "                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1"
     - "                         RecordBatchesExec: chunks=1, projection=[__chunk_order, tag, time]"
-    - "                 SortExec: expr=[tag@1 ASC,time@2 ASC,__chunk_order@0 ASC]"
-    - "                   CoalesceBatchesExec: target_batch_size=8192"
-    - "                     FilterExec: time@2 > 0 AND time@2 > 2"
-    - "                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=2"
-    - "                         ParquetExec: file_groups={2 groups: [[2.parquet], [3.parquet]]}, projection=[__chunk_order, tag, time], output_ordering=[tag@1 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=time@1 > 0 AND time@1 > 2, pruning_predicate=time_max@0 > 0 AND time_max@0 > 2"
+    - "                 CoalesceBatchesExec: target_batch_size=8192"
+    - "                   FilterExec: time@2 > 0 AND time@2 > 2"
+    - "                     ParquetExec: file_groups={16 groups: [[2.parquet:0..125], [3.parquet:0..125], [2.parquet:125..250], [3.parquet:125..250], [2.parquet:250..375], ...]}, projection=[__chunk_order, tag, time], output_ordering=[tag@1 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=time@1 > 0 AND time@1 > 2, pruning_predicate=time_max@0 > 0 AND time_max@0 > 2, required_guarantees=[]"
     "###
     );
 }
@@ -177,8 +175,12 @@ async fn test_parquet_must_resorted() {
 
     let plan = state.create_physical_plan(&plan).await.unwrap();
 
-    // The output of the parquet files must be sorted prior to merging
-    // if the first file_group has more than one file
+    // The output of the parquet files should not be resorted and there should
+    // be no SortExec in the following plan.
+    //
+    // In order for correct results, the parquet files can not be intermixed
+    // across file groups: only one parquet file can be in each group, though
+    // subranges of the same parquet file can be in multiple groups.
     //
     // Prior to https://github.com/influxdata/influxdb_iox/issues/9450, the plan
     // called for the ParquetExec to read the files in parallel (using subranges) like:
@@ -203,8 +205,7 @@ async fn test_parquet_must_resorted() {
     - "             SortPreservingMergeExec: [tag@3 ASC,time@2 ASC,__chunk_order@0 ASC]"
     - "               CoalesceBatchesExec: target_batch_size=8192"
     - "                 FilterExec: tag@3 > foo AND time@2 > 2"
-    - "                   RepartitionExec: partitioning=RoundRobinBatch(6), input_partitions=2, preserve_order=true, sort_exprs=tag@3 ASC,time@2 ASC,__chunk_order@0 ASC"
-    - "                     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[__chunk_order, field, time, tag], output_ordering=[tag@3 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=tag@1 > foo AND time@2 > 2, pruning_predicate=tag_max@0 > foo AND time_max@1 > 2"
+    - "                   ParquetExec: file_groups={6 groups: [[1.parquet:0..1], [2.parquet:0..20000000], [2.parquet:20000000..40000000], [2.parquet:40000000..60000000], [2.parquet:60000000..80000000], ...]}, projection=[__chunk_order, field, time, tag], output_ordering=[tag@3 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=tag@1 > foo AND time@2 > 2, pruning_predicate=tag_max@0 > foo AND time_max@1 > 2, required_guarantees=[]"
     "###
     );
 }

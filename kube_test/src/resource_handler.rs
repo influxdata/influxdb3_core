@@ -1,7 +1,7 @@
 use super::{object_map::ObjectMap, request::Request, status, Handler, Result};
 use http::{HeaderMap, HeaderValue, Response, StatusCode};
 use hyper::Body;
-use kube_core::{ApiResource, DynamicObject, ObjectList, ObjectMeta, Resource};
+use kube_core::{ApiResource, DynamicObject, ObjectList, ObjectMeta, Resource, TypeMeta};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
@@ -88,7 +88,10 @@ where
     }
 }
 
-impl<R> ResourceHandler<R> {
+impl<R> ResourceHandler<R>
+where
+    R: Resource<DynamicType = ()>,
+{
     fn maybe_generate_name(&self, meta: &mut ObjectMeta) {
         if meta.name.is_none() {
             if let Some(prefix) = &meta.generate_name {
@@ -130,6 +133,7 @@ impl<R> ResourceHandler<R> {
 
     fn list(&self, ns: Option<String>) -> Result<Response<Body>> {
         let list = ObjectList {
+            types: TypeMeta::list::<R>(),
             metadata: Default::default(),
             items: Arc::clone(&self.objects)
                 .lock()
@@ -226,7 +230,7 @@ fn response<T: Serialize>(status: StatusCode, data: &T) -> Result<Response<Body>
 
 impl<R> Handler for ResourceHandler<R>
 where
-    R: Debug,
+    R: Resource<DynamicType = ()> + Debug,
 {
     fn api_resource(&self) -> ApiResource {
         self.api_resource.clone()

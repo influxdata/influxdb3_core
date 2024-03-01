@@ -23,35 +23,25 @@ where
     RecordBatch::try_from_iter(vec![(field_name, Arc::new(array) as ArrayRef)])
 }
 
-/// Ensures the record batch has the specified schema
+/// Create a new [`RecordBatch`] that has the specified schema, adding null values for columns that
+/// don't appear in the batch.
 pub fn ensure_schema(
     output_schema: &SchemaRef,
     batch: &RecordBatch,
 ) -> Result<RecordBatch, ArrowError> {
-    let batch_schema = batch.schema();
-
     // Go over all columns of output_schema
     let batch_output_columns = output_schema
         .fields()
         .iter()
         .map(|output_field| {
-            // See if the output_field available in the batch
-            let batch_field_index = batch_schema
-                .fields()
-                .iter()
-                .enumerate()
-                .find(|(_, batch_field)| output_field.name() == batch_field.name())
-                .map(|(idx, _)| idx);
-
-            if let Some(batch_field_index) = batch_field_index {
-                // The column available, use it
-                Arc::clone(batch.column(batch_field_index))
-            } else {
-                // the column not available, add it with all null values
-                new_null_array(output_field.data_type(), batch.num_rows())
-            }
+            // If the field is available in the batch, use it. Otherwise, add a column with all
+            // null values.
+            batch
+                .column_by_name(output_field.name())
+                .map(Arc::clone)
+                .unwrap_or_else(|| new_null_array(output_field.data_type(), batch.num_rows()))
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     RecordBatch::try_new(Arc::clone(output_schema), batch_output_columns)
 }

@@ -2,7 +2,8 @@ use crate::{
     dump_log_to_stdout, log_command, rand_id,
     server_type::AddAddrEnv,
     service_link::{link_services, LinkableService},
-    write_to_ingester, write_to_router, HttpReverseProxy, ServerFixture, TestConfig, TestServer,
+    try_request_http, write_to_ingester, write_to_router, HttpReverseProxy, ServerFixture,
+    TestConfig, TestServer,
 };
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use arrow_flight::{
@@ -13,7 +14,7 @@ use arrow_flight::{
 use assert_cmd::prelude::*;
 use data_types::{NamespaceId, TableId};
 use futures::{stream::FuturesOrdered, StreamExt};
-use http::Response;
+use http::{Method, Response};
 use hyper::Body;
 use influxdb_iox_client::{
     catalog::generated_types::{
@@ -48,6 +49,9 @@ pub struct MiniCluster {
 
     /// Standard optional querier
     querier: Option<ServerFixture>,
+
+    /// Optional parquet_cache server
+    parquet_cache: Option<ServerFixture>,
 
     /// Standard optional compactor configuration, to be used on-demand
     compactor_config: Option<TestConfig>,
@@ -116,6 +120,7 @@ impl MiniCluster {
             router,
             ingesters,
             querier,
+            parquet_cache: None, // currently, parquet cache is not tested with shared servers
             compactor_config,
             catalog,
             catalog_reverse_proxy,
@@ -365,6 +370,14 @@ impl MiniCluster {
         self
     }
 
+    /// create a parquet_cache server with the specified configuration;
+    pub async fn with_parquet_cache(mut self, parquet_cache_config: TestConfig) -> Self {
+        let fixture = ServerFixture::create(parquet_cache_config).await;
+        self.add_catalog_reverse_proxy_client(fixture.strong());
+        self.parquet_cache = Some(fixture);
+        self
+    }
+
     /// create an catalog with the specified configuration;
     pub async fn with_catalog(mut self, catalog_configs: [TestConfig; 3]) -> Self {
         assert!(self.catalog.is_empty());
@@ -406,6 +419,13 @@ impl MiniCluster {
     /// Retrieve all of the underlying ingester servers
     pub fn ingesters(&self) -> &[ServerFixture] {
         &self.ingesters
+    }
+
+    /// Retrieve the underlying parquet_cache server, if set
+    fn parquet_cache(&self) -> &ServerFixture {
+        self.parquet_cache
+            .as_ref()
+            .expect("parquet cache not initialized")
     }
 
     /// Restart router.
@@ -749,6 +769,33 @@ impl MiniCluster {
             .into_grpc_connection();
 
         generated_types::storage_client::StorageClient::new(grpc_connection)
+    }
+
+    /// Check current state of the parquet_cache server
+    pub async fn parquet_cache_state(
+        &self,
+    ) -> Result<Response<Body>, Box<dyn std::error::Error + Send>> {
+        try_request_http(
+            self.parquet_cache().parquet_cache_http_base(),
+            "/state",
+            Method::GET,
+            Body::empty(),
+        )
+        .await
+    }
+
+    /// Check for object in parquet_cache
+    pub async fn parquet_cache_fetch(
+        &self,
+        location: impl AsRef<str> + Send,
+    ) -> Result<Response<Body>, Box<dyn std::error::Error + Send>> {
+        try_request_http(
+            self.parquet_cache().parquet_cache_http_base(),
+            format!("/object?location={}", location.as_ref()),
+            Method::GET,
+            Body::empty(),
+        )
+        .await
     }
 }
 

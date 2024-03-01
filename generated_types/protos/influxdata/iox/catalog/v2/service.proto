@@ -9,6 +9,8 @@ import "influxdata/iox/column_type/v1/type.proto";
 import "influxdata/iox/catalog_cache/v1/value.proto";
 
 service CatalogService {
+  rpc RootSnapshot(RootSnapshotRequest) returns (RootSnapshotResponse);
+
   rpc NamespaceCreate(NamespaceCreateRequest) returns (NamespaceCreateResponse);
   rpc NamespaceUpdateRetentionPeriod(NamespaceUpdateRetentionPeriodRequest) returns (NamespaceUpdateRetentionPeriodResponse);
   rpc NamespaceList(NamespaceListRequest) returns (stream NamespaceListResponse);
@@ -17,6 +19,7 @@ service CatalogService {
   rpc NamespaceSoftDelete(NamespaceSoftDeleteRequest) returns (NamespaceSoftDeleteResponse);
   rpc NamespaceUpdateTableLimit(NamespaceUpdateTableLimitRequest) returns (NamespaceUpdateTableLimitResponse);
   rpc NamespaceUpdateColumnLimit(NamespaceUpdateColumnLimitRequest) returns (NamespaceUpdateColumnLimitResponse);
+  rpc NamespaceSnapshot(NamespaceSnapshotRequest) returns (NamespaceSnapshotResponse);
 
   rpc TableCreate(TableCreateRequest) returns (TableCreateResponse);
   rpc TableGetById(TableGetByIdRequest) returns (TableGetByIdResponse);
@@ -42,6 +45,8 @@ service CatalogService {
   rpc PartitionDeleteSkippedCompactions(PartitionDeleteSkippedCompactionsRequest) returns (PartitionDeleteSkippedCompactionsResponse);
   rpc PartitionMostRecentN(PartitionMostRecentNRequest) returns (stream PartitionMostRecentNResponse);
   rpc PartitionNewFileBetween(PartitionNewFileBetweenRequest) returns (stream PartitionNewFileBetweenResponse);
+  rpc PartitionNeedingColdCompact(PartitionNeedingColdCompactRequest) returns (stream PartitionNeedingColdCompactResponse);
+  rpc PartitionUpdateColdCompact(PartitionUpdateColdCompactRequest) returns (PartitionUpdateColdCompactResponse);
   rpc PartitionListOldStyle(PartitionListOldStyleRequest) returns (stream PartitionListOldStyleResponse);
   rpc PartitionSnapshot(PartitionSnapshotRequest) returns (PartitionSnapshotResponse);
 
@@ -51,6 +56,13 @@ service CatalogService {
   rpc ParquetFileGetByObjectStoreId(ParquetFileGetByObjectStoreIdRequest) returns (ParquetFileGetByObjectStoreIdResponse);
   rpc ParquetFileExistsByObjectStoreIdBatch(stream ParquetFileExistsByObjectStoreIdBatchRequest) returns (stream ParquetFileExistsByObjectStoreIdBatchResponse);
   rpc ParquetFileCreateUpgradeDelete(ParquetFileCreateUpgradeDeleteRequest) returns (ParquetFileCreateUpgradeDeleteResponse);
+}
+
+message RootSnapshotRequest {}
+
+message RootSnapshotResponse {
+  catalog_cache.v1.Root root = 1;
+  uint64 generation = 2;
 }
 
 message NamespaceCreateRequest {
@@ -103,7 +115,9 @@ message NamespaceSoftDeleteRequest {
   string name = 1;
 }
 
-message NamespaceSoftDeleteResponse {}
+message NamespaceSoftDeleteResponse {
+  int64 namespace_id = 1;
+}
 
 message NamespaceUpdateTableLimitRequest {
   string name = 1;
@@ -121,6 +135,15 @@ message NamespaceUpdateColumnLimitRequest {
 
 message NamespaceUpdateColumnLimitResponse {
   Namespace namespace = 1;
+}
+
+message NamespaceSnapshotRequest {
+  int64 namespace_id = 1;
+}
+
+message NamespaceSnapshotResponse {
+  catalog_cache.v1.Namespace namespace = 1;
+  uint64 generation = 2;
 }
 
 message TableCreateRequest {
@@ -317,6 +340,22 @@ message PartitionNewFileBetweenResponse {
   int64 partition_id = 1;
 }
 
+message PartitionNeedingColdCompactRequest {
+  int64 maximum_time = 1;
+  uint64 n = 2;
+}
+
+message PartitionNeedingColdCompactResponse {
+  int64 partition_id = 1;
+}
+
+message PartitionUpdateColdCompactRequest {
+  int64 partition_id = 1;
+  int64 cold_compact_at = 2;
+}
+
+message PartitionUpdateColdCompactResponse {}
+
 message PartitionListOldStyleRequest {}
 
 message PartitionListOldStyleResponse {
@@ -396,6 +435,9 @@ message Namespace {
   int32 max_columns_per_table = 5;
   optional int64 deleted_at = 6;
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 7;
+  // A monotonically increasing counter tracking the version of this namespace's
+  // metadata, as managed by the router.
+  int64 router_version = 8;
 }
 
 enum SoftDeletedRows {
@@ -430,6 +472,7 @@ message Partition {
   string partition_key = 4;
   SortKeyIds sort_key_ids = 5;
   optional int64 new_file_at = 6;
+  optional int64 cold_compact_at = 7;
 }
 
 message SkippedCompaction {

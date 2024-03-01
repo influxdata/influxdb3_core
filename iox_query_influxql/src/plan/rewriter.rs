@@ -1100,7 +1100,12 @@ impl FieldChecker {
             Expr::Call(c) => self.check_aggregate_function(c),
             Expr::Binary(b) => match (&*b.lhs, &*b.rhs) {
                 (Expr::Literal(_), Expr::Literal(_)) => {
-                    error::query("cannot perform a binary expression on two literals")
+                    // InfluxQL 1.x did not allow this scenario. It performed a `reduce` step earlier in the planning
+                    // phase to prevent arriving here without it being an error.
+                    // We don't want to implement that `reduce` step the same way in IOx because DataFusion has strong support
+                    // for the types of constant folding we support in InfluxQL. So we check later in the plan to make
+                    // sure it ends up being a valid query.
+                    Ok(())
                 }
                 (Expr::Literal(_), other) | (other, Expr::Literal(_)) => self.check_expr(other),
                 (lhs, rhs) => {
@@ -1110,7 +1115,7 @@ impl FieldChecker {
             },
             Expr::Nested(e) => self.check_expr(e),
             // BindParameter should be substituted prior to validating fields.
-            Expr::BindParameter(_) => error::internal("unexpected bind parameter"),
+            Expr::BindParameter(_) => error::query("unexpected bind parameter"),
             Expr::Wildcard(_) => error::internal("unexpected wildcard"),
             Expr::Literal(Literal::Regex(_)) => error::internal("unexpected regex"),
             Expr::Distinct(_) => error::internal("unexpected distinct clause"),
@@ -2025,11 +2030,6 @@ mod test {
         // pow expects 2 arguments
         let sel = parse_select("SELECT pow(foo, 2, 3) FROM cpu");
         assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "invalid number of arguments for pow, expected 2, got 3");
-
-        // Cannot perform binary operations on literals
-        // See: https://github.com/influxdata/influxdb/blob/98361e207349a3643bcc332d54b009818fe7585f/query/compile.go#L329
-        let sel = parse_select("SELECT 1 + 1 FROM cpu");
-        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "cannot perform a binary expression on two literals");
 
         // can't project literals
         let sel = parse_select("SELECT foo, 1 FROM cpu");

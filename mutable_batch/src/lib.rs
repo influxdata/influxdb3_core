@@ -1,17 +1,4 @@
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+#![warn(missing_docs)]
 
 //! A mutable data structure for a collection of writes.
 //!
@@ -142,7 +129,7 @@ impl MutableBatch {
     }
 
     /// Returns an iterator over the columns in this batch in no particular order
-    pub fn columns(&self) -> impl Iterator<Item = (&String, &Column)> + ExactSizeIterator + '_ {
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = (&String, &Column)> + '_ {
         self.column_names
             .iter()
             .map(move |(name, idx)| (name, &self.columns[*idx]))

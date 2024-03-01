@@ -4,6 +4,7 @@
 //! Defines the progressive eval plan
 
 use std::any::Any;
+use std::borrow::Cow::Borrowed;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -11,18 +12,22 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::{internal_err, DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr, PhysicalSortRequirement};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Metric, Partitioning,
+    RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
 use futures::{ready, Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use observability_deps::tracing::{debug, trace};
+use observability_deps::tracing::{debug, trace, warn};
+
+use crate::config::IoxConfigExt;
 
 /// ProgressiveEval return a stream of record batches in the order of its inputs.
 /// It will stop when the number of output rows reach the given limit.
@@ -51,7 +56,7 @@ use observability_deps::tracing::{debug, trace};
 ///  Input Streams                                             Output stream
 ///  (in some order)                                           (in same order)
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ProgressiveEvalExec {
     /// Input plan
     input: Arc<dyn ExecutionPlan>,
@@ -190,24 +195,28 @@ impl ExecutionPlan for ProgressiveEvalExec {
         );
         let schema = self.schema();
 
-        // Have the input streams run in parallel
-        // todo: maybe in the future we do not need this parallelism if number of fecthed rows is in the fitst stream
-        let receivers = (0..input_partitions)
-            .map(|partition| {
-                let stream = self
-                    .input
-                    .execute(partition, Arc::<TaskContext>::clone(&context))?;
-
-                Ok(spawn_buffered(stream, 1))
-            })
-            .collect::<Result<_>>()?;
-
-        debug!("Done setting up sender-receiver for ProgressiveEvalExec::execute");
+        // Add a metric to record the number of inputs
+        let num_inputs = Count::new();
+        num_inputs.add(self.input.output_partitioning().partition_count());
+        self.metrics.register(Arc::new(Metric::new(
+            MetricValue::Count {
+                name: Borrowed("num_inputs"),
+                count: num_inputs,
+            },
+            None,
+        )));
+        // Add a metric to record the number of inputs that are actually read which is <= num_inputs
+        let num_read_inputs_counter =
+            MetricBuilder::new(&self.metrics).global_counter("num_read_inputs");
+        // Add other base line metrics
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
         let result = ProgressiveEvalStream::new(
-            receivers,
+            Arc::clone(&self.input),
+            Arc::clone(&context),
             schema,
-            BaselineMetrics::new(&self.metrics, partition),
+            baseline_metrics,
+            num_read_inputs_counter,
             self.fetch,
         )?;
 
@@ -230,19 +239,160 @@ impl ExecutionPlan for ProgressiveEvalExec {
     }
 }
 
+/// Handle when to prefetch input streams and how to poll next record batch
+struct InputStreams {
+    /// Input plan of the progressive eval exec
+    input_plan: Arc<dyn ExecutionPlan>,
+
+    /// Context of the progressive eval exec
+    context: Arc<TaskContext>,
+
+    /// Total input streams
+    input_stream_count: usize,
+
+    /// Number of input streams to prefetch
+    num_input_streams_to_prefetch: usize,
+
+    /// Index of current stream
+    current_stream_idx: usize,
+
+    /// Input stream to poll data
+    current_input_stream: Option<SendableRecordBatchStream>,
+
+    /// Prefetched Input streams
+    prefetched_input_streams: Vec<SendableRecordBatchStream>,
+
+    /// Used to record number of actually read input streams
+    num_read_inputs_counter: Count,
+}
+
+impl InputStreams {
+    fn new(
+        input_plan: Arc<dyn ExecutionPlan>,
+        context: Arc<TaskContext>,
+        num_input_streams_to_prefetch: usize,
+        num_read_inputs_counter: Count,
+    ) -> Result<Self> {
+        let input_stream_count = input_plan.output_partitioning().partition_count();
+
+        let current_stream_idx = 0;
+        let mut current_input_stream = None;
+        let mut capacity = 0;
+        if num_input_streams_to_prefetch > 1 {
+            capacity = num_input_streams_to_prefetch - 1;
+        } else {
+            warn!("num_input_streams_to_prefetch is {num_input_streams_to_prefetch} and not greater than 1");
+        }
+        let mut prefetched_input_streams = Vec::with_capacity(capacity);
+
+        for i in 0..num_input_streams_to_prefetch {
+            if i >= input_stream_count {
+                break;
+            }
+
+            let input_stream = spawn_buffered(
+                input_plan.execute(i, Arc::<TaskContext>::clone(&context))?,
+                1,
+            );
+            num_read_inputs_counter.add(1);
+
+            if i == 0 {
+                current_input_stream = Some(input_stream);
+            } else {
+                prefetched_input_streams.push(input_stream);
+            }
+        }
+
+        Ok(Self {
+            input_plan,
+            context,
+            input_stream_count,
+            num_input_streams_to_prefetch,
+            current_stream_idx,
+            current_input_stream,
+            prefetched_input_streams,
+            num_read_inputs_counter,
+        })
+    }
+
+    /// Set next available stream to current_input_stream
+    /// Also prefetch one more input stream if not all of them are prefetched yet
+    fn next_stream(&mut self) {
+        // No more input stream
+        if self.current_stream_idx >= self.input_stream_count {
+            // panic if we have not reached the end of all input streams
+            assert!(
+                self.prefetched_input_streams.is_empty(),
+                "Internal error in ProgressiveEvalStream: There should not have input streams left to read",);
+
+            self.current_input_stream = None;
+        } else {
+            // prefetch one more input stream before setting next strem to the current input stream
+            if self.current_stream_idx + self.num_input_streams_to_prefetch
+                < self.input_stream_count
+            {
+                self.num_read_inputs_counter.add(1);
+                self.prefetched_input_streams.push(spawn_buffered(
+                    self.input_plan
+                        .execute(
+                            self.current_stream_idx + self.num_input_streams_to_prefetch,
+                            Arc::<TaskContext>::clone(&self.context),
+                        )
+                        .unwrap(),
+                    1,
+                ));
+            }
+
+            self.current_stream_idx += 1;
+            if self.prefetched_input_streams.is_empty() {
+                self.current_input_stream = None;
+            } else {
+                self.current_input_stream = Some(self.prefetched_input_streams.remove(0));
+            }
+        }
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+        // All input streams have been read
+        if self.current_input_stream.is_none() {
+            return Poll::Ready(None);
+        }
+
+        // Get next record batch
+        let mut poll;
+        loop {
+            poll = self
+                .current_input_stream
+                .as_mut()
+                .unwrap()
+                .poll_next_unpin(cx);
+            match poll {
+                // This input stream no longer has data, move to next stream
+                Poll::Ready(None) => {
+                    self.next_stream();
+                    if self.current_input_stream.is_none() {
+                        // Have reached the end of all input streams
+                        return Poll::Ready(None);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        poll
+    }
+}
+
 /// Concat input streams until reaching the fetch limit
 struct ProgressiveEvalStream {
-    /// input streams
-    input_streams: Vec<SendableRecordBatchStream>,
+    /// Input streams
+    input_streams: InputStreams,
 
     /// The schema of the input and output.
     schema: SchemaRef,
 
-    /// used to record execution metrics
-    metrics: BaselineMetrics,
-
-    /// Index of current stream
-    current_stream_idx: usize,
+    /// used to record execution baseline metrics
+    baseline_metrics: BaselineMetrics,
 
     /// If the stream has encountered an error
     aborted: bool,
@@ -256,16 +406,36 @@ struct ProgressiveEvalStream {
 
 impl ProgressiveEvalStream {
     fn new(
-        input_streams: Vec<SendableRecordBatchStream>,
+        input_plan: Arc<dyn ExecutionPlan>,
+        context: Arc<TaskContext>,
         schema: SchemaRef,
-        metrics: BaselineMetrics,
+        baseline_metrics: BaselineMetrics,
+        num_read_inputs_counter: Count,
         fetch: Option<usize>,
     ) -> Result<Self> {
+        // Use config param to set number of prefetch stream
+        let mut num_input_streams_to_prefetch = context
+            .session_config()
+            .get_extension::<IoxConfigExt>()
+            .unwrap_or_default()
+            .progressive_eval_num_prefetch_input_streams;
+
+        // If there is no limit of number of rows to fecth, prefetch all input streams
+        if fetch.is_none() {
+            num_input_streams_to_prefetch = input_plan.output_partitioning().partition_count()
+        }
+
+        let input_streams = InputStreams::new(
+            input_plan,
+            context,
+            num_input_streams_to_prefetch,
+            num_read_inputs_counter,
+        )?;
+
         Ok(Self {
             input_streams,
             schema,
-            metrics,
-            current_stream_idx: 0,
+            baseline_metrics,
             aborted: false,
             fetch,
             produced: 0,
@@ -289,27 +459,7 @@ impl Stream for ProgressiveEvalStream {
             return Poll::Ready(None);
         }
 
-        // Have reached the end of all input streams
-        if self.current_stream_idx >= self.input_streams.len() {
-            return Poll::Ready(None);
-        }
-
-        // Get next record batch
-        let mut poll;
-        loop {
-            let idx = self.current_stream_idx;
-            poll = self.input_streams[idx].poll_next_unpin(cx);
-            match poll {
-                // This input stream no longer has data, move to next stream
-                Poll::Ready(None) => {
-                    self.current_stream_idx += 1;
-                    if self.current_stream_idx >= self.input_streams.len() {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
+        let poll = self.input_streams.poll_next(cx);
 
         let poll = match ready!(poll) {
             // This input stream has data, return its next record batch
@@ -325,15 +475,11 @@ impl Stream for ProgressiveEvalStream {
             // This input stream has no more data, return None (aka finished)
             None => {
                 // Reaching here means data of all streams have read
-                assert!(
-                    self.current_stream_idx >= self.input_streams.len(),
-                    "ProgressiveEvalStream::poll_next should not return None before all input streams are read",);
-
                 Poll::Ready(None)
             }
         };
 
-        self.metrics.record_poll(poll)
+        self.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -396,11 +542,39 @@ mod tests {
     #[tokio::test]
     async fn test_no_input_stream() {
         let task_ctx = Arc::new(TaskContext::default());
+
+        // no fetch limit --> return all rows
         _test_progressive_eval(
             &[],
             None,
-            None, // no fetch limit --> return all rows
+            None,
             &["++", "++"],
+            0, // 0 input stream
+            0, // 0 input stream is prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // limit = 0 means select nothing
+        _test_progressive_eval(
+            &[],
+            None,
+            Some(0),
+            &["++", "++"],
+            0, // 0 input stream
+            0, // 0 input stream is prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // limit = 1 on no data
+        _test_progressive_eval(
+            &[],
+            None,
+            Some(1),
+            &["++", "++"],
+            0, // 0 input stream
+            0, // 0 input stream is prefetched and polled
             task_ctx,
         )
         .await;
@@ -436,6 +610,8 @@ mod tests {
                 "| 3 | j | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
+            1, // 1 input stream
+            1, // 1 input stream is prefetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -446,6 +622,8 @@ mod tests {
             None,
             Some(0),
             &["++", "++"],
+            1,
+            1,
             Arc::clone(&task_ctx),
         )
         .await;
@@ -466,6 +644,8 @@ mod tests {
                 "| 3 | j | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
+            1, // 1 input stream
+            1, // 1 input stream is prefetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -486,6 +666,8 @@ mod tests {
                 "| 3 | j | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
+            1, // 1 input stream
+            1, // 1 input stream is prefetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -517,6 +699,7 @@ mod tests {
         let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
         // [b1, b2]
+        // return all by not specifying fetch limit
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
@@ -537,13 +720,44 @@ mod tests {
                 "| 30 | j | 1970-01-01T00:00:00.000000006 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2]
+        // return all by specifying large limit
+        _test_progressive_eval(
+            &[vec![b1.clone()], vec![b2.clone()]],
+            None,
+            Some(10), // limit = max num rows --> return all rows
+            &[
+                "+----+---+-------------------------------+",
+                "| a  | b | c                             |",
+                "+----+---+-------------------------------+",
+                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
+                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
+                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
+                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
+                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
+                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
+                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
+                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
+                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
+                "+----+---+-------------------------------+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
 
         // [b2, b1]
+        // return all by not specifying fetch limit
         _test_progressive_eval(
-            &[vec![b2], vec![b1]],
+            &[vec![b2.clone()], vec![b1.clone()]],
             None,
             None,
             &[
@@ -562,6 +776,36 @@ mod tests {
                 "| 3  | j | 1970-01-01T00:00:00.000000008 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b2, b1]
+        // return all by specifying large limit
+        _test_progressive_eval(
+            &[vec![b2], vec![b1]],
+            None,
+            Some(20),
+            &[
+                "+----+---+-------------------------------+",
+                "| a  | b | c                             |",
+                "+----+---+-------------------------------+",
+                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
+                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
+                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
+                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
+                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
+                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
+                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
+                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
+                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
+                "+----+---+-------------------------------+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
             task_ctx,
         )
         .await;
@@ -609,6 +853,8 @@ mod tests {
                 "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -632,6 +878,8 @@ mod tests {
                 "| 3  | e | 1970-01-01T00:00:00.000000008 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
             task_ctx,
         )
         .await;
@@ -676,6 +924,8 @@ mod tests {
                 "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched by default even thouggh only the first one is actally polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -698,6 +948,8 @@ mod tests {
                 "| 3 | e | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched by default even thouggh only the first one is actally polled
             task_ctx,
         )
         .await;
@@ -742,6 +994,8 @@ mod tests {
                 "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched by default even thouggh only the first one is actally polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -764,6 +1018,8 @@ mod tests {
                 "| 3 | e | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched by default even thouggh only the first one is actally polled
             task_ctx,
         )
         .await;
@@ -813,6 +1069,8 @@ mod tests {
                 "| 3  | e | 1970-01-01T00:00:00.000000008 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -838,6 +1096,8 @@ mod tests {
                 "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "+----+---+-------------------------------+",
             ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
             task_ctx,
         )
         .await;
@@ -894,6 +1154,8 @@ mod tests {
                 "| 3 | f | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
+            3, // 3 input streams
+            2, // 2 input streams are prefetched by default even though only the first one is polled
             Arc::clone(&task_ctx),
         )
         .await;
@@ -919,6 +1181,8 @@ mod tests {
                 "| 70 | h | 1970-01-01T00:00:00.000000020 |",
                 "+----+---+-------------------------------+",
             ],
+            3, // 3 input streams
+            3, // since we need to poll 2 input streams, 3 streams are prefetched. Always one extra stream is prefetched
             Arc::clone(&task_ctx),
         )
         .await;
@@ -948,7 +1212,281 @@ mod tests {
                 "| 900 | i | 1970-01-01T00:00:00.000000002 |",
                 "+-----+---+-------------------------------+",
             ],
+            3, // 3 input streams
+            3, // 3 input streams are prefetched and polled
             task_ctx,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_four_partitions_with_nulls() {
+        let task_ctx = Arc::new(TaskContext::default());
+
+        // partition 1
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 7, 9, 3]));
+        let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            None,
+            Some("f"),
+        ]));
+        let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
+        let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
+
+        // partition 2
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 70]));
+        let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
+            Some("e"),
+            Some("g"),
+            Some("h"),
+        ]));
+        let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![40, 60, 20]));
+        let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
+
+        // partition 3
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![100, 200, 700, 900]));
+        let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
+            None,
+            Some("g"),
+            Some("h"),
+            Some("i"),
+        ]));
+        let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![4, 6, 2, 2]));
+        let b3 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
+
+        // partition 4
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1000, 2000]));
+        let b: ArrayRef = Arc::new(StringArray::from_iter(vec![None, Some("x")]));
+        let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![40, 60]));
+        let b4 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // Fetch limit is 0 --> return nothing.
+        // Prefetch minum 2 input streams
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            Some(0),
+            &["++", "++"],
+            4, // 4 input streams
+            2, // 2 input streams are prefetched by default even though nothing is polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // Fetch limit is 3 --> return all 5 rows of b1
+        // Prefetch minum 2 input streams
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            Some(3),
+            &[
+                "+---+---+-------------------------------+",
+                "| a | b | c                             |",
+                "+---+---+-------------------------------+",
+                "| 1 | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2 | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7 | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9 |   | 1970-01-01T00:00:00.000000005 |",
+                "| 3 | f | 1970-01-01T00:00:00.000000008 |",
+                "+---+---+-------------------------------+",
+            ],
+            4, // 4 input streams
+            2, // 2 input streams are prefetched  and one stream is polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // Fetch limit is 5 --> return all 5 rows of b1
+        // Prefetch minum 2 input streams
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            Some(5),
+            &[
+                "+---+---+-------------------------------+",
+                "| a | b | c                             |",
+                "+---+---+-------------------------------+",
+                "| 1 | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2 | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7 | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9 |   | 1970-01-01T00:00:00.000000005 |",
+                "| 3 | f | 1970-01-01T00:00:00.000000008 |",
+                "+---+---+-------------------------------+",
+            ],
+            4, // 4 input streams
+            2, // 2 input streams are prefetched and one stream is polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // Fetch limit is 8 --> return all 8 rows of b1 and b2
+        // Prefetched 3 input streams since we will always prefetch one extra one
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            Some(8),
+            &[
+                "+----+---+-------------------------------+",
+                "| a  | b | c                             |",
+                "+----+---+-------------------------------+",
+                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2  | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7  | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9  |   | 1970-01-01T00:00:00.000000005 |",
+                "| 3  | f | 1970-01-01T00:00:00.000000008 |",
+                "| 10 | e | 1970-01-01T00:00:00.000000040 |",
+                "| 20 | g | 1970-01-01T00:00:00.000000060 |",
+                "| 70 | h | 1970-01-01T00:00:00.000000020 |",
+                "+----+---+-------------------------------+",
+            ],
+            4, // 4 input streams
+            3, // 3 input streams are prefetched and 2 streams are polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // Fetch limit is 12 --> return all 12 rows of b1, b2 and b3
+        // Prefetch 4 input streams since we will always prefetch one extra one
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            Some(12),
+            &[
+                "+-----+---+-------------------------------+",
+                "| a   | b | c                             |",
+                "+-----+---+-------------------------------+",
+                "| 1   | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2   | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7   | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9   |   | 1970-01-01T00:00:00.000000005 |",
+                "| 3   | f | 1970-01-01T00:00:00.000000008 |",
+                "| 10  | e | 1970-01-01T00:00:00.000000040 |",
+                "| 20  | g | 1970-01-01T00:00:00.000000060 |",
+                "| 70  | h | 1970-01-01T00:00:00.000000020 |",
+                "| 100 |   | 1970-01-01T00:00:00.000000004 |",
+                "| 200 | g | 1970-01-01T00:00:00.000000006 |",
+                "| 700 | h | 1970-01-01T00:00:00.000000002 |",
+                "| 900 | i | 1970-01-01T00:00:00.000000002 |",
+                "+-----+---+-------------------------------+",
+            ],
+            4, // 4 input streams
+            4, // 4 input streams are prefetched and 3 streams are polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // Fetch limit is 15 --> return all 15 rows of b1, b2, b3 and b4
+        // Prefetched all 4 input streams
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            Some(15),
+            &[
+                "+------+---+-------------------------------+",
+                "| a    | b | c                             |",
+                "+------+---+-------------------------------+",
+                "| 1    | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2    | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7    | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9    |   | 1970-01-01T00:00:00.000000005 |",
+                "| 3    | f | 1970-01-01T00:00:00.000000008 |",
+                "| 10   | e | 1970-01-01T00:00:00.000000040 |",
+                "| 20   | g | 1970-01-01T00:00:00.000000060 |",
+                "| 70   | h | 1970-01-01T00:00:00.000000020 |",
+                "| 100  |   | 1970-01-01T00:00:00.000000004 |",
+                "| 200  | g | 1970-01-01T00:00:00.000000006 |",
+                "| 700  | h | 1970-01-01T00:00:00.000000002 |",
+                "| 900  | i | 1970-01-01T00:00:00.000000002 |",
+                "| 1000 |   | 1970-01-01T00:00:00.000000040 |",
+                "| 2000 | x | 1970-01-01T00:00:00.000000060 |",
+                "+------+---+-------------------------------+",
+            ],
+            4, // 4 input streams
+            4, // 4 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // [b1, b2, b3, b4]
+        // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
+        // No fetch limit--> return all 15 rows of b1, b2, b3 and b4
+        // Prefetched all 4 input streams
+        _test_progressive_eval(
+            &[
+                vec![b1.clone()],
+                vec![b2.clone()],
+                vec![b3.clone()],
+                vec![b4.clone()],
+            ],
+            None,
+            None, // No fetch limit
+            &[
+                "+------+---+-------------------------------+",
+                "| a    | b | c                             |",
+                "+------+---+-------------------------------+",
+                "| 1    | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2    | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7    | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9    |   | 1970-01-01T00:00:00.000000005 |",
+                "| 3    | f | 1970-01-01T00:00:00.000000008 |",
+                "| 10   | e | 1970-01-01T00:00:00.000000040 |",
+                "| 20   | g | 1970-01-01T00:00:00.000000060 |",
+                "| 70   | h | 1970-01-01T00:00:00.000000020 |",
+                "| 100  |   | 1970-01-01T00:00:00.000000004 |",
+                "| 200  | g | 1970-01-01T00:00:00.000000006 |",
+                "| 700  | h | 1970-01-01T00:00:00.000000002 |",
+                "| 900  | i | 1970-01-01T00:00:00.000000002 |",
+                "| 1000 |   | 1970-01-01T00:00:00.000000040 |",
+                "| 2000 | x | 1970-01-01T00:00:00.000000060 |",
+                "+------+---+-------------------------------+",
+            ],
+            4, // 4 input streams
+            4, // 4 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
         )
         .await;
     }
@@ -957,7 +1495,9 @@ mod tests {
         partitions: &[Vec<RecordBatch>],
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
-        exp: &[&str],
+        expected_result: &[&str],
+        expected_num_input_streams: usize,
+        expected_num_read_input_streams: usize,
         context: Arc<TaskContext>,
     ) {
         let schema = if partitions.is_empty() {
@@ -976,8 +1516,32 @@ mod tests {
             fetch,
         ));
 
+        let progressive_clone = Arc::clone(&progressive);
+
         let collected = collect(progressive, context).await.unwrap();
-        assert_batches_eq!(exp, collected.as_slice());
+        assert_batches_eq!(expected_result, collected.as_slice());
+
+        // verify metrics
+        let metrics = progressive_clone.metrics().unwrap();
+        let num_input_streams = Count::new();
+        num_input_streams.add(expected_num_input_streams);
+        let num_read_input_streams = Count::new();
+        num_read_input_streams.add(expected_num_read_input_streams);
+
+        assert_eq!(
+            metrics.sum_by_name("num_inputs"),
+            Some(MetricValue::Count {
+                name: Borrowed("num_inputs"),
+                count: num_input_streams
+            })
+        );
+        assert_eq!(
+            metrics.sum_by_name("num_read_inputs"),
+            Some(MetricValue::Count {
+                name: Borrowed("num_read_inputs"),
+                count: num_read_input_streams
+            })
+        );
     }
 
     #[tokio::test]
@@ -1015,6 +1579,26 @@ mod tests {
 
         assert_eq!(metrics.output_rows().unwrap(), 4);
         assert!(metrics.elapsed_compute().unwrap() > 0);
+
+        let num_input_streams = Count::new();
+        num_input_streams.add(2);
+        assert_eq!(
+            metrics.sum_by_name("num_inputs"),
+            Some(MetricValue::Count {
+                name: Borrowed("num_inputs"),
+                count: num_input_streams
+            })
+        );
+
+        let num_read_input_streams = Count::new();
+        num_read_input_streams.add(2);
+        assert_eq!(
+            metrics.sum_by_name("num_read_inputs"),
+            Some(MetricValue::Count {
+                name: Borrowed("num_read_inputs"),
+                count: num_read_input_streams
+            })
+        );
 
         let mut saw_start = false;
         let mut saw_end = false;

@@ -1,10 +1,11 @@
 use arrow::datatypes::SchemaRef;
-use datafusion::common::ParamValues;
+
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use influxdb_influxql_parser::show_field_keys::ShowFieldKeysStatement;
 use influxdb_influxql_parser::show_measurements::ShowMeasurementsStatement;
 use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
 use influxdb_influxql_parser::show_tag_values::ShowTagValuesStatement;
+use iox_query_params::StatementParams;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -151,20 +152,15 @@ impl InfluxQLQueryPlanner {
     pub async fn query(
         &self,
         query: &str,
-        params: impl Into<ParamValues> + Send,
+        params: impl Into<StatementParams> + Send,
         ctx: &IOxSessionContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let ctx = ctx.child_ctx("InfluxQLQueryPlanner::query");
         debug!(text=%query, "planning InfluxQL query");
 
         let statement = self.query_to_statement(query)?;
-        let logical_plan = self.statement_to_plan(statement, &ctx).await?;
+        let logical_plan = self.statement_to_plan(statement, params, &ctx).await?;
         // add params to plan only when they're non-empty
-        let logical_plan = match params.into() {
-            ParamValues::List(v) if !v.is_empty() => logical_plan.with_param_values(v)?,
-            ParamValues::Map(m) if !m.is_empty() => logical_plan.with_param_values(m)?,
-            _ => logical_plan,
-        };
         let input = ctx.create_physical_plan(&logical_plan).await?;
 
         // Merge schema-level metadata from the logical plan with the
@@ -184,6 +180,7 @@ impl InfluxQLQueryPlanner {
     async fn statement_to_plan(
         &self,
         statement: Statement,
+        params: impl Into<StatementParams> + Send,
         ctx: &IOxSessionContext,
     ) -> Result<LogicalPlan> {
         use std::collections::hash_map::Entry;
@@ -231,7 +228,7 @@ impl InfluxQLQueryPlanner {
         }
 
         let planner = InfluxQLToLogicalPlan::new(&sp, &ctx);
-        let logical_plan = planner.statement_to_plan(statement)?;
+        let logical_plan = planner.statement_to_plan_with_params(statement, params.into())?;
         debug!(plan=%logical_plan.display_graphviz(), "logical plan");
         Ok(logical_plan)
     }

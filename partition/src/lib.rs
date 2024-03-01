@@ -3,29 +3,29 @@
 //! The partitioning template, derived partition key format, and encodings are
 //! described in detail in the [`data_types::partition_template`] module.
 
-mod bucket;
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 mod filter;
-mod strftime;
+mod template;
 mod traits;
 
-use std::{borrow::Cow, num::NonZeroUsize, ops::Range};
+use std::{num::NonZeroUsize, ops::Range};
 
+use arrow::{array::UInt64Array, compute::take, error::ArrowError, record_batch::RecordBatch};
 use data_types::{
     partition_template::{
-        TablePartitionTemplateOverride, TemplatePart, ENCODED_PARTITION_KEY_CHARS,
-        MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_KEY_DELIMITER, PARTITION_KEY_MAX_PART_LEN,
-        PARTITION_KEY_PART_TRUNCATED, PARTITION_KEY_VALUE_EMPTY_STR, PARTITION_KEY_VALUE_NULL_STR,
+        TablePartitionTemplateOverride, TemplatePart, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
+        PARTITION_KEY_DELIMITER,
     },
     PartitionKey,
 };
 use hashbrown::HashMap;
 use mutable_batch::{MutableBatch, WritePayload};
-use percent_encoding::utf8_percent_encode;
 use thiserror::Error;
-use unicode_segmentation::UnicodeSegmentation;
 
+use self::template::Template;
 pub use self::traits::{Batch, PartitioningColumn, TimeColumnError};
-use self::{bucket::BucketHasher, strftime::StrftimeFormatter};
 
 /// An error generating a partition key for a row.
 #[allow(missing_copy_implementations)]
@@ -66,207 +66,12 @@ where
     range_encode(partition_keys(batch, template.parts()))
 }
 
-/// A [`TablePartitionTemplateOverride`] is made up of one of more
-/// [`TemplatePart`]s that are rendered and joined together by
-/// [`PARTITION_KEY_DELIMITER`] to form a single partition key.
-///
-/// To avoid allocating intermediate strings, and performing column lookups for
-/// every row, each [`TemplatePart`] is converted to a [`Template`].
-///
-/// [`Template::fmt_row`] can then be used to render the template for that
-/// particular row to the provided string, without performing any additional
-/// column lookups
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-enum Template<'a, T: PartitioningColumn> {
-    TagValue(&'a T, Option<&'a T::TagIdentityKey>),
-    TimeFormat(&'a [i64], StrftimeFormatter<'a>),
-    Bucket(&'a T, BucketHasher, Option<&'a T::TagIdentityKey>),
-
-    /// This batch is missing a partitioning tag column.
-    MissingTag,
-}
-
-impl<'a, T> Template<'a, T>
-where
-    T: PartitioningColumn,
-{
-    /// Renders this template to `out` for the row `idx`.
-    fn fmt_row<W: std::fmt::Write>(
-        &mut self,
-        out: &mut W,
-        idx: usize,
-    ) -> Result<(), PartitionKeyError> {
-        match self {
-            Template::TagValue(col, last_key) if col.is_valid(idx) => {
-                let this_key = col
-                    .get_tag_identity_key(idx)
-                    .ok_or_else(|| PartitionKeyError::TagValueNotTag(col.type_description()))?;
-
-                // Update the "is identical" tracking key for this new,
-                // potentially different key.
-                *last_key = Some(this_key);
-
-                out.write_str(encode_key_part(col.get_tag_value(this_key).unwrap()).as_ref())?
-            }
-            Template::TimeFormat(t, fmt) => fmt.render(t[idx], out)?,
-            Template::Bucket(col, bucketer, last_key) if col.is_valid(idx) => {
-                let this_key = col
-                    .get_tag_identity_key(idx)
-                    .ok_or_else(|| PartitionKeyError::TagValueNotTag(col.type_description()))?;
-                let this_value = col.get_tag_value(this_key).unwrap();
-                let bucket = bucketer.assign_bucket(this_value);
-
-                // Update the "is identical" tracking key for this new,
-                // potentially different key.
-                *last_key = Some(this_key);
-
-                write!(out, "{bucket}")?
-            }
-            // Either a tag that has no value for this given row index, or the
-            // batch does not contain this tag at all.
-            Template::TagValue(_, last_key) => {
-                // This row doesn't have a tag value, which should be carried
-                // forwards to be checked against the next row.
-                *last_key = None;
-                out.write_str(PARTITION_KEY_VALUE_NULL_STR)?
-            }
-            // Either a tag that has no value for this given row index, or the
-            // batch does not contain this tag at all.
-            Template::Bucket(_, _, last_key) => {
-                // This row doesn't have a tag value, which should be carried
-                // forwards to be checked against the next row.
-                *last_key = None;
-                out.write_str(PARTITION_KEY_VALUE_NULL_STR)?
-            }
-            Template::MissingTag => out.write_str(PARTITION_KEY_VALUE_NULL_STR)?,
-        }
-
-        Ok(())
-    }
-
-    /// Returns true if the partition key generated by `self` for `idx` will be
-    /// identical to the last generated key.
-    fn is_identical(&mut self, idx: usize) -> bool {
-        match self {
-            Template::TagValue(col, last_key) if col.is_valid(idx) => {
-                let this_key = match col.get_tag_identity_key(idx) {
-                    Some(key) => key,
-                    // This is an error, but for the purposes of identical checks,
-                    // it is treated as not identical, causing the error to be
-                    // raised when formatting is attempted.
-                    None => return false,
-                };
-
-                // Check if the key matches the last key, indicating the same value is going to
-                // be rendered.
-                last_key.map(|v| v == this_key).unwrap_or_default()
-            }
-            Template::TimeFormat(t, fmt) => {
-                // Check if the last value matches the current value, after
-                // optionally applying the precision reduction optimisation.
-                fmt.equals_last(t[idx])
-            }
-            Template::Bucket(col, fmt, last_key) if col.is_valid(idx) => {
-                // To perform an equality check for `idx` when it is a
-                // `Bucket` template part we must check in order:
-                //
-                //     1. If this dictionary key is the same as the
-                //        previous
-                //     2. If the assigned bucket is the same as the
-                //        previous
-                //
-                // While just checking the bucket is correct, checking
-                // the dictionary key first avoids unnecessary throwaway
-                // hashing work.
-                let this_key = match col.get_tag_identity_key(idx) {
-                    Some(key) => key,
-                    // This is an error, but for the purposes of identical checks,
-                    // it is treated as not identical, causing the error to be
-                    // raised when formatting is attempted.
-                    None => return false,
-                };
-
-                match last_key {
-                    Some(v) if this_key == *v => true,
-                    Some(_) => {
-                        col.get_tag_value(this_key)
-                            .map(|this_value| {
-                                // Grab the last assigned bucket, assign
-                                // a bucket for the current value and
-                                // check for equality.
-                                fmt.last_assigned_bucket()
-                                    .map(|last_bucket| last_bucket == fmt.assign_bucket(this_value))
-                                    .unwrap_or_default()
-                            })
-                            .unwrap_or_default()
-                    }
-                    None => false,
-                }
-            }
-            // The last row did not contain this key, and neither does this.
-            Template::TagValue(_, None) | Template::Bucket(_, _, None) => true,
-            // The last row did contain a key, but this one does not (therefore
-            // it differs).
-            Template::TagValue(_, Some(_)) | Template::Bucket(_, _, Some(_)) => false,
-            // The batch does not contain this tag at all - it always matches
-            // with the previous row.
-            Template::MissingTag => true,
-        }
-    }
-}
-
-fn encode_key_part(s: &str) -> Cow<'_, str> {
-    // Encode reserved characters and non-ascii characters.
-    let as_str: Cow<'_, str> = utf8_percent_encode(s, &ENCODED_PARTITION_KEY_CHARS).into();
-
-    match as_str.len() {
-        0 => Cow::Borrowed(PARTITION_KEY_VALUE_EMPTY_STR),
-        1..=PARTITION_KEY_MAX_PART_LEN => as_str,
-        _ => {
-            // This string exceeds the maximum byte length limit and must be
-            // truncated.
-            //
-            // Truncation of unicode strings can be tricky - this implementation
-            // avoids splitting unicode code-points nor graphemes. See the
-            // partition_template module docs in data_types before altering
-            // this.
-
-            // Preallocate the string to hold the long partition key part.
-            let mut buf = String::with_capacity(PARTITION_KEY_MAX_PART_LEN);
-
-            // This is a slow path, re-encoding the original input string -
-            // fortunately this is an uncommon path.
-            //
-            // Walk the string, encoding each grapheme (which includes spaces)
-            // individually, tracking the total length of the encoded string.
-            // Once it hits 199 bytes, stop and append a #.
-
-            let mut bytes = 0;
-            s.graphemes(true)
-                .map(|v| Cow::from(utf8_percent_encode(v, &ENCODED_PARTITION_KEY_CHARS)))
-                .take_while(|v| {
-                    bytes += v.len(); // Byte length of encoded grapheme
-                    bytes < PARTITION_KEY_MAX_PART_LEN
-                })
-                .for_each(|v| buf.push_str(v.as_ref()));
-
-            // Append the truncation marker.
-            buf.push(PARTITION_KEY_PART_TRUNCATED);
-
-            assert!(buf.len() <= PARTITION_KEY_MAX_PART_LEN);
-
-            Cow::Owned(buf)
-        }
-    }
-}
-
 /// Returns an iterator of partition keys for the given table batch.
 ///
 /// This function performs deduplication on returned keys; the returned iterator
 /// yields [`Some`] containing the partition key string when a new key is
 /// generated, and [`None`] when the generated key would equal the last key.
-fn partition_keys<'a, T>(
+pub fn partition_keys<'a, T>(
     batch: &'a T,
     template_parts: impl Iterator<Item = TemplatePart<'a>>,
 ) -> impl Iterator<Item = Option<Result<String, PartitionKeyError>>> + 'a
@@ -278,18 +83,7 @@ where
 
     // Convert TemplatePart into an ordered array of Template
     let mut template = template_parts
-        .map(|v| match v {
-            TemplatePart::TagValue(col_name) => batch
-                .column(col_name)
-                .map_or_else(|| Template::MissingTag, |v| Template::TagValue(v, None)),
-            TemplatePart::TimeFormat(fmt) => {
-                Template::TimeFormat(time, StrftimeFormatter::new(fmt))
-            }
-            TemplatePart::Bucket(col_name, num_buckets) => batch.column(col_name).map_or_else(
-                || Template::MissingTag,
-                |v| Template::Bucket(v, BucketHasher::new(num_buckets), None),
-            ),
-        })
+        .map(|v| Template::from((v, batch, time)))
         .collect::<Vec<_>>();
 
     // Track the length of the last yielded partition key, and pre-allocate the
@@ -410,22 +204,25 @@ pub enum PartitionWriteError {
 
 /// A [`MutableBatch`] with a non-zero set of row ranges to write
 #[derive(Debug)]
-pub struct PartitionWrite<'a> {
-    batch: &'a MutableBatch,
+pub struct PartitionWrite<'a, T> {
+    batch: &'a T,
     ranges: Vec<Range<usize>>,
     min_timestamp: i64,
     max_timestamp: i64,
     row_count: NonZeroUsize,
 }
 
-impl<'a> PartitionWrite<'a> {
+impl<'a, T> PartitionWrite<'a, T>
+where
+    T: Batch,
+{
     /// Create a new [`PartitionWrite`] with the entire range of the provided batch
     ///
     /// # Panic
     ///
     /// Panics if the batch has no rows
-    pub fn new(batch: &'a MutableBatch) -> Result<Self, PartitionWriteError> {
-        let row_count = NonZeroUsize::new(batch.rows()).unwrap();
+    pub fn new(batch: &'a T) -> Result<Self, PartitionWriteError> {
+        let row_count = NonZeroUsize::new(batch.num_rows()).unwrap();
         let time = batch.time_column()?;
         let (min_timestamp, max_timestamp) = min_max_time(time);
 
@@ -434,7 +231,7 @@ impl<'a> PartitionWrite<'a> {
         #[allow(clippy::single_range_in_vec_init)]
         Ok(Self {
             batch,
-            ranges: vec![0..batch.rows()],
+            ranges: vec![0..batch.num_rows()],
             min_timestamp,
             max_timestamp,
             row_count,
@@ -456,40 +253,10 @@ impl<'a> PartitionWrite<'a> {
         self.row_count
     }
 
-    /// Returns a [`PartitionWrite`] containing just the rows of `Self` that pass
-    /// the provided time predicate, or None if no rows
-    pub fn filter(&self, predicate: impl Fn(i64) -> bool) -> Option<PartitionWrite<'a>> {
-        let mut min_timestamp = i64::MAX;
-        let mut max_timestamp = i64::MIN;
-        let mut row_count = 0_usize;
-
-        // Construct a predicate that lets us inspect the timestamps as they are filtered
-        let inspect = |t| match predicate(t) {
-            true => {
-                min_timestamp = min_timestamp.min(t);
-                max_timestamp = max_timestamp.max(t);
-                row_count += 1;
-                true
-            }
-            false => false,
-        };
-
-        let ranges: Vec<_> = filter::filter_time(self.batch, &self.ranges, inspect);
-        let row_count = NonZeroUsize::new(row_count)?;
-
-        Some(PartitionWrite {
-            batch: self.batch,
-            ranges,
-            min_timestamp,
-            max_timestamp,
-            row_count,
-        })
-    }
-
     /// Create a collection of [`PartitionWrite`] indexed by partition key
     /// from a [`MutableBatch`] and [`TablePartitionTemplateOverride`]
     pub fn partition(
-        batch: &'a MutableBatch,
+        batch: &'a T,
         partition_template: &TablePartitionTemplateOverride,
     ) -> Result<HashMap<PartitionKey, Self>, PartitionWriteError> {
         use hashbrown::hash_map::Entry;
@@ -521,11 +288,117 @@ impl<'a> PartitionWrite<'a> {
         }
         Ok(partition_ranges)
     }
+
+    /// Create a [`PartitionWrite`] for the data in the batch that belongs in the partition
+    /// specified by the partition template and partition key. Returns `None` if no data in the
+    /// batch belongs to the partition key.
+    pub fn filter_to_partition(
+        batch: &'a T,
+        partition_template: &TablePartitionTemplateOverride,
+        partition_key: &PartitionKey,
+    ) -> Result<Option<Self>, PartitionWriteError> {
+        let time = batch.time_column()?;
+
+        let mut maybe_pw: Option<Self> = None;
+
+        for (partition, range) in partition_batch(batch, partition_template) {
+            let partition = partition?;
+
+            if partition == partition_key.inner() {
+                let range_row_count = NonZeroUsize::new(range.end - range.start).unwrap();
+                let (range_min_timestamp, range_max_timestamp) = min_max_time(&time[range.clone()]);
+
+                maybe_pw = match maybe_pw {
+                    Some(Self {
+                        batch,
+                        mut ranges,
+                        min_timestamp,
+                        max_timestamp,
+                        row_count,
+                    }) => {
+                        ranges.push(range);
+
+                        Some(Self {
+                            batch,
+                            ranges,
+                            min_timestamp: min_timestamp.min(range_min_timestamp),
+                            max_timestamp: max_timestamp.max(range_max_timestamp),
+                            row_count: NonZeroUsize::new(row_count.get() + range_row_count.get())
+                                .unwrap(),
+                        })
+                    }
+                    None => Some(Self {
+                        batch,
+                        ranges: vec![range],
+                        min_timestamp: range_min_timestamp,
+                        max_timestamp: range_max_timestamp,
+                        row_count: range_row_count,
+                    }),
+                }
+            }
+        }
+
+        Ok(maybe_pw)
+    }
 }
 
-impl<'a> WritePayload for PartitionWrite<'a> {
+impl<'a> PartitionWrite<'a, MutableBatch> {
+    /// Returns a [`PartitionWrite`] containing just the rows of `Self` that pass
+    /// the provided time predicate, or None if no rows
+    pub fn filter(&self, predicate: impl Fn(i64) -> bool) -> Option<Self> {
+        let mut min_timestamp = i64::MAX;
+        let mut max_timestamp = i64::MIN;
+        let mut row_count = 0_usize;
+
+        // Construct a predicate that lets us inspect the timestamps as they are filtered
+        let inspect = |t| match predicate(t) {
+            true => {
+                min_timestamp = min_timestamp.min(t);
+                max_timestamp = max_timestamp.max(t);
+                row_count += 1;
+                true
+            }
+            false => false,
+        };
+
+        let ranges: Vec<_> = filter::filter_time(self.batch, &self.ranges, inspect);
+        let row_count = NonZeroUsize::new(row_count)?;
+
+        Some(PartitionWrite {
+            batch: self.batch,
+            ranges,
+            min_timestamp,
+            max_timestamp,
+            row_count,
+        })
+    }
+}
+
+impl<'a> WritePayload for PartitionWrite<'a, MutableBatch> {
     fn write_to_batch(&self, batch: &mut MutableBatch) -> mutable_batch::Result<()> {
         batch.extend_from_ranges(self.batch, &self.ranges)
+    }
+}
+
+impl<'a> PartitionWrite<'a, RecordBatch> {
+    /// Given a `PartitionWrite` that holds a `RecordBatch` and some ranges, return a new
+    /// `RecordBatch` containing only the rows in the ranges.
+    pub fn to_record_batch(&self) -> Result<RecordBatch, ArrowError> {
+        let indices = UInt64Array::from(
+            self.ranges
+                .clone()
+                .into_iter()
+                .flat_map(|r| r.into_iter().map(|i| i as u64))
+                .collect::<Vec<_>>(),
+        );
+
+        let columns = self
+            .batch
+            .columns()
+            .iter()
+            .map(|c| take(c, &indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        RecordBatch::try_new(self.batch.schema(), columns)
     }
 }
 
@@ -541,8 +414,15 @@ fn min_max_time(col: &[i64]) -> (i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    // Workaround for "unused crate" lint false positives.
+    // These crates are used in integration tests but not unit tests
+    use criterion as _;
+    use generated_types as _;
+    use mutable_batch_lp as _;
 
+    use std::{borrow::Cow, collections::HashMap};
+
+    use self::template::bucket::BucketHasher;
     use super::*;
 
     use assert_matches::assert_matches;
@@ -780,14 +660,124 @@ mod tests {
     }
 
     #[test]
-    fn test_bucket_fixture() {
-        let mut bucketer = BucketHasher::new(10);
-        assert_eq!(bucketer.assign_bucket("foo"), 6);
-        assert_eq!(bucketer.last_assigned_bucket(), Some(6));
-        assert_eq!(bucketer.assign_bucket("bat"), 5);
-        assert_eq!(bucketer.last_assigned_bucket(), Some(5));
-        assert_eq!(bucketer.assign_bucket("qux"), 5);
-        assert_eq!(bucketer.last_assigned_bucket(), Some(5));
+    fn partition_write_partition_and_filter() {
+        let mut batch = MutableBatch::new();
+        let mut writer = Writer::new(&mut batch, 7);
+
+        writer
+            .write_time(
+                "time",
+                vec![
+                    1,
+                    1685971961464736000,
+                    1,
+                    1,
+                    1,
+                    1685971961464736000,
+                    1685971961464736000,
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        writer
+            .write_tag(
+                "region",
+                Some(&[0b01111111]),
+                vec![
+                    "platanos", "platanos", "platanos", "platanos", "bananas", "bananas",
+                    "platanos",
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+
+        let table_partition_template = test_table_partition_override(vec![
+            TemplatePart::TimeFormat("%Y-%m-%d %H:%M:%S"),
+            TemplatePart::TagValue("region"),
+        ]);
+
+        writer.commit();
+
+        let by_partition = PartitionWrite::partition(&batch, &table_partition_template).unwrap();
+
+        let mut partitions: Vec<_> = by_partition.keys().map(ToString::to_string).collect();
+        partitions.sort();
+        assert_eq!(
+            partitions,
+            [
+                "1970-01-01 00:00:00|bananas",
+                "1970-01-01 00:00:00|platanos",
+                "2023-06-05 13:32:41|bananas",
+                "2023-06-05 13:32:41|platanos",
+            ]
+        );
+
+        let bananas1970 = by_partition
+            .get(&PartitionKey::from("1970-01-01 00:00:00|bananas"))
+            .unwrap();
+        let mut bananas1970_batch = MutableBatch::new();
+        bananas1970.write_to_batch(&mut bananas1970_batch).unwrap();
+        assert_eq!(bananas1970_batch.num_rows(), 1);
+
+        let platanos1970 = by_partition
+            .get(&PartitionKey::from("1970-01-01 00:00:00|platanos"))
+            .unwrap();
+        let mut platanos1970_batch = MutableBatch::new();
+        platanos1970
+            .write_to_batch(&mut platanos1970_batch)
+            .unwrap();
+        assert_eq!(platanos1970_batch.num_rows(), 3);
+
+        let bananas2023 = by_partition
+            .get(&PartitionKey::from("2023-06-05 13:32:41|bananas"))
+            .unwrap();
+        let mut bananas2023_batch = MutableBatch::new();
+        bananas2023.write_to_batch(&mut bananas2023_batch).unwrap();
+        assert_eq!(bananas2023_batch.num_rows(), 1);
+
+        let platanos2023 = by_partition
+            .get(&PartitionKey::from("2023-06-05 13:32:41|platanos"))
+            .unwrap();
+        let mut platanos2023_batch = MutableBatch::new();
+        platanos2023
+            .write_to_batch(&mut platanos2023_batch)
+            .unwrap();
+        assert_eq!(platanos2023_batch.num_rows(), 2);
+
+        let filter_to_platanos1970 = PartitionWrite::filter_to_partition(
+            &batch,
+            &table_partition_template,
+            &PartitionKey::from("1970-01-01 00:00:00|platanos"),
+        )
+        .unwrap()
+        .unwrap();
+        let mut filter_to_platanos1970_batch = MutableBatch::new();
+        filter_to_platanos1970
+            .write_to_batch(&mut filter_to_platanos1970_batch)
+            .unwrap();
+        assert_eq!(filter_to_platanos1970_batch.num_rows(), 3);
+
+        assert!(PartitionWrite::filter_to_partition(
+            &batch,
+            &table_partition_template,
+            &PartitionKey::from("1970-01-01 00:00:00|not-a-matching-partition-key"),
+        )
+        .unwrap()
+        .is_none());
+
+        let initial_record_batch = batch.to_arrow(Projection::All).unwrap();
+        let filter_record_batch_to_platanos1970 = PartitionWrite::filter_to_partition(
+            &initial_record_batch,
+            &table_partition_template,
+            &PartitionKey::from("1970-01-01 00:00:00|platanos"),
+        )
+        .unwrap()
+        .unwrap();
+        let filtered_record_batch = filter_record_batch_to_platanos1970
+            .to_record_batch()
+            .unwrap();
+        assert_eq!(filtered_record_batch.num_rows(), 3);
     }
 
     #[test]
@@ -934,8 +924,8 @@ mod tests {
         }
     }
 
-    fn bucket(bucket_id: u32) -> ColumnValue<'static> {
-        ColumnValue::Bucket(bucket_id)
+    fn bucket(id: u32, num_buckets: u32) -> ColumnValue<'static> {
+        ColumnValue::Bucket { id, num_buckets }
     }
 
     // Generate a test that asserts the derived partition key matches
@@ -1015,7 +1005,7 @@ mod tests {
             (TIME_COLUMN_NAME, year(2023)),
             ("a", identity("bananas")),
             ("b", identity("are_good")),
-            ("c", bucket(1)),
+            ("c", bucket(1, 5)),
         ]
     );
 
@@ -1064,7 +1054,7 @@ mod tests {
         template = [TemplatePart::Bucket("a", 10)],
         tags = [("a", "")],
         want_key = "0",
-        want_reversed_tags = [("a", bucket(0))]
+        want_reversed_tags = [("a", bucket(0, 10))]
     );
 
     test_partition_key!(
@@ -1437,7 +1427,10 @@ mod tests {
     prop_compose! {
         /// Yield a Vec containing an identical timestamp run of random length,
         /// up to `max_run_len`,
-        fn arbitrary_timestamp_run(max_run_len: usize)(v in 0_i64..i64::MAX, run_len in 1..max_run_len) -> Vec<i64> {
+        fn arbitrary_timestamp_run(max_run_len: usize)(
+            v in 0_i64..i64::MAX,
+            run_len in 1..max_run_len,
+        ) -> Vec<i64> {
             let mut x = Vec::with_capacity(run_len);
             x.resize(run_len, v);
             x
@@ -1459,7 +1452,7 @@ mod tests {
     enum ExpectedColumnValue {
         String(String),
         TSRange(DateTime<Utc>, DateTime<Utc>),
-        Bucket(u32),
+        Bucket(u32, u32),
     }
 
     impl ExpectedColumnValue {
@@ -1467,7 +1460,7 @@ mod tests {
             match self {
                 Self::String(s) => s,
                 Self::TSRange(_, _) => panic!("expected string, got TS range"),
-                Self::Bucket(_) => panic!("expected string, got bucket id"),
+                Self::Bucket(_, _) => panic!("expected string, got bucket id"),
             }
         }
 
@@ -1475,15 +1468,15 @@ mod tests {
             match self {
                 Self::String(_) => panic!("expected TS range, got string"),
                 Self::TSRange(b, e) => (*b, *e),
-                Self::Bucket(_) => panic!("expected TS range, got bucket id"),
+                Self::Bucket(_, _) => panic!("expected TS range, got bucket id"),
             }
         }
 
-        fn expect_bucket_id(&self) -> u32 {
+        fn expect_bucket(&self) -> (u32, u32) {
             match self {
                 Self::String(_) => panic!("expected bucket id, got string"),
                 Self::TSRange(_, _) => panic!("expected bucket id, got TS range"),
-                Self::Bucket(bucket_id) => *bucket_id,
+                Self::Bucket(id, num_buckets) => (*id, *num_buckets),
             }
         }
     }
@@ -1522,38 +1515,59 @@ mod tests {
             assert_eq!(keys.len(), 1);
 
             // Reverse the encoding.
-            let reversed: Vec<(&str, ColumnValue<'_>)> = build_column_values(&template, &keys[0]).collect();
+            let reversed: Vec<(&str, ColumnValue<'_>)> = build_column_values(
+                &template,
+                &keys[0]
+            ).collect();
 
             // Build the expected set of reversed tags by filtering out any
             // NULL tags (preserving empty string values).
             let ts = Utc.timestamp_nanos(ts);
-            let want_reversed: Vec<(&str, ExpectedColumnValue)> = template.parts().filter_map(|v| match v {
-                TemplatePart::TagValue(col_name) if tag_values.contains_key(col_name) => {
-                    // This tag had a (potentially empty) value wrote and should
-                    // appear in the reversed output.
-                    Some((col_name, ExpectedColumnValue::String(tag_values.get(col_name).unwrap().to_string())))
-                }
-                TemplatePart::TimeFormat("%Y/%m/%d" | "%Y-%m-%d") => {
-                    let begin = Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), 0, 0, 0).unwrap();
-                    let end = begin + Days::new(1);
-                    Some((TIME_COLUMN_NAME, ExpectedColumnValue::TSRange(begin, end)))
-                }
-                TemplatePart::Bucket(col_name, num_buckets) if tag_values.contains_key(col_name) => {
-                    // Hash-bucketing is not fully-reversible from value to
-                    // tag-name (intentionally so, it makes it much simpler to
-                    // implement).
-                    //
-                    // The test must assign buckets as they are when the
-                    // partition key is rendered.
-                    let want_bucket = BucketHasher::new(num_buckets).assign_bucket(tag_values.get(col_name).unwrap());
-                    Some((col_name, ExpectedColumnValue::Bucket(want_bucket)))
-                }
-                _ => None,
+            let want_reversed: Vec<(&str, ExpectedColumnValue)> = template
+                .parts()
+                .filter_map(|v| match v {
+                    TemplatePart::TagValue(col_name) if tag_values.contains_key(col_name) => {
+                        // This tag had a (potentially empty) value wrote and should
+                        // appear in the reversed output.
+                        Some((
+                            col_name,
+                            ExpectedColumnValue::String(
+                                tag_values.get(col_name).unwrap().to_string()
+                            )
+                        ))
+                    }
+                    TemplatePart::TimeFormat("%Y/%m/%d" | "%Y-%m-%d") => {
+                        let begin = Utc.with_ymd_and_hms(
+                            ts.year(),
+                            ts.month(),
+                            ts.day(),
+                            0,
+                            0,
+                            0,
+                        ).unwrap();
+                        let end = begin + Days::new(1);
+                        Some((TIME_COLUMN_NAME, ExpectedColumnValue::TSRange(begin, end)))
+                    }
+                    TemplatePart::Bucket(col_name, num_buckets)
+                        if tag_values.contains_key(col_name) => {
+                        // Hash-bucketing is not fully-reversible from value to
+                        // tag-name (intentionally so, it makes it much simpler to
+                        // implement).
+                        //
+                        // The test must assign buckets as they are when the
+                        // partition key is rendered.
+                        let want_bucket = BucketHasher::new(num_buckets)
+                            .assign_bucket(tag_values.get(col_name).unwrap());
+                        Some((col_name, ExpectedColumnValue::Bucket(want_bucket, num_buckets)))
+                    }
+                    _ => None,
             }).collect();
 
             assert_eq!(want_reversed.len(), reversed.len());
 
-            for ((want_col, want_val), (got_col, got_val)) in want_reversed.iter().zip(reversed.iter()) {
+            for ((want_col, want_val), (got_col, got_val)) in want_reversed
+                .iter()
+                .zip(reversed.iter()) {
                 assert_eq!(got_col, want_col, "column names differ");
 
                 match got_val {
@@ -1588,9 +1602,10 @@ mod tests {
                             _ => panic!("expected datatime column value but got: {:?}", got_val)
                         }
                     },
-                    ColumnValue::Bucket(got_bucket_id) => {
-                        let want_bucket_id = want_val.expect_bucket_id();
+                    ColumnValue::Bucket{id: got_bucket_id, num_buckets: got_num_buckets} => {
+                        let (want_bucket_id, want_num_buckets) = want_val.expect_bucket();
                         assert_eq!(*got_bucket_id, want_bucket_id);
+                        assert_eq!(*got_num_buckets, want_num_buckets);
                     }
                 };
             }
@@ -1654,7 +1669,8 @@ mod tests {
             times in arbitrary_timestamps(),
             format in prop_oneof![
                 Just("%Y-%m-%d"), // Default scheme
-                Just("%s")        // Unix seconds, to drive increased cache miss rate in strftime formatter
+                Just("%s")        // Unix seconds, to drive increased cache miss rate in strftime
+                                  // formatter
             ]
         ) {
             use std::fmt::Write;

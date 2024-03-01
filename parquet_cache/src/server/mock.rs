@@ -3,22 +3,80 @@ use std::{
     convert::Infallible,
     ops::Range,
     sync::Arc,
+    time::Duration,
 };
 
+use arrow::{
+    array::{ArrayRef, StringArray, TimestampNanosecondArray},
+    record_batch::RecordBatch,
+};
 use bytes::{BufMut, Bytes, BytesMut};
+use chrono::{DateTime, Utc};
+use datafusion_util::{unbounded_memory_pool, MemoryStream};
 use hyper::{
     server::conn::{AddrIncoming, AddrStream},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
+use iox_time::Time;
 use object_store::ObjectStore;
 use parking_lot::Mutex;
+use parquet_file::{metadata::IoxMetadata, serialize::to_parquet_bytes, ParquetFilePath};
+use schema::{builder::SchemaBuilder, InfluxFieldType, TIME_DATA_TIMEZONE};
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::data_types::{
     KeyspaceResponseBody, ServiceNode, X_RANGE_END_HEADER, X_RANGE_START_HEADER,
 };
+
+pub async fn create_mock_raw_parquet_file(
+    parquet_path: ParquetFilePath,
+    creation_timestamp: DateTime<Utc>,
+) -> (Vec<u8>, parquet::format::FileMetaData) {
+    let meta = IoxMetadata {
+        object_store_id: parquet_path.object_store_id(),
+        creation_timestamp: Time::from_date_time(creation_timestamp)
+            .checked_add(Duration::from_secs(30))
+            .expect("should set L1 time as 30 seconds greater"),
+        namespace_id: parquet_path.namespace_id(),
+        namespace_name: "bananas".into(),
+        table_id: parquet_path.table_id(),
+        table_name: "platanos".into(),
+        partition_key: "potato".into(),
+        compaction_level: data_types::CompactionLevel::FileNonOverlapped,
+        sort_key: None,
+        max_l0_created_at: Time::from_date_time(creation_timestamp),
+    };
+
+    let array = StringArray::from_iter([Some("bananas")]);
+    let data: ArrayRef = Arc::new(array);
+
+    let timestamps = Arc::new(
+        [1647695292000000000]
+            .iter()
+            .map(|v| Some(*v))
+            .collect::<TimestampNanosecondArray>()
+            .with_timezone_opt(TIME_DATA_TIMEZONE()),
+    );
+
+    // Build a schema that contains the IOx metadata, ensuring it is
+    // correctly populated in the final parquet file's metadata to be read
+    // back later in the test.
+    let schema = SchemaBuilder::new()
+        .influx_field("a", InfluxFieldType::String)
+        .timestamp()
+        .build()
+        .expect("could not create schema")
+        .as_arrow();
+
+    let batch = RecordBatch::try_new(schema, vec![data, timestamps]).unwrap();
+    let stream = Box::pin(MemoryStream::new(vec![batch.clone()]));
+
+    to_parquet_bytes(stream, &meta, unbounded_memory_pool())
+        .await
+        .expect("should serialize")
+}
 
 #[allow(missing_debug_implementations)]
 pub struct MockCacheServer {
@@ -71,7 +129,7 @@ impl MockCacheServer {
     }
 
     pub fn addr(&self) -> String {
-        format!("http://{}", self.addr)
+        self.addr.to_string()
     }
 
     pub async fn close(self) {

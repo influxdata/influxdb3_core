@@ -25,7 +25,7 @@ use http_body::SizeHint;
 use pin_project::{pin_project, pinned_drop};
 use tower::{Layer, Service};
 
-use observability_deps::tracing::{error, warn};
+use observability_deps::tracing::{debug, error};
 use trace::span::{SpanEvent, SpanStatus};
 use trace::{span::SpanRecorder, TraceCollector};
 
@@ -183,7 +183,7 @@ impl<F> PinnedDrop for TracedFuture<F> {
     fn drop(self: Pin<&mut Self>) {
         if !self.was_ready {
             let trace = self.request_ctx.format_jaeger();
-            warn!(
+            debug!(
                 %trace,
                 when="before returning headers",
                 "request cancelled",
@@ -271,14 +271,14 @@ impl<B> PinnedDrop for TracedBody<B> {
     fn drop(self: Pin<&mut Self>) {
         if !self.was_done_data.load(Ordering::SeqCst) {
             let trace = self.request_ctx.format_jaeger();
-            warn!(
+            debug!(
                 %trace,
                 when="before fully returning body data",
                 "request cancelled",
             );
         } else if !self.was_ready_trailers.load(Ordering::SeqCst) {
             let trace = self.request_ctx.format_jaeger();
-            warn!(
+            debug!(
                 %trace,
                 when="before returning trailers",
                 "request cancelled",
@@ -314,6 +314,8 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
         match &result {
             Ok(body) => {
                 let size = body.remaining() as i64;
+                metrics_recorder.add_response_body_size(size as u64);
+
                 match projected.inner.is_end_stream() {
                     true => {
                         metrics_recorder.set_classification(Classification::Ok);

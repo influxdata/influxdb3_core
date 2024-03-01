@@ -17,6 +17,9 @@ message LogEntry {
   // Unique entry ID.
   string id = 1;
 
+  // Current lifecycle phase of the query.
+  Phase phase = 16;
+
   // Namespace ID.
   int64 namespace_id = 2;
 
@@ -59,6 +62,9 @@ message LogEntry {
 
   // If the query is currently running (in any state).
   bool running = 14;
+
+  // If the query was cancelled.
+  bool cancelled = 17;
 }
 
 message GetLogResponse {
@@ -70,4 +76,14 @@ message GetLogResponse {
 
   // Number of evicted entries due to the "max size" constraint.
   uint64 evicted = 3;
+}
+
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  PHASE_RECEIVED = 1;
+  PHASE_PLANNED = 2;
+  PHASE_PERMIT = 3;
+  PHASE_CANCEL = 4;
+  PHASE_SUCCESS = 5;
+  PHASE_FAIL = 6;
 }

@@ -17,7 +17,39 @@ pub enum SpanStatus {
 /// A `Span` has a name, metadata, a start and end time and a unique ID. Additionally they
 /// have relationships with other Spans that together comprise a Trace
 ///
+/// The `Span` is the primary interface for instrumenting code that isn't tracing aware.
+/// You might accumulate some statistics about library calls, then afterwards create a
+/// [`Span`] to record the results.  For example, at this time Data Fusion doesn't support
+/// tracing, so we generate a [`Span`] after calling DF to trace the details of the DF call.
 ///
+/// Example:
+///  ```compile_fail
+///   # use trace::span::Span;
+///   # use trace::span::SpanRecorder;
+///
+///   async fn my_function(mut recorder: SpanRecorder) {
+///       // We're about to call a library that doesn't support tracing, but we want to record
+///       // details about the library's work. So we create a span from the recorder.
+///       let span = recorder.child_span("data_fusion");
+///
+///       // Call library that doesn't support tracing, but returns detailed data about its work.
+///       let plan = components
+///            .df_planner
+///            .plan(&plan_ir, Arc::clone(partition_info))
+///            .await?;
+///        .....
+///
+///        // Now populate the span with details of the library's work
+///        if let Some(span) = &span {
+///            // see iox_query::exec::query_tracing::send_metrics_to_tracing for example implementation.
+///            send_metrics_to_tracing(Utc::now(), span, plan.as_ref(), true);
+///        };
+///   }
+///  ```
+///
+/// See Also: If you are implementing code that is tracing aware, you may prefer to use
+/// [`SpanRecorder`] as your primary interface.
+///  
 #[derive(Debug, Clone)]
 pub struct Span {
     pub name: Cow<'static, str>,
@@ -177,8 +209,56 @@ impl From<i64> for MetaValue {
 /// If a [`SpanRecorder`] is created from a [`Span`] it will update the start timestamp
 /// of the span on creation, and on Drop will set the finish time and call [`Span::export`]
 ///
-/// If not created with a `Span`, e.g. this request is not being sampled, all operations
+/// If not created with a [`Span`], e.g. this request is not being sampled, all operations
 /// called on this `SpanRecorder` will be a no-op
+///
+/// For code we control and can instrument with tracing, [`SpanRecorder`]` is the primary interface
+/// to add the tracing.  If you're instrumenting code that is not tracing aware, you may need
+/// to use [`Span`] to create traces after the fact.
+///
+/// Example:
+///  ```compile_fail
+///   # use trace::span::SpanRecorder;
+///
+///   pub async fn start_my_operation() {
+///       let root_span: Option<Span> = trace_collector
+///           .as_ref()
+///           .map(|collector| Span::root("compaction", Arc::clone(collector)));
+///       let recorder = SpanRecorder::new(root_span);
+///
+///       // add metadata to the recorder
+///       recorder.set_metadata("partition_id", partition_id.get().to_string());
+///
+///       // Create a child recorder to track a sub-operation
+///       do_interesting_work(recorder.child("interesting_work")).await;
+///
+///       // can create more child recorders for various sub-operations
+///       ...
+///   }
+///
+///   async fn do_interesting_work(mut recorder: SpanRecorder) {
+///       ...
+///       // can add metadata to the recorder to report details of the operation
+///       recorder.set_metadata("input_bytes", plan_ir.input_bytes().to_string());
+///
+///       // can create (gran)child recorders as desired
+///       result = do_more_interesting_work(recorder.child("more_interesting_work"));
+///
+///       recorder.set_metadata("output_bytes", result.bytes().to_string());
+///       ...
+///   }
+///  ```
+///
+/// Example: Testing
+///  ```compile_fail
+///     // Create a no-op SpanRecorder to allow testing of a function that uses a SpanRecorder
+///     start_my_operation(SpanRecorder::new(None)).await;
+///  ```
+///
+///   You generally shouldn't add timing data to a SpanRecorder, as the start/stop times are
+///   automatically recorded for each SpanRecorder.  Instead, consider adding child SpanRecorders
+///   to track the timing of various activities.
+///
 #[derive(Debug, Default)]
 pub struct SpanRecorder {
     span: Option<Span>,

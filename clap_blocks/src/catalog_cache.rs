@@ -44,6 +44,42 @@ pub struct CatalogConfig {
     )]
     pub peers: Vec<Url>,
 
+    /// Peer connect timeout.
+    #[clap(
+        long = "catalog-cache-peer-connect-timeout",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_PEER_CONNECT_TIMEOUT",
+        default_value = "2s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub peer_connect_timeout: Duration,
+
+    /// Peer `GET` request timeout.
+    #[clap(
+        long = "catalog-cache-peer-get-request-timeout",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_PEER_GET_REQUEST_TIMEOUT",
+        default_value = "1s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub peer_get_request_timeout: Duration,
+
+    /// Peer `PUT` request timeout.
+    #[clap(
+        long = "catalog-cache-peer-put-request-timeout",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_PEER_PUT_REQUEST_TIMEOUT",
+        default_value = "1s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub peer_put_request_timeout: Duration,
+
+    /// Peer `LIST` request timeout.
+    #[clap(
+        long = "catalog-cache-peer-list-request-timeout",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_PEER_LIST_REQUEST_TIMEOUT",
+        default_value = "20s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub peer_list_request_timeout: Duration,
+
     /// Warmup delay.
     ///
     /// The warm-up (via dumping the cache of our peers) is delayed by the given time to make sure that we already
@@ -51,7 +87,7 @@ pub struct CatalogConfig {
     #[clap(
         long = "catalog-cache-warmup-delay",
         env = "INFLUXDB_IOX_CATALOG_CACHE_WARMUP_DELAY",
-        default_value = default_warmup_delay(),
+        default_value = "5m",
         value_parser = humantime::parse_duration,
     )]
     pub warmup_delay: Duration,
@@ -63,10 +99,22 @@ pub struct CatalogConfig {
     #[clap(
         long = "catalog-cache-gc-interval",
         env = "INFLUXDB_IOX_CATALOG_CACHE_GC_INTERVAL",
-        default_value = default_gc_interval(),
+        default_value = "15m",
         value_parser = humantime::parse_duration,
     )]
     pub gc_interval: Duration,
+
+    /// Backoff when reacting to OOM situations.
+    ///
+    /// After triggering a garbage collection after an out-of-memory situation, the system will wait for the given
+    /// amount of time before triggering the next OOM reaction.
+    #[clap(
+        long = "catalog-cache-oom-backoff",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_OOM_BACKOFF",
+        default_value = "60s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub oom_backoff: Duration,
 
     /// Maximum number of bytes that should be cached within the catalog cache.
     ///
@@ -90,6 +138,15 @@ pub struct CatalogConfig {
         default_value_t = 10
     )]
     pub quorum_fanout: usize,
+
+    /// gRPC server timeout.
+    #[clap(
+        long = "catalog-cache-grpc-server-timeout",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_GRPC_SERVER_TIMEOUT",
+        default_value = "20s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub grpc_server_timeout: Duration,
 }
 
 impl CatalogConfig {
@@ -107,16 +164,6 @@ impl CatalogConfig {
 
         Ok([peer1.clone(), peer2.clone()])
     }
-}
-
-fn default_warmup_delay() -> &'static str {
-    let s = humantime::format_duration(Duration::from_secs(60 * 5)).to_string();
-    Box::leak(Box::new(s))
-}
-
-fn default_gc_interval() -> &'static str {
-    let s = humantime::format_duration(Duration::from_secs(60 * 15)).to_string();
-    Box::leak(Box::new(s))
 }
 
 #[cfg(test)]

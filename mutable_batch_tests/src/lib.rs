@@ -1,7 +1,5 @@
 //! This crate only exists for its tests and benchmarks
 
-#![warn(unused_crate_dependencies)]
-
 // Workaround for "unused crate" lint false positives.
 #[cfg(test)]
 use bytes as _;

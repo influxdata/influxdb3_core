@@ -1,3 +1,82 @@
+//! Cache Manager
+//!
+//! In order to expediently produce a highly concurrent cache manager
+//! within a short turn-around time for MVP, we utilized an existing
+//! highly concurrent cache. Then adapted to our needs.
+//!
+//! Key features of moka:
+//! * fast, highly concurrent in-memory cache
+//!    * in memory, we only store the metadata used for cache management
+//! * admission based on LFU, eviction based on LRU
+//! * ability to set per-entry expiration
+//! * decide when to evict based upon a weighter
+//!    * determines a need to evict, not what to evict
+//! * async callback upon eviction
+//!
+//! In order to maintain it's highly concurrent nature, moka
+//! flushes the task queue (applying updates) intermittently.
+//! Inserted entries are immediately available, however, moka determines
+//! when it needs to flush the task queue. We are making a trade-off between
+//! a deterministic decision based on the serialization of cache events
+//! (which is slow), versus integrating to a probabilistic cache state
+//! over time (faster).
+//!
+//! We fully anticipate this will be replaced post-MVP.
+//!
+//!
+//!
+//! Cache Management:
+//!
+//!    ┌────────────────────┐
+//!    │  Insert requested  │
+//!    └──────────┬─────────┘
+//!               │
+//!    ┌──────────▼──────────┐
+//!    │ Moka entry creation ├───────────────────────────┐
+//!    └──────────┬──────────┘                           │
+//!               │                    ┌─────────────────▼─────────────────┐
+//!               │                    │ On-create expiration is set       │
+//!    ┌──────────▼────────────┐       │   * within cache policy?          │        ┌──────────────────┐
+//!    │ Immediately available │       │   * event time recency?           └────────► event timestamp  │
+//!    └──────────┬────────────┘       │   * currently applied per cache,  ◄────────┐   * min heap     │
+//!               │                    │        could be per table         │        └──────────────────┘
+//!               │                    └─────────────────┬─────────────────┘
+//!    ┌──────────▼──────────────┐                       │
+//!    │ In entry buffer         │                       │
+//!    │                         │                       │
+//!    │   * expiration added    ◄───────────────────────┘
+//!    │   * LFU stats collected │
+//!    └──────────┬──────────────┘
+//!               │
+//!               │ LFU based admission
+//!               │
+//!    ┌──────────▼───────────────────────┐
+//!    │ LRU cache                        │            ┌───────────────────────────┐
+//!    │                                  └────────────► size weighter             │
+//!    │   * expiration is applied first  ◄────────────┐   * use parquet file size │
+//!    │   * then LRU                     │            └───────────────────────────┘
+//!    └──────────┬───────────────────────┘
+//!               │
+//!               │
+//!    ┌──────────▼──────────────────────┐
+//!    │ eviction notification           │
+//!    │   * callback triggered          │
+//!    │   * local store background task │
+//!    │       will evict                │
+//!    └─────────────────────────────────┘
+//!
+//!
+//! The min heap does require locking, however, the creation expiration is performed
+//! while the entry is in the entry buffer. Does not impact immediate availability.
+//!
+//! When to evict:
+//!   * moka compares it's max capacity permitted, to the weighted size of the entries.
+//!   * the max capacity can be set relative to the NVMe etc size.
+//!   * the weighter decides the weight of each entry.
+//!       * moka stores in memory only the metadata per entry
+//!       * the weighter states that each entry is as big as it's `metadata.file_size_bytes`
+//!
+
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};

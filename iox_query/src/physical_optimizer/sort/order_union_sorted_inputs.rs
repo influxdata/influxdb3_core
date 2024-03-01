@@ -347,7 +347,7 @@ mod test {
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
+            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
             - "     UnionExec"
             - "       SortExec: expr=[time@3 DESC NULLS LAST]"
             - "         UnionExec"
@@ -427,7 +427,7 @@ mod test {
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
+            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
             - "     UnionExec"
             - "       SortExec: expr=[time@3 DESC NULLS LAST]"
             - "         UnionExec"
@@ -661,7 +661,7 @@ mod test {
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
             - "   UnionExec"
             - "     SortExec: expr=[time@3 DESC NULLS LAST]"
             - "       UnionExec"
@@ -925,7 +925,7 @@ mod test {
           - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
             - "   UnionExec"
             - "     SortExec: expr=[time@3 DESC NULLS LAST]"
             - "       ProjectionExec: expr=[time@3 as time]"

@@ -20,12 +20,12 @@ use arrow_flight::{
 use arrow_util::flight::prepare_schema_for_flight;
 use bytes::Bytes;
 use datafusion::{
-    common::ParamValues,
     logical_expr::{LogicalPlan, TableType},
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
 use iox_query::{exec::IOxSessionContext, QueryNamespace};
+
 use observability_deps::tracing::debug;
 use once_cell::sync::Lazy;
 use prost::Message;
@@ -96,7 +96,6 @@ impl FlightSQLPlanner {
         namespace_name: impl AsRef<str> + Send,
         _database: Arc<dyn QueryNamespace>,
         cmd: FlightSQLCommand,
-        params: impl Into<ParamValues> + Send,
         ctx: &IOxSessionContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let namespace_name = namespace_name.as_ref();
@@ -105,12 +104,14 @@ impl FlightSQLPlanner {
         match cmd {
             FlightSQLCommand::CommandStatementQuery(CommandStatementQuery { query, .. }) => {
                 debug!(%query, "Planning FlightSQL query");
-                Ok(ctx.sql_to_physical_plan_with_params(&query, params).await?)
+                Ok(ctx.sql_to_physical_plan(&query).await?)
             }
             FlightSQLCommand::CommandPreparedStatementQuery(handle) => {
-                let query = handle.query();
+                let (query, params) = handle.into_parts();
                 debug!(%query, "Planning FlightSQL prepared query");
-                Ok(ctx.sql_to_physical_plan_with_params(query, params).await?)
+                Ok(ctx
+                    .sql_to_physical_plan_with_params(query.as_str(), params)
+                    .await?)
             }
             FlightSQLCommand::CommandGetSqlInfo(cmd) => {
                 debug!(?cmd, "Planning GetSqlInfo query");
@@ -411,7 +412,7 @@ async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Resu
         // "virtual" catalog in DataFusion and thus is not reported
         // directly via the table providers
         // We ensure this list is kept in sync with tests
-        let table_names = vec!["columns", "df_settings", "tables", "views"];
+        let table_names = vec!["columns", "df_settings", "tables", "views", "schemata"];
         for table_name in table_names {
             let schema_name = "information_schema";
             let table_ref = TableReference::full(&catalog_name, schema_name, table_name);

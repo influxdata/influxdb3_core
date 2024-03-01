@@ -5,6 +5,10 @@ pub(crate) fn query<T>(s: impl Into<String>) -> Result<T> {
     Err(map::query(s))
 }
 
+/// An error that was the result of invalid InfluxQL bind parameters.
+pub(crate) fn params<T>(s: impl Into<String>) -> Result<T> {
+    Err(map::params(s))
+}
 /// An unexpected error whilst planning that represents a bug in IOx.
 pub(crate) fn internal<T>(s: impl Into<String>) -> Result<T> {
     Err(map::internal(s))
@@ -35,6 +39,11 @@ pub(crate) mod map {
 
     /// An error that was the result of an invalid InfluxQL query.
     pub(crate) fn query(s: impl Into<String>) -> DataFusionError {
+        DataFusionError::Plan(s.into())
+    }
+
+    /// An error that was the result of an invalid InfluxQL parameter.
+    pub(crate) fn params(s: impl Into<String>) -> DataFusionError {
         DataFusionError::Plan(s.into())
     }
 

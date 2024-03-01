@@ -2,14 +2,45 @@
 //!
 //! Candidate for upstreaming as per <https://github.com/apache/arrow-datafusion/issues/6074>.
 //!
-//! For struct types, this preforms a recursive "first none-null" filling.
+//! For struct types, this preforms a recursive "first none-null" filling,
+//! taking the first non-null field from argument list.
 //!
-//! For non-struct types (like uint32) this works like the normal `coalesce` function.
+//! For scalar (non-struct) types (like uint32) this works like the normal `coalesce`
+//! function.
 //!
-//! # Example
+//! # Example: Scalars
+//!
+//! Both `coalesce` and `coalesce_struct` return the first non null value
+//! from their arguments:
 //!
 //! ```sql
-//! coalesce_nested(
+//! coalesce(NULL, 2) = 2
+//! coalesce_struct(NULL, 2) = 2
+//! ```
+//!
+//! # Example: Struct
+//!
+//! When invoked on struct arguments, `coalesce_struct` returns a struct whose
+//! *fields* contain the first non null value from the fields of its arguments:
+//!
+//! ```sql
+//! coalesce_struct(
+//!   { a: 1, b: NULL }, -- first argument, b is null
+//!   { a: 2, b: 20 },   -- second argument, b is 20
+//! )
+//!
+//! =
+//!
+//! { a: 1, b: 20 } -- the null from the first b was replaced with the `20`
+//! ```
+//!
+//! # Example: Deeply Nested Struct
+//!
+//! `coalesce_struct` also works recursively on structs which themselves
+//! contain structs, taking the first non-null value from each field:
+//!
+//! ```sql
+//! coalesce_struct(
 //!   NULL,
 //!   {
 //!     a: 1,
@@ -42,11 +73,13 @@
 //! ```
 use std::{any::Any, sync::Arc};
 
+use arrow::array::ArrayRef;
 use arrow::{
     array::{Array, StructArray},
     compute::{is_null, kernels::zip::zip},
     datatypes::DataType,
 };
+use datafusion::common::internal_err;
 use datafusion::{
     common::cast::as_struct_array,
     error::{DataFusionError, Result},
@@ -61,6 +94,7 @@ use once_cell::sync::Lazy;
 pub const COALESCE_STRUCT_UDF_NAME: &str = "coalesce_struct";
 
 #[derive(Debug)]
+/// See [module-level docs](self) for more documentation.
 struct CoalesceStructUDF {
     signature: Signature,
 }
@@ -115,7 +149,13 @@ impl ScalarUDFImpl for CoalesceStructUDF {
 
             let (array1, array2) = match (accu, arg) {
                 (ColumnarValue::Scalar(scalar1), ColumnarValue::Scalar(scalar2)) =>  {
-                    return Ok(Some(ColumnarValue::Scalar(scalar_coalesce_struct(scalar1, scalar2))));
+                    let ScalarValue::Struct(array1) = scalar1 else {
+                        return internal_err!("Expected struct, got {:?}", scalar1);
+                    };
+                    let ScalarValue::Struct(array2) = scalar2 else {
+                        return internal_err!("Expected struct, got {:?}", scalar2);
+                    };
+                    (Arc::clone(&array1) as ArrayRef, Arc::clone(array2) as ArrayRef)
                 }
                 (ColumnarValue::Scalar(s), ColumnarValue::Array(array2)) => {
                     let array1 = s.to_array_of_size(array2.len())?;
@@ -170,24 +210,9 @@ fn arrow_coalesce_struct(
         let array = StructArray::from(cols);
         Ok(Arc::new(array))
     } else {
-        let array = zip(&is_null(array1)?, array2, array1)?;
+        let is_null = is_null(array1)?;
+        let array = zip(&is_null, &array2, &array1)?;
         Ok(array)
-    }
-}
-
-/// Recursively fold [`ScalarValue`]s.
-fn scalar_coalesce_struct(scalar1: ScalarValue, scalar2: &ScalarValue) -> ScalarValue {
-    match (scalar1, scalar2) {
-        (ScalarValue::Struct(Some(vals1), fields1), ScalarValue::Struct(Some(vals2), _)) => {
-            let vals = vals1
-                .into_iter()
-                .zip(vals2)
-                .map(|(v1, v2)| scalar_coalesce_struct(v1, v2))
-                .collect();
-            ScalarValue::Struct(Some(vals), fields1)
-        }
-        (scalar1, scalar2) if scalar1.is_null() => scalar2.clone(),
-        (scalar1, _) => scalar1,
     }
 }
 
@@ -200,6 +225,7 @@ pub fn coalesce_struct(args: Vec<Expr>) -> Expr {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::FieldRef;
     use arrow::{
         datatypes::{Field, Fields, Schema},
         record_batch::RecordBatch,
@@ -208,6 +234,7 @@ mod tests {
     use datafusion::{
         assert_batches_eq,
         common::assert_contains,
+        common::scalar::ScalarStructBuilder,
         prelude::{col, lit},
         scalar::ScalarValue,
     };
@@ -216,14 +243,15 @@ mod tests {
 
     #[tokio::test]
     async fn test() {
-        let fields_b = Fields::from(vec![
-            Field::new("ba", DataType::UInt64, true),
-            Field::new("bb", DataType::UInt64, true),
-        ]);
-        let fields = Fields::from(vec![
-            Field::new("a", DataType::UInt64, true),
-            Field::new("b", DataType::Struct(fields_b.clone()), true),
-        ]);
+        let field_ba: FieldRef = Field::new("ba", DataType::UInt64, true).into();
+        let field_bb: FieldRef = Field::new("bb", DataType::UInt64, true).into();
+
+        let fields_b = Fields::from(vec![Arc::clone(&field_ba), Arc::clone(&field_bb)]);
+
+        let field_a: FieldRef = Field::new("a", DataType::UInt64, true).into();
+        let field_b: FieldRef = Field::new("b", DataType::Struct(fields_b.clone()), true).into();
+
+        let fields = Fields::from(vec![Arc::clone(&field_a), Arc::clone(&field_b)]);
         let dt = DataType::Struct(fields.clone());
 
         assert_case_ok(
@@ -239,9 +267,7 @@ mod tests {
 
         assert_case_ok(
             [ColumnarValue::Array(
-                ScalarValue::Struct(None, fields.clone())
-                    .to_array()
-                    .unwrap(),
+                ScalarStructBuilder::new_null(&fields).to_array().unwrap(),
             )],
             &dt,
             ["+-----+", "| out |", "+-----+", "|     |", "+-----+"],
@@ -250,43 +276,32 @@ mod tests {
 
         assert_case_ok(
             [
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields).to_array().unwrap()),
                 ColumnarValue::Array(
-                    ScalarValue::Struct(None, fields.clone())
+                    ScalarStructBuilder::new()
+                        .with_scalar(&field_a, ScalarValue::from(1u64))
+                        .with_scalar(&field_b, ScalarStructBuilder::new_null(&fields_b))
+                        .build()
+                        .unwrap()
                         .to_array()
                         .unwrap(),
                 ),
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields).to_array().unwrap()),
                 ColumnarValue::Array(
-                    ScalarValue::Struct(
-                        Some(vec![
-                            ScalarValue::UInt64(Some(1)),
-                            ScalarValue::Struct(None, fields_b.clone()),
-                        ]),
-                        fields.clone(),
-                    )
-                    .to_array()
-                    .unwrap(),
-                ),
-                ColumnarValue::Array(
-                    ScalarValue::Struct(None, fields.clone())
+                    ScalarStructBuilder::new()
+                        .with_scalar(&field_a, ScalarValue::from(2u64))
+                        .with_scalar(
+                            &field_b,
+                            ScalarStructBuilder::new()
+                                .with_scalar(&field_ba, ScalarValue::from(3u64))
+                                .with_scalar(&field_bb, ScalarValue::UInt64(None))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build()
+                        .unwrap()
                         .to_array()
                         .unwrap(),
-                ),
-                ColumnarValue::Array(
-                    ScalarValue::Struct(
-                        Some(vec![
-                            ScalarValue::UInt64(Some(2)),
-                            ScalarValue::Struct(
-                                Some(vec![
-                                    ScalarValue::UInt64(Some(3)),
-                                    ScalarValue::UInt64(None),
-                                ]),
-                                fields_b.clone(),
-                            ),
-                        ]),
-                        fields.clone(),
-                    )
-                    .to_array()
-                    .unwrap(),
                 ),
             ],
             &dt,
@@ -299,37 +314,33 @@ mod tests {
             ],
         )
         .await;
-
         // same case as above, but with ColumnarValue::Scalar
         assert_case_ok(
             [
-                ColumnarValue::Scalar(ScalarValue::Struct(None, fields.clone())),
-                ColumnarValue::Scalar(ScalarValue::Struct(
-                    Some(vec![
-                        ScalarValue::UInt64(Some(1)),
-                        ScalarValue::Struct(None, fields_b.clone()),
-                    ]),
-                    fields.clone(),
-                )),
-                ColumnarValue::Scalar(ScalarValue::Struct(None, fields.clone())),
-                ColumnarValue::Scalar(ScalarValue::Struct(
-                    Some(vec![
-                        ScalarValue::UInt64(Some(2)),
-                        ScalarValue::Struct(
-                            Some(vec![
-                                ScalarValue::UInt64(Some(3)),
-                                ScalarValue::UInt64(None),
-                            ]),
-                            fields_b.clone(),
-                        ),
-                    ]),
-                    fields.clone(),
-                )),
-                ColumnarValue::Array(
-                    ScalarValue::Struct(None, fields.clone())
-                        .to_array()
+                ColumnarValue::Scalar(ScalarStructBuilder::new_null(&fields)),
+                ColumnarValue::Scalar(
+                    ScalarStructBuilder::new()
+                        .with_scalar(&field_a, ScalarValue::from(1u64))
+                        .with_scalar(&field_b, ScalarStructBuilder::new_null(&fields_b))
+                        .build()
                         .unwrap(),
                 ),
+                ColumnarValue::Scalar(ScalarStructBuilder::new_null(&fields)),
+                ColumnarValue::Scalar(
+                    ScalarStructBuilder::new()
+                        .with_scalar(&field_a, ScalarValue::from(2u64))
+                        .with_scalar(
+                            &field_b,
+                            ScalarStructBuilder::new()
+                                .with_scalar(&field_ba, ScalarValue::from(3u64))
+                                .with_scalar(&field_bb, ScalarValue::UInt64(None))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build()
+                        .unwrap(),
+                ),
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields).to_array().unwrap()),
             ],
             &dt,
             [
@@ -350,28 +361,40 @@ mod tests {
         .await;
 
         assert_case_err(
-            [ColumnarValue::Array(ScalarValue::Struct(None, fields.clone()).to_array().unwrap()), ColumnarValue::Array(ScalarValue::Struct(None, fields_b.clone()).to_array().unwrap())],
+            [
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields).to_array().unwrap()),
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields_b).to_array().unwrap())
+            ],
             &dt,
             "Error during planning: coalesce_struct expects all arguments to have the same type, but first arg is"
         )
         .await;
 
         assert_case_err(
-            [ColumnarValue::Array(ScalarValue::Struct(None, fields.clone()).to_array().unwrap()), ColumnarValue::Scalar(ScalarValue::Struct(None, fields_b.clone()))],
+            [
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields).to_array().unwrap()),
+                ColumnarValue::Scalar(ScalarStructBuilder::new_null(&fields_b)),
+            ],
             &dt,
             "Error during planning: coalesce_struct expects all arguments to have the same type, but first arg is"
         )
         .await;
 
         assert_case_err(
-            [ColumnarValue::Scalar(ScalarValue::Struct(None, fields.clone())), ColumnarValue::Array(ScalarValue::Struct(None, fields_b.clone()).to_array().unwrap())],
+            [
+                ColumnarValue::Scalar(ScalarStructBuilder::new_null(&fields)),
+                ColumnarValue::Array(ScalarStructBuilder::new_null(&fields_b).to_array().unwrap())
+            ],
             &dt,
             "Error during planning: coalesce_struct expects all arguments to have the same type, but first arg is"
         )
         .await;
 
         assert_case_err(
-            [ColumnarValue::Scalar(ScalarValue::Struct(None, fields.clone())), ColumnarValue::Scalar(ScalarValue::Struct(None, fields_b.clone()))],
+            [
+                ColumnarValue::Scalar(ScalarStructBuilder::new_null(&fields)),
+                ColumnarValue::Scalar(ScalarStructBuilder::new_null(&fields_b))
+            ],
             &dt,
             "Error during planning: coalesce_struct expects all arguments to have the same type, but first arg is"
         )

@@ -6,6 +6,7 @@ use crate::{CacheKey, CacheValue};
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 use futures::{pin_mut, StreamExt};
+use observability_deps::tracing::info;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,14 +72,16 @@ impl QuorumCatalogCache {
     pub async fn get(&self, key: CacheKey) -> Result<Option<CacheValue>> {
         let local = self.local.get(key);
 
-        let fut1 = self.replicas[0].get(key);
-        let fut2 = self.replicas[1].get(key);
+        let local_generation = local.as_ref().map(|x| x.generation);
+        let fut1 = self.replicas[0].get_if_modified(key, local_generation);
+        let fut2 = self.replicas[1].get_if_modified(key, local_generation);
         pin_mut!(fut1);
         pin_mut!(fut2);
 
         match select(fut1, fut2).await {
             Either::Left((result, fut)) | Either::Right((result, fut)) => match (local, result) {
                 (None, Ok(None)) => Ok(None),
+                (Some(l), Err(ClientError::NotModified)) => Ok(Some(l)),
                 (Some(l), Ok(Some(r))) if l.generation <= r.generation => {
                     // preempt write from remote to local that arrives late
                     if l.generation < r.generation {
@@ -90,6 +93,7 @@ impl QuorumCatalogCache {
                     // r1 either failed or did not return anything
                     let r2 = fut.await;
                     match (local, r1, r2) {
+                        (Some(l), _, Err(ClientError::NotModified)) => Ok(Some(l)),
                         (None, _, Ok(None)) | (_, Ok(None), Ok(None)) => Ok(None),
                         (Some(l), _, Ok(Some(r))) if l.generation <= r.generation => {
                             // preempt write from remote to local that arrives late
@@ -184,11 +188,22 @@ impl QuorumCatalogCache {
             }
         }
 
+        info!(
+            count = generations.len(),
+            "Collected version information from first replica"
+        );
+
+        let mut count = 0;
+        let mut total_bytes = 0;
+
         let mut list = self.replicas[1].list(None);
         while let Some(entry) = list.next().await.transpose().context(ListSnafu)? {
             if let Some(k) = entry.key() {
                 match (generations.get(&k), entry.value()) {
                     (Some(generation), Some(v)) if *generation == entry.generation() => {
+                        count += 1;
+                        total_bytes += v.len();
+
                         let value = CacheValue::new(v.clone(), *generation);
                         // In the case that local already has the given version
                         // this will be a no-op
@@ -198,7 +213,18 @@ impl QuorumCatalogCache {
                 }
             }
         }
+        info!(count, total_bytes, "Finished warmup");
         Ok(())
+    }
+
+    /// Returns a reference to the local [`CatalogCache`]
+    pub fn local(&self) -> &Arc<CatalogCache> {
+        &self.local
+    }
+
+    /// Returns a reference to the peers of this [`QuorumCatalogCache`]
+    pub fn peers(&self) -> &[CatalogCacheClient; 2] {
+        &self.replicas
     }
 }
 
@@ -213,8 +239,9 @@ mod tests {
     #[tokio::test]
     async fn test_basic() {
         let local = Arc::new(CatalogCache::default());
-        let r1 = TestCacheServer::bind_ephemeral();
-        let r2 = TestCacheServer::bind_ephemeral();
+        let metric_registry = Arc::new(metric::Registry::new());
+        let r1 = TestCacheServer::bind_ephemeral(&metric_registry);
+        let r2 = TestCacheServer::bind_ephemeral(&metric_registry);
 
         let replicas = Arc::new([r1.client(), r2.client()]);
         let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
@@ -306,9 +333,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_through() {
+        let metric_registry = Arc::new(metric::Registry::new());
         let local = Arc::new(CatalogCache::default());
-        let r1 = TestCacheServer::bind_ephemeral();
-        let r2 = TestCacheServer::bind_ephemeral();
+        let r1 = TestCacheServer::bind_ephemeral(&metric_registry);
+        let r2 = TestCacheServer::bind_ephemeral(&metric_registry);
 
         let replicas = Arc::new([r1.client(), r2.client()]);
         let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
@@ -382,9 +410,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_warm() {
+        let metric_registry = Arc::new(metric::Registry::new());
         let local = Arc::new(CatalogCache::default());
-        let r1 = TestCacheServer::bind_ephemeral();
-        let r2 = TestCacheServer::bind_ephemeral();
+        let r1 = TestCacheServer::bind_ephemeral(&metric_registry);
+        let r2 = TestCacheServer::bind_ephemeral(&metric_registry);
 
         let replicas = Arc::new([r1.client(), r2.client()]);
         let quorum = QuorumCatalogCache::new(local, Arc::clone(&replicas));

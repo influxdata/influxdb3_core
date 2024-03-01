@@ -12,16 +12,18 @@ repository = "https://github.com/influxdata/influxdb_iox/tree/main/influxdb_line
 # Note this crate is published as its own crate on crates.io but kept in
 # this repository for maintenance convenience.
 #
-# Thus it is important not to have workspace dependencies or workspace configuration.
+# Thus it is important not to have `path` `[dependencies]` on other workspace crates that aren't
+# published.
 #
-# https://github.com/influxdata/influxdb_iox/issues/7051
+# History: https://github.com/influxdata/influxdb_iox/issues/7051
 
 [dependencies] # In alphabetical order
 bytes = "1.5"
-log = "0.4.20"
+log = "0.4.21"
 nom = { version = "7", default-features = false, features = ["std"] }
-smallvec = { version = "1.12.0", features = ["union"] }
+smallvec = { workspace = true }
 snafu = "0.8"
 
+# `path` `[dev-dependencies]` are fine
 [dev-dependencies] # In alphabetical order
 test_helpers = { path = "../test_helpers" }

@@ -1,18 +1,6 @@
 //! This module contains the schema definition for IOx
 
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![allow(clippy::clone_on_ref_ptr)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -610,11 +598,11 @@ impl TryFrom<&String> for InfluxFieldType {
 
     fn try_from(s: &String) -> Result<Self, Self::Error> {
         Ok(match s.as_str() {
-            "Float" => InfluxFieldType::Float,
-            "Integer" => InfluxFieldType::Integer,
-            "UnsignedInteger" => InfluxFieldType::UInteger,
-            "Boolean" => InfluxFieldType::Boolean,
-            "String" => InfluxFieldType::String,
+            "Float" => Self::Float,
+            "Integer" => Self::Integer,
+            "UnsignedInteger" => Self::UInteger,
+            "Boolean" => Self::Boolean,
+            "String" => Self::String,
             _ => {
                 return Err("No corresponding type in the InfluxDB data model");
             }
@@ -1401,6 +1389,6 @@ mod test {
             .unwrap();
 
         // this is mostly a smoke test
-        assert_eq!(schema.estimate_size(), 1243);
+        assert_eq!(schema.estimate_size(), 1246);
     }
 }

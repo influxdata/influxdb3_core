@@ -33,7 +33,7 @@ use datafusion::{
     logical_expr::{Expr, LogicalPlan},
 };
 
-pub use context::{IOxSessionConfig, IOxSessionContext, SessionContextIOxExt};
+pub use context::{IOxSessionConfig, IOxSessionContext, QueryConfig, SessionContextIOxExt};
 use schema_pivot::SchemaPivotNode;
 
 use crate::exec::metrics::DataFusionMemoryPoolMetricsBridge;

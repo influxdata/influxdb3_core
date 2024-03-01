@@ -1,17 +1,6 @@
 //! Custom panic hook that sends the panic information to a tracing
 //! span
 
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
-#![warn(
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -211,7 +200,7 @@ mod tests {
     use std::panic::panic_any;
 
     use metric::{Attributes, Metric};
-    use test_helpers::{maybe_start_logging, tracing::TracingCapture};
+    use test_helpers::{assert_contains, maybe_start_logging, tracing::TracingCapture};
 
     use super::*;
 
@@ -281,12 +270,26 @@ mod tests {
         assert_count(&metrics, "offset_overflow", 2);
         assert_count(&metrics, "unknown", 2);
 
-        assert_eq!(
-            capture.to_string(),
-            "level = ERROR; message = Thread panic; panic_type = \"unknown\"; panic_message = \"it's bananas\"; panic_file = \"panic_logging/src/lib.rs\"; panic_line = 242; panic_column = 13; \n\
-             level = ERROR; message = Thread panic; panic_type = \"offset_overflow\"; panic_message = \"offset\"; panic_file = \"panic_logging/src/lib.rs\"; panic_line = 250; panic_column = 13; \n\
-             level = ERROR; message = Thread panic; panic_type = \"offset_overflow\"; panic_message = \"offset overflow\"; panic_file = \"panic_logging/src/lib.rs\"; panic_line = 259; panic_column = 13; \n\
-             level = ERROR; message = Thread panic; panic_type = \"unknown\"; panic_file = \"panic_logging/src/lib.rs\"; panic_line = 267; panic_column = 13; "
+        let logs = capture.to_string();
+        let log_lines: Vec<_> = logs.split('\n').collect();
+
+        // The ends of the lines have line numbers, so only assert on the beginning of the lines to
+        // avoid having to update this test every time there's any edit to this file.
+        assert_contains!(
+            log_lines[0],
+            "level = ERROR; message = Thread panic; panic_type = \"unknown\"; panic_message = \"it's bananas\"; panic_file = \"panic_logging/src/lib.rs\";"
+        );
+        assert_contains!(
+            log_lines[1],
+            "level = ERROR; message = Thread panic; panic_type = \"offset_overflow\"; panic_message = \"offset\"; panic_file = \"panic_logging/src/lib.rs\";"
+        );
+        assert_contains!(
+            log_lines[2],
+            "level = ERROR; message = Thread panic; panic_type = \"offset_overflow\"; panic_message = \"offset overflow\"; panic_file = \"panic_logging/src/lib.rs\";"
+        );
+        assert_contains!(
+            log_lines[3],
+            "level = ERROR; message = Thread panic; panic_type = \"unknown\"; panic_file = \"panic_logging/src/lib.rs\";"
         );
     }
 }

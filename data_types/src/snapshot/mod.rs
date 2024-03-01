@@ -7,5 +7,7 @@
 pub mod hash;
 pub mod list;
 pub mod mask;
+pub mod namespace;
 pub mod partition;
+pub mod root;
 pub mod table;

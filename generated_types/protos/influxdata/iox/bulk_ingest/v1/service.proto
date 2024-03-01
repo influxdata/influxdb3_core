@@ -46,7 +46,7 @@ message NewParquetMetadataResponse {
    // Opaque payload consisting of a `key=value` map to be inserted into the Parquet file metadata.
    //
    // Metadata is IOxMetadata + ECDSA signature to ensure it is not tampered with.
-   map<string, bytes> metadata = 1;
+   map<string, string> metadata = 1;
 
    // A pre-authorised, signed URL which should be used to PUT the file to object storage
    string upload_url = 2;

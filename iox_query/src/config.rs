@@ -41,8 +41,59 @@ extensions_options! {
         /// [`target_partitions`]: datafusion::common::config::ExecutionOptions::target_partitions
         pub max_parquet_fanout: usize, default = 40
 
+        /// Number of input streams to prefect for ProgressiveEvalExec
+        /// Since ProgressiveEvalExec only polls one stream at a time in their stream order,
+        /// we do not need to prefetch all streams at once to save resources. However, if the
+        /// streams' IO time is way more than their CPU/procesing time, prefetching them will help
+        /// improve the performance.
+        /// Default is 2 which means we will prefetch one extra stream before polling the current one.
+        /// Increasing this value if IO time to read a stream is often much more than CPU time to process its previous one.
+        pub progressive_eval_num_prefetch_input_streams: usize, default = 2
+
         /// Cuttoff date for InfluxQL metadata queries.
         pub influxql_metadata_cutoff: MetadataCutoff, default = MetadataCutoff::Relative(Duration::from_secs(3600 * 24))
+
+        /// Limit for the number of partitions to scan in a single query. Zero means no limit.
+        pub partition_limit: usize, default = 0
+
+        /// Limit for the number of parquet files to scan in a single query. Zero means no limit.
+        pub parquet_file_limit: usize, default = 0
+    }
+}
+
+impl IoxConfigExt {
+    /// Get the partition limit as an Option.
+    pub fn partition_limit_opt(&self) -> Option<usize> {
+        match self.partition_limit {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Set the partition limit. If the limit is already set it will not be increased.
+    pub fn set_partition_limit(&mut self, limit: usize) {
+        match (self.partition_limit, limit) {
+            (_, 0) => {}
+            (0, n) => self.partition_limit = n,
+            (a, b) => self.partition_limit = a.min(b),
+        }
+    }
+
+    /// Get the parquet file limit as an Option.
+    pub fn parquet_file_limit_opt(&self) -> Option<usize> {
+        match self.parquet_file_limit {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Set the parquet file limit. If the limit is already set it will not be increased.
+    pub fn set_parquet_file_limit(&mut self, limit: usize) {
+        match (self.parquet_file_limit, limit) {
+            (_, 0) => {}
+            (0, n) => self.parquet_file_limit = n,
+            (a, b) => self.parquet_file_limit = a.min(b),
+        }
     }
 }
 

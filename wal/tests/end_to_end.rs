@@ -1,3 +1,6 @@
+// Tests and benchmarks don't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use assert_matches::assert_matches;
 use data_types::{NamespaceId, SequenceNumber, TableId};
 use dml::DmlWrite;

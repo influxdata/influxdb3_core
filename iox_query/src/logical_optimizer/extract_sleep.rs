@@ -65,7 +65,7 @@ fn optimize(plan: &LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
         .into_iter()
         .map(|expr| rewrite_preserving_name(expr, &mut expr_rewriter))
         .collect::<Result<Vec<_>, DataFusionError>>()?;
-    let mut plan = plan.with_new_exprs(new_exprs, &new_inputs)?;
+    let mut plan = plan.with_new_exprs(new_exprs, new_inputs)?;
 
     if !expr_rewriter.found_exprs.is_empty() {
         plan = LogicalPlan::Extension(Extension {

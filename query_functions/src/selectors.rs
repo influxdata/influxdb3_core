@@ -95,12 +95,15 @@
 //!
 //! [InfluxQL]: https://docs.influxdata.com/influxdb/v1.8/query_language/
 //! [selector functions]: https://docs.influxdata.com/influxdb/v1.8/query_language/functions/#selectors
-use std::{fmt::Debug, sync::Arc};
+use std::any::Any;
+use std::fmt::Debug;
+use std::sync::OnceLock;
 
 use arrow::datatypes::DataType;
+use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
     error::Result as DataFusionResult,
-    logical_expr::{AccumulatorFactoryFunction, Signature, Volatility},
+    logical_expr::{Signature, Volatility},
     physical_plan::{udaf::AggregateUDF, Accumulator},
     prelude::SessionContext,
 };
@@ -110,6 +113,11 @@ use internal::{Comparison, Selector, Target};
 
 mod type_handling;
 use type_handling::AggType;
+
+static SELECTOR_FIRST: OnceLock<AggregateUDF> = OnceLock::new();
+static SELECTOR_LAST: OnceLock<AggregateUDF> = OnceLock::new();
+static SELECTOR_MIN: OnceLock<AggregateUDF> = OnceLock::new();
+static SELECTOR_MAX: OnceLock<AggregateUDF> = OnceLock::new();
 
 /// registers selector functions so they can be invoked via SQL
 pub fn register_selector_aggregates(ctx: &SessionContext) {
@@ -134,7 +142,14 @@ pub fn register_selector_aggregates(ctx: &SessionContext) {
 /// If there are multiple rows with the minimum timestamp value, the
 /// value returned is arbitrary
 pub fn selector_first() -> AggregateUDF {
-    make_uda("selector_first", FactoryBuilder::new(SelectorType::First))
+    SELECTOR_FIRST
+        .get_or_init(|| {
+            AggregateUDF::new_from_impl(SelectorUDAFImpl::new(
+                "selector_first",
+                SelectorType::First,
+            ))
+        })
+        .clone()
 }
 
 /// Returns a DataFusion user defined aggregate function for computing
@@ -152,7 +167,11 @@ pub fn selector_first() -> AggregateUDF {
 /// If there are multiple rows with the maximum timestamp value, the
 /// value is arbitrary
 pub fn selector_last() -> AggregateUDF {
-    make_uda("selector_last", FactoryBuilder::new(SelectorType::Last))
+    SELECTOR_LAST
+        .get_or_init(|| {
+            AggregateUDF::new_from_impl(SelectorUDAFImpl::new("selector_last", SelectorType::Last))
+        })
+        .clone()
 }
 
 /// Returns a DataFusion user defined aggregate function for computing
@@ -170,7 +189,11 @@ pub fn selector_last() -> AggregateUDF {
 /// If there are multiple rows with the same minimum value, the value
 /// with the first (earliest/smallest) timestamp is chosen
 pub fn selector_min() -> AggregateUDF {
-    make_uda("selector_min", FactoryBuilder::new(SelectorType::Min))
+    SELECTOR_MIN
+        .get_or_init(|| {
+            AggregateUDF::new_from_impl(SelectorUDAFImpl::new("selector_min", SelectorType::Min))
+        })
+        .clone()
 }
 
 /// Returns a DataFusion user defined aggregate function for computing
@@ -188,7 +211,11 @@ pub fn selector_min() -> AggregateUDF {
 /// If there are multiple rows with the same maximum value, the value
 /// with the first (earliest/smallest) timestamp is chosen
 pub fn selector_max() -> AggregateUDF {
-    make_uda("selector_max", FactoryBuilder::new(SelectorType::Max))
+    SELECTOR_MAX
+        .get_or_init(|| {
+            AggregateUDF::new_from_impl(SelectorUDAFImpl::new("selector_max", SelectorType::Max))
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,101 +226,86 @@ enum SelectorType {
     Max,
 }
 
-/// Builder to create the appropriate typed factory functions for selectors
+/// DataFusion user defined Aggregate Function (UDAF) for Selector functions
 #[derive(Debug)]
-struct FactoryBuilder {
+struct SelectorUDAFImpl {
+    name: String,
     selector_type: SelectorType,
+    signature: Signature,
 }
 
-impl FactoryBuilder {
-    fn new(selector_type: SelectorType) -> Self {
-        Self { selector_type }
-    }
-
-    fn build_state_type_factory(&self) -> StateTypeFactory {
-        Arc::new(move |return_type| {
-            let agg_type = AggType::try_from_return_type(return_type)?;
-            Ok(Arc::new(agg_type.state_datatypes()))
-        })
-    }
-
-    /// Returns a function that instantiates the accumulator, consuming self
-    fn build_accumulator_factory(self) -> AccumulatorFactoryFunction {
-        let Self { selector_type } = self;
-
-        Arc::new(move |return_type| {
-            let agg_type = AggType::try_from_return_type(return_type)?;
-            let value_type = agg_type.value_type;
-            let timezone = match agg_type.time_type {
-                DataType::Timestamp(_, tz) => tz.clone(),
-                _ => None,
-            };
-            let other_types = agg_type.other_types;
-
-            let accumulator: Box<dyn Accumulator> = match selector_type {
-                SelectorType::First => Box::new(Selector::new(
-                    Comparison::Min,
-                    Target::Time,
-                    timezone,
-                    value_type,
-                    other_types.iter().cloned(),
-                )?),
-                SelectorType::Last => Box::new(Selector::new(
-                    Comparison::Max,
-                    Target::Time,
-                    timezone,
-                    value_type,
-                    other_types.iter().cloned(),
-                )?),
-                SelectorType::Min => Box::new(Selector::new(
-                    Comparison::Min,
-                    Target::Value,
-                    timezone,
-                    value_type,
-                    other_types.iter().cloned(),
-                )?),
-                SelectorType::Max => Box::new(Selector::new(
-                    Comparison::Max,
-                    Target::Value,
-                    timezone,
-                    value_type,
-                    other_types.iter().cloned(),
-                )?),
-            };
-            Ok(accumulator)
-        })
+impl SelectorUDAFImpl {
+    fn new(name: impl Into<String>, selector_type: SelectorType) -> Self {
+        Self {
+            name: name.into(),
+            selector_type,
+            signature: Signature::variadic_any(Volatility::Stable),
+        }
     }
 }
 
-type ReturnTypeFunction = Arc<dyn Fn(&[DataType]) -> DataFusionResult<Arc<DataType>> + Send + Sync>;
-type StateTypeFactory =
-    Arc<dyn Fn(&DataType) -> DataFusionResult<Arc<Vec<DataType>>> + Send + Sync>;
+impl AggregateUDFImpl for SelectorUDAFImpl {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 
-/// Create a User Defined Aggregate Function (UDAF) for datafusion.
-fn make_uda(name: &str, factory_builder: FactoryBuilder) -> AggregateUDF {
-    // All selectors support the same input types / signatures
-    let input_signature = Signature::variadic_any(Volatility::Stable);
+    fn name(&self) -> &str {
+        &self.name
+    }
 
-    // return type of the selector is based on the input arguments.
-    //
-    // The inputs are (value, time) and the output is a struct with a
-    // 'value' and 'time' field of the same time.
-    let captured_name = name.to_string();
-    let return_type_func: ReturnTypeFunction = Arc::new(move |arg_types| {
-        let agg_type = AggType::try_from_arg_types(arg_types, &captured_name)?;
-        Ok(Arc::new(agg_type.return_type()))
-    });
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
-    // state type given the return type
-    let state_type_factory = factory_builder.build_state_type_factory();
+    fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(AggType::try_from_arg_types(arg_types, &self.name)?.return_type())
+    }
 
-    AggregateUDF::new(
-        name,
-        &input_signature,
-        &return_type_func,
-        &factory_builder.build_accumulator_factory(),
-        &state_type_factory,
-    )
+    fn accumulator(&self, arg: &DataType) -> DataFusionResult<Box<dyn Accumulator>> {
+        let agg_type = AggType::try_from_return_type(arg)?;
+        let value_type = agg_type.value_type;
+        let timezone = match agg_type.time_type {
+            DataType::Timestamp(_, tz) => tz.clone(),
+            _ => None,
+        };
+        let other_types = agg_type.other_types;
+
+        let accumulator: Box<dyn Accumulator> = match self.selector_type {
+            SelectorType::First => Box::new(Selector::new(
+                Comparison::Min,
+                Target::Time,
+                timezone,
+                value_type,
+                other_types.iter().cloned(),
+            )?),
+            SelectorType::Last => Box::new(Selector::new(
+                Comparison::Max,
+                Target::Time,
+                timezone,
+                value_type,
+                other_types.iter().cloned(),
+            )?),
+            SelectorType::Min => Box::new(Selector::new(
+                Comparison::Min,
+                Target::Value,
+                timezone,
+                value_type,
+                other_types.iter().cloned(),
+            )?),
+            SelectorType::Max => Box::new(Selector::new(
+                Comparison::Max,
+                Target::Value,
+                timezone,
+                value_type,
+                other_types.iter().cloned(),
+            )?),
+        };
+        Ok(accumulator)
+    }
+
+    fn state_type(&self, return_type: &DataType) -> DataFusionResult<Vec<DataType>> {
+        Ok(AggType::try_from_return_type(return_type)?.state_datatypes())
+    }
 }
 
 #[cfg(test)]
@@ -1110,6 +1122,7 @@ mod test {
 
     mod utils {
         use arrow::datatypes::TimeUnit;
+        use std::sync::Arc;
 
         use super::*;
 

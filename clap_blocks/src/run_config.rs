@@ -2,7 +2,7 @@
 use trace_exporters::TracingConfig;
 use trogging::cli::LoggingConfig;
 
-use crate::{object_store::ObjectStoreConfig, socket_addr::SocketAddr};
+use crate::socket_addr::SocketAddr;
 
 /// The default bind address for the HTTP API.
 pub const DEFAULT_API_BIND_ADDR: &str = "127.0.0.1:8080";
@@ -30,6 +30,14 @@ pub struct RunConfig {
     )]
     pub http_bind_address: SocketAddr,
 
+    /// Maximum number of pending RST_STREAM before a GOAWAY will be sent
+    /// by the service bound to `http_bind_address`
+    ///
+    /// This is important for services that produce a large number of stream
+    /// resets as part of normal operation, e.g. quorum catalog reads
+    #[clap(long, env = "INFLUXDB_IOX_MAX_PENDING_RESET_STREAMS")]
+    pub http_max_pending_reset_streams: Option<usize>,
+
     /// The address on which IOx will serve Storage gRPC API requests.
     #[clap(
         long = "grpc-bind",
@@ -47,21 +55,12 @@ pub struct RunConfig {
         action,
     )]
     pub max_http_request_size: usize,
-
-    /// object store config
-    #[clap(flatten)]
-    pub(crate) object_store_config: ObjectStoreConfig,
 }
 
 impl RunConfig {
     /// Get a reference to the run config's tracing config.
     pub fn tracing_config(&self) -> &TracingConfig {
         &self.tracing_config
-    }
-
-    /// Get a reference to the run config's object store config.
-    pub fn object_store_config(&self) -> &ObjectStoreConfig {
-        &self.object_store_config
     }
 
     /// Get a mutable reference to the run config's tracing config.
@@ -93,7 +92,6 @@ impl RunConfig {
         http_bind_address: SocketAddr,
         grpc_bind_address: SocketAddr,
         max_http_request_size: usize,
-        object_store_config: ObjectStoreConfig,
     ) -> Self {
         Self {
             logging_config,
@@ -101,7 +99,7 @@ impl RunConfig {
             http_bind_address,
             grpc_bind_address,
             max_http_request_size,
-            object_store_config,
+            http_max_pending_reset_streams: None,
         }
     }
 }

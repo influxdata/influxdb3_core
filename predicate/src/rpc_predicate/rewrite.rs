@@ -162,6 +162,11 @@ fn is_comparison(op: Operator) -> bool {
         // array containment operators
         Operator::ArrowAt => true,
         Operator::AtArrow => true,
+        // regex pattern matches (*~, etc)
+        Operator::LikeMatch => true,
+        Operator::ILikeMatch => true,
+        Operator::NotLikeMatch => true,
+        Operator::NotILikeMatch => true,
     }
 }
 

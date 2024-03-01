@@ -1,7 +1,10 @@
 use crate::classify::Classification;
 use hashbrown::HashMap;
 use http::Method;
-use metric::{Attributes, DurationHistogram, Metric, ResultMetric, U64Counter};
+use metric::{
+    Attributes, DurationHistogram, Metric, ResultMetric, U64Counter, U64Histogram,
+    U64HistogramOptions,
+};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,6 +67,7 @@ impl RequestMetrics {
             path: Some(request.uri().path().to_string()),
             method: Some(request.method().clone()),
             classification: None,
+            response_body_size: 0,
         }
     }
 
@@ -134,6 +138,9 @@ struct Metrics {
 
     /// Latency distribution of non-aborted requests
     request_duration: ResultMetric<DurationHistogram>,
+
+    /// Response body size distribution for non-aborted requests.
+    response_body_size: ResultMetric<U64Histogram>,
 }
 
 impl Metrics {
@@ -142,11 +149,27 @@ impl Metrics {
         attributes: impl Into<Attributes>,
         family: MetricFamily,
     ) -> Self {
-        let (counter, duration) = match family {
-            MetricFamily::GrpcServer => ("grpc_requests", "grpc_request_duration"),
-            MetricFamily::HttpServer => ("http_requests", "http_request_duration"),
-            MetricFamily::GrpcClient => ("grpc_client_requests", "grpc_client_request_duration"),
-            MetricFamily::HttpClient => ("http_client_requests", "http_client_request_duration"),
+        let (counter, duration, response_body_size) = match family {
+            MetricFamily::GrpcServer => (
+                "grpc_requests",
+                "grpc_request_duration",
+                "grpc_response_body_size_bytes",
+            ),
+            MetricFamily::HttpServer => (
+                "http_requests",
+                "http_request_duration",
+                "http_response_body_size_bytes",
+            ),
+            MetricFamily::GrpcClient => (
+                "grpc_client_requests",
+                "grpc_client_request_duration",
+                "grpc_client_response_body_size_bytes",
+            ),
+            MetricFamily::HttpClient => (
+                "http_client_requests",
+                "http_client_request_duration",
+                "http_client_response_body_size_bytes",
+            ),
         };
 
         let counter: Metric<U64Counter> =
@@ -155,9 +178,26 @@ impl Metrics {
         let duration: Metric<DurationHistogram> =
             registry.register_metric(duration, "distribution of request latencies");
 
+        let response_body_size: Metric<U64Histogram> = registry.register_metric_with_options(
+            response_body_size,
+            "distribution of response body size in bytes",
+            || {
+                U64HistogramOptions::new([
+                    100,
+                    1_000, // 1KiB
+                    10_000,
+                    100_000,
+                    1_000_000, // 1MiB
+                    10_000_000,
+                    u64::MAX,
+                ])
+            },
+        );
+
         let mut attributes = attributes.into();
         let count = ResultMetric::new(&counter, attributes.clone());
         let duration = ResultMetric::new(&duration, attributes.clone());
+        let response_body_size = ResultMetric::new(&response_body_size, attributes.clone());
 
         attributes.insert("status", "aborted");
         let aborted_count = counter.recorder(attributes);
@@ -166,6 +206,7 @@ impl Metrics {
             request_count: count,
             request_duration: duration,
             aborted_count,
+            response_body_size,
         }
     }
 }
@@ -178,6 +219,7 @@ pub(crate) struct MetricsRecorder {
     path: Option<String>,
     method: Option<Method>,
     classification: Option<Classification>,
+    response_body_size: u64,
 }
 
 impl MetricsRecorder {
@@ -197,6 +239,11 @@ impl MetricsRecorder {
             None => classification,
         });
     }
+
+    /// Register additional response body size.
+    pub(crate) fn add_response_body_size(&mut self, bytes: u64) {
+        self.response_body_size += bytes;
+    }
 }
 
 impl Drop for MetricsRecorder {
@@ -210,16 +257,28 @@ impl Drop for MetricsRecorder {
             Some(Classification::Ok) => {
                 metrics.request_count.ok.inc(1);
                 metrics.request_duration.ok.record(duration);
+                metrics
+                    .response_body_size
+                    .ok
+                    .record(self.response_body_size);
             }
             Some(Classification::ClientErr)
             | Some(Classification::PathNotFound)
             | Some(Classification::MethodNotAllowed) => {
                 metrics.request_count.client_error.inc(1);
                 metrics.request_duration.client_error.record(duration);
+                metrics
+                    .response_body_size
+                    .client_error
+                    .record(self.response_body_size);
             }
             Some(Classification::ServerErr) => {
                 metrics.request_count.server_error.inc(1);
                 metrics.request_duration.server_error.record(duration);
+                metrics
+                    .response_body_size
+                    .server_error
+                    .record(self.response_body_size);
             }
             Some(Classification::UnexpectedResponse) => {
                 metrics.request_count.unexpected_response.inc(1);
@@ -227,6 +286,10 @@ impl Drop for MetricsRecorder {
                     .request_duration
                     .unexpected_response
                     .record(duration);
+                metrics
+                    .response_body_size
+                    .unexpected_response
+                    .record(self.response_body_size);
             }
             None => metrics.aborted_count.inc(1),
         }

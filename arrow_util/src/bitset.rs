@@ -95,12 +95,12 @@ impl BitSet {
     }
 
     /// Extends this [`BitSet`] by the context of `other`
-    pub fn extend_from(&mut self, other: &BitSet) {
+    pub fn extend_from(&mut self, other: &Self) {
         self.append_bits(other.len, &other.buffer)
     }
 
     /// Extends this [`BitSet`] by `range` elements in `other`
-    pub fn extend_from_range(&mut self, other: &BitSet, range: Range<usize>) {
+    pub fn extend_from_range(&mut self, other: &Self, range: Range<usize>) {
         let count = range.end - range.start;
         if count == 0 {
             return;

@@ -2,6 +2,9 @@
 // structures are global, once you se a logging subscriber you can't undo
 // that.... So punting on that for now
 
+// Tests and benchmarks don't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use logfmt::LogFmtLayer;
 use observability_deps::tracing::{debug, error, info, span, trace, warn, Level};
 use once_cell::sync::Lazy;

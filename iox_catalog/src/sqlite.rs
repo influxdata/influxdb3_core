@@ -1,6 +1,6 @@
 //! A SQLite backed implementation of the Catalog
 
-use crate::interface::PartitionRepoExt;
+use crate::interface::{PartitionRepoExt, RootRepo};
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
@@ -12,16 +12,18 @@ use crate::{
     metrics::MetricDecorator,
 };
 use async_trait::async_trait;
-use data_types::snapshot::partition::PartitionSnapshot;
-use data_types::snapshot::table::TableSnapshot;
+use data_types::snapshot::namespace::NamespaceSnapshot;
+use data_types::snapshot::root::RootSnapshot;
 use data_types::{
     partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
     },
+    snapshot::{partition::PartitionSnapshot, table::TableSnapshot},
     Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables,
-    Namespace, NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId,
-    ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
-    PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
+    Namespace, NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride,
+    NamespaceVersion, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, Partition,
+    PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId,
+    Timestamp,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use metric::Registry;
@@ -41,6 +43,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use trace::ctx::SpanContext;
 
 static MIGRATOR: Migrator = sqlx::migrate!("sqlite/migrations");
 
@@ -166,14 +169,15 @@ impl Catalog for SqliteCatalog {
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
         Box::new(MetricDecorator::new(
-            SqliteTxn {
+            Box::new(SqliteTxn {
                 inner: Mutex::new(SqliteTxnInner {
                     pool: self.pool.clone(),
                 }),
                 time_provider: Arc::clone(&self.time_provider),
-            },
+            }),
             Arc::clone(&self.metrics),
             Arc::clone(&self.time_provider),
+            "sqlite",
         ))
     }
 
@@ -188,6 +192,10 @@ impl Catalog for SqliteCatalog {
 }
 
 impl RepoCollection for SqliteTxn {
+    fn root(&mut self) -> &mut dyn RootRepo {
+        self
+    }
+
     fn namespaces(&mut self) -> &mut dyn NamespaceRepo {
         self
     }
@@ -206,6 +214,30 @@ impl RepoCollection for SqliteTxn {
 
     fn parquet_files(&mut self) -> &mut dyn ParquetFileRepo {
         self
+    }
+
+    fn set_span_context(&mut self, _span_ctx: Option<SpanContext>) {}
+}
+
+#[async_trait]
+impl RootRepo for SqliteTxn {
+    async fn snapshot(&mut self) -> Result<RootSnapshot> {
+        let mut tx = self.inner.get_mut().pool.begin().await?;
+
+        // This will upgrade the transaction to be exclusive
+        let row = sqlx::query("UPDATE root SET generation = generation + 1 RETURNING *;")
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let generation: i64 = row.get("generation");
+
+        let namespaces = sqlx::query_as::<_, Namespace>("SELECT * from namespace;")
+            .fetch_all(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(RootSnapshot::encode(namespaces, generation as _)?)
     }
 }
 
@@ -227,17 +259,18 @@ impl NamespaceRepo for SqliteTxn {
 
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
-INSERT INTO namespace ( name, retention_period_ns, max_tables, max_columns_per_table, partition_template )
-VALUES ( $1, $2, $3, $4, $5 )
+INSERT INTO namespace ( name, retention_period_ns, max_tables, max_columns_per_table, partition_template, router_version )
+VALUES ( $1, $2, $3, $4, $5, $6 )
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-          partition_template;
+          partition_template, router_version;
             "#,
         )
         .bind(name.as_str()) // $1
         .bind(retention_period_ns) // $2
         .bind(max_tables) // $3
         .bind(max_columns_per_table) // $4
-        .bind(partition_template); // $5
+        .bind(partition_template) // $5
+        .bind(NamespaceVersion::default()); // $6
 
         let rec = rec.fetch_one(self.inner.get_mut()).await.map_err(|e| {
             if is_unique_violation(&e) {
@@ -263,7 +296,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             format!(
                 r#"
 SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-       partition_template
+       partition_template, router_version
 FROM namespace
 WHERE {v};
                 "#,
@@ -286,7 +319,7 @@ WHERE {v};
             format!(
                 r#"
 SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-       partition_template
+       partition_template, router_version
 FROM namespace
 WHERE id=$1 AND {v};
                 "#,
@@ -316,7 +349,7 @@ WHERE id=$1 AND {v};
             format!(
                 r#"
 SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-       partition_template
+       partition_template, router_version
 FROM namespace
 WHERE name=$1 AND {v};
                 "#,
@@ -337,17 +370,28 @@ WHERE name=$1 AND {v};
         Ok(Some(namespace))
     }
 
-    async fn soft_delete(&mut self, name: &str) -> Result<()> {
+    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
         let flagged_at = Timestamp::from(self.time_provider.now());
 
         // note that there is a uniqueness constraint on the name column in the DB
-        sqlx::query(r#"UPDATE namespace SET deleted_at=$1 WHERE name = $2;"#)
-            .bind(flagged_at) // $1
-            .bind(name) // $2
-            .execute(self.inner.get_mut())
-            .await
-            .map_err(Error::from)
-            .map(|_| ())
+        let rec = sqlx::query_as::<_, NamespaceId>(
+            r#"UPDATE namespace SET deleted_at=$1 WHERE name = $2 RETURNING id;"#,
+        )
+        .bind(flagged_at) // $1
+        .bind(name) // $2
+        .fetch_one(self.inner.get_mut())
+        .await;
+
+        let id = rec.map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::NotFound {
+                descr: name.to_string(),
+            },
+            _ => Error::External {
+                source: Box::new(e),
+            },
+        })?;
+
+        Ok(id)
     }
 
     async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
@@ -357,7 +401,7 @@ UPDATE namespace
 SET max_tables = $1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-          partition_template;
+          partition_template, router_version;
         "#,
         )
         .bind(new_max)
@@ -388,7 +432,7 @@ UPDATE namespace
 SET max_columns_per_table = $1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-          partition_template;
+          partition_template, router_version;
         "#,
         )
         .bind(new_max)
@@ -419,7 +463,7 @@ UPDATE namespace
 SET retention_period_ns = $1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
-          partition_template;
+          partition_template, router_version;
             "#,
         )
         .bind(retention_period_ns) // $1
@@ -437,6 +481,42 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         })?;
 
         Ok(namespace)
+    }
+
+    async fn snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot> {
+        let mut tx = self.inner.get_mut().pool.begin().await?;
+
+        // This will upgrade the transaction to be exclusive
+        let rec = sqlx::query(
+            "UPDATE namespace SET generation = generation + 1 where id = $1 RETURNING *;",
+        )
+        .bind(namespace_id) // $1
+        .fetch_one(&mut *tx)
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Err(Error::NotFound {
+                descr: format!("namespace: {namespace_id}"),
+            });
+        }
+        let row = rec?;
+
+        let generation: i64 = row.get("generation");
+        let namespace = Namespace::from_row(&row)?;
+
+        let tables =
+            sqlx::query_as::<_, Table>("SELECT * from table_name where namespace_id = $1;")
+                .bind(namespace_id) // $1
+                .fetch_all(&mut *tx)
+                .await?;
+
+        tx.commit().await?;
+
+        Ok(NamespaceSnapshot::encode(
+            namespace,
+            tables,
+            generation as _,
+        )?)
     }
 }
 
@@ -820,6 +900,7 @@ struct PartitionPod {
     partition_key: PartitionKey,
     sort_key_ids: Json<Vec<i64>>,
     new_file_at: Option<Timestamp>,
+    cold_compact_at: Option<Timestamp>,
 }
 
 impl From<PartitionPod> for Partition {
@@ -833,6 +914,7 @@ impl From<PartitionPod> for Partition {
             value.partition_key,
             sort_key_ids,
             value.new_file_at,
+            value.cold_compact_at,
         )
     }
 }
@@ -854,7 +936,7 @@ VALUES
     ($1, $2, $3, '[]')
 ON CONFLICT (table_id, partition_key)
 DO UPDATE SET partition_key = partition.partition_key
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
         "#,
         )
         .bind(key) // $1
@@ -883,7 +965,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at;
 
         sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
 FROM partition
 WHERE id IN (SELECT value FROM json_each($1));
             "#,
@@ -898,7 +980,7 @@ WHERE id IN (SELECT value FROM json_each($1));
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
 FROM partition
 WHERE table_id = $1;
             "#,
@@ -945,7 +1027,7 @@ WHERE table_id = $1;
 UPDATE partition
 SET sort_key_ids = $1
 WHERE id = $2 AND sort_key_ids = $3
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
         "#,
         )
         .bind(Json(raw_new_sort_key_ids)) // $1
@@ -1081,7 +1163,7 @@ RETURNING *
     async fn most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
 FROM partition
 ORDER BY id DESC
 LIMIT $1;
@@ -1120,10 +1202,52 @@ LIMIT $1;
             .map_err(Error::from)
     }
 
+    async fn partitions_needing_cold_compact(
+        &mut self,
+        maximum_time: Timestamp,
+        n: usize,
+    ) -> Result<Vec<PartitionId>> {
+        sqlx::query_as(
+            r#"
+SELECT p.id as partition_id
+FROM partition p
+WHERE p.new_file_at != 0
+AND p.new_file_at <= $1
+AND (p.cold_compact_at == 0 OR p.cold_compact_at < p.new_file_at)
+ORDER BY p.new_file_at ASC
+limit $2;"#,
+        )
+        .bind(maximum_time) // $1
+        .bind(n as i64) // $2
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map_err(Error::from)
+    }
+
+    async fn update_cold_compact(
+        &mut self,
+        partition_id: PartitionId,
+        cold_compact_at: Timestamp,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+UPDATE partition
+SET cold_compact_at = $1
+WHERE id = $2;
+        "#,
+        )
+        .bind(cold_compact_at) // $1
+        .bind(partition_id) // $2
+        .execute(self.inner.get_mut())
+        .await?;
+
+        Ok(())
+    }
+
     async fn list_old_style(&mut self) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
 FROM partition
 WHERE hash_id IS NULL
 ORDER BY id DESC;
@@ -1403,8 +1527,8 @@ WHERE object_store_id IN ({v});",
         let mut ids = Vec::with_capacity(create.len());
         for file in create {
             if file.partition_id != partition_id {
-                return Err(Error::External {
-                    source: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id).into(),
+                return Err(Error::Malformed {
+                    descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
                 });
             }
             let res = create_parquet_file(&mut *tx, file.clone()).await?;
@@ -1643,7 +1767,7 @@ VALUES
     ($1, $2, '[]')
 ON CONFLICT (table_id, partition_key)
 DO UPDATE SET partition_key = partition.partition_key
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
         "#,
         )
         .bind(&key) // $1
@@ -2192,5 +2316,97 @@ RETURNING *;
         let partition_template: Option<TablePartitionTemplateOverride> =
             record.try_get("partition_template").unwrap();
         assert!(partition_template.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cold_compact() {
+        let sqlite = setup_db().await;
+        let pool = sqlite.pool.clone();
+        let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+        let mut repos = sqlite.repositories();
+        let namespace = arbitrary_namespace(&mut *repos, "ns5").await;
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
+        let key = "NoBananas";
+        let partition = repos
+            .partitions()
+            .create_or_get(key.into(), table.id)
+            .await
+            .unwrap();
+
+        // Set the new_file_at time to be 1000, so we can test queries for cold partitions before & after
+        let time: i64 = 1000;
+        sqlx::query(
+            r#"
+UPDATE partition
+SET new_file_at = $3
+WHERE partition_key = $1
+AND table_id = $2
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
+        "#,
+        )
+        .bind(key) // $1
+        .bind(table.id) // $2
+        .bind(time) // $3
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Getting partitions colder than `partition`'s time should find none.
+        let need_cold = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(time - 1), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(need_cold.len(), 0);
+
+        // Getting cold partitions up to `partition`'s coldness should find it
+        let need_cold = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(time), 1)
+            .await
+            .unwrap();
+        assert_eq!(need_cold.len(), 1);
+        assert_eq!(need_cold[0], partition.id);
+
+        // Getting cold including warmer than `partition`'s coldness should find it
+        let need_cold = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(time + 1), 1)
+            .await
+            .unwrap();
+        assert_eq!(need_cold.len(), 1);
+        assert_eq!(need_cold[0], partition.id);
+
+        // Give `partition` a cold_compact_at time that's invalid (older than its new_file_at)
+        repos
+            .partitions()
+            .update_cold_compact(partition.id, Timestamp::new(time - 1))
+            .await
+            .unwrap();
+
+        // Getting cold partitions up to `partition`'s age still find it when it has an invalid cold compact time.
+        let need_cold = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(time), 1)
+            .await
+            .unwrap();
+        assert_eq!(need_cold.len(), 1);
+        assert_eq!(need_cold[0], partition.id);
+
+        // Give `partition` a cold_compact_at time that's valid (newer than new_file_at)
+        repos
+            .partitions()
+            .update_cold_compact(partition.id, Timestamp::new(time + 1))
+            .await
+            .unwrap();
+
+        // With a valid cold compact time, `partition` isn't returned.
+        let need_cold = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(time), 1)
+            .await
+            .unwrap();
+        assert_eq!(need_cold.len(), 0);
     }
 }

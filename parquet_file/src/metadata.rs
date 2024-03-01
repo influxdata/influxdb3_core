@@ -422,20 +422,6 @@ impl IoxMetadata {
     }
 
     /// Create a corresponding iox catalog's ParquetFile
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the [`IoxParquetMetaData`] structure does not
-    /// contain valid metadata bytes, has no readable schema, or has no field
-    /// statistics.
-    ///
-    /// A [`RecordBatch`] serialized without the embedded metadata found in the
-    /// IOx [`Schema`] type will cause a statistic resolution failure due to
-    /// lack of the IOx field type metadata for the time column. Batches
-    /// produced from the through the IOx write path always include this
-    /// metadata.
-    ///
-    /// [`RecordBatch`]: arrow::record_batch::RecordBatch
     pub fn to_parquet_file<F>(
         &self,
         partition_id: PartitionId,
@@ -469,23 +455,12 @@ impl IoxMetadata {
             .read_statistics(&schema)
             .expect("invalid statistics");
         let columns: Vec<_> = stats.iter().map(|v| column_id_map(&v.name)).collect();
-        let time_summary = stats
-            .into_iter()
-            .find(|v| v.name == TIME_COLUMN_NAME)
-            .expect("no time column in metadata statistics");
-
-        // Sanity check the type of this column before using the values.
-        assert_eq!(time_summary.influxdb_type, InfluxDbType::Timestamp);
 
         // Extract the min/max timestamps.
-        let (min_time, max_time) = match time_summary.stats {
-            Statistics::I64(stats) => {
-                let min = Timestamp::new(stats.min.expect("no min time statistic"));
-                let max = Timestamp::new(stats.max.expect("no max time statistic"));
-                (min, max)
-            }
-            _ => panic!("unexpected physical type for timestamp column"),
-        };
+        let TimestampRange {
+            min: min_time,
+            max: max_time,
+        } = derive_min_max_time(stats);
 
         ParquetFileParams {
             namespace_id: self.namespace_id,
@@ -545,6 +520,49 @@ fn decode_timestamp_from_field(
     Ok(Time::from_date_time(date_time))
 }
 
+/// Range of timestamps from min to max.
+#[derive(Debug, Clone, Copy)]
+pub struct TimestampRange {
+    /// min timestamp
+    pub min: Timestamp,
+    /// max timestamp
+    pub max: Timestamp,
+}
+
+/// Derive min/max time from column statistics.
+///
+/// # Panics
+///
+/// This method panics if the [`IoxParquetMetaData`] structure does not
+/// contain valid metadata bytes, has no readable schema, or has no field
+/// statistics.
+///
+/// A [`RecordBatch`] serialized without the embedded metadata found in the
+/// IOx [`Schema`] type will cause a statistic resolution failure due to
+/// lack of the IOx field type metadata for the time column. Batches
+/// produced from the through the IOx write path always include this
+/// metadata.
+///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
+pub fn derive_min_max_time(stats: Vec<ColumnSummary>) -> TimestampRange {
+    let time_summary = stats
+        .into_iter()
+        .find(|v| v.name == TIME_COLUMN_NAME)
+        .expect("no time column in metadata statistics");
+
+    // Sanity check the type of this column before using the values.
+    assert_eq!(time_summary.influxdb_type, InfluxDbType::Timestamp);
+
+    // Extract the min/max timestamps.
+    match time_summary.stats {
+        Statistics::I64(stats) => {
+            let min = Timestamp::new(stats.min.expect("no min time statistic"));
+            let max = Timestamp::new(stats.max.expect("no max time statistic"));
+            TimestampRange { min, max }
+        }
+        _ => panic!("unexpected physical type for timestamp column"),
+    }
+}
 /// Parquet metadata with IOx-specific wrapper.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IoxParquetMetaData {
@@ -802,6 +820,14 @@ impl DecodedIoxParquetMetaData {
         // memory pointed to in the `ParquetMetaData` structues.
         // Feature tracked in arrow-rs: https://github.com/apache/arrow-rs/issues/1729
         mem::size_of_val(self)
+    }
+}
+
+impl From<Arc<ParquetMetaData>> for DecodedIoxParquetMetaData {
+    fn from(md: Arc<ParquetMetaData>) -> Self {
+        Self {
+            md: md.as_ref().clone(),
+        }
     }
 }
 

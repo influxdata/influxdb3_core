@@ -34,11 +34,9 @@ mod tests {
 
             // create new metrics for client so that they don't overlap w/ server
             let metrics = Arc::new(metric::Registry::default());
-            let client = Arc::new(client::GrpcCatalogClient::new(
-                uri,
-                metrics,
-                Arc::clone(&time_provider),
-            ));
+            let client =
+                client::GrpcCatalogClient::builder(uri, metrics, Arc::clone(&time_provider))
+                    .build();
 
             let test_catalog = TestCatalog::new(client);
             test_catalog.hold_onto(test_server);
@@ -60,11 +58,14 @@ mod tests {
 
         // create new metrics for client so that they don't overlap w/ server
         let metrics = Arc::new(metric::Registry::default());
-        let client = Arc::new(client::GrpcCatalogClient::new(
-            uri,
-            Arc::clone(&metrics),
-            Arc::clone(&time_provider),
-        ));
+        let client = Arc::new(
+            client::GrpcCatalogClient::builder(
+                uri,
+                Arc::clone(&metrics),
+                Arc::clone(&time_provider),
+            )
+            .build(),
+        );
 
         let ns = client
             .repositories()

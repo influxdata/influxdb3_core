@@ -77,7 +77,18 @@ macro_rules! add_service {
 /// be used w/ [`serve_builder!`](crate::serve_builder).
 #[macro_export]
 macro_rules! setup_builder {
-    ($input:ident, $server_type:ident) => {{
+    ($input:ident, $server_type:ident) => {
+        $crate::setup_builder_impl!($input, $server_type, None)
+    };
+    ($input:ident, $server_type:ident, $server_timeout:expr) => {
+        $crate::setup_builder_impl!($input, $server_type, Some($server_timeout))
+    };
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! setup_builder_impl {
+    ($input:ident, $server_type:ident, $server_timeout:expr) => {{
         #[allow(unused_imports)]
         use $crate::{add_service, rpc::RpcBuilder, server_type::ServerType};
 
@@ -113,6 +124,11 @@ macro_rules! setup_builder {
                 ),
             )
             .layer($crate::reexport::tower_trailer::TrailerLayer::default());
+
+        let builder = match $server_timeout {
+            Some(t) => builder.timeout(t),
+            None => builder,
+        };
 
         let builder = RpcBuilder {
             inner: builder,

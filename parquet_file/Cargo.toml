@@ -25,9 +25,9 @@ pbjson-types = { workspace = true }
 prost = { workspace = true }
 schema = { path = "../schema" }
 snafu = "0.8"
-thiserror = "1.0.56"
+thiserror = "1.0.57"
 thrift = "0.17"
-tokio = { version = "1.35", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1.36", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = { version = "0.13", default-features = false }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

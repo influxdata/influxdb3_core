@@ -53,8 +53,8 @@ where
         let partition_hash_id: Option<PartitionHashId> = row.try_get("partition_hash_id")?;
 
         let transition_partition_id = match (partition_id, partition_hash_id) {
-            (_, Some(hash_id)) => TransitionPartitionId::Deterministic(hash_id),
-            (Some(id), _) => TransitionPartitionId::Deprecated(id),
+            (_, Some(hash_id)) => Self::Deterministic(hash_id),
+            (Some(id), _) => Self::Deprecated(id),
             (None, None) => {
                 return Err(sqlx::Error::ColumnDecode {
                     index: "partition_id".into(),
@@ -120,10 +120,10 @@ impl From<TransitionPartitionId>
     fn from(value: TransitionPartitionId) -> Self {
         use generated_types::influxdata::iox::catalog::v1 as proto;
         match value {
-            TransitionPartitionId::Deprecated(id) => proto::PartitionIdentifier {
+            TransitionPartitionId::Deprecated(id) => Self {
                 id: Some(proto::partition_identifier::Id::CatalogId(id.get())),
             },
-            TransitionPartitionId::Deterministic(hash) => proto::PartitionIdentifier {
+            TransitionPartitionId::Deterministic(hash) => Self {
                 id: Some(proto::partition_identifier::Id::HashId(
                     hash.as_bytes().to_owned(),
                 )),
@@ -146,11 +146,9 @@ impl TryFrom<generated_types::influxdata::iox::catalog::v1::PartitionIdentifier>
         let id = value.id.ok_or(PartitionIdProtoError::NoId)?;
 
         Ok(match id {
-            proto::partition_identifier::Id::CatalogId(v) => {
-                TransitionPartitionId::Deprecated(PartitionId::new(v))
-            }
+            proto::partition_identifier::Id::CatalogId(v) => Self::Deprecated(PartitionId::new(v)),
             proto::partition_identifier::Id::HashId(hash) => {
-                TransitionPartitionId::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
+                Self::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
             }
         })
     }
@@ -477,6 +475,9 @@ pub struct Partition {
 
     /// The time at which the newest file of the partition is created
     pub new_file_at: Option<Timestamp>,
+
+    /// The time at which the partition was last cold compacted
+    pub cold_compact_at: Option<Timestamp>,
 }
 
 impl Partition {
@@ -491,6 +492,7 @@ impl Partition {
         partition_key: PartitionKey,
         sort_key_ids: SortKeyIds,
         new_file_at: Option<Timestamp>,
+        cold_compact_at: Option<Timestamp>,
     ) -> Self {
         Self {
             id,
@@ -499,6 +501,7 @@ impl Partition {
             partition_key,
             sort_key_ids,
             new_file_at,
+            cold_compact_at,
         }
     }
 

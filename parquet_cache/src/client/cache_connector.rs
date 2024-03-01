@@ -1,3 +1,4 @@
+use object_store::GetRange;
 use std::fmt::Debug;
 
 use tower::{Layer, ServiceBuilder};
@@ -16,6 +17,10 @@ pub enum Error {
     /// Failure reading the (already fetched) data from cache.
     #[error("Data error: {0}")]
     ReadData(String),
+
+    /// Range type is not supported
+    #[error("Internal Error: GetRange not supported: {0}")]
+    InternalUnsupportedRange(GetRange),
 }
 
 /// Builder for the cache connector service.

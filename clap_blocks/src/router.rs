@@ -157,6 +157,15 @@ pub struct RouterConfig {
         default_value = "10"
     )]
     pub rpc_write_health_num_probes: u64,
+
+    /// If set to `true`, the router will not wait for upstream ingester
+    /// connections to be established before starting.
+    #[clap(
+        long = "no-wait-rpc-upstreams",
+        env = "INFLUXDB_IOX_NO_WAIT_RPC_UPSTREAMS",
+        default_value = "false"
+    )]
+    pub no_wait_rpc_upstreams: bool,
 }
 
 /// Map a string containing an integer number of seconds into a [`Duration`].

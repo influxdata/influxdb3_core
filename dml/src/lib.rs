@@ -1,43 +1,19 @@
 //! DML data types
-
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+#![warn(missing_docs)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use std::time::Duration;
-
 use data_types::{
-    DeletePredicate, NamespaceId, NonEmptyString, PartitionKey, SequenceNumber, StatValues,
-    Statistics, TableId,
+    DeletePredicate, NamespaceId, NonEmptyString, PartitionKey, StatValues, Statistics, TableId,
 };
 use hashbrown::HashMap;
-use iox_time::{Time, TimeProvider};
 use mutable_batch::MutableBatch;
 use trace::ctx::SpanContext;
 
 /// Metadata information about a DML operation
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct DmlMeta {
-    /// The sequence number associated with this write
-    sequence_number: Option<SequenceNumber>,
-
-    /// When this write was ingested into the write buffer
-    producer_ts: Option<Time>,
-
     /// Optional span context associated w/ this write
     span_ctx: Option<SpanContext>,
 
@@ -47,15 +23,8 @@ pub struct DmlMeta {
 
 impl DmlMeta {
     /// Create a new [`DmlMeta`] for a sequenced operation
-    pub fn sequenced(
-        sequence_number: SequenceNumber,
-        producer_ts: Time,
-        span_ctx: Option<SpanContext>,
-        bytes_read: usize,
-    ) -> Self {
+    pub fn sequenced(span_ctx: Option<SpanContext>, bytes_read: usize) -> Self {
         Self {
-            sequence_number: Some(sequence_number),
-            producer_ts: Some(producer_ts),
             span_ctx,
             bytes_read: Some(bytes_read),
         }
@@ -64,27 +33,9 @@ impl DmlMeta {
     /// Create a new [`DmlMeta`] for an unsequenced operation
     pub fn unsequenced(span_ctx: Option<SpanContext>) -> Self {
         Self {
-            sequence_number: None,
-            producer_ts: None,
             span_ctx,
             bytes_read: None,
         }
-    }
-
-    /// Gets the sequence number associated with the write if any
-    pub fn sequence(&self) -> Option<SequenceNumber> {
-        self.sequence_number
-    }
-
-    /// Gets the producer timestamp associated with the write if any
-    pub fn producer_ts(&self) -> Option<Time> {
-        self.producer_ts
-    }
-
-    /// returns the Duration since this DmlMeta was produced, if any
-    pub fn duration_since_production(&self, time_provider: &dyn TimeProvider) -> Option<Duration> {
-        self.producer_ts
-            .and_then(|ts| time_provider.now().checked_duration_since(ts))
     }
 
     /// Gets the span context if any
@@ -398,16 +349,6 @@ pub mod test_util {
         assert_eq!(a.namespace_id, b.namespace_id);
         assert_eq!(a.partition_key(), b.partition_key());
 
-        // Depending on what implementation is under test ( :( ) different
-        // timestamp precisions may be used.
-        //
-        // Truncate them all to milliseconds (the lowest common denominator) so
-        // they are comparable.
-        assert_eq!(
-            truncate_timestamp_to_millis(a.meta()),
-            truncate_timestamp_to_millis(b.meta())
-        );
-
         assert_eq!(a.table_count(), b.table_count());
 
         for (table_id, a_batch) in a.tables() {
@@ -427,26 +368,5 @@ pub mod test_util {
             DmlOperation::Delete(a) => assert_eq!(a, b),
             _ => panic!("unexpected operation: {a:?}"),
         }
-    }
-
-    fn truncate_timestamp_to_millis(m: &DmlMeta) -> DmlMeta {
-        // Kafka supports millisecond precision in timestamps, so drop some
-        // precision from this producer timestamp in the metadata (which has
-        // nanosecond precision) to ensure the returned write is directly
-        // comparable to a write that has come through the write buffer.
-        //
-        // This mangling is to support testing comparisons only.
-        let timestamp = m
-            .producer_ts()
-            .expect("no producer timestamp in de-aggregated metadata");
-        let timestamp =
-            Time::from_timestamp_millis(timestamp.timestamp_millis()).expect("ts in range");
-
-        DmlMeta::sequenced(
-            m.sequence().unwrap(),
-            timestamp,
-            m.span_context().cloned(),
-            m.bytes_read().unwrap(),
-        )
     }
 }

@@ -1,3 +1,6 @@
+// This example doesn't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use influxdb2_client::models::{LanguageRequest, Query};
 
 #[tokio::main]

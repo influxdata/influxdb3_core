@@ -1,18 +1,7 @@
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
+#![warn(missing_docs)]
 // `clippy::use_self` is deliberately excluded from the lints this crate uses.
 // See <https://github.com/rust-lang/rust-clippy/issues/6902>.
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    clippy::clone_on_ref_ptr,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
+#![allow(clippy::use_self)]
 
 //! # influxdb2_client
 //!
@@ -73,6 +62,7 @@
 use once_cell as _;
 #[cfg(test)]
 use parking_lot as _;
+use smallvec as _;
 #[cfg(test)]
 use test_helpers as _;
 

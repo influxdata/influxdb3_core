@@ -1,16 +1,4 @@
 //! Contains the IOx query engine
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
-#![warn(
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
 #![allow(unreachable_pub)]
 
 use datafusion_util::MemoryStream;
@@ -48,10 +36,12 @@ pub mod physical_optimizer;
 pub mod plan;
 pub mod provider;
 pub mod pruning;
+pub mod pruning_oracle;
 pub mod query_log;
 pub mod statistics;
 pub mod util;
 
+use crate::exec::QueryConfig;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 /// The name of the virtual column that represents the chunk order.
@@ -145,7 +135,11 @@ pub trait QueryNamespace: Debug + Send + Sync {
     ) -> QueryCompletedToken<StateReceived>;
 
     /// Returns a new execution context suitable for running queries
-    fn new_query_context(&self, span_ctx: Option<SpanContext>) -> IOxSessionContext;
+    fn new_query_context(
+        &self,
+        span_ctx: Option<SpanContext>,
+        query_config: Option<&QueryConfig>,
+    ) -> IOxSessionContext;
 }
 
 /// Trait that allows the query engine (which includes flight and storage/InfluxRPC) to access a
@@ -163,7 +157,7 @@ pub trait QueryNamespaceProvider: std::fmt::Debug + Send + Sync + 'static {
         name: &str,
         span: Option<Span>,
         include_debug_info_tables: bool,
-    ) -> Option<Arc<dyn QueryNamespace>>;
+    ) -> Result<Option<Arc<dyn QueryNamespace>>, DataFusionError>;
 
     /// Acquire concurrency-limiting sempahore
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit;

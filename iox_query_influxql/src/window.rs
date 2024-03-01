@@ -7,6 +7,7 @@ use std::sync::Arc;
 mod cumulative_sum;
 mod derivative;
 mod difference;
+mod elapsed;
 mod moving_average;
 mod non_negative;
 mod percent_row_number;
@@ -29,6 +30,13 @@ pub(crate) static DERIVATIVE: Lazy<WindowFunctionDefinition> = Lazy::new(|| {
 pub(crate) static DIFFERENCE: Lazy<WindowFunctionDefinition> = Lazy::new(|| {
     WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::new_from_impl(
         difference::DifferenceUDWF::new(),
+    )))
+});
+
+/// Definition of the `ELAPSED` user-defined window function.
+pub(crate) static ELAPSED: Lazy<WindowFunctionDefinition> = Lazy::new(|| {
+    WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::new_from_impl(
+        elapsed::ElapsedUDWF::new(),
     )))
 });
 

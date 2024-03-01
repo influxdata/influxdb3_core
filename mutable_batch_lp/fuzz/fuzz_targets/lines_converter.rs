@@ -1,9 +1,13 @@
 #![no_main]
 
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use hashbrown::HashMap;
 use libfuzzer_sys::fuzz_target;
-use mutable_batch::{column::ColumnData, MutableBatch, PartitionWrite, WritePayload};
+use mutable_batch::{column::ColumnData, MutableBatch, WritePayload};
 use mutable_batch_lp::LinesConverter;
+use partition::PartitionWrite;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(body) = std::str::from_utf8(data) {
@@ -18,8 +22,7 @@ fuzz_target!(|data: &[u8]| {
         if let Ok((batches, stats)) = converter.finish() {
             let mut total_rows = 0;
 
-            let mut partitions: HashMap<_, HashMap<String, MutableBatch>> =
-                HashMap::default();
+            let mut partitions: HashMap<_, HashMap<String, MutableBatch>> = HashMap::default();
 
             for (table_name, mutable_batch) in &batches {
                 assert!(
@@ -35,17 +38,15 @@ fuzz_target!(|data: &[u8]| {
                 );
 
                 for (partition_key, partition_payload) in
-                    PartitionWrite::partition(&mutable_batch, &table_partition_template).unwrap()
+                    PartitionWrite::partition(mutable_batch, &table_partition_template).unwrap()
                 {
                     let partition = partitions.entry(partition_key).or_default();
 
-                    let mut table_batch = partition
+                    let table_batch = partition
                         .raw_entry_mut()
                         .from_key(table_name.as_str())
                         .or_insert_with(|| (table_name.to_owned(), MutableBatch::default()));
-                    partition_payload
-                        .write_to_batch(&mut table_batch.1)
-                        .unwrap();
+                    partition_payload.write_to_batch(table_batch.1).unwrap();
                 }
 
                 total_rows += mutable_batch.rows();

@@ -271,6 +271,7 @@ impl ListEntry {
     /// Create a new [`ListEntry`] from the provided key and value
     pub fn new(key: CacheKey, value: CacheValue) -> Self {
         let (variant, key) = match key {
+            CacheKey::Root => (b'r', 0),
             CacheKey::Namespace(v) => (b'n', v as _),
             CacheKey::Table(v) => (b't', v as _),
             CacheKey::Partition(v) => (b'p', v as _),
@@ -289,6 +290,7 @@ impl ListEntry {
     /// Returns `None` otherwise
     pub fn key(&self) -> Option<CacheKey> {
         match self.variant {
+            b'r' => Some(CacheKey::Root),
             b't' => Some(CacheKey::Table(self.key as _)),
             b'n' => Some(CacheKey::Namespace(self.key as _)),
             b'p' => Some(CacheKey::Partition(self.key as _)),
@@ -373,6 +375,7 @@ mod tests {
                 CacheKey::Partition(3),
                 CacheValue::new("bananas".into(), 23),
             ),
+            ListEntry::new(CacheKey::Root, CacheValue::new("the_root".into(), 1337)),
         ];
 
         let encoded: Vec<_> = ListEncoder::new(expected.clone()).collect();

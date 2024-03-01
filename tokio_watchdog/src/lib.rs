@@ -1,19 +1,8 @@
 //! Monitors if the tokio runtime still looks healthy.
-#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
-#![warn(
-    missing_copy_implementations,
-    missing_docs,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::use_self,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
 
-use observability_deps::tracing::warn;
+#![warn(missing_docs)]
+
+use observability_deps::tracing::{debug, warn};
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -162,13 +151,13 @@ impl<'a> WatchdogConfig<'a> {
                     let d = match rx_response.try_recv() {
                         Ok(d) => d,
                         Err(TryRecvError::Empty) => {
-                            warn!(runtime = runtime_name, "tokio starts hanging",);
+                            debug!(runtime = runtime_name, "tokio starts hanging",);
                             metric_hang.inc(1);
 
                             let Some(d) = rx_response.blocking_recv() else {
                                 return;
                             };
-                            warn!(
+                            debug!(
                                 runtime = runtime_name,
                                 hang_secs = d.as_secs_f64(),
                                 "tokio stops hanging",

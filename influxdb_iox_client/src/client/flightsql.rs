@@ -66,7 +66,7 @@ impl FlightSqlClient {
 
     /// Create a new client from an existing [`FlightClient`]
     pub fn new_from_flight(inner: FlightClient) -> Self {
-        FlightSqlClient { inner }
+        Self { inner }
     }
 
     /// Return a reference to the underlying [`FlightClient`]

@@ -55,8 +55,14 @@ async fn process_item_list(
     checker: &mpsc::Sender<ObjectMeta>,
 ) -> Result<i32> {
     let mut i = 0;
+    // TODO(10211): Remove this or make it configurable.
+    let skip = object_store::path::Path::from_url_path("iceberg").expect("static input");
     for item in items {
         let item = item.context(MalformedSnafu)?;
+        if item.location.prefix_matches(&skip) {
+            debug!(location = %item.location, "icebergexporter configuration file SKIPPED");
+            continue;
+        }
         debug!(location = %item.location, "Object store item");
         checker.send(item).await?;
         i += 1;
@@ -82,3 +88,6 @@ pub enum Error {
 }
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests;

@@ -265,7 +265,7 @@ pub async fn retry_cas_sort_key(
     new_sort_key_ids: &SortKeyIds,
     partition_id: PartitionId,
     catalog: Arc<dyn Catalog>,
-) -> Result<SortKeyIds, SortKeyIds> {
+) -> Result<(), SortKeyIds> {
     use backoff::Backoff;
     use observability_deps::tracing::{info, warn};
     use std::ops::ControlFlow;
@@ -281,7 +281,7 @@ pub async fn retry_cas_sort_key(
                     .cas_sort_key(partition_id, old_sort_key_ids, &new_sort_key_ids)
                     .await
                 {
-                    Ok(_) => ControlFlow::Break(Ok(new_sort_key_ids)),
+                    Ok(_) => ControlFlow::Break(Ok(())),
                     Err(CasFailure::QueryError(e)) => ControlFlow::Continue(e),
                     Err(CasFailure::ValueMismatch(observed_sort_key_ids))
                         if observed_sort_key_ids == new_sort_key_ids =>
@@ -300,7 +300,7 @@ pub async fn retry_cas_sort_key(
                             update_sort_key_ids=?new_sort_key_ids,
                             "detected matching concurrent sort key update"
                         );
-                        ControlFlow::Break(Ok(new_sort_key_ids))
+                        ControlFlow::Break(Ok(()))
                     }
                     Err(CasFailure::ValueMismatch(observed_sort_key_ids)) => {
                         // Another ingester concurrently updated the sort

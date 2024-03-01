@@ -54,9 +54,9 @@ pub enum QueryOutputFormat {
 impl Display for QueryOutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueryOutputFormat::Pretty => write!(f, "pretty"),
-            QueryOutputFormat::Csv => write!(f, "csv"),
-            QueryOutputFormat::Json => write!(f, "json"),
+            Self::Pretty => write!(f, "pretty"),
+            Self::Csv => write!(f, "csv"),
+            Self::Json => write!(f, "json"),
         }
     }
 }

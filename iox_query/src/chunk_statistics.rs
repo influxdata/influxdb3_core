@@ -11,11 +11,18 @@ use datafusion::{
 use datafusion_util::{option_to_precision, timestamptz_nano};
 use schema::{InfluxColumnType, Schema};
 
+use crate::pruning_oracle::BucketInfo;
+
 /// Represent known min/max values for a specific column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRange {
-    pub min_value: Arc<ScalarValue>,
-    pub max_value: Arc<ScalarValue>,
+    pub min_value: Option<Arc<ScalarValue>>,
+    pub max_value: Option<Arc<ScalarValue>>,
+    /// The server-side bucketing bucket ID of the column for this partition.
+    ///
+    /// None if this column or this table is not bucketed. e.g. the partition
+    /// template of this table does not contain `TemplatePart::Bucket`.
+    pub bucket_info: Option<BucketInfo>,
 }
 
 /// Represents the known min/max values for a subset (not all) of the columns in a partition.
@@ -32,10 +39,20 @@ fn range_to_min_max_stats(
     let Some(range) = range else {
         return (Precision::Absent, Precision::Absent);
     };
-    (
-        Precision::Exact(range.min_value.as_ref().clone()),
-        Precision::Exact(range.max_value.as_ref().clone()),
-    )
+
+    let min_value = range
+        .min_value
+        .as_ref()
+        .map(|min_value| Precision::Exact(min_value.as_ref().clone()))
+        .unwrap_or(Precision::Absent);
+
+    let max_value = range
+        .max_value
+        .as_ref()
+        .map(|max_value| Precision::Exact(max_value.as_ref().clone()))
+        .unwrap_or(Precision::Absent);
+
+    (min_value, max_value)
 }
 
 /// Create chunk [statistics](Statistics).
@@ -137,22 +154,25 @@ mod tests {
             (
                 Arc::from("tag1"),
                 ColumnRange {
-                    min_value: Arc::new(ScalarValue::from("aaa")),
-                    max_value: Arc::new(ScalarValue::from("bbb")),
+                    min_value: Some(Arc::new(ScalarValue::from("aaa"))),
+                    max_value: Some(Arc::new(ScalarValue::from("bbb"))),
+                    bucket_info: None,
                 },
             ),
             (
                 Arc::from("tag3"), // does not exist in schema
                 ColumnRange {
-                    min_value: Arc::new(ScalarValue::from("ccc")),
-                    max_value: Arc::new(ScalarValue::from("ddd")),
+                    min_value: Some(Arc::new(ScalarValue::from("ccc"))),
+                    max_value: Some(Arc::new(ScalarValue::from("ddd"))),
+                    bucket_info: None,
                 },
             ),
             (
                 Arc::from("field_integer"),
                 ColumnRange {
-                    min_value: Arc::new(ScalarValue::from(10i64)),
-                    max_value: Arc::new(ScalarValue::from(20i64)),
+                    min_value: Some(Arc::new(ScalarValue::from(10i64))),
+                    max_value: Some(Arc::new(ScalarValue::from(20i64))),
+                    bucket_info: None,
                 },
             ),
         ]));
@@ -209,8 +229,9 @@ mod tests {
         let ranges = Arc::new(HashMap::from([(
             Arc::from(TIME_COLUMN_NAME),
             ColumnRange {
-                min_value: Arc::new(timestamptz_nano(12)),
-                max_value: Arc::new(timestamptz_nano(22)),
+                min_value: Some(Arc::new(timestamptz_nano(12))),
+                max_value: Some(Arc::new(timestamptz_nano(22))),
+                bucket_info: None,
             },
         )]));
 
@@ -245,8 +266,9 @@ mod tests {
         let ranges = Arc::new(HashMap::from([(
             Arc::from(TIME_COLUMN_NAME),
             ColumnRange {
-                min_value: Arc::new(timestamptz_nano(12)),
-                max_value: Arc::new(timestamptz_nano(22)),
+                min_value: Some(Arc::new(timestamptz_nano(12))),
+                max_value: Some(Arc::new(timestamptz_nano(22))),
+                bucket_info: None,
             },
         )]));
 

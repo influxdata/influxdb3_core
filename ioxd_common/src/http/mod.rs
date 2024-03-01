@@ -94,6 +94,7 @@ pub async fn serve(
     server_type: Arc<dyn ServerType>,
     shutdown: CancellationToken,
     trace_header_parser: TraceHeaderParser,
+    max_pending_reset_streams: Option<usize>,
 ) -> Result<(), hyper::Error> {
     let trace_collector = server_type.trace_collector();
     let trace_layer = TraceLayer::new(
@@ -103,7 +104,12 @@ pub async fn serve(
         server_type.name(),
     );
 
-    hyper::Server::builder(addr)
+    let mut builder = hyper::Server::builder(addr).http2_adaptive_window(true);
+    if let Some(x) = max_pending_reset_streams {
+        builder = builder.http2_max_pending_accept_reset_streams(Some(x));
+    }
+
+    builder
         .serve(hyper::service::make_service_fn(|_conn: &AddrStream| {
             let server_type = Arc::clone(&server_type);
             let service = hyper::service::service_fn(move |request: Request<_>| {

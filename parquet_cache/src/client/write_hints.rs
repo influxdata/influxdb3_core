@@ -1,15 +1,12 @@
 use async_trait::async_trait;
-use bytes::{BufMut, BytesMut};
 use data_types::ParquetFileParams;
-use futures::FutureExt;
-use hyper::Method;
 use object_store::{limit::LimitStore, path::Path, Error as ObjectStoreError, ObjectStore, Result};
+use observability_deps::tracing::warn;
 use tower::{Service, ServiceExt};
 
-use crate::data_types::{WriteHint, WriteHintAck, WriteHintRequestBody};
-use crate::DataCacheObjectStore;
+use crate::data_types::{Request, WriteHint, WriteHintAck, WriteHintRequestBody};
 
-use super::request::RawRequest;
+use super::{request::RawRequest, DataCacheObjectStore};
 
 /// identifier for `object_store::Error::Generic`
 const DATA_CACHE: &str = "write hint to data cache";
@@ -39,62 +36,67 @@ impl WriteHintingObjectStore for DataCacheObjectStore {
         new_file: &'a ParquetFileParams,
         ack_setting: WriteHintAck,
     ) -> Result<()> {
-        let mut buf = BytesMut::new().writer();
-        serde_json::to_writer(
-            &mut buf,
-            &WriteHintRequestBody {
+        let req = RawRequest {
+            request: Request::WriteHint(WriteHintRequestBody {
                 location: location.to_string(),
                 hint: WriteHint::from(new_file),
                 ack_setting,
-            },
-        )
-        .map_err(|e| ObjectStoreError::Generic {
-            store: DATA_CACHE,
-            source: Box::new(e),
-        })?;
-
-        let key = location.to_string();
-
-        let uri_parts = "/write-hint"
-            .parse::<http::Uri>()
-            .map(http::uri::Parts::from)
-            .expect("should be valid uri");
-
-        let req = RawRequest {
-            method: Method::POST,
-            uri_parts,
-            key: Some(key),
-            body: hyper::Body::from(buf.into_inner().freeze()),
-            ..Default::default()
+            }),
+            authority: None,
         };
 
         let mut cache = self.cache.clone();
-        let service = cache.ready().await.map_err(|e| ObjectStoreError::Generic {
-            store: DATA_CACHE,
-            source: Box::new(e),
-        })?;
-
-        let write_hints = service.call(req);
 
         match ack_setting {
             WriteHintAck::Sent => {
-                write_hints.now_or_never();
+                // spawn a non-blocking task to send the write hint
+                tokio::spawn(async move {
+                    match cache.ready().await.map_err(|e| ObjectStoreError::Generic {
+                        store: DATA_CACHE,
+                        source: Box::new(e),
+                    }) {
+                        Ok(service) => {
+                            if let Err(error) = service.call(req).await {
+                                warn!(%error, "write hinting failed");
+                            };
+                        }
+                        Err(error) => {
+                            warn!(%error, "write hinting failed");
+                        }
+                    }
+                });
                 Ok(())
             }
             WriteHintAck::Received => {
-                // server responds ok after receipt
-                write_hints.await.map_err(|e| ObjectStoreError::Generic {
+                let service = cache.ready().await.map_err(|e| ObjectStoreError::Generic {
                     store: DATA_CACHE,
                     source: Box::new(e),
                 })?;
+
+                // server responds ok after receipt
+                service
+                    .call(req)
+                    .await
+                    .map_err(|e| ObjectStoreError::Generic {
+                        store: DATA_CACHE,
+                        source: Box::new(e),
+                    })?;
                 Ok(())
             }
             WriteHintAck::Completed => {
-                // server responds ok after downstream actions complete
-                write_hints.await.map_err(|e| ObjectStoreError::Generic {
+                let service = cache.ready().await.map_err(|e| ObjectStoreError::Generic {
                     store: DATA_CACHE,
                     source: Box::new(e),
                 })?;
+
+                // server responds ok after downstream actions complete
+                service
+                    .call(req)
+                    .await
+                    .map_err(|e| ObjectStoreError::Generic {
+                        store: DATA_CACHE,
+                        source: Box::new(e),
+                    })?;
                 Ok(())
             }
         }

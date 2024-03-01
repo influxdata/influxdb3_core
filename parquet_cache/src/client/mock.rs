@@ -12,11 +12,9 @@ use object_store::{
 use parking_lot::Mutex;
 use tokio::io::AsyncWrite;
 
-use crate::{
-    data_types::WriteHintAck, DataCacheObjectStore, MockCacheServer, WriteHintingObjectStore,
-};
+use crate::{data_types::WriteHintAck, MockCacheServer, WriteHintingObjectStore};
 
-use super::cache_connector::build_cache_connector;
+use super::{cache_connector::build_cache_connector, DataCacheObjectStore};
 
 /// Build a cache client,
 /// with a mocked server and mocked direct-to-store fallback.

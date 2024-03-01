@@ -1,3 +1,4 @@
+use http::StatusCode;
 use std::borrow::Cow;
 
 /// A classification of if a given request was successful
@@ -35,7 +36,9 @@ pub(crate) fn classify_response<B>(
 ) -> (Cow<'static, str>, Classification) {
     let status = response.status();
 
-    if status.is_success() {
+    // The HTTP specification describes NOT_MODIFIED as a redirection to the locally cached resource
+    // Whilst pedantically true, for the purposes of request classification we categorise this as success
+    if status.is_success() || status == StatusCode::NOT_MODIFIED {
         classify_headers(Some(response.headers()))
     } else if status.is_client_error() {
         match status {

@@ -1,5 +1,3 @@
-#![warn(unused_crate_dependencies)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 

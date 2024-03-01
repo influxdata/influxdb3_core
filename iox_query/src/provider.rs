@@ -3,10 +3,7 @@
 use async_trait::async_trait;
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::{
-    datatypes::{Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef},
-    error::ArrowError,
-};
+use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::{
     datasource::{provider_as_source, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
@@ -75,17 +72,15 @@ pub enum Error {
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl From<Error> for ArrowError {
-    // Wrap an error into an arrow error
-    fn from(e: Error) -> Self {
-        Self::ExternalError(Box::new(e))
-    }
-}
-
 impl From<Error> for DataFusionError {
-    // Wrap an error into a datafusion error
     fn from(e: Error) -> Self {
-        Self::ArrowError(e.into(), None)
+        match e {
+            e @ Error::InternalNoChunkPruner { .. } => Self::External(Box::new(e)),
+            Error::InternalSelectExpr { source }
+            | Error::InternalSort { source }
+            | Error::InternalFilter { source }
+            | Error::InternalProjection { source } => source,
+        }
     }
 }
 

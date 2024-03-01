@@ -14,3 +14,17 @@ pub(crate) mod request;
 /// Mocks used for internal testing
 #[cfg(test)]
 pub(crate) mod mock;
+
+use ::object_store::ObjectStore;
+use std::sync::Arc;
+
+use crate::client::{cache_connector::build_cache_connector, object_store::DataCacheObjectStore};
+
+/// Build a cache client.
+pub fn make_client(
+    namespace_service_address: String,
+    object_store: Arc<dyn ObjectStore>,
+) -> Arc<DataCacheObjectStore> {
+    let server_connection = build_cache_connector(namespace_service_address);
+    Arc::new(DataCacheObjectStore::new(server_connection, object_store))
+}

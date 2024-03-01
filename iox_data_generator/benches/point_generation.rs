@@ -1,3 +1,6 @@
+// Tests and benchmarks don't use all the crate dependencies and that's all right.
+#![allow(unused_crate_dependencies)]
+
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use iox_data_generator::{
     agent::Agent,

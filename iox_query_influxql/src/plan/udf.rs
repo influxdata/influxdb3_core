@@ -26,6 +26,7 @@ pub(super) enum WindowFunction {
     Derivative,
     NonNegativeDerivative,
     CumulativeSum,
+    Elapsed,
 }
 
 impl WindowFunction {
@@ -38,6 +39,7 @@ impl WindowFunction {
             DERIVATIVE_UDF_NAME => Some(Self::Derivative),
             NON_NEGATIVE_DERIVATIVE_UDF_NAME => Some(Self::NonNegativeDerivative),
             CUMULATIVE_SUM_UDF_NAME => Some(Self::CumulativeSum),
+            ELAPSED_UDF_NAME => Some(Self::Elapsed),
             _ => None,
         }
     }
@@ -157,6 +159,49 @@ static DIFFERENCE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
                 .collect(),
             Volatility::Immutable,
         ),
+    }))
+});
+
+const ELAPSED_UDF_NAME: &str = "elapsed";
+
+#[derive(Debug)]
+struct ElapsedUDF {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ElapsedUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        ELAPSED_UDF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int64)
+    }
+
+    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+        error::internal(format!(
+            "{ELAPSED_UDF_NAME} should not exist in the final logical plan"
+        ))
+    }
+}
+
+/// Create an expression to represent the `ELAPSED` function.
+pub(crate) fn elapsed(args: Vec<Expr>) -> Expr {
+    ELAPSED.call(args)
+}
+
+/// Definition of the `ELAPSED` function.
+static ELAPSED: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+    Arc::new(ScalarUDF::from(ElapsedUDF {
+        signature: Signature::any(3, Volatility::Immutable),
     }))
 });
 

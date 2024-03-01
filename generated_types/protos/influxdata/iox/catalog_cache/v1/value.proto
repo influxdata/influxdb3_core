@@ -73,6 +73,9 @@ message Partition {
 
   // Skipped compaction registered for this partition.
   influxdata.iox.skipped_compaction.v1.SkippedCompaction skipped_compaction = 11;
+
+  // The time of the last cold compaction
+  optional int64 cold_compact_at = 12;
 }
 
 message PartitionFile {
@@ -146,13 +149,54 @@ message TableColumn {
 message Namespace {
   // A MessageList of NamespaceTable
   MessageList tables = 1;
+
   // A HashBuckets of NamespaceTable.table_name
   HashBuckets table_names = 2;
+
+  // The id of this namespace
+  int64 id = 3;
+
+  // The name of this table.
+  bytes name = 4;
+
+  // The retention period in ns. None represents infinite duration (i.e. never drop data).
+  optional int64 retention_period_ns = 5;
+
+  // The maximum number of tables that can exist in this namespace
+  int32 max_tables = 6;
+
+  // The maximum number of columns per table in this namespace
+  int32 max_columns_per_table = 7;
+
+  // When this namespace was marked for deletion.
+  optional int64 deleted_at = 8;
+
+  // The partition template to use for new tables in this namespace either created implicitly or
+  // created without specifying a partition template.
+  influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 9;
+
+  // The router-managed version associated with this instance of the namespace data object.
+  int64 router_version = 10;
 }
 
 message NamespaceTable {
   // The id of this table
   int64 id = 1;
   // The name of this table
+  bytes name = 2;
+}
+
+message Root {
+  // A MessageList of `RootNamespace``
+  MessageList namespaces = 1;
+
+  // A HashBuckets of `RootNamespace.name`
+  HashBuckets namespace_names = 2;
+}
+
+message RootNamespace {
+  // The id of this namespace
+  int64 id = 1;
+  // The name of this namespace
   bytes name = 2;
 }

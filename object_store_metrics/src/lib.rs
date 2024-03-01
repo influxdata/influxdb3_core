@@ -1,25 +1,13 @@
 //! A metric instrumentation wrapper over [`ObjectStore`] implementations.
 
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![allow(clippy::clone_on_ref_ptr)]
-#![warn(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    clippy::explicit_iter_loop,
-    // See https://github.com/influxdata/influxdb_iox/pull/1671
-    clippy::future_not_send,
-    clippy::clone_on_ref_ptr,
-    clippy::todo,
-    clippy::dbg_macro,
-    unused_crate_dependencies
-)]
 
 use object_store::{GetOptions, GetResultPayload, PutOptions, PutResult};
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use std::ops::Range;
 use std::sync::Arc;
+use std::{borrow::Cow, ops::Range};
 use std::{
     marker::PhantomData,
     pin::Pin,
@@ -38,6 +26,19 @@ use object_store::{
 };
 use tokio::io::AsyncWrite;
 
+/// A typed name of a instance scope / shard to report the metrics under.
+#[derive(Debug, Clone)]
+pub struct ShardName(Cow<'static, str>);
+
+impl<T> From<T> for ShardName
+where
+    T: Into<Cow<'static, str>>,
+{
+    fn from(v: T) -> Self {
+        Self(v.into())
+    }
+}
+
 #[cfg(test)]
 mod dummy;
 
@@ -48,7 +49,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(registry: &metric::Registry, op: &'static str) -> Self {
+    fn new(registry: &metric::Registry, shard: &ShardName, op: &'static str) -> Self {
         // Call durations broken down by op & result
         let duration: Metric<DurationHistogram> = registry.register_metric(
             "object_store_op_duration",
@@ -56,8 +57,16 @@ impl Metrics {
         );
 
         Self {
-            success_duration: duration.recorder(&[("op", op), ("result", "success")]),
-            error_duration: duration.recorder(&[("op", op), ("result", "error")]),
+            success_duration: duration.recorder([
+                ("shard", shard.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("success")),
+            ]),
+            error_duration: duration.recorder([
+                ("shard", shard.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("error")),
+            ]),
         }
     }
 
@@ -84,7 +93,7 @@ struct MetricsWithBytes {
 }
 
 impl MetricsWithBytes {
-    fn new(registry: &metric::Registry, op: &'static str) -> Self {
+    fn new(registry: &metric::Registry, shard: &ShardName, op: &'static str) -> Self {
         // Byte counts up/down
         let bytes = registry.register_metric::<U64Counter>(
             "object_store_transfer_bytes",
@@ -92,9 +101,17 @@ impl MetricsWithBytes {
         );
 
         Self {
-            inner: Metrics::new(registry, op),
-            success_bytes: bytes.recorder(&[("op", op), ("result", "success")]),
-            error_bytes: bytes.recorder(&[("op", op), ("result", "error")]),
+            inner: Metrics::new(registry, shard, op),
+            success_bytes: bytes.recorder([
+                ("shard", shard.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("success")),
+            ]),
+            error_bytes: bytes.recorder([
+                ("shard", shard.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("error")),
+            ]),
         }
     }
 
@@ -123,16 +140,24 @@ struct MetricsWithCount {
 }
 
 impl MetricsWithCount {
-    fn new(registry: &metric::Registry, op: &'static str) -> Self {
+    fn new(registry: &metric::Registry, shard: &ShardName, op: &'static str) -> Self {
         let count = registry.register_metric::<U64Counter>(
             "object_store_transfer_objects",
             "cumulative count of objects transferred to/from the object store",
         );
 
         Self {
-            inner: Metrics::new(registry, op),
-            success_count: count.recorder(&[("op", op), ("result", "success")]),
-            error_count: count.recorder(&[("op", op), ("result", "error")]),
+            inner: Metrics::new(registry, shard, op),
+            success_count: count.recorder([
+                ("shard", shard.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("success")),
+            ]),
+            error_count: count.recorder([
+                ("shard", shard.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("error")),
+            ]),
         }
     }
 
@@ -225,26 +250,29 @@ impl ObjectStoreMetrics {
     pub fn new(
         inner: Arc<dyn ObjectStore>,
         time_provider: Arc<dyn TimeProvider>,
+        shard: impl Into<ShardName>,
         registry: &metric::Registry,
     ) -> Self {
+        let shard = shard.into();
+
         Self {
             inner,
             time_provider,
 
-            put: MetricsWithBytes::new(registry, "put"),
-            get: MetricsWithBytes::new(registry, "get"),
-            get_range: MetricsWithBytes::new(registry, "get_range"),
-            get_ranges: MetricsWithBytes::new(registry, "get_ranges"),
-            head: Metrics::new(registry, "head"),
-            delete: Metrics::new(registry, "delete"),
-            delete_stream: MetricsWithCount::new(registry, "delete_stream"),
-            list: MetricsWithCount::new(registry, "list"),
-            list_with_offset: MetricsWithCount::new(registry, "list_with_offset"),
-            list_with_delimiter: MetricsWithCount::new(registry, "list_with_delimiter"),
-            copy: Metrics::new(registry, "copy"),
-            rename: Metrics::new(registry, "rename"),
-            copy_if_not_exists: Metrics::new(registry, "copy_if_not_exists"),
-            rename_if_not_exists: Metrics::new(registry, "rename_if_not_exists"),
+            put: MetricsWithBytes::new(registry, &shard, "put"),
+            get: MetricsWithBytes::new(registry, &shard, "get"),
+            get_range: MetricsWithBytes::new(registry, &shard, "get_range"),
+            get_ranges: MetricsWithBytes::new(registry, &shard, "get_ranges"),
+            head: Metrics::new(registry, &shard, "head"),
+            delete: Metrics::new(registry, &shard, "delete"),
+            delete_stream: MetricsWithCount::new(registry, &shard, "delete_stream"),
+            list: MetricsWithCount::new(registry, &shard, "list"),
+            list_with_offset: MetricsWithCount::new(registry, &shard, "list_with_offset"),
+            list_with_delimiter: MetricsWithCount::new(registry, &shard, "list_with_delimiter"),
+            copy: Metrics::new(registry, &shard, "copy"),
+            rename: Metrics::new(registry, &shard, "rename"),
+            copy_if_not_exists: Metrics::new(registry, &shard, "copy_if_not_exists"),
+            rename_if_not_exists: Metrics::new(registry, &shard, "rename_if_not_exists"),
         }
     }
 }
@@ -728,7 +756,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .put(
@@ -741,13 +769,13 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "put"), ("result", "success")],
+            [("shard", "bananas"), ("op", "put"), ("result", "success")],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "put"), ("result", "success")],
+            [("shard", "bananas"), ("op", "put"), ("result", "success")],
         );
     }
 
@@ -756,7 +784,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(DummyObjectStore::new("s3"));
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .put(
@@ -769,13 +797,13 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "put"), ("result", "error")],
+            [("shard", "bananas"), ("op", "put"), ("result", "error")],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "put"), ("result", "error")],
+            [("shard", "bananas"), ("op", "put"), ("result", "error")],
         );
     }
 
@@ -792,20 +820,20 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store.list(None).try_collect::<Vec<_>>().await.unwrap();
 
         assert_counter_value(
             &metrics,
             "object_store_transfer_objects",
-            [("op", "list"), ("result", "success")],
+            [("shard", "bananas"), ("op", "list"), ("result", "success")],
             2,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "list"), ("result", "success")],
+            [("shard", "bananas"), ("op", "list"), ("result", "success")],
         );
     }
 
@@ -826,7 +854,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .list_with_offset(None, &Path::from("bar"))
@@ -837,20 +865,28 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_objects",
-            [("op", "list_with_offset"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "list_with_offset"),
+                ("result", "success"),
+            ],
             2,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "list_with_offset"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "list_with_offset"),
+                ("result", "success"),
+            ],
         );
 
         // NOT raw `list` call
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "list"), ("result", "success")],
+            [("shard", "bananas"), ("op", "list"), ("result", "success")],
         );
     }
 
@@ -859,7 +895,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(DummyObjectStore::new("s3"));
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         assert!(
             store.list(None).try_collect::<Vec<_>>().await.is_err(),
@@ -869,7 +905,7 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "list"), ("result", "error")],
+            [("shard", "bananas"), ("op", "list"), ("result", "error")],
         );
     }
 
@@ -878,7 +914,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .list_with_delimiter(Some(&Path::from("test")))
@@ -888,7 +924,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "list_with_delimiter"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "list_with_delimiter"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -897,7 +937,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(DummyObjectStore::new("s3"));
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         assert!(
             store
@@ -910,7 +950,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "list_with_delimiter"), ("result", "error")],
+            [
+                ("shard", "bananas"),
+                ("op", "list_with_delimiter"),
+                ("result", "error"),
+            ],
         );
     }
 
@@ -919,7 +963,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(DummyObjectStore::new("s3"));
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .head(&Path::from("test"))
@@ -929,7 +973,7 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "head"), ("result", "error")],
+            [("shard", "bananas"), ("op", "head"), ("result", "error")],
         );
     }
 
@@ -938,7 +982,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(DummyObjectStore::new("s3"));
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .get(&Path::from("test"))
@@ -948,7 +992,7 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get"), ("result", "error")],
+            [("shard", "bananas"), ("op", "get"), ("result", "error")],
         );
     }
 
@@ -957,7 +1001,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(DummyObjectStore::new("s3"));
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .get_range(&Path::from("test"), 0..1000)
@@ -967,7 +1011,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get_range"), ("result", "error")],
+            [
+                ("shard", "bananas"),
+                ("op", "get_range"),
+                ("result", "error"),
+            ],
         );
     }
 
@@ -980,7 +1028,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .get_ranges(&Path::from("foo"), &[0..2, 1..2, 0..1])
@@ -990,20 +1038,32 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "get_ranges"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "get_ranges"),
+                ("result", "success"),
+            ],
             4,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get_ranges"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "get_ranges"),
+                ("result", "success"),
+            ],
         );
 
         // NO `get_range` used!
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get_range"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "get_range"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1016,7 +1076,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .copy(&Path::from("foo"), &Path::from("bar"))
@@ -1026,7 +1086,7 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "copy"), ("result", "success")],
+            [("shard", "bananas"), ("op", "copy"), ("result", "success")],
         );
     }
 
@@ -1039,7 +1099,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .copy_if_not_exists(&Path::from("foo"), &Path::from("bar"))
@@ -1049,7 +1109,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "copy_if_not_exists"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "copy_if_not_exists"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1062,7 +1126,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .rename(&Path::from("foo"), &Path::from("bar"))
@@ -1072,19 +1136,27 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "rename"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "rename"),
+                ("result", "success"),
+            ],
         );
 
         // NO `copy`/`delete` used!
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "copy"), ("result", "success")],
+            [("shard", "bananas"), ("op", "copy"), ("result", "success")],
         );
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "delete"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "delete"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1097,7 +1169,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .rename_if_not_exists(&Path::from("foo"), &Path::from("bar"))
@@ -1107,24 +1179,36 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "rename_if_not_exists"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "rename_if_not_exists"),
+                ("result", "success"),
+            ],
         );
 
         // NO `copy`/`copy_if_not_exists`/`delete` used!
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "copy"), ("result", "success")],
+            [("shard", "bananas"), ("op", "copy"), ("result", "success")],
         );
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "copy_if_not_exists"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "copy_if_not_exists"),
+                ("result", "success"),
+            ],
         );
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "delete"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "delete"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1145,7 +1229,7 @@ mod tests {
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         store
             .delete_stream(
@@ -1160,20 +1244,32 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_objects",
-            [("op", "delete_stream"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "delete_stream"),
+                ("result", "success"),
+            ],
             2,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "delete_stream"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "delete_stream"),
+                ("result", "success"),
+            ],
         );
 
         // NOT raw `delete` call
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "delete"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "delete"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1184,7 +1280,7 @@ mod tests {
         let path = std::fs::canonicalize(".").unwrap();
         let store = Arc::new(LocalFileSystem::new_with_prefix(path).unwrap());
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         let data = [42_u8, 42, 42, 42, 42];
         let path = Path::from("test");
@@ -1207,13 +1303,13 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "get"), ("result", "success")],
+            [("shard", "bananas"), ("op", "get"), ("result", "success")],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get"), ("result", "success")],
+            [("shard", "bananas"), ("op", "get"), ("result", "success")],
         );
 
         store
@@ -1223,20 +1319,28 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "get_range"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "get_range"),
+                ("result", "success"),
+            ],
             3,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get_range"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "get_range"),
+                ("result", "success"),
+            ],
         );
 
         store.head(&path).await.expect("should clean up test file");
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "head"), ("result", "success")],
+            [("shard", "bananas"), ("op", "head"), ("result", "success")],
         );
 
         store
@@ -1246,7 +1350,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "delete"), ("result", "success")],
+            [
+                ("shard", "bananas"),
+                ("op", "delete"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1255,7 +1363,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         let time = Arc::new(SystemProvider::new());
-        let store = ObjectStoreMetrics::new(store, time, &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         let data = [42_u8, 42, 42, 42, 42];
         let path = Path::from("test");
@@ -1273,13 +1381,13 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "get"), ("result", "success")],
+            [("shard", "bananas"), ("op", "get"), ("result", "success")],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("op", "get"), ("result", "success")],
+            [("shard", "bananas"), ("op", "get"), ("result", "success")],
         );
     }
 
@@ -1300,7 +1408,7 @@ mod tests {
         let time_provider = SystemProvider::default();
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, "test");
+        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
@@ -1317,7 +1425,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             1,
         );
 
@@ -1335,7 +1443,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             4,
         );
 
@@ -1355,7 +1463,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             4,
         );
 
@@ -1379,7 +1487,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             4,
         );
     }
@@ -1401,7 +1509,7 @@ mod tests {
         let time_provider = SystemProvider::default();
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, "test");
+        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
@@ -1418,7 +1526,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             1,
         );
 
@@ -1439,7 +1547,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             1,
         );
     }
@@ -1461,7 +1569,7 @@ mod tests {
         let time_provider = SystemProvider::default();
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, "test");
+        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
@@ -1478,13 +1586,13 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             1,
         );
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "error")],
+            [("shard", "bananas"), ("op", "test"), ("result", "error")],
             0,
         );
 
@@ -1505,13 +1613,13 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             1,
         );
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "error")],
+            [("shard", "bananas"), ("op", "test"), ("result", "error")],
             0,
         );
     }
@@ -1533,7 +1641,7 @@ mod tests {
         let time_provider = SystemProvider::default();
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, "test");
+        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
@@ -1550,7 +1658,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             1,
         );
 
@@ -1569,7 +1677,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             4,
         );
 
@@ -1585,7 +1693,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             4,
         );
     }
@@ -1603,7 +1711,7 @@ mod tests {
         let time_provider = SystemProvider::default();
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, "test");
+        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
 
         let stream = StreamMetricRecorder::new(
             inner,
@@ -1622,7 +1730,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             0,
         );
     }
@@ -1639,7 +1747,7 @@ mod tests {
         let time_provider = SystemProvider::default();
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, "test");
+        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
@@ -1658,7 +1766,7 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("op", "test"), ("result", "success")],
+            [("shard", "bananas"), ("op", "test"), ("result", "success")],
             0,
         );
     }

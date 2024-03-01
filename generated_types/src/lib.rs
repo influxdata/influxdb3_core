@@ -1,16 +1,15 @@
 // This crate deliberately does not use the same linting rules as the other
 // crates because of all the generated code it contains that we don't have much
 // control over.
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #![allow(
     clippy::derive_partial_eq_without_eq,
     clippy::future_not_send,
     clippy::needless_borrow,
     clippy::needless_borrows_for_generic_args,
+    clippy::use_self,
     missing_copy_implementations,
     unreachable_pub
 )]
-#![warn(unused_crate_dependencies)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;

@@ -75,8 +75,8 @@ impl Extend<SequenceNumber> for SequenceNumberSet {
     }
 }
 
-impl Extend<SequenceNumberSet> for SequenceNumberSet {
-    fn extend<T: IntoIterator<Item = SequenceNumberSet>>(&mut self, iter: T) {
+impl Extend<Self> for SequenceNumberSet {
+    fn extend<T: IntoIterator<Item = Self>>(&mut self, iter: T) {
         for new_set in iter {
             self.add_set(&new_set);
         }

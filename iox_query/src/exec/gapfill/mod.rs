@@ -276,31 +276,26 @@ pub(crate) fn plan_gap_fill(
     let group_expr: Result<Vec<_>> = gap_fill
         .group_expr
         .iter()
-        .map(|e| create_physical_expr(e, input_dfschema, input_schema, execution_props))
+        .map(|e| create_physical_expr(e, input_dfschema, execution_props))
         .collect();
     let group_expr = group_expr?;
 
     let aggr_expr: Result<Vec<_>> = gap_fill
         .aggr_expr
         .iter()
-        .map(|e| create_physical_expr(e, input_dfschema, input_schema, execution_props))
+        .map(|e| create_physical_expr(e, input_dfschema, execution_props))
         .collect();
     let aggr_expr = aggr_expr?;
 
     let logical_time_column = gap_fill.params.time_column.try_into_col()?;
     let time_column = Column::new_with_schema(&logical_time_column.name, input_schema)?;
 
-    let stride = create_physical_expr(
-        &gap_fill.params.stride,
-        input_dfschema,
-        input_schema,
-        execution_props,
-    )?;
+    let stride = create_physical_expr(&gap_fill.params.stride, input_dfschema, execution_props)?;
 
     let time_range = &gap_fill.params.time_range;
     let time_range = try_map_range(time_range, |b| {
         try_map_bound(b.as_ref(), |e| {
-            create_physical_expr(e, input_dfschema, input_schema, execution_props)
+            create_physical_expr(e, input_dfschema, execution_props)
         })
     })?;
 
@@ -308,7 +303,7 @@ pub(crate) fn plan_gap_fill(
         .params
         .origin
         .as_ref()
-        .map(|e| create_physical_expr(e, input_dfschema, input_schema, execution_props))
+        .map(|e| create_physical_expr(e, input_dfschema, execution_props))
         .transpose()?;
 
     let fill_strategy = gap_fill
@@ -317,7 +312,7 @@ pub(crate) fn plan_gap_fill(
         .iter()
         .map(|(e, fs)| {
             Ok((
-                create_physical_expr(e, input_dfschema, input_schema, execution_props)?,
+                create_physical_expr(e, input_dfschema, execution_props)?,
                 *fs,
             ))
         })
@@ -749,7 +744,7 @@ mod test {
             format_logical_plan(&plan),
             @r###"
         ---
-        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
+        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
         - "   TableScan: temps"
         "###
         );

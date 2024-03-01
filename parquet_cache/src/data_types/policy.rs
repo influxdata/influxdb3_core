@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-/// TODO: clap_blocks
+/// Policy configuration for the cache.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PolicyConfig {
+    /// Maximum bytes of parquet files to cache.
     pub max_capacity: u64,
+    /// Maximum Cache TTL (without prior eviction).
     pub event_recency_max_duration_nanoseconds: u64,
 }
 

@@ -52,8 +52,8 @@ pub enum Language {
 impl Language {
     fn normalize_results(&self, n: &Normalizer, results: Vec<RecordBatch>) -> Vec<String> {
         match self {
-            Language::Sql => n.normalize_results(results),
-            Language::InfluxQL => {
+            Self::Sql => n.normalize_results(results),
+            Self::InfluxQL => {
                 let results = if n.sorted_compare && !results.is_empty() {
                     let schema = results[0].schema();
                     let batch = arrow::compute::concat_batches(&schema, &results)
@@ -115,8 +115,8 @@ impl Language {
 impl Display for Language {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Language::Sql => Display::fmt("SQL", f),
-            Language::InfluxQL => Display::fmt("InfluxQL", f),
+            Self::Sql => Display::fmt("SQL", f),
+            Self::InfluxQL => Display::fmt("InfluxQL", f),
         }
     }
 }

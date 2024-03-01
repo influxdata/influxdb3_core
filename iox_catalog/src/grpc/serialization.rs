@@ -1,8 +1,8 @@
 use data_types::{
     partition_template::NamespacePartitionTemplateOverride, Column, ColumnId, ColumnSet,
-    ColumnType, Namespace, NamespaceId, ObjectStoreId, ParquetFile, ParquetFileId,
-    ParquetFileParams, Partition, PartitionId, SkippedCompaction, SortKeyIds, Table, TableId,
-    Timestamp,
+    ColumnType, Namespace, NamespaceId, NamespaceVersion, ObjectStoreId, ParquetFile,
+    ParquetFileId, ParquetFileParams, Partition, PartitionId, SkippedCompaction, SortKeyIds, Table,
+    TableId, Timestamp,
 };
 use generated_types::influxdata::iox::catalog::v2 as proto;
 use uuid::Uuid;
@@ -119,6 +119,7 @@ pub(crate) fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Stat
         Error::AlreadyExists { descr } => tonic::Status::already_exists(descr),
         Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
         Error::NotFound { descr } => tonic::Status::not_found(descr),
+        Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
     }
 }
 
@@ -136,6 +137,9 @@ pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
             descr: status.message().to_owned(),
         },
         tonic::Code::NotFound => Error::NotFound {
+            descr: status.message().to_owned(),
+        },
+        tonic::Code::InvalidArgument => Error::Malformed {
             descr: status.message().to_owned(),
         },
         _ => Error::External {
@@ -176,6 +180,7 @@ pub(crate) fn serialize_namespace(ns: Namespace) -> proto::Namespace {
         max_columns_per_table: ns.max_columns_per_table.get_i32(),
         deleted_at: ns.deleted_at.map(|ts| ts.get()),
         partition_template: ns.partition_template.as_proto().cloned(),
+        router_version: ns.router_version.get(),
     }
 }
 
@@ -195,6 +200,7 @@ pub(crate) fn deserialize_namespace(ns: proto::Namespace) -> Result<Namespace, E
             .convert_opt()
             .ctx("partition_template")?
             .unwrap_or_else(NamespacePartitionTemplateOverride::const_default),
+        router_version: NamespaceVersion::new(ns.router_version),
     })
 }
 
@@ -270,6 +276,7 @@ pub(crate) fn serialize_partition(partition: Partition) -> proto::Partition {
             partition.sort_key_ids().unwrap_or(&empty_sk),
         )),
         new_file_at: partition.new_file_at.map(|ts| ts.get()),
+        cold_compact_at: partition.cold_compact_at.map(|ts| ts.get()),
     }
 }
 
@@ -284,6 +291,7 @@ pub(crate) fn deserialize_partition(partition: proto::Partition) -> Result<Parti
         partition.partition_key.into(),
         deserialize_sort_key_ids(partition.sort_key_ids.required().ctx("sort_key_ids")?),
         partition.new_file_at.map(Timestamp::new),
+        partition.cold_compact_at.map(Timestamp::new),
     ))
 }
 
@@ -476,6 +484,9 @@ mod tests {
         assert_error_roundtrip(Error::NotFound {
             descr: "foo".to_owned(),
         });
+        assert_error_roundtrip(Error::Malformed {
+            descr: "foo".to_owned(),
+        });
     }
 
     #[track_caller]
@@ -521,6 +532,7 @@ mod tests {
                 },
             )
             .unwrap(),
+            router_version: NamespaceVersion::new(1),
         };
         let protobuf = serialize_namespace(ns.clone());
         let ns2 = deserialize_namespace(protobuf).unwrap();
@@ -594,6 +606,7 @@ mod tests {
             partition_key.clone(),
             SortKeyIds::new([ColumnId::new(3), ColumnId::new(4)]),
             Some(Timestamp::new(5)),
+            Default::default(),
         ));
         assert_partition_roundtrip(Partition::new_catalog_only(
             PartitionId::new(2),
@@ -602,6 +615,7 @@ mod tests {
             partition_key,
             SortKeyIds::new(std::iter::empty()),
             Some(Timestamp::new(5)),
+            Default::default(),
         ));
     }
 

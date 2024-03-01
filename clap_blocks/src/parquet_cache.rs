@@ -15,6 +15,28 @@ pub struct ParquetCacheClientConfig {
     pub namespace_addr: String,
 }
 
+/// Cache Policy.
+#[derive(Debug, Copy, Clone, Default, clap::Parser)]
+pub struct ParquetCachePolicy {
+    /// Maximum bytes of parquet files to cache.
+    #[clap(
+        long = "parquet-cache-capacity",
+        env = "INFLUXDB_IOX_PARQUET_CACHE_CAPACITY",
+        required = false,
+        default_value = format!("{}", 40_u64 * 1024 * 1024 * 1024) // 40 GiB
+    )]
+    pub max_capacity: u64,
+
+    /// Maximum Cache TTL (without prior eviction).
+    #[clap(
+        long = "parquet-cache-ttl",
+        env = "INFLUXDB_IOX_PARQUET_CACHE_TTL",
+        required = false,
+        default_value = format!("{}", 1_000_000_000_u64 * 60*60*72) // 72 hrs
+    )]
+    pub event_recency_max_duration_nanoseconds: u64,
+}
+
 /// Config for cache instance.
 #[derive(Debug, Clone, Default, clap::Parser)]
 pub struct ParquetCacheInstanceConfig {
@@ -43,15 +65,38 @@ pub struct ParquetCacheInstanceConfig {
         required = true
     )]
     pub local_dir: String,
+
+    /// During catalog querying for pre-warming,
+    /// what is the max tables that should be queried at once?
+    #[clap(
+        long = "parquet-cache-prewarm-table-concurrency",
+        env = "INFLUXDB_IOX_PARQUET_CACHE_PREWARM_TABLE_CONCURRENCY",
+        required = false,
+        default_value = "10"
+    )]
+    pub prewarming_table_concurrency: usize,
+
+    /// Cache Policy
+    #[clap(flatten)]
+    pub cache_policy: ParquetCachePolicy,
 }
 
 impl From<ParquetCacheInstanceConfig> for parquet_cache::ParquetCacheServerConfig {
     fn from(instance_config: ParquetCacheInstanceConfig) -> Self {
+        let ParquetCachePolicy {
+            max_capacity,
+            event_recency_max_duration_nanoseconds,
+        } = instance_config.cache_policy;
+
         Self {
             keyspace_config_path: instance_config.keyspace_config_path,
             hostname: instance_config.instance_hostname,
             local_dir: instance_config.local_dir,
-            policy_config: Default::default(),
+            policy_config: parquet_cache::PolicyConfig {
+                max_capacity,
+                event_recency_max_duration_nanoseconds,
+            },
+            prewarming_table_concurrency: instance_config.prewarming_table_concurrency,
         }
     }
 }
