@@ -5,7 +5,7 @@
 use crate::{
     exec::{
         stringset::{StringSet, StringSetRef},
-        Executor, ExecutorType, IOxSessionContext, QueryConfig,
+        Executor, IOxSessionContext, QueryConfig,
     },
     pruning::prune_chunks,
     query_log::{QueryLog, StateReceived},
@@ -36,6 +36,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_util::{config::DEFAULT_SCHEMA, option_to_precision, timestamptz_nano};
+use iox_query_params::StatementParams;
 use iox_time::SystemProvider;
 use itertools::Itertools;
 use object_store::{path::Path, ObjectMeta};
@@ -236,12 +237,14 @@ impl QueryNamespace for TestDatabase {
         span_ctx: Option<&SpanContext>,
         query_type: &'static str,
         query_text: QueryText,
+        query_params: StatementParams,
     ) -> QueryCompletedToken<StateReceived> {
         QueryLog::new(0, Arc::new(SystemProvider::new())).push(
             NamespaceId::new(1),
             Arc::from("ns"),
             query_type,
             query_text,
+            query_params,
             span_ctx.map(|s| s.trace_id),
         )
     }
@@ -254,7 +257,7 @@ impl QueryNamespace for TestDatabase {
         // Note: unlike Db this does not register a catalog provider
         let mut cmd = self
             .executor
-            .new_execution_config(ExecutorType::Query)
+            .new_execution_config()
             .with_default_catalog(Arc::new(TestDatabaseCatalogProvider::from_test_database(
                 self,
             )))
@@ -316,15 +319,15 @@ impl SchemaProvider for TestDatabaseSchemaProvider {
             .collect()
     }
 
-    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        Some(Arc::new(TestDatabaseTableProvider {
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        Ok(Some(Arc::new(TestDatabaseTableProvider {
             partitions: self
                 .partitions
                 .values()
                 .flat_map(|chunks| chunks.values().filter(|c| c.table_name() == name))
                 .map(Clone::clone)
                 .collect(),
-        }))
+        })))
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -511,6 +514,7 @@ impl TestChunk {
         Self {
             table_data: TestChunkData::Parquet(ParquetExecInput {
                 object_store_url: ObjectStoreUrl::parse(store).unwrap(),
+                object_store: Arc::new(object_store::memory::InMemory::new()),
                 object_meta: ObjectMeta {
                     location: Self::parquet_location(self.id),
                     last_modified: Default::default(),

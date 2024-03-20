@@ -4,6 +4,7 @@
 #![allow(
     clippy::derive_partial_eq_without_eq,
     clippy::future_not_send,
+    clippy::large_enum_variant,
     clippy::needless_borrow,
     clippy::needless_borrows_for_generic_args,
     clippy::use_self,
@@ -184,6 +185,10 @@ pub mod influxdata {
 
                 /// Partition sort key update notifications.
                 PartitionSortKeyUpdates = 5,
+
+                /// Notifications for non-schema changes to namespace state in
+                /// the cluster.
+                NamespaceEvents = 6,
             }
 
             impl TryFrom<u64> for Topic {
@@ -200,6 +205,7 @@ pub mod influxdata {
                         v if v == Self::PartitionSortKeyUpdates as u64 => {
                             Self::PartitionSortKeyUpdates
                         }
+                        v if v == Self::NamespaceEvents as u64 => Self::NamespaceEvents,
                         _ => return Err(format!("unknown topic id {}", v).into()),
                     })
                 }
@@ -415,6 +421,7 @@ mod tests {
             Topic::CompactionEvents,
             Topic::SchemaCacheConsistency,
             Topic::PartitionSortKeyUpdates,
+            Topic::NamespaceEvents,
         ];
 
         for topic in topics {
@@ -432,6 +439,7 @@ mod tests {
             Topic::CompactionEvents => {}
             Topic::SchemaCacheConsistency => {}
             Topic::PartitionSortKeyUpdates => {}
+            Topic::NamespaceEvents => {}
         }
     }
 }

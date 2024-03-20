@@ -6,7 +6,7 @@ use datafusion::{
         tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
     },
     config::ConfigOptions,
-    error::{DataFusionError, Result},
+    error::Result,
     physical_expr::{PhysicalSortExpr, PhysicalSortRequirement},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
@@ -73,19 +73,23 @@ impl PhysicalOptimizerRule for PushSortThroughUnion {
 
             let mut plan = Arc::clone(sort_exec.input());
             let mut rewriter = SortRewriter {
-                ordering: sort_exec.output_ordering().unwrap().to_vec(),
+                ordering: sort_exec.properties().output_ordering().unwrap().to_vec(),
             };
 
             plan = plan.rewrite(&mut rewriter)?;
 
             // As a sanity check, make sure plan has the same ordering as before.
             // If this fails, there is a bug in this optimization.
-            let Some(required_order) = sort_exec.output_ordering().map(sort_exprs_to_requirement)
+            let Some(required_order) = sort_exec
+                .properties()
+                .output_ordering()
+                .map(sort_exprs_to_requirement)
             else {
                 return internal_err!("No sort order after a sort");
             };
 
             if !plan
+                .properties()
                 .equivalence_properties()
                 .ordering_satisfy_requirement(&required_order)
             {
@@ -121,7 +125,11 @@ fn sort_should_be_pushed_down(sort_exec: &SortExec) -> Result<bool> {
         return Ok(false);
     };
 
-    let Some(required_order) = sort_exec.output_ordering().map(sort_exprs_to_requirement) else {
+    let Some(required_order) = sort_exec
+        .properties()
+        .output_ordering()
+        .map(sort_exprs_to_requirement)
+    else {
         return internal_err!("No sort order after a sort");
     };
 
@@ -130,6 +138,7 @@ fn sort_should_be_pushed_down(sort_exec: &SortExec) -> Result<bool> {
     // push down the sort.
     Ok(union_exec.children().iter().any(|child| {
         child
+            .properties()
             .equivalence_properties()
             .ordering_satisfy_requirement(&required_order)
     }))
@@ -163,7 +172,7 @@ impl TreeNodeRewriter for SortRewriter {
             Ok(Arc::new(
                 RepartitionExec::try_new(
                     Arc::clone(repartition_exec.input()),
-                    repartition_exec.output_partitioning(),
+                    repartition_exec.properties().output_partitioning().clone(),
                 )?
                 .with_preserve_order(),
             ))
@@ -177,6 +186,7 @@ impl TreeNodeRewriter for SortRewriter {
                 .into_iter()
                 .map(|child| {
                     if !child
+                        .properties()
                         .equivalence_properties()
                         .ordering_satisfy_requirement(&required_ordering)
                     {

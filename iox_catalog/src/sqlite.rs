@@ -189,6 +189,12 @@ impl Catalog for SqliteCatalog {
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
     }
+
+    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
+        Err(Error::NotImplemented {
+            descr: "active applications".to_owned(),
+        })
+    }
 }
 
 impl RepoCollection for SqliteTxn {
@@ -398,7 +404,7 @@ WHERE name=$1 AND {v};
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
-SET max_tables = $1
+SET max_tables = $1, router_version = router_version + 1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
@@ -429,7 +435,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
-SET max_columns_per_table = $1
+SET max_columns_per_table = $1, router_version = router_version + 1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
@@ -460,7 +466,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
-SET retention_period_ns = $1
+SET retention_period_ns = $1, router_version = router_version + 1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
@@ -1735,7 +1741,7 @@ mod tests {
         cat
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
         crate::interface_tests::test_catalog(|| async {
             let sqlite = setup_db().await;

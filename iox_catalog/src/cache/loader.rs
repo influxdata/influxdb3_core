@@ -41,6 +41,9 @@ impl From<Error> for CatalogError {
                 Self::Malformed { descr } => Self::Malformed {
                     descr: descr.clone(),
                 },
+                Self::NotImplemented { descr } => Self::NotImplemented {
+                    descr: descr.clone(),
+                },
             },
             Error::Join { .. } => Self::External {
                 source: Box::new(err),

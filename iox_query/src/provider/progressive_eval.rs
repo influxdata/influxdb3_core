@@ -11,14 +11,14 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::{internal_err, DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr, PhysicalSortRequirement};
+use datafusion::physical_expr::PhysicalSortRequirement;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Metric, Partitioning,
-    RecordBatchStream, SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, Metric,
+    Partitioning, PlanProperties, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
 use futures::{ready, Stream, StreamExt};
@@ -70,6 +70,9 @@ pub(crate) struct ProgressiveEvalExec {
 
     /// Optional number of rows to fetch. Stops producing rows after this fetch
     fetch: Option<usize>,
+
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
 }
 
 impl ProgressiveEvalExec {
@@ -79,17 +82,30 @@ impl ProgressiveEvalExec {
         value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
     ) -> Self {
+        let cache = Self::compute_properties(&input);
         Self {
             input,
             value_ranges,
             metrics: ExecutionPlanMetricsSet::new(),
             fetch,
+            cache,
         }
     }
 
     /// Input schema
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        // progressive eval does not change the equivalence properties of its input
+        let eq_properties = input.equivalence_properties().clone();
+
+        // This node serializes all the data to a single partition
+        let output_partitioning = Partitioning::UnknownPartitioning(1);
+
+        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
     }
 }
 
@@ -121,17 +137,8 @@ impl ExecutionPlan for ProgressiveEvalExec {
         self.input.schema()
     }
 
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        // This node serializes all the data to a single partition
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        Ok(children[0])
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -144,14 +151,11 @@ impl ExecutionPlan for ProgressiveEvalExec {
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
         self.input()
+            .properties()
             .output_ordering()
             .map(|_| None)
             .into_iter()
             .collect()
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
     }
 
     /// ProgressiveEvalExec will only accept sorted input
@@ -188,7 +192,11 @@ impl ExecutionPlan for ProgressiveEvalExec {
             return internal_err!("ProgressiveEvalExec invalid partition {partition}");
         }
 
-        let input_partitions = self.input.output_partitioning().partition_count();
+        let input_partitions = self
+            .input
+            .properties()
+            .output_partitioning()
+            .partition_count();
         trace!(
             "Number of input partitions of  ProgressiveEvalExec::execute: {}",
             input_partitions
@@ -197,7 +205,12 @@ impl ExecutionPlan for ProgressiveEvalExec {
 
         // Add a metric to record the number of inputs
         let num_inputs = Count::new();
-        num_inputs.add(self.input.output_partitioning().partition_count());
+        num_inputs.add(
+            self.input
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+        );
         self.metrics.register(Arc::new(Metric::new(
             MetricValue::Count {
                 name: Borrowed("num_inputs"),
@@ -231,11 +244,6 @@ impl ExecutionPlan for ProgressiveEvalExec {
 
     fn statistics(&self) -> Result<Statistics, DataFusionError> {
         self.input.statistics()
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        // progressive eval does not change the equivalence properties of its input
-        self.input.equivalence_properties()
     }
 }
 
@@ -273,7 +281,10 @@ impl InputStreams {
         num_input_streams_to_prefetch: usize,
         num_read_inputs_counter: Count,
     ) -> Result<Self> {
-        let input_stream_count = input_plan.output_partitioning().partition_count();
+        let input_stream_count = input_plan
+            .properties()
+            .output_partitioning()
+            .partition_count();
 
         let current_stream_idx = 0;
         let mut current_input_stream = None;
@@ -422,7 +433,10 @@ impl ProgressiveEvalStream {
 
         // If there is no limit of number of rows to fecth, prefetch all input streams
         if fetch.is_none() {
-            num_input_streams_to_prefetch = input_plan.output_partitioning().partition_count()
+            num_input_streams_to_prefetch = input_plan
+                .properties()
+                .output_partitioning()
+                .partition_count()
         }
 
         let input_streams = InputStreams::new(
@@ -532,9 +546,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
+    use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::memory::MemoryExec;
     use datafusion::physical_plan::metrics::{MetricValue, Timestamp};
+    use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
     use futures::{Future, FutureExt};
 
     use super::*;
@@ -1678,20 +1694,21 @@ mod tests {
         /// Schema that is mocked by this plan.
         schema: SchemaRef,
 
-        /// Number of output partitions.
-        n_partitions: usize,
-
         /// Ref-counting helper to check if the plan and the produced stream are still in memory.
         refs: Arc<()>,
+
+        /// Cache holding plan properties like equivalences, output partitioning etc.
+        cache: PlanProperties,
     }
 
     impl BlockingExec {
         /// Create new [`BlockingExec`] with a give schema and number of partitions.
         pub fn new(schema: SchemaRef, n_partitions: usize) -> Self {
+            let cache = Self::compute_properties(Arc::clone(&schema), n_partitions);
             Self {
                 schema,
-                n_partitions,
                 refs: Default::default(),
+                cache,
             }
         }
 
@@ -1702,6 +1719,17 @@ mod tests {
         /// loop. Use [`assert_strong_count_converges_to_zero`] to archive this.
         pub fn refs(&self) -> Weak<()> {
             Arc::downgrade(&self.refs)
+        }
+
+        /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+        fn compute_properties(schema: SchemaRef, n_partitions: usize) -> PlanProperties {
+            let eq_properties = EquivalenceProperties::new(schema);
+
+            PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(n_partitions),
+                ExecutionMode::Bounded,
+            )
         }
     }
 
@@ -1724,21 +1752,13 @@ mod tests {
             self
         }
 
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
+        fn properties(&self) -> &PlanProperties {
+            &self.cache
         }
 
         fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
             // this is a leaf node and has no children
             vec![]
-        }
-
-        fn output_partitioning(&self) -> Partitioning {
-            Partitioning::UnknownPartitioning(self.n_partitions)
-        }
-
-        fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-            None
         }
 
         fn with_new_children(

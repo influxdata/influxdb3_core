@@ -225,9 +225,9 @@ pub struct InfluxRpcPlanner {
 
 impl InfluxRpcPlanner {
     /// Create a new instance of the RPC planner
-    pub async fn new(ctx: IOxSessionContext) -> Self {
-        let meta = Arc::new(NamespaceMeta::new(&ctx).await);
-        Self { ctx, meta }
+    pub async fn new(ctx: IOxSessionContext) -> Result<Self> {
+        let meta = Arc::new(NamespaceMeta::new(&ctx).await?);
+        Ok(Self { ctx, meta })
     }
 
     /// Returns a builder that includes
@@ -1833,7 +1833,7 @@ struct NamespaceMeta {
 }
 
 impl NamespaceMeta {
-    async fn new(ctx: &IOxSessionContext) -> Self {
+    async fn new(ctx: &IOxSessionContext) -> Result<Self> {
         let schema_provider = ctx
             .inner()
             .catalog(DEFAULT_CATALOG)
@@ -1845,7 +1845,10 @@ impl NamespaceMeta {
             .map(|table_name| {
                 let schema_provider = Arc::clone(&schema_provider);
                 async move {
-                    let table_provider = schema_provider.table(&table_name).await?;
+                    let table_provider = schema_provider
+                        .table(&table_name)
+                        .await
+                        .expect("get table provider")?;
                     let schema: Schema = table_provider
                         .schema()
                         .try_into()
@@ -1858,7 +1861,7 @@ impl NamespaceMeta {
             .collect()
             .await;
 
-        Self { tables }
+        Ok(Self { tables })
     }
 }
 
@@ -1988,7 +1991,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await;
+        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // predicate has no field_columns
         // predicate on a tag column `foo`
@@ -2066,7 +2069,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await;
+        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // empty predicate
         let predicate = Predicate::new();
@@ -2134,7 +2137,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await;
+        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // predicate on a tag column `foo`
         let expr = col("foo").eq(lit("some_thing"));
@@ -2181,7 +2184,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await;
+        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         let need_fields = false;
 
@@ -2264,7 +2267,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await;
+        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // predicate on unknown column
         let expr = col("unknown_name").eq(lit(10));
@@ -2300,6 +2303,7 @@ mod tests {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .table_names(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2315,6 +2319,7 @@ mod tests {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .tag_keys(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2330,6 +2335,7 @@ mod tests {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .tag_values(test_db, "foo", rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2345,6 +2351,7 @@ mod tests {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .field_columns(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2360,6 +2367,7 @@ mod tests {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .read_filter(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2377,6 +2385,7 @@ mod tests {
                 let group_columns = &["foo"];
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .read_group(test_db, rpc_predicate, agg, group_columns)
                     .await
                     .expect("creating plan");
@@ -2417,6 +2426,7 @@ mod tests {
         let group_columns = &["foo"];
         let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
             .await
+            .unwrap()
             .read_group(Arc::clone(&test_db) as _, rpc_predicate, agg, group_columns)
             .await
             .expect("creating plan");
@@ -2438,6 +2448,7 @@ mod tests {
                 let offset = WindowDuration::from_months(1, false);
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .await
+                    .unwrap()
                     .read_window_aggregate(test_db, rpc_predicate, agg, every, offset)
                     .await
                     .expect("creating plan");
@@ -2471,6 +2482,7 @@ mod tests {
 
         let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
             .await
+            .unwrap()
             .read_filter(Arc::clone(&test_db) as _, rpc_predicate)
             .await
             .expect("creating plan");

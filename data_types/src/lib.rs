@@ -311,8 +311,8 @@ impl std::str::FromStr for ObjectStoreId {
 }
 
 /// A monotonically increasing `i64` counter tracking the version of its
-/// corresponding [`Namespace`].
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
+/// corresponding [`Namespace`]'s non-schema properties.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct NamespaceVersion(i64);
 
@@ -326,16 +326,6 @@ impl NamespaceVersion {
     /// Returns the inner version value as its primitive type.
     pub fn get(&self) -> i64 {
         self.0
-    }
-
-    /// Increments the version counter of the non-schema [`Namespace`] metadata
-    /// by one.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if incrementing the version would cause wrap-around.
-    pub fn inc(&mut self) {
-        self.0 = self.0.checked_add(1).expect("namespace version overflow");
     }
 }
 
@@ -352,33 +342,47 @@ pub struct Namespace {
     pub max_tables: MaxTables,
     /// The maximum number of columns per table in this namespace
     pub max_columns_per_table: MaxColumnsPerTable,
-    /// When this file was marked for deletion.
+    /// When this namespace was marked for deletion.
     pub deleted_at: Option<Timestamp>,
     /// The partition template to use for new tables in this namespace either created implicitly or
     /// created without specifying a partition template.
     pub partition_template: NamespacePartitionTemplateOverride,
-    /// The router-managed version associated with this instance of the namespace data object.
+    /// The monotonically increasing counter tracking the version of this
+    /// namespace's non-schema properties, as used across routers.
     pub router_version: NamespaceVersion,
 }
 
-/// Schema collection for a namespace. This is an in-memory object useful for a schema
-/// cache.
+/// A container for the mutable, non-schema configuration of a namespace and the
+/// version the configuration is associated with.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Hash)]
+pub struct NamespaceConfig {
+    /// The maximum number of tables permitted in this namespace.
+    pub max_tables: MaxTables,
+    /// The number of columns per table this namespace allows
+    pub max_columns_per_table: MaxColumnsPerTable,
+    /// The retention period in ns.
+    /// None represents infinite duration (i.e. never drop data).
+    pub retention_period_ns: Option<i64>,
+    /// The monotonically increasing counter tracking the version of this
+    /// namespace's non-schema properties, as used across routers.
+    pub router_version: NamespaceVersion,
+}
+
+/// Data-object for a namespace, bundled together with its schema information.
+/// This is an in-memory object useful for a schema cache.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct NamespaceSchema {
     /// the namespace id
     pub id: NamespaceId,
     /// the tables in the namespace by name
     pub tables: BTreeMap<String, TableSchema>,
-    /// The maximum number of tables permitted in this namespace.
-    pub max_tables: MaxTables,
-    /// the number of columns per table this namespace allows
-    pub max_columns_per_table: MaxColumnsPerTable,
-    /// The retention period in ns.
-    /// None represents infinite duration (i.e. never drop data).
-    pub retention_period_ns: Option<i64>,
+
     /// The partition template to use for new tables in this namespace either created implicitly or
     /// created without specifying a partition template.
     pub partition_template: NamespacePartitionTemplateOverride,
+
+    /// The mutable, non-schema configuration elements of this namespace.
+    pub config: NamespaceConfig,
 }
 
 impl NamespaceSchema {
@@ -391,16 +395,20 @@ impl NamespaceSchema {
             max_tables,
             max_columns_per_table,
             ref partition_template,
+            router_version,
             ..
         } = namespace;
 
         Self {
             id,
             tables: BTreeMap::new(),
-            max_tables,
-            max_columns_per_table,
-            retention_period_ns,
             partition_template: partition_template.clone(),
+            config: NamespaceConfig {
+                max_tables,
+                max_columns_per_table,
+                retention_period_ns,
+                router_version,
+            },
         }
     }
 }
@@ -2800,10 +2808,13 @@ mod tests {
         let schema1 = NamespaceSchema {
             id: NamespaceId::new(1),
             tables: BTreeMap::from([]),
-            max_tables: MaxTables::try_from(42).unwrap(),
-            max_columns_per_table: MaxColumnsPerTable::try_from(4).unwrap(),
-            retention_period_ns: None,
             partition_template: Default::default(),
+            config: NamespaceConfig {
+                max_tables: MaxTables::try_from(42).unwrap(),
+                max_columns_per_table: MaxColumnsPerTable::try_from(4).unwrap(),
+                retention_period_ns: None,
+                router_version: NamespaceVersion::new(42),
+            },
         };
         let schema2 = NamespaceSchema {
             id: NamespaceId::new(1),
@@ -2815,10 +2826,13 @@ mod tests {
                     partition_template: Default::default(),
                 },
             )]),
-            max_tables: MaxTables::try_from(42).unwrap(),
-            max_columns_per_table: MaxColumnsPerTable::try_from(4).unwrap(),
-            retention_period_ns: None,
             partition_template: Default::default(),
+            config: NamespaceConfig {
+                max_tables: MaxTables::try_from(42).unwrap(),
+                max_columns_per_table: MaxColumnsPerTable::try_from(4).unwrap(),
+                retention_period_ns: None,
+                router_version: NamespaceVersion::new(42),
+            },
         };
         assert!(schema1.size() < schema2.size());
     }

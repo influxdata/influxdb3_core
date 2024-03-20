@@ -29,12 +29,12 @@ use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use flightsql::FlightSQLCommand;
 use futures::{ready, stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
-use iox_query::exec::QueryConfig;
 use iox_query::{
     exec::IOxSessionContext,
     query_log::{QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
     QueryNamespaceProvider,
 };
+use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
 use observability_deps::tracing::{debug, info, warn};
 use prost::Message;
 use request::{IoxGetRequest, RunQuery};
@@ -86,6 +86,15 @@ const IOX_FLIGHT_EXECUTION_DURATION_RESPONSE_TRAILER: &str =
 
 /// Trailer that describes the duration (in seconds) the CPU(s) took to compute the results.
 const IOX_FLIGHT_COMPUTE_DURATION_RESPONSE_TRAILER: &str = "x-influxdata-compute-duration-seconds";
+
+/// Trailer that describes the number of partitions processed by a query.
+const IOX_FLIGHT_PARTITIONS_RESPONSE_TRAILER: &str = "x-influxdata-partitions";
+
+/// Trailer that describes the number of parquet files processed by a query.
+const IOX_FLIGHT_PARQUET_FILES_RESPONSE_TRAILER: &str = "x-influxdata-parquet-files";
+
+/// Trailer that describes the peak memory usage of a query.
+const IOX_FLIGHT_MAX_MEMORY_RESPONSE_TRAILER: &str = "x-influxdata-max-memory-bytes";
 
 /// In which interval should the `DoGet` stream send empty messages as keep alive markers?
 const DO_GET_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -165,8 +174,11 @@ pub enum Error {
     #[snafu(display("Permission denied"))]
     PermissionDenied,
 
-    #[snafu(display("Authz error: {}", source))]
-    Authz { source: authz::Error },
+    #[snafu(display("Authz verification error: {}: {}", msg, source))]
+    AuthzVerification {
+        msg: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -198,7 +210,7 @@ impl From<Error> for tonic::Status {
             | Error::InternalCreatingTicket { .. }
             | Error::UnsupportedMessageType { .. }
             | Error::FlightSQL { .. }
-            | Error::Authz { .. } => {
+            | Error::AuthzVerification { .. } => {
                 warn!(e=%err, %namespace, %query, msg)
             }
         }
@@ -242,8 +254,8 @@ impl Error {
             },
             Self::InternalCreatingTicket { .. }
             | Self::Optimize { .. }
-            | Self::EncodeSchema { .. }
-            | Self::Authz { .. } => tonic::Code::Internal,
+            | Self::EncodeSchema { .. } => tonic::Code::Internal,
+            Self::AuthzVerification { .. } => tonic::Code::Unavailable,
             Self::Unauthenticated => tonic::Code::Unauthenticated,
             Self::PermissionDenied => tonic::Code::PermissionDenied,
         };
@@ -269,7 +281,7 @@ impl Error {
             | Self::UnsupportedMessageType { .. }
             | Self::Unauthenticated
             | Self::PermissionDenied
-            | Self::Authz { .. } => "<unknown>",
+            | Self::AuthzVerification { .. } => "<unknown>",
             Self::DatabaseNotFound { namespace_name } => namespace_name,
             Self::Query { namespace_name, .. } => namespace_name,
             Self::Planning { namespace_name, .. } => namespace_name,
@@ -294,7 +306,7 @@ impl Error {
             | Self::UnsupportedMessageType { .. }
             | Self::Unauthenticated
             | Self::PermissionDenied
-            | Self::Authz { .. }
+            | Self::AuthzVerification { .. }
             | Self::DatabaseNotFound { .. } => "NONE",
             Self::Query { query, .. } => query,
             Self::Planning { query, .. } => query,
@@ -320,7 +332,7 @@ impl From<authz::Error> for Error {
             authz::Error::Forbidden => Self::PermissionDenied,
             authz::Error::InvalidToken => Self::PermissionDenied,
             authz::Error::NoToken => Self::Unauthenticated,
-            source => Self::Authz { source },
+            authz::Error::Verification { source, msg } => Self::AuthzVerification { msg, source },
         }
     }
 }
@@ -538,11 +550,11 @@ where
             .context(DatabaseSnafu)?
             .context(DatabaseNotFoundSnafu { namespace_name })?;
 
-        //TODO: add structured logging for parameterized queries https://github.com/influxdata/influxdb_iox/issues/9626
         let query_completed_token = db.record_query(
             external_span_ctx.as_ref().map(RequestLogContext::ctx),
             query.variant(),
             Box::new(query.to_string()),
+            params.clone(),
         );
 
         *log_entry = Some(Arc::clone(query_completed_token.entry()));
@@ -583,7 +595,7 @@ where
         let (physical_plan, query_completed_token) = match physical_plan_res {
             Ok(physical_plan) => {
                 let query_completed_token =
-                    query_completed_token.planned(Arc::clone(&physical_plan));
+                    query_completed_token.planned(&ctx, Arc::clone(&physical_plan));
                 (physical_plan, query_completed_token)
             }
             Err(e) => {
@@ -648,7 +660,7 @@ where
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, tonic::Status> {
         let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
-        // technically the trailers layer should always be installed but for testing this isn' always the case, so lets
+        // technically the trailers layer should always be installed but for testing this isn't always the case, so lets
         // make this optional
         let trailers: Option<Trailers> = request.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
@@ -1168,6 +1180,11 @@ struct QueryResponseMetadata {
 }
 
 impl QueryResponseMetadata {
+    fn write_trailer_count(md: &mut HeaderMap, key: &'static str, count: Option<i64>) {
+        let Some(count) = count else { return };
+        md.insert(key, count.to_string().parse().expect("always valid"));
+    }
+
     fn write_trailer_duration(md: &mut HeaderMap, key: &'static str, d: Option<Duration>) {
         let Some(d) = d else { return };
 
@@ -1182,26 +1199,56 @@ impl QueryResponseMetadata {
             return;
         };
 
+        let state = log_entry.state();
+        let QueryLogEntryState {
+            id: _,
+            namespace_id: _,
+            namespace_name: _,
+            query_type: _,
+            query_text: _,
+            query_params: _,
+            trace_id: _,
+            issue_time: _,
+            partitions,
+            parquet_files,
+            permit_duration,
+            plan_duration,
+            execute_duration,
+            end2end_duration: _,
+            compute_duration,
+            max_memory,
+            success: _,
+            running: _,
+            phase: _,
+        } = state.as_ref();
+
         Self::write_trailer_duration(
             md,
             IOX_FLIGHT_QUEUE_DURATION_RESPONSE_TRAILER,
-            log_entry.permit_duration(),
+            *permit_duration,
         );
         Self::write_trailer_duration(
             md,
             IOX_FLIGHT_PLANNING_DURATION_RESPONSE_TRAILER,
-            log_entry.plan_duration(),
+            *plan_duration,
         );
         Self::write_trailer_duration(
             md,
             IOX_FLIGHT_EXECUTION_DURATION_RESPONSE_TRAILER,
-            log_entry.execute_duration(),
+            *execute_duration,
         );
         Self::write_trailer_duration(
             md,
             IOX_FLIGHT_COMPUTE_DURATION_RESPONSE_TRAILER,
-            log_entry.compute_duration(),
+            *compute_duration,
         );
+        Self::write_trailer_count(md, IOX_FLIGHT_PARTITIONS_RESPONSE_TRAILER, *partitions);
+        Self::write_trailer_count(
+            md,
+            IOX_FLIGHT_PARQUET_FILES_RESPONSE_TRAILER,
+            *parquet_files,
+        );
+        Self::write_trailer_count(md, IOX_FLIGHT_MAX_MEMORY_RESPONSE_TRAILER, *max_memory);
     }
 }
 
@@ -1490,7 +1537,7 @@ mod tests {
             sql_request("Bearer INVALID"),
         )
         .await;
-        assert_code(&svc, tonic::Code::Internal, sql_request("Bearer UGLY")).await;
+        assert_code(&svc, tonic::Code::Unavailable, sql_request("Bearer UGLY")).await;
 
         assert_code(&svc, tonic::Code::Unauthenticated, influxql_request("")).await;
 
@@ -1506,7 +1553,12 @@ mod tests {
             influxql_request("Bearer BAD"),
         )
         .await;
-        assert_code(&svc, tonic::Code::Internal, influxql_request("Bearer UGLY")).await;
+        assert_code(
+            &svc,
+            tonic::Code::Unavailable,
+            influxql_request("Bearer UGLY"),
+        )
+        .await;
 
         assert_code(&svc, tonic::Code::Unauthenticated, flightsql_request("")).await;
         assert_code(&svc, tonic::Code::Ok, flightsql_request("Bearer GOOD")).await;
@@ -1518,7 +1570,7 @@ mod tests {
         .await;
         assert_code(
             &svc,
-            tonic::Code::Internal,
+            tonic::Code::Unavailable,
             flightsql_request("Bearer UGLY"),
         )
         .await;
@@ -1566,6 +1618,6 @@ mod tests {
         assert_code(&svc, tonic::Code::Unauthenticated, request("")).await;
         assert_code(&svc, tonic::Code::Ok, request("Bearer GOOD")).await;
         assert_code(&svc, tonic::Code::PermissionDenied, request("Bearer BAD")).await;
-        assert_code(&svc, tonic::Code::Internal, request("Bearer UGLY")).await;
+        assert_code(&svc, tonic::Code::Unavailable, request("Bearer UGLY")).await;
     }
 }

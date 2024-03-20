@@ -18,10 +18,7 @@ use parquet::{
 };
 use thiserror::Error;
 
-use crate::{
-    metadata::{IoxMetadata, METADATA_KEY},
-    writer::TrackedMemoryArrowWriter,
-};
+use crate::{metadata::IoxMetadata, writer::TrackedMemoryArrowWriter};
 
 /// Parquet row group write size
 pub const ROW_GROUP_WRITE_SIZE: usize = 1024 * 1024;
@@ -115,12 +112,13 @@ impl From<crate::writer::Error> for CodecError {
 /// data was serialised.
 ///
 /// [`proto::IoxMetadata`]: generated_types::influxdata::iox::ingester::v1
+/// [`METADATA_KEY`]: crate::metadata::METADATA_KEY
 /// [`FileMetaData`]: parquet::format::FileMetaData
 /// [`IoxParquetMetaData`]: crate::metadata::IoxParquetMetaData
 /// [`RecordBatch`]: arrow::record_batch::RecordBatch
 pub async fn to_parquet<W>(
     batches: SendableRecordBatchStream,
-    meta: &IoxMetadata,
+    meta: Vec<KeyValue>,
     pool: Arc<dyn MemoryPool>,
     sink: W,
 ) -> Result<parquet::format::FileMetaData, CodecError>
@@ -156,12 +154,13 @@ where
         return Err(CodecError::NoRows);
     }
 
-    debug!(num_batches,
-           num_rows=writer_meta.num_rows,
-           object_store_id=?meta.object_store_id,
-           write_batch_size,
-           max_row_group_size,
-           "Created parquet file");
+    debug!(
+        num_batches,
+        num_rows = writer_meta.num_rows,
+        write_batch_size,
+        max_row_group_size,
+        "Created parquet file"
+    );
 
     Ok(writer_meta)
 }
@@ -181,7 +180,7 @@ pub async fn to_parquet_bytes(
     );
 
     // Serialize the record batches into the in-memory buffer
-    let meta = to_parquet(batches, meta, pool, &mut bytes).await?;
+    let meta = to_parquet(batches, meta.try_into()?, pool, &mut bytes).await?;
     bytes.shrink_to_fit();
 
     trace!(?meta, "generated parquet file metadata");
@@ -189,15 +188,10 @@ pub async fn to_parquet_bytes(
     Ok((bytes, meta))
 }
 
-/// Helper to construct [`WriterProperties`] , serialising the given
-/// [`IoxMetadata`] and embedding it as a key=value property keyed by
-/// [`METADATA_KEY`].
-fn writer_props(meta: &IoxMetadata) -> Result<WriterProperties, prost::EncodeError> {
+/// Helper to construct [`WriterProperties`] for a list of given [`KeyValue`] metadata values
+fn writer_props(meta: Vec<KeyValue>) -> Result<WriterProperties, prost::EncodeError> {
     let builder = WriterProperties::builder()
-        .set_key_value_metadata(Some(vec![KeyValue {
-            key: METADATA_KEY.to_string(),
-            value: Some(meta.to_base64()?),
-        }]))
+        .set_key_value_metadata(Some(meta))
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(ROW_GROUP_WRITE_SIZE);
 

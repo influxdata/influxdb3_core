@@ -438,9 +438,10 @@ mod tests {
     use datafusion::{
         datasource::object_store::ObjectStoreUrl,
         logical_expr::Operator,
+        physical_expr::EquivalenceProperties,
         physical_plan::{
             expressions::{BinaryExpr, Literal},
-            DisplayAs, PhysicalExpr, Statistics,
+            DisplayAs, ExecutionMode, PhysicalExpr, PlanProperties, Statistics,
         },
         scalar::ScalarValue,
     };
@@ -1028,7 +1029,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert_unknown_partitioning(plan.output_partitioning(), 2);
+        assert_unknown_partitioning(plan.properties().output_partitioning().clone(), 2);
 
         let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
@@ -1049,7 +1050,14 @@ mod tests {
         "###
         );
 
-        assert_unknown_partitioning(test.output_plan().unwrap().output_partitioning(), 2);
+        assert_unknown_partitioning(
+            test.output_plan()
+                .unwrap()
+                .properties()
+                .output_partitioning()
+                .clone(),
+            2,
+        );
     }
 
     // since `SortPreservingMergeExec` and `FilterExec` both use `wrap_user_into_projections`, we only test one variant for `SortPreservingMergeExec`
@@ -1649,7 +1657,8 @@ mod tests {
     #[derive(Debug)]
     struct TestExec {
         schema: SchemaRef,
-        partitions: usize,
+        /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+        cache: PlanProperties,
     }
 
     impl TestExec {
@@ -1658,7 +1667,18 @@ mod tests {
         }
 
         fn new_with_partitions(schema: SchemaRef, partitions: usize) -> Self {
-            Self { schema, partitions }
+            let cache = Self::compute_properties(Arc::clone(&schema), partitions);
+            Self { schema, cache }
+        }
+
+        /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+        fn compute_properties(schema: SchemaRef, partitions: usize) -> PlanProperties {
+            let eq_properties = EquivalenceProperties::new(schema);
+
+            let output_partitioning =
+                datafusion::physical_plan::Partitioning::UnknownPartitioning(partitions);
+
+            PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
         }
     }
 
@@ -1671,12 +1691,8 @@ mod tests {
             Arc::clone(&self.schema)
         }
 
-        fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(self.partitions)
-        }
-
-        fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-            None
+        fn properties(&self) -> &PlanProperties {
+            &self.cache
         }
 
         fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

@@ -167,12 +167,18 @@ impl QuorumCatalogCache {
         }
     }
 
-    /// Warm the local cache by performing quorum reads from the other two replicas
+    /// Warm the local cache by performing quorum reads from the other two replicas.
+    ///
+    /// From the first replica we will only fetch the version. From the second one we will fetch the actual payload. The
+    /// payload size is limited by the given `max_value_size`. If [`None`] is given, this will default to [`MAX_VALUE_SIZE`].
     ///
     /// This method should be called after this server has been participating in the write quorum
     /// for a period of time, e.g. 1 minute. This avoids an issue where a quorum cannot be
     /// established for in-progress writes.
-    pub async fn warm(&self) -> Result<()> {
+    ///
+    ///
+    /// [`MAX_VALUE_SIZE`]: crate::api::list::MAX_VALUE_SIZE
+    pub async fn warm(&self, max_value_size: Option<usize>) -> Result<WarmupStats> {
         // List doesn't return keys in any particular order
         //
         // We therefore build a hashmap with the keys from one replica and compare
@@ -193,28 +199,58 @@ impl QuorumCatalogCache {
             "Collected version information from first replica"
         );
 
-        let mut count = 0;
-        let mut total_bytes = 0;
+        let mut second_replicate_elements_with_payload = 0;
+        let mut second_replicate_elements_without_payload = 0;
+        let mut second_replicate_bytes = 0;
+        let mut inserted_elements = 0;
+        let mut inserted_bytes = 0;
 
-        let mut list = self.replicas[1].list(None);
+        let mut list = self.replicas[1].list(max_value_size);
         while let Some(entry) = list.next().await.transpose().context(ListSnafu)? {
-            if let Some(k) = entry.key() {
-                match (generations.get(&k), entry.value()) {
-                    (Some(generation), Some(v)) if *generation == entry.generation() => {
-                        count += 1;
-                        total_bytes += v.len();
+            let Some(k) = entry.key() else {
+                continue;
+            };
 
-                        let value = CacheValue::new(v.clone(), *generation);
-                        // In the case that local already has the given version
-                        // this will be a no-op
-                        self.local.insert(k, value)?;
-                    }
-                    _ => {}
+            let v = match entry.value() {
+                Some(v) => {
+                    second_replicate_elements_with_payload += 1;
+                    second_replicate_bytes += v.len();
+                    v
                 }
+                None => {
+                    second_replicate_elements_without_payload += 1;
+                    continue;
+                }
+            };
+
+            let Some(generation) = generations.get(&k) else {
+                continue;
+            };
+
+            if *generation == entry.generation() {
+                inserted_elements += 1;
+                inserted_bytes += v.len();
+
+                let value = CacheValue::new(v.clone(), *generation);
+                // In the case that local already has the given version
+                // this will be a no-op
+                self.local.insert(k, value)?;
             }
         }
-        info!(count, total_bytes, "Finished warmup");
-        Ok(())
+
+        info!(
+            count = inserted_elements,
+            total_bytes = inserted_elements,
+            "Finished warmup"
+        );
+        Ok(WarmupStats {
+            first_replicate_elements: generations.len(),
+            second_replicate_elements_with_payload,
+            second_replicate_elements_without_payload,
+            second_replicate_bytes,
+            inserted_elements,
+            inserted_bytes,
+        })
     }
 
     /// Returns a reference to the local [`CatalogCache`]
@@ -226,6 +262,37 @@ impl QuorumCatalogCache {
     pub fn peers(&self) -> &[CatalogCacheClient; 2] {
         &self.replicas
     }
+}
+
+/// Statistics for [warm-up](QuorumCatalogCache::warm)
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_copy_implementations)] // allow extensions
+pub struct WarmupStats {
+    /// Number elements pulled from the first replica.
+    ///
+    /// These elements only provide a version, NOT any form of payload.
+    pub first_replicate_elements: usize,
+
+    /// Number of elements with payload that we got from the second replica.
+    pub second_replicate_elements_with_payload: usize,
+
+    /// Number of elements without payload that we got from the second replica.
+    ///
+    /// Elements in this category did not get any payload due to the provided `max_value_size`.
+    pub second_replicate_elements_without_payload: usize,
+
+    /// Number of payload bytes transferred from the second replica.
+    pub second_replicate_bytes: usize,
+
+    /// Inserted elements.
+    ///
+    /// For these, both replicas agreed on a version and we also got payload data.
+    pub inserted_elements: usize,
+
+    /// Inserted bytes.
+    ///
+    /// For these, both replicas agreed on a version and we also got payload data.
+    pub inserted_bytes: usize,
 }
 
 #[cfg(test)]
@@ -432,7 +499,17 @@ mod tests {
 
         assert_eq!(local.list().count(), 0);
 
-        quorum.warm().await.unwrap();
+        assert_eq!(
+            quorum.warm(None).await.unwrap(),
+            WarmupStats {
+                first_replicate_elements: 2,
+                second_replicate_elements_with_payload: 2,
+                second_replicate_elements_without_payload: 0,
+                second_replicate_bytes: 4,
+                inserted_elements: 2,
+                inserted_bytes: 4,
+            },
+        );
 
         // Should populate both entries
         let mut entries: Vec<_> = local.list().collect();
@@ -448,14 +525,34 @@ mod tests {
         assert!(r1.cache().insert(k2, v3.clone()).unwrap());
 
         // Cannot establish quorum for k1 so should skip over
-        quorum.warm().await.unwrap();
+        assert_eq!(
+            quorum.warm(None).await.unwrap(),
+            WarmupStats {
+                first_replicate_elements: 2,
+                second_replicate_elements_with_payload: 2,
+                second_replicate_elements_without_payload: 0,
+                second_replicate_bytes: 4,
+                inserted_elements: 1,
+                inserted_bytes: 2,
+            },
+        );
         let entries: Vec<_> = local.list().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], (k1, v1.clone()));
 
         // If r2 updated warming should pick up new quorum
         assert!(r2.cache().insert(k2, v3.clone()).unwrap());
-        quorum.warm().await.unwrap();
+        assert_eq!(
+            quorum.warm(None).await.unwrap(),
+            WarmupStats {
+                first_replicate_elements: 2,
+                second_replicate_elements_with_payload: 2,
+                second_replicate_elements_without_payload: 0,
+                second_replicate_bytes: 4,
+                inserted_elements: 2,
+                inserted_bytes: 4,
+            },
+        );
         let mut entries: Vec<_> = local.list().collect();
         entries.sort_unstable_by_key(|(k, _)| *k);
         assert_eq!(entries, vec![(k1, v1), (k2, v3)]);
@@ -484,5 +581,22 @@ mod tests {
                 }
             }
         }
+
+        // test max size
+        let local = Arc::new(CatalogCache::default());
+        let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
+        assert_eq!(local.list().count(), 0);
+        assert_eq!(
+            quorum.warm(Some(0)).await.unwrap(),
+            WarmupStats {
+                first_replicate_elements: 3,
+                second_replicate_elements_with_payload: 0,
+                second_replicate_elements_without_payload: 3,
+                second_replicate_bytes: 0,
+                inserted_elements: 0,
+                inserted_bytes: 0,
+            },
+        );
+        assert_eq!(local.list().count(), 0);
     }
 }

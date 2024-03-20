@@ -21,7 +21,7 @@ use iox_catalog::{
     util::{get_schema_by_id, get_table_columns_by_id},
 };
 use iox_query::{
-    exec::{DedicatedExecutors, Executor, ExecutorConfig},
+    exec::{DedicatedExecutor, Executor, ExecutorConfig},
     provider::RecordBatchDeduplicator,
     util::arrow_sort_key_exprs,
 };
@@ -61,21 +61,18 @@ impl TestCatalog {
     /// All test catalogs use the same [`Executor`]. Use [`with_execs`](Self::with_execs) if you need a special or
     /// dedicated executor.
     pub fn new() -> Arc<Self> {
-        let exec = Arc::new(DedicatedExecutors::new_testing());
+        let exec = DedicatedExecutor::new_testing();
         Self::with_execs(exec, NonZeroUsize::new(1).unwrap())
     }
 
     /// Initialize with partitions
     pub fn with_target_query_partitions(target_query_partitions: NonZeroUsize) -> Arc<Self> {
-        let exec = Arc::new(DedicatedExecutors::new_testing());
+        let exec = DedicatedExecutor::new_testing();
         Self::with_execs(exec, target_query_partitions)
     }
 
     /// Initialize with given executors and partitions
-    pub fn with_execs(
-        exec: Arc<DedicatedExecutors>,
-        target_query_partitions: NonZeroUsize,
-    ) -> Arc<Self> {
+    pub fn with_execs(exec: DedicatedExecutor, target_query_partitions: NonZeroUsize) -> Arc<Self> {
         let metric_registry = Arc::new(metric::Registry::new());
         let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0).unwrap()));
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(
@@ -85,7 +82,7 @@ impl TestCatalog {
         let object_store = Arc::new(InMemory::new());
         let parquet_store =
             ParquetStorage::new(Arc::clone(&object_store) as _, StorageId::from("iox"));
-        let exec = Arc::new(Executor::new_with_config_and_executors(
+        let exec = Arc::new(Executor::new_with_config_and_executor(
             ExecutorConfig {
                 num_threads: exec.num_threads(),
                 target_query_partitions,

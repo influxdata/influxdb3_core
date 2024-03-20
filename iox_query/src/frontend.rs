@@ -14,7 +14,7 @@ mod test {
     use schema::{merge::SchemaMerger, sort::SortKey, Schema};
 
     use crate::{
-        exec::{split::StreamSplitExec, Executor, ExecutorType},
+        exec::{split::StreamSplitExec, Executor},
         frontend::reorg::ReorgPlanner,
         provider::{DeduplicateExec, RecordBatchesExec},
         test::TestChunk,
@@ -70,12 +70,12 @@ mod test {
 
         let executor = Executor::new_testing();
         let plan = executor
-            .new_context(ExecutorType::Reorg)
+            .new_context()
             .create_physical_plan(&split_plan)
             .await
             .unwrap();
 
-        assert_eq!(plan.output_partitioning().partition_count(), 2);
+        assert_eq!(plan.properties().output_partitioning().partition_count(), 2);
 
         println!("Executing partition 0");
         let mut stream0 = test_execute_partition(Arc::clone(&plan), 0).await;

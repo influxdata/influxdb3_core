@@ -23,7 +23,7 @@ http = "0.2.11"
 hyper = "0.14"
 influxdb_iox_client = { path = "../influxdb_iox_client", features = ["flight", "format"] }
 ingester_query_grpc = { path = "../ingester_query_grpc" }
-insta = { version = "1.35.1", features = ["yaml"] }
+insta = { version = "1.36.1", features = ["yaml"] }
 iox_catalog = { path = "../iox_catalog" }
 iox_query_params = { path = "../iox_query_params" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
@@ -38,7 +38,7 @@ regex = "1.10"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde_json = "1.0.113"
 snafu = "0.8"
-sqlx = { version = "0.7.3", features = [ "runtime-tokio-rustls" , "postgres", "uuid" ] }
+sqlx = { version = "0.7.4", features = [ "runtime-tokio-rustls" , "postgres", "uuid" ] }
 tempfile = "3.10.1"
 test_helpers = { path = "../test_helpers" }
 tokio = { version = "1.36", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }

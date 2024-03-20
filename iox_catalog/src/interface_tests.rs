@@ -1,11 +1,10 @@
 //! Abstract tests of the catalog interface w/o relying on the actual implementation.
-use crate::{
-    interface::{
-        CasFailure, Catalog, Error, ParquetFileRepoExt, PartitionRepoExt, RepoCollection,
-        SoftDeletedRows,
-    },
-    test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
-    util::{list_schemas, validate_or_insert_schema},
+use std::{any::Any, collections::HashSet, fmt::Display};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ops::DerefMut,
+    sync::Arc,
+    time::Duration,
 };
 
 use ::test_helpers::assert_error;
@@ -21,17 +20,19 @@ use data_types::{
     PartitionId, SortKeyIds, TableId, Timestamp,
 };
 use data_types::{snapshot::partition::PartitionSnapshot, Column, PartitionHashId, PartitionKey};
-use futures::{Future, StreamExt};
+use futures::{future::try_join_all, stream::FuturesUnordered, Future, StreamExt};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::TimeProvider;
 use metric::{Observation, RawReporter};
 use parking_lot::Mutex;
-use std::{any::Any, fmt::Display};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    ops::DerefMut,
-    sync::Arc,
-    time::Duration,
+
+use crate::{
+    interface::{
+        CasFailure, Catalog, Error, ParquetFileRepoExt, PartitionRepoExt, RepoCollection,
+        SoftDeletedRows,
+    },
+    test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
+    util::{list_schemas, validate_or_insert_schema},
 };
 
 pub(crate) async fn test_catalog<R, F>(clean_state: R)
@@ -74,6 +75,7 @@ where
 
     test_two_repos(clean_state().await).await;
     test_partition_create_or_get_idempotent(clean_state().await).await;
+    test_namespace_router_version_atomicity(clean_state().await).await;
     test_column_create_or_get_many_unchecked(clean_state).await;
 }
 
@@ -96,6 +98,10 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         namespace.partition_template,
         NamespacePartitionTemplateOverride::default()
     );
+
+    let previous_router_version = namespace.router_version;
+    assert_eq!(previous_router_version.get(), 0); // Assert the new namespace starts at version 0
+
     let lookup_namespace = repos
         .namespaces()
         .get_by_name(&namespace_name, SoftDeletedRows::ExcludeDeleted)
@@ -163,6 +169,12 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .await
         .expect("namespace should be updateable");
     assert_eq!(new_table_limit, modified.max_tables);
+    assert_eq!(
+        previous_router_version.get() + 1,
+        modified.router_version.get(),
+        "namespace version did not increment monotonically"
+    );
+    let previous_router_version = modified.router_version;
 
     let new_column_limit = MaxColumnsPerTable::try_from(1_500).unwrap();
     let modified = repos
@@ -171,6 +183,11 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .await
         .expect("namespace should be updateable");
     assert_eq!(new_column_limit, modified.max_columns_per_table);
+    assert_eq!(
+        previous_router_version.get() + 1,
+        modified.router_version.get()
+    );
+    let previous_router_version = modified.router_version;
 
     const NEW_RETENTION_PERIOD_NS: i64 = 5 * 60 * 60 * 1000 * 1000 * 1000;
     let modified = repos
@@ -182,6 +199,12 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         NEW_RETENTION_PERIOD_NS,
         modified.retention_period_ns.unwrap()
     );
+    assert_eq!(
+        previous_router_version.get() + 1,
+        modified.router_version.get(),
+        "namespace version did not increment monotonically"
+    );
+    let previous_router_version = modified.router_version;
 
     let modified = repos
         .namespaces()
@@ -189,6 +212,11 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .await
         .expect("namespace should be updateable");
     assert!(modified.retention_period_ns.is_none());
+    assert_eq!(
+        previous_router_version.get() + 1,
+        modified.router_version.get(),
+        "namespace version did not increment monotonically"
+    );
 
     // create namespace with retention period NULL (the default)
     let namespace3 = arbitrary_namespace(&mut *repos, "test_namespace3").await;
@@ -205,12 +233,20 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         NEW_RETENTION_PERIOD_NS,
         namespace4.retention_period_ns.unwrap()
     );
+    let previous_router_version = namespace.router_version;
+    assert_eq!(previous_router_version.get(), 0); // Assert the new namespace starts at version 0
+
     // reset retention period to NULL to avoid affecting later tests
-    repos
+    let modified = repos
         .namespaces()
         .update_retention_period(&namespace4_name, None)
         .await
         .expect("namespace should be updateable");
+    assert_eq!(
+        previous_router_version.get() + 1,
+        modified.router_version.get(),
+        "namespace version did not increment monotonically"
+    );
 
     // create a namespace with a PartitionTemplate other than the default
     let tag_partition_template =
@@ -271,6 +307,79 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .await
         .expect_err("should errored");
     assert_matches!(err, Error::NotFound { .. });
+}
+
+async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
+    const CALLS_PER_METHOD: i64 = 25;
+    const NAMESPACE_NAME: &str = "bananas_namespace";
+
+    let namespace = catalog
+        .repositories()
+        .namespaces()
+        .create(
+            &NamespaceName::new(NAMESPACE_NAME).expect("invalid namespace name"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("failed to create namespace");
+    assert!(namespace.id > NamespaceId::new(0));
+    assert_eq!(namespace.name, NAMESPACE_NAME);
+    assert_eq!(
+        namespace.partition_template,
+        NamespacePartitionTemplateOverride::default()
+    );
+    assert_eq!(namespace.router_version.get(), 0); // Assert the new namespace starts at version 0
+
+    // Create a set of JoinHandle futures to allow the runtime to drive the tasks
+    // in parallel for a multi-threaded environment, rather than concurrently as
+    // pinned, boxed futures.
+    let update_futures = FuturesUnordered::new();
+    for _ in 0..CALLS_PER_METHOD {
+        let mut repos = Arc::clone(&catalog).repositories();
+        update_futures.push(tokio::spawn(async move {
+            repos
+                .namespaces()
+                .update_retention_period(NAMESPACE_NAME, Some(1))
+                .await
+        }));
+        let mut repos = Arc::clone(&catalog).repositories();
+        update_futures.push(tokio::spawn(async move {
+            repos
+                .namespaces()
+                .update_table_limit(
+                    NAMESPACE_NAME,
+                    MaxTables::try_from(100).expect("invalid max tables"),
+                )
+                .await
+        }));
+        let mut repos = Arc::clone(&catalog).repositories();
+        update_futures.push(tokio::spawn(async move {
+            repos
+                .namespaces()
+                .update_column_limit(
+                    NAMESPACE_NAME,
+                    MaxColumnsPerTable::try_from(100).expect("invalid max tables"),
+                )
+                .await
+        }));
+    }
+
+    try_join_all(update_futures)
+        .await
+        .expect("all calls must succeed");
+
+    let namespace = catalog
+        .repositories()
+        .namespaces()
+        .get_by_name(NAMESPACE_NAME, SoftDeletedRows::AllRows)
+        .await
+        .expect("failed to get namespace")
+        .expect("namespace doesn't exist");
+    // Ensure that the router version clock has incremeneted 1 for each update
+    // and no increments have been skipped.
+    assert_eq!(namespace.router_version.get(), CALLS_PER_METHOD * 3);
 }
 
 /// Construct a set of two namespaces:
@@ -1226,15 +1335,17 @@ async fn test_partition(catalog: Arc<dyn Catalog>) {
             non_existing_partition_id,
         ])
         .await
-        .unwrap();
-    assert_eq!(skipped_partition_records.len(), 2);
+        .unwrap()
+        .into_iter()
+        .map(|record| record.partition_id)
+        .collect::<HashSet<_>>();
+    // `get_in_skipped_compactions` makes no ordering guarantees, so assert on
+    // set membership.
     assert_eq!(
-        skipped_partition_records[0].partition_id,
-        to_skip_partition.id
-    );
-    assert_eq!(
-        skipped_partition_records[1].partition_id,
-        to_skip_partition_too.id
+        skipped_partition_records,
+        [to_skip_partition.id, to_skip_partition_too.id]
+            .into_iter()
+            .collect::<HashSet<_>>()
     );
 
     // Delete the skipped compactions
@@ -3339,6 +3450,10 @@ impl<T: Catalog> Catalog for TestCatalog<T> {
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         self.inner.time_provider()
+    }
+
+    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
+        self.inner.active_applications().await
     }
 }
 

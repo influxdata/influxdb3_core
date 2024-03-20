@@ -21,14 +21,14 @@ use datafusion::{
     execution::{context::TaskContext, memory_pool::MemoryConsumer},
     logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
     physical_expr::{
-        create_physical_expr, execution_props::ExecutionProps, PhysicalSortExpr,
-        PhysicalSortRequirement,
+        create_physical_expr, execution_props::ExecutionProps, EquivalenceProperties,
+        PhysicalSortExpr, PhysicalSortRequirement,
     },
     physical_plan::{
         expressions::Column,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
-        SendableRecordBatchStream, Statistics,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+        Partitioning, PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
     },
     prelude::Expr,
 };
@@ -375,6 +375,8 @@ pub struct GapFillExec {
     params: GapFillExecParams,
     /// Metrics reporting behavior during execution.
     metrics: ExecutionPlanMetricsSet,
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
 }
 
 #[derive(Clone, Debug)]
@@ -433,6 +435,8 @@ impl GapFillExec {
             sort_expr
         };
 
+        let cache = Self::compute_properties(&input);
+
         Ok(Self {
             input,
             group_expr,
@@ -440,7 +444,23 @@ impl GapFillExec {
             sort_expr,
             params,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         })
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        let eq_properties = match input.properties().output_ordering() {
+            None => EquivalenceProperties::new(input.schema()),
+            Some(output_ordering) => EquivalenceProperties::new_with_orderings(
+                input.schema(),
+                &[output_ordering.to_vec()],
+            ),
+        };
+
+        let output_partitioning = Partitioning::UnknownPartitioning(1);
+
+        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
     }
 }
 
@@ -459,18 +479,14 @@ impl ExecutionPlan for GapFillExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         // It seems like it could be possible to partition on all the
         // group keys except for the time expression. For now, keep it simple.
         vec![Distribution::SinglePartition]
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
     }
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
@@ -574,7 +590,7 @@ mod test {
     use std::ops::{Bound, Range};
 
     use crate::{
-        exec::{Executor, ExecutorType},
+        exec::Executor,
         test::{format_execution_plan, format_logical_plan},
     };
 
@@ -753,7 +769,7 @@ mod test {
 
     async fn format_explain(sql: &str) -> Result<Vec<String>> {
         let executor = Executor::new_testing();
-        let context = executor.new_context(ExecutorType::Query);
+        let context = executor.new_context();
         context
             .inner()
             .register_table("temps", Arc::new(EmptyTable::new(Arc::new(schema()))))?;

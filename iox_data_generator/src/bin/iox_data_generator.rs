@@ -254,7 +254,7 @@ mod test {
     fn relative() {
         let fixed_now = Local::now();
         let ns = datetime_nanoseconds(Some("1hr"), fixed_now);
-        let expected = (fixed_now - chrono::Duration::hours(1))
+        let expected = (fixed_now - chrono::Duration::try_hours(1).expect("valid hours"))
             .timestamp_nanos_opt()
             .unwrap();
         assert_eq!(ns, Some(expected));

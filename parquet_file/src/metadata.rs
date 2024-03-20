@@ -100,7 +100,7 @@ use parquet::{
     arrow::parquet_to_arrow_schema,
     file::{
         metadata::{
-            FileMetaData as ParquetFileMetaData, ParquetMetaData,
+            FileMetaData as ParquetFileMetaData, KeyValue, ParquetMetaData,
             RowGroupMetaData as ParquetRowGroupMetaData,
         },
         reader::FileReader,
@@ -296,6 +296,17 @@ pub struct IoxMetadata {
     /// If this metadata is for an L1/L2 file, this value will be the max of all L0 files
     ///  that are compacted into this file
     pub max_l0_created_at: Time,
+}
+
+impl TryFrom<&IoxMetadata> for Vec<KeyValue> {
+    type Error = prost::EncodeError;
+
+    fn try_from(iox_metadata: &IoxMetadata) -> Result<Self, Self::Error> {
+        Ok(vec![KeyValue {
+            key: METADATA_KEY.to_string(),
+            value: Some(iox_metadata.to_base64()?),
+        }])
+    }
 }
 
 impl IoxMetadata {

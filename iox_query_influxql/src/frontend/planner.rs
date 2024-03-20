@@ -17,9 +17,10 @@ use crate::plan::{parse_regex, InfluxQLToLogicalPlan, SchemaProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};
-use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Partitioning, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
+    SendableRecordBatchStream,
 };
 use datafusion::{
     error::{DataFusionError, Result},
@@ -77,6 +78,34 @@ impl<'a> SchemaProvider for ContextSchemaProvider<'a> {
 struct SchemaExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
+
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
+}
+
+impl SchemaExec {
+    fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
+        let cache = Self::compute_properties(&input, Arc::clone(&schema));
+        Self {
+            input,
+            schema,
+            cache,
+        }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
+        let eq_properties = match input.properties().output_ordering() {
+            None => EquivalenceProperties::new(schema),
+            Some(output_odering) => {
+                EquivalenceProperties::new_with_orderings(schema, &[output_odering.to_vec()])
+            }
+        };
+
+        let output_partitioning = input.output_partitioning().clone();
+
+        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
+    }
 }
 
 impl Debug for SchemaExec {
@@ -94,12 +123,8 @@ impl ExecutionPlan for SchemaExec {
         Arc::clone(&self.schema)
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -174,7 +199,7 @@ impl InfluxQLQueryPlanner {
             md,
         ));
 
-        Ok(Arc::new(SchemaExec { input, schema }))
+        Ok(Arc::new(SchemaExec::new(input, schema)))
     }
 
     async fn statement_to_plan(
@@ -217,7 +242,7 @@ impl InfluxQLQueryPlanner {
                 let mut ctx = ctx.child_ctx("get table schema");
                 ctx.set_metadata("table", table_name.to_owned());
 
-                if let Some(table) = schema.table(table_name).await {
+                if let Some(table) = schema.table(table_name).await? {
                     let schema = Schema::try_from(table.schema())
                         .map_err(|err| {
                             DataFusionError::Internal(format!("unable to convert DataFusion schema for measurement {table_name} to IOx schema: {err}"))

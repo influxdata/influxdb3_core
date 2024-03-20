@@ -179,7 +179,7 @@ mod tests {
     use arrow_util::assert_batches_eq;
     use datafusion_util::test_collect_partition;
     use iox_query::{
-        exec::{Executor, ExecutorType},
+        exec::Executor,
         test::{format_execution_plan, TestChunk},
     };
     use schema::merge::SchemaMerger;
@@ -202,7 +202,7 @@ mod tests {
         // Build physical plan
         let executor = Executor::new_testing();
         let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
+            .new_context()
             .create_physical_plan(&logical_plan)
             .await
             .unwrap();
@@ -222,10 +222,13 @@ mod tests {
         // Verify output data
         // Since data is merged due to deduplication, the two input chunks will be merged into one output chunk
         assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
+            physical_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             1,
             "{:?}",
-            physical_plan.output_partitioning()
+            physical_plan.properties().output_partitioning()
         );
         let batches0 = test_collect_partition(Arc::clone(&physical_plan), 0).await;
         // Data is sorted on tag1 & time. One row is removed due to deduplication

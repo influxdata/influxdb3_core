@@ -145,8 +145,7 @@ fn timestamp_to_datetime(ts: i64) -> DateTime<Utc> {
     let nsec = ts % 1_000_000_000;
     // Note that nsec as u32 is safe here because modulo on a negative ts value
     //  still produces a positive remainder.
-    let datetime = NaiveDateTime::from_timestamp_opt(secs, nsec as u32).expect("ts in range");
-    DateTime::from_naive_utc_and_offset(datetime, Utc)
+    DateTime::from_timestamp(secs, nsec as u32).expect("timestamp in range")
 }
 
 /// Original: <https://github.com/influxdata/flux/blob/1e9bfd49f21c0e679b42acf6fc515ce05c6dec2b/values/time.go#L491>

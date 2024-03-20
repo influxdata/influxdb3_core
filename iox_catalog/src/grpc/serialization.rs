@@ -120,6 +120,7 @@ pub(crate) fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Stat
         Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
         Error::NotFound { descr } => tonic::Status::not_found(descr),
         Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
+        Error::NotImplemented { descr } => tonic::Status::unimplemented(descr),
     }
 }
 
@@ -140,6 +141,9 @@ pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
             descr: status.message().to_owned(),
         },
         tonic::Code::InvalidArgument => Error::Malformed {
+            descr: status.message().to_owned(),
+        },
+        tonic::Code::Unimplemented => Error::NotImplemented {
             descr: status.message().to_owned(),
         },
         _ => Error::External {
@@ -485,6 +489,9 @@ mod tests {
             descr: "foo".to_owned(),
         });
         assert_error_roundtrip(Error::Malformed {
+            descr: "foo".to_owned(),
+        });
+        assert_error_roundtrip(Error::NotImplemented {
             descr: "foo".to_owned(),
         });
     }

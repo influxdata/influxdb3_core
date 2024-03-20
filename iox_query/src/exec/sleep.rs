@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 
 use arrow::{
     array::{Array, Float32Array, Float64Array, Int64Array},
-    datatypes::{DataType, SchemaRef, TimeUnit},
+    datatypes::{DataType, TimeUnit},
 };
 use datafusion::{
     common::DFSchemaRef,
@@ -16,7 +16,7 @@ use datafusion::{
     logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        PhysicalExpr, SendableRecordBatchStream, Statistics,
+        PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
     },
     physical_planner::PhysicalPlanner,
     prelude::Expr,
@@ -100,11 +100,25 @@ pub struct SleepExpr {
 
     /// Expression that determines the sum of the sleep duration.
     duration: Vec<Arc<dyn PhysicalExpr>>,
+
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
 }
 
 impl SleepExpr {
     pub fn new(input: Arc<dyn ExecutionPlan>, duration: Vec<Arc<dyn PhysicalExpr>>) -> Self {
-        Self { input, duration }
+        let cache = Self::compute_properties(&input);
+
+        Self {
+            input,
+            duration,
+            cache,
+        }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        input.properties().clone()
     }
 }
 
@@ -130,16 +144,8 @@ impl ExecutionPlan for SleepExpr {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.input.schema()
-    }
-
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.cache
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

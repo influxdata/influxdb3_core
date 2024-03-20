@@ -122,9 +122,6 @@ impl TryFrom<Bytes> for PreparedStatementHandle {
 ///
 /// Handles encoding/decoding prost::Any messages back
 /// and forth to native Rust types
-///
-/// TODO use / contribute upstream arrow-flight implementation, when ready:
-/// <https://github.com/apache/arrow-rs/issues/3874>
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlightSQLCommand {
     /// Run a normal query

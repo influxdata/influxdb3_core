@@ -65,10 +65,10 @@ use datafusion::{
     logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
     physical_expr::PhysicalSortRequirement,
     physical_plan::{
-        expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
-        ColumnarValue, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
-        PhysicalExpr, SendableRecordBatchStream, Statistics,
+        ColumnarValue, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties,
+        SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };
@@ -162,17 +162,34 @@ pub struct StreamSplitExec {
     split_exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
 }
 
 impl StreamSplitExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, split_exprs: Vec<Arc<dyn PhysicalExpr>>) -> Self {
         let state = Mutex::new(State::New);
+        let cache = Self::compute_properties(&input, &split_exprs);
         Self {
             state,
             input,
             split_exprs,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        split_exprs: &[Arc<dyn PhysicalExpr>],
+    ) -> PlanProperties {
+        let eq_properties = input.equivalence_properties().clone();
+
+        // Always produces exactly two outputs
+        let output_partitioning = Partitioning::UnknownPartitioning(split_exprs.len() + 1);
+
+        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
     }
 }
 
@@ -191,13 +208,8 @@ impl ExecutionPlan for StreamSplitExec {
         self.input.schema()
     }
 
-    /// Always produces exactly two outputs
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.split_exprs.len() + 1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
     /// Always require a single input (eventually we might imagine
@@ -212,6 +224,7 @@ impl ExecutionPlan for StreamSplitExec {
         // (so that this node logically splits what was desired)
         let requirement = self
             .input
+            .properties()
             .output_ordering()
             .map(PhysicalSortRequirement::from_sort_exprs);
 
@@ -296,7 +309,11 @@ impl StreamSplitExec {
             return Ok(());
         }
 
-        let num_input_streams = self.input.output_partitioning().partition_count();
+        let num_input_streams = self
+            .input
+            .properties()
+            .output_partitioning()
+            .partition_count();
         assert_eq!(
             num_input_streams, 1,
             "need exactly one input partition for stream split exec"

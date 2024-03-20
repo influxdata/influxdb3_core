@@ -15,12 +15,14 @@ use generated_types::prost::Message;
 
 use crate::interface::{Catalog, Result};
 
-pub(crate) trait SnapshotKey: Copy + Eq + std::hash::Hash + Send + Sync {
+pub(crate) trait SnapshotKey:
+    Copy + std::fmt::Debug + Eq + std::hash::Hash + Send + Sync
+{
     fn get(&self) -> Option<i64>;
     fn to_key(&self) -> CacheKey;
 }
 
-pub(crate) trait Snapshot: Clone + Send + Sync + 'static {
+pub(crate) trait Snapshot: Clone + std::fmt::Debug + Send + Sync + 'static {
     /// Machine- & humand-readable name.
     const NAME: &'static str;
 

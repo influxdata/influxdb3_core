@@ -11,6 +11,8 @@ use catalog_cache::{
 
 use metric::{DurationHistogram, U64Counter};
 use observability_deps::tracing::{debug, warn};
+use trace::ctx::SpanContext;
+use trace::span::{SpanEvent, SpanExt, SpanRecorder};
 
 use crate::cache::snapshot::SnapshotKey;
 use crate::{
@@ -51,9 +53,9 @@ impl CacheMetric {
     }
 }
 
-/// Abstract cache access.
+/// Shared state between [`CacheHandlerCatalog`] and [`CacheHandlerRepos`].
 #[derive(Debug)]
-pub(crate) struct CacheHandler<T>
+struct CacheHandlerInner<T>
 where
     T: Snapshot,
 {
@@ -65,7 +67,16 @@ where
     loader: Loader<T::Key, T>,
 }
 
-impl<T> CacheHandler<T>
+/// Abstract cache access.
+#[derive(Debug)]
+pub(crate) struct CacheHandlerCatalog<T>
+where
+    T: Snapshot,
+{
+    inner: Arc<CacheHandlerInner<T>>,
+}
+
+impl<T> CacheHandlerCatalog<T>
 where
     T: Snapshot,
 {
@@ -76,26 +87,62 @@ where
         backoff_config: Arc<BackoffConfig>,
     ) -> Self {
         Self {
-            backing,
-            get_hit: CacheMetric::new(registry, T::NAME, "hit"),
-            get_miss: CacheMetric::new(registry, T::NAME, "miss"),
-            cache,
-            backoff_config,
-            loader: Loader::default(),
+            inner: Arc::new(CacheHandlerInner {
+                backing,
+                get_hit: CacheMetric::new(registry, T::NAME, "hit"),
+                get_miss: CacheMetric::new(registry, T::NAME, "miss"),
+                cache,
+                backoff_config,
+                loader: Loader::default(),
+            }),
         }
+    }
+
+    pub(crate) fn repos(&self) -> CacheHandlerRepos<T> {
+        CacheHandlerRepos {
+            inner: Arc::clone(&self.inner),
+            span_ctx: None,
+        }
+    }
+}
+
+/// Abstract cache access.
+#[derive(Debug)]
+pub(crate) struct CacheHandlerRepos<T>
+where
+    T: Snapshot,
+{
+    inner: Arc<CacheHandlerInner<T>>,
+    span_ctx: Option<SpanContext>,
+}
+
+impl<T> CacheHandlerRepos<T>
+where
+    T: Snapshot,
+{
+    /// Set span context.
+    pub(crate) fn set_span_context(&mut self, span_ctx: Option<SpanContext>) {
+        self.span_ctx = span_ctx;
+    }
+
+    /// Get span recorder.
+    fn span_recorder(&self, action: &'static str) -> SpanRecorder {
+        let mut recorder = SpanRecorder::new(self.span_ctx.child_span(action));
+        recorder.set_metadata("snapshot_type", T::NAME);
+        recorder
     }
 
     /// Get data from quorum cache.
     ///
     /// This method implements retries.
     async fn get_quorum(&self, key: CacheKey) -> Result<Option<CacheValue>, QuorumError> {
-        let mut backoff = Backoff::new(&self.backoff_config);
+        let mut backoff = Backoff::new(&self.inner.backoff_config);
 
         // Note: We don't use retry_with_backoff as some retries are expected in the event
         // of racing writers or only two available replicas. We should only log if
         // the deadline expires
         loop {
-            match self.cache.get(key).await {
+            match self.inner.cache.get(key).await {
                 Ok(val) => return Ok(val),
                 Err(e @ QuorumError::Quorum { .. }) => match backoff.next() {
                     None => return Err(e), // Deadline exceeded
@@ -110,8 +157,8 @@ where
     ///
     /// If `refresh` is false will potentially await an existing snapshot request
     async fn do_snapshot(&self, k: T::Key, refresh: bool) -> Result<T> {
-        let backing = Arc::clone(&self.backing);
-        let cache = Arc::clone(&self.cache);
+        let backing = Arc::clone(&self.inner.backing);
+        let cache = Arc::clone(&self.inner.cache);
 
         let fut = async move {
             let snapshot = T::snapshot(backing.as_ref(), k).await?;
@@ -138,8 +185,8 @@ where
         };
 
         let snapshot = match refresh {
-            true => self.loader.refresh(k, fut).await?,
-            false => self.loader.load(k, fut).await?,
+            true => self.inner.loader.refresh(k, fut).await?,
+            false => self.inner.loader.load(k, fut).await?,
         };
         Ok(snapshot)
     }
@@ -150,14 +197,32 @@ where
     ///
     /// Note that this also performs a snapshot+write if the data was NOT cached yet.
     pub(crate) async fn refresh(&self, key: T::Key) -> Result<()> {
-        self.do_snapshot(key, true).await?;
-        Ok(())
+        let mut span_recorder = self.span_recorder("refresh");
+        match self.do_snapshot(key, true).await {
+            Ok(_) => {
+                span_recorder.ok("ok");
+                Ok(())
+            }
+            Err(e) => {
+                span_recorder.error(e.to_string());
+                Err(e)
+            }
+        }
     }
 
     /// Warm up cached value.
     pub(crate) async fn warm_up(&self, key: T::Key) -> Result<()> {
-        self.do_snapshot(key, false).await?;
-        Ok(())
+        let mut span_recorder = self.span_recorder("warm up");
+        match self.do_snapshot(key, false).await {
+            Ok(_) => {
+                span_recorder.ok("ok");
+                Ok(())
+            }
+            Err(e) => {
+                span_recorder.error(e.to_string());
+                Err(e)
+            }
+        }
     }
 
     /// Get snapshot.
@@ -165,8 +230,10 @@ where
     /// This first tries to quorum-read the data. If the data does not exist yet, this will perform a
     /// [refresh](Self::refresh).
     pub(crate) async fn get(&self, k: T::Key) -> Result<T> {
+        let mut span_recorder = self.span_recorder("get");
         let start = Instant::now();
         let key = k.to_key();
+
         match self.get_quorum(key).await {
             Ok(Some(val)) => {
                 debug!(
@@ -176,12 +243,14 @@ where
                     generation = val.generation(),
                     "get",
                 );
-                self.get_hit.record(start.elapsed());
+                self.inner.get_hit.record(start.elapsed());
+                span_recorder.ok("HIT");
 
                 return T::from_cache_value(val);
             }
             Ok(None) => {
                 debug!(what = T::NAME, key = k.get(), status = "MISS", "get",);
+                span_recorder.event(SpanEvent::new("MISS"));
             }
             Err(e @ QuorumError::Quorum { .. }) => {
                 warn!(
@@ -191,15 +260,27 @@ where
                     %e,
                     "deadline expired for quorum read, obtaining fresh snapshot",
                 );
+                span_recorder.event(SpanEvent::new("deadline expired"));
             }
             Err(e) => {
+                span_recorder.error(e.to_string());
                 return Err(Error::External {
                     source: Box::new(e),
-                })
+                });
             }
         }
 
-        self.get_miss.record(start.elapsed());
-        self.do_snapshot(k, false).await
+        self.inner.get_miss.record(start.elapsed());
+
+        match self.do_snapshot(k, false).await {
+            Ok(x) => {
+                span_recorder.ok("got new snapshot");
+                Ok(x)
+            }
+            Err(e) => {
+                span_recorder.error(e.to_string());
+                Err(e)
+            }
+        }
     }
 }

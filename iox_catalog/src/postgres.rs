@@ -47,6 +47,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::task::JoinSet;
 use trace::ctx::SpanContext;
 
 static MIGRATOR: Lazy<IOxMigrator> =
@@ -118,6 +119,10 @@ impl Default for PostgresConnectionOptions {
 pub struct PostgresCatalog {
     metrics: Arc<metric::Registry>,
     pool: HotSwapPool<Postgres>,
+
+    // keep around in the background
+    refresh_task: Arc<JoinSet<()>>,
+
     time_provider: Arc<dyn TimeProvider>,
     // Connection options for display
     options: PostgresConnectionOptions,
@@ -129,10 +134,11 @@ impl PostgresCatalog {
         options: PostgresConnectionOptions,
         metrics: Arc<metric::Registry>,
     ) -> Result<Self> {
-        let pool = new_pool(&options, Arc::clone(&metrics)).await?;
+        let (pool, refresh_task) = new_pool(&options, Arc::clone(&metrics)).await?;
 
         Ok(Self {
             pool,
+            refresh_task: Arc::new(refresh_task),
             metrics,
             time_provider: Arc::new(SystemProvider::new()),
             options,
@@ -165,6 +171,11 @@ impl Display for PostgresCatalog {
 #[derive(Debug)]
 pub struct PostgresTxn {
     inner: PostgresTxnInner,
+
+    // keep around in the background
+    #[allow(dead_code)]
+    refresh_task: Arc<JoinSet<()>>,
+
     time_provider: Arc<dyn TimeProvider>,
 }
 
@@ -261,6 +272,7 @@ impl Catalog for PostgresCatalog {
                 inner: PostgresTxnInner {
                     pool: self.pool.clone(),
                 },
+                refresh_task: Arc::clone(&self.refresh_task),
                 time_provider: Arc::clone(&self.time_provider),
             }),
             Arc::clone(&self.metrics),
@@ -276,6 +288,25 @@ impl Catalog for PostgresCatalog {
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
+        let pool = self.pool.clone();
+
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT application_name
+            FROM pg_stat_activity
+            WHERE datname = current_database();
+            "#,
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get("application_name"))
+            .collect())
     }
 }
 
@@ -493,11 +524,12 @@ pub fn parse_dsn(dsn: &str) -> Result<String, sqlx::Error> {
 async fn new_pool(
     options: &PostgresConnectionOptions,
     metrics: Arc<metric::Registry>,
-) -> Result<HotSwapPool<Postgres>, sqlx::Error> {
+) -> Result<(HotSwapPool<Postgres>, JoinSet<()>), sqlx::Error> {
     let parsed_dsn = parse_dsn(&options.dsn)?;
     let metrics = PoolMetrics::new(metrics);
     let pool = HotSwapPool::new(new_raw_pool(options, &parsed_dsn, metrics.clone()).await?);
     let polling_interval = options.hotswap_poll_interval;
+    let mut refresh_task = JoinSet::new();
 
     if let Some(dsn_file) = get_dsn_file_path(&options.dsn) {
         let pool = pool.clone();
@@ -510,36 +542,23 @@ async fn new_pool(
         // Pool) and we also potentially pollute the logs with spurious warnings
         // if the dsn file disappears (this may be annoying if they show up in the test
         // logs).
-        tokio::spawn(async move {
+        refresh_task.spawn(async move {
             let mut current_dsn = parsed_dsn.clone();
+            let mut close_pool_tasks = JoinSet::new();
+
             loop {
                 tokio::time::sleep(polling_interval).await;
 
-                async fn try_update(
-                    options: &PostgresConnectionOptions,
-                    current_dsn: &str,
-                    dsn_file: &str,
-                    pool: &HotSwapPool<Postgres>,
-                    metrics: PoolMetrics,
-                ) -> Result<Option<String>, sqlx::Error> {
-                    let new_dsn = std::fs::read_to_string(dsn_file)?;
-                    if new_dsn == current_dsn {
-                        Ok(None)
-                    } else {
-                        let new_pool = new_raw_pool(options, &new_dsn, metrics).await?;
-                        let old_pool = pool.replace(new_pool);
-                        info!("replaced hotswap pool");
-                        info!(?old_pool, "closing old DB connection pool");
-                        // The pool is not closed on drop. We need to call `close`.
-                        // It will close all idle connections, and wait until acquired connections
-                        // are returned to the pool or closed.
-                        old_pool.close().await;
-                        info!(?old_pool, "closed old DB connection pool");
-                        Ok(Some(new_dsn))
-                    }
-                }
-
-                match try_update(&options, &current_dsn, &dsn_file, &pool, metrics.clone()).await {
+                match try_update(
+                    &options,
+                    &current_dsn,
+                    &dsn_file,
+                    &pool,
+                    metrics.clone(),
+                    &mut close_pool_tasks,
+                )
+                .await
+                {
                     Ok(None) => {}
                     Ok(Some(new_dsn)) => {
                         current_dsn = new_dsn;
@@ -557,7 +576,54 @@ async fn new_pool(
         });
     }
 
-    Ok(pool)
+    Ok((pool, refresh_task))
+}
+
+async fn try_update(
+    options: &PostgresConnectionOptions,
+    current_dsn: &str,
+    dsn_file: &str,
+    pool: &HotSwapPool<Postgres>,
+    metrics: PoolMetrics,
+    close_pool_tasks: &mut JoinSet<()>,
+) -> Result<Option<String>, sqlx::Error> {
+    let new_dsn = tokio::fs::read_to_string(dsn_file).await?;
+
+    if new_dsn == current_dsn {
+        Ok(None)
+    } else {
+        let new_pool = new_raw_pool(options, &new_dsn, metrics).await?;
+        let old_pool = pool.replace(new_pool);
+        info!("replaced hotswap pool");
+
+        // check for old tasks
+        while let Some(res) = close_pool_tasks.try_join_next() {
+            if let Err(e) = res {
+                warn!(%e, "closing of old pool of previous DSN change failed");
+            }
+        }
+        let n_tasks = close_pool_tasks.len();
+        if n_tasks > 0 {
+            warn!(
+                n_tasks,
+                "still trying to close old pools from previous DSN changes"
+            );
+        }
+
+        // Spawn new background task to close the pool.
+        // This may take a while and we don't want this to block the overall check&refresh loop.
+        // See https://github.com/influxdata/influxdb_iox/issues/10353 .
+        close_pool_tasks.spawn(async move {
+            info!(?old_pool, "closing old DB connection pool");
+            // The pool is not closed on drop. We need to call `close`.
+            // It will close all idle connections, and wait until acquired connections
+            // are returned to the pool or closed.
+            old_pool.close().await;
+            info!(?old_pool, "closed old DB connection pool");
+        });
+
+        Ok(Some(new_dsn))
+    }
 }
 
 // Parses a `dsn-file://` scheme, according to the rules of the IDPE kit/sql package.
@@ -836,7 +902,7 @@ WHERE name=$1 AND {v};
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
-SET max_tables = $1
+SET max_tables = $1, router_version = router_version + 1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
@@ -867,7 +933,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
-SET max_columns_per_table = $1
+SET max_columns_per_table = $1, router_version = router_version + 1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
@@ -898,7 +964,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
-SET retention_period_ns = $1
+SET retention_period_ns = $1, router_version = router_version + 1
 WHERE name = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
@@ -2047,6 +2113,12 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) async fn setup_db_no_migration() -> PostgresCatalog {
+        setup_db_no_migration_with_app_name("test").await
+    }
+
+    pub(crate) async fn setup_db_no_migration_with_app_name(
+        app_name: &'static str,
+    ) -> PostgresCatalog {
         // create a random schema for this particular pool
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
@@ -2068,7 +2140,7 @@ pub(crate) mod test_utils {
         create_db(&dsn).await;
 
         let options = PostgresConnectionOptions {
-            app_name: String::from("test"),
+            app_name: app_name.to_owned(),
             schema_name: schema_name.clone(),
             dsn,
             max_conns: 3,
@@ -2113,6 +2185,7 @@ mod tests {
     use crate::{
         postgres::test_utils::{
             create_db, maybe_skip_integration, setup_db, setup_db_no_migration,
+            setup_db_no_migration_with_app_name,
         },
         test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
     };
@@ -2160,7 +2233,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
         maybe_skip_integration!();
         maybe_start_logging();
@@ -2299,13 +2372,14 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
     #[tokio::test]
     async fn test_reload() {
         maybe_skip_integration!();
+        maybe_start_logging();
 
         const POLLING_INTERVAL: Duration = Duration::from_millis(10);
 
         // fetch dsn from envvar
         let test_dsn = std::env::var("TEST_INFLUXDB_IOX_CATALOG_DSN").unwrap();
         create_db(&test_dsn).await;
-        eprintln!("TEST_DSN={test_dsn}");
+        println!("TEST_DSN={test_dsn}");
 
         // create a temp file to store the initial dsn
         let mut dsn_file = NamedTempFile::new().expect("create temp file");
@@ -2315,7 +2389,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
 
         const TEST_APPLICATION_NAME: &str = "test_application_name";
         let dsn_good = format!("dsn-file://{}", dsn_file.path().display());
-        eprintln!("dsn_good={dsn_good}");
+        println!("dsn_good={dsn_good}");
 
         // create a hot swap pool with test application name and dsn file pointing to tmp file.
         // we will later update this file and the pool should be replaced.
@@ -2328,8 +2402,8 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             ..Default::default()
         };
         let metrics = Arc::new(metric::Registry::new());
-        let pool = new_pool(&options, metrics).await.expect("connect");
-        eprintln!("got a pool");
+        let (pool, _refresh_task) = new_pool(&options, metrics).await.expect("connect");
+        println!("got a pool");
 
         // ensure the application name is set as expected
         let application_name: String =
@@ -2339,36 +2413,61 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                 .expect("read application_name");
         assert_eq!(application_name, TEST_APPLICATION_NAME);
 
-        // create a new temp file object with updated dsn and overwrite the previous tmp file
-        const TEST_APPLICATION_NAME_NEW: &str = "changed_application_name";
-        let mut new_dsn_file = NamedTempFile::new().expect("create temp file");
-        new_dsn_file
-            .write_all(test_dsn.as_bytes())
-            .expect("write temp file");
-        new_dsn_file
-            .write_all(format!("?application_name={TEST_APPLICATION_NAME_NEW}").as_bytes())
-            .expect("write temp file");
-        new_dsn_file
-            .persist(dsn_file.path())
-            .expect("overwrite new dsn file");
+        // pool for long running queries
+        let mut long_running_queries = JoinSet::new();
 
-        // wait until the hotswap machinery has reloaded the updated DSN file and
-        // successfully performed a new connection with the new DSN.
-        let mut application_name = "".to_string();
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5)
-            && application_name != TEST_APPLICATION_NAME_NEW
-        {
-            tokio::time::sleep(POLLING_INTERVAL).await;
+        // try refreshing twice
+        for i in 0..2 {
+            // try to block update
+            create_long_running_query(&pool, &mut long_running_queries).await;
+            create_long_running_query(&pool, &mut long_running_queries).await;
 
-            application_name = sqlx::query_scalar(
-                "SELECT current_setting('application_name') as application_name;",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("read application_name");
+            // create a new temp file object with updated dsn and overwrite the previous tmp file
+            let test_application_name_new = format!("changed_application_name_{i}");
+            let mut new_dsn_file = NamedTempFile::new().expect("create temp file");
+            new_dsn_file
+                .write_all(test_dsn.as_bytes())
+                .expect("write temp file");
+            new_dsn_file
+                .write_all(format!("?application_name={test_application_name_new}").as_bytes())
+                .expect("write temp file");
+            new_dsn_file
+                .persist(dsn_file.path())
+                .expect("overwrite new dsn file");
+
+            // wait until the hotswap machinery has reloaded the updated DSN file and
+            // successfully performed a new connection with the new DSN.
+            let mut application_name = "".to_string();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5)
+                && application_name != test_application_name_new
+            {
+                tokio::time::sleep(POLLING_INTERVAL).await;
+
+                application_name = sqlx::query_scalar(
+                    "SELECT current_setting('application_name') as application_name;",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("read application_name");
+            }
+            assert_eq!(application_name, test_application_name_new);
         }
-        assert_eq!(application_name, TEST_APPLICATION_NAME_NEW);
+
+        long_running_queries.shutdown().await;
+    }
+
+    async fn create_long_running_query(pool: &HotSwapPool<Postgres>, tasks: &mut JoinSet<()>) {
+        let pool = pool.clone();
+        tasks.spawn(async move {
+            sqlx::query("SELECT pg_sleep(10);")
+                .execute(&pool)
+                .await
+                .expect("query works");
+        });
+
+        // give query some time to get started
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     #[tokio::test]
@@ -2993,5 +3092,20 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                 .unwrap(),
             &Observation::U64Gauge(3),
         );
+    }
+
+    #[tokio::test]
+    async fn test_active_applications() {
+        maybe_skip_integration!();
+
+        const APP_1: &str = "test_other_apps_1";
+        const APP_2: &str = "test_other_apps_2";
+
+        let c1 = setup_db_no_migration_with_app_name(APP_1).await;
+        let _c2 = setup_db_no_migration_with_app_name(APP_2).await;
+
+        let apps = c1.active_applications().await.unwrap();
+        assert!(apps.contains(APP_1));
+        assert!(apps.contains(APP_2));
     }
 }

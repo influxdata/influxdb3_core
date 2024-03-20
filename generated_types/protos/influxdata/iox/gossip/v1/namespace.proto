@@ -1,0 +1,36 @@
+syntax = "proto3";
+package influxdata.iox.gossip.v1;
+option go_package = "github.com/influxdata/iox/gossip/v1";
+
+// A message exchanged via the IOx gossip mechanism to inform listeners of
+// non-schema changes to cluster namespace state.
+message NamespaceMessage {
+  oneof event {
+    // An existing namespace was updated.
+    NamespaceUpdated namespace_updated = 2;
+  }
+}
+
+// An update to the non-schema properties of a namespace occurred.
+message NamespaceUpdated {
+  // Namespace ID
+  int64 id = 1;
+
+  // Name of the Namespace
+  string name = 2;
+
+  // Retention period in nanoseconds.
+  //
+  // NULL means "infinite retention".
+  optional int64 retention_period_ns = 3;
+
+  // The maximum number of tables which this namespace is allowed to contain.
+  int32 max_tables = 4;
+
+  // The maximum number of columns a table belonging to this namespace may have.
+  int32 max_columns_per_table = 5;
+
+  // A snapshot of the monotonically increasing counter which tracks the version
+  // of this namespace's non-schema properties. 
+  int64 router_version = 6;
+}

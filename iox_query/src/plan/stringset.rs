@@ -162,7 +162,7 @@ impl StringSetPlanBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::exec::{Executor, ExecutorType};
+    use crate::exec::Executor;
 
     use super::*;
 
@@ -222,7 +222,7 @@ mod tests {
 
         assert!(matches!(plan, StringSetPlan::Plan(_)));
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let ss = ctx.to_string_set(plan).await.unwrap();
         assert_eq!(ss, expected_ss);
     }

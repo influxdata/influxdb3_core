@@ -12,11 +12,12 @@ use datafusion::{
     logical_expr::{col, count, lit, Expr, ExprSchemable, LogicalPlanBuilder},
     scalar::ScalarValue,
 };
+use executor::DedicatedExecutor;
 use schema::sort::SortKey;
 use test_helpers::maybe_start_logging;
 
 use crate::{
-    exec::{DedicatedExecutors, Executor, ExecutorConfig, ExecutorType},
+    exec::{Executor, ExecutorConfig},
     provider::ProviderBuilder,
     test::{format_execution_plan, TestChunk},
     QueryChunk,
@@ -34,11 +35,8 @@ async fn test_parquet_should_not_be_resorted() {
         target_query_partitions: 16.try_into().unwrap(),
         ..ExecutorConfig::testing()
     };
-    let exec = Executor::new_with_config_and_executors(
-        config,
-        Arc::new(DedicatedExecutors::new_testing()),
-    );
-    let ctx = exec.new_context(ExecutorType::Query);
+    let exec = Executor::new_with_config_and_executor(config, DedicatedExecutor::new_testing());
+    let ctx = exec.new_context();
     let state = ctx.inner().state();
 
     // chunks
@@ -119,11 +117,8 @@ async fn test_parquet_must_resorted() {
         target_query_partitions: 6.try_into().unwrap(),
         ..ExecutorConfig::testing()
     };
-    let exec = Executor::new_with_config_and_executors(
-        config,
-        Arc::new(DedicatedExecutors::new_testing()),
-    );
-    let ctx = exec.new_context(ExecutorType::Query);
+    let exec = Executor::new_with_config_and_executor(config, DedicatedExecutor::new_testing());
+    let ctx = exec.new_context();
     let state = ctx.inner().state();
 
     // chunks

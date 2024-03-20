@@ -1,6 +1,6 @@
 //! Implementation of statistics based pruning
 
-use crate::pruning_oracle::{NoopPruningOracle, PruningOracle};
+use crate::pruning_oracle::BucketPartitionPruningOracle;
 use crate::QueryChunk;
 
 use arrow::{
@@ -86,6 +86,7 @@ pub fn prune_chunks(
         .map(|c| Summary {
             stats: c.stats(),
             schema_ref: c.schema().as_arrow(),
+            pruning_oracle: None,
         })
         .collect();
 
@@ -145,42 +146,22 @@ pub fn prune_summaries(
 pub struct Summary {
     pub stats: Arc<Statistics>,
     pub schema_ref: SchemaRef,
-    // TODO chunchun: add pruning_oracle, something like:
-    // pub pruning_oracle: Option<Arc<BucketPartitionPruningOracle>>,
+    pub pruning_oracle: Option<Arc<BucketPartitionPruningOracle>>,
 }
 
 /// Wraps a collection of pruning summaries and implements the [`PruningStatistics`]
 /// interface required to use them for pruning [`QueryChunk`]s
 #[derive(Debug)]
-pub struct ChunkPruningStatistics<'a, T> {
+pub struct ChunkPruningStatistics<'a> {
     table_schema: &'a Schema,
     summaries: &'a [Summary],
-    pruning_oracle: T,
 }
 
-impl<'a> ChunkPruningStatistics<'a, NoopPruningOracle> {
-    /// A constructor for [`ChunkPruningStatistics`] when no [`PruningOracle`]
-    /// is to be provided.
+impl<'a> ChunkPruningStatistics<'a> {
     pub fn new(table_schema: &'a Schema, summaries: &'a [Summary]) -> Self {
-        Self::new_with_pruning_oracle(table_schema, summaries, NoopPruningOracle)
-    }
-}
-
-impl<'a, T> ChunkPruningStatistics<'a, T>
-where
-    T: PruningOracle,
-{
-    /// Constructs the [`ChunkPruningStatistics`] to use `pruning_oracle` for the
-    /// implementation of [`PruningStatistics::contained()`].
-    pub fn new_with_pruning_oracle(
-        table_schema: &'a Schema,
-        summaries: &'a [Summary],
-        pruning_oracle: T,
-    ) -> Self {
         Self {
             table_schema,
             summaries,
-            pruning_oracle,
         }
     }
 
@@ -197,26 +178,24 @@ where
         column: &'b Column,
     ) -> impl Iterator<Item = Option<&'a ColumnStatistics>> + 'a {
         self.summaries.iter().map(|summary| {
-            let Summary { stats, schema_ref } = summary;
+            let Summary {
+                stats,
+                schema_ref,
+                pruning_oracle: _,
+            } = summary;
             let idx = schema_ref.index_of(&column.name).ok()?;
             Some(&stats.column_statistics[idx])
         })
     }
 }
 
-impl<'a, T> SchemaPruningStatistics for ChunkPruningStatistics<'a, T>
-where
-    T: PruningOracle,
-{
+impl<'a> SchemaPruningStatistics for ChunkPruningStatistics<'a> {
     fn table_schema(&self) -> &'a Schema {
         self.table_schema
     }
 }
 
-impl<'a, T> PruningStatistics for ChunkPruningStatistics<'a, T>
-where
-    T: PruningOracle,
-{
+impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let data_type = self.column_type(column)?;
         let summaries = self.column_summaries(column);
@@ -243,13 +222,15 @@ where
     }
 
     fn contained(&self, column: &Column, values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
-        // This type does not yet implement `contained()` for itself, so must
-        // rely on it's [`PruningOracle`] to provide any answers.
-        let contained = self.pruning_oracle.could_contain_values(column, values)?;
-        // Invariant: If the pruning oracle provides an answer, it must be the same length as the summaries
-        // this pruning statistics holds.
-        assert_eq!(contained.len(), self.summaries.len());
-        Some(contained)
+        Some(
+            self.summaries
+                .iter()
+                .map(|summary| match summary.pruning_oracle {
+                    Some(ref pruning_oracle) => pruning_oracle.could_contain_values(column, values),
+                    None => None,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -288,11 +269,16 @@ pub fn retention_expr(retention_time: i64) -> Expr {
 mod test {
     use std::{ops::Not, sync::Arc};
 
+    use data_types::partition_template::bucket_for_tag_value;
     use datafusion::prelude::{col, lit};
     use datafusion_util::lit_dict;
     use schema::merge::SchemaMerger;
 
-    use crate::{test::TestChunk, QueryChunk};
+    use crate::{
+        pruning_oracle::{BucketInfo, BucketPartitionPruningOracleBuilder},
+        test::TestChunk,
+        QueryChunk,
+    };
 
     use super::*;
 
@@ -746,5 +732,176 @@ mod test {
             result.expect("Pruning succeeds"),
             vec![true, false, false, true, false, true]
         );
+    }
+
+    #[test]
+    fn test_pruned_server_side_bucketing() {
+        test_helpers::maybe_start_logging();
+        // column1=foo where
+        //  c1: BucketInfo { id: hash("bar"), num_buckets: 10 } --> pruned
+
+        const NUM_BUCKETS: u32 = 10;
+
+        let c1 = Arc::new(
+            TestChunk::new("chunk1").with_string_field_column_with_stats("column1", None, None),
+        ) as Arc<dyn QueryChunk>;
+
+        let schema = c1.schema().clone();
+
+        let summaries: Vec<_> = [c1]
+            .iter()
+            .map(|c| {
+                let mut oracle_builder = BucketPartitionPruningOracleBuilder::default();
+                oracle_builder.insert(
+                    Arc::from("column1"),
+                    BucketInfo {
+                        id: Some(bucket_for_tag_value("bar", NUM_BUCKETS)),
+                        num_buckets: NUM_BUCKETS,
+                    },
+                );
+                Summary {
+                    stats: c.stats(),
+                    schema_ref: c.schema().as_arrow(),
+                    pruning_oracle: Some(Arc::new(oracle_builder.build(None))),
+                }
+            })
+            .collect();
+
+        let filter = col("column1").eq(lit_dict("foo"));
+
+        let result = prune_summaries(ChunkPruningStatistics::new(&schema, &summaries), &filter);
+        assert_eq!(result.expect("pruning succeeds"), vec![false]);
+    }
+
+    #[test]
+    fn test_pruned_server_side_bucketing_multi_chunk() {
+        test_helpers::maybe_start_logging();
+        // column1=foo where
+        //  c1: BucketInfo { id: hash("foo"), num_buckets: 4 } --> not pruned
+        //  c2: BucketInfo { id: hash("bar"), num_buckets: 4 } --> pruned
+        //  c3: BucketInfo { id: hash("baz"), num_buckets: 4 } --> pruned
+        //  c4: BucketInfo { id: hash("mia"), num_buckets: 4 } --> not pruned (this chunk share the same bucket with c1, i.e. foo)
+
+        const NUM_BUCKETS: u32 = 4;
+
+        let c1 = Arc::new(
+            TestChunk::new("chunk1").with_string_field_column_with_stats("column1", None, None),
+        ) as Arc<dyn QueryChunk>;
+        let chunks = vec![c1; 4];
+        let schema = merge_schema(&chunks);
+
+        let tag_values = ["foo", "bar", "baz", "mia"];
+        let summaries: Vec<_> = chunks
+            .iter()
+            .zip(tag_values.iter())
+            .map(|(c, &tag_value)| {
+                let mut oracle_builder = BucketPartitionPruningOracleBuilder::default();
+                oracle_builder.insert(
+                    Arc::from("column1"),
+                    BucketInfo {
+                        id: Some(bucket_for_tag_value(tag_value, NUM_BUCKETS)),
+                        num_buckets: NUM_BUCKETS,
+                    },
+                );
+                Summary {
+                    stats: c.stats(),
+                    schema_ref: c.schema().as_arrow(),
+                    pruning_oracle: Some(Arc::new(oracle_builder.build(None))),
+                }
+            })
+            .collect();
+
+        let filter = col("column1").eq(lit_dict("foo"));
+
+        let result = prune_summaries(ChunkPruningStatistics::new(&schema, &summaries), &filter);
+        assert_eq!(
+            result.expect("pruning succeeds"),
+            vec![true, false, false, true]
+        );
+    }
+
+    #[test]
+    fn test_not_pruned_server_side_bucketing_same_tag_value() {
+        test_helpers::maybe_start_logging();
+        // column1=foo where
+        //  c1: BucketInfo { id: hash("foo"), num_buckets: 10 } --> not pruned
+
+        const NUM_BUCKETS: u32 = 10;
+
+        let c1 = Arc::new(
+            TestChunk::new("chunk1").with_string_field_column_with_stats("column1", None, None),
+        ) as Arc<dyn QueryChunk>;
+
+        let table_schema = c1.schema().clone();
+
+        let summaries: Vec<_> = [c1]
+            .iter()
+            .map(|c| {
+                let mut oracle_builder = BucketPartitionPruningOracleBuilder::default();
+                oracle_builder.insert(
+                    Arc::from("column1"),
+                    BucketInfo {
+                        id: Some(bucket_for_tag_value("foo", NUM_BUCKETS)),
+                        num_buckets: NUM_BUCKETS,
+                    },
+                );
+                Summary {
+                    stats: c.stats(),
+                    schema_ref: c.schema().as_arrow(),
+                    pruning_oracle: Some(Arc::new(oracle_builder.build(None))),
+                }
+            })
+            .collect();
+
+        let filter = col("column1").eq(lit_dict("foo"));
+
+        let result = prune_summaries(
+            ChunkPruningStatistics::new(&table_schema, &summaries),
+            &filter,
+        );
+        assert_eq!(result.expect("pruning succeeds"), vec![true]);
+    }
+
+    #[test]
+    fn test_not_pruned_server_side_bucketing_different_tag_value() {
+        test_helpers::maybe_start_logging();
+        // column1=foo where
+        //  c1: BucketInfo { id: hash("bar"), num_buckets: 1 } --> not pruned
+
+        // Only one bucket, so both foo and bar will be in the same bucket
+        const NUM_BUCKETS: u32 = 1;
+
+        let c1 = Arc::new(
+            TestChunk::new("chunk1").with_string_field_column_with_stats("column1", None, None),
+        ) as Arc<dyn QueryChunk>;
+
+        let table_schema = c1.schema().clone();
+
+        let summaries: Vec<_> = [c1]
+            .iter()
+            .map(|c| {
+                let mut oracle_builder = BucketPartitionPruningOracleBuilder::default();
+                oracle_builder.insert(
+                    Arc::from("column1"),
+                    BucketInfo {
+                        id: Some(bucket_for_tag_value("bar", NUM_BUCKETS)),
+                        num_buckets: NUM_BUCKETS,
+                    },
+                );
+                Summary {
+                    stats: c.stats(),
+                    schema_ref: c.schema().as_arrow(),
+                    pruning_oracle: Some(Arc::new(oracle_builder.build(None))),
+                }
+            })
+            .collect();
+
+        let filter = col("column1").eq(lit_dict("foo"));
+
+        let result = prune_summaries(
+            ChunkPruningStatistics::new(&table_schema, &summaries),
+            &filter,
+        );
+        assert_eq!(result.expect("pruning succeeds"), vec![true]);
     }
 }

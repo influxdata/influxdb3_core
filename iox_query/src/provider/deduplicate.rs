@@ -4,6 +4,7 @@ mod algo;
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use arrow::{error::ArrowError, record_batch::RecordBatch};
+use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion_util::{watch::WatchedTask, AdapterStream};
 
 use crate::CHUNK_ORDER_COLUMN_NAME;
@@ -20,7 +21,7 @@ use datafusion::{
         metrics::{
             self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput,
         },
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream, Statistics,
     },
 };
@@ -115,6 +116,8 @@ pub struct DeduplicateExec {
     use_chunk_order_col: bool,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
 }
 
 impl DeduplicateExec {
@@ -133,12 +136,14 @@ impl DeduplicateExec {
                 options: Default::default(),
             })
         }
+        let cache = Self::compute_properties(&input, &sort_keys);
         Self {
             input,
             sort_keys,
             input_order,
             use_chunk_order_col,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
     }
 
@@ -156,6 +161,20 @@ impl DeduplicateExec {
 
     pub fn use_chunk_order_col(&self) -> bool {
         self.use_chunk_order_col
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        sort_keys: &Vec<PhysicalSortExpr>,
+    ) -> PlanProperties {
+        trace!("Deduplicate output ordering: {:?}", sort_keys);
+        let eq_properties =
+            EquivalenceProperties::new_with_orderings(input.schema(), &[sort_keys.to_vec()]);
+
+        let output_partitioning = Partitioning::UnknownPartitioning(1);
+
+        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
     }
 }
 
@@ -183,13 +202,8 @@ impl ExecutionPlan for DeduplicateExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        trace!("Deduplicate output ordering: {:?}", self.sort_keys);
-        Some(&self.sort_keys)
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.cache
     }
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
@@ -208,11 +222,6 @@ impl ExecutionPlan for DeduplicateExec {
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![Arc::clone(&self.input)]
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        // deduplicate does not change the equivalence properties
-        self.input.equivalence_properties()
     }
 
     fn with_new_children(
@@ -367,7 +376,7 @@ mod test {
         record_batch::RecordBatch,
     };
     use arrow_util::assert_batches_eq;
-    use datafusion::physical_plan::{expressions::col, memory::MemoryExec};
+    use datafusion::physical_plan::{expressions::col, memory::MemoryExec, ExecutionMode};
     use datafusion_util::test_collect;
 
     use super::*;
@@ -1012,10 +1021,7 @@ mod test {
             Err(ArrowError::ComputeError("This is the error".to_string())),
         ];
 
-        let input = Arc::new(DummyExec {
-            schema: Arc::clone(&schema),
-            batches,
-        });
+        let input = Arc::new(DummyExec::new(Arc::clone(&schema), batches));
 
         let sort_keys = vec![PhysicalSortExpr {
             expr: col("t1", &schema).unwrap(),
@@ -1159,6 +1165,27 @@ mod test {
     struct DummyExec {
         schema: SchemaRef,
         batches: Vec<Result<RecordBatch, ArrowError>>,
+        /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+        cache: PlanProperties,
+    }
+
+    impl DummyExec {
+        pub fn new(schema: SchemaRef, batches: Vec<Result<RecordBatch, ArrowError>>) -> Self {
+            let cache = Self::compute_properties(Arc::clone(&schema));
+            Self {
+                schema,
+                batches,
+                cache,
+            }
+        }
+
+        fn compute_properties(schema: SchemaRef) -> PlanProperties {
+            let eq_properties = EquivalenceProperties::new(schema);
+
+            let output_partitioning = Partitioning::UnknownPartitioning(1);
+
+            PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
+        }
     }
 
     impl ExecutionPlan for DummyExec {
@@ -1170,12 +1197,8 @@ mod test {
             Arc::clone(&self.schema)
         }
 
-        fn output_partitioning(&self) -> Partitioning {
-            unimplemented!();
-        }
-
-        fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-            unimplemented!()
+        fn properties(&self) -> &PlanProperties {
+            &self.cache
         }
 
         fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

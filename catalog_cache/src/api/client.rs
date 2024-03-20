@@ -11,7 +11,7 @@ use hyper::service::Service;
 use metric::DurationHistogram;
 use reqwest::dns::{Resolve, Resolving};
 use reqwest::{Client, Response, StatusCode, Url};
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 pub enum Error {
     #[snafu(display("Creating client: {source}"))]
     Client { source: reqwest::Error },
+
+    #[snafu(display("Invalid endpoint: {url}"))]
+    InvalidEndpoint { url: Url },
 
     #[snafu(display("Put Reqwest error: {source}"))]
     Put { source: reqwest::Error },
@@ -74,6 +77,25 @@ impl CatalogCacheClientBuilder {
             endpoint,
             registry,
         } = self;
+
+        ensure!(
+            endpoint.path().is_empty() || endpoint.path() == "/",
+            InvalidEndpointSnafu {
+                url: endpoint.clone()
+            },
+        );
+        ensure!(
+            endpoint.query().is_none(),
+            InvalidEndpointSnafu {
+                url: endpoint.clone()
+            },
+        );
+        ensure!(
+            endpoint.fragment().is_none(),
+            InvalidEndpointSnafu {
+                url: endpoint.clone()
+            },
+        );
 
         // Note: do NOT set `.timeout` here because we set the timeout per request type.
         let client = Client::builder()
@@ -162,6 +184,14 @@ impl CatalogCacheClient {
         }
     }
 
+    /// URL to given key.
+    fn url(&self, path: RequestPath) -> Url {
+        // try to construct URL rather cheaply, a true builder doesn't really exists yet, see https://github.com/servo/rust-url/issues/835
+        let mut url = self.endpoint.clone();
+        url.set_path(&path.to_string());
+        url
+    }
+
     /// Retrieve the given value from the remote cache, if present
     pub async fn get(&self, key: CacheKey) -> Result<Option<CacheValue>> {
         self.get_if_modified(key, None).await
@@ -175,7 +205,7 @@ impl CatalogCacheClient {
         key: CacheKey,
         generation: Option<u64>,
     ) -> Result<Option<CacheValue>> {
-        let url = format!("{}{}", self.endpoint, RequestPath::Resource(key));
+        let url = self.url(RequestPath::Resource(key));
         let mut req = self.client.get(url).timeout(self.get_request_timeout);
         if let Some(generation) = generation {
             req = req.header(&GENERATION_NOT_MATCH, generation)
@@ -209,7 +239,7 @@ impl CatalogCacheClient {
     /// Returns false if the value had a generation less than or equal to
     /// an existing value
     pub async fn put(&self, key: CacheKey, value: &CacheValue) -> Result<bool> {
-        let url = format!("{}{}", self.endpoint, RequestPath::Resource(key));
+        let url = self.url(RequestPath::Resource(key));
 
         let response = self
             .client
@@ -231,8 +261,10 @@ impl CatalogCacheClient {
     /// Values larger than `max_value_size` will not be returned inline, with only the key
     /// and generation returned instead. Defaults to [`MAX_VALUE_SIZE`]
     pub fn list(&self, max_value_size: Option<usize>) -> ListStream {
+        let mut url = self.url(RequestPath::List);
         let size = max_value_size.unwrap_or(MAX_VALUE_SIZE);
-        let url = format!("{}{}?size={size}", self.endpoint, RequestPath::List);
+        url.set_query(Some(&format!("size={size}")));
+
         let fut = self
             .client
             .get(url)
@@ -337,5 +369,32 @@ impl ResolverMetrics {
 
     fn record(&self, duration: Duration) {
         self.duration.record(duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_checks_endpoint() {
+        // OK
+        construct_with_endpoint("http://example.com").unwrap();
+        construct_with_endpoint("http://example.com/").unwrap();
+        construct_with_endpoint("https://example.com").unwrap();
+        construct_with_endpoint("https://example.com:11111").unwrap();
+
+        // no OK
+        construct_with_endpoint("http://example.com/x").unwrap_err();
+        construct_with_endpoint("http://example.com?a").unwrap_err();
+        construct_with_endpoint("http://example.com#a").unwrap_err();
+    }
+
+    fn construct_with_endpoint(endpoint: &'static str) -> Result<CatalogCacheClient> {
+        CatalogCacheClient::builder(
+            endpoint.try_into().unwrap(),
+            Arc::new(metric::Registry::new()),
+        )
+        .build()
     }
 }

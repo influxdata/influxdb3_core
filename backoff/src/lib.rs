@@ -10,6 +10,7 @@ use rand::prelude::*;
 use snafu::Snafu;
 use std::ops::ControlFlow;
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// Exponential backoff with jitter
 ///
@@ -64,8 +65,7 @@ pub struct Backoff {
     next_backoff_secs: f64,
     max_backoff_secs: f64,
     base: f64,
-    total: f64,
-    deadline: Option<f64>,
+    deadline: Option<Deadline>,
     rng: Option<Box<dyn RngCore + Sync + Send>>,
 }
 
@@ -76,7 +76,6 @@ impl std::fmt::Debug for Backoff {
             .field("next_backoff_secs", &self.next_backoff_secs)
             .field("max_backoff_secs", &self.max_backoff_secs)
             .field("base", &self.base)
-            .field("total", &self.total)
             .field("deadline", &self.deadline)
             .finish()
     }
@@ -118,8 +117,7 @@ impl Backoff {
             next_backoff_secs: init_backoff,
             max_backoff_secs: max_backoff,
             base: config.base,
-            total: 0.0,
-            deadline: config.deadline.map(|d| d.as_secs_f64()),
+            deadline: config.deadline.map(Deadline::new),
             rng,
         }
     }
@@ -134,7 +132,6 @@ impl Backoff {
             next_backoff_secs: self.next_backoff_secs,
             max_backoff_secs: new.max_backoff_secs,
             base: new.base,
-            total: self.total,
             deadline: new.deadline,
             rng: self.rng.take(),
         };
@@ -165,7 +162,7 @@ impl Backoff {
                 Some(backoff) => backoff,
                 None => {
                     return Err(BackoffError::DeadlineExceeded {
-                        deadline: Duration::from_secs_f64(self.deadline.expect("deadline")),
+                        deadline: self.deadline.expect("deadline").duration,
                         source: e,
                     });
                 }
@@ -223,12 +220,9 @@ impl Iterator for Backoff {
         };
 
         let next_backoff = self.max_backoff_secs.min(rand_backoff);
-        self.total += next_backoff;
         let res = std::mem::replace(&mut self.next_backoff_secs, next_backoff);
-        if let Some(deadline) = self.deadline {
-            if self.total >= deadline {
-                return None;
-            }
+        if self.deadline.is_some_and(|x| x.expired()) {
+            return None;
         }
         duration_try_from_secs_f64(res)
     }
@@ -244,6 +238,25 @@ fn duration_try_from_secs_f64(secs: f64) -> Option<Duration> {
         .then(|| Duration::from_secs_f64(secs))
 }
 
+#[derive(Debug, Copy, Clone)]
+struct Deadline {
+    duration: Duration,
+    start: Instant,
+}
+
+impl Deadline {
+    fn new(duration: Duration) -> Self {
+        Self {
+            duration,
+            start: Instant::now(),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.start.elapsed() > self.duration
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_backoff() {
-        let init_backoff_secs = 1.;
+        let init_backoff_secs = 0.1;
         let max_backoff_secs = 500.;
         let base = 3.;
 
@@ -302,6 +315,7 @@ mod tests {
             },
             Some(rng),
         );
+        std::thread::sleep(Duration::from_secs_f64(init_backoff_secs));
         assert_eq!(backoff.next(), None);
     }
 

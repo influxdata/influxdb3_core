@@ -226,7 +226,7 @@ pub struct ObjectStoreConfig {
 
     /// Optional config for the cache client.
     #[clap(flatten)]
-    pub cache_config: Option<ParquetCacheClientConfig>,
+    pub parquet_cache_config: Option<ParquetCacheClientConfig>,
 }
 
 impl ObjectStoreConfig {
@@ -253,7 +253,7 @@ impl ObjectStoreConfig {
             google_service_account: Default::default(),
             object_store,
             object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
-            cache_config: Default::default(),
+            parquet_cache_config: Default::default(),
         }
     }
 }
@@ -445,7 +445,7 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
         },
     };
 
-    if let Some(cache_config) = &config.cache_config {
+    if let Some(cache_config) = &config.parquet_cache_config {
         let cache = parquet_cache::make_client(
             cache_config.namespace_addr.clone(),
             Arc::clone(&remote_store),

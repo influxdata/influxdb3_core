@@ -432,7 +432,7 @@ async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Resu
             };
 
             for table_name in schema.table_names() {
-                let Some(table) = schema.table(&table_name).await else {
+                let Some(table) = schema.table(&table_name).await? else {
                     continue;
                 };
 

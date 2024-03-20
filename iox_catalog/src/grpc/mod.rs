@@ -21,7 +21,7 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
         maybe_start_logging();
 

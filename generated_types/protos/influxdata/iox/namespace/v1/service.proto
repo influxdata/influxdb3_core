@@ -117,6 +117,6 @@ message Namespace {
   optional influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 6;
 
   // A monotonically increasing counter tracking the version of this namespace's
-  // metadata, as managed by the router.
+  // non-schema properties, as used across routers.
   int64 router_version = 7;
 }

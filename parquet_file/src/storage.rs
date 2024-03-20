@@ -100,6 +100,9 @@ pub struct ParquetExecInput {
     /// Store where the file is located.
     pub object_store_url: ObjectStoreUrl,
 
+    /// The actual store referenced by [`object_store_url`](Self::object_store_url).
+    pub object_store: Arc<DynObjectStore>,
+
     /// Object metadata.
     pub object_meta: ObjectMeta,
 }
@@ -291,6 +294,7 @@ impl ParquetStorage {
         ParquetExecInput {
             object_store_url: ObjectStoreUrl::parse(format!("iox://{}/", self.id))
                 .expect("valid object store URL"),
+            object_store: Arc::clone(&self.object_store),
             object_meta: ObjectMeta {
                 location: path.object_store_path(),
                 // we don't care about the "last modified" field
