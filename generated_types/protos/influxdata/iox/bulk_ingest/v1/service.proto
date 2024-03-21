@@ -13,6 +13,10 @@ service BulkIngestService {
   // in the catalog by merging these new columns with the existing catalog sort key, then return
   // the full sort key.
   rpc UpsertSortKey(UpsertSortKeyRequest) returns (UpsertSortKeyResponse);
+
+  // Given a Parquet file that a bulk ingester has uploaded to object storage, validate it contains
+  // the metadata and signature provided in this request, then add it to the catalog.
+  rpc FinalizeParquet(FinalizeParquetRequest) returns (FinalizeParquetResponse);
 }
 
 message NewParquetMetadataRequest {
@@ -26,7 +30,8 @@ message NewParquetMetadataRequest {
   string partition_key = 3;
 
   // The set of column names that will appear in this Parquet file, ordered by cardinality of the
-  // full data set (not just the cardinality of the data appearing in this file).
+  // full data set (not just the cardinality of the data appearing in this file), used to sort this
+  // file.
   //
   // This is not necessarily the column order that will be uploaded later.
   //
@@ -34,7 +39,7 @@ message NewParquetMetadataRequest {
   // returned in the metadata blob.
   //
   // This request will return an error if any columns are unknown or have no schema information.
-  repeated string columns = 4;
+  repeated string file_sort_key = 4;
 
   // Timestamp when the dataset to be imported was generated - used to order older/newer data
   google.protobuf.Timestamp data_created_at = 5;
@@ -71,3 +76,14 @@ message UpsertSortKeyResponse {
    // which columns actually occur in the file
    repeated string sort_key = 3;
 }
+
+message FinalizeParquetRequest {
+   // The Parquet metadata blob.
+   //
+   // Opaque payload consisting of a `key=value` map to be inserted into the Parquet file metadata.
+   //
+   // Metadata is IOxMetadata + ECDSA signature to ensure it is not tampered with.
+   map<string, string> metadata = 1;
+}
+
+message FinalizeParquetResponse {}

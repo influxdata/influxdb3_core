@@ -140,10 +140,24 @@ impl CatalogCache {
     ///
     /// Periodically calling this provides a Not-Recently-Used eviction policy
     pub fn evict_unused(&self) -> EvictionStats {
+        self.retain(|_key, entry| entry.used.swap(false, Ordering::Relaxed))
+    }
+
+    /// Wipe everything.
+    pub fn clear(&self) -> EvictionStats {
+        // do NOT use `self.map.clear` because this bypasses the observers and the memory limiter, so the accounting and
+        // metrics will be all off
+        self.retain(|_, _| false)
+    }
+
+    fn retain<F>(&self, f: F) -> EvictionStats
+    where
+        F: for<'a> Fn(&'a CacheKey, &'a CacheEntry) -> bool,
+    {
         let mut stats = EvictionStats { count: 0, size: 0 };
 
         self.map.retain(|key, entry| {
-            let retain = entry.used.swap(false, Ordering::Relaxed);
+            let retain = f(key, entry);
 
             if !retain {
                 let size = entry.value.data.len();
@@ -372,5 +386,19 @@ mod tests {
         assert_eq!(cache.evict_unused(), EvictionStats { count: 1, size: 20 },);
 
         cache.insert(k2, CacheValue::new(v_100.clone(), 1)).unwrap();
+    }
+
+    #[test]
+    fn test_clear() {
+        let observer = Arc::new(KeyObserver::default());
+        let cache = CatalogCache::default().with_observer(Arc::clone(&observer) as _);
+
+        let v1 = CacheValue::new("1".into(), 5);
+        assert!(cache.insert(CacheKey::Table(0), v1.clone()).unwrap());
+        assert_eq!(cache.get(CacheKey::Table(0)).unwrap(), v1);
+
+        assert_eq!(cache.clear(), EvictionStats { count: 1, size: 1 },);
+        assert_eq!(cache.get(CacheKey::Table(0)), None);
+        assert_eq!(observer.keys.len(), 0)
     }
 }

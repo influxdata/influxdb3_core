@@ -1,4 +1,5 @@
 //! gRPC client implementation.
+use std::collections::HashSet;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -173,6 +174,12 @@ impl Catalog for GrpcCatalogClient {
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
+        Err(Error::NotImplemented {
+            descr: "active applications".to_owned(),
+        })
     }
 }
 

@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use datafusion::{execution::context::SessionState, physical_optimizer::PhysicalOptimizerRule};
 
+pub(crate) use self::limits::ParquetFileMetrics;
 use self::{
-    combine_chunks::CombineChunks,
     dedup::{
-        dedup_null_columns::DedupNullColumns, dedup_sort_order::DedupSortOrder,
-        partition_split::PartitionSplit, remove_dedup::RemoveDedup, time_split::TimeSplit,
+        dedup_null_columns::DedupNullColumns, dedup_sort_order::DedupSortOrder, split::SplitDedup,
     },
     limits::CheckLimits,
     predicate_pushdown::PredicatePushdown,
@@ -16,7 +15,6 @@ use self::{
 };
 
 mod chunk_extraction;
-mod combine_chunks;
 mod dedup;
 mod limits;
 mod predicate_pushdown;
@@ -35,10 +33,7 @@ pub fn register_iox_physical_optimizers(state: SessionState) -> SessionState {
     // prepend IOx-specific rules to DataFusion builtins
     // The optimizer rules have to be done in this order
     let mut optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Sync + Send>> = vec![
-        Arc::new(PartitionSplit),
-        Arc::new(TimeSplit),
-        Arc::new(RemoveDedup),
-        Arc::new(CombineChunks),
+        Arc::new(SplitDedup),
         Arc::new(DedupNullColumns),
         Arc::new(DedupSortOrder),
         Arc::new(PredicatePushdown),

@@ -5,9 +5,11 @@ option go_package = "github.com/influxdata/iox/querier/v1";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
+import "influxdata/iox/querier/v1/params.proto";
+
 service QueryLogService {
     // Get the process-local query log.
-    rpc GetLog(GetLogRequest) returns (GetLogResponse);
+    rpc GetLog(GetLogRequest) returns (stream GetLogResponse);
 }
 
 message GetLogRequest {}
@@ -32,11 +34,20 @@ message LogEntry {
   // Query text.
   string query_text = 5;
 
+  // Query parameters
+  repeated QueryParam query_params = 21;
+
   // Trace ID.
   string trace_id = 6;
 
   // Start timestamp.
   google.protobuf.Timestamp issue_time = 7;
+
+  // Number of partitions the query was executed on.
+  int64 partitions = 18;
+
+  // Number of parquet files the query was executed on.
+  int64 parquet_files = 19;
 
   reserved 8;
   reserved 'query_completed_duration';
@@ -57,6 +68,9 @@ message LogEntry {
   // CPU duration spend for computation.
   google.protobuf.Duration compute_duration = 15;
 
+  // Maximum memory allocated when executing the query.
+  int64 max_memory = 20;
+
   // If the query completed successfully.
   bool success = 9;
 
@@ -67,15 +81,20 @@ message LogEntry {
   bool cancelled = 17;
 }
 
-message GetLogResponse {
-  // Current entries.
-  repeated LogEntry entries = 1;
-
+// Metadata for the entire response.
+message Metadata {
   // Maximum size of the query log.
-  uint64 max_size = 2;
+  uint64 max_size = 1;
 
   // Number of evicted entries due to the "max size" constraint.
-  uint64 evicted = 3;
+  uint64 evicted = 2;
+}
+
+message GetLogResponse {
+  oneof data {
+    Metadata metadata = 1;
+    LogEntry entry = 2;
+  }
 }
 
 enum Phase {

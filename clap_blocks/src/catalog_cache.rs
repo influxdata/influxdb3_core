@@ -92,6 +92,26 @@ pub struct CatalogConfig {
     )]
     pub warmup_delay: Duration,
 
+    /// Maximum tries that we perform a warmup.
+    #[clap(
+        long = "catalog-cache-warmup-tries-limit",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_WARMUP_TRIES_LIMIT",
+        default_value_t = 100
+    )]
+    pub warmup_tries_limit: usize,
+
+    /// Limits the size of cache values pulled from peers during warm-up.
+    ///
+    /// Values that exceed this limit will NOT be pulled during warm-up and will likely lead to a cache MISS later.
+    ///
+    /// This mostly acts as a service protection limit to limit the size of the warm-up data.
+    #[clap(
+        long = "catalog-cache-warmup-max-value-size",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_WARMUP_MAX_VALUE_SIZE",
+        default_value_t = 1024 * 10
+    )]
+    pub warmup_max_value_size: usize,
+
     /// Garbage collection interval.
     ///
     /// Every time this interval past, cache elements that have not been used (i.e. read or updated) since the last time
@@ -147,6 +167,57 @@ pub struct CatalogConfig {
         value_parser = humantime::parse_duration,
     )]
     pub grpc_server_timeout: Duration,
+
+    /// Enable cache bypass detection.
+    ///
+    /// This will report the bypass detection status via metrics and will clear the cache once the bypass ends. This
+    /// helps to restore consistency after the initial roll-out.
+    #[clap(
+        long = "catalog-cache-bypass-detection-enabled",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_ENABLED",
+        default_value = "true"
+    )]
+    pub bypass_detection_enabled: bool,
+
+    /// Application that the cache bypass detection will consider.
+    #[clap(
+        long = "catalog-cache-bypass-detection-conflicting-apps",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_CONFLICTING_APPS",
+        required = false,
+        num_args=1..,
+        value_delimiter = ',',
+        default_value = "compactor,garbage-collector,ingester,querier,router",
+    )]
+    pub bypass_detection_conflicting_apps: Vec<String>,
+
+    /// How often should the bypass detection run?
+    #[clap(
+        long = "catalog-cache-bypass-detection-check-interval",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_CHECK_INTERVAL",
+        default_value = "10s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub bypass_detection_check_interval: Duration,
+
+    /// How quickly should the bypass detection mark as "Ok"/"not bypassed" after the last conflicting app is gone?
+    #[clap(
+        long = "catalog-cache-bypass-detection-recovery-duration",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_RECOVERY_DURATION",
+        default_value = "5m",
+        value_parser = humantime::parse_duration,
+    )]
+    pub bypass_detection_recovery_duration: Duration,
+
+    /// While a catalog bypass is detected, we will wipe the catalog cache in this interval.
+    ///
+    /// In addition to this, we also wipe the cache when the bypass phase ends.
+    #[clap(
+        long = "catalog-cache-bypass-detection-clear-interval",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_CLEAR_INTERVAL",
+        default_value = "10m",
+        value_parser = humantime::parse_duration,
+    )]
+    pub bypass_detection_clear_interval: Duration,
 }
 
 impl CatalogConfig {

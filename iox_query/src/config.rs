@@ -8,8 +8,8 @@ pub const IOX_CONFIG_PREFIX: &str = "iox";
 extensions_options! {
     /// Config options for IOx.
     pub struct IoxConfigExt {
-        /// When splitting de-duplicate operations based on IOx partitions[^iox_part], this is the maximum number of IOx
-        /// partitions that should be considered. If there are more partitions, the split will NOT be performed.
+        /// When splitting de-duplicate operations based on IOx partitions[^iox_part] and time, this is the maximum number of groups
+        /// that should be considered. If there are more groups, the split will NOT be performed.
         ///
         /// This protects against certain highly degenerative plans.
         ///
@@ -17,13 +17,7 @@ extensions_options! {
         /// [^iox_part]: "IOx partition" refers to a partition within the IOx catalog, i.e. a partition within the
         ///              primary key space. This is NOT the same as a DataFusion partition which refers to a stream
         ///              within the physical plan data flow.
-        pub max_dedup_partition_split: usize, default = 10_000
-
-        /// When splitting de-duplicate operations based on time-based overlaps, this is the maximum number of groups
-        /// that should be considered. If there are more groups, the split will NOT be performed.
-        ///
-        /// This protects against certain highly degenerative plans.
-        pub max_dedup_time_split: usize, default = 100
+        pub max_dedup_split: usize, default = 100
 
         /// When multiple parquet files are required in a sorted way (e.g. for de-duplication), we have two options:
         ///

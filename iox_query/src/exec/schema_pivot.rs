@@ -35,11 +35,11 @@ use datafusion::{
     error::{DataFusionError as Error, Result},
     execution::context::TaskContext,
     logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
-        expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
-        DisplayFormatType, Distribution, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-        Statistics,
+        DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+        PlanProperties, SendableRecordBatchStream, Statistics,
     },
 };
 use datafusion::{error::DataFusionError, physical_plan::DisplayAs};
@@ -144,15 +144,35 @@ pub struct SchemaPivotExec {
     schema: SchemaRef,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+    cache: PlanProperties,
 }
 
 impl SchemaPivotExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
+        let cache = Self::compute_properties(&input, Arc::clone(&schema));
         Self {
             input,
             schema,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+
+        use Partitioning::*;
+        let output_partitioning = match input.output_partitioning() {
+            RoundRobinBatch(num_partitions) => RoundRobinBatch(*num_partitions),
+            // as this node transforms the output schema,  whatever partitioning
+            // was present on the input is lost on the output
+            Hash(_, num_partitions) => UnknownPartitioning(*num_partitions),
+            UnknownPartitioning(num_partitions) => UnknownPartitioning(*num_partitions),
+        };
+
+        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
     }
 }
 
@@ -171,19 +191,8 @@ impl ExecutionPlan for SchemaPivotExec {
         Arc::clone(&self.schema)
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        use Partitioning::*;
-        match self.input.output_partitioning() {
-            RoundRobinBatch(num_partitions) => RoundRobinBatch(num_partitions),
-            // as this node transforms the output schema,  whatever partitioning
-            // was present on the input is lost on the output
-            Hash(_, num_partitions) => UnknownPartitioning(num_partitions),
-            UnknownPartitioning(num_partitions) => UnknownPartitioning(num_partitions),
-        }
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -199,11 +208,10 @@ impl ExecutionPlan for SchemaPivotExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match children.len() {
-            1 => Ok(Arc::new(Self {
-                input: Arc::clone(&children[0]),
-                schema: Arc::clone(&self.schema),
-                metrics: ExecutionPlanMetricsSet::new(),
-            })),
+            1 => Ok(Arc::new(Self::new(
+                Arc::clone(&children[0]),
+                Arc::clone(&self.schema),
+            ))),
             _ => Err(Error::Internal(
                 "SchemaPivotExec wrong number of children".to_string(),
             )),
@@ -218,7 +226,7 @@ impl ExecutionPlan for SchemaPivotExec {
     ) -> Result<SendableRecordBatchStream> {
         debug!(partition, "Start SchemaPivotExec::execute");
 
-        if self.output_partitioning().partition_count() <= partition {
+        if self.properties().output_partitioning().partition_count() <= partition {
             return Err(Error::Internal(format!(
                 "SchemaPivotExec invalid partition {partition}"
             )));

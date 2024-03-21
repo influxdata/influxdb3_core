@@ -14,7 +14,7 @@ pub mod sleep;
 pub(crate) mod split;
 pub mod stringset;
 use datafusion_util::config::register_iox_object_store;
-use executor::DedicatedExecutor;
+pub use executor::DedicatedExecutor;
 use metric::Registry;
 use object_store::DynObjectStore;
 use parquet_file::storage::StorageId;
@@ -83,55 +83,12 @@ impl Display for ExecutorConfig {
     }
 }
 
-#[derive(Debug)]
-pub struct DedicatedExecutors {
-    /// Executor for running user queries
-    query_exec: DedicatedExecutor,
-
-    /// Executor for running system/reorganization tasks such as
-    /// compact
-    reorg_exec: DedicatedExecutor,
-
-    /// Number of threads per thread pool
-    num_threads: NonZeroUsize,
-}
-
-impl DedicatedExecutors {
-    pub fn new(num_threads: NonZeroUsize, metric_registry: Arc<Registry>) -> Self {
-        let query_exec =
-            DedicatedExecutor::new("IOx Query", num_threads, Arc::clone(&metric_registry));
-        let reorg_exec = DedicatedExecutor::new("IOx Reorg", num_threads, metric_registry);
-
-        Self {
-            query_exec,
-            reorg_exec,
-            num_threads,
-        }
-    }
-
-    pub fn new_testing() -> Self {
-        let query_exec = DedicatedExecutor::new_testing();
-        let reorg_exec = DedicatedExecutor::new_testing();
-        assert_eq!(query_exec.num_threads(), reorg_exec.num_threads());
-        let num_threads = query_exec.num_threads();
-        Self {
-            query_exec,
-            reorg_exec,
-            num_threads,
-        }
-    }
-
-    pub fn num_threads(&self) -> NonZeroUsize {
-        self.num_threads
-    }
-}
-
 /// Handles executing DataFusion plans, and marshalling the results into rust
 /// native structures.
 #[derive(Debug)]
 pub struct Executor {
-    /// Executors
-    executors: Arc<DedicatedExecutors>,
+    /// Executor
+    executor: DedicatedExecutor,
 
     /// The default configuration options with which to create contexts
     config: ExecutorConfig,
@@ -147,60 +104,56 @@ impl Display for Executor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutorType {
-    /// Run using the pool for queries
-    Query,
-
-    /// Run using the pool for system / reorganization tasks
-    Reorg,
-}
-
 impl Executor {
     /// Creates a new executor with a two dedicated thread pools, each
     /// with num_threads
     pub fn new(
+        name: &'static str,
         num_threads: NonZeroUsize,
         mem_pool_size: usize,
         metric_registry: Arc<Registry>,
     ) -> Self {
-        Self::new_with_config(ExecutorConfig {
-            num_threads,
-            target_query_partitions: num_threads,
-            object_stores: HashMap::default(),
-            metric_registry,
-            mem_pool_size,
-        })
+        Self::new_with_config(
+            name,
+            ExecutorConfig {
+                num_threads,
+                target_query_partitions: num_threads,
+                object_stores: HashMap::default(),
+                metric_registry,
+                mem_pool_size,
+            },
+        )
     }
 
     /// Create new executor based on a specific config.
-    pub fn new_with_config(config: ExecutorConfig) -> Self {
-        let executors = Arc::new(DedicatedExecutors::new(
+    pub fn new_with_config(name: &'static str, config: ExecutorConfig) -> Self {
+        let executor = DedicatedExecutor::new(
+            name,
             config.num_threads,
             Arc::clone(&config.metric_registry),
-        ));
-        Self::new_with_config_and_executors(config, executors)
+        );
+        Self::new_with_config_and_executor(config, executor)
     }
 
     /// Get testing executor that runs a on single thread and a low memory bound
     /// to preserve resources.
     pub fn new_testing() -> Self {
         let config = ExecutorConfig::testing();
-        let executors = Arc::new(DedicatedExecutors::new_testing());
-        Self::new_with_config_and_executors(config, executors)
+        let executor = DedicatedExecutor::new_testing();
+        Self::new_with_config_and_executor(config, executor)
     }
 
     /// Low-level constructor.
     ///
-    /// This is mostly useful if you wanna keep the executors (because they are quiet expensive to create) but need a fresh IOx runtime.
+    /// This is mostly useful if you wanna keep the executor (because they are quite expensive to create) but need a fresh IOx runtime.
     ///
     /// # Panic
-    /// Panics if the number of threads in `executors` is different from `config`.
-    pub fn new_with_config_and_executors(
+    /// Panics if the number of threads in `executor` is different from `config`.
+    pub fn new_with_config_and_executor(
         config: ExecutorConfig,
-        executors: Arc<DedicatedExecutors>,
+        executor: DedicatedExecutor,
     ) -> Self {
-        assert_eq!(config.num_threads, executors.num_threads);
+        assert_eq!(config.num_threads, executor.num_threads());
 
         let runtime_config = RuntimeConfig::new()
             .with_disk_manager(DiskManagerConfig::Disabled)
@@ -230,7 +183,7 @@ impl Executor {
         );
 
         Self {
-            executors,
+            executor,
             config,
             runtime,
         }
@@ -239,31 +192,21 @@ impl Executor {
     /// Return a new execution config, suitable for executing a new query or system task.
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
-    pub fn new_execution_config(&self, executor_type: ExecutorType) -> IOxSessionConfig {
-        let exec = self.executor(executor_type).clone();
-        IOxSessionConfig::new(exec, Arc::clone(&self.runtime))
+    pub fn new_execution_config(&self) -> IOxSessionConfig {
+        IOxSessionConfig::new(self.executor.clone(), Arc::clone(&self.runtime))
             .with_target_partitions(self.config.target_query_partitions)
     }
 
     /// Create a new execution context, suitable for executing a new query or system task
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
-    pub fn new_context(&self, executor_type: ExecutorType) -> IOxSessionContext {
-        self.new_execution_config(executor_type).build()
-    }
-
-    /// Return the execution pool  of the specified type
-    pub fn executor(&self, executor_type: ExecutorType) -> &DedicatedExecutor {
-        match executor_type {
-            ExecutorType::Query => &self.executors.query_exec,
-            ExecutorType::Reorg => &self.executors.reorg_exec,
-        }
+    pub fn new_context(&self) -> IOxSessionContext {
+        self.new_execution_config().build()
     }
 
     /// Initializes shutdown.
     pub fn shutdown(&self) {
-        self.executors.query_exec.shutdown();
-        self.executors.reorg_exec.shutdown();
+        self.executor.shutdown();
     }
 
     /// Stops all subsequent task executions, and waits for the worker
@@ -273,8 +216,7 @@ impl Executor {
     /// executing thread to complete. All other calls to join will
     /// complete immediately.
     pub async fn join(&self) {
-        self.executors.query_exec.join().await;
-        self.executors.reorg_exec.join().await;
+        self.executor.join().await;
     }
 
     /// Returns the memory pool associated with this `Executor`
@@ -285,6 +227,11 @@ impl Executor {
     /// Returns underlying config.
     pub fn config(&self) -> &ExecutorConfig {
         &self.config
+    }
+
+    /// Returns the underlying [`DedicatedExecutor`].
+    pub fn executor(&self) -> &DedicatedExecutor {
+        &self.executor
     }
 }
 
@@ -404,9 +351,10 @@ mod tests {
         datasource::{provider_as_source, MemTable},
         error::DataFusionError,
         logical_expr::LogicalPlanBuilder,
-        physical_expr::PhysicalSortExpr,
+        physical_expr::{EquivalenceProperties, PhysicalSortExpr},
         physical_plan::{
-            expressions::Column, sorts::sort::SortExec, DisplayAs, ExecutionPlan, RecordBatchStream,
+            expressions::Column, sorts::sort::SortExec, DisplayAs, ExecutionMode, ExecutionPlan,
+            PlanProperties, RecordBatchStream,
         },
     };
     use futures::{stream::BoxStream, Stream, StreamExt};
@@ -425,7 +373,7 @@ mod tests {
         let plan = StringSetPlan::Known(Arc::clone(&expected_strings));
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let result_strings = ctx.to_string_set(plan).await.unwrap();
         assert_eq!(result_strings, expected_strings);
     }
@@ -438,7 +386,7 @@ mod tests {
         let plan: StringSetPlan = vec![scan].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, StringSetRef::new(StringSet::new()));
@@ -454,7 +402,7 @@ mod tests {
         let plan: StringSetPlan = vec![scan].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, to_set(&["foo", "bar", "baz"]));
@@ -474,7 +422,7 @@ mod tests {
         let plan: StringSetPlan = vec![scan].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, to_set(&["foo", "bar", "baz"]));
@@ -498,7 +446,7 @@ mod tests {
         let plan: StringSetPlan = vec![scan1, scan2].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, to_set(&["foo", "bar", "baz"]));
@@ -517,7 +465,7 @@ mod tests {
         let plan: StringSetPlan = vec![scan].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await;
 
         let actual_error = match results {
@@ -541,7 +489,7 @@ mod tests {
         let plan: StringSetPlan = vec![scan].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await;
 
         let actual_error = match results {
@@ -571,7 +519,7 @@ mod tests {
         let plan = vec![pivot].into();
 
         let exec = Executor::new_testing();
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let results = ctx.to_string_set(plan).await.expect("Executed plan");
 
         assert_eq!(results, to_set(&["f1", "f2"]));
@@ -600,7 +548,7 @@ mod tests {
             }],
             Arc::clone(&test_input) as _,
         ));
-        let ctx = exec.new_context(ExecutorType::Query);
+        let ctx = exec.new_context();
         let handle = tokio::spawn(async move {
             ctx.collect(plan).await.unwrap();
         });
@@ -658,18 +606,25 @@ mod tests {
         barrier: Arc<Barrier>,
         // Barrier right before the operator is complete
         barrier_finish: Arc<Barrier>,
+        /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
+        cache: PlanProperties,
     }
 
     impl Default for TestExec {
         fn default() -> Self {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                "c",
+                DataType::Int64,
+                true,
+            )]));
+
+            let cache = Self::compute_properties(Arc::clone(&schema));
+
             Self {
-                schema: Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
-                    "c",
-                    DataType::Int64,
-                    true,
-                )])),
+                schema,
                 barrier: Arc::new(Barrier::new(2)),
                 barrier_finish: Arc::new(Barrier::new(2)),
+                cache,
             }
         }
     }
@@ -683,6 +638,16 @@ mod tests {
         /// wait for output to be done
         pub async fn wait_for_finish(&self) {
             self.barrier_finish.wait().await;
+        }
+
+        /// This function creates the cache object that stores the plan properties such as equivalence properties, partitioning, ordering, etc.
+        fn compute_properties(schema: SchemaRef) -> PlanProperties {
+            let eq_properties = EquivalenceProperties::new(schema);
+
+            let output_partitioning =
+                datafusion::physical_plan::Partitioning::UnknownPartitioning(1);
+
+            PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
         }
     }
 
@@ -705,12 +670,8 @@ mod tests {
             Arc::clone(&self.schema)
         }
 
-        fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-        }
-
-        fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-            None
+        fn properties(&self) -> &PlanProperties {
+            &self.cache
         }
 
         fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

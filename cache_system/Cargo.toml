@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-async-trait = "0.1.77"
+async-trait = "0.1.78"
 backoff = { path = "../backoff" }
 futures = "0.3"
 iox_time = { path = "../iox_time" }

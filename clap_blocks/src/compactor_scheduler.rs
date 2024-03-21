@@ -342,11 +342,10 @@ pub struct CompactorSchedulerConfig {
     /// How long since the last new file was written to a partition, in order for it
     /// to be considered cold.
     ///
-    /// If not specified, defaults to 0s ago  (Off).
+    /// If not specified, defaults to None (Off).
     /// After cold compaction is tested & stable, the default will be something like 2h.
     #[clap(
         long,
-        default_value = "0s",
         value_parser = parse_duration,
         env = "INFLUXDB_IOX_COMPACTION_COLD_THRESHOLD"
     )]

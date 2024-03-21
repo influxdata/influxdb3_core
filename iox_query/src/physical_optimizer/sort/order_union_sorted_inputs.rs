@@ -119,7 +119,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
             };
 
             // Check all inputs of UnionExec must be already sorted and on the same sort_expr of SortPreservingMergeExec
-            let Some(union_output_ordering) = union_exec.output_ordering() else {
+            let Some(union_output_ordering) = union_exec.properties().output_ordering() else {
                 warn!(plan=%displayable(plan.as_ref()).indent(false), "Union input to SortPreservingMerge is not sorted");
                 return Ok(Transformed::No(plan));
             };
@@ -150,7 +150,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
             let new_inputs = plans_value_ranges.plans
                 .iter()
                 .map(|input| {
-                    if input.output_partitioning().partition_count() > 1 {
+                    if input.properties().output_partitioning().partition_count() > 1 {
                         // Add SortPreservingMergeExec on top of this input
                         let sort_preserving_merge_exec = Arc::new(
                             SortPreservingMergeExec::new(sort_expr.to_vec(), Arc::clone(input))

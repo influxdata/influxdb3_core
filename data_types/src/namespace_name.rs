@@ -131,19 +131,15 @@ impl<'a> NamespaceName<'a> {
 
         Ok(Self::new(format!("{}_{}", org, bucket))?)
     }
+}
 
+impl<'a> From<NamespaceName<'a>> for String {
     /// Efficiently returns the string representation of this [`NamespaceName`].
     ///
     /// If this [`NamespaceName`] contains an owned string, it is returned
     /// without cloning.
-    pub fn into_string(self) -> String {
-        self.0.into_owned()
-    }
-}
-
-impl<'a> std::convert::From<NamespaceName<'a>> for String {
     fn from(name: NamespaceName<'a>) -> Self {
-        name.0.to_string()
+        name.0.into_owned()
     }
 }
 
@@ -199,23 +195,17 @@ mod tests {
             .expect("failed on valid DB mapping");
 
         assert_eq!(got.as_str(), "org_bucket");
-        assert_eq!(got.into_string(), "org_bucket");
+        assert_eq!(Into::<String>::into(got), "org_bucket");
     }
 
     #[test]
     fn test_into_string() {
-        // Ref type str
-        assert_eq!(
-            NamespaceName::new("bananas").unwrap().into_string(),
-            "bananas"
-        );
+        let name = NamespaceName::new("bananas").unwrap();
+
+        // From ref
+        assert_eq!(Into::<String>::into(&name), "bananas");
         // Owned type string
-        assert_eq!(
-            NamespaceName::new("bananas".to_string())
-                .unwrap()
-                .into_string(),
-            "bananas"
-        );
+        assert_eq!(Into::<String>::into(name), "bananas");
     }
 
     #[test]

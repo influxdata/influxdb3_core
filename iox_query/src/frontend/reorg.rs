@@ -236,7 +236,7 @@ mod test {
     use schema::sort::SortKeyBuilder;
 
     use crate::{
-        exec::{Executor, ExecutorType},
+        exec::Executor,
         test::{format_execution_plan, raw_data, TestChunk},
     };
 
@@ -365,7 +365,7 @@ mod test {
                 .expect("created compact plan");
 
             let physical_plan = executor
-                .new_context(ExecutorType::Reorg)
+                .new_context()
                 .create_physical_plan(&compact_plan)
                 .await
                 .unwrap();
@@ -403,7 +403,7 @@ mod test {
 
         let executor = Executor::new_testing();
         let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
+            .new_context()
             .create_physical_plan(&compact_plan)
             .await
             .unwrap();
@@ -425,10 +425,13 @@ mod test {
         );
 
         assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
+            physical_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             1,
             "{:?}",
-            physical_plan.output_partitioning()
+            physical_plan.properties().output_partitioning()
         );
 
         let batches = test_collect(physical_plan).await;
@@ -470,7 +473,7 @@ mod test {
 
         let executor = Executor::new_testing();
         let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
+            .new_context()
             .create_physical_plan(&compact_plan)
             .await
             .unwrap();
@@ -492,10 +495,13 @@ mod test {
         );
 
         assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
+            physical_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             1,
             "{:?}",
-            physical_plan.output_partitioning()
+            physical_plan.properties().output_partitioning()
         );
 
         let batches = test_collect(physical_plan).await;
@@ -538,7 +544,7 @@ mod test {
 
         let executor = Executor::new_testing();
         let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
+            .new_context()
             .create_physical_plan(&split_plan)
             .await
             .unwrap();
@@ -561,10 +567,13 @@ mod test {
         );
 
         assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
+            physical_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             2,
             "{:?}",
-            physical_plan.output_partitioning()
+            physical_plan.properties().output_partitioning()
         );
 
         // verify that the stream was split
@@ -619,7 +628,7 @@ mod test {
 
         let executor = Executor::new_testing();
         let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
+            .new_context()
             .create_physical_plan(&split_plan)
             .await
             .unwrap();
@@ -642,10 +651,13 @@ mod test {
         );
 
         assert_eq!(
-            physical_plan.output_partitioning().partition_count(),
+            physical_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             3,
             "{:?}",
-            physical_plan.output_partitioning()
+            physical_plan.properties().output_partitioning()
         );
 
         // Verify that the stream was split

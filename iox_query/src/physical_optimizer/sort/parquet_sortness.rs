@@ -165,7 +165,7 @@ impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
             ParquetExec::new(base_config, parquet_exec.predicate().cloned(), None);
 
         // did this help?
-        if new_parquet_exec.output_ordering() == Some(self.desired_ordering) {
+        if new_parquet_exec.properties().output_ordering() == Some(self.desired_ordering) {
             Ok(Arc::new(new_parquet_exec))
         } else {
             Ok(node)
@@ -284,7 +284,7 @@ mod tests {
                 .with_fetch(Some(42)),
         );
 
-        assert_unknown_partitioning(plan.output_partitioning(), 2);
+        assert_unknown_partitioning(plan.properties().output_partitioning().clone(), 2);
 
         let opt = ParquetSortness;
         let test = OptimizationTest::new(plan, opt);
@@ -302,7 +302,14 @@ mod tests {
         "###
         );
 
-        assert_unknown_partitioning(test.output_plan().unwrap().output_partitioning(), 3);
+        assert_unknown_partitioning(
+            test.output_plan()
+                .unwrap()
+                .properties()
+                .output_partitioning()
+                .clone(),
+            3,
+        );
     }
 
     #[test]

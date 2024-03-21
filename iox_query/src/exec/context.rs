@@ -52,7 +52,7 @@ use datafusion::{
 use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
 use executor::DedicatedExecutor;
 use futures::{Stream, StreamExt, TryStreamExt};
-use observability_deps::tracing::{debug, warn};
+use observability_deps::tracing::debug;
 use query_functions::{register_scalar_functions, selectors::register_selector_aggregates};
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 use trace::{
@@ -61,6 +61,7 @@ use trace::{
 };
 
 // Reuse DataFusion error and Result types for this module
+use crate::memory_pool::{Monitor, MonitoredMemoryPool};
 pub use datafusion::error::{DataFusionError, Result};
 
 /// This structure implements the DataFusion notion of "query planner"
@@ -230,7 +231,7 @@ impl IOxSessionConfig {
     pub fn with_config_option(mut self, key: &str, value: &str) -> Self {
         // ignore invalid config
         if let Err(e) = self.session_config.options_mut().set(key, value) {
-            warn!(
+            debug!(
                 key,
                 value,
                 %e,
@@ -267,7 +268,17 @@ impl IOxSessionConfig {
             .session_config
             .with_extension(Arc::new(recorder.span().cloned()));
 
-        let state = SessionState::new_with_config_rt(session_config, self.runtime)
+        let memory_monitor = Arc::new(Default::default());
+        let runtime = RuntimeEnv {
+            memory_pool: Arc::new(MonitoredMemoryPool::new(
+                Arc::clone(&self.runtime.memory_pool),
+                Arc::clone(&memory_monitor),
+            )),
+            disk_manager: Arc::clone(&self.runtime.disk_manager),
+            cache_manager: Arc::clone(&self.runtime.cache_manager),
+            object_store_registry: Arc::clone(&self.runtime.object_store_registry),
+        };
+        let state = SessionState::new_with_config_rt(session_config, Arc::new(runtime))
             .with_query_planner(Arc::new(IOxQueryPlanner {}));
         let state = register_iox_physical_optimizers(state);
         let state = register_iox_logical_optimizers(state);
@@ -279,7 +290,7 @@ impl IOxSessionConfig {
             inner.register_catalog(DEFAULT_CATALOG, default_catalog);
         }
 
-        IOxSessionContext::new(inner, self.exec, recorder)
+        IOxSessionContext::new(inner, self.exec, recorder, memory_monitor)
     }
 }
 
@@ -320,6 +331,9 @@ pub struct IOxSessionContext {
 
     /// Span context from which to create spans for this query
     recorder: SpanRecorder,
+
+    /// Monitor for the amount of memory allocated in this context.
+    memory_monitor: Arc<Monitor>,
 }
 
 impl fmt::Debug for IOxSessionContext {
@@ -342,6 +356,7 @@ impl IOxSessionContext {
             inner: SessionContext::default(),
             exec: DedicatedExecutor::new_testing(),
             recorder: SpanRecorder::default(),
+            memory_monitor: Arc::new(Default::default()),
         }
     }
 
@@ -350,11 +365,13 @@ impl IOxSessionContext {
         inner: SessionContext,
         exec: DedicatedExecutor,
         recorder: SpanRecorder,
+        memory_monitor: Arc<Monitor>,
     ) -> Self {
         Self {
             inner,
             exec,
             recorder,
+            memory_monitor,
         }
     }
 
@@ -465,7 +482,11 @@ impl IOxSessionContext {
         &self,
         physical_plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
-        match physical_plan.output_partitioning().partition_count() {
+        match physical_plan
+            .properties()
+            .output_partitioning()
+            .partition_count()
+        {
             0 => Ok(Box::pin(EmptyRecordBatchStream::new(
                 physical_plan.schema(),
             ))),
@@ -506,7 +527,7 @@ impl IOxSessionContext {
         // Wrap the resulting stream into `CrossRtStream`. This is required because polling the DataFusion result stream
         // actually drives the (potentially CPU-bound) work. We need to make sure that this work stays within the
         // dedicated executor because otherwise this may block the top-level tokio/tonic runtime which may lead to
-        // requests timetouts (either for new requests, metrics or even for HTTP2 pings on the active connection).
+        // requests timeouts (either for new requests, metrics or even for HTTP2 pings on the active connection).
         let schema = stream.schema();
         let stream = CrossRtStream::new_with_df_error_stream(stream, self.exec.clone());
         let stream = RecordBatchStreamAdapter::new(schema, stream);
@@ -722,6 +743,7 @@ impl IOxSessionContext {
             self.inner.clone(),
             self.exec.clone(),
             self.recorder.child(name),
+            Arc::clone(&self.memory_monitor),
         )
     }
 
@@ -748,6 +770,11 @@ impl IOxSessionContext {
     /// Number of currently active tasks.
     pub fn tasks(&self) -> usize {
         self.exec.tasks()
+    }
+
+    /// Retrieve the memory monitor for this context.
+    pub(crate) fn memory_monitor(&self) -> &Arc<Monitor> {
+        &self.memory_monitor
     }
 }
 

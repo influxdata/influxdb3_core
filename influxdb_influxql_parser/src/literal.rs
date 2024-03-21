@@ -6,7 +6,7 @@ use crate::keywords::keyword;
 use crate::string::{regex, single_quoted_string, Regex};
 use crate::timestamp::Timestamp;
 use crate::{impl_tuple_clause, write_escaped};
-use chrono::{NaiveDateTime, Offset};
+use chrono::{DateTime, Utc};
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{char, digit0, digit1};
@@ -358,11 +358,9 @@ pub(crate) fn literal_regex(i: &str) -> ParseResult<&str, Literal> {
 pub fn nanos_to_timestamp(nanos: i64) -> Timestamp {
     let (secs, nsec) = num_integer::div_mod_floor(nanos, NANOS_PER_SEC);
 
-    Timestamp::from_naive_utc_and_offset(
-        NaiveDateTime::from_timestamp_opt(secs, nsec as u32)
-            .expect("unable to convert duration to timestamp"),
-        chrono::Utc.fix(),
-    )
+    DateTime::<Utc>::from_timestamp(secs, nsec as u32)
+        .expect("unable to convert duration to timestamp")
+        .fixed_offset()
 }
 
 #[cfg(test)]

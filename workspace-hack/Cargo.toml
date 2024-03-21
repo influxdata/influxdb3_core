@@ -84,7 +84,6 @@ sha2 = { version = "0.10" }
 similar = { version = "2", features = ["inline"] }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-sqlparser = { version = "0.43", features = ["visitor"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "sqlite", "uuid"] }
 sqlx-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.7", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
@@ -99,6 +98,7 @@ tracing = { version = "0.1", features = ["log", "max_level_trace", "release_max_
 tracing-core = { version = "0.1" }
 tracing-log = { version = "0.2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
+twox-hash = { version = "1" }
 unicode-bidi = { version = "0.3" }
 unicode-normalization = { version = "0.1" }
 url = { version = "2" }
@@ -175,7 +175,7 @@ uuid = { version = "1", features = ["v4"] }
 hyper-rustls = { version = "0.24" }
 linux-raw-sys = { version = "0.4", default-features = false, features = ["elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "0.8", features = ["net", "os-ext"] }
-nix = { version = "0.27", features = ["fs", "ioctl", "poll", "signal", "term", "user"] }
+nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "term"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
 spin = { version = "0.9" }
 
@@ -183,31 +183,28 @@ spin = { version = "0.9" }
 libc = { version = "0.2", features = ["extra_traits"] }
 linux-raw-sys = { version = "0.4", default-features = false, features = ["elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 mio = { version = "0.8", features = ["net", "os-ext"] }
-nix = { version = "0.27", features = ["fs", "ioctl", "poll", "signal", "term", "user"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
 spin = { version = "0.9" }
 
 [target.x86_64-apple-darwin.dependencies]
 hyper-rustls = { version = "0.24" }
-nix = { version = "0.27", features = ["fs", "ioctl", "poll", "signal", "term", "user"] }
+nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "term"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
 spin = { version = "0.9" }
 
 [target.x86_64-apple-darwin.build-dependencies]
 libc = { version = "0.2", features = ["extra_traits"] }
-nix = { version = "0.27", features = ["fs", "ioctl", "poll", "signal", "term", "user"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
 spin = { version = "0.9" }
 
 [target.aarch64-apple-darwin.dependencies]
 hyper-rustls = { version = "0.24" }
-nix = { version = "0.27", features = ["fs", "ioctl", "poll", "signal", "term", "user"] }
+nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "term"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
 spin = { version = "0.9" }
 
 [target.aarch64-apple-darwin.build-dependencies]
 libc = { version = "0.2", features = ["extra_traits"] }
-nix = { version = "0.27", features = ["fs", "ioctl", "poll", "signal", "term", "user"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
 spin = { version = "0.9" }
 
@@ -215,15 +212,15 @@ spin = { version = "0.9" }
 hyper-rustls = { version = "0.24" }
 rustix = { version = "0.38", default-features = false, features = ["fs", "net", "std"] }
 spin = { version = "0.9" }
-winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "knownfolders", "minwinbase", "minwindef", "ntsecapi", "objbase", "processenv", "profileapi", "shlobj", "std", "synchapi", "sysinfoapi", "winbase", "wincon", "windef", "winerror", "winioctl", "winnt", "winuser", "ws2ipdef", "ws2tcpip"] }
-windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "knownfolders", "minwinbase", "minwindef", "ntsecapi", "objbase", "processenv", "profileapi", "shlobj", "std", "sysinfoapi", "winbase", "wincon", "windef", "winerror", "winioctl", "winnt", "ws2ipdef", "ws2tcpip"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 rustix = { version = "0.38", default-features = false, features = ["fs", "net", "std"] }
 spin = { version = "0.9" }
-winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "knownfolders", "minwinbase", "minwindef", "ntsecapi", "objbase", "processenv", "profileapi", "shlobj", "std", "synchapi", "sysinfoapi", "winbase", "wincon", "windef", "winerror", "winioctl", "winnt", "winuser", "ws2ipdef", "ws2tcpip"] }
-windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "knownfolders", "minwinbase", "minwindef", "ntsecapi", "objbase", "processenv", "profileapi", "shlobj", "std", "sysinfoapi", "winbase", "wincon", "windef", "winerror", "winioctl", "winnt", "ws2ipdef", "ws2tcpip"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
 
 ### END HAKARI SECTION

@@ -14,6 +14,7 @@ use data_types::{
 };
 use iox_time::TimeProvider;
 use snafu::Snafu;
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
@@ -62,6 +63,9 @@ pub enum Error {
 
     #[snafu(display("malformed request: {descr}"))]
     Malformed { descr: String },
+
+    #[snafu(display("not implemented: {descr}"))]
+    NotImplemented { descr: String },
 }
 
 impl From<sqlx::Error> for Error {
@@ -191,6 +195,13 @@ pub trait Catalog: Send + Sync + Debug + Display {
 
     /// Gets the time provider associated with this catalog.
     fn time_provider(&self) -> Arc<dyn TimeProvider>;
+
+    /// Detect active applications running on this catalog instance.
+    ///
+    /// This includes this very catalog as well.
+    ///
+    /// This is only implemented for some backends, others may return [`NotImplemented`](Error::NotImplemented).
+    async fn active_applications(&self) -> Result<HashSet<String>, Error>;
 }
 
 /// Methods for working with the catalog's various repositories (collections of entities).
@@ -531,6 +542,7 @@ impl ParquetFileRepoExt for &mut dyn ParquetFileRepo {
                 let id = params.object_store_id;
                 if let Some(existing) = self.get_by_object_store_id(id).await? {
                     let expected = ParquetFile::from_params(params, existing.id);
+
                     if expected == existing {
                         return Ok(existing);
                     }

@@ -343,7 +343,6 @@ mod tests {
     use datafusion::{
         execution::context::TaskContext,
         physical_plan::{
-            expressions::PhysicalSortExpr,
             metrics::{Count, Time, Timestamp},
             DisplayAs, Metric,
         },
@@ -644,11 +643,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-            unimplemented!()
-        }
-
-        fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
             unimplemented!()
         }
 

@@ -3,6 +3,7 @@
 
 use datafusion_util::MemoryStream;
 use futures::TryStreamExt;
+use iox_query_params::StatementParams;
 use query_log::{QueryCompletedToken, QueryText, StateReceived};
 use trace::{ctx::SpanContext, span::Span};
 
@@ -132,6 +133,7 @@ pub trait QueryNamespace: Debug + Send + Sync {
         span_ctx: Option<&SpanContext>,
         query_type: &'static str,
         query_text: QueryText,
+        query_params: StatementParams,
     ) -> QueryCompletedToken<StateReceived>;
 
     /// Returns a new execution context suitable for running queries
@@ -218,4 +220,5 @@ impl std::fmt::Debug for QueryChunkData {
 
 //
 //#[cfg(test)]
+mod memory_pool;
 pub mod test;

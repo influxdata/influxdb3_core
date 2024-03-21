@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-base64 = "0.21"
+base64 = "0.22"
 byteorder = { version = "1", features = ["std"] }
 bytes = "1.5"
 futures = "0.3"

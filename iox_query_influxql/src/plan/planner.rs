@@ -1055,6 +1055,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         WindowFrameBound::Preceding(ScalarValue::Null),
                         WindowFrameBound::Following(ScalarValue::Null),
                     ),
+                    None,
                 ));
                 let perc_row_column_name = window_perc_row.display_name()?;
 
@@ -1070,6 +1071,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         WindowFrameBound::Preceding(ScalarValue::Null),
                         WindowFrameBound::Following(ScalarValue::Null),
                     ),
+                    None,
                 ));
                 let row_column_name = window_row.display_name()?;
 
@@ -1503,6 +1505,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 WindowFrameBound::Preceding(ScalarValue::Null),
                 WindowFrameBound::CurrentRow,
             ),
+            None,
         ));
         let column_name = window_expr.display_name()?;
         let filter_expr = binary_expr(col(column_name.clone()), Operator::LtEq, lit(count));
@@ -1569,6 +1572,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     WindowFrameBound::Preceding(ScalarValue::Null),
                     WindowFrameBound::Following(ScalarValue::Null),
                 ),
+                null_treatment: None,
             })
             .alias(alias)),
             Some(udf::WindowFunction::Difference) => Ok(Expr::WindowFunction(WindowFunction {
@@ -1581,6 +1585,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     WindowFrameBound::Preceding(ScalarValue::Null),
                     WindowFrameBound::Following(ScalarValue::Null),
                 ),
+                null_treatment: None,
             })
             .alias(alias)),
             Some(udf::WindowFunction::Elapsed) => Ok(Expr::WindowFunction(WindowFunction {
@@ -1593,6 +1598,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     WindowFrameBound::Preceding(ScalarValue::Null),
                     WindowFrameBound::Following(ScalarValue::Null),
                 ),
+                null_treatment: None,
             })
             .alias(alias)),
             Some(udf::WindowFunction::NonNegativeDifference) => {
@@ -1606,6 +1612,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         WindowFrameBound::Preceding(ScalarValue::Null),
                         WindowFrameBound::Following(ScalarValue::Null),
                     ),
+                    null_treatment: None,
                 })
                 .alias(alias))
             }
@@ -1623,6 +1630,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     WindowFrameBound::Preceding(ScalarValue::Null),
                     WindowFrameBound::Following(ScalarValue::Null),
                 ),
+                null_treatment: None,
             })
             .alias(alias)),
             Some(udf::WindowFunction::NonNegativeDerivative) => {
@@ -1640,6 +1648,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         WindowFrameBound::Preceding(ScalarValue::Null),
                         WindowFrameBound::Following(ScalarValue::Null),
                     ),
+                    null_treatment: None,
                 })
                 .alias(alias))
             }
@@ -1653,6 +1662,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     WindowFrameBound::Preceding(ScalarValue::Null),
                     WindowFrameBound::Following(ScalarValue::Null),
                 ),
+                null_treatment: None,
             })
             .alias(alias)),
             None => error::internal(format!(
@@ -1733,6 +1743,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     WindowFrameBound::Preceding(ScalarValue::Null),
                     WindowFrameBound::CurrentRow,
                 ),
+                None,
             ))
             .alias(IOX_ROW_ALIAS)];
 
@@ -2274,21 +2285,43 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .map(|e| self.expr_to_df_expr(scope, e, schema))
             .collect::<Result<Vec<Expr>>>()?;
 
-        match BuiltinScalarFunction::from_str(call.name.as_str())? {
-            BuiltinScalarFunction::Log => {
-                if args.len() != 2 {
-                    error::query("invalid number of arguments for log, expected 2, got 1")
-                } else {
-                    let arg1 = args.pop().unwrap();
-                    let arg0 = args.pop().unwrap();
-                    // reverse args
-                    Ok(datafusion::prelude::log(arg1, arg0))
+        match BuiltinScalarFunction::from_str(call.name.as_str()) {
+            Ok(builtin_scalar_function) => {
+                match builtin_scalar_function {
+                    BuiltinScalarFunction::Log => {
+                        if args.len() != 2 {
+                            error::query("invalid number of arguments for log, expected 2, got 1")
+                        } else {
+                            let arg1 = args.pop().unwrap();
+                            let arg0 = args.pop().unwrap();
+                            // reverse args
+                            Ok(datafusion::prelude::log(arg1, arg0))
+                        }
+                    }
+                    fun => Ok(Expr::ScalarFunction(ScalarFunction {
+                        func_def: ScalarFunctionDefinition::BuiltIn(fun),
+                        args,
+                    })),
                 }
             }
-            fun => Ok(Expr::ScalarFunction(ScalarFunction {
-                func_def: ScalarFunctionDefinition::BuiltIn(fun),
-                args,
-            })),
+            Err(_e) => {
+                // If we can't find a built-in function with the specified name, try looking for
+                // user defined functions. DataFusion is in the process of migrating away from BuiltInScalarFunction
+                // https://github.com/apache/arrow-datafusion/issues/8045
+                let udf = self
+                    .s
+                    .get_function_meta(call.name.as_str())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "There is no built-in function nor UDF function named {}",
+                            call.name.as_str()
+                        ))
+                    })?;
+                Ok(Expr::ScalarFunction(ScalarFunction {
+                    func_def: ScalarFunctionDefinition::UDF(udf),
+                    args,
+                }))
+            }
         }
     }
 

@@ -9,13 +9,13 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.77"
+async-trait = "0.1.78"
 bytes = "1.5"
 futures = "0.3"
 iox_time = { version = "0.1.0", path = "../iox_time" }
 metric = { version = "0.1.0", path = "../metric" }
 object_store = { workspace = true }
-pin-project = "1.1.4"
+pin-project = "1.1.5"
 tokio = { version = "1.36", features = ["io-util"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

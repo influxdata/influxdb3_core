@@ -127,8 +127,8 @@ mod test {
             calls.join("\n")
         }
 
-        insta::assert_display_snapshot!(walk_expression("5 + 6 = 2 + 9"));
-        insta::assert_display_snapshot!(walk_expression("time > now() + 1h"));
+        insta::assert_snapshot!(walk_expression("5 + 6 = 2 + 9"));
+        insta::assert_snapshot!(walk_expression("time > now() + 1h"));
     }
 
     #[test]
@@ -167,8 +167,8 @@ mod test {
             calls.join("\n")
         }
 
-        insta::assert_display_snapshot!(walk_expr("5 + 6"));
-        insta::assert_display_snapshot!(walk_expr("now() + 1h"));
+        insta::assert_snapshot!(walk_expr("5 + 6"));
+        insta::assert_snapshot!(walk_expr("now() + 1h"));
     }
 
     #[test]
@@ -185,8 +185,8 @@ mod test {
             calls.join("\n")
         }
 
-        insta::assert_display_snapshot!(walk_expr_mut("5 + 6"));
-        insta::assert_display_snapshot!(walk_expr_mut("now() + 1h"));
+        insta::assert_snapshot!(walk_expr_mut("5 + 6"));
+        insta::assert_snapshot!(walk_expr_mut("now() + 1h"));
     }
 
     #[test]

@@ -25,6 +25,7 @@ members = [
     "influxrpc_parser",
     "iox_catalog",
     "iox_data_generator",
+    "iox_http",
     "iox_query_influxql",
     "iox_query_influxrpc",
     "iox_query",
@@ -87,10 +88,10 @@ license = "MIT OR Apache-2.0"
 arrow = { version = "50.0.0", features = ["prettyprint", "chrono-tz"] }
 arrow-buffer = { version = "50.0.0" }
 arrow-flight = { version = "50.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "91f3eb2e5430d23e2b551e66732bec1a3a575971" }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "91f3eb2e5430d23e2b551e66732bec1a3a575971" }
+datafusion = { git = "https://github.com/erratic-pattern/arrow-datafusion.git", rev = "5965d670c88bdfa1fb74f32fd5021d400838dade" }
+datafusion-proto = { git = "https://github.com/erratic-pattern/arrow-datafusion.git", rev = "5965d670c88bdfa1fb74f32fd5021d400838dade" }
 hashbrown = { version = "0.14.3" }
-object_store = { version = "0.9.0" }
+object_store = { version = "0.9.1" }
 parquet = { version = "50.0.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
@@ -99,7 +100,7 @@ prost = { version = "0.12.3" }
 prost-build = { version = "0.12.2" }
 prost-types = { version = "0.12.3" }
 smallvec = { version = "1.13.1", features = ["union"] }
-sqlparser = { version = "0.43.1" }
+sqlparser = { version = "0.44.0" }
 tonic = { version = "0.10.2", features = ["tls", "tls-roots"] }
 tonic-build = { version = "0.10.2" }
 tonic-health = { version = "0.10.2" }

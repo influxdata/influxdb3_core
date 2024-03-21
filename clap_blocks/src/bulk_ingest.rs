@@ -61,10 +61,9 @@ pub struct BulkIngestConfig {
     #[clap(
         hide = true,
         long = "bulk-ingest-use-mock-presigned-url-signer",
-        env = "INFLUXDB_IOX_BULK_INGEST_USE_MOCK_PRESIGNED_URL_SIGNER",
-        default_value = "false"
+        env = "INFLUXDB_IOX_BULK_INGEST_USE_MOCK_PRESIGNED_URL_SIGNER"
     )]
-    pub use_mock_presigned_url_signer: bool,
+    pub use_mock_presigned_url_signer: Option<String>,
 }
 
 impl BulkIngestConfig {
@@ -72,7 +71,7 @@ impl BulkIngestConfig {
     pub fn new(
         metadata_signing_key_file: Option<PathBuf>,
         additional_verification_key_files: Vec<PathBuf>,
-        use_mock_presigned_url_signer: bool,
+        use_mock_presigned_url_signer: Option<String>,
     ) -> Self {
         Self {
             metadata_signing_key_file,

@@ -138,7 +138,7 @@ struct State {
     /// from here and runs them.
     ///
     /// This is `None` if we triggered shutdown.
-    requests: Option<std::sync::mpsc::Sender<Task>>,
+    requests: Option<tokio::sync::mpsc::UnboundedSender<Task>>,
 
     /// Receiver side indicating that shutdown is complete.
     completed_shutdown: Shared<BoxFuture<'static, Result<(), Arc<RecvError>>>>,
@@ -222,7 +222,7 @@ impl DedicatedExecutor {
     ) -> Self {
         let thread_counter = Arc::new(AtomicUsize::new(1));
 
-        let (tx_tasks, rx_tasks) = std::sync::mpsc::channel::<Task>();
+        let (tx_tasks, mut rx_tasks) = tokio::sync::mpsc::unbounded_channel::<Task>();
         let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel();
 
         let thread = std::thread::Builder::new()
@@ -259,7 +259,7 @@ impl DedicatedExecutor {
                     // We therefore use a RwLock to wait for tasks to complete
                     let join = Arc::new(tokio::sync::RwLock::new(()));
 
-                    while let Ok(task) = rx_tasks.recv() {
+                    while let Some(task) = rx_tasks.recv().await {
                         let join = Arc::clone(&join);
                         let handle = join.read_owned().await;
 

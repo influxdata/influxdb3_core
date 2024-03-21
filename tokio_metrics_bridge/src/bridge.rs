@@ -197,6 +197,13 @@ impl Instrument for TokioInstrumentDispatcher {
         worker_metric!(
             this = guard,
             reporter = reporter,
+            metric = worker_mean_poll_time,
+            descr = "The mean duration of task polls. This is an exponentially weighted moving average. Currently, this metric is only provided by the multi-threaded runtime.",
+            t = DurationGauge,
+        );
+        worker_metric!(
+            this = guard,
+            reporter = reporter,
             metric = worker_noop_count,
             descr = "The number of times the given worker thread unparked but performed no work before parking again.",
             t = U64Counter,

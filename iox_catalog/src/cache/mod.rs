@@ -39,7 +39,7 @@ use crate::{
     metrics::MetricDecorator,
 };
 
-use self::handler::CacheHandler;
+use self::handler::{CacheHandlerCatalog, CacheHandlerRepos};
 use self::snapshot::RootKey;
 
 /// Caching catalog.
@@ -49,10 +49,10 @@ pub struct CachingCatalog {
     metrics: Arc<metric::Registry>,
     time_provider: Arc<dyn TimeProvider>,
     quorum_fanout: usize,
-    partitions: Arc<CacheHandler<PartitionSnapshot>>,
-    tables: Arc<CacheHandler<TableSnapshot>>,
-    namespaces: Arc<CacheHandler<NamespaceSnapshot>>,
-    root: Arc<CacheHandler<RootSnapshot>>,
+    partitions: CacheHandlerCatalog<PartitionSnapshot>,
+    tables: CacheHandlerCatalog<TableSnapshot>,
+    namespaces: CacheHandlerCatalog<NamespaceSnapshot>,
+    root: CacheHandlerCatalog<RootSnapshot>,
 }
 
 impl CachingCatalog {
@@ -79,30 +79,30 @@ impl CachingCatalog {
             deadline: Some(Duration::from_millis(750)),
         });
 
-        let partitions = Arc::new(CacheHandler::new(
+        let partitions = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-        ));
-        let tables = Arc::new(CacheHandler::new(
+        );
+        let tables = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-        ));
-        let namespaces = Arc::new(CacheHandler::new(
+        );
+        let namespaces = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-        ));
-        let root = Arc::new(CacheHandler::new(
+        );
+        let root = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-        ));
+        );
 
         Self {
             backing,
@@ -132,12 +132,12 @@ impl Catalog for CachingCatalog {
     fn repositories(&self) -> Box<dyn RepoCollection> {
         Box::new(MetricDecorator::new(
             Box::new(Repos {
-                backing: Arc::clone(&self.backing),
+                backing: self.backing.repositories(),
                 quorum_fanout: self.quorum_fanout,
-                tables: Arc::clone(&self.tables),
-                partitions: Arc::clone(&self.partitions),
-                namespaces: Arc::clone(&self.namespaces),
-                root: Arc::clone(&self.root),
+                tables: self.tables.repos(),
+                partitions: self.partitions.repos(),
+                namespaces: self.namespaces.repos(),
+                root: self.root.repos(),
             }),
             Arc::clone(&self.metrics),
             self.time_provider(),
@@ -153,15 +153,21 @@ impl Catalog for CachingCatalog {
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
     }
+
+    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
+        Err(Error::NotImplemented {
+            descr: "active applications".to_owned(),
+        })
+    }
 }
 
 #[derive(Debug)]
 struct Repos {
-    partitions: Arc<CacheHandler<PartitionSnapshot>>,
-    tables: Arc<CacheHandler<TableSnapshot>>,
-    namespaces: Arc<CacheHandler<NamespaceSnapshot>>,
-    root: Arc<CacheHandler<RootSnapshot>>,
-    backing: Arc<dyn Catalog>,
+    partitions: CacheHandlerRepos<PartitionSnapshot>,
+    tables: CacheHandlerRepos<TableSnapshot>,
+    namespaces: CacheHandlerRepos<NamespaceSnapshot>,
+    root: CacheHandlerRepos<RootSnapshot>,
+    backing: Box<dyn RepoCollection>,
     quorum_fanout: usize,
 }
 
@@ -203,7 +209,13 @@ impl RepoCollection for Repos {
         self
     }
 
-    fn set_span_context(&mut self, _span_ctx: Option<SpanContext>) {}
+    fn set_span_context(&mut self, span_ctx: Option<SpanContext>) {
+        self.partitions.set_span_context(span_ctx.clone());
+        self.tables.set_span_context(span_ctx.clone());
+        self.namespaces.set_span_context(span_ctx.clone());
+        self.root.set_span_context(span_ctx.clone());
+        self.backing.set_span_context(span_ctx);
+    }
 }
 
 #[async_trait]
@@ -224,7 +236,6 @@ impl NamespaceRepo for Repos {
     ) -> Result<Namespace> {
         let ns = self
             .backing
-            .repositories()
             .namespaces()
             .create(
                 name,
@@ -250,7 +261,6 @@ impl NamespaceRepo for Repos {
 
         let ns = self
             .backing
-            .repositories()
             .namespaces()
             .update_retention_period(name, retention_period_ns)
             .with_refresh(self.namespaces.refresh(ns_id))
@@ -329,7 +339,6 @@ impl NamespaceRepo for Repos {
 
         let id = self
             .backing
-            .repositories()
             .namespaces()
             .soft_delete(name)
             .with_refresh(self.namespaces.refresh(ns_id))
@@ -345,7 +354,6 @@ impl NamespaceRepo for Repos {
 
         let ns = self
             .backing
-            .repositories()
             .namespaces()
             .update_table_limit(name, new_max)
             .with_refresh(self.namespaces.refresh(ns_id))
@@ -365,7 +373,6 @@ impl NamespaceRepo for Repos {
 
         let ns = self
             .backing
-            .repositories()
             .namespaces()
             .update_column_limit(name, new_max)
             .with_refresh(self.namespaces.refresh(ns_id))
@@ -391,7 +398,6 @@ impl TableRepo for Repos {
     ) -> Result<Table> {
         let table = self
             .backing
-            .repositories()
             .tables()
             .create(name, partition_template, namespace_id)
             .with_refresh(self.namespaces.refresh(namespace_id))
@@ -475,7 +481,7 @@ impl TableRepo for Repos {
 
     async fn list(&mut self) -> Result<Vec<Table>> {
         // read-through: global-scoped, only used by parquet cache during startup
-        self.backing.repositories().tables().list().await
+        self.backing.tables().list().await
     }
 
     async fn snapshot(&mut self, table_id: TableId) -> Result<TableSnapshot> {
@@ -509,7 +515,6 @@ impl ColumnRepo for Repos {
 
         let c = self
             .backing
-            .repositories()
             .columns()
             .create_or_get(name, table_id, column_type)
             .with_refresh(self.tables.refresh(table_id))
@@ -546,7 +551,6 @@ impl ColumnRepo for Repos {
 
         let r = self
             .backing
-            .repositories()
             .columns()
             .create_or_get_many_unchecked(table_id, columns)
             .with_refresh(self.tables.refresh(table_id))
@@ -558,7 +562,6 @@ impl ColumnRepo for Repos {
     async fn list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Column>> {
         // read-through: users should use `list_by_table_id`, see https://github.com/influxdata/influxdb_iox/issues/10146
         self.backing
-            .repositories()
             .columns()
             .list_by_namespace_id(namespace_id)
             .await
@@ -571,7 +574,7 @@ impl ColumnRepo for Repos {
 
     async fn list(&mut self) -> Result<Vec<Column>> {
         // Read-through: should we retain this method?
-        self.backing.repositories().columns().list().await
+        self.backing.columns().list().await
     }
 }
 
@@ -588,7 +591,6 @@ impl PartitionRepo for Repos {
 
         let p = self
             .backing
-            .repositories()
             .partitions()
             .create_or_get(key, table_id)
             .with_refresh(self.tables.refresh(table_id))
@@ -656,7 +658,7 @@ impl PartitionRepo for Repos {
 
     async fn list_ids(&mut self) -> Result<Vec<PartitionId>> {
         // read-through: only used for testing, we should eventually remove this interface
-        self.backing.repositories().partitions().list_ids().await
+        self.backing.partitions().list_ids().await
     }
 
     async fn cas_sort_key(
@@ -667,7 +669,6 @@ impl PartitionRepo for Repos {
     ) -> Result<Partition, CasFailure<SortKeyIds>> {
         let res = self
             .backing
-            .repositories()
             .partitions()
             .cas_sort_key(partition_id, old_sort_key_ids, new_sort_key_ids)
             .with_refresh(
@@ -692,7 +693,6 @@ impl PartitionRepo for Repos {
         limit_bytes: u64,
     ) -> Result<()> {
         self.backing
-            .repositories()
             .partitions()
             .record_skipped_compaction(
                 partition_id,
@@ -741,11 +741,7 @@ impl PartitionRepo for Repos {
 
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>> {
         // read-through: used for debugging, this should be replaced w/ proper hierarchy-traversal
-        self.backing
-            .repositories()
-            .partitions()
-            .list_skipped_compactions()
-            .await
+        self.backing.partitions().list_skipped_compactions().await
     }
 
     async fn delete_skipped_compactions(
@@ -754,7 +750,6 @@ impl PartitionRepo for Repos {
     ) -> Result<Option<SkippedCompaction>> {
         let res = self
             .backing
-            .repositories()
             .partitions()
             .delete_skipped_compactions(partition_id)
             .with_refresh(self.partitions.refresh(partition_id))
@@ -765,11 +760,7 @@ impl PartitionRepo for Repos {
 
     async fn most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>> {
         // read-through: used for ingester warm-up at the moment
-        self.backing
-            .repositories()
-            .partitions()
-            .most_recent_n(n)
-            .await
+        self.backing.partitions().most_recent_n(n).await
     }
 
     async fn partitions_new_file_between(
@@ -779,7 +770,6 @@ impl PartitionRepo for Repos {
     ) -> Result<Vec<PartitionId>> {
         // read-through: used by the compactor for scheduling, we should eventually find a better interface
         self.backing
-            .repositories()
             .partitions()
             .partitions_new_file_between(minimum_time, maximum_time)
             .await
@@ -792,7 +782,6 @@ impl PartitionRepo for Repos {
     ) -> Result<Vec<PartitionId>> {
         // read-through: used by the compactor for scheduling, we should eventually find a better interface
         self.backing
-            .repositories()
             .partitions()
             .partitions_needing_cold_compact(maximum_time, n)
             .await
@@ -805,7 +794,6 @@ impl PartitionRepo for Repos {
     ) -> Result<()> {
         // read-through: used by the compactor for scheduling, we should eventually find a better interface
         self.backing
-            .repositories()
             .partitions()
             .update_cold_compact(partition_id, cold_compact_at)
             .await
@@ -813,11 +801,7 @@ impl PartitionRepo for Repos {
 
     async fn list_old_style(&mut self) -> Result<Vec<Partition>> {
         // read-through: used by the ingester due to hash-id stuff
-        self.backing
-            .repositories()
-            .partitions()
-            .list_old_style()
-            .await
+        self.backing.partitions().list_old_style().await
     }
 
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
@@ -830,7 +814,6 @@ impl ParquetFileRepo for Repos {
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
         let res = self
             .backing
-            .repositories()
             .parquet_files()
             .flag_for_delete_by_retention()
             .await?;
@@ -881,7 +864,6 @@ impl ParquetFileRepo for Repos {
     async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         // deleted files are NOT part of the snapshot, so this bypasses the cache
         self.backing
-            .repositories()
             .parquet_files()
             .delete_old_ids_only(older_than)
             .await
@@ -928,7 +910,6 @@ impl ParquetFileRepo for Repos {
     ) -> Result<Option<ParquetFile>> {
         // read-through: see https://github.com/influxdata/influxdb_iox/issues/9719
         self.backing
-            .repositories()
             .parquet_files()
             .get_by_object_store_id(object_store_id)
             .await
@@ -940,7 +921,6 @@ impl ParquetFileRepo for Repos {
     ) -> Result<Vec<ObjectStoreId>> {
         // read-through: this is used by the GC, so this is not overall latency-critical
         self.backing
-            .repositories()
             .parquet_files()
             .exists_by_object_store_id_batch(object_store_ids)
             .await
@@ -956,7 +936,6 @@ impl ParquetFileRepo for Repos {
     ) -> Result<Vec<ParquetFileId>> {
         let res = self
             .backing
-            .repositories()
             .parquet_files()
             .create_upgrade_delete(partition_id, delete, upgrade, create, target_level)
             .with_refresh(self.partitions.refresh(partition_id))
@@ -991,6 +970,34 @@ fn filter_namespace(ns: Namespace, deleted: SoftDeletedRows) -> Option<Namespace
     }
 }
 
+/// Determines if that error should lead to a refresh, see [`RefreshExt`].
+trait ShouldRefresh {
+    /// Should we refresh the cache state?
+    fn should_refresh(&self) -> bool;
+}
+
+impl ShouldRefresh for Error {
+    fn should_refresh(&self) -> bool {
+        match self {
+            Self::External { .. } => false,
+            Self::AlreadyExists { .. } => true,
+            Self::LimitExceeded { .. } => true,
+            Self::NotFound { .. } => true,
+            Self::Malformed { .. } => false,
+            Self::NotImplemented { .. } => false,
+        }
+    }
+}
+
+impl<T> ShouldRefresh for CasFailure<T> {
+    fn should_refresh(&self) -> bool {
+        match self {
+            Self::ValueMismatch(_) => true,
+            Self::QueryError(e) => e.should_refresh(),
+        }
+    }
+}
+
 /// Add a refresh callback to a [`Future`].
 ///
 /// This is used to refresh cache state after a future is called but BEFORE a potential error is evaluated. This is
@@ -1010,7 +1017,7 @@ trait RefreshExt {
     type Out;
 
     /// [Err](Result::Err) output of the operation.
-    type Err;
+    type Err: ShouldRefresh;
 
     /// Add a refresh operation to the given future that will be called no matter what the result of the original future
     /// was.
@@ -1026,7 +1033,7 @@ impl<F, T, E> RefreshExt for F
 where
     F: Future<Output = Result<T, E>> + Send,
     T: Send,
-    E: Send,
+    E: ShouldRefresh + Send,
 {
     type Out = T;
     type Err = E;
@@ -1036,6 +1043,12 @@ where
         R: Future<Output = Result<(), Self::Err>> + Send,
     {
         let self_res = self.await;
+        if let Err(e) = &self_res {
+            if !e.should_refresh() {
+                return self_res;
+            }
+        }
+
         let refresh_res = refresh_fut.await;
 
         let out = self_res?;
@@ -1062,7 +1075,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
         crate::interface_tests::test_catalog(|| async { Arc::new(catalog().0) as _ }).await;
     }
@@ -1186,39 +1199,98 @@ mod tests {
             res_op: Ok("ok_op"),
             res_refresh: Ok(()),
             expected: Ok("ok_op"),
+            refresh_called: true,
         }
         .run()
         .await;
 
         RefreshExtTest {
-            res_op: Err("err_op"),
+            res_op: Err(TestErr("err_op", true)),
             res_refresh: Ok(()),
-            expected: Err("err_op"),
+            expected: Err(TestErr("err_op", true)),
+            refresh_called: true,
+        }
+        .run()
+        .await;
+
+        RefreshExtTest {
+            res_op: Err(TestErr("err_op", false)),
+            res_refresh: Ok(()),
+            expected: Err(TestErr("err_op", false)),
+            refresh_called: false,
         }
         .run()
         .await;
 
         RefreshExtTest {
             res_op: Ok("ok_op"),
-            res_refresh: Err("err_refresh"),
-            expected: Err("err_refresh"),
+            res_refresh: Err(TestErr("err_refresh", true)),
+            expected: Err(TestErr("err_refresh", true)),
+            refresh_called: true,
         }
         .run()
         .await;
 
         RefreshExtTest {
-            res_op: Err("err_op"),
-            res_refresh: Err("err_refresh"),
-            expected: Err("err_op"),
+            res_op: Ok("ok_op"),
+            res_refresh: Err(TestErr("err_refresh", false)),
+            expected: Err(TestErr("err_refresh", false)),
+            refresh_called: true,
+        }
+        .run()
+        .await;
+
+        RefreshExtTest {
+            res_op: Err(TestErr("err_op", true)),
+            res_refresh: Err(TestErr("err_refresh", true)),
+            expected: Err(TestErr("err_op", true)),
+            refresh_called: true,
+        }
+        .run()
+        .await;
+
+        RefreshExtTest {
+            res_op: Err(TestErr("err_op", false)),
+            res_refresh: Err(TestErr("err_refresh", true)),
+            expected: Err(TestErr("err_op", false)),
+            refresh_called: false,
+        }
+        .run()
+        .await;
+
+        RefreshExtTest {
+            res_op: Err(TestErr("err_op", true)),
+            res_refresh: Err(TestErr("err_refresh", false)),
+            expected: Err(TestErr("err_op", true)),
+            refresh_called: true,
+        }
+        .run()
+        .await;
+
+        RefreshExtTest {
+            res_op: Err(TestErr("err_op", false)),
+            res_refresh: Err(TestErr("err_refresh", false)),
+            expected: Err(TestErr("err_op", false)),
+            refresh_called: false,
         }
         .run()
         .await;
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestErr(&'static str, bool);
+
+    impl ShouldRefresh for TestErr {
+        fn should_refresh(&self) -> bool {
+            self.1
+        }
+    }
+
     struct RefreshExtTest {
-        res_op: Result<&'static str, &'static str>,
-        res_refresh: Result<(), &'static str>,
-        expected: Result<&'static str, &'static str>,
+        res_op: Result<&'static str, TestErr>,
+        res_refresh: Result<(), TestErr>,
+        expected: Result<&'static str, TestErr>,
+        refresh_called: bool,
     }
 
     impl RefreshExtTest {
@@ -1227,6 +1299,7 @@ mod tests {
                 res_op,
                 res_refresh,
                 expected,
+                refresh_called,
             } = self;
 
             let called_op = Arc::new(AtomicBool::new(false));
@@ -1249,7 +1322,7 @@ mod tests {
             assert_eq!(actual, expected);
 
             assert!(called_op.load(Ordering::SeqCst));
-            assert!(called_refresh.load(Ordering::SeqCst));
+            assert_eq!(called_refresh.load(Ordering::SeqCst), refresh_called);
         }
     }
 

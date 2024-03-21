@@ -1,7 +1,11 @@
 //! Ring buffer of queries that have been run with some brief information
 
+use crate::exec::IOxSessionContext;
+use crate::memory_pool::Monitor;
+use crate::physical_optimizer::ParquetFileMetrics;
 use data_types::NamespaceId;
 use datafusion::physical_plan::ExecutionPlan;
+use iox_query_params::StatementParams;
 use iox_time::{Time, TimeProvider};
 use observability_deps::tracing::{info, warn};
 use parking_lot::Mutex;
@@ -9,16 +13,13 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     sync::{
-        atomic::{self, AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
 };
 use trace::ctx::TraceId;
 use uuid::Uuid;
-
-/// The query duration used for queries still running.
-const UNCOMPLETED_DURATION: i64 = -1;
 
 /// Phase of a query entry.
 ///
@@ -97,31 +98,6 @@ impl QueryPhase {
             Self::Fail => "fail",
         }
     }
-
-    /// ID.
-    fn id(&self) -> u8 {
-        match self {
-            Self::Received => 0,
-            Self::Planned => 1,
-            Self::Permit => 2,
-            Self::Cancel => 3,
-            Self::Success => 4,
-            Self::Fail => 5,
-        }
-    }
-
-    /// Create from ID.
-    fn from_id(id: u8) -> Self {
-        match id {
-            0 => Self::Received,
-            1 => Self::Planned,
-            2 => Self::Permit,
-            3 => Self::Cancel,
-            4 => Self::Success,
-            5 => Self::Fail,
-            _ => unreachable!(),
-        }
-    }
 }
 
 impl std::fmt::Debug for QueryPhase {
@@ -136,8 +112,9 @@ impl std::fmt::Display for QueryPhase {
     }
 }
 
-/// Information about a single query that was executed
-pub struct QueryLogEntry {
+/// State of a [`QueryLogEntry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLogEntryState {
     /// Unique ID.
     pub id: Uuid,
 
@@ -151,7 +128,10 @@ pub struct QueryLogEntry {
     pub query_type: &'static str,
 
     /// The text of the query (SQL for sql queries, pbjson for storage rpc queries)
-    pub query_text: QueryText,
+    pub query_text: QueryTextWrapper,
+
+    /// key-value parameters associated with this query
+    pub query_params: StatementParams,
 
     /// The trace ID if any
     pub trace_id: Option<TraceId>,
@@ -159,121 +139,104 @@ pub struct QueryLogEntry {
     /// Time at which the query was run
     pub issue_time: Time,
 
+    /// Number of partitions processed by the query.
+    pub partitions: Option<i64>,
+
+    /// Number of parquet files processed by the query.
+    pub parquet_files: Option<i64>,
+
     /// Duration it took to acquire a semaphore permit, relative to [`issue_time`](Self::issue_time).
-    permit_duration: AtomicDuration,
+    pub permit_duration: Option<Duration>,
 
     /// Duration it took to plan the query, relative to [`issue_time`](Self::issue_time) + [`permit_duration`](Self::permit_duration).
-    plan_duration: AtomicDuration,
+    pub plan_duration: Option<Duration>,
 
     /// Duration it took to execute the query, relative to [`issue_time`](Self::issue_time) +
     /// [`permit_duration`](Self::permit_duration) + [`plan_duration`](Self::plan_duration).
-    execute_duration: AtomicDuration,
+    pub execute_duration: Option<Duration>,
 
     /// Duration from [`issue_time`](Self::issue_time) til the query ended somehow.
-    end2end_duration: AtomicDuration,
+    pub end2end_duration: Option<Duration>,
 
     /// CPU duration spend for computation.
-    compute_duration: AtomicDuration,
+    pub compute_duration: Option<Duration>,
+
+    /// Peak memory allocated for processing the query.
+    pub max_memory: Option<i64>,
 
     /// If the query completed successfully
-    success: AtomicBool,
+    pub success: bool,
 
     /// If the query is currently running (in any state).
-    running: AtomicBool,
+    pub running: bool,
 
     /// Phase.
-    phase: AtomicU8,
+    pub phase: QueryPhase,
 }
 
-impl Debug for QueryLogEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueryLogEntry")
-            .field("id", &self.id)
-            .field("phase", &self.phase().name())
-            .field("namespace_id", &self.namespace_id)
-            .field("namespace_name", &self.namespace_name)
-            .field("query_type", &self.query_type)
-            .field("query_text", &self.query_text.to_string())
-            .field("trace_id", &self.trace_id)
-            .field("issue_time", &self.issue_time)
-            .field("permit_duration", &self.permit_duration())
-            .field("plan_duration", &self.plan_duration())
-            .field("execute_duration", &self.execute_duration())
-            .field("end2end_duration", &self.end2end_duration())
-            .field("compute_duration", &self.compute_duration())
-            .field("success", &self.success())
-            .field("running", &self.running())
-            .field("cancelled", &self.cancelled())
-            .finish()
-    }
+/// Information about a single query that was executed
+#[derive(Debug)]
+pub struct QueryLogEntry {
+    /// State.
+    state: Mutex<Arc<QueryLogEntryState>>,
 }
 
 impl QueryLogEntry {
-    /// Current phase.
-    pub fn phase(&self) -> QueryPhase {
-        QueryPhase::from_id(self.phase.load(Ordering::SeqCst))
+    /// Get current state.
+    pub fn state(&self) -> Arc<QueryLogEntryState> {
+        Arc::clone(&self.state.lock())
     }
 
-    /// Duration it took to acquire a semaphore permit, relative to [`issue_time`](Self::issue_time).
-    pub fn permit_duration(&self) -> Option<Duration> {
-        self.permit_duration.get()
-    }
-
-    /// Duration it took to plan the query, relative to [`issue_time`](Self::issue_time) + [`permit_duration`](Self::permit_duration).
-    pub fn plan_duration(&self) -> Option<Duration> {
-        self.plan_duration.get()
-    }
-
-    /// Duration it took to execute the query, relative to [`issue_time`](Self::issue_time) +
-    /// [`permit_duration`](Self::permit_duration) + [`plan_duration`](Self::plan_duration).
-    pub fn execute_duration(&self) -> Option<Duration> {
-        self.execute_duration.get()
-    }
-
-    /// Duration from [`issue_time`](Self::issue_time) til the query ended somehow.
-    pub fn end2end_duration(&self) -> Option<Duration> {
-        self.end2end_duration.get()
-    }
-
-    /// CPU duration spend for computation.
-    pub fn compute_duration(&self) -> Option<Duration> {
-        self.compute_duration.get()
-    }
-
-    /// Returns true if `set_completed` was called with `success=true`
-    pub fn success(&self) -> bool {
-        self.success.load(Ordering::SeqCst)
-    }
-
-    /// If the query is currently running (in any state).
-    pub fn running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
-    /// If the query was cancelled.
-    pub fn cancelled(&self) -> bool {
-        self.phase() == QueryPhase::Cancel
+    fn set(&self, state: QueryLogEntryState) {
+        *self.state.lock() = Arc::new(state);
     }
 
     /// Log entry.
-    pub fn log(&self) {
+    fn log(&self) {
+        let state = self.state();
+        let QueryLogEntryState {
+            id,
+            namespace_id,
+            namespace_name,
+            query_type,
+            query_text,
+            query_params,
+            trace_id,
+            issue_time,
+            partitions,
+            parquet_files,
+            permit_duration,
+            plan_duration,
+            execute_duration,
+            end2end_duration,
+            compute_duration,
+            max_memory,
+            success,
+            running,
+            phase,
+        } = state.as_ref();
+
         info!(
-            when=self.phase().name(),
-            id=%self.id,
-            namespace_id=self.namespace_id.get(),
-            namespace_name=self.namespace_name.as_ref(),
-            query_type=self.query_type,
-            query_text=%self.query_text,
-            trace_id=self.trace_id.map(|id| format!("{:x}", id.get())),
-            issue_time=%self.issue_time,
-            plan_duration_secs=self.plan_duration().map(|d| d.as_secs_f64()),
-            permit_duration_secs=self.permit_duration().map(|d| d.as_secs_f64()),
-            execute_duration_secs=self.execute_duration().map(|d| d.as_secs_f64()),
-            end2end_duration_secs=self.end2end_duration().map(|d| d.as_secs_f64()),
-            compute_duration_secs=self.compute_duration().map(|d| d.as_secs_f64()),
-            success=self.success(),
-            running=self.running(),
-            cancelled=self.cancelled(),
+            when=phase.name(),
+            id=%id,
+            namespace_id=namespace_id.get(),
+            namespace_name=namespace_name.as_ref(),
+            query_type=query_type,
+            query_text=%query_text,
+            query_params=%query_params,
+            trace_id=trace_id.map(|id| format!("{:x}", id.get())),
+            issue_time=%issue_time,
+            partitions,
+            parquet_files,
+            plan_duration_secs=plan_duration.map(|d| d.as_secs_f64()),
+            permit_duration_secs=permit_duration.map(|d| d.as_secs_f64()),
+            execute_duration_secs=execute_duration.map(|d| d.as_secs_f64()),
+            end2end_duration_secs=end2end_duration.map(|d| d.as_secs_f64()),
+            compute_duration_secs=compute_duration.map(|d| d.as_secs_f64()),
+            max_memory=max_memory,
+            success=success,
+            running=running,
+            cancelled=(*phase == QueryPhase::Cancel),
             "query",
         )
     }
@@ -329,24 +292,31 @@ impl QueryLog {
         namespace_name: Arc<str>,
         query_type: &'static str,
         query_text: QueryText,
+        query_params: StatementParams,
         trace_id: Option<TraceId>,
     ) -> QueryCompletedToken<StateReceived> {
         let entry = Arc::new(QueryLogEntry {
-            id: (self.id_gen)(),
-            namespace_id,
-            namespace_name,
-            query_type,
-            query_text,
-            trace_id,
-            issue_time: self.time_provider.now(),
-            permit_duration: Default::default(),
-            plan_duration: Default::default(),
-            execute_duration: Default::default(),
-            end2end_duration: Default::default(),
-            compute_duration: Default::default(),
-            success: atomic::AtomicBool::new(false),
-            running: atomic::AtomicBool::new(true),
-            phase: AtomicU8::new(QueryPhase::Received.id()),
+            state: Mutex::new(Arc::new(QueryLogEntryState {
+                id: (self.id_gen)(),
+                namespace_id,
+                namespace_name,
+                query_type,
+                query_text: QueryTextWrapper(query_text.into()),
+                query_params,
+                trace_id,
+                issue_time: self.time_provider.now(),
+                partitions: Default::default(),
+                parquet_files: Default::default(),
+                permit_duration: Default::default(),
+                plan_duration: Default::default(),
+                execute_duration: Default::default(),
+                end2end_duration: Default::default(),
+                compute_duration: Default::default(),
+                max_memory: Default::default(),
+                success: false,
+                running: true,
+                phase: QueryPhase::Received,
+            })),
         });
         entry.log();
 
@@ -396,6 +366,8 @@ impl Debug for QueryLog {
 
 trait State {
     fn plan(&self) -> Option<&Arc<dyn ExecutionPlan>>;
+
+    fn memory_monitor(&self) -> Option<&Arc<Monitor>>;
 }
 
 /// State of [`QueryCompletedToken`], equivalent to [`QueryPhase::Received`].
@@ -406,6 +378,10 @@ impl State for StateReceived {
     fn plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         None
     }
+
+    fn memory_monitor(&self) -> Option<&Arc<Monitor>> {
+        None
+    }
 }
 
 /// State of [`QueryCompletedToken`], equivalent to [`QueryPhase::Planned`].
@@ -413,11 +389,18 @@ impl State for StateReceived {
 pub struct StatePlanned {
     /// Physical execution plan.
     plan: Arc<dyn ExecutionPlan>,
+
+    /// Memory usage monitor.
+    memory_monitor: Arc<Monitor>,
 }
 
 impl State for StatePlanned {
     fn plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         Some(&self.plan)
+    }
+
+    fn memory_monitor(&self) -> Option<&Arc<Monitor>> {
+        Some(&self.memory_monitor)
     }
 }
 
@@ -426,11 +409,18 @@ impl State for StatePlanned {
 pub struct StatePermit {
     /// Physical execution plan.
     plan: Arc<dyn ExecutionPlan>,
+
+    /// Memory usage monitor.
+    memory_monitor: Arc<Monitor>,
 }
 
 impl State for StatePermit {
     fn plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         Some(&self.plan)
+    }
+
+    fn memory_monitor(&self) -> Option<&Arc<Monitor>> {
+        Some(&self.memory_monitor)
     }
 }
 
@@ -465,48 +455,64 @@ where
         self.entry.as_ref().expect("valid state")
     }
 
-    fn collect_compute_time(&self, entry: &Arc<QueryLogEntry>) {
+    fn collect_compute_time(&self, state: &mut QueryLogEntryState) {
         let Some(plan) = self.state.plan() else {
             return;
         };
 
-        entry
-            .compute_duration
-            .set_absolute(collect_compute_duration(plan.as_ref()));
+        state.compute_duration = Some(collect_compute_duration(plan.as_ref()));
+    }
+
+    fn collect_memory_usage(&self, state: &mut QueryLogEntryState) {
+        if let Some(memory_monitor) = self.state.memory_monitor() {
+            state.max_memory = Some(memory_monitor.max() as i64);
+        }
     }
 }
 
 impl QueryCompletedToken<StateReceived> {
     /// Record that this query got planned.
-    pub fn planned(mut self, plan: Arc<dyn ExecutionPlan>) -> QueryCompletedToken<StatePlanned> {
-        self.set_time();
-
+    pub fn planned(
+        mut self,
+        ctx: &IOxSessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> QueryCompletedToken<StatePlanned> {
         let entry = self.entry.take().expect("valid state");
-        entry
-            .phase
-            .store(QueryPhase::Planned.id(), Ordering::SeqCst);
+        let mut state = entry.state().as_ref().clone();
+        self.set_time(&mut state);
+        state.phase = QueryPhase::Planned;
+        let ParquetFileMetrics {
+            partitions,
+            parquet_files,
+        } = ParquetFileMetrics::plan_metrics(plan.as_ref());
+        state.partitions = Some(partitions as i64);
+        state.parquet_files = Some(parquet_files as i64);
+        entry.set(state);
         entry.log();
 
         QueryCompletedToken {
             entry: Some(entry),
             time_provider: Arc::clone(&self.time_provider),
-            state: StatePlanned { plan },
+            state: StatePlanned {
+                plan,
+                memory_monitor: Arc::clone(ctx.memory_monitor()),
+            },
         }
     }
 
     /// Record that this query failed during planning.
     pub fn fail(self) {
-        self.set_time();
-
         let entry = self.entry.as_ref().expect("valid state");
-        entry.phase.store(QueryPhase::Fail.id(), Ordering::SeqCst);
+        let mut state = entry.state().as_ref().clone();
+        self.set_time(&mut state);
+        state.phase = QueryPhase::Fail;
+        entry.set(state);
     }
 
-    fn set_time(&self) {
-        let entry = self.entry.as_ref().expect("valid state");
+    fn set_time(&self, state: &mut QueryLogEntryState) {
         let now = self.time_provider.now();
-        let origin = entry.issue_time;
-        entry.plan_duration.set_relative(origin, now);
+        let origin = state.issue_time;
+        set_relative(origin, now, &mut state.plan_duration);
     }
 }
 
@@ -514,11 +520,15 @@ impl QueryCompletedToken<StatePlanned> {
     /// Record that this query got a semaphore permit.
     pub fn permit(mut self) -> QueryCompletedToken<StatePermit> {
         let entry = self.entry.take().expect("valid state");
+        let mut state = entry.state().as_ref().clone();
 
-        let now = self.time_provider.now();
-        let origin = entry.issue_time + entry.plan_duration().expect("valid state");
-        entry.permit_duration.set_relative(origin, now);
-        entry.phase.store(QueryPhase::Permit.id(), Ordering::SeqCst);
+        if let Some(plan_duration) = state.plan_duration {
+            let now = self.time_provider.now();
+            let origin = state.issue_time + plan_duration;
+            set_relative(origin, now, &mut state.permit_duration);
+        }
+        state.phase = QueryPhase::Permit;
+        entry.set(state);
         entry.log();
 
         QueryCompletedToken {
@@ -526,6 +536,7 @@ impl QueryCompletedToken<StatePlanned> {
             time_provider: Arc::clone(&self.time_provider),
             state: StatePermit {
                 plan: Arc::clone(&self.state.plan),
+                memory_monitor: Arc::clone(&self.state.memory_monitor),
             },
         }
     }
@@ -535,32 +546,36 @@ impl QueryCompletedToken<StatePermit> {
     /// Record that this query completed successfully
     pub fn success(self) {
         let entry = self.entry.as_ref().expect("valid state");
-        entry.success.store(true, Ordering::SeqCst);
-        entry
-            .phase
-            .store(QueryPhase::Success.id(), Ordering::SeqCst);
+        let mut state = entry.state().as_ref().clone();
 
-        self.finish()
+        state.success = true;
+        state.phase = QueryPhase::Success;
+
+        self.finish(entry, state)
     }
 
     /// Record that the query finished execution with an error.
     pub fn fail(self) {
         let entry = self.entry.as_ref().expect("valid state");
-        entry.phase.store(QueryPhase::Fail.id(), Ordering::SeqCst);
+        let mut state = entry.state().as_ref().clone();
 
-        self.finish()
+        state.phase = QueryPhase::Fail;
+
+        self.finish(entry, state)
     }
 
-    fn finish(&self) {
-        let entry = self.entry.as_ref().expect("valid state");
+    fn finish(&self, entry: &Arc<QueryLogEntry>, mut state: QueryLogEntryState) {
+        if let (Some(permit_duration), Some(plan_duration)) =
+            (state.permit_duration, state.plan_duration)
+        {
+            let now = self.time_provider.now();
+            let origin = state.issue_time + permit_duration + plan_duration;
+            set_relative(origin, now, &mut state.execute_duration);
+        }
 
-        let now = self.time_provider.now();
-        let origin = entry.issue_time
-            + entry.permit_duration().expect("valid state")
-            + entry.plan_duration().expect("valid state");
-        entry.execute_duration.set_relative(origin, now);
-
-        self.collect_compute_time(entry);
+        self.collect_compute_time(&mut state);
+        self.collect_memory_usage(&mut state);
+        entry.set(state);
     }
 }
 
@@ -570,19 +585,23 @@ where
 {
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            if entry.phase() != QueryPhase::Fail && entry.execute_duration().is_none() {
-                entry.phase.store(QueryPhase::Cancel.id(), Ordering::SeqCst);
+            let mut state = entry.state().as_ref().clone();
 
-                if entry.permit_duration().is_some() {
+            if state.phase != QueryPhase::Fail && state.execute_duration.is_none() {
+                state.phase = QueryPhase::Cancel;
+
+                if state.permit_duration.is_some() {
                     // started computation, collect partial stats
-                    self.collect_compute_time(&entry);
+                    self.collect_compute_time(&mut state);
+                    self.collect_memory_usage(&mut state);
                 }
             }
 
             let now = self.time_provider.now();
-            entry.end2end_duration.set_relative(entry.issue_time, now);
-            entry.running.store(false, Ordering::SeqCst);
+            set_relative(state.issue_time, now, &mut state.end2end_duration);
+            state.running = false;
 
+            entry.set(state);
             entry.log();
         }
     }
@@ -593,38 +612,48 @@ where
 /// This avoids storing potentially large strings
 pub type QueryText = Box<dyn std::fmt::Display + Send + Sync>;
 
-/// Method that generated [`Uuid`]s.
-pub type IDGen = Box<dyn Fn() -> Uuid + Send + Sync>;
+/// Wrapper for QueryText that also implements [`Debug`].
+#[derive(Clone)]
+pub struct QueryTextWrapper(Arc<dyn std::fmt::Display + Send + Sync>);
 
-struct AtomicDuration(AtomicI64);
-
-impl AtomicDuration {
-    fn get(&self) -> Option<Duration> {
-        match self.0.load(Ordering::Relaxed) {
-            UNCOMPLETED_DURATION => None,
-            d => Some(Duration::from_nanos(d as u64)),
-        }
-    }
-
-    fn set_relative(&self, origin: Time, now: Time) {
-        match now.checked_duration_since(origin) {
-            Some(dur) => {
-                self.0.store(dur.as_nanos() as i64, Ordering::Relaxed);
-            }
-            None => {
-                warn!("Clock went backwards, not query duration")
-            }
-        }
-    }
-
-    fn set_absolute(&self, d: Duration) {
-        self.0.store(d.as_nanos() as i64, Ordering::Relaxed);
+impl QueryTextWrapper {
+    #[cfg(test)]
+    fn from_static(s: &'static str) -> Self {
+        Self(Arc::new(s.to_owned()))
     }
 }
 
-impl Default for AtomicDuration {
-    fn default() -> Self {
-        Self(AtomicI64::new(UNCOMPLETED_DURATION))
+impl Debug for QueryTextWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for QueryTextWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for QueryTextWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_string() == other.0.to_string()
+    }
+}
+
+impl Eq for QueryTextWrapper {}
+
+/// Method that generates [`Uuid`]s.
+pub type IDGen = Box<dyn Fn() -> Uuid + Send + Sync>;
+
+fn set_relative(origin: Time, now: Time, target: &mut Option<Duration>) {
+    match now.checked_duration_since(origin) {
+        Some(dur) => {
+            *target = Some(dur);
+        }
+        None => {
+            warn!("Clock went backwards, not query duration")
+        }
     }
 }
 
@@ -648,6 +677,7 @@ fn collect_compute_duration(plan: &dyn ExecutionPlan) -> Duration {
 #[cfg(test)]
 mod test_super {
     use datafusion::error::DataFusionError;
+    use iox_query_params::params;
     use std::sync::atomic::AtomicU64;
 
     use datafusion::physical_plan::{
@@ -667,64 +697,131 @@ mod test_super {
             time_provider,
             token,
             entry,
+            start_state,
         } = Test::default();
 
-        assert_eq!(entry.phase(), QueryPhase::Received);
-        assert!(!entry.success());
-        assert!(entry.running());
-        assert!(!entry.cancelled());
-        assert_eq!(entry.permit_duration(), None,);
-        assert_eq!(entry.plan_duration(), None,);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), None,);
-        assert_eq!(entry.compute_duration(), None,);
+        let expected = start_state;
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         time_provider.inc(Duration::from_millis(1));
-        let token = token.planned(plan());
+        let ctx = IOxSessionContext::with_testing();
+        let token = token.planned(&ctx, plan());
 
-        assert_eq!(entry.phase(), QueryPhase::Planned);
-        assert!(!entry.success());
-        assert!(entry.running());
-        assert!(!entry.cancelled());
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.permit_duration(), None,);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), None,);
-        assert_eq!(entry.compute_duration(), None,);
+        let expected = QueryLogEntryState {
+            partitions: Some(0),
+            parquet_files: Some(0),
+            plan_duration: Some(Duration::from_millis(1)),
+            phase: QueryPhase::Planned,
+            ..expected
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         time_provider.inc(Duration::from_millis(10));
         let token = token.permit();
 
-        assert_eq!(entry.phase(), QueryPhase::Permit);
-        assert!(!entry.success());
-        assert!(entry.running());
-        assert!(!entry.cancelled());
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.permit_duration(), Some(Duration::from_millis(10)),);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), None,);
-        assert_eq!(entry.compute_duration(), None,);
+        let expected = QueryLogEntryState {
+            permit_duration: Some(Duration::from_millis(10)),
+            phase: QueryPhase::Permit,
+            ..expected
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         time_provider.inc(Duration::from_millis(100));
         token.success();
 
-        assert_eq!(entry.phase(), QueryPhase::Success);
-        assert!(entry.success());
-        assert!(!entry.running());
-        assert!(!entry.cancelled());
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.permit_duration(), Some(Duration::from_millis(10)),);
-        assert_eq!(entry.execute_duration(), Some(Duration::from_millis(100)),);
-        assert_eq!(entry.end2end_duration(), Some(Duration::from_millis(111)),);
-        assert_eq!(entry.compute_duration(), Some(Duration::from_millis(1_337)),);
+        let expected = QueryLogEntryState {
+            execute_duration: Some(Duration::from_millis(100)),
+            end2end_duration: Some(Duration::from_millis(111)),
+            compute_duration: Some(Duration::from_millis(1_337)),
+            max_memory: Some(0),
+            success: true,
+            running: false,
+            phase: QueryPhase::Success,
+            ..expected
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         assert_logs(
             capture,
             [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; success = true; running = false; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; success = true; running = false; cancelled = false;"#,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_params_end2end_success() {
+        let params: StatementParams = params!(
+            "a" => true,
+        )
+        .into();
+        let capture = TracingCapture::new();
+        let test = Test::with_log_entry(
+            NamespaceId::new(1),
+            Arc::from("ns"),
+            "sql",
+            "SELECT $a;",
+            params.clone(),
+            None,
+        );
+        let Test {
+            time_provider,
+            token,
+            entry,
+            start_state,
+        } = test;
+
+        let expected = start_state;
+        assert_eq!(entry.state().as_ref(), &expected,);
+
+        time_provider.inc(Duration::from_millis(1));
+        let ctx = IOxSessionContext::with_testing();
+        let token = token.planned(&ctx, plan());
+
+        let expected = QueryLogEntryState {
+            partitions: Some(0),
+            parquet_files: Some(0),
+            plan_duration: Some(Duration::from_millis(1)),
+            phase: QueryPhase::Planned,
+            ..expected
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
+
+        time_provider.inc(Duration::from_millis(10));
+        let token = token.permit();
+
+        let expected = QueryLogEntryState {
+            permit_duration: Some(Duration::from_millis(10)),
+            phase: QueryPhase::Permit,
+            ..expected
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
+
+        time_provider.inc(Duration::from_millis(100));
+        token.success();
+
+        let expected = QueryLogEntryState {
+            execute_duration: Some(Duration::from_millis(100)),
+            end2end_duration: Some(Duration::from_millis(111)),
+            compute_duration: Some(Duration::from_millis(1_337)),
+            max_memory: Some(0),
+            success: true,
+            running: false,
+            phase: QueryPhase::Success,
+            ..expected
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
+
+        assert_logs(
+            capture,
+            [
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; success = true; running = false; cancelled = false;"#,
             ],
         );
     }
@@ -737,26 +834,26 @@ mod test_super {
             time_provider,
             token,
             entry,
+            start_state,
         } = Test::default();
 
         time_provider.inc(Duration::from_millis(1));
         token.fail();
 
-        assert_eq!(entry.phase(), QueryPhase::Fail);
-        assert!(!entry.success());
-        assert!(!entry.running());
-        assert!(!entry.cancelled());
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.permit_duration(), None,);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.compute_duration(), None,);
+        let expected = QueryLogEntryState {
+            plan_duration: Some(Duration::from_millis(1)),
+            end2end_duration: Some(Duration::from_millis(1)),
+            running: false,
+            phase: QueryPhase::Fail,
+            ..start_state
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         assert_logs(
             capture,
             [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; end2end_duration_secs = 0.001; success = false; running = false; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; end2end_duration_secs = 0.001; success = false; running = false; cancelled = false;"#,
             ],
         );
     }
@@ -769,32 +866,39 @@ mod test_super {
             time_provider,
             token,
             entry,
+            start_state,
         } = Test::default();
 
         time_provider.inc(Duration::from_millis(1));
-        let token = token.planned(plan());
+        let ctx = IOxSessionContext::with_testing();
+        let token = token.planned(&ctx, plan());
         time_provider.inc(Duration::from_millis(10));
         let token = token.permit();
         time_provider.inc(Duration::from_millis(100));
         token.fail();
 
-        assert_eq!(entry.phase(), QueryPhase::Fail);
-        assert!(!entry.success());
-        assert!(!entry.running());
-        assert!(!entry.cancelled());
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.permit_duration(), Some(Duration::from_millis(10)),);
-        assert_eq!(entry.execute_duration(), Some(Duration::from_millis(100)),);
-        assert_eq!(entry.end2end_duration(), Some(Duration::from_millis(111)),);
-        assert_eq!(entry.compute_duration(), Some(Duration::from_millis(1_337)),);
+        let expected = QueryLogEntryState {
+            partitions: Some(0),
+            parquet_files: Some(0),
+            plan_duration: Some(Duration::from_millis(1)),
+            permit_duration: Some(Duration::from_millis(10)),
+            execute_duration: Some(Duration::from_millis(100)),
+            end2end_duration: Some(Duration::from_millis(111)),
+            compute_duration: Some(Duration::from_millis(1_337)),
+            max_memory: Some(0),
+            running: false,
+            phase: QueryPhase::Fail,
+            ..start_state
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         assert_logs(
             capture,
             [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; success = false; running = false; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; success = false; running = false; cancelled = false;"#,
             ],
         );
     }
@@ -807,26 +911,25 @@ mod test_super {
             time_provider,
             token,
             entry,
+            start_state,
         } = Test::default();
 
         time_provider.inc(Duration::from_millis(1));
         drop(token);
 
-        assert_eq!(entry.phase(), QueryPhase::Cancel);
-        assert!(!entry.success());
-        assert!(!entry.running());
-        assert!(entry.cancelled());
-        assert_eq!(entry.permit_duration(), None,);
-        assert_eq!(entry.plan_duration(), None,);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.compute_duration(), None,);
+        let expected = QueryLogEntryState {
+            end2end_duration: Some(Duration::from_millis(1)),
+            running: false,
+            phase: QueryPhase::Cancel,
+            ..start_state
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         assert_logs(
             capture,
             [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; end2end_duration_secs = 0.001; success = false; running = false; cancelled = true;"#,
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; end2end_duration_secs = 0.001; success = false; running = false; cancelled = true;"#,
             ],
         );
     }
@@ -839,29 +942,32 @@ mod test_super {
             time_provider,
             token,
             entry,
+            start_state,
         } = Test::default();
 
         time_provider.inc(Duration::from_millis(1));
-        let token = token.planned(plan());
+        let ctx = IOxSessionContext::with_testing();
+        let token = token.planned(&ctx, plan());
         time_provider.inc(Duration::from_millis(10));
         drop(token);
 
-        assert_eq!(entry.phase(), QueryPhase::Cancel);
-        assert!(!entry.success());
-        assert!(!entry.running());
-        assert!(entry.cancelled());
-        assert_eq!(entry.permit_duration(), None,);
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), Some(Duration::from_millis(11)),);
-        assert_eq!(entry.compute_duration(), None,);
+        let expected = QueryLogEntryState {
+            partitions: Some(0),
+            parquet_files: Some(0),
+            plan_duration: Some(Duration::from_millis(1)),
+            end2end_duration: Some(Duration::from_millis(11)),
+            running: false,
+            phase: QueryPhase::Cancel,
+            ..start_state
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         assert_logs(
             capture,
             [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; end2end_duration_secs = 0.011; success = false; running = false; cancelled = true;"#,
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; end2end_duration_secs = 0.011; success = false; running = false; cancelled = true;"#,
             ],
         );
     }
@@ -874,32 +980,39 @@ mod test_super {
             time_provider,
             token,
             entry,
+            start_state,
         } = Test::default();
 
         time_provider.inc(Duration::from_millis(1));
-        let token = token.planned(plan());
+        let ctx = IOxSessionContext::with_testing();
+        let token = token.planned(&ctx, plan());
         time_provider.inc(Duration::from_millis(10));
         let token = token.permit();
         time_provider.inc(Duration::from_millis(100));
         drop(token);
 
-        assert_eq!(entry.phase(), QueryPhase::Cancel);
-        assert!(!entry.success());
-        assert!(!entry.running());
-        assert!(entry.cancelled());
-        assert_eq!(entry.permit_duration(), Some(Duration::from_millis(10)),);
-        assert_eq!(entry.plan_duration(), Some(Duration::from_millis(1)),);
-        assert_eq!(entry.execute_duration(), None,);
-        assert_eq!(entry.end2end_duration(), Some(Duration::from_millis(111)),);
-        assert_eq!(entry.compute_duration(), Some(Duration::from_millis(1_337)),); // partial stats collected
+        let expected = QueryLogEntryState {
+            partitions: Some(0),
+            parquet_files: Some(0),
+            plan_duration: Some(Duration::from_millis(1)),
+            permit_duration: Some(Duration::from_millis(10)),
+            end2end_duration: Some(Duration::from_millis(111)),
+            // partial stats collected
+            compute_duration: Some(Duration::from_millis(1_337)),
+            max_memory: Some(0),
+            running: false,
+            phase: QueryPhase::Cancel,
+            ..start_state
+        };
+        assert_eq!(entry.state().as_ref(), &expected,);
 
         assert_logs(
             capture,
             [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; permit_duration_secs = 0.01; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; success = false; running = false; cancelled = true;"#,
+                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; success = false; running = false; cancelled = true;"#,
             ],
         );
     }
@@ -908,10 +1021,18 @@ mod test_super {
         time_provider: Arc<MockProvider>,
         token: QueryCompletedToken<StateReceived>,
         entry: Arc<QueryLogEntry>,
+        start_state: QueryLogEntryState,
     }
 
-    impl Default for Test {
-        fn default() -> Self {
+    impl Test {
+        fn with_log_entry(
+            namespace_id: NamespaceId,
+            namespace_name: Arc<str>,
+            query_type: &'static str,
+            query_text: &'static str,
+            query_params: StatementParams,
+            trace_id: Option<TraceId>,
+        ) -> Self {
             let time_provider =
                 Arc::new(MockProvider::new(Time::from_timestamp_millis(100).unwrap()));
             let id_counter = AtomicU64::new(1);
@@ -922,20 +1043,57 @@ mod test_super {
             );
 
             let token = log.push(
-                NamespaceId::new(1),
-                Arc::from("ns"),
-                "sql",
-                Box::new("SELECT 1"),
-                None,
+                namespace_id,
+                Arc::clone(&namespace_name),
+                query_type,
+                Box::new(query_text),
+                query_params.clone(),
+                trace_id,
             );
 
             let entry = Arc::clone(token.entry());
+
+            let start_state = QueryLogEntryState {
+                id: Uuid::from_u128(1),
+                namespace_id,
+                namespace_name,
+                query_type,
+                query_text: QueryTextWrapper::from_static(query_text),
+                query_params,
+                trace_id,
+                issue_time: Time::from_timestamp_millis(100).unwrap(),
+                partitions: None,
+                parquet_files: None,
+                permit_duration: None,
+                plan_duration: None,
+                execute_duration: None,
+                end2end_duration: None,
+                compute_duration: None,
+                max_memory: None,
+                success: false,
+                running: true,
+                phase: QueryPhase::Received,
+            };
 
             Self {
                 time_provider,
                 token,
                 entry,
+                start_state,
             }
+        }
+    }
+
+    impl Default for Test {
+        fn default() -> Self {
+            Self::with_log_entry(
+                NamespaceId::new(1),
+                Arc::from("ns"),
+                "sql",
+                "SELECT 1",
+                Default::default(),
+                None,
+            )
         }
     }
 
@@ -965,11 +1123,7 @@ mod test_super {
             unimplemented!()
         }
 
-        fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-            unimplemented!()
-        }
-
-        fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
             unimplemented!()
         }
 
@@ -1011,7 +1165,11 @@ mod test_super {
     #[track_caller]
     fn assert_logs<const N: usize>(capture: TracingCapture, expected: [&str; N]) {
         let logs = capture.to_string();
-        let actual = logs.split('\n').map(|s| s.trim()).collect::<Vec<_>>();
+        let actual = logs
+            .split('\n')
+            .map(|s| s.trim())
+            .filter(|s| s.starts_with("level = INFO;"))
+            .collect::<Vec<_>>();
         assert!(
             actual == expected,
             "Actual:\n{}\n\nExpected:\n{}",

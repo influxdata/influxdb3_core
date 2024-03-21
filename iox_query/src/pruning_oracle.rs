@@ -1,18 +1,25 @@
 //! Implementations of pruning oracle for Server-side Bucketing.
 
-use arrow::array::BooleanArray;
 use data_types::partition_template::{
     bucket_for_tag_value, TablePartitionTemplateOverride, TemplatePart,
 };
-use datafusion::{prelude::Column, scalar::ScalarValue};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use datafusion::scalar::ScalarValue;
+use std::{collections::HashMap, sync::Arc};
 
-/// An abstraction that provides a side channel for determining if a column could
-/// contain a set of values.
-pub trait PruningOracle {
+/// A struct that is server-side bucketing aware, and can be used to prune
+/// partitions based on the bucketing information.
+///
+/// This struct is used to prune partitions based on the bucketing information
+/// that is stored in the partition template. It is used to determine if a
+/// partition does not contain any data for a given set of tag values.
+#[derive(Debug)]
+pub struct BucketPartitionPruningOracle {
+    /// A map of column names to the bucket info held for that column in this
+    /// partition.
+    tag_bucket_info: HashMap<Arc<str>, BucketInfo>,
+}
+
+impl BucketPartitionPruningOracle {
     /// An implementation must return an array that indicates, for each summary
     /// associated with this pruning oracle, if to its knowledge `column`
     /// contains ONLY the provided `values`.
@@ -24,104 +31,102 @@ pub trait PruningOracle {
     /// - `true` if the values in `column` ONLY contain values from `values`
     /// - `false` if the values in `column` are NOT ANY of `values`
     /// - `null` if the neither of the above holds or is unknown.
-    ///
-    fn could_contain_values(
+    pub fn could_contain_values(
         &self,
-        column: &Column,
-        values: &HashSet<ScalarValue>,
-    ) -> Option<BooleanArray>;
-}
+        column: &datafusion::prelude::Column,
+        values: &std::collections::HashSet<ScalarValue>,
+    ) -> Option<bool> {
+        // If there are no values in the hash-set, the oracle should opt to not
+        // prune.
+        if values.is_empty() {
+            return None;
+        }
 
-impl<T> PruningOracle for Arc<T>
-where
-    T: PruningOracle,
-{
-    fn could_contain_values(
-        &self,
-        column: &Column,
-        values: &HashSet<ScalarValue>,
-    ) -> Option<BooleanArray> {
-        T::could_contain_values(self, column, values)
+        // Grab the bucket information for the column, if any. If none exists
+        // then this type can't provide any information.
+        let column_bucket_info = self.tag_bucket_info.get(column.name.as_str())?;
+
+        // Could the bucket contain any of the values?
+        let may_contain_value = values.iter().any(|v| {
+            let literal_value = extract_tag_value(v);
+            column_bucket_info.may_contain_value(literal_value)
+        });
+
+        if may_contain_value {
+            // Even though one of the `values` is contained in this bucket,
+            // there can be other values not in `values` that are also contained
+            // in this bucket. Therefore, we can't be sure that this bucket
+            // contains ONLY the `values`, so return None
+            None
+        } else {
+            // We are sure that the bucket ID for this column is NOT ANY
+            // of the `values`, so return false
+            Some(false)
+        }
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct NoopPruningOracle;
+/// Returns the underlying string for a tag column, which are encoded as
+/// dictionary literals in DataFusion
+fn extract_tag_value(v: &ScalarValue) -> &str {
+    let ScalarValue::Dictionary(_, value_type) = v else {
+        // If it's not a dictionary, but has been tag-bucket-partitioned.
+        // It likely means tag encoding has changed and this code should
+        // also be updated to keep working.
+        panic!("invalid scalar value type for tag column: {v:?}");
+    };
 
-impl PruningOracle for NoopPruningOracle {
-    fn could_contain_values(
-        &self,
-        _column: &Column,
-        _values: &HashSet<ScalarValue>,
-    ) -> Option<BooleanArray> {
-        None
-    }
+    let ScalarValue::Utf8(Some(tag_value)) = value_type.as_ref() else {
+        // If the value type isn't a UTF-8 string and we've got this
+        // far then something is pretty broken.
+        panic!("invalid dictionary scalar value type for tag column: {v:?}");
+    };
+
+    tag_value
 }
 
-/// Creates a map of tag name to total bucket number.
-///
-/// If we have a partition with the following given information:
-///
-///   Partition template:
-///   ```rs
-///   TemplatePart::Bucket("banana", 50), TemplatePart::Bucket("uuid", 10)
-///   ```
-///
-/// The `create_num_buckets_per_column_map` would create a map look like:
-///   ```rs
-///   {"banana": 50, "uuid": 10}
-///   ```
-///
-///  # Example
-///
-/// ```rs
-/// use data_types::partition_template::{TablePartitionTemplateOverride, TemplatePart};
-/// use generated_types::influxdata::iox::partition_template::v1::template_part::Part;
-/// use iox_query::pruning_oracle::get_num_buckets_per_tag;
-///
-/// let table_partition_template = TablePartitionTemplateOverride::try_new(
-///     Some(PartitionTemplate {
-///         parts: vec![
-///             TemplatePart {
-///                 part: Some(Part::Bucket(
-///                     influxdb_iox_client::table::generated_types::Bucket {
-///                         tag_name: "banana",
-///                         num_buckets: 50,
-///                     },
-///                 )),
-///             },
-///             TemplatePart {
-///                 part: Some(Part::Bucket(
-///                     influxdb_iox_client::table::generated_types::Bucket {
-///                         tag_name: "uuid",
-///                         num_buckets: 10,
-///                     },
-///                 )),
-///             },
-///         ],
-///     }),
-///     &NamespacePartitionTemplateOverride::default(),
-/// )
-/// .expect("valid partition template");
-///
-/// let num_buckets_per_column = get_num_buckets_per_tag(&table_partition_template);
-///
-/// assert_eq!(num_buckets_per_tag.get(&Arc::from("banana")), Some(&50));
-/// assert_eq!(num_buckets_per_tag.get(&Arc::from("uuid")), Some(&10));
-/// assert_eq!(num_buckets_per_tag.get(&Arc::from("not_exist")), None);
-/// ```
-pub fn get_num_buckets_per_tag(
-    table_partition_template: &TablePartitionTemplateOverride,
-) -> HashMap<Arc<str>, u32> {
-    let mut num_buckets_per_column = table_partition_template
-        .parts()
-        .filter_map(|part| match part {
-            TemplatePart::Bucket(tag_name, num_buckets) => Some((Arc::from(tag_name), num_buckets)),
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    num_buckets_per_column.shrink_to_fit();
-    num_buckets_per_column
+/// A builder for constructing a [`BucketPartitionPruningOracle`].
+#[derive(Default, Debug)]
+pub struct BucketPartitionPruningOracleBuilder {
+    /// A map of column names to the bucket info held for that column in this
+    /// partition.
+    tag_bucket_info: HashMap<Arc<str>, BucketInfo>,
+}
+
+impl BucketPartitionPruningOracleBuilder {
+    /// Return `true` if the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tag_bucket_info.is_empty()
+    }
+
+    /// Insert a column name and its bucket info
+    pub fn insert(&mut self, column: Arc<str>, bucket_info: BucketInfo) {
+        self.tag_bucket_info.insert(column, bucket_info);
+    }
+
+    pub fn build(
+        &mut self,
+        table_partition_template: Option<&TablePartitionTemplateOverride>,
+    ) -> BucketPartitionPruningOracle {
+        // Insert missing entries if there are any. This step is necessary for
+        // the cases when partition key is empty for a column, i.e. "!".
+        if let Some(table_partition_template) = table_partition_template {
+            for part in table_partition_template.parts() {
+                if let TemplatePart::Bucket(column_name, num_buckets) = part {
+                    self.tag_bucket_info
+                        .entry(Arc::from(column_name))
+                        .or_insert(BucketInfo {
+                            id: None, // partition key is empty for this column
+                            num_buckets,
+                        });
+                }
+            }
+        }
+
+        BucketPartitionPruningOracle {
+            tag_bucket_info: self.tag_bucket_info.clone(),
+        }
+    }
 }
 
 /// A container type to bundle a bucket ID with the number of

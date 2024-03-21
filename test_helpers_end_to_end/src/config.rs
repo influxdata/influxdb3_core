@@ -42,7 +42,7 @@ pub struct TestConfig {
 impl TestConfig {
     /// Create a new TestConfig. Tests should use one of the specific
     /// configuration setup below, such as [new_router](Self::new_router).
-    fn new(
+    pub fn new(
         server_type: ServerType,
         dsn: Option<String>,
         catalog_schema_name: impl Into<String>,
@@ -81,12 +81,43 @@ impl TestConfig {
     fn new_catalog(dsn: Option<String>, catalog_schema_name: String) -> Self {
         Self::new(ServerType::Catalog, dsn, catalog_schema_name)
             .with_env("INFLUXDB_IOX_CATALOG_CACHE_WARMUP_DELAY", "100ms")
+            // disable bypass detection by default
+            .with_bypass_detection(false)
+    }
+
+    /// Enable/disable catalog cache bypass detection
+    pub fn with_bypass_detection(self, enable: bool) -> Self {
+        assert_eq!(self.server_type(), ServerType::Catalog);
+
+        self.with_env(
+            "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_ENABLED",
+            enable.to_string(),
+        )
+        .with_env(
+            "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_CHECK_INTERVAL",
+            "100ms",
+        )
+        .with_env(
+            "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_RECOVERY_DURATION",
+            "1s",
+        )
+        .with_env(
+            "INFLUXDB_IOX_CATALOG_CACHE_BYPASS_DETECTION_CLEAR_INTERVAL",
+            "500ms",
+        )
     }
 
     /// Create a triplet of catalog cache nodes.
     pub fn catalog_nodes(dsn: impl Into<String>) -> [Self; 3] {
-        let dsn = Some(dsn.into());
         let catalog_schema_name = random_catalog_schema_name();
+        Self::catalog_nodes_with_catalog_schema_name(dsn, catalog_schema_name)
+    }
+
+    pub fn catalog_nodes_with_catalog_schema_name(
+        dsn: impl Into<String>,
+        catalog_schema_name: String,
+    ) -> [Self; 3] {
+        let dsn = Some(dsn.into());
 
         let n0 = Self::new_catalog(dsn.clone(), catalog_schema_name.clone());
         let n1 = Self::new_catalog(dsn.clone(), catalog_schema_name.clone());
@@ -218,6 +249,12 @@ impl TestConfig {
     pub fn new_querier_without_ingester(ingester_config: &Self) -> Self {
         Self::new_with_existing_catalog(ServerType::Querier, ingester_config)
             .with_existing_object_store(ingester_config)
+            .with_querier_defaults()
+    }
+
+    /// Set querier defaults.
+    pub fn with_querier_defaults(self) -> Self {
+        self
             // Hard code query threads so query plans do not vary based on environment
             .with_env("INFLUXDB_IOX_NUM_QUERY_THREADS", "4")
             .with_env(
@@ -391,8 +428,15 @@ impl TestConfig {
             .with_env("INFLUXDB_IOX_DB_DIR", object_store_string)
     }
 
+    pub fn with_file_object_store(mut self, tmpdir: Arc<TempDir>) -> Self {
+        let object_store_string = tmpdir.path().display().to_string();
+        self.object_store_dir = Some(tmpdir);
+        self.with_env("INFLUXDB_IOX_OBJECT_STORE", "file")
+            .with_env("INFLUXDB_IOX_DB_DIR", object_store_string)
+    }
+
     /// Configures this TestConfig to use the same object store as other
-    fn with_existing_object_store(mut self, other: &Self) -> Self {
+    pub fn with_existing_object_store(mut self, other: &Self) -> Self {
         // copy a reference to the temp dir, if any
         self.object_store_dir = other.object_store_dir.clone();
         self.copy_env("INFLUXDB_IOX_OBJECT_STORE", other)
@@ -425,10 +469,10 @@ impl TestConfig {
 
     /// Use a mock presigned URL generator rather than whatever object store may have been
     /// configured. Allows for testing bulk ingest without needing S3.
-    pub fn with_mock_presigned_url_signer(self) -> Self {
+    pub fn with_mock_presigned_url_signer(self, url: &str) -> Self {
         self.with_env(
             "INFLUXDB_IOX_BULK_INGEST_USE_MOCK_PRESIGNED_URL_SIGNER",
-            "true",
+            url,
         )
     }
 

@@ -91,7 +91,7 @@ pub fn group_potential_duplicates(
     groups
 }
 
-fn timestamp_min_max(chunk: &dyn QueryChunk) -> Option<TimestampMinMax> {
+pub(crate) fn timestamp_min_max(chunk: &dyn QueryChunk) -> Option<TimestampMinMax> {
     let stats = chunk.stats();
     chunk
         .schema()

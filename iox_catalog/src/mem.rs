@@ -12,7 +12,6 @@ use crate::{
     metrics::MetricDecorator,
 };
 use async_trait::async_trait;
-use data_types::snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot};
 use data_types::snapshot::{root::RootSnapshot, table::TableSnapshot};
 use data_types::{
     partition_template::{
@@ -23,14 +22,17 @@ use data_types::{
     ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
     PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
 };
+use data_types::{
+    snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot},
+    NamespaceVersion,
+};
 use iox_time::TimeProvider;
 use parking_lot::Mutex;
 use snafu::ensure;
-use std::ops::Deref;
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
-    ops::DerefMut,
+    ops::{Deref, DerefMut},
     sync::Arc,
 };
 use trace::ctx::SpanContext;
@@ -161,6 +163,12 @@ impl Catalog for MemCatalog {
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
+        Err(Error::NotImplemented {
+            descr: "active applications".to_owned(),
+        })
     }
 }
 
@@ -302,6 +310,7 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.max_tables = new_max;
+                update_namespace_router_version(n);
                 Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
@@ -319,6 +328,7 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.max_columns_per_table = new_max;
+                update_namespace_router_version(n);
                 Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
@@ -336,6 +346,7 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
                 n.retention_period_ns = retention_period_ns;
+                update_namespace_router_version(n);
                 Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
@@ -1228,6 +1239,10 @@ fn update_compaction_level(
     Ok(updated)
 }
 
+fn update_namespace_router_version(n: &mut Namespace) {
+    n.router_version = NamespaceVersion::new(n.router_version.get() + 1);
+}
+
 #[cfg(test)]
 mod tests {
     use iox_time::SystemProvider;
@@ -1235,7 +1250,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
         crate::interface_tests::test_catalog(|| async {
             let metrics = Arc::new(metric::Registry::default());

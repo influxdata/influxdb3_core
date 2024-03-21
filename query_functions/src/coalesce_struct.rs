@@ -356,7 +356,15 @@ mod tests {
         assert_case_err(
             [],
             &dt,
-            "Error during planning: coalesce_struct expects at least 1 argument",
+            "No function matches the given name and argument types 'coalesce_struct()'",
+        )
+        .await;
+
+        assert_case_err(
+            [],
+            &dt,
+            // make sure the error message is helpful
+            "coalesce_struct(Any, .., Any)",
         )
         .await;
 

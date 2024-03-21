@@ -25,3 +25,4 @@ pub mod router;
 pub mod run_config;
 pub mod single_tenant;
 pub mod socket_addr;
+pub mod tokio_main;

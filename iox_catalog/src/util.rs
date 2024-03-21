@@ -122,6 +122,28 @@ where
     Ok(Some(namespace))
 }
 
+/// Get a Table's schema by its ID.
+pub async fn get_table_schema_by_id<R>(
+    id: TableId,
+    repos: &mut R,
+) -> Result<Option<TableSchema>, crate::interface::Error>
+where
+    R: RepoCollection + ?Sized,
+{
+    let Some(table) = repos.tables().get_by_id(id).await? else {
+        return Ok(None);
+    };
+
+    let mut table_schema = TableSchema::new_empty_from(&table);
+
+    let columns = repos.columns().list_by_table_id(table.id).await?;
+    for c in columns {
+        table_schema.add_column(c);
+    }
+
+    Ok(Some(table_schema))
+}
+
 /// Gets all the table's columns.
 pub async fn get_table_columns_by_id<R>(
     id: TableId,

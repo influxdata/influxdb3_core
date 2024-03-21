@@ -1,5 +1,6 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
+use crate::provider::cached_parquet_data::CachedParquetFileReaderFactory;
 use crate::statistics::build_statistics_for_chunks;
 use crate::{
     provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs, QueryChunk,
@@ -16,7 +17,8 @@ use datafusion::{
     physical_plan::{empty::EmptyExec, expressions::Column, union::UnionExec, ExecutionPlan},
     scalar::ScalarValue,
 };
-use object_store::ObjectMeta;
+use object_store::{ObjectMeta, ObjectStore};
+use once_cell::sync::Lazy;
 use schema::{sort::SortKey, Schema};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -37,6 +39,7 @@ pub struct PartitionedFileExt {
 #[derive(Debug)]
 struct ParquetChunkList {
     object_store_url: ObjectStoreUrl,
+    object_store: Arc<dyn ObjectStore>,
     chunks: Vec<(ObjectMeta, Arc<dyn QueryChunk>)>,
     /// Sort key to place on the ParquetExec, validated to be
     /// compatible with all chunk sort keys
@@ -50,6 +53,7 @@ impl ParquetChunkList {
     /// the chunk order.
     fn new(
         object_store_url: ObjectStoreUrl,
+        object_store: Arc<dyn ObjectStore>,
         chunk: &Arc<dyn QueryChunk>,
         meta: ObjectMeta,
         output_sort_key: Option<&SortKey>,
@@ -58,6 +62,7 @@ impl ParquetChunkList {
 
         Self {
             object_store_url,
+            object_store,
             chunks: vec![(meta, Arc::clone(chunk))],
             sort_key,
         }
@@ -166,6 +171,7 @@ pub fn chunks_to_physical_nodes(
                         let output_sort_key = output_sort_key.or_else(|| chunk.sort_key());
                         v.insert(ParquetChunkList::new(
                             parquet_input.object_store_url,
+                            parquet_input.object_store,
                             chunk,
                             parquet_input.object_meta,
                             output_sort_key,
@@ -190,6 +196,7 @@ pub fn chunks_to_physical_nodes(
     for (_url_str, chunk_list) in parquet_chunks {
         let ParquetChunkList {
             object_store_url,
+            object_store,
             mut chunks,
             sort_key,
         } = chunk_list;
@@ -273,13 +280,28 @@ pub fn chunks_to_physical_nodes(
         };
         let meta_size_hint = None;
 
-        let parquet_exec = ParquetExec::new(base_config, None, meta_size_hint);
+        let mut parquet_exec = ParquetExec::new(base_config, None, meta_size_hint);
+        if *USE_CACHED_PARQUET_LOADING {
+            parquet_exec = parquet_exec.with_parquet_file_reader_factory(Arc::new(
+                CachedParquetFileReaderFactory::new(object_store),
+            ));
+        }
+
         output_nodes.push(Arc::new(parquet_exec));
     }
 
     assert!(!output_nodes.is_empty());
     Arc::new(UnionExec::new(output_nodes))
 }
+
+/// Hackish feature switch for easier experiments.
+///
+/// TODO(marco): do this properly.
+static USE_CACHED_PARQUET_LOADING: Lazy<bool> = Lazy::new(|| {
+    std::env::var("INFLUXDB_IOX_CACHED_PARQUET_LOADER")
+        .map(|s| s.to_lowercase() == "true" || s == "1")
+        .unwrap_or_default()
+});
 
 /// Distribute items from the given iterator into `n` containers.
 ///

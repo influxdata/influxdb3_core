@@ -149,8 +149,9 @@ fn extract_interval_nanos(cv: &ColumnarValue) -> Result<i64> {
                 ));
             }
 
-            let nanos =
-                (Duration::days(days as i64) + Duration::nanoseconds(nanos)).num_nanoseconds();
+            let nanos = (Duration::try_days(days as i64).expect("days must be in bounds")
+                + Duration::nanoseconds(nanos))
+            .num_nanoseconds();
             nanos.ok_or_else(|| {
                 DataFusionError::Execution("gap filling argument is too large".to_string())
             })
@@ -182,7 +183,7 @@ mod tests {
 
     use crate::exec::{
         gapfill::{FillStrategy, GapFillExec, GapFillExecParams},
-        Executor, ExecutorType,
+        Executor,
     };
 
     use super::GapFillParams;
@@ -374,7 +375,7 @@ mod tests {
 
     async fn plan_statement_and_get_params(sql: &str) -> Result<GapFillParams> {
         let executor = Executor::new_testing();
-        let context = executor.new_context(ExecutorType::Query);
+        let context = executor.new_context();
         context
             .inner()
             .register_table("t", Arc::new(EmptyTable::new(Arc::new(schema()))))?;
