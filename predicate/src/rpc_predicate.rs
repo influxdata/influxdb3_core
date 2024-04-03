@@ -7,7 +7,7 @@ mod value_rewrite;
 use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 use crate::Predicate;
 
-use datafusion::common::tree_node::TreeNode;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::ToDFSchema;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::ExecutionProps;
@@ -233,38 +233,43 @@ fn normalize_predicate(
                 // Rewrite any references to `_value = some_value` to literal true values.
                 // Keeps track of these expressions, which can then be used to
                 // augment field projections with conditions using `CASE` statements.
-                .and_then(|e| rewrite_field_value_references(&mut field_value_exprs, e))
+                .and_then(|e| rewrite_field_value_references(&mut field_value_exprs, e.data))
                 .map(|e| log_rewrite(e, "rewrite_field_value_references"))
                 // Rewrite any references to `_field` with a literal
                 // and keep track of referenced field names to add to
                 // the field column projection set.
-                .and_then(|e| field_projections.rewrite_field_exprs(e))
+                .and_then(|e| field_projections.rewrite_field_exprs(e.data))
                 .map(|e| log_rewrite(e, "field_projections"))
                 // Any column references that exist in the RPC predicate must exist
                 // in the table's schema as tags. Replace any column references that
                 // do not exist, or that are not tags, with NULL.
                 // Field values always use `_value` as a name and are handled above.
-                .and_then(|e| e.transform(&|e| missing_tag_to_null(&schema, e)))
+                .and_then(|e| e.data.transform(&|e| missing_tag_to_null(&schema, e)))
                 .map(|e| log_rewrite(e, "missing_columums"))
                 // apply IOx specific rewrites (that unlock other simplifications)
-                .and_then(rewrite::iox_expr_rewrite)
+                .and_then(|e| rewrite::iox_expr_rewrite(e.data))
                 .map(|e| log_rewrite(e, "rewrite"))
                 // apply type_coercing so datafuson simplification can deal with this
-                .and_then(|e| simplifier.coerce(e, Arc::clone(&df_schema)))
+                .and_then(|e| {
+                    simplifier
+                        .coerce(e.data, Arc::clone(&df_schema))
+                        .map(Transformed::yes)
+                })
                 .map(|e| log_rewrite(e, "coerce_expr"))
                 // Call DataFusion simplification logic
-                .and_then(|e| simplifier.simplify(e))
+                .and_then(|e| simplifier.simplify(e.data).map(Transformed::yes))
                 .map(|e| log_rewrite(e, "simplify_expr"))
-                .and_then(rewrite::simplify_predicate)
+                .and_then(|e| rewrite::simplify_predicate(e.data))
                 .map(|e| log_rewrite(e, "simplify_predicate"));
 
             debug!(?e, "rewritten expr");
             e
         })
         // Filter out literal true so is_empty works correctly
-        .filter(|f| match f {
-            Err(_) => true,
-            Ok(expr) => (*expr) != lit(true),
+        .filter_map(|f| match f {
+            Err(e) => Some(Err(e)),
+            Ok(expr) if expr.data != lit(true) => Some(Ok(expr.data)),
+            _ => None,
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
 
@@ -275,8 +280,8 @@ fn normalize_predicate(
     field_projections.add_to_predicate(predicate)
 }
 
-fn log_rewrite(expr: Expr, description: &str) -> Expr {
-    trace!(?expr, %description, "After rewrite");
+fn log_rewrite(expr: Transformed<Expr>, description: &str) -> Transformed<Expr> {
+    trace!(expr=?expr.data, transformed=expr.transformed, %description, "After rewrite");
     expr
 }
 

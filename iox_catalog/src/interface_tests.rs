@@ -2540,6 +2540,30 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
         .create(l1_file_params.clone())
         .await
         .unwrap();
+    // should return just one partition because L1s don't update new_file_at
+    let mut partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_two_hour_ago, None)
+        .await
+        .unwrap();
+    assert_eq!(partitions.len(), 1);
+    partitions.sort();
+    assert_eq!(partitions[0], partition1.id);
+
+    // Add an L0 file created just now, to update new_file_at
+    let l0_file_params = ParquetFileParams {
+        object_store_id: ObjectStoreId::new(),
+        created_at: time_now,
+        partition_id: partition2.id,
+        partition_hash_id: partition2.hash_id().cloned(),
+        compaction_level: CompactionLevel::Initial,
+        ..parquet_file_params.clone()
+    };
+    repos
+        .parquet_files()
+        .create(l0_file_params.clone())
+        .await
+        .unwrap();
     // should return both partitions
     let mut partitions = repos
         .partitions()
@@ -2633,11 +2657,10 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
         .partitions_new_file_between(time_two_hour_ago, None)
         .await
         .unwrap();
-    assert_eq!(partitions.len(), 3);
+    assert_eq!(partitions.len(), 2);
     partitions.sort();
     assert_eq!(partitions[0], partition1.id);
     assert_eq!(partitions[1], partition2.id);
-    assert_eq!(partitions[2], partition3.id);
     // Only return partition1: the creation time must be strictly less than the maximum time,
     // not equal
     let partitions = repos

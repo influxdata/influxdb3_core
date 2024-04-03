@@ -15,8 +15,14 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+use std::collections::HashMap;
+
+use once_cell::sync::Lazy;
+use prost::Message;
+use prost_types::FileDescriptorProto;
 // Re-export prost for users of proto types.
 pub use prost;
+pub use prost_types::FileDescriptorSet;
 
 /// This module imports the generated protobuf code into a Rust module
 /// hierarchy that matches the namespace hierarchy of the protobuf
@@ -365,6 +371,41 @@ pub fn protobuf_type_url(protobuf_type: &str) -> String {
 /// Useful in gRPC reflection.
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("proto_descriptor");
 
+/// A map of [`tonic::server::NamedService::NAME`] strings to
+/// [`prost_types::FileDescriptorProto`]s. This is intended to be used to selectively populating
+/// the gRPC reflection service only with service protos being registered in a given IOx component.
+pub static FILE_DESCRIPTOR_MAP: Lazy<HashMap<String, FileDescriptorProto>> = Lazy::new(|| {
+    FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+        .expect("decoding FILE_DESCRIPTOR_SET")
+        .file
+        .into_iter()
+        .flat_map(|proto| {
+            proto
+                .service
+                .iter()
+                .map(|svc| {
+                    // Figure out the fully-qualified name of this service.
+                    //
+                    // This string will be in the form of "<package>.<service>"
+                    // where "package" may itself contain multiple parts
+                    // delimited by "."
+                    //
+                    // If no package exists, use the service name only.
+                    let qualified_name = proto
+                        .package
+                        .iter()
+                        .chain(svc.name.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(".");
+
+                    (qualified_name, proto.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+});
+
 /// Compares the protobuf type URL found within a google.protobuf.Any
 /// message to an expected Protobuf package and message name
 ///
@@ -393,6 +434,8 @@ pub use prost::{DecodeError, EncodeError};
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use crate::influxdata::iox::gossip::Topic;
 
     use super::*;
@@ -441,5 +484,38 @@ mod tests {
             Topic::PartitionSortKeyUpdates => {}
             Topic::NamespaceEvents => {}
         }
+    }
+
+    #[test]
+    fn test_file_descriptor_map() {
+        // use the following command if the list of expected keys needs to be updated:
+        // grep -E -rn 'const NAME' target/debug/build/generated_types-*/out/*rs | awk -F" = " '{print $2}' | sort | uniq | tr -d \;
+        let expected_keys = vec![
+            "influxdata.platform.storage.Storage",
+            "influxdata.platform.storage.IOxTesting",
+            "google.longrunning.Operations",
+            "influxdata.iox.catalog.v1.CatalogService",
+            "influxdata.iox.schema.v1.SchemaService",
+            "influxdata.iox.gossip.v1.AntiEntropyService",
+            "influxdata.iox.authz.v1.IoxAuthorizerService",
+            "influxdata.iox.delete.v1.DeleteService",
+            "influxdata.iox.namespace.v1.NamespaceService",
+            "influxdata.iox.ingester.v1.PersistService",
+            "influxdata.iox.ingester.v1.WriteService",
+            "influxdata.iox.querier.v1.QueryLogService",
+            "grpc.health.v1.Health",
+            "influxdata.iox.compactor.v1.CompactionService",
+            "influxdata.iox.object_store.v1.ObjectStoreService",
+            "influxdata.iox.catalog.v2.CatalogService",
+            "influxdata.iox.table.v1.TableService",
+            "influxdata.iox.bulk_ingest.v1.BulkIngestService",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let fd_map_actual_keys: HashSet<String> = FILE_DESCRIPTOR_MAP.keys().cloned().collect();
+
+        assert_eq!(fd_map_actual_keys, expected_keys);
     }
 }

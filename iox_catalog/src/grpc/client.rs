@@ -273,6 +273,7 @@ impl GrpcCatalogClientRepos {
             .map_err(|be| {
                 let status = match be {
                     BackoffError::DeadlineExceeded { source, .. } => source,
+                    BackoffError::RetryDisallowed { source, .. } => source,
                 };
                 convert_status(status)
             })?
@@ -716,6 +717,17 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         Ok(deserialize_partition(
             resp.partition.required().ctx("partition")?,
         )?)
+    }
+
+    async fn set_new_file_at(
+        &mut self,
+        _partition_id: PartitionId,
+        _new_file_at: Timestamp,
+    ) -> Result<()> {
+        Err(Error::NotImplemented {
+            descr: "set_new_file_at is for test use only, not implemented for grpc client"
+                .to_string(),
+        })
     }
 
     async fn get_by_id_batch(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<Partition>> {

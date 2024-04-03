@@ -28,7 +28,7 @@ use arrow::datatypes::{DataType, Field as ArrowField, Int32Type, Schema as Arrow
 use arrow::record_batch::RecordBatch;
 use chrono_tz::Tz;
 use datafusion::catalog::TableReference;
-use datafusion::common::tree_node::{Transformed, TreeNode, VisitRecursion};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, ToDFSchema};
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::expr::{AggregateFunctionDefinition, Alias, ScalarFunction};
@@ -479,7 +479,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         mut statement: Statement,
         params: StatementParams,
     ) -> Result<LogicalPlan> {
-        if !params.as_hashmap().is_empty() {
+        if !params.is_empty() {
             statement = replace_bind_params_with_values(statement, params)
                 .or_else(|e| error::params(e.to_string()))?;
         }
@@ -1273,11 +1273,12 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         .clone()
                         .transform_up(&|expr| {
                             if expr == selector {
-                                Ok(Transformed::Yes(selector_new.clone()))
+                                Ok(Transformed::yes(selector_new.clone()))
                             } else {
-                                Ok(Transformed::No(expr))
+                                Ok(Transformed::no(expr))
                             }
                         })
+                        .map(|t| t.data)
                         .expect("cannot fail");
                     aggr_exprs[0] = selector_new.clone();
 
@@ -1423,7 +1424,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     _ => None,
                 };
 
-                rebase_expr(expr, &aggr_projection_exprs, &fill_if_null, &plan)
+                rebase_expr(expr, &aggr_projection_exprs, &fill_if_null, &plan).map(|t| t.data)
             })
             .collect::<Result<Vec<Expr>>>()?;
 
@@ -1465,12 +1466,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .map(|expr| {
                 expr.clone().transform_up(&|udf_expr| {
                     Ok(if udfs.contains(&udf_expr) {
-                        Transformed::Yes(expr_as_column_expr(&udf_expr, &plan)?)
+                        Transformed::yes(expr_as_column_expr(&udf_expr, &plan)?)
                     } else {
-                        Transformed::No(udf_expr)
+                        Transformed::no(udf_expr)
                     })
                 })
             })
+            .map(|t| t.data())
             .collect::<Result<Vec<Expr>>>()?;
 
         Ok((plan, select_exprs))
@@ -1852,7 +1854,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     ) -> Result<Expr> {
         let expr = self.expr_to_df_expr(ExprScope::Projection, &field.expr, schema)?;
         let expr = planner_rewrite_expression::rewrite_field_expr(expr, schema)?;
-        normalize_col(expr.alias(&field.name), plan)
+        normalize_col(expr.data.alias(&field.name), plan)
     }
 
     /// Map an InfluxQL [`ConditionalExpression`] to a DataFusion [`Expr`].
@@ -2077,6 +2079,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     distinct,
                     None,
                     None,
+                    None,
                 )))
             }
             "sum" | "stddev" | "mean" | "median" => {
@@ -2090,6 +2093,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     AggregateFunction::from_str(name)?,
                     vec![expr],
                     false,
+                    None,
                     None,
                     None,
                 )))
@@ -2107,6 +2111,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     distinct: false,
                     filter: None,
                     order_by: None,
+                    null_treatment: None,
                 }))
             }
             "percentile" => {
@@ -2123,6 +2128,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     distinct: false,
                     filter: None,
                     order_by: None,
+                    null_treatment: None,
                 }))
             }
             "spread" => {
@@ -2138,6 +2144,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     distinct: false,
                     filter: None,
                     order_by: None,
+                    null_treatment: None,
                 }))
             }
             name @ ("first" | "last" | "min" | "max") => {
@@ -3199,9 +3206,9 @@ fn build_gap_fill_node(
                             },
                             time_range => time_range,
                         });
-                        Ok(VisitRecursion::Stop)
+                        Ok(TreeNodeRecursion::Stop)
                     }
-                    _ => Ok(VisitRecursion::Continue),
+                    _ => Ok(TreeNodeRecursion::Continue),
                 });
                 time_range = if projection_type == &ProjectionType::WindowAggregateMixed {
                     // For WindowAggregateMixed queries do not gap fill before the first
@@ -4254,7 +4261,7 @@ mod test {
                   Distinct: [many_measurements:Dictionary(Int32, Utf8);N]
                     Projection: m4.many_measurements [many_measurements:Dictionary(Int32, Utf8);N]
                       Filter: m4.time >= TimestampNanosecond(1672444800000000000, None) [f64_field:Float64;N, many_measurements:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
-                        TableScan: m4 [f64_field:Float64;N, many_measurements:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))] 
+                        TableScan: m4 [f64_field:Float64;N, many_measurements:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
         }
 

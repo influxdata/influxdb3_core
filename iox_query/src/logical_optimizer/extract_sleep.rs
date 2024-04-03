@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::{
-    common::{tree_node::TreeNodeRewriter, DFSchema},
+    common::{
+        tree_node::{Transformed, TreeNodeRewriter},
+        DFSchema,
+    },
     error::DataFusionError,
     logical_expr::{expr_rewriter::rewrite_preserving_name, Extension, LogicalPlan},
     optimizer::{OptimizerConfig, OptimizerRule},
@@ -82,19 +85,22 @@ struct Rewriter {
 }
 
 impl TreeNodeRewriter for Rewriter {
-    type N = Expr;
+    type Node = Expr;
 
-    fn mutate(&mut self, expr: Expr) -> Result<Expr, DataFusionError> {
+    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>, DataFusionError> {
         match expr {
             Expr::ScalarFunction(ScalarFunction { func_def, mut args }) => {
                 if func_def.name() == SLEEP_UDF_NAME {
                     self.found_exprs.append(&mut args);
-                    return Ok(lit(ScalarValue::Null));
+                    return Ok(Transformed::yes(lit(ScalarValue::Null)));
                 }
 
-                Ok(Expr::ScalarFunction(ScalarFunction { func_def, args }))
+                Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
+                    func_def,
+                    args,
+                })))
             }
-            _ => Ok(expr),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 }

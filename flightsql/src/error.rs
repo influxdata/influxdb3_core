@@ -22,6 +22,13 @@ pub enum Error {
         source: FromUtf8Error,
     },
 
+    #[snafu(display(
+        "Expected stream of FlightData but found none when executing method {} for command {:?}.",
+        method,
+        cmd
+    ))]
+    NoFlightData { cmd: String, method: &'static str },
+
     #[snafu(display("Invalid Any type URL. Expected '{}' found '{}'", expected, actual))]
     InvalidTypeUrl { expected: String, actual: String },
 
@@ -46,6 +53,12 @@ pub enum Error {
 
     #[snafu(display("Protocol error. Method {} does not expect '{:?}'", method, cmd))]
     Protocol { cmd: String, method: &'static str },
+
+    #[snafu(display(
+        "Unable to infer the type of parameter '{}' in prepared statement",
+        parameter_name
+    ))]
+    UnknownParameterType { parameter_name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

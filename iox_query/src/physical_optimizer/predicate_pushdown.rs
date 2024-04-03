@@ -1,7 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::{
-    common::tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRewriter},
     config::ConfigOptions,
     datasource::physical_plan::ParquetExec,
     error::{DataFusionError, Result},
@@ -39,7 +39,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
 
                 let child_any = child.as_any();
                 if child_any.downcast_ref::<EmptyExec>().is_some() {
-                    return Ok(Transformed::Yes(child));
+                    return Ok(Transformed::yes(child));
                 } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
                     let new_inputs = child_union
                         .inputs()
@@ -53,7 +53,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let new_union = UnionExec::new(new_inputs);
-                    return Ok(Transformed::Yes(Arc::new(new_union)));
+                    return Ok(Transformed::yes(Arc::new(new_union)));
                 } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
                     let existing = child_parquet
                         .predicate()
@@ -74,7 +74,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                             None,
                         )),
                     )?);
-                    return Ok(Transformed::Yes(new_node));
+                    return Ok(Transformed::yes(new_node));
                 } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
                     let dedup_cols = child_dedup.sort_columns();
                     let (pushdown, no_pushdown): (Vec<_>, Vec<_>) =
@@ -106,13 +106,14 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                                 new_node,
                             )?);
                         }
-                        return Ok(Transformed::Yes(new_node));
+                        return Ok(Transformed::yes(new_node));
                     }
                 }
             }
 
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {
@@ -130,23 +131,21 @@ struct ColumnCollector {
 }
 
 impl TreeNodeRewriter for ColumnCollector {
-    type N = Arc<dyn PhysicalExpr>;
+    type Node = Arc<dyn PhysicalExpr>;
 
-    fn pre_visit(
-        &mut self,
-        node: &Arc<dyn PhysicalExpr>,
-    ) -> Result<RewriteRecursion, DataFusionError> {
+    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>, DataFusionError> {
         if let Some(column) = node.as_any().downcast_ref::<Column>() {
             self.cols.insert(column.clone());
+            return Ok(Transformed::yes(node));
         }
-        Ok(RewriteRecursion::Continue)
+        Ok(Transformed::no(node))
     }
 
-    fn mutate(
+    fn f_up(
         &mut self,
         expr: Arc<dyn PhysicalExpr>,
-    ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-        Ok(expr)
+    ) -> Result<Transformed<Self::Node>, DataFusionError> {
+        Ok(Transformed::no(expr))
     }
 }
 

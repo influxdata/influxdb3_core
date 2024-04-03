@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::{
     common::{
         internal_err,
-        tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     },
     config::ConfigOptions,
     error::Result,
@@ -64,11 +64,11 @@ impl PhysicalOptimizerRule for PushSortThroughUnion {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(&|plan| {
             let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() else {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             if !sort_should_be_pushed_down(sort_exec)? {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             }
 
             let mut plan = Arc::clone(sort_exec.input());
@@ -76,7 +76,10 @@ impl PhysicalOptimizerRule for PushSortThroughUnion {
                 ordering: sort_exec.properties().output_ordering().unwrap().to_vec(),
             };
 
-            plan = plan.rewrite(&mut rewriter)?;
+            plan = match plan.rewrite(&mut rewriter) {
+                Err(e) => return Err(e),
+                Ok(plan) => plan.data,
+            };
 
             // As a sanity check, make sure plan has the same ordering as before.
             // If this fails, there is a bug in this optimization.
@@ -96,8 +99,9 @@ impl PhysicalOptimizerRule for PushSortThroughUnion {
                 return internal_err!("PushSortThroughUnion corrupted plan sort order");
             }
 
-            Ok(Transformed::Yes(plan))
+            Ok(Transformed::yes(plan))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {
@@ -154,28 +158,28 @@ struct SortRewriter {
 }
 
 impl TreeNodeRewriter for SortRewriter {
-    type N = Arc<dyn ExecutionPlan>;
+    type Node = Arc<dyn ExecutionPlan>;
 
-    fn pre_visit(&mut self, plan: &Self::N) -> Result<RewriteRecursion> {
+    fn f_down(&mut self, plan: Self::Node) -> Result<Transformed<Self::Node>> {
         if plan.as_any().is::<RepartitionExec>() {
-            Ok(datafusion::common::tree_node::RewriteRecursion::Continue)
+            Ok(Transformed::no(plan))
         } else if plan.as_any().is::<UnionExec>() {
-            Ok(datafusion::common::tree_node::RewriteRecursion::Mutate)
+            Ok(Transformed::new(plan, true, TreeNodeRecursion::Jump))
         } else {
-            Ok(datafusion::common::tree_node::RewriteRecursion::Stop)
+            Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
         }
     }
 
-    fn mutate(&mut self, plan: Self::N) -> Result<Self::N> {
+    fn f_up(&mut self, plan: Self::Node) -> Result<Transformed<Self::Node>> {
         if let Some(repartition_exec) = plan.as_any().downcast_ref::<RepartitionExec>() {
             // Convert any RepartitionExec to be sort-preserving
-            Ok(Arc::new(
+            Ok(Transformed::yes(Arc::new(
                 RepartitionExec::try_new(
                     Arc::clone(repartition_exec.input()),
                     repartition_exec.properties().output_partitioning().clone(),
                 )?
                 .with_preserve_order(),
-            ))
+            )))
         } else if let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() {
             // Any children of the UnionExec that are not already sorted,
             // need to be sorted.
@@ -199,9 +203,9 @@ impl TreeNodeRewriter for SortRewriter {
                 })
                 .collect();
 
-            Ok(Arc::new(UnionExec::new(new_children)))
+            Ok(Transformed::yes(Arc::new(UnionExec::new(new_children))))
         } else {
-            Ok(plan)
+            Ok(Transformed::no(plan))
         }
     }
 }

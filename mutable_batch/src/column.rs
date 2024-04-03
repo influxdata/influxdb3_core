@@ -661,29 +661,22 @@ where
     min.zip(max)
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{borrow::Borrow, collections::HashSet, fmt::Debug, mem::discriminant};
-
-    use arrow::record_batch::RecordBatch;
-    use arrow_util::assert_batches_eq;
-    use assert_matches::assert_matches;
-    use data_types::IsNan;
-    use proptest::prelude::*;
-
+/// Test helpers for randomised testing.
+#[cfg(any(test, feature = "arbitrary"))]
+pub mod arbitrary {
     use super::*;
 
-    fn hydrate(dict: &Dictionary, data: &[DID]) -> Vec<String> {
-        data.iter()
-            .map(|&id| dict.lookup_id(id).unwrap().to_string())
-            .collect::<Vec<_>>()
-    }
+    use proptest::prelude::*;
+
+    pub(crate) const MAX_ROWS: usize = 20;
 
     /// Take an iterator of nullable `T`, and convert it into a vector of
     /// non-optional values and a null mask compatible with [`ColumnData`].
     ///
     /// Returns the number of nulls in `data`.
-    fn densify<T, U>(data: impl IntoIterator<Item = Option<U>>) -> (Vec<T>, BitSet, usize)
+    pub(crate) fn densify<T, U>(
+        data: impl IntoIterator<Item = Option<U>>,
+    ) -> (Vec<T>, BitSet, usize)
     where
         U: ToOwned<Owned = T>,
         T: Default,
@@ -708,136 +701,12 @@ mod tests {
         (out, bitmap, nulls)
     }
 
-    #[test]
-    #[allow(clippy::bool_assert_comparison)]
-    fn test_densify() {
-        let input = [None, Some(42), None, None, Some(24)];
-
-        let (got, nulls, count) = densify(input);
-        assert_eq!(got, [0, 42, 0, 0, 24]); // NULLS are populated with 0 (not sparse representation)
-        assert_eq!(nulls.get(0), false);
-        assert_eq!(nulls.get(1), true);
-        assert_eq!(nulls.get(2), false);
-        assert_eq!(nulls.get(3), false);
-        assert_eq!(nulls.get(4), true);
-        assert_eq!(nulls.len(), 5);
-        assert_eq!(count, 3);
-    }
-
-    #[test]
-    fn test_rewrite_dictionary() {
-        let mut original = Dictionary::new();
-        let mut data = vec![];
-
-        // Input strings to be dictionary encoded.
-        let input = [
-            "bananas", "platanos", "bananas", "platanos", "ananas", "ananas", "ananas",
-        ];
-
-        for v in input {
-            data.push(original.lookup_value_or_insert(v));
-        }
-
-        assert_eq!(data.len(), input.len());
-        assert_eq!(original.values().len(), 3); // 3 distinct values
-
-        let mut new_data = data.split_off(3);
-        let new_dict = rebuild_dictionary(&original, &mut new_data);
-        let old_dict = rebuild_dictionary(&original, &mut data);
-
-        let new_data_hydrated = hydrate(&new_dict, &new_data);
-        let old_data_hydrated = hydrate(&old_dict, &data);
-
-        assert_eq!(
-            new_data_hydrated,
-            ["platanos", "ananas", "ananas", "ananas"]
-        );
-        assert_eq!(old_data_hydrated, ["bananas", "platanos", "bananas"]);
-
-        assert_eq!(new_dict.values().len(), 2); // 2 distinct values
-        assert_eq!(old_dict.values().len(), 2); // 2 distinct values
-    }
-
-    #[test]
-    fn test_split_off() {
-        let (data, valid, _) = densify([Some(42), None, None, Some(24)]);
-        valid.to_arrow();
-
-        let mut col = Column {
-            influx_type: InfluxColumnType::Field(InfluxFieldType::UInteger),
-            valid,
-            data: ColumnData::U64(data, StatValues::new(None, None, 4, Some(2))),
-        };
-
-        let mut schema = schema::SchemaBuilder::new();
-        schema.influx_column("bananas", col.influx_type());
-        let schema = schema.build().unwrap();
-
-        // Before the split
-        let batch = RecordBatch::try_new(
-            schema.clone().into(),
-            vec![col.to_arrow().expect("failed to covert column to arrow")],
-        )
-        .expect("failed to build record batch");
-        assert_batches_eq!(
-            [
-                "+---------+",
-                "| bananas |",
-                "+---------+",
-                "| 42      |",
-                "|         |",
-                "|         |",
-                "| 24      |",
-                "+---------+",
-            ],
-            &[batch]
-        );
-
-        let col2 = col.split_off(2);
-
-        // After the split, the input column
-        let batch = RecordBatch::try_new(
-            schema.clone().into(),
-            vec![col.to_arrow().expect("failed to covert column to arrow")],
-        )
-        .expect("failed to build record batch");
-        assert_batches_eq!(
-            [
-                "+---------+",
-                "| bananas |",
-                "+---------+",
-                "| 42      |",
-                "|         |",
-                "+---------+",
-            ],
-            &[batch]
-        );
-
-        // After the split, the split off column
-        let batch = RecordBatch::try_new(
-            schema.into(),
-            vec![col2.to_arrow().expect("failed to covert column to arrow")],
-        )
-        .expect("failed to build record batch");
-        assert_batches_eq!(
-            [
-                "+---------+",
-                "| bananas |",
-                "+---------+",
-                "|         |",
-                "| 24      |",
-                "+---------+",
-            ],
-            &[batch]
-        );
-    }
-
-    const MAX_ROWS: usize = 20;
-
     /// Returns a vector of `Option<T>`.
-    fn sparse_array<T>(s: impl Strategy<Value = T>) -> impl Strategy<Value = Vec<Option<T>>>
+    pub(crate) fn sparse_array<T>(
+        s: impl Strategy<Value = T>,
+    ) -> impl Strategy<Value = Vec<Option<T>>>
     where
-        T: Debug,
+        T: std::fmt::Debug,
     {
         prop::collection::vec(prop::option::of(s), 0..MAX_ROWS)
     }
@@ -849,7 +718,7 @@ mod tests {
     ///
     /// [`MutableBatch`]: crate::MutableBatch
     /// [`Writer`]: crate::writer::Writer
-    fn arbitrary_column() -> impl Strategy<Value = Column> {
+    pub fn arbitrary_column() -> impl Strategy<Value = Column> {
         prop_oneof![
             sparse_array(any::<f64>()).prop_map(|v| {
                 let (data, valid, null_count) = densify(v.clone());
@@ -976,6 +845,151 @@ mod tests {
             }),
         ]
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{borrow::Borrow, collections::HashSet, mem::discriminant};
+
+    use arrow::record_batch::RecordBatch;
+    use arrow_util::assert_batches_eq;
+    use assert_matches::assert_matches;
+    use data_types::IsNan;
+    use proptest::prelude::*;
+    use tests::arbitrary::{arbitrary_column, densify, MAX_ROWS};
+
+    use super::*;
+
+    fn hydrate(dict: &Dictionary, data: &[DID]) -> Vec<String> {
+        data.iter()
+            .map(|&id| dict.lookup_id(id).unwrap().to_string())
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    #[allow(clippy::bool_assert_comparison)]
+    fn test_densify() {
+        let input = [None, Some(42), None, None, Some(24)];
+
+        let (got, nulls, count) = densify(input);
+        assert_eq!(got, [0, 42, 0, 0, 24]); // NULLS are populated with 0 (not sparse representation)
+        assert_eq!(nulls.get(0), false);
+        assert_eq!(nulls.get(1), true);
+        assert_eq!(nulls.get(2), false);
+        assert_eq!(nulls.get(3), false);
+        assert_eq!(nulls.get(4), true);
+        assert_eq!(nulls.len(), 5);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_rewrite_dictionary() {
+        let mut original = Dictionary::new();
+        let mut data = vec![];
+
+        // Input strings to be dictionary encoded.
+        let input = [
+            "bananas", "platanos", "bananas", "platanos", "ananas", "ananas", "ananas",
+        ];
+
+        for v in input {
+            data.push(original.lookup_value_or_insert(v));
+        }
+
+        assert_eq!(data.len(), input.len());
+        assert_eq!(original.values().len(), 3); // 3 distinct values
+
+        let mut new_data = data.split_off(3);
+        let new_dict = rebuild_dictionary(&original, &mut new_data);
+        let old_dict = rebuild_dictionary(&original, &mut data);
+
+        let new_data_hydrated = hydrate(&new_dict, &new_data);
+        let old_data_hydrated = hydrate(&old_dict, &data);
+
+        assert_eq!(
+            new_data_hydrated,
+            ["platanos", "ananas", "ananas", "ananas"]
+        );
+        assert_eq!(old_data_hydrated, ["bananas", "platanos", "bananas"]);
+
+        assert_eq!(new_dict.values().len(), 2); // 2 distinct values
+        assert_eq!(old_dict.values().len(), 2); // 2 distinct values
+    }
+
+    #[test]
+    fn test_split_off() {
+        let (data, valid, _) = densify([Some(42), None, None, Some(24)]);
+        valid.to_arrow();
+
+        let mut col = Column {
+            influx_type: InfluxColumnType::Field(InfluxFieldType::UInteger),
+            valid,
+            data: ColumnData::U64(data, StatValues::new(None, None, 4, Some(2))),
+        };
+
+        let mut schema = schema::SchemaBuilder::new();
+        schema.influx_column("bananas", col.influx_type());
+        let schema = schema.build().unwrap();
+
+        // Before the split
+        let batch = RecordBatch::try_new(
+            schema.clone().into(),
+            vec![col.to_arrow().expect("failed to covert column to arrow")],
+        )
+        .expect("failed to build record batch");
+        assert_batches_eq!(
+            [
+                "+---------+",
+                "| bananas |",
+                "+---------+",
+                "| 42      |",
+                "|         |",
+                "|         |",
+                "| 24      |",
+                "+---------+",
+            ],
+            &[batch]
+        );
+
+        let col2 = col.split_off(2);
+
+        // After the split, the input column
+        let batch = RecordBatch::try_new(
+            schema.clone().into(),
+            vec![col.to_arrow().expect("failed to covert column to arrow")],
+        )
+        .expect("failed to build record batch");
+        assert_batches_eq!(
+            [
+                "+---------+",
+                "| bananas |",
+                "+---------+",
+                "| 42      |",
+                "|         |",
+                "+---------+",
+            ],
+            &[batch]
+        );
+
+        // After the split, the split off column
+        let batch = RecordBatch::try_new(
+            schema.into(),
+            vec![col2.to_arrow().expect("failed to covert column to arrow")],
+        )
+        .expect("failed to build record batch");
+        assert_batches_eq!(
+            [
+                "+---------+",
+                "| bananas |",
+                "+---------+",
+                "|         |",
+                "| 24      |",
+                "+---------+",
+            ],
+            &[batch]
+        );
+    }
+
     // Set the number of test cases higher than the default (256) to ensure better
     // coverage of the generated arbitrary columns without compromising too
     // much on the input space.

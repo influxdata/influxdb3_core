@@ -320,11 +320,12 @@ mod tests {
                         Some(Arc::new(Literal::new(ScalarValue::from(false)))),
                         None,
                     );
-                    return Ok(Transformed::Yes(Arc::new(exec)));
+                    return Ok(Transformed::yes(Arc::new(exec)));
                 }
-                Ok(Transformed::No(plan))
+                Ok(Transformed::no(plan))
             })
-            .unwrap();
+            .unwrap()
+            .data;
         assert!(extract_chunks(plan.as_ref()).is_none());
     }
 

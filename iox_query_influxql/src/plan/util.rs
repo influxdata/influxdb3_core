@@ -1,7 +1,7 @@
 use crate::error;
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::scalar::ScalarStructBuilder;
-use datafusion::common::tree_node::{Transformed, TreeNode, VisitRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::logical_expr::utils::expr_as_column_expr;
 use datafusion::logical_expr::{lit, Expr, ExprSchemable, LogicalPlan, Operator};
@@ -147,26 +147,26 @@ pub(crate) fn rebase_expr(
     base_exprs: &[Expr],
     fill_if_null: &Option<Number>,
     plan: &LogicalPlan,
-) -> Result<Expr> {
+) -> Result<Transformed<Expr>> {
     if let Some(value) = fill_if_null {
         expr.clone().transform_up(&|nested_expr| {
             Ok(if base_exprs.contains(&nested_expr) {
                 let col_expr = expr_as_column_expr(&nested_expr, plan)?;
                 let data_type = col_expr.get_type(plan.schema())?;
-                Transformed::Yes(coalesce_struct(vec![
+                Transformed::yes(coalesce_struct(vec![
                     col_expr,
                     lit(number_to_scalar(value, &data_type)?),
                 ]))
             } else {
-                Transformed::No(nested_expr)
+                Transformed::no(nested_expr)
             })
         })
     } else {
         expr.clone().transform_up(&|nested_expr| {
             Ok(if base_exprs.contains(&nested_expr) {
-                Transformed::Yes(expr_as_column_expr(&nested_expr, plan)?)
+                Transformed::yes(expr_as_column_expr(&nested_expr, plan)?)
             } else {
-                Transformed::No(nested_expr)
+                Transformed::no(nested_expr)
             })
         })
     }
@@ -177,9 +177,9 @@ pub(crate) fn contains_expr(expr: &Expr, needle: &Expr) -> bool {
     expr.apply(&mut |expr| {
         if expr == needle {
             found = true;
-            Ok(VisitRecursion::Stop)
+            Ok(TreeNodeRecursion::Stop)
         } else {
-            Ok(VisitRecursion::Continue)
+            Ok(TreeNodeRecursion::Continue)
         }
     })
     .expect("cannot fail");
@@ -226,10 +226,10 @@ where
                 exprs.push(expr.clone())
             }
             // stop recursing down this expr once we find a match
-            return Ok(VisitRecursion::Skip);
+            return Ok(TreeNodeRecursion::Jump);
         }
 
-        Ok(VisitRecursion::Continue)
+        Ok(TreeNodeRecursion::Continue)
     })
     // pre_visit always returns OK, so this will always too
     .expect("no way to return error during recursion");

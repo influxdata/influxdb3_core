@@ -1,7 +1,20 @@
 //! General-purpose data type and utilities for working with
 //! values that can be supplied as an InfluxDB bind parameter.
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::{hash_map, HashMap},
+    ops::Index,
+    sync::Arc,
+};
 
+use arrow::{
+    array::{ArrayRef, AsArray},
+    datatypes::{
+        DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    record_batch::RecordBatch,
+};
 use datafusion::scalar::ScalarValue;
 use observability_deps::tracing::warn;
 use serde::{Deserialize, Serialize};
@@ -23,21 +36,33 @@ pub enum Error {
     Conversion { msg: String },
 }
 
-/// A helper macro to construct a `HashMap` over `(String, StatementParam)` pairs.
+/// A helper macro to construct a `StatementParams` collection.
+/// ```
+/// use iox_query_params::{params, StatementParams};
+/// let my_params: StatementParams = params!(
+///     "key1" => true,
+///     "key2" => "string value",
+///     "key3" => 1234,
+///     "key4" => 3.14
+/// );
+/// assert_eq!(my_params.len(), 4);
+/// ```
 #[macro_export]
 macro_rules! params {
     () => (
-        std::collections::HashMap::new()
+        $crate::StatementParams::new()
     );
     ($($key:expr => $val:expr),+ $(,)?) => (
-        std::collections::HashMap::from([$((String::from($key), $crate::StatementParam::from($val))),+])
+        $crate::StatementParams::from([$((String::from($key), $crate::StatementParam::from($val))),+])
     );
 }
 
 /// A collection of statement parameter (name,value) pairs.
 ///
-/// This is a newtype wrapper to facillitate data conversions.
-/// [From] instances can be used to convert to/from protobuf and JSON
+/// This is a collection wrapper to facilitate data conversions and provide
+/// usability improvements for working with collections of parameters.
+///
+/// [From] and [TryFrom] instances can be used to convert to/from protobuf and JSON
 /// protocol formats.
 ///
 /// There is also a [From] instance to convert to
@@ -48,14 +73,138 @@ macro_rules! params {
 pub struct StatementParams(HashMap<String, StatementParam>);
 
 impl StatementParams {
-    /// Convert to internal representation.
-    pub fn into_inner(self) -> HashMap<String, StatementParam> {
-        self.0
+    /// Creates an empty parameter map.
+    pub fn new() -> Self {
+        Self(HashMap::new())
     }
 
-    /// Reference as a hashmap
-    pub fn as_hashmap(&self) -> &HashMap<String, StatementParam> {
-        &self.0
+    /// An iterator visiting all parameter names. Currently this will iterate
+    /// in an arbitrary order, but specific ordering is subject to change and shouldn't
+    /// be relied upon.
+    pub fn names(&self) -> Names<'_> {
+        Names(self.0.keys())
+    }
+
+    /// Creates a consuming iterator visiting all parameter names. Currently this will iterate
+    /// in an arbitrary order, but specific ordering is subject to change and shouldn't
+    /// be relied upon.
+    pub fn into_names(self) -> IntoNames {
+        IntoNames(self.0.into_keys())
+    }
+
+    /// An iterator visiting all parameter values. Currently this will iterate
+    /// in an arbitrary order, but specific ordering is subject to change and shouldn't
+    /// be relied upon.
+    pub fn values(&self) -> Values<'_> {
+        Values(self.0.values())
+    }
+
+    /// An iterator visiting all parameter values as mutable references. Currently this will iterate
+    /// in an arbitrary order, but specific ordering is subject to change and shouldn't
+    /// be relied upon.
+    pub fn values_mut(&mut self) -> ValuesMut<'_> {
+        ValuesMut(self.0.values_mut())
+    }
+
+    /// Creates a consuming iterator visiting all parameter values. Currently this will iterate
+    /// in an arbitrary order, but specific ordering is subject to change and shouldn't
+    /// be relied upon.
+    pub fn into_values(self) -> IntoValues {
+        IntoValues(self.0.into_values())
+    }
+
+    /// An iterator visiting all name-value pairs. Currently this will iterate
+    /// in an arbitrary order, but specific ordering is subject to change and shouldn't
+    /// be relied upon.
+    pub fn iter(&self) -> Iter<'_> {
+        Iter(self.0.iter())
+    }
+
+    /// An iterator visiting all name-value pairs with mutable references to the values.
+    /// Currently this will iterate in an arbitrary order, but specific ordering is subject
+    /// to change and shouldn't be relied upon.
+    pub fn iter_mut(&mut self) -> IterMut<'_> {
+        IterMut(self.0.iter_mut())
+    }
+
+    /// Return the number of parameters in this collection.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true when there are no parameters defined in the collection.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Clears the map, removing all name-value pairs.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Retrieve the value of a parameter with the given name.
+    pub fn get(&self, name: &str) -> Option<&StatementParam> {
+        self.0.get(name)
+    }
+
+    pub fn get_name_value(&self, name: &str) -> Option<(&String, &StatementParam)> {
+        self.0.get_key_value(name)
+    }
+
+    /// Returnd `true` if the map contains a parameter with the specified name.
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    /// Retrieves a mutable reference to the value corresponding to the given name.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut StatementParam> {
+        self.0.get_mut(name)
+    }
+
+    /// Inserts a parameter name-value pair into the map.
+    ///
+    /// If the map did not have this parameter name present, `None` is returned.
+    ///
+    /// If the map did have the parameter name present, the value is updated, and the old value is
+    /// returned.
+    pub fn insert(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<StatementParam>,
+    ) -> Option<StatementParam> {
+        self.0.insert(name.into(), value.into())
+    }
+
+    /// Attempts to insert the given name-value pair, using [`StatementParam::try_from`]
+    /// on the given value prior to inserting into the map.
+    ///
+    /// If the [`StatementParam::try_from`] call results in an error, it will be returned as
+    /// an `Err` result.
+    ///
+    /// If the map did not have this parameter name present, the value is inserted
+    /// and `Ok(None)` is returned.
+    ///
+    /// If the map did have the parameter name present, the value is updated, and the old value is
+    /// returned as an `Ok` result.
+    pub fn try_insert<V>(
+        &mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> Result<Option<StatementParam>, V::Error>
+    where
+        V: TryInto<StatementParam>,
+    {
+        Ok(self.0.insert(name.into(), value.try_into()?))
+    }
+
+    /// Removes a parameter from the map by name, returning the parameter value if the name was previously in the map.
+    pub fn remove(&mut self, name: &str) -> Option<StatementParam> {
+        self.0.remove(name)
+    }
+
+    /// Removes a parameter from the map by name, returning the name-value pair if the parameter name was previously in the map.
+    pub fn remove_entry(&mut self, name: &str) -> Option<(String, StatementParam)> {
+        self.0.remove_entry(name)
     }
 
     /// Convert into a HashMap of (name, value) pairs
@@ -64,11 +213,6 @@ impl StatementParams {
             .into_iter()
             .map(|(key, value)| (key, value.into()))
             .collect::<HashMap<String, V>>()
-    }
-
-    /// Convert to [datafusion::common::ParamValues] used by [datafusion::logical_expr::LogicalPlan]::with_param_values
-    pub fn into_df_param_values(self) -> datafusion::common::ParamValues {
-        self.into()
     }
 }
 
@@ -83,10 +227,40 @@ impl std::fmt::Display for StatementParams {
     }
 }
 
+impl Index<&str> for StatementParams {
+    type Output = StatementParam;
+    fn index(&self, index: &str) -> &Self::Output {
+        self.0.index(index)
+    }
+}
+
+/// From fixed-size array
+impl<const N: usize> From<[(String, StatementParam); N]> for StatementParams {
+    fn from(value: [(String, StatementParam); N]) -> Self {
+        Self(HashMap::from(value))
+    }
+}
+
 /// From HashMap
 impl From<HashMap<String, StatementParam>> for StatementParams {
     fn from(value: HashMap<String, StatementParam>) -> Self {
         Self(value)
+    }
+}
+
+/// Convert from an arrow [RecordBatch]
+impl TryFrom<RecordBatch> for StatementParams {
+    type Error = self::Error;
+    fn try_from(batch: RecordBatch) -> Result<Self, Self::Error> {
+        let mut params = HashMap::with_capacity(batch.num_columns());
+        let schema = batch.schema();
+        for field in schema.all_fields() {
+            params.insert(
+                field.name().clone(),
+                StatementParam::try_from(Arc::clone(&batch[field.name()]))?,
+            );
+        }
+        Ok(Self(params))
     }
 }
 
@@ -139,20 +313,89 @@ impl From<StatementParams> for Vec<proto::QueryParam> {
     }
 }
 
-/// Enum of possible data types that can be used as parameters in an InfluxQL query.
+/// Creates a struct that wraps an existing collection iterator
+macro_rules! iterator_wrapper {
+    ($($lifetime:lifetime ,)? $iter_type:ident, $item_type:ty, $inner_type:ty  $(,)? ) => {
+
+        #[derive(Debug)]
+        #[repr(transparent)]
+        pub struct $iter_type $(<$lifetime>)? ($inner_type);
+        impl $(<$lifetime>)? Iterator for $iter_type $(<$lifetime>)? {
+            type Item = $item_type;
+
+            fn next(&mut self) -> Option<Self::Item> {
+              self.0.next()
+            }
+        }
+
+        impl $(<$lifetime>)? ExactSizeIterator for $iter_type $(<$lifetime>)? {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        impl $(<$lifetime>)? std::iter::FusedIterator for $iter_type $(<$lifetime>)? { }
+    };
+}
+iterator_wrapper!('a, Names, &'a String, hash_map::Keys<'a, String, StatementParam>);
+iterator_wrapper!(IntoNames, String, hash_map::IntoKeys<String, StatementParam>);
+iterator_wrapper!('a, Values, &'a StatementParam, hash_map::Values<'a, String, StatementParam>);
+iterator_wrapper!('a, ValuesMut, &'a mut StatementParam, hash_map::ValuesMut<'a, String, StatementParam>);
+iterator_wrapper!(IntoValues, StatementParam, hash_map::IntoValues<String, StatementParam>);
+iterator_wrapper!('a, Iter, (&'a String, &'a StatementParam), hash_map::Iter<'a, String, StatementParam>);
+iterator_wrapper!('a, IterMut, (&'a String, &'a mut StatementParam), hash_map::IterMut<'a, String, StatementParam>);
+iterator_wrapper!(IntoIter, (String, StatementParam), hash_map::IntoIter<String, StatementParam>);
+
+impl IntoIterator for StatementParams {
+    type Item = (String, StatementParam);
+    type IntoIter = IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter(self.0.into_iter())
+    }
+}
+
+impl<'a> IntoIterator for &'a StatementParams {
+    type Item = (&'a String, &'a StatementParam);
+    type IntoIter = Iter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a> IntoIterator for &'a mut StatementParams {
+    type Item = (&'a String, &'a mut StatementParam);
+    type IntoIter = IterMut<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl FromIterator<(String, StatementParam)> for StatementParams {
+    fn from_iter<T: IntoIterator<Item = (String, StatementParam)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// Allows extending the parameters from an iterator
+impl Extend<(String, StatementParam)> for StatementParams {
+    fn extend<T: IntoIterator<Item = (String, StatementParam)>>(&mut self, iter: T) {
+        self.0.extend(iter)
+    }
+}
+
+/// Enum of possible data types that can be used as parameters in an InfluxDB query.
 ///
-/// # creating values
+/// # Creating Values
 ///
 /// [From] implementations for many builtin types are provided to make creation of parameter values
 /// easier from the influxdb client.
 ///
-/// # protocol formats
+/// # Protocol and serialized Formats
 ///
 /// There are [From]/[TryFrom] implementations to convert to/from
 /// protobuf and JSON. These are used for deserialization/serialization of
 /// protocol messages across gRPC and the legacy REST API
 ///
-/// # planning/execution
+/// # Planning/Execution
 ///
 /// There is a [From] implementation to convert to DataFusion [ScalarValue]s. This
 /// allows params to be passed into the DataFusion [datafusion::logical_expr::LogicalPlan]
@@ -319,6 +562,61 @@ impl TryFrom<serde_json::Value> for StatementParam {
     }
 }
 
+/// Convert from an arrow [ArrayRef] column. Only the first element in the array is used.
+/// Fails when array length != 1
+impl TryFrom<ArrayRef> for StatementParam {
+    type Error = self::Error;
+    fn try_from(arr: ArrayRef) -> Result<Self, Self::Error> {
+        if arr.len() != 1 {
+            return Err(Error::Conversion {
+                msg: format!("Expected array to have length 1 but found {}", arr.len()),
+            });
+        }
+        fn unsupported_type(type_name: &'static str) -> Result<StatementParam, Error> {
+            Err(Error::Conversion{ msg: format!("Arrow type {type_name} is not supported as query parameter. Expected null, boolean, numeric, or UTF-8 types")})
+        }
+        match arr.data_type() {
+            DataType::Null => Ok(Self::Null),
+            DataType::Boolean => Ok(Self::from(arr.as_boolean().value(0))),
+            DataType::Int8 => Ok(Self::from(arr.as_primitive::<Int8Type>().value(0))),
+            DataType::Int16 => Ok(Self::from(arr.as_primitive::<Int16Type>().value(0))),
+            DataType::Int32 => Ok(Self::from(arr.as_primitive::<Int32Type>().value(0))),
+            DataType::Int64 => Ok(Self::from(arr.as_primitive::<Int64Type>().value(0))),
+            DataType::UInt8 => Ok(Self::from(arr.as_primitive::<UInt8Type>().value(0))),
+            DataType::UInt16 => Ok(Self::from(arr.as_primitive::<UInt16Type>().value(0))),
+            DataType::UInt32 => Ok(Self::from(arr.as_primitive::<UInt32Type>().value(0))),
+            DataType::UInt64 => Ok(Self::from(arr.as_primitive::<UInt64Type>().value(0))),
+            DataType::Float16 => Ok(Self::from(
+                arr.as_primitive::<Float16Type>().value(0).to_f64(),
+            )),
+            DataType::Float32 => Ok(Self::from(arr.as_primitive::<Float32Type>().value(0))),
+            DataType::Float64 => Ok(Self::from(arr.as_primitive::<Float64Type>().value(0))),
+            DataType::Utf8 => Ok(Self::from(arr.as_string::<i32>().value(0))),
+            DataType::LargeUtf8 => Ok(Self::from(arr.as_string::<i64>().value(0))),
+            DataType::Timestamp(_, _) => unsupported_type("Timestamp"),
+            DataType::Date32 => unsupported_type("Date32"),
+            DataType::Date64 => unsupported_type("Date64"),
+            DataType::Time32(_) => unsupported_type("Time32"),
+            DataType::Time64(_) => unsupported_type("Time64"),
+            DataType::Duration(_) => unsupported_type("Duration"),
+            DataType::Interval(_) => unsupported_type("Interval"),
+            DataType::Binary => unsupported_type("Binary"),
+            DataType::FixedSizeBinary(_) => unsupported_type("FixedSizeBinary"),
+            DataType::LargeBinary => unsupported_type("LargeBinary"),
+            DataType::List(_) => unsupported_type("List"),
+            DataType::FixedSizeList(_, _) => unsupported_type("FixedSizeList"),
+            DataType::LargeList(_) => unsupported_type("LargeList"),
+            DataType::Struct(_) => unsupported_type("Struct"),
+            DataType::Union(_, _) => unsupported_type("Union"),
+            DataType::Dictionary(_, _) => unsupported_type("Dictionary"),
+            DataType::Decimal128(_, _) => unsupported_type("Decimal128"),
+            DataType::Decimal256(_, _) => unsupported_type("Decimal256"),
+            DataType::Map(_, _) => unsupported_type("Map"),
+            DataType::RunEndEncoded(_, _) => unsupported_type("RunEndEncoded"),
+        }
+    }
+}
+
 /// [`Option`] values are unwrapped and [`None`] values are converted to NULL
 impl<T> From<Option<T>> for StatementParam
 where
@@ -463,7 +761,7 @@ mod tests {
         })
         .into();
         let result = StatementParams::try_from(proto);
-        let params = result.unwrap().0;
+        let params = result.unwrap();
         assert_eq!(
             params,
             params! {
@@ -527,7 +825,7 @@ mod tests {
             }
         "#;
         let result = serde_json::from_str::<StatementParams>(json);
-        let params = result.unwrap().0;
+        let params = result.unwrap();
         assert_eq!(
             params,
             params! {
@@ -687,6 +985,34 @@ mod tests {
         assert_ne!(
             StatementParam::from("string1"),
             StatementParam::from("string2")
+        );
+    }
+
+    // Test try_insert for StatementParams
+    #[test]
+    fn params_try_insert() {
+        let mut params = StatementParams::new();
+        // test From instance
+        let value = params.try_insert("param1", "string value").unwrap();
+        assert_eq!(value, None);
+        // test a TryFrom instance that succeeds
+        let value = params.try_insert("param2", json!(true)).unwrap();
+        assert_eq!(value, None);
+        // test updating an existing param with a TryFrom instance
+        let value = params
+            .try_insert("param2", json!("string from JSON"))
+            .unwrap();
+        assert_eq!(value, Some(StatementParam::Boolean(true)));
+        // invalid conversion - JSON object cannot be converted to param
+        let err = params.try_insert("param3", json!({})).unwrap_err();
+        assert_matches!(err, Error::Conversion { .. });
+        assert_eq!(params.len(), 2);
+        assert_eq!(
+            params,
+            params!(
+                "param1" => "string value",
+                "param2" => "string from JSON"
+            )
         );
     }
 }

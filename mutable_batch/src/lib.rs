@@ -501,3 +501,42 @@ mod tests {
         );
     }
 }
+
+/// Test helpers for randomised testing.
+#[cfg(any(test, feature = "arbitrary"))]
+pub mod arbitrary {
+    use proptest::prelude::*;
+
+    use crate::{
+        column::{arbitrary::arbitrary_column, Column},
+        MutableBatch,
+    };
+
+    /// Deterministically generate a name for `c` derived from the column type.
+    fn column_name(c: &Column) -> String {
+        format!("col-{}", c.influx_type())
+    }
+
+    /// Instantiate a [`MutableBatch`] containing random columns and data.
+    ///
+    /// The batch will contain at most one column of each data type.
+    pub fn arbitrary_mutable_batch() -> impl Strategy<Value = MutableBatch> {
+        prop::collection::vec(arbitrary_column(), 0..20).prop_map(|v| {
+            v.into_iter().fold(MutableBatch::new(), |mut acc, v| {
+                // Convert this column into a single-column batch, and then
+                // merge it into the accumulator.
+                //
+                // This allows us to build batches that contain null ranges,
+                // correct batch statistics, etc.
+                let c = MutableBatch {
+                    column_names: [(column_name(&v), 0)].into_iter().collect(),
+                    row_count: v.len(),
+                    columns: vec![v],
+                };
+
+                acc.extend_from(&c).expect("must merge batch");
+                acc
+            })
+        })
+    }
+}

@@ -11,8 +11,8 @@ pub(crate) fn missing_tag_to_null(
     expr: Expr,
 ) -> DataFusionResult<Transformed<Expr>> {
     Ok(match expr {
-        Expr::Column(col) if !tag_column_exists(schema, &col)? => Transformed::Yes(lit_null()),
-        expr => Transformed::No(expr),
+        Expr::Column(col) if !tag_column_exists(schema, &col)? => Transformed::yes(lit_null()),
+        expr => Transformed::no(expr),
     })
 }
 
@@ -91,6 +91,7 @@ mod tests {
             .unwrap();
 
         expr.transform(&|expr| missing_tag_to_null(&schema, expr))
+            .map(|t| t.data)
             .unwrap()
     }
 }

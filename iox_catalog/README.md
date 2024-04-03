@@ -27,7 +27,7 @@ client tool `createdb` or the sqlx command line.
 ```
 createdb iox_shared
 # Or if you don't want to install postgres:
-cargo install sqlx-cli
+cargo install sqlx-cli --locked
 DATABASE_URL=postgres:///iox_shared sqlx database create
 ```
 
@@ -46,8 +46,8 @@ migration module but with the right namespace setup.
 ## Migrations
 
 If you need to create and run migrations to add, remove, or change the schema, you'll need the
-`sqlx-cli` tool. Install with `cargo install sqlx-cli` if you haven't already, then run `sqlx
-migrate --help` to see the commands relevant to migrations.
+`sqlx-cli` tool. Install with `cargo install sqlx-cli --locked` if you haven't already, then run
+`sqlx migrate --help` to see the commands relevant to migrations.
 
 ## Tests
 

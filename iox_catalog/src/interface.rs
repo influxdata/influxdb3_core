@@ -393,6 +393,13 @@ pub trait PartitionRepo: Send + Sync {
     /// create or get a partition record for the given partition key and table
     async fn create_or_get(&mut self, key: PartitionKey, table_id: TableId) -> Result<Partition>;
 
+    /// For test use only, update the new_file_at time on a partition
+    async fn set_new_file_at(
+        &mut self,
+        partition_id: PartitionId,
+        new_file_at: Timestamp,
+    ) -> Result<()>;
+
     /// get multiple partitions by ID.
     ///
     /// the output order is undefined, non-existing partitions are not part of the output.

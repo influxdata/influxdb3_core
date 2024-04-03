@@ -14,7 +14,7 @@ arrow-flight = { workspace = true }
 arrow_util = { path = "../arrow_util" }
 assert_cmd = "2.0.14"
 assert_matches = "1.5.0"
-bytes = "1.5"
+bytes = "1.6"
 data_types = { path = "../data_types" }
 dml = { path = "../dml" }
 futures = "0.3"
@@ -23,7 +23,7 @@ http = "0.2.11"
 hyper = "0.14"
 influxdb_iox_client = { path = "../influxdb_iox_client", features = ["flight", "format"] }
 ingester_query_grpc = { path = "../ingester_query_grpc" }
-insta = { version = "1.36.1", features = ["yaml"] }
+insta = { version = "1.38.0", features = ["yaml"] }
 iox_catalog = { path = "../iox_catalog" }
 iox_query_params = { path = "../iox_query_params" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
@@ -36,12 +36,12 @@ prost = { workspace = true }
 rand = "0.8.3"
 regex = "1.10"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots"] }
-serde_json = "1.0.113"
+serde_json = "1.0.115"
 snafu = "0.8"
 sqlx = { version = "0.7.4", features = [ "runtime-tokio-rustls" , "postgres", "uuid" ] }
 tempfile = "3.10.1"
 test_helpers = { path = "../test_helpers" }
-tokio = { version = "1.36", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.37", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 tonic = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

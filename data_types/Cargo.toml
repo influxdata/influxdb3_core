@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 arrow-buffer = { workspace = true }
-bytes = "1.5"
+bytes = "1.6"
 chrono = { version = "0.4", default-features = false }
 croaring = "1.0.0"
 influxdb-line-protocol = { path = "../influxdb_line_protocol" }

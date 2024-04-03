@@ -49,8 +49,11 @@ pub enum BackoffError<E>
 where
     E: std::error::Error + 'static,
 {
-    #[snafu(display("Retry did not exceed within {deadline:?}: {source}"))]
+    #[snafu(display("Retry did not succeed within {deadline:?}: {source}"))]
     DeadlineExceeded { deadline: Duration, source: E },
+
+    #[snafu(display("Retry not allowed for this error {source}"))]
+    RetryDisallowed { source: E },
 }
 
 /// Backoff result.
@@ -141,9 +144,26 @@ impl Backoff {
     pub async fn retry_with_backoff<F, F1, B, E>(
         &mut self,
         task_name: &str,
+        do_stuff: F,
+    ) -> BackoffResult<B, E>
+    where
+        F: (FnMut() -> F1) + Send,
+        F1: std::future::Future<Output = ControlFlow<B, E>> + Send,
+        E: std::error::Error + Send + 'static,
+    {
+        self.retry_some_with_backoff(task_name, |_| true, do_stuff)
+            .await
+    }
+
+    /// Perform an async operation that retries caller specified errors, with a backoff
+    pub async fn retry_some_with_backoff<R, F, F1, B, E>(
+        &mut self,
+        task_name: &str,
+        mut is_retriable: R,
         mut do_stuff: F,
     ) -> BackoffResult<B, E>
     where
+        R: (FnMut(&(dyn std::error::Error + Send + 'static)) -> bool) + Send,
         F: (FnMut() -> F1) + Send,
         F1: std::future::Future<Output = ControlFlow<B, E>> + Send,
         E: std::error::Error + Send + 'static,
@@ -157,6 +177,10 @@ impl Backoff {
                 ControlFlow::Break(r) => break Ok(r),
                 ControlFlow::Continue(e) => e,
             };
+
+            if !is_retriable(&e) {
+                return Err(BackoffError::RetryDisallowed { source: e });
+            }
 
             let backoff = match self.next() {
                 Some(backoff) => backoff,
@@ -205,6 +229,33 @@ impl Backoff {
         })
         .await
     }
+
+    /// Retry errors caller says are retriable
+    pub async fn retry_some_errors<R, F, F1, B, E>(
+        &mut self,
+        task_name: &str,
+        is_retriable: R,
+        mut do_stuff: F,
+    ) -> BackoffResult<B, E>
+    where
+        R: (FnMut(&(dyn std::error::Error + Send + 'static)) -> bool) + Send,
+        F: (FnMut() -> F1) + Send,
+        F1: std::future::Future<Output = Result<B, E>> + Send,
+        E: std::error::Error + Send + 'static,
+    {
+        self.retry_some_with_backoff(task_name, is_retriable, move || {
+            // first execute `F` and then use it, so we can avoid `F: Sync`.
+            let do_stuff = do_stuff();
+
+            async {
+                match do_stuff.await {
+                    Ok(b) => ControlFlow::Break(b),
+                    Err(e) => ControlFlow::Continue(e),
+                }
+            }
+        })
+        .await
+    }
 }
 
 impl Iterator for Backoff {
@@ -224,18 +275,14 @@ impl Iterator for Backoff {
         if self.deadline.is_some_and(|x| x.expired()) {
             return None;
         }
-        duration_try_from_secs_f64(res)
+        // This creates the original behavior which returned None if res was somehow negative,
+        // not finite, or overflowed Duration as the code originally worked around
+        // https://github.com/rust-lang/rust/issues/83400
+        match Duration::try_from_secs_f64(res) {
+            Ok(d) => Some(d),
+            Err(_) => None,
+        }
     }
-}
-
-const MAX_F64_SECS: f64 = 1_000_000.0;
-
-/// Try to get `Duration` from `f64` secs.
-///
-/// This is required till <https://github.com/rust-lang/rust/issues/83400> is resolved.
-fn duration_try_from_secs_f64(secs: f64) -> Option<Duration> {
-    (secs.is_finite() && (0.0..=MAX_F64_SECS).contains(&secs))
-        .then(|| Duration::from_secs_f64(secs))
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -261,6 +308,9 @@ impl Deadline {
 mod tests {
     use super::*;
     use rand::rngs::mock::StepRng;
+    use std::io::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_backoff() {
@@ -332,17 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn test_duration_try_from_f64() {
-        for d in [-0.1, f64::INFINITY, f64::NAN, MAX_F64_SECS + 0.1] {
-            assert!(duration_try_from_secs_f64(d).is_none());
-        }
-
-        for d in [0.0, MAX_F64_SECS] {
-            assert!(duration_try_from_secs_f64(d).is_some());
-        }
-    }
-
-    #[test]
     fn test_max_backoff_smaller_init() {
         let rng = Box::new(StepRng::new(u64::MAX, 0));
         let cfg = BackoffConfig {
@@ -397,5 +436,52 @@ mod tests {
         let mut backoff = Backoff::new_with_rng(&cfg, Some(rng));
         assert_eq!(backoff.next(), Some(Duration::from_secs(1)));
         assert_eq!(backoff.next(), Some(Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn test_retry_some_errors() {
+        let mut backoff = Backoff::new(&BackoffConfig::default());
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let res = backoff
+            .retry_some_errors(
+                "test",
+                |_| true,
+                || async {
+                    let old_count = count.fetch_add(1, Ordering::SeqCst);
+                    if old_count < 2 {
+                        Err(Error::from_raw_os_error(3))
+                    } else {
+                        Ok("ok")
+                    }
+                },
+            )
+            .await;
+        // It must take 3 tries to succeed
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_retry_some_errors_non_retriable() {
+        let mut backoff = Backoff::new(&BackoffConfig::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        let res = backoff
+            .retry_some_errors(
+                "test",
+                |_| false,
+                || async {
+                    let old_count = count.fetch_add(1, Ordering::SeqCst);
+                    if old_count < 1 {
+                        Err(Error::from_raw_os_error(1))
+                    } else {
+                        Ok("ok")
+                    }
+                },
+            )
+            .await;
+        // no error type is retryable, so it fails on the first try with no retries
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(res.is_err());
     }
 }

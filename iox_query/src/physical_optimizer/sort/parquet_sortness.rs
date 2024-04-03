@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
     datasource::physical_plan::{FileScanConfig, ParquetExec},
     error::Result,
@@ -34,7 +34,7 @@ impl PhysicalOptimizerRule for ParquetSortness {
         plan.transform_down(&|plan| {
             let Some(children_with_sort) = detect_children_with_desired_ordering(plan.as_ref())
             else {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
             let mut children_new = Vec::with_capacity(children_with_sort.len());
             for (child, desired_ordering) in children_with_sort {
@@ -43,11 +43,12 @@ impl PhysicalOptimizerRule for ParquetSortness {
                     desired_ordering: &desired_ordering,
                 };
                 let child = Arc::clone(&child).rewrite(&mut rewriter)?;
-                children_new.push(child);
+                children_new.push(child.data);
             }
 
-            Ok(Transformed::Yes(plan.with_new_children(children_new)?))
+            Ok(Transformed::yes(plan.with_new_children(children_new)?))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {
@@ -107,32 +108,32 @@ struct ParquetSortnessRewriter<'a> {
 }
 
 impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
-    type N = Arc<dyn ExecutionPlan>;
+    type Node = Arc<dyn ExecutionPlan>;
 
-    fn pre_visit(&mut self, node: &Self::N) -> Result<RewriteRecursion> {
+    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
         if detect_children_with_desired_ordering(node.as_ref()).is_some() {
             // another sort or sort-desiring node
-            Ok(RewriteRecursion::Stop)
+            Ok(Transformed::new(node, false, TreeNodeRecursion::Jump))
         } else {
-            Ok(RewriteRecursion::Continue)
+            Ok(Transformed::no(node))
         }
     }
 
-    fn mutate(&mut self, node: Self::N) -> Result<Self::N> {
+    fn f_up(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
         let Some(parquet_exec) = node.as_any().downcast_ref::<ParquetExec>() else {
             // not a parquet exec
-            return Ok(node);
+            return Ok(Transformed::no(node));
         };
 
         let base_config = parquet_exec.base_config();
         if base_config.output_ordering.is_empty() {
             // no output ordering requested
-            return Ok(node);
+            return Ok(Transformed::no(node));
         }
 
         if base_config.file_groups.iter().all(|g| g.len() < 2) {
             // already flat
-            return Ok(node);
+            return Ok(Transformed::no(node));
         }
 
         // Protect against degenerative plans
@@ -149,7 +150,7 @@ impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
                 n_files,
                 max_parquet_fanout, "cannot use pre-sorted parquet files, fan-out too wide"
             );
-            return Ok(node);
+            return Ok(Transformed::no(node));
         }
 
         let base_config = FileScanConfig {
@@ -166,9 +167,9 @@ impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
 
         // did this help?
         if new_parquet_exec.properties().output_ordering() == Some(self.desired_ordering) {
-            Ok(Arc::new(new_parquet_exec))
+            Ok(Transformed::yes(Arc::new(new_parquet_exec)))
         } else {
-            Ok(node)
+            Ok(Transformed::no(node))
         }
     }
 }

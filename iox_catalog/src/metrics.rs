@@ -216,6 +216,7 @@ decorate!(
     repo = partitions,
     methods = [
         "partition_create_or_get" = create_or_get(&mut self, key: PartitionKey, table_id: TableId) -> Result<Partition>;
+        "set_new_file_at" = set_new_file_at(&mut self, partition_id: PartitionId, new_file_at: Timestamp) -> Result<()>;
         "partition_get_by_id_batch" = get_by_id_batch(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<Partition>>;
         "partition_list_by_table_id" = list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>>;
         "partition_list_ids" = list_ids(&mut self) -> Result<Vec<PartitionId>>;

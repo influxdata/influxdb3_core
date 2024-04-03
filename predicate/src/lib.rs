@@ -7,7 +7,7 @@ pub mod rpc_predicate;
 
 use data_types::TimestampRange;
 use datafusion::{
-    common::tree_node::{TreeNodeVisitor, VisitRecursion},
+    common::tree_node::{TreeNodeRecursion, TreeNodeVisitor},
     error::DataFusionError,
     logical_expr::{binary_expr, BinaryExpr},
     prelude::{col, Expr},
@@ -416,9 +416,9 @@ impl Default for RowBasedVisitor {
 }
 
 impl TreeNodeVisitor for RowBasedVisitor {
-    type N = Expr;
+    type Node = Expr;
 
-    fn pre_visit(&mut self, expr: &Expr) -> Result<VisitRecursion, DataFusionError> {
+    fn f_down(&mut self, expr: &Expr) -> Result<TreeNodeRecursion, DataFusionError> {
         match expr {
             Expr::Alias(_)
             | Expr::Between { .. }
@@ -450,13 +450,13 @@ impl TreeNodeVisitor for RowBasedVisitor {
             | Expr::SimilarTo { .. }
             | Expr::Sort { .. }
             | Expr::TryCast { .. }
-            | Expr::Wildcard { .. } => Ok(VisitRecursion::Continue),
+            | Expr::Wildcard { .. } => Ok(TreeNodeRecursion::Continue),
             Expr::AggregateFunction { .. }
             | Expr::GroupingSet(_)
             | Expr::WindowFunction { .. }
             | Expr::Unnest(_) => {
                 self.row_based = false;
-                Ok(VisitRecursion::Stop)
+                Ok(TreeNodeRecursion::Stop)
             }
         }
     }

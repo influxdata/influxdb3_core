@@ -88,8 +88,8 @@ license = "MIT OR Apache-2.0"
 arrow = { version = "50.0.0", features = ["prettyprint", "chrono-tz"] }
 arrow-buffer = { version = "50.0.0" }
 arrow-flight = { version = "50.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/erratic-pattern/arrow-datafusion.git", rev = "5965d670c88bdfa1fb74f32fd5021d400838dade" }
-datafusion-proto = { git = "https://github.com/erratic-pattern/arrow-datafusion.git", rev = "5965d670c88bdfa1fb74f32fd5021d400838dade" }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "581e74785b876615d6a63db8c2e5ba372bf78828" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "581e74785b876615d6a63db8c2e5ba372bf78828" }
 hashbrown = { version = "0.14.3" }
 object_store = { version = "0.9.1" }
 parquet = { version = "50.0.0", features = ["object_store"] }
@@ -99,7 +99,7 @@ pbjson-types = { version = "0.6.0" }
 prost = { version = "0.12.3" }
 prost-build = { version = "0.12.2" }
 prost-types = { version = "0.12.3" }
-smallvec = { version = "1.13.1", features = ["union"] }
+smallvec = { version = "1.13.2", features = ["union"] }
 sqlparser = { version = "0.44.0" }
 tonic = { version = "0.10.2", features = ["tls", "tls-roots"] }
 tonic-build = { version = "0.10.2" }
@@ -107,16 +107,19 @@ tonic-health = { version = "0.10.2" }
 tonic-reflection = { version = "0.10.2" }
 
 [workspace.lints.rust]
+missing_copy_implementations = "deny"
+missing_debug_implementations = "deny"
 rust_2018_idioms = "deny"
 unreachable_pub = "deny"
-missing_debug_implementations = "deny"
-missing_copy_implementations = "deny"
+unused_crate_dependencies = "deny"
 
 [workspace.lints.clippy]
-dbg_macro = "deny"
-todo = "deny"
 clone_on_ref_ptr = "deny"
+dbg_macro = "deny"
+explicit_iter_loop = "deny"
 future_not_send = "deny"
+todo = "deny"
+use_self = "deny"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
@@ -130,6 +133,11 @@ debug = true
 lto = "thin"
 
 [profile.bench]
+debug = true
+
+# avoid rebuilds of build dependencies
+# See https://github.com/rust-lang/cargo/pull/11252
+[profile.dev.build-override]
 debug = true
 
 # This profile optimizes for short build times at the expense of larger binary size and slower
@@ -146,3 +154,13 @@ opt-level = 3
 
 [profile.dev.package.similar]
 opt-level = 3
+
+# patch arrow-flight crate to allow for prepared statement parameters
+# see related arrow-rs PR https://github.com/apache/arrow-rs/pull/5433
+[patch.crates-io]
+arrow-array = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0" }
+arrow-schema = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0" }
+arrow-data = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0" }
+arrow-buffer = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0" }
+arrow-ipc = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0" }
+arrow-flight = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0" }

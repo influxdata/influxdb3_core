@@ -384,7 +384,16 @@ impl IOxSessionContext {
     /// in the SQL have been registered with this context. Use
     /// `create_physical_plan` to actually execute the query.
     pub async fn sql_to_logical_plan(&self, sql: &str) -> Result<LogicalPlan> {
-        Self::sql_to_logical_plan_with_params(self, sql, ParamValues::List(vec![])).await
+        let ctx = self.child_ctx("sql_to_logical_plan");
+        debug!(text=%sql, "planning SQL query");
+        let plan = ctx.inner.state().create_logical_plan(sql).await?;
+        // ensure the plan does not contain unwanted statements
+        let verifier = SQLOptions::new()
+            .with_allow_ddl(false) // no CREATE ...
+            .with_allow_dml(false) // no INSERT or COPY
+            .with_allow_statements(false); // no SET VARIABLE, etc
+        verifier.verify_plan(&plan)?;
+        Ok(plan)
     }
 
     /// Plan a SQL statement, providing a list of parameter values
@@ -397,21 +406,9 @@ impl IOxSessionContext {
         sql: &str,
         params: impl Into<ParamValues> + Send,
     ) -> Result<LogicalPlan> {
-        let ctx = self.child_ctx("sql_to_logical_plan");
-        debug!(text=%sql, "planning SQL query");
-        let plan = ctx
-            .inner
-            .state()
-            .create_logical_plan(sql)
+        self.sql_to_logical_plan(sql)
             .await?
-            .with_param_values(params.into())?;
-        // ensure the plan does not contain unwanted statements
-        let verifier = SQLOptions::new()
-            .with_allow_ddl(false) // no CREATE ...
-            .with_allow_dml(false) // no INSERT or COPY
-            .with_allow_statements(false); // no SET VARIABLE, etc
-        verifier.verify_plan(&plan)?;
-        Ok(plan)
+            .with_param_values(params)
     }
 
     /// Create a logical plan that reads a single [`RecordBatch`]. Use
@@ -425,7 +422,11 @@ impl IOxSessionContext {
     /// Plan a SQL statement and convert it to an execution plan. This assumes that any
     /// tables referenced in the SQL have been registered with this context
     pub async fn sql_to_physical_plan(&self, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
-        Self::sql_to_physical_plan_with_params(self, sql, ParamValues::List(vec![])).await
+        let ctx = self.child_ctx("sql_to_physical_plan");
+
+        let logical_plan = ctx.sql_to_logical_plan(sql).await?;
+
+        ctx.create_physical_plan(&logical_plan).await
     }
 
     /// Plan a SQL statement and convert it to an execution plan, providing a list of
@@ -436,9 +437,10 @@ impl IOxSessionContext {
         sql: &str,
         params: impl Into<ParamValues> + Send,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let ctx = self.child_ctx("sql_to_physical_plan");
+        let ctx = self.child_ctx("sql_to_physical_plan_with_params");
 
         let logical_plan = ctx.sql_to_logical_plan_with_params(sql, params).await?;
+
         ctx.create_physical_plan(&logical_plan).await
     }
 

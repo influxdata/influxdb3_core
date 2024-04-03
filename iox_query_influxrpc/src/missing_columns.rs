@@ -1,4 +1,5 @@
 use arrow::datatypes::DataType;
+use datafusion::common::tree_node::Transformed;
 use datafusion::{
     common::{tree_node::TreeNodeRewriter, DFSchema},
     error::Result as DatafusionResult,
@@ -78,9 +79,9 @@ impl<'a> MissingColumnsToNull<'a> {
 }
 
 impl<'a> TreeNodeRewriter for MissingColumnsToNull<'a> {
-    type N = Expr;
+    type Node = Expr;
 
-    fn mutate(&mut self, expr: Expr) -> DatafusionResult<Expr> {
+    fn f_up(&mut self, expr: Expr) -> DatafusionResult<Transformed<Expr>> {
         // Ideally this would simply find all Expr::Columns and
         // replace them with a constant NULL value. However, doing do
         // is blocked on DF bug
@@ -88,16 +89,16 @@ impl<'a> TreeNodeRewriter for MissingColumnsToNull<'a> {
         //
         // Until then, we need to know what type of expr the column is
         // being compared with, so workaround by finding the datatype of the other arg
-        match expr {
+        Ok(match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let left = self.rewrite_op_arg(*left, &right)?;
                 let right = self.rewrite_op_arg(*right, &left)?;
-                Ok(binary_expr(left, op, right))
+                Transformed::yes(binary_expr(left, op, right))
             }
-            Expr::IsNull(expr) if self.is_null_column(&expr) => Ok(lit(true)),
-            Expr::IsNotNull(expr) if self.is_null_column(&expr) => Ok(lit(false)),
-            expr => Ok(expr),
-        }
+            Expr::IsNull(expr) if self.is_null_column(&expr) => Transformed::yes(lit(true)),
+            Expr::IsNotNull(expr) if self.is_null_column(&expr) => Transformed::yes(lit(false)),
+            expr => Transformed::no(expr),
+        })
     }
 }
 
@@ -216,7 +217,8 @@ mod tests {
         let rewritten_expr = expr
             .clone()
             .rewrite(&mut rewriter)
-            .expect("Rewrite successful");
+            .expect("Rewrite successful")
+            .data;
 
         assert_eq!(
             &rewritten_expr, &expected,

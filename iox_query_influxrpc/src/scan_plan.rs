@@ -152,12 +152,12 @@ impl<'a> ScanPlanBuilder<'a> {
                 let schema = provider.iox_schema();
                 trace!(%table_name, ?filter_expr, "Adding filter expr");
                 let mut rewriter = MissingColumnsToNull::new(schema);
-                let filter_expr =
-                    filter_expr
-                        .rewrite(&mut rewriter)
-                        .context(RewritingFilterPredicateSnafu {
-                            table_name: table_name.as_ref(),
-                        })?;
+                let filter_expr = filter_expr
+                    .rewrite(&mut rewriter)
+                    .context(RewritingFilterPredicateSnafu {
+                        table_name: table_name.as_ref(),
+                    })?
+                    .data;
 
                 trace!(?filter_expr, "Rewritten filter_expr");
 

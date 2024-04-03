@@ -6,7 +6,7 @@ pub mod range_predicate;
 use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use datafusion::logical_expr::ScalarFunctionDefinition;
 use datafusion::{
-    common::tree_node::{RewriteRecursion, TreeNode, TreeNodeRewriter, VisitRecursion},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     error::{DataFusionError, Result},
     logical_expr::{
         expr::{Alias, ScalarFunction},
@@ -348,7 +348,7 @@ fn replace_date_bin_gapfill(group_expr: &[Expr]) -> Result<Option<RewriteInfo>> 
         .enumerate()
         .map(|(i, e)| {
             if i == date_bin_gapfill_index {
-                e.clone().rewrite(&mut rewriter)
+                e.clone().rewrite(&mut rewriter).map(|t| t.data)
             } else {
                 Ok(e.clone())
             }
@@ -377,17 +377,17 @@ struct DateBinGapfillRewriter {
 }
 
 impl TreeNodeRewriter for DateBinGapfillRewriter {
-    type N = Expr;
-    fn pre_visit(&mut self, expr: &Expr) -> Result<RewriteRecursion> {
-        match expr {
+    type Node = Expr;
+    fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+        match &expr {
             Expr::ScalarFunction(fun) if fun.func_def.name() == DATE_BIN_GAPFILL_UDF_NAME => {
-                Ok(RewriteRecursion::Mutate)
+                Ok(Transformed::new(expr, true, TreeNodeRecursion::Jump))
             }
-            _ => Ok(RewriteRecursion::Continue),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         // We need to preserve the name of the original expression
         // so that everything stays wired up.
         let orig_name = expr.display_name()?;
@@ -396,13 +396,15 @@ impl TreeNodeRewriter for DateBinGapfillRewriter {
                 if func_def.name() == DATE_BIN_GAPFILL_UDF_NAME =>
             {
                 self.args = Some(args.clone());
-                Ok(Expr::ScalarFunction(ScalarFunction {
-                    func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::DateBin),
-                    args,
-                })
-                .alias(orig_name))
+                Ok(Transformed::yes(
+                    Expr::ScalarFunction(ScalarFunction {
+                        func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::DateBin),
+                        args,
+                    })
+                    .alias(orig_name),
+                ))
             }
-            _ => Ok(expr),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 }
@@ -449,6 +451,7 @@ fn handle_projection(proj: &Projection) -> Result<Option<LogicalPlan>> {
         .map(|expr| {
             expr.clone()
                 .rewrite(&mut fill_fn_rewriter)
+                .map(|t| t.data)
                 .map_err(|e| e.context(format!("rewrite: {expr}")))
         })
         .collect::<Result<Vec<Expr>>>()?;
@@ -495,31 +498,31 @@ struct FillFnRewriter {
 }
 
 impl TreeNodeRewriter for FillFnRewriter {
-    type N = Expr;
-    fn pre_visit(&mut self, expr: &Expr) -> Result<RewriteRecursion> {
-        match expr {
+    type Node = Expr;
+    fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+        match &expr {
             Expr::ScalarFunction(fun) if udf_to_fill_strategy(fun.func_def.name()).is_some() => {
-                Ok(RewriteRecursion::Mutate)
+                Ok(Transformed::new(expr, true, TreeNodeRecursion::Jump))
             }
-            _ => Ok(RewriteRecursion::Continue),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         let orig_name = expr.display_name()?;
         match expr {
             Expr::ScalarFunction(ref fun)
                 if udf_to_fill_strategy(fun.func_def.name()).is_none() =>
             {
-                Ok(expr)
+                Ok(Transformed::no(expr))
             }
             Expr::ScalarFunction(mut fun) => {
                 let fs = udf_to_fill_strategy(fun.func_def.name()).expect("must be a fill fn");
                 let arg = fun.args.remove(0);
                 self.add_fill_strategy(arg.clone(), fs)?;
-                Ok(arg.alias(orig_name))
+                Ok(Transformed::yes(arg.alias(orig_name)))
             }
-            _ => Ok(expr),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 }
@@ -544,7 +547,7 @@ fn count_udf(e: &Expr, name: &str) -> Result<usize> {
         if matches_udf(expr, name) {
             count += 1;
         }
-        Ok(VisitRecursion::Continue)
+        Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(count)
 }

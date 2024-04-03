@@ -16,9 +16,9 @@ pub(crate) fn rewrite_measurement_references(
             // should not have a qualified foo._measurement
             // reference
             assert!(relation.is_none());
-            Transformed::Yes(lit(table_name))
+            Transformed::yes(lit(table_name))
         }
         // no rewrite needed
-        _ => Transformed::No(expr),
+        _ => Transformed::no(expr),
     })
 }

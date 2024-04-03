@@ -1,6 +1,8 @@
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+pub use generated_types::FileDescriptorSet;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::{body::BoxBody, transport::NamedService, Code};
@@ -24,6 +26,8 @@ pub struct RpcBuilderInput {
 #[derive(Debug)]
 pub struct RpcBuilder<T> {
     pub inner: T,
+    pub reflection_fd_set: FileDescriptorSet,
+    pub expected_missing_fds: HashSet<&'static str>,
     pub health_reporter: HealthReporter,
     pub shutdown: CancellationToken,
     pub socket: TcpListener,
@@ -48,20 +52,37 @@ macro_rules! add_service {
                 let RpcBuilder {
                     mut inner,
                     mut health_reporter,
+                    mut reflection_fd_set,
+                    expected_missing_fds,
                     shutdown,
                     socket,
                 } = $builder;
                 let service = $svc;
 
                 let status = $crate::reexport::tonic_health::ServingStatus::$status;
+                let service_name = service_name(&service);
                 health_reporter
-                    .set_service_status(service_name(&service), status)
+                    .set_service_status(service_name, status)
                     .await;
 
                 let inner = inner.add_service(service);
 
+                if let Some(proto) =
+                    $crate::reexport::generated_types::FILE_DESCRIPTOR_MAP.get(service_name)
+                {
+                    reflection_fd_set.file.push(proto.clone());
+                } else if !expected_missing_fds.contains(&service_name) {
+                    // other than a few known FileDescriptorProtos that we don't expect to be
+                    // available, we panic here to ensure that in the future when protobufs are
+                    // changed or new services are added we make sure they are made properly
+                    // available for reflection
+                    panic!("missing from FileDescriptorProto map: {service_name}");
+                }
+
                 RpcBuilder {
                     inner,
+                    reflection_fd_set,
+                    expected_missing_fds,
                     health_reporter,
                     shutdown,
                     socket,
@@ -90,6 +111,10 @@ macro_rules! setup_builder {
 macro_rules! setup_builder_impl {
     ($input:ident, $server_type:ident, $server_timeout:expr) => {{
         #[allow(unused_imports)]
+        use std::collections::HashSet;
+        #[allow(unused_imports)]
+        use $crate::rpc::FileDescriptorSet;
+        #[allow(unused_imports)]
         use $crate::{add_service, rpc::RpcBuilder, server_type::ServerType};
 
         let RpcBuilderInput {
@@ -100,12 +125,6 @@ macro_rules! setup_builder_impl {
 
         let (health_reporter, health_service) =
             $crate::reexport::tonic_health::server::health_reporter();
-        let reflection_service = $crate::reexport::tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(
-                $crate::reexport::generated_types::FILE_DESCRIPTOR_SET,
-            )
-            .build()
-            .expect("gRPC reflection data broken");
 
         let builder = $crate::reexport::tonic::transport::Server::builder();
         let builder = builder
@@ -130,15 +149,29 @@ macro_rules! setup_builder_impl {
             None => builder,
         };
 
+        // all services being registered should have a FileDescriptorProto available execept for
+        // these
+        let expected_missing_fds = HashSet::from([
+            // the reflection service lists itself without the need to be explicitly registered and
+            // it's not defined in this git repo anyway so we shouldn't expect it to be in
+            // FILE_DESCRIPTOR_MAP
+            "grpc.reflection.v1alpha.ServerReflection",
+            // the FileDescriptorProto of this service is known to be unavailable since it lives in
+            // a different git repo: https://github.com/influxdata/influxdb_iox/issues/4543
+            // we can remove it from this set once that issue is addressed
+            "arrow.flight.protocol.FlightService",
+        ]);
+
         let builder = RpcBuilder {
             inner: builder,
+            reflection_fd_set: FileDescriptorSet { file: Vec::new() },
+            expected_missing_fds,
             health_reporter,
             shutdown,
             socket,
         };
 
         add_service!(builder, health_service);
-        add_service!(builder, reflection_service);
         add_service!(
             builder,
             $crate::reexport::service_grpc_testing::make_server()
@@ -153,6 +186,12 @@ macro_rules! setup_builder_impl {
 macro_rules! serve_builder {
     ($builder:ident) => {{
         use $crate::rpc::RpcBuilder;
+
+        let reflection_service = $crate::reexport::tonic_reflection::server::Builder::configure()
+            .register_file_descriptor_set($builder.reflection_fd_set.clone())
+            .build()
+            .expect("gRPC reflection data broken");
+        $crate::add_service!($builder, reflection_service);
 
         let RpcBuilder {
             inner,

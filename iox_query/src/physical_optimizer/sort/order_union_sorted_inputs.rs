@@ -87,7 +87,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
             let Some(sort_preserving_merge_exec) =
                 plan.as_any().downcast_ref::<SortPreservingMergeExec>()
             else {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             // Check if the sortExpr is only on one column
@@ -97,14 +97,14 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
                     ?sort_expr,
                     "-------- sortExpr is not on one column. No optimization"
                 );
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
             let Some(sorted_col) = sort_expr[0].expr.as_any().downcast_ref::<Column>() else {
                 trace!(
                     ?sort_expr,
                     "-------- sortExpr is not on pure column but expression. No optimization"
                 );
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
             let sort_options = sort_expr[0].options;
 
@@ -115,24 +115,24 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
                 .downcast_ref::<UnionExec>()
             else {
                 trace!("-------- SortPreservingMergeExec input is not UnionExec. No optimization");
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             // Check all inputs of UnionExec must be already sorted and on the same sort_expr of SortPreservingMergeExec
             let Some(union_output_ordering) = union_exec.properties().output_ordering() else {
                 warn!(plan=%displayable(plan.as_ref()).indent(false), "Union input to SortPreservingMerge is not sorted");
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             // Check if the first PhysicalSortExpr is the same as the sortExpr[0] in SortPreservingMergeExec
             if sort_expr[0] != union_output_ordering[0] {
                 warn!(?sort_expr, ?union_output_ordering, plan=%displayable(plan.as_ref()).indent(false), "-------- Sort order of SortPreservingMerge and its children are different");
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             }
 
             let Some(value_ranges) = collect_statistics_min_max(union_exec.inputs(), sorted_col.name())?
             else {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             // Sort the inputs by their value ranges
@@ -141,7 +141,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
                 sort_by_value_ranges(union_exec.inputs().to_vec(), value_ranges, sort_options)?
             else {
                 trace!("-------- inputs are not sorted by value ranges. No optimization");
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             // If each input of UnionExec outputs many sorted streams, data of different streams may overlap and
@@ -172,8 +172,8 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
                 sort_preserving_merge_exec.fetch(),
             ));
 
-            Ok(Transformed::Yes(progresive_eval_exec))
-        })
+            Ok(Transformed::yes(progresive_eval_exec))
+        }).map(|t| t.data)
     }
 
     fn name(&self) -> &str {

@@ -23,7 +23,7 @@ object_store = { workspace = true }
 observability_deps = { path = "../observability_deps" }
 parquet_cache = { path = "../parquet_cache" }
 snafu = "0.8"
-sysinfo = "0.30.7"
+sysinfo = "0.30.8"
 trace_exporters = { path = "../trace_exporters" }
 trogging = { path = "../trogging", default-features = false, features = ["clap"] }
 url = "2.4"

@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 base64 = "0.22"
 byteorder = { version = "1", features = ["std"] }
-bytes = "1.5"
+bytes = "1.6"
 futures = "0.3"
 http = "0.2"
 http-body = "0.4"

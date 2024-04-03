@@ -149,73 +149,77 @@ pub(super) fn rewrite_conditional_expr(
     let simplifier = ExprSimplifier::new(simplify_context);
 
     Ok(expr)
-        .map(|expr| log_rewrite(expr, "original"))
+        .map(|expr| log_rewrite(Transformed::no(expr), "original"))
         // make regex matching with invalid types produce false
-        .and_then(|expr| expr.rewrite(&mut FixRegularExpressions { schema }))
+        .and_then(|expr| expr.data.rewrite(&mut FixRegularExpressions { schema }))
         .map(|expr| log_rewrite(expr, "after fix_regular_expressions"))
         // rewrite exprs with incompatible operands to NULL or FALSE
         // (seems like FixRegularExpressions could be combined into this pass)
-        .and_then(|expr| rewrite_expr(expr, schema))
+        .and_then(|expr| rewrite_expr(expr.data, schema))
         .map(|expr| log_rewrite(expr, "after rewrite_expr"))
         // Convert tag column references to CASE WHEN <tag> IS NULL THEN '' ELSE <tag> END
-        .and_then(|expr| rewrite_tag_columns(expr, schema))
+        .and_then(|expr| rewrite_tag_columns(expr.data, schema))
         .map(|expr| log_rewrite(expr, "after rewrite_tag_columns"))
         // Push comparison operators into CASE exprs:
         //     CASE WHEN tag0 IS NULL THEN '' ELSE tag0 END = 'foo'
         // becomes
         //     CASE WHEN tag0 IS NULL THEN '' = 'foo' ELSE tag0 = 'foo' END
-        .and_then(iox_expr_rewrite)
+        .and_then(|expr| iox_expr_rewrite(expr.data))
         .map(|expr| log_rewrite(expr, "after iox_expr_rewrite"))
         // Coerce operand types to be compatible:
         // - convert numeric types so that operands agree
         // - convert Utf8 to Dictionary as needed
         // The next step will fail with type errors if we don't do this.
-        .and_then(|expr| simplifier.coerce(expr, Arc::clone(&schema.df_schema)))
+        .and_then(|expr| {
+            simplifier
+                .coerce(expr.data, Arc::clone(&schema.df_schema))
+                .map(Transformed::yes)
+        })
         .map(|expr| log_rewrite(expr, "after coerce"))
         // DataFusion expression simplification. This is important here because:
         //     CASE WHEN tag0 IS NULL THEN '' = 'foo' ELSE tag0 = 'foo' END
         // becomes
         //     tag0 IS NOT NULL AND tag0 = 'foo'
-        .and_then(|expr| simplifier.simplify(expr))
+        .and_then(|expr| simplifier.simplify(expr.data).map(Transformed::yes))
         .map(|expr| log_rewrite(expr, "after simplify"))
         // Further simplify:
         //     tag0 IS NOT NULL AND tag0 = 'foo'
         // becomes
         //     tags = 'foo'
         // (this could be upstreamed into DataFusion)
-        .and_then(simplify_predicate)
+        .and_then(|expr| simplify_predicate(expr.data))
         .map(|expr| log_rewrite(expr, "after simplify_predicate"))
         .map(|expr| {
             if matches!(
-                expr,
+                expr.data,
                 Expr::Literal(ScalarValue::Null) | Expr::Literal(ScalarValue::Boolean(None))
             ) {
                 lit(false)
             } else {
-                expr
+                expr.data
             }
         })
 }
 
-fn log_rewrite(expr: Expr, description: &str) -> Expr {
-    trace!(?expr, %description, "After rewrite");
+fn log_rewrite(expr: Transformed<Expr>, description: &str) -> Transformed<Expr> {
+    trace!(expr=?expr.data, transformed=expr.transformed, %description, "After rewrite");
     expr
 }
 
 /// Perform a series of passes to rewrite `expr`, used as a column projection,
 /// to match the behavior of InfluxQL.
-pub(super) fn rewrite_field_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Expr> {
+pub(super) fn rewrite_field_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>> {
     rewrite_expr(expr, schema)
 }
 
 /// The expression was rewritten
 fn yes(expr: Expr) -> Result<Transformed<Expr>> {
-    Ok(Transformed::Yes(expr))
+    Ok(Transformed::yes(expr))
 }
 
 /// The expression was not rewritten
 fn no(expr: Expr) -> Result<Transformed<Expr>> {
-    Ok(Transformed::No(expr))
+    Ok(Transformed::no(expr))
 }
 
 /// Rewrite the expression tree and return a result or `NULL` if some of the operands are
@@ -223,7 +227,7 @@ fn no(expr: Expr) -> Result<Transformed<Expr>> {
 ///
 /// Rewrite and coerce the expression tree to model the behavior
 /// of an InfluxQL query.
-fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Expr> {
+fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>> {
     expr.transform(&|expr| {
         match expr {
             Expr::BinaryExpr(BinaryExpr {
@@ -485,9 +489,9 @@ struct FixRegularExpressions<'a> {
 }
 
 impl<'a> TreeNodeRewriter for FixRegularExpressions<'a> {
-    type N = Expr;
+    type Node = Expr;
 
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match expr {
             // InfluxQL evaluates regular expression conditions to false if the column is numeric
             // or the column doesn't exist.
@@ -496,7 +500,7 @@ impl<'a> TreeNodeRewriter for FixRegularExpressions<'a> {
                 op: op @ (Operator::RegexMatch | Operator::RegexNotMatch),
                 right,
             }) => {
-                Ok(if let Expr::Column(ref col) = *left {
+                Ok(Transformed::yes(if let Expr::Column(ref col) = *left {
                     match self.schema.df_schema.field_from_column(col)?.data_type() {
                         DataType::Dictionary(..) | DataType::Utf8 => {
                             Expr::BinaryExpr(BinaryExpr { left, op, right })
@@ -519,9 +523,9 @@ impl<'a> TreeNodeRewriter for FixRegularExpressions<'a> {
                     //
                     // * `SELECT f64 FROM m0 WHERE tag0 = '' + tag0`
                     lit(false)
-                })
+                }))
             }
-            _ => Ok(expr),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 }
@@ -531,7 +535,7 @@ impl<'a> TreeNodeRewriter for FixRegularExpressions<'a> {
 ///         case when tag0 is null then "" else tag0 end
 /// ```
 /// This ensures that we treat tags with the same semantics as OG InfluxQL.
-fn rewrite_tag_columns(expr: Expr, schema: &IQLSchema<'_>) -> Result<Expr> {
+fn rewrite_tag_columns(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>> {
     expr.transform(&|expr| match expr {
         Expr::Column(ref c) if schema.is_tag_field(&c.name) => {
             yes(when(expr.clone().is_null(), lit("")).otherwise(expr)?)
@@ -579,7 +583,12 @@ mod test {
     #[test]
     fn test_division() {
         let schemas = new_schema();
-        let rewrite = |expr| rewrite_expr(expr, &schemas).unwrap().to_string();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
 
         // Float64
         let expr = lit(5.0) / "float_field".as_expr();
@@ -640,7 +649,12 @@ mod test {
     fn test_pass_thru() {
         test_helpers::maybe_start_logging();
         let schemas = new_schema();
-        let rewrite = |expr| rewrite_expr(expr, &schemas).unwrap().to_string();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
 
         let expr = lit(5.5).gt(lit(1_i64));
         assert_eq!(rewrite(expr), "Float64(5.5) > Int64(1)");
@@ -701,7 +715,12 @@ mod test {
     #[test]
     fn test_boolean_operations() {
         let schemas = new_schema();
-        let rewrite = |expr| rewrite_expr(expr, &schemas).unwrap().to_string();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
 
         let expr = "boolean_field".as_expr().and(lit(true));
         assert_eq!(rewrite(expr), "boolean_field AND Boolean(true)");
@@ -756,7 +775,12 @@ mod test {
     #[test]
     fn test_rewrite_conditional_null() {
         let schemas = new_schema();
-        let rewrite = |expr| rewrite_expr(expr, &schemas).unwrap().to_string();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
 
         // NULL on either side and boolean on the other of a binary expression
         let expr = lit(ScalarValue::Null).eq(lit(true));
@@ -792,7 +816,12 @@ mod test {
     #[test]
     fn test_time_range() {
         let schemas = new_schema();
-        let rewrite = |expr| rewrite_expr(expr, &schemas).unwrap().to_string();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
 
         let expr = "time".as_expr().gt_eq(lit_timestamptz_nano(1000));
         assert_eq!(
@@ -830,7 +859,12 @@ mod test {
     #[test]
     fn test_rewrite_expr_coercion_reduce_to_null() {
         let schemas = new_schema();
-        let rewrite = |expr| rewrite_expr(expr, &schemas).unwrap().to_string();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
 
         //
         // FLOAT types

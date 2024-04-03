@@ -29,14 +29,14 @@ impl PhysicalOptimizerRule for SplitDedup {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(&|plan| {
             let Some(dedup_exec) = plan.as_any().downcast_ref::<DeduplicateExec>() else {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             let mut children = dedup_exec.children();
             assert_eq!(children.len(), 1);
             let child = children.remove(0);
             let Some((schema, chunks, output_sort_key)) = extract_chunks(child.as_ref()) else {
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             };
 
             let groups = split_by_partition(chunks);
@@ -58,14 +58,14 @@ impl PhysicalOptimizerRule for SplitDedup {
                 .max_dedup_split;
             let n_split = groups.len();
             if n_split == 0 {
-                return Ok(Transformed::Yes(Arc::new(EmptyExec::new(schema))));
+                return Ok(Transformed::yes(Arc::new(EmptyExec::new(schema))));
             }
             if n_split > max_dedup_split {
                 warn!(
                     n_split,
                     max_dedup_split, "cannot split dedup operation, fanout too wide"
                 );
-                return Ok(Transformed::No(plan));
+                return Ok(Transformed::no(plan));
             }
 
             let out = UnionExec::new(
@@ -92,8 +92,9 @@ impl PhysicalOptimizerRule for SplitDedup {
                     .collect(),
             );
 
-            Ok(Transformed::Yes(Arc::new(out)))
+            Ok(Transformed::yes(Arc::new(out)))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {

@@ -34,12 +34,13 @@ impl PhysicalOptimizerRule for OneUnion {
             if let Some(union_exec) = plan_any.downcast_ref::<UnionExec>() {
                 let mut children = union_exec.children();
                 if children.len() == 1 {
-                    return Ok(Transformed::Yes(children.remove(0)));
+                    return Ok(Transformed::yes(children.remove(0)));
                 }
             }
 
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {
