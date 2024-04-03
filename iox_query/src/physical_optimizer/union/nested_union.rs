@@ -52,12 +52,13 @@ impl PhysicalOptimizerRule for NestedUnion {
                 }
 
                 if found_union {
-                    return Ok(Transformed::Yes(Arc::new(UnionExec::new(children_new))));
+                    return Ok(Transformed::yes(Arc::new(UnionExec::new(children_new))));
                 }
             }
 
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {

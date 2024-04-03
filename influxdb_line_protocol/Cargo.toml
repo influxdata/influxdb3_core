@@ -18,7 +18,7 @@ repository = "https://github.com/influxdata/influxdb_iox/tree/main/influxdb_line
 # History: https://github.com/influxdata/influxdb_iox/issues/7051
 
 [dependencies] # In alphabetical order
-bytes = "1.5"
+bytes = "1.6"
 log = "0.4.21"
 nom = { version = "7", default-features = false, features = ["std"] }
 smallvec = { workspace = true }

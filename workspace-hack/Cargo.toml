@@ -20,8 +20,8 @@ workspace = true
 ### BEGIN HAKARI SECTION
 [dependencies]
 ahash = { version = "0.8" }
-arrow = { version = "50", features = ["chrono-tz", "prettyprint"] }
-arrow-ipc = { version = "50", features = ["lz4"] }
+arrow-array = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0", default-features = false, features = ["chrono-tz"] }
+arrow-ipc = { git = "https://github.com/erratic-pattern/arrow-rs.git", branch = "50.0.0", features = ["lz4"] }
 base64 = { version = "0.21" }
 bit-set = { version = "0.5" }
 bit-vec = { version = "0.6" }
@@ -84,6 +84,7 @@ sha2 = { version = "0.10" }
 similar = { version = "2", features = ["inline"] }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
+sqlparser = { version = "0.44", features = ["visitor"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "sqlite", "uuid"] }
 sqlx-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.7", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }

@@ -1,16 +1,19 @@
 //! Query planner wrapper for use in IOx services
 use std::sync::Arc;
 
+use arrow_flight::FlightData;
 use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef, error::DataFusionError, physical_plan::ExecutionPlan,
 };
 use flightsql::{FlightSQLCommand, FlightSQLPlanner};
+use futures::stream::Peekable;
 use iox_query::{exec::IOxSessionContext, frontend::sql::SqlQueryPlanner, QueryNamespace};
 
 pub(crate) use datafusion::error::{DataFusionError as Error, Result};
 use iox_query_influxql::frontend::planner::InfluxQLQueryPlanner;
 use iox_query_params::StatementParams;
+use tonic::Streaming;
 
 /// Query planner that plans queries on a separate threadpool.
 ///
@@ -87,6 +90,23 @@ impl Planner {
         let ctx = self.ctx.child_ctx("planner flight_sql_do_action");
 
         FlightSQLPlanner::do_action(namespace_name, namespace, cmd, &ctx)
+            .await
+            .map_err(DataFusionError::from)
+    }
+
+    /// Creates a plan for a `DoPut` FlightSQL message, as described on
+    /// [`FlightSQLPlanner::do_put`], on a separate threadpool
+    pub(crate) async fn flight_sql_do_put(
+        &self,
+        namespace_name: impl Into<String> + Send,
+        namespace: Arc<dyn QueryNamespace>,
+        cmd: FlightSQLCommand,
+        data: Peekable<Streaming<FlightData>>,
+    ) -> Result<Bytes> {
+        let namespace_name = namespace_name.into();
+        let ctx = self.ctx.child_ctx("planner flight_sql_do_put");
+
+        FlightSQLPlanner::do_put(namespace_name, namespace, cmd, data, &ctx)
             .await
             .map_err(DataFusionError::from)
     }

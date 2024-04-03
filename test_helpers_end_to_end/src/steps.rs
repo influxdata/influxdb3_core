@@ -10,10 +10,9 @@ use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_sorted_eq;
 use futures::future::BoxFuture;
 use http::StatusCode;
-use iox_query_params::StatementParam;
+use iox_query_params::StatementParams;
 use observability_deps::tracing::info;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::{path::PathBuf, time::Duration};
 use test_helpers::assert_contains;
 use tokio::time;
@@ -236,7 +235,7 @@ pub enum Step {
     /// `assert_batches_eq!` macro
     QueryWithParams {
         sql: String,
-        params: HashMap<String, StatementParam>,
+        params: StatementParams,
         expected: Vec<&'static str>,
     },
 
@@ -261,7 +260,7 @@ pub enum Step {
     /// request returns the expected error code and message
     QueryWithParamsExpectingError {
         sql: String,
-        params: HashMap<String, StatementParam>,
+        params: StatementParams,
         expected_error_code: tonic::Code,
         expected_message: String,
     },
@@ -309,7 +308,7 @@ pub enum Step {
     /// results match the expected results using the `assert_batches_eq!` macro
     InfluxQLQueryWithParams {
         query: String,
-        params: HashMap<String, StatementParam>,
+        params: StatementParams,
         expected: Vec<&'static str>,
     },
 
@@ -334,7 +333,7 @@ pub enum Step {
     /// request returns the expected error code and message
     InfluxQLWithParamsExpectingError {
         query: String,
-        params: HashMap<String, StatementParam>,
+        params: StatementParams,
         expected_error_code: tonic::Code,
         expected_message: String,
     },

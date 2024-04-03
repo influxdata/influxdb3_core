@@ -2,6 +2,8 @@ syntax = "proto3";
 package influxdata.iox.gossip.v1;
 option go_package = "github.com/influxdata/iox/gossip/v1";
 
+import "google/protobuf/timestamp.proto";
+
 // A message exchanged via the IOx gossip mechanism to inform listeners of
 // non-schema changes to cluster namespace state.
 message NamespaceMessage {
@@ -9,6 +11,13 @@ message NamespaceMessage {
     // An existing namespace was updated.
     NamespaceUpdated namespace_updated = 2;
   }
+
+  // Wall-clock time when this consistency probe was enqueued for broadcast
+  // by the sending node.
+  //
+  // Clock-skew yada yada applies to any calculations done by nodes in receipt
+  // of the message.
+  google.protobuf.Timestamp sent_at = 15;
 }
 
 // An update to the non-schema properties of a namespace occurred.

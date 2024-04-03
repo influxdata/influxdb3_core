@@ -23,21 +23,26 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::{
+    datatypes::{Schema, SchemaRef},
+    error::ArrowError,
+    record_batch::RecordBatch,
+};
 use arrow_flight::{
     decode::FlightRecordBatchStream,
+    encode::FlightDataEncoderBuilder,
     error::{FlightError, Result},
     sql::{
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, Any,
         CommandGetCatalogs, CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys,
         CommandGetImportedKeys, CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes,
         CommandGetTables, CommandGetXdbcTypeInfo, CommandPreparedStatementQuery,
-        CommandStatementQuery, ProstMessageExt,
+        CommandStatementQuery, DoPutPreparedStatementResult, ProstMessageExt,
     },
-    Action, FlightClient, FlightDescriptor, FlightInfo, IpcMessage, Ticket,
+    Action, FlightClient, FlightDescriptor, FlightInfo, IpcMessage, PutResult, Ticket,
 };
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{stream::BoxStream, Stream, TryStreamExt};
 use prost::Message;
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
@@ -440,14 +445,36 @@ impl FlightSqlClient {
         self.inner.do_get(Ticket { ticket }).await
     }
 
+    /// Implements the DoPut method for sending a stream of FlightData to the server:
+    pub async fn do_put_with_cmd(
+        &mut self,
+        cmd: arrow_flight::sql::Any,
+        record_batch_stream: impl Stream<Item = Result<RecordBatch>> + Send + 'static,
+    ) -> Result<BoxStream<'static, Result<PutResult>>> {
+        let descriptor = FlightDescriptor::new_cmd(cmd.encode_to_vec());
+        let flight_stream_builder =
+            FlightDataEncoderBuilder::new().with_flight_descriptor(Some(descriptor));
+        let flight_data = flight_stream_builder.build(record_batch_stream);
+        self.inner.do_put(flight_data).await
+    }
+
     /// Create a prepared statement for execution.
     ///
-    /// Sends a [`ActionCreatePreparedStatementRequest`] message to
+    /// This involves two roundtrips:
+    ///
+    /// Step 1: Sends a [`ActionCreatePreparedStatementRequest`] message to
     /// the `DoAction` endpoint of the FlightSQL server, and returns
     /// the handle from the server.
     ///
+    /// If params are given:
+    /// Step 2: Add parameters to the prepared statement using `DoPut(` [`CommandStatementQuery`] )
+    ///
     /// See [`Self::execute`] to run a previously prepared statement
-    pub async fn prepare(&mut self, query: String) -> Result<PreparedStatement> {
+    pub async fn prepare(
+        &mut self,
+        query: String,
+        params: Option<RecordBatch>,
+    ) -> Result<PreparedStatement> {
         let cmd = ActionCreatePreparedStatementRequest {
             query,
             transaction_id: None,
@@ -473,7 +500,7 @@ impl FlightSqlClient {
             .map_err(|e| FlightError::ExternalError(Box::new(e)))?;
 
         let ActionCreatePreparedStatementResult {
-            prepared_statement_handle,
+            mut prepared_statement_handle,
             dataset_schema,
             parameter_schema,
         } = Any::unpack(&response)?.ok_or_else(|| {
@@ -483,6 +510,12 @@ impl FlightSqlClient {
             ))
         })?;
 
+        // Add parameters to prepared statement and update handle if server provides a new one.
+        if let Some(params) = params {
+            prepared_statement_handle = self
+                .write_bind_params(prepared_statement_handle, params)
+                .await?;
+        };
         Ok(PreparedStatement::new(
             prepared_statement_handle,
             schema_bytes_to_schema(dataset_schema)?,
@@ -490,9 +523,48 @@ impl FlightSqlClient {
         ))
     }
 
+    /// Write bind params to the server.
+    /// Returns an optionally updated prepared statement, or the old handle if
+    /// the server did not provide a new one.
+    /// Ignores errors since not all FlightSQL servers implement returning
+    /// an updated handle
+    async fn write_bind_params(
+        &mut self,
+        prepared_statement_handle: Bytes,
+        params_batch: RecordBatch,
+    ) -> Result<Bytes> {
+        let cmd = CommandPreparedStatementQuery {
+            prepared_statement_handle,
+        };
+        // run DoPut and get PutResult
+        let mut stream = self
+            .do_put_with_cmd(cmd.as_any(), futures_util::stream::iter([Ok(params_batch)]))
+            .await?;
+        if let Ok(Some(put_result)) = stream.try_next().await {
+            if let Ok(Some(handle)) = self.unpack_prepared_statement_handle(&put_result) {
+                return Ok(handle);
+            }
+        }
+        Ok(cmd.prepared_statement_handle)
+    }
+
+    /// Decodes the app_metadata stored in a [`PutResult`] as a
+    /// [`DoPutPreparedStatementResult`] and then returns
+    /// the inner prepared statement handle as [`Bytes`]
+    fn unpack_prepared_statement_handle(
+        &self,
+        put_result: &PutResult,
+    ) -> std::result::Result<Option<Bytes>, ArrowError> {
+        let any = Any::decode(&*put_result.app_metadata)
+            .map_err(|err| ArrowError::IpcError(err.to_string()))?;
+        Ok(any
+            .unpack::<DoPutPreparedStatementResult>()?
+            .and_then(|result| result.prepared_statement_handle))
+    }
+
     /// Execute a SQL query on the server using [`CommandStatementQuery`]
     ///
-    /// This involves two round trips
+    /// This involves two roundtrips
     ///
     /// Step 1: send a [`CommandStatementQuery`] message to the
     /// `GetFlightInfo` endpoint of the FlightSQL server to receive a
@@ -510,7 +582,6 @@ impl FlightSqlClient {
             dataset_schema: _,
             parameter_schema: _,
         } = statement;
-        // TODO handle parameters (via DoPut)
 
         let cmd = CommandPreparedStatementQuery {
             prepared_statement_handle,

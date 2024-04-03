@@ -105,7 +105,7 @@ struct ReplaceBindParamsWithValuesVisitor {
 
 impl ReplaceBindParamsWithValuesVisitor {
     fn new(params: StatementParams) -> Self {
-        let len = params.as_hashmap().len();
+        let len = params.len();
         Self {
             params,
             found: HashSet::with_capacity(len),
@@ -118,7 +118,7 @@ impl VisitorMut for ReplaceBindParamsWithValuesVisitor {
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> Result<Recursion, Self::Error> {
         match expr {
             Expr::BindParameter(BindParameter(id)) => {
-                if let Some(value) = self.params.as_hashmap().get(id) {
+                if let Some(value) = self.params.get(id) {
                     self.found.insert(id.clone());
                     *expr = Expr::Literal(param_value_to_literal(value.clone())?);
                     Ok(Recursion::Continue)
@@ -130,7 +130,7 @@ impl VisitorMut for ReplaceBindParamsWithValuesVisitor {
         }
     }
     fn post_visit_statement(&mut self, _n: &mut Statement) -> Result<(), Self::Error> {
-        for name in self.params.as_hashmap().keys() {
+        for name in self.params.names() {
             if !self.found.contains(name) {
                 return Err(BindParameterError::NotFound(format!("${name}")));
             }

@@ -4,7 +4,7 @@ use super::FIELD_COLUMN_NAME;
 use arrow::array::{as_boolean_array, as_string_array, ArrayRef, StringArray};
 use arrow::compute::kernels;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::utils::split_conjunction_owned;
@@ -59,7 +59,10 @@ impl FieldProjectionRewriter {
 
     /// Rewrites the predicate. See the description on
     /// [`FieldProjectionRewriter`] for more details.
-    pub(crate) fn rewrite_field_exprs(&mut self, expr: Expr) -> DataFusionResult<Expr> {
+    pub(crate) fn rewrite_field_exprs(
+        &mut self,
+        expr: Expr,
+    ) -> DataFusionResult<Transformed<Expr>> {
         // for predicates like `A AND B AND C`
         // rewrite `A`, `B` and `C` separately and put them back together
         let rewritten_expr = split_conjunction_owned(expr)
@@ -73,7 +76,7 @@ impl FieldProjectionRewriter {
             .reduce(|acc, expr| acc.and(expr))
             .expect("at least one expr");
 
-        Ok(rewritten_expr)
+        Ok(Transformed::yes(rewritten_expr))
     }
 
     // Rewrites a single predicate. Does not handle AND specially
@@ -224,8 +227,8 @@ struct ColumnReferencesFinder {
 }
 
 impl TreeNodeVisitor for ColumnReferencesFinder {
-    type N = Expr;
-    fn pre_visit(&mut self, expr: &Expr) -> DataFusionResult<VisitRecursion> {
+    type Node = Expr;
+    fn f_down(&mut self, expr: &Expr) -> DataFusionResult<TreeNodeRecursion> {
         if let Expr::Column(col) = expr {
             if col.name == FIELD_COLUMN_NAME {
                 self.saw_field_reference = true;
@@ -236,9 +239,9 @@ impl TreeNodeVisitor for ColumnReferencesFinder {
 
         // terminate early if we have already found both
         if self.saw_field_reference && self.saw_non_field_reference {
-            Ok(VisitRecursion::Stop)
+            Ok(TreeNodeRecursion::Stop)
         } else {
-            Ok(VisitRecursion::Continue)
+            Ok(TreeNodeRecursion::Continue)
         }
     }
 }
@@ -430,7 +433,7 @@ mod tests {
             );
             let mut rewriter = FieldProjectionRewriter::new(schema.clone());
 
-            let rewritten = rewriter.rewrite_field_exprs(input).unwrap();
+            let rewritten = rewriter.rewrite_field_exprs(input).map(|t| t.data).unwrap();
             assert_eq!(rewritten, exp_expr);
 
             let predicate = rewriter.add_to_predicate(Predicate::new()).unwrap();

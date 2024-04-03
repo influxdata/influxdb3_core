@@ -54,11 +54,11 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                             column_names.push(output_name.as_str());
                         } else {
                             // don't bother w/ renames
-                            return Ok(Transformed::No(plan));
+                            return Ok(Transformed::no(plan));
                         }
                     } else {
                         // don't bother to deal w/ calculation within projection nodes
-                        return Ok(Transformed::No(plan));
+                        return Ok(Transformed::no(plan));
                     }
                 }
 
@@ -66,14 +66,14 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                 if let Some(child_empty) = child_any.downcast_ref::<EmptyExec>() {
                     let new_child =
                         EmptyExec::new(Arc::new(child_empty.schema().project(&column_indices)?));
-                    return Ok(Transformed::Yes(Arc::new(new_child)));
+                    return Ok(Transformed::yes(Arc::new(new_child)));
                 } else if let Some(child_placeholder) =
                     child_any.downcast_ref::<PlaceholderRowExec>()
                 {
                     let new_child = PlaceholderRowExec::new(Arc::new(
                         child_placeholder.schema().project(&column_indices)?,
                     ));
-                    return Ok(Transformed::Yes(Arc::new(new_child)));
+                    return Ok(Transformed::yes(Arc::new(new_child)));
                 } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
                     let new_inputs = child_union
                         .inputs()
@@ -87,7 +87,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let new_union = UnionExec::new(new_inputs);
-                    return Ok(Transformed::Yes(Arc::new(new_union)));
+                    return Ok(Transformed::yes(Arc::new(new_union)));
                 } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
                     let projection = match child_parquet.base_config().projection.as_ref() {
                         Some(projection) => column_indices
@@ -115,7 +115,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                     };
                     let new_child =
                         ParquetExec::new(base_config, child_parquet.predicate().cloned(), None);
-                    return Ok(Transformed::Yes(Arc::new(new_child)));
+                    return Ok(Transformed::yes(Arc::new(new_child)));
                 } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
                     let filter_required_cols = collect_columns(child_filter.predicate());
                     let filter_required_cols = filter_required_cols
@@ -139,7 +139,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         },
                     )?;
 
-                    return Ok(Transformed::Yes(plan));
+                    return Ok(Transformed::yes(plan));
                 } else if let Some(child_sort) = child_any.downcast_ref::<SortExec>() {
                     let sort_required_cols = child_sort
                         .expr()
@@ -168,7 +168,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         },
                     )?;
 
-                    return Ok(Transformed::Yes(plan));
+                    return Ok(Transformed::yes(plan));
                 } else if let Some(child_sort) = child_any.downcast_ref::<SortPreservingMergeExec>()
                 {
                     let sort_required_cols = child_sort
@@ -194,7 +194,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         },
                     )?;
 
-                    return Ok(Transformed::Yes(plan));
+                    return Ok(Transformed::yes(plan));
                 } else if let Some(child_proj) = child_any.downcast_ref::<ProjectionExec>() {
                     let expr = column_indices
                         .iter()
@@ -209,7 +209,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                     // and miss the optimization of that particular new ProjectionExec
                     let plan = self.optimize(plan, config)?;
 
-                    return Ok(Transformed::Yes(plan));
+                    return Ok(Transformed::yes(plan));
                 } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
                     let dedup_required_cols = child_dedup.sort_columns();
 
@@ -234,7 +234,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         },
                     )?;
 
-                    return Ok(Transformed::Yes(plan));
+                    return Ok(Transformed::yes(plan));
                 } else if let Some(child_recordbatches) =
                     child_any.downcast_ref::<RecordBatchesExec>()
                 {
@@ -243,12 +243,13 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         Arc::new(child_recordbatches.schema().project(&column_indices)?),
                         child_recordbatches.output_sort_key_memo().cloned(),
                     );
-                    return Ok(Transformed::Yes(Arc::new(new_child)));
+                    return Ok(Transformed::yes(Arc::new(new_child)));
                 }
             }
 
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {

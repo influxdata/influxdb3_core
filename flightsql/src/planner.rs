@@ -9,13 +9,15 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
+    decode::FlightRecordBatchStream,
     sql::{
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, Any,
         CommandGetCatalogs, CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys,
         CommandGetImportedKeys, CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes,
         CommandGetTables, CommandGetXdbcTypeInfo, CommandStatementQuery,
+        DoPutPreparedStatementResult, ProstMessageExt,
     },
-    IpcMessage, SchemaAsIpc,
+    FlightData, IpcMessage, SchemaAsIpc,
 };
 use arrow_util::flight::prepare_schema_for_flight;
 use bytes::Bytes;
@@ -24,13 +26,16 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
+use futures::{stream::Peekable, TryStreamExt};
 use iox_query::{exec::IOxSessionContext, QueryNamespace};
 
 use observability_deps::tracing::debug;
 use once_cell::sync::Lazy;
 use prost::Message;
+use snafu::OptionExt;
+use tonic::Streaming;
 
-use crate::{error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data};
+use crate::{error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data, Error};
 use crate::{FlightSQLCommand, PreparedStatementHandle};
 
 /// Logic for creating plans for various Flight messages against a query database
@@ -107,10 +112,9 @@ impl FlightSQLPlanner {
                 Ok(ctx.sql_to_physical_plan(&query).await?)
             }
             FlightSQLCommand::CommandPreparedStatementQuery(handle) => {
-                let (query, params) = handle.into_parts();
-                debug!(%query, "Planning FlightSQL prepared query");
+                debug!(%handle, "Planning FlightSQL prepared query");
                 Ok(ctx
-                    .sql_to_physical_plan_with_params(query.as_str(), params)
+                    .sql_to_physical_plan_with_params(handle.query(), handle.to_df_param_values()?)
                     .await?)
             }
             FlightSQLCommand::CommandGetSqlInfo(cmd) => {
@@ -252,18 +256,14 @@ impl FlightSQLPlanner {
             ) => {
                 debug!(%query, "Creating prepared statement");
 
-                // todo run the planner here and actually figure out parameter schemas
-                // see https://github.com/apache/arrow-datafusion/pull/4701
-                let parameter_schema = vec![];
-
-                let dataset_schema = get_schema_for_query(&query, ctx).await?;
-                let dataset_schema = encode_schema(dataset_schema.as_ref())?;
+                let (dataset_schema, parameter_schema) =
+                    get_encoded_schemas_for_prepared_statement(&query, ctx).await?;
                 let handle = PreparedStatementHandle::new(query);
 
                 let result = ActionCreatePreparedStatementResult {
-                    prepared_statement_handle: Bytes::from(handle),
+                    prepared_statement_handle: Bytes::try_from(handle)?,
                     dataset_schema,
-                    parameter_schema: Bytes::from(parameter_schema),
+                    parameter_schema,
                 };
 
                 let msg = Any::pack(&result)?;
@@ -283,18 +283,104 @@ impl FlightSQLPlanner {
             .fail(),
         }
     }
+
+    /// Handles receiving the given `data` from the client based on the action
+    /// specified by `cmd` and returns bytes for the [`arrow_flight::Result`]
+    /// (not the same as a rust [`Result`]!)
+    pub async fn do_put(
+        namespace_name: impl Into<String> + Send,
+        _database: Arc<dyn QueryNamespace>,
+        cmd: FlightSQLCommand,
+        data: Peekable<Streaming<FlightData>>,
+        _ctx: &IOxSessionContext,
+    ) -> Result<Bytes> {
+        let namespace_name = namespace_name.into();
+        debug!(%namespace_name, %cmd, "Handling flightsql do_put");
+        match cmd {
+            FlightSQLCommand::CommandPreparedStatementQuery(mut prepared_statement_handle) => {
+                debug!(
+                    %prepared_statement_handle,
+                    "Adding parameters to prepared statement handle"
+                );
+                // convert FlightData stream into RecordBatches
+                let params_batch =
+                    FlightRecordBatchStream::new_from_flight_data(data.map_err(|e| e.into()))
+                        .try_next()
+                        .await?
+                        .with_context(|| NoFlightDataSnafu {
+                            cmd: format!(
+                                "{}",
+                                FlightSQLCommand::CommandPreparedStatementQuery(
+                                    prepared_statement_handle.clone()
+                                )
+                            ),
+                            method: "DoPut",
+                        })?;
+                prepared_statement_handle.params = Some(params_batch);
+                let result = DoPutPreparedStatementResult {
+                    prepared_statement_handle: Some(prepared_statement_handle.try_into()?),
+                };
+                Ok(result.as_any().encode_to_vec().into())
+            }
+            _ => ProtocolSnafu {
+                cmd: format!("{cmd:?}"),
+                method: "DoPut",
+            }
+            .fail(),
+        }
+    }
+}
+
+/// Return the IPC encoded dataset and parameter schema for the specified query
+async fn get_encoded_schemas_for_prepared_statement(
+    query: &str,
+    ctx: &IOxSessionContext,
+) -> Result<(Bytes, Bytes)> {
+    let plan = ctx.sql_to_logical_plan(query).await?;
+    let dataset_schema = get_schema_for_plan(&plan);
+    let parameter_schema = get_parameter_schema_for_plan(&plan)?;
+    Ok((
+        encode_schema(&dataset_schema)?,
+        encode_schema(&parameter_schema)?,
+    ))
 }
 
 /// Return the schema for the specified query
 async fn get_schema_for_query(query: &str, ctx: &IOxSessionContext) -> Result<SchemaRef> {
-    Ok(get_schema_for_plan(ctx.sql_to_logical_plan(query).await?))
+    let plan = ctx.sql_to_logical_plan(query).await?;
+    Ok(get_schema_for_plan(&plan))
 }
 
 /// Return the schema for the specified logical plan
-fn get_schema_for_plan(logical_plan: LogicalPlan) -> SchemaRef {
+fn get_schema_for_plan(logical_plan: &LogicalPlan) -> SchemaRef {
     // gather real schema, but only
-    let schema = Arc::new(Schema::from(logical_plan.schema().as_ref())) as _;
+    let schema = Arc::new(Schema::from(logical_plan.schema().as_ref()));
     prepare_schema_for_flight(schema)
+}
+
+/// Return the schema for any bind parameters within the specified logical plan
+fn get_parameter_schema_for_plan(logical_plan: &LogicalPlan) -> Result<SchemaRef> {
+    let parameter_schema = parameter_types_to_schema(logical_plan.get_parameter_types()?)?;
+    Ok(prepare_schema_for_flight(parameter_schema))
+}
+
+/// Return the parameter schema for the specified map of parameters.
+/// Map can be produced from [LogicalPlan::get_parameter_types]
+fn parameter_types_to_schema(
+    parameter_types: impl IntoIterator<Item = (String, Option<DataType>)>,
+) -> Result<SchemaRef> {
+    let parameters_schema = Schema::new(
+        parameter_types
+            .into_iter()
+            .map(|(id, data_type)| {
+                let data_type = data_type.ok_or_else(|| Error::UnknownParameterType {
+                    parameter_name: id.clone(),
+                })?;
+                Ok(Field::new(id, data_type, true))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(Arc::new(parameters_schema))
 }
 
 /// Encodes the schema IPC encoded (schema_bytes)
@@ -595,3 +681,39 @@ static GET_XDBC_TYPE_INFO_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("interval_precision", DataType::Int32, true),
     ]))
 });
+
+#[cfg(test)]
+mod test {
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::parameter_types_to_schema;
+
+    #[test]
+    fn test_prepared_statement_parameter_schema() {
+        let types = [
+            ("param1".to_owned(), Some(DataType::Null)),
+            ("param2".to_owned(), Some(DataType::Utf8)),
+            (
+                "param3".to_owned(),
+                Some(DataType::Dictionary(
+                    Box::new(DataType::UInt64),
+                    Box::new(DataType::Utf8),
+                )),
+            ),
+        ];
+        let schema = parameter_types_to_schema(types).unwrap();
+        assert_eq!(
+            *schema,
+            Schema::new(vec![
+                Field::new("param1", DataType::Null, true),
+                Field::new("param2", DataType::Utf8, true),
+                Field::new(
+                    "param3".to_owned(),
+                    DataType::Dictionary(Box::new(DataType::UInt64), Box::new(DataType::Utf8)),
+                    true
+                ),
+            ])
+        );
+    }
+}

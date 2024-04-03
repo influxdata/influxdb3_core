@@ -42,7 +42,7 @@ impl PhysicalOptimizerRule for DedupNullColumns {
                 let child = children.remove(0);
                 let Some((schema, chunks, _output_sort_key)) = extract_chunks(child.as_ref())
                 else {
-                    return Ok(Transformed::No(plan));
+                    return Ok(Transformed::no(plan));
                 };
 
                 let pk_cols = dedup_exec.sort_columns();
@@ -73,15 +73,16 @@ impl PhysicalOptimizerRule for DedupNullColumns {
                 );
 
                 let sort_exprs = arrow_sort_key_exprs(&sort_key, &schema);
-                return Ok(Transformed::Yes(Arc::new(DeduplicateExec::new(
+                return Ok(Transformed::yes(Arc::new(DeduplicateExec::new(
                     child,
                     sort_exprs,
                     dedup_exec.use_chunk_order_col(),
                 ))));
             }
 
-            Ok(Transformed::No(plan))
+            Ok(Transformed::no(plan))
         })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {

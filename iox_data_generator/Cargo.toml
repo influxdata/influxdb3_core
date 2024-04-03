@@ -10,7 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-bytes = "1.5"
+bytes = "1.6"
 chrono = { version = "0.4", default-features = false }
 clap = { version = "4", features = ["derive", "env", "cargo"] }
 datafusion_util = { path = "../datafusion_util" }
@@ -26,9 +26,9 @@ rand = { version = "0.8.3", features = ["small_rng"] }
 regex = "1.10"
 schema = { path = "../schema" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.113"
+serde_json = "1.0.115"
 snafu = "0.8"
-tokio = { version = "1.36", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.37", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 toml = "0.8.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"

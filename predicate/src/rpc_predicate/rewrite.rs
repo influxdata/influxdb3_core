@@ -33,21 +33,21 @@ use datafusion::{
 ///  ELSE tag_col = 'cpu'
 /// END
 /// ```
-pub fn iox_expr_rewrite(expr: Expr) -> Result<Expr> {
+pub fn iox_expr_rewrite(expr: Expr) -> Result<Transformed<Expr>> {
     expr.transform(&iox_expr_rewrite_inner)
 }
 
 fn iox_expr_rewrite_inner(expr: Expr) -> Result<Transformed<Expr>> {
     Ok(match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_case(&left) && is_comparison(op) => {
-            Transformed::Yes(inline_case(true, *left, *right, op))
+            Transformed::yes(inline_case(true, *left, *right, op))
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if is_case(&right) && is_comparison(op) =>
         {
-            Transformed::Yes(inline_case(false, *left, *right, op))
+            Transformed::yes(inline_case(false, *left, *right, op))
         }
-        expr => Transformed::No(expr),
+        expr => Transformed::no(expr),
     })
 }
 
@@ -67,7 +67,7 @@ fn iox_expr_rewrite_inner(expr: Expr) -> Result<Transformed<Expr>> {
 ///
 /// Currently it is special cases, but it would be great to generalize
 /// it and contribute it back to DataFusion
-pub fn simplify_predicate(expr: Expr) -> Result<Expr> {
+pub fn simplify_predicate(expr: Expr) -> Result<Transformed<Expr>> {
     expr.transform(&simplify_predicate_inner)
 }
 
@@ -104,22 +104,22 @@ fn simplify_predicate_inner(expr: Expr) -> Result<Transformed<Expr>> {
         }) => {
             if let (Some(coll), Some(colr)) = (is_col_not_null(&left), is_col_op_lit(&right)) {
                 if colr == coll {
-                    return Ok(Transformed::Yes(*right));
+                    return Ok(Transformed::yes(*right));
                 }
             } else if let (Some(coll), Some(colr)) = (is_col_op_lit(&left), is_col_not_null(&right))
             {
                 if colr == coll {
-                    return Ok(Transformed::Yes(*left));
+                    return Ok(Transformed::yes(*left));
                 }
             };
 
-            Ok(Transformed::No(Expr::BinaryExpr(BinaryExpr {
+            Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Operator::And,
                 right,
             })))
         }
-        expr => Ok(Transformed::No(expr)),
+        expr => Ok(Transformed::no(expr)),
     }
 }
 
@@ -280,7 +280,7 @@ mod tests {
             .eq(lit("case2"));
 
         let expected = expr.clone();
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -295,7 +295,7 @@ mod tests {
             col("tag").eq(lit("bar")),
         );
 
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
             lit("bar").eq(col("tag")),
         );
 
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
             )),
         );
 
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -385,7 +385,7 @@ mod tests {
             expr.clone()
         };
 
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
             .otherwise(lit("WTF?").eq(lit("is null")))
             .unwrap();
 
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
             .add(lit(1));
 
         let expected = expr.clone();
-        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).map(|t| t.data).unwrap());
     }
 
     fn make_case(when_expr: Expr, then_expr: Expr, otherwise_expr: Expr) -> Expr {
@@ -444,14 +444,14 @@ mod tests {
     fn test_simplify_predicate() {
         let expr = col("foo").is_null().not().and(col("foo").eq(lit("bar")));
         let expected = col("foo").eq(lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
     fn test_simplify_predicate_reversed() {
         let expr = col("foo").eq(lit("bar")).and(col("foo").is_null().not());
         let expected = col("foo").eq(lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
         // only works when col references are the same
         let expr = col("foo").is_null().not().and(col("foo2").eq(lit("bar")));
         let expected = expr.clone();
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -467,14 +467,14 @@ mod tests {
         // only works when col references are the same
         let expr = col("foo2").eq(lit("bar")).and(col("foo").is_null().not());
         let expected = expr.clone();
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
     fn test_simplify_predicate_is_not_null() {
         let expr = col("foo").is_not_null().and(col("foo").eq(lit("bar")));
         let expected = col("foo").eq(lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
         // can't rewrite to some thing else fancy on the right
         let expr = col("foo").is_null().not().and(col("foo").eq(col("foo")));
         let expected = expr.clone();
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -492,7 +492,7 @@ mod tests {
             .not()
             .and(col("foo").eq(lit("bar")));
         let expected = col("foo").eq(lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -502,7 +502,7 @@ mod tests {
             .not()
             .and(cast(col("foo"), DataType::Utf8).eq(lit("bar")));
         let expected = cast(col("foo"), DataType::Utf8).eq(lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     #[test]
@@ -512,7 +512,7 @@ mod tests {
             .not()
             .and(cast(col("foo"), DataType::Utf8).eq(lit("bar")));
         let expected = cast(col("foo"), DataType::Utf8).eq(lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 
     fn like(expr: Expr, pattern: Expr) -> Expr {
@@ -531,6 +531,6 @@ mod tests {
     fn test_simplify_predicate_like() {
         let expr = col("foo").is_null().not().and(like(col("foo"), lit("bar")));
         let expected = like(col("foo"), lit("bar"));
-        assert_eq!(expected, simplify_predicate(expr).unwrap());
+        assert_eq!(expected, simplify_predicate(expr).map(|t| t.data).unwrap());
     }
 }

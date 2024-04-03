@@ -599,6 +599,16 @@ impl PartitionRepo for Repos {
         Ok(p)
     }
 
+    async fn set_new_file_at(
+        &mut self,
+        _partition_id: PartitionId,
+        _new_file_at: Timestamp,
+    ) -> Result<()> {
+        Err(Error::NotImplemented {
+            descr: "set_new_file_at is for test use only, not implemented for cache".to_string(),
+        })
+    }
+
     async fn get_by_id_batch(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<Partition>> {
         futures::stream::iter(prepare_set(partition_ids.iter().cloned()))
             .map(|p_id| {

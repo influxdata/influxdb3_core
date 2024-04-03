@@ -6,7 +6,7 @@ use std::{
 
 use datafusion::{
     common::{
-        tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
+        tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
         DFSchema,
     },
     error::Result,
@@ -35,18 +35,18 @@ struct TimeRangeVisitor {
 }
 
 impl TreeNodeVisitor for TimeRangeVisitor {
-    type N = LogicalPlan;
+    type Node = LogicalPlan;
 
-    fn pre_visit(&mut self, plan: &LogicalPlan) -> Result<VisitRecursion> {
+    fn f_down(&mut self, plan: &LogicalPlan) -> Result<TreeNodeRecursion> {
         match plan {
             LogicalPlan::Projection(p) => {
                 let idx = p.schema.index_of_column(&self.col)?;
                 match unwrap_alias(&p.expr[idx]) {
                     Expr::Column(ref c) => {
                         self.col = c.clone();
-                        Ok(VisitRecursion::Continue)
+                        Ok(TreeNodeRecursion::Continue)
                     }
-                    _ => Ok(VisitRecursion::Stop),
+                    _ => Ok(TreeNodeRecursion::Stop),
                 }
             }
             LogicalPlan::Filter(f) => {
@@ -57,7 +57,7 @@ impl TreeNodeVisitor for TimeRangeVisitor {
                         range.with_expr(f.input.schema().as_ref(), &self.col, expr)
                     })?;
                 self.range = range;
-                Ok(VisitRecursion::Continue)
+                Ok(TreeNodeRecursion::Continue)
             }
             LogicalPlan::TableScan(t) => {
                 let range = self.range.clone();
@@ -80,21 +80,21 @@ impl TreeNodeVisitor for TimeRangeVisitor {
                         range.with_expr(unprojected_schema, &self.col, expr)
                     })?;
                 self.range = range;
-                Ok(VisitRecursion::Continue)
+                Ok(TreeNodeRecursion::Continue)
             }
             LogicalPlan::SubqueryAlias(_) => {
                 // The nodes below this one refer to the column with a different table name,
                 // just unset the relation so we match on the column name.
                 self.col.relation = None;
-                Ok(VisitRecursion::Continue)
+                Ok(TreeNodeRecursion::Continue)
             }
             // These nodes do not alter their schema, so we can recurse through them
             LogicalPlan::Sort(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Limit(_)
-            | LogicalPlan::Distinct(_) => Ok(VisitRecursion::Continue),
+            | LogicalPlan::Distinct(_) => Ok(TreeNodeRecursion::Continue),
             // At some point we may wish to handle joins here too.
-            _ => Ok(VisitRecursion::Stop),
+            _ => Ok(TreeNodeRecursion::Stop),
         }
     }
 }

@@ -653,6 +653,24 @@ impl PartitionRepo for MemTxn {
         Ok(partition.value.clone())
     }
 
+    // set_new_file_at is for test use only.
+    async fn set_new_file_at(
+        &mut self,
+        partition_id: PartitionId,
+        new_file_at: Timestamp,
+    ) -> Result<()> {
+        let mut stage = self.collections.lock();
+        match stage.partitions.iter_mut().find(|p| p.id == partition_id) {
+            Some(p) => {
+                p.new_file_at = Some(new_file_at);
+                Ok(())
+            }
+            None => Err(Error::NotFound {
+                descr: partition_id.to_string(),
+            }),
+        }
+    }
+
     async fn get_by_id_batch(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<Partition>> {
         let lookup = partition_ids.iter().collect::<HashSet<_>>();
 
@@ -831,6 +849,10 @@ impl PartitionRepo for MemTxn {
                 && p.new_file_at <= Some(maximum_time) // is cold
                     && (p.cold_compact_at == Some(Timestamp::new(0))
                     || p.cold_compact_at < p.new_file_at) // no valid cold compact
+                && !stage
+                    .skipped_compactions
+                    .iter()
+                    .any(|sc| sc.partition_id == p.id)
             })
             .collect();
 
@@ -1168,17 +1190,20 @@ fn create_parquet_file(
     );
     let created_at = parquet_file.created_at;
     let partition_id = parquet_file.partition_id;
+    let level = parquet_file.compaction_level;
     stage.parquet_files.push(parquet_file);
 
-    // Update the new_file_at field its partition to the time of created_at
-    let partition = stage
-        .partitions
-        .iter_mut()
-        .find(|p| p.id == partition_id)
-        .ok_or(Error::NotFound {
-            descr: partition_id.to_string(),
-        })?;
-    partition.new_file_at = Some(created_at);
+    if level == CompactionLevel::Initial {
+        // Update the new_file_at field for its partition to the time of created_at
+        let partition = stage
+            .partitions
+            .iter_mut()
+            .find(|p| p.id == partition_id)
+            .ok_or(Error::NotFound {
+                descr: partition_id.to_string(),
+            })?;
+        partition.new_file_at = Some(created_at);
+    }
 
     Ok(stage.parquet_files.last().unwrap().clone())
 }

@@ -162,6 +162,9 @@ pub enum Error {
     #[snafu(display("Error while planning Flight SQL : {}", source))]
     FlightSQL { source: flightsql::Error },
 
+    #[snafu(display("No FlightDescriptor in Flight SQL request"))]
+    NoFlightDescriptor,
+
     #[snafu(display("Invalid protobuf: {}", source))]
     Deserialization { source: prost::DecodeError },
 
@@ -210,7 +213,8 @@ impl From<Error> for tonic::Status {
             | Error::InternalCreatingTicket { .. }
             | Error::UnsupportedMessageType { .. }
             | Error::FlightSQL { .. }
-            | Error::AuthzVerification { .. } => {
+            | Error::AuthzVerification { .. }
+            | Error::NoFlightDescriptor { .. } => {
                 warn!(e=%err, %namespace, %query, msg)
             }
         }
@@ -231,6 +235,7 @@ impl Error {
             | Self::Deserialization { .. }
             | Self::TooManyFlightSQLDatabases { .. }
             | Self::NoFlightSQLDatabase
+            | Self::NoFlightDescriptor
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. } => tonic::Code::InvalidArgument,
             Self::Database { source }
@@ -242,7 +247,9 @@ impl Error {
                 | flightsql::Error::InvalidTypeUrl { .. }
                 | flightsql::Error::Decode { .. }
                 | flightsql::Error::InvalidPreparedStatementParams { .. }
+                | flightsql::Error::NoFlightData { .. }
                 | flightsql::Error::Protocol { .. }
+                | flightsql::Error::UnknownParameterType { .. }
                 | flightsql::Error::UnsupportedMessageType { .. } => tonic::Code::InvalidArgument,
                 flightsql::Error::Flight { source: e } => return tonic::Status::from(e),
                 fs_err @ flightsql::Error::Arrow { .. } => {
@@ -272,6 +279,7 @@ impl Error {
             | Self::InvalidHandshake {}
             | Self::TooManyFlightSQLDatabases { .. }
             | Self::NoFlightSQLDatabase
+            | Self::NoFlightDescriptor
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. }
             | Self::Optimize { .. }
@@ -297,6 +305,7 @@ impl Error {
             | Self::InvalidHandshake {}
             | Self::TooManyFlightSQLDatabases { .. }
             | Self::NoFlightSQLDatabase
+            | Self::NoFlightDescriptor
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. }
             | Self::Optimize { .. }
@@ -418,7 +427,7 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 ///
 /// 4. Calls the `DoGet` method with the `Ticket` from the previous step.
 ///
-/// 5. Recieve a stream of data encoded as [`FlightData`]
+/// 5. Receive a stream of data encoded as [`FlightData`]
 ///
 /// ```text
 ///                                                      .───────.
@@ -448,7 +457,7 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 ///       ┃                                                  ┃
 /// ```
 ///
-/// ## FlightSQL Prepared Statement (no bind parameters like $1, etc)
+/// ## FlightSQL Prepared Statement with no bind parameters (e.g. $1, $name)
 ///
 /// To run a prepared query, via FlightSQL, the client undertakes a
 /// few more steps:
@@ -468,36 +477,98 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 /// 5. Steps 5,6,7 proceed the same as for a FlightSQL ad-hoc query
 ///
 /// ```text
-///                                                      .───────.
-/// ╔═══════════╗                                       (         )
-/// ║           ║                                       │`───────'│
-/// ║ FlightSQL ║                                       │   IOx   │
-/// ║  Client   ║                                       │.───────.│
-/// ║           ║                                       (         )
-/// ╚═══════════╝                                        `───────'
-///       ┃ Creates                                          ┃
-///     1 ┃ ActionCreatePreparedStatementRequest             ┃
-///       ┃                                                  ┃
-///       ┃                                                  ┃
-///       ┃  DoAction(ActionCreatePreparedStatementRequest)  ┃
-///     2 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
-///       ┃                                                  ┃
-///       ┃  Result(ActionCreatePreparedStatementResponse)   ┃
-///     3 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
-///       ┃                                                  ┃
-///       ┃  GetFlightInfo(CommandPreparedStatementQuery)    ┃
-///     4 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
-///       ┃  FlightInfo(..Ticket{                            ┃
-///       ┃     CommandPreparedStatementQuery})              ┃
-///     5 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
-///       ┃                                                  ┃
-///       ┃                  DoGet(Ticket)                   ┃
-///     6 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
-///       ┃                                                  ┃
-///       ┃                Stream of FightData               ┃
-///     7 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+///                                                            .───────.
+/// ╔═══════════╗                                             (         )
+/// ║           ║                                             │`───────'│
+/// ║ FlightSQL ║                                             │   IOx   │
+/// ║  Client   ║                                             │.───────.│
+/// ║           ║                                             (         )
+/// ╚═══════════╝                                              `───────'
+///     1 ┃ Creates an ActionCreatePreparedStatementRequest        ┃
+///       ┃                                                        ┃
+///       ┃  DoAction(ActionCreatePreparedStatementRequest)        ┃
+///     2 ┃━ ━ ━ ━ ━ ━ ━ ━  ━ ━ ━━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃  Result(ActionCreatePreparedStatementResult{handle})   ┃
+///     3 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+///       ┃                                                        ┃
+///       ┃  GetFlightInfo(CommandPreparedStatementQuery)          ┃
+///     4 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃  FlightInfo(Ticket{CommandPreparedStatementQuery})     ┃
+///     5 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+///       ┃                                                        ┃
+///       ┃                  DoGet(Ticket)                         ┃
+///     6 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃                Stream of FlightData                     ┃
+///     7 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
 /// ```
 ///
+/// ## FlightSQL Prepared Statement with bind parameters (e.g. $1, $name)
+///
+/// Running a prepared query with bind parameters is largely the same as
+/// running a prepared query without bind parameters, but there is an additional
+/// step to bind the parameter values to the prepared statement handle.
+///
+/// 1. Encode the query in a `ActionCreatePreparedStatementRequest`
+/// request structure
+///
+/// 2. Call `DoAction` method with the the request
+///
+/// 3. Receive a `ActionCreatePreparedStatementResponse`, which contains
+/// a prepared statement "handle".
+///
+/// 4. Call `DoPut method with `CommandPreparedStatementQuery`
+///
+/// 5. Send a stream of [`FlightData`] containing the parameters
+///
+/// 6. Receive a `DoPutPreparedStatementResult` which contains an updated prepared
+///    statement handle to use with the subsequent steps.
+///
+/// 7. Encode the updated handle in a `CommandPreparedStatementQuery`
+/// FlightSQL structure in a [`FlightDescriptor`] and call the
+/// `GetFlightInfo` method with the the [`FlightDescriptor`]
+///
+/// 8. Steps 8,9,10 proceed the same as for a FlightSQL ad-hoc query
+///
+/// ```text
+///                                                            .───────.
+/// ╔═══════════╗                                             (         )
+/// ║           ║                                             │`───────'│
+/// ║ FlightSQL ║                                             │   IOx   │
+/// ║  Client   ║                                             │.───────.│
+/// ║           ║                                             (         )
+/// ╚═══════════╝                                              `───────'
+///     1 ┃  Creates an ActionCreatePreparedStatementRequest       ┃
+///       ┃                                                        ┃
+///       ┃  DoAction(ActionCreatePreparedStatementRequest)        ┃
+///     2 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━  ━ ━ ━━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃  Result(ActionCreatePreparedStatementResult{handle})   ┃
+///     3 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+///       ┃                                                        ┃
+///       ┃  DoPut(CommandPreparedStatementQuery)                  ┃
+///     4 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃  parameters as stream of FlightData                    ┃
+///     5 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃  Result(DoPutPreparedStatementResult{handle})          ┃
+///     6 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+///       ┃                                                        ┃
+///       ┃  GetFlightInfo(CommandPreparedStatementQuery)          ┃
+///     7 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃  FlightInfo(Ticket{CommandPreparedStatementQuery})     ┃
+///     8 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+///       ┃                                                        ┃
+///       ┃                  DoGet(Ticket)                         ┃
+///     9 ┃━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━▶┃
+///       ┃                                                        ┃
+///       ┃                Stream of FightData                     ┃
+///    10 ┃◀ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ┃
+/// ```
 /// [Arrow Flight]: https://arrow.apache.org/docs/format/Flight.html
 /// [Arrow FlightSQL]: https://arrow.apache.org/docs/format/FlightSql.html
 #[derive(Debug)]
@@ -861,11 +932,64 @@ where
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, tonic::Status> {
         info!("Handling flightsql do_put body");
+        let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
+        let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
+        let trace = external_span_ctx.format_jaeger();
+        let is_debug = has_debug_header(request.metadata());
 
-        Err(tonic::Status::unimplemented("Not yet implemented: do_put"))
+        let namespace_name = get_flightsql_namespace(request.metadata())?;
+        let authz_token = get_flight_authz(request.metadata());
+
+        // get stream from request
+        let mut stream = request.into_inner().peekable();
+        // peek at the first FlightData in the stream to get the FlightDescriptor
+        let flight_descriptor = Pin::new(&mut stream)
+            .peek()
+            .await
+            .cloned()
+            .transpose()?
+            .and_then(|data| data.flight_descriptor)
+            .context(NoFlightDescriptorSnafu)?;
+        // extract the FlightSQL message
+        let cmd = FlightSQLCommand::try_decode(flight_descriptor.cmd).context(FlightSQLSnafu)?;
+
+        info!(%namespace_name, %cmd, %trace, "DoPut request");
+
+        let perms = flightsql_permissions(&namespace_name, &cmd);
+        self.authz
+            .permissions(authz_token, &perms)
+            .await
+            .map_err(Error::from)?;
+
+        let db = self
+            .server
+            .db(
+                &namespace_name,
+                span_ctx.child_span("get namespace"),
+                is_debug,
+            )
+            .await
+            .context(DatabaseSnafu)?
+            .context(DatabaseNotFoundSnafu {
+                namespace_name: &namespace_name,
+            })?;
+
+        let ctx = db.new_query_context(span_ctx, None);
+        let app_metadata = Planner::new(&ctx)
+            .flight_sql_do_put(&namespace_name, db, cmd.clone(), stream)
+            .await
+            .context(PlanningSnafu {
+                namespace_name: &namespace_name,
+                query: format!("{cmd:?}"),
+            })?;
+
+        let result = arrow_flight::PutResult { app_metadata };
+        let stream = futures::stream::iter([Ok(result)]);
+
+        Ok(Response::new(stream.boxed()))
     }
 
     async fn do_action(

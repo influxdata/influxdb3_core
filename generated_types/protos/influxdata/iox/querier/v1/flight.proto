@@ -28,7 +28,8 @@ message ReadInfo {
   // A FlightSQL command payload (serialized protobuf bytes). One of
   // the messages defined in the [protobuf definition].
   //
-  // [protobuf definition]: https://arrow.apache.org/docs/format/FlightSql.html#protocol-buffer-definitions
+  // [protobuf definition]:
+  // https://arrow.apache.org/docs/format/FlightSql.html#protocol-buffer-definitions
   bytes flightsql_command = 4;
 
   // The type of query
@@ -55,13 +56,16 @@ message ReadInfo {
 
   // Do we present debug information to the user?
   //
-  // Debug information are mostly features that are helpful to IOx developers but a unhelpful or even confusing to end
-  // users. One example are process-local query logs, which in most deployment scenarios will be inconsistent from a
-  // user PoV due to the routing layer that sits in front of the queriers.
+  // Debug information are mostly features that are helpful to IOx developers,
+  // but might be unhelpful or even confusing to end users.
+  // For example, process-local query logs in most deployment scenarios appear inconsistent from a user's point-of-view,
+  // due to the routing layer that sits in front of the queriers.
   //
-  // Note that debug information MUST NOT include security-relevant information. E.g. the process-local query log
-  // mentioned above MUST be namespace-scoped! So even a user hand-crafsts the `ReadInfo` message, they do NOT gain
-  // relevant information. The worst case is that their user experience will be suboptimal.
+  // Note that debug information MUST NOT include security-relevant information.
+  // For example, the process-local query log MUST be namespace-scoped!
+  // So, even if a user handcrafts the `ReadInfo` message,
+  // they don't gain relevant information.
+  // The worst case is a suboptimal user experience.
   bool is_debug = 5;
 }
 
@@ -73,8 +77,9 @@ message ReadInfo {
 message AppMetadata {}
 
 // A structure which describes the layout of the group key in a `RecordBatch`.
-// This information is used to map the data in a `RecordBatch` to the InfluxDB data model
-// where in addition to a data type, each columns is either a `tag`, `field` or `timestamp`
+// This information is used to map the data in a `RecordBatch` to the InfluxDB
+// data model where in addition to a data type, each column is either a `tag`,
+// `field` or `timestamp`
 //
 // Typically, this structure is encoded in the schema of a `RecordBatch`.
 message InfluxQlMetadata {
@@ -87,7 +92,8 @@ message InfluxQlMetadata {
     string tag_key = 1;
     // The column index of the tag values.
     uint32 column_index = 2;
-    // `true` if the tag key column is also a projected column in original query.
+    // `true` if the tag key column is also a projected column in original
+    // query.
     bool is_projected = 3;
   }
 
@@ -103,8 +109,7 @@ message InfluxQlMetadata {
 message FlightSqlPreparedStatementHandle {
   // The text of the FlightSQL query
   string query = 1;
-  // A sequence of (name, value) parameter pairs to insert into the query in place
-  // of `$placeholder`  variables
-  repeated QueryParam params = 2;
+  // Statement parameters encoded as Arrow IPC
+  optional bytes params = 2;
 }
 

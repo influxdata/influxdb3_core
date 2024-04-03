@@ -1370,6 +1370,16 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
         Ok(v)
     }
 
+    async fn set_new_file_at(
+        &mut self,
+        _partition_id: PartitionId,
+        _new_file_at: Timestamp,
+    ) -> Result<()> {
+        Err(Error::NotImplemented {
+            descr: "set_new_file_at is for test use only, not implemented for postgres".to_string(),
+        })
+    }
+
     async fn get_by_id_batch(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<Partition>> {
         let ids: Vec<_> = partition_ids.iter().map(|p| p.get()).collect();
 
@@ -1623,6 +1633,7 @@ FROM partition p
 WHERE p.new_file_at != 0
 AND p.new_file_at <= $1
 AND (p.cold_compact_at = 0 OR p.cold_compact_at < p.new_file_at)
+AND p.id not in (select partition_id from skipped_compactions)
 ORDER BY p.new_file_at ASC
 limit $2;"#,
         )
@@ -3060,6 +3071,21 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             .unwrap();
 
         // With a valid cold compact time, `partition` isn't returned.
+        let need_cold = repos
+            .partitions()
+            .partitions_needing_cold_compact(Timestamp::new(time), 1)
+            .await
+            .unwrap();
+        assert_eq!(need_cold.len(), 0);
+
+        // Now mark need_cold[0] as skipped and ensure it's not returned
+        let reason = "test";
+        repos
+            .partitions()
+            .record_skipped_compaction(partition.id, reason, 0, 0, 0, 0, 0)
+            .await
+            .unwrap();
+
         let need_cold = repos
             .partitions()
             .partitions_needing_cold_compact(Timestamp::new(time), 1)

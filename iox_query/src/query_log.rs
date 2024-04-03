@@ -756,8 +756,7 @@ mod test_super {
     fn test_params_end2end_success() {
         let params: StatementParams = params!(
             "a" => true,
-        )
-        .into();
+        );
         let capture = TracingCapture::new();
         let test = Test::with_log_entry(
             NamespaceId::new(1),

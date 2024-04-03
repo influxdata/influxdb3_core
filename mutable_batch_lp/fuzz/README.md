@@ -9,7 +9,7 @@ The fuzz tests in this `fuzz` crate were created using [cargo-fuzz] version 0.11
 To install `cargo-fuzz`:
 
 ```
-$ cargo install cargo-fuzz
+$ cargo install cargo-fuzz --locked
 ```
 
 You'll also need a nightly Rust:

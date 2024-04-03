@@ -351,6 +351,18 @@ pub struct CompactorSchedulerConfig {
     )]
     pub cold_threshold: Option<Duration>,
 
+    /// How many cold compaction jobs can run concurrently
+    /// To avoid starving hot compaction, this should be a fraction of the total partition
+    /// concurrency (e.g. half or less).  Its preferred to have this value auto-scaled in
+    /// in k8s rather than maintain it per cluster.
+    #[clap(
+        long = "compaction-cold-concurrency",
+        env = "INFLUXDB_IOX_COMPACTION_COLD_CONCURRENCY",
+        default_value = "1",
+        action
+    )]
+    pub cold_concurrency: usize,
+
     /// Partition source config used by the local scheduler.
     #[clap(flatten)]
     pub partition_source_config: PartitionSourceConfigForLocalScheduler,

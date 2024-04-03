@@ -17,7 +17,7 @@ serde_urlencoded = "0.7"
 thiserror = "1.0"
 
 # workspace dependencies in alphabetical order
-authz = { path = "../authz" }
+authz = { path = "../authz", features = ["http"] }
 data_types = { path = "../data_types" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

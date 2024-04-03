@@ -1,16 +1,24 @@
 //! IOx FlightSQL Command structures
 
-use std::fmt::Display;
+use std::{collections::HashMap, fmt::Display};
 
+use arrow::{
+    array::RecordBatch,
+    ipc::{
+        reader::StreamReader,
+        writer::{IpcWriteOptions, StreamWriter},
+    },
+};
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, Any,
     CommandGetCatalogs, CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys,
     CommandGetImportedKeys, CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes,
     CommandGetTables, CommandGetXdbcTypeInfo, CommandPreparedStatementQuery, CommandStatementQuery,
 };
+use arrow_util::display::pretty_format_batches;
 use bytes::Bytes;
+use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
 use generated_types::influxdata::iox::querier::v1::FlightSqlPreparedStatementHandle;
-use iox_query_params::StatementParams;
 use prost::Message;
 use snafu::ResultExt;
 
@@ -22,9 +30,9 @@ use crate::error::*;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatementHandle {
     /// The raw SQL query text
-    query: String,
+    pub(crate) query: String,
     /// Any parameters supplied via DoPut(CommandPreparedStatementQuery)
-    params: StatementParams,
+    pub(crate) params: Option<RecordBatch>,
 }
 
 impl PreparedStatementHandle {
@@ -32,13 +40,9 @@ impl PreparedStatementHandle {
         "type.googleapis.com/influxdata.iox.querier.v1.FlightSqlPreparedStatementHandle";
 
     pub(crate) fn new(query: impl Into<String>) -> Self {
-        Self::new_with_params(query, StatementParams::default())
-    }
-
-    pub(crate) fn new_with_params(query: impl Into<String>, params: StatementParams) -> Self {
         Self {
             query: query.into(),
-            params,
+            params: None,
         }
     }
 
@@ -48,13 +52,29 @@ impl PreparedStatementHandle {
     }
 
     /// return a reference to the params
-    pub fn params(&self) -> &StatementParams {
+    pub fn params(&self) -> &Option<RecordBatch> {
         &self.params
     }
 
-    /// Consume the handle and return the query and parameters
-    pub(crate) fn into_parts(self) -> (String, StatementParams) {
-        (self.query, self.params)
+    /// Converts the parameters stored in this handle into a map of DataFusion [[ScalarValue]]s
+    pub fn to_df_param_values(&self) -> Result<ParamValues, DataFusionError> {
+        let map = match &self.params {
+            Some(params) => params
+                .schema()
+                .all_fields()
+                .into_iter()
+                .zip(params.columns())
+                .map(|(field, col)| {
+                    Ok((
+                        field.name().to_owned(),
+                        ScalarValue::try_from_array(col, 0)?,
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>, DataFusionError>>()?,
+
+            None => HashMap::default(),
+        };
+        Ok(ParamValues::Map(map))
     }
 
     fn try_decode(handle: Bytes) -> Result<Self> {
@@ -62,10 +82,14 @@ impl PreparedStatementHandle {
             Ok(any) => {
                 if any.type_url == Self::PREPARED_STATEMENT_HANDLE_TYPE_URL {
                     let decoded_handle = FlightSqlPreparedStatementHandle::decode(any.value)?;
-                    Ok(Self::new_with_params(
-                        decoded_handle.query,
-                        decoded_handle.params.try_into()?,
-                    ))
+                    let query = decoded_handle.query;
+                    // decode Arrow IPC encoded parameters
+                    let params = match decoded_handle.params {
+                        Some(params) => StreamReader::try_new(params.as_slice(), None)?.next(),
+                        None => None,
+                    }
+                    .transpose()?;
+                    Ok(Self { query, params })
                 } else {
                     InvalidTypeUrlSnafu {
                         expected: Self::PREPARED_STATEMENT_HANDLE_TYPE_URL,
@@ -84,28 +108,52 @@ impl PreparedStatementHandle {
         }
     }
 
-    fn encode(self) -> Bytes {
+    fn encode(self) -> Result<Bytes> {
+        let params = match self.params {
+            Some(params) => {
+                let buffer: Vec<u8> = Vec::new();
+                let schema = params.schema();
+                // encode parameters as Arrow IPC
+                let mut writer = StreamWriter::try_new_with_options(
+                    buffer,
+                    &schema,
+                    IpcWriteOptions::default(),
+                )?;
+                writer.write(&params)?;
+                Some(writer.into_inner()?)
+            }
+            None => None,
+        };
         let flightsql_handle = FlightSqlPreparedStatementHandle {
             query: self.query,
-            params: self.params.into(),
+            params,
         };
         let any = Any {
             type_url: Self::PREPARED_STATEMENT_HANDLE_TYPE_URL.to_string(),
             value: flightsql_handle.encode_to_vec().into(),
         };
-        any.encode_to_vec().into()
+        Ok(any.encode_to_vec().into())
     }
 }
 
 impl Display for PreparedStatementHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Pepared({}, {})", self.query, self.params)
+        write!(f, "Prepared({}", self.query)?;
+        if let Some(batch) = &self.params {
+            write!(
+                f,
+                ",{}",
+                pretty_format_batches(&[batch.clone()]).map_err(|_| std::fmt::Error)?
+            )?
+        };
+        write!(f, ")")
     }
 }
 
 /// Encode a PreparedStatementHandle as Bytes
-impl From<PreparedStatementHandle> for Bytes {
-    fn from(value: PreparedStatementHandle) -> Self {
+impl TryFrom<PreparedStatementHandle> for Bytes {
+    type Error = self::Error;
+    fn try_from(value: PreparedStatementHandle) -> Result<Self> {
         value.encode()
     }
 }
@@ -362,7 +410,7 @@ impl FlightSQLCommand {
         let msg = match self {
             Self::CommandStatementQuery(cmd) => Any::pack(&cmd),
             Self::CommandPreparedStatementQuery(handle) => {
-                let prepared_statement_handle = handle.encode();
+                let prepared_statement_handle = handle.encode()?;
                 let cmd = CommandPreparedStatementQuery {
                     prepared_statement_handle,
                 };
@@ -380,7 +428,7 @@ impl FlightSQLCommand {
             Self::CommandGetXdbcTypeInfo(cmd) => Any::pack(&cmd),
             Self::ActionCreatePreparedStatementRequest(cmd) => Any::pack(&cmd),
             Self::ActionClosePreparedStatementRequest(handle) => {
-                let prepared_statement_handle = handle.encode();
+                let prepared_statement_handle = handle.encode()?;
                 Any::pack(&ActionClosePreparedStatementRequest {
                     prepared_statement_handle,
                 })
@@ -393,7 +441,6 @@ impl FlightSQLCommand {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use iox_query_params::StatementParams;
 
     use crate::PreparedStatementHandle;
 
@@ -404,6 +451,6 @@ mod tests {
         let handle_bytes = Bytes::from("SELECT 1");
         let handle = PreparedStatementHandle::try_decode(handle_bytes).unwrap();
         assert_eq!(handle.query, "SELECT 1");
-        assert_eq!(handle.params, StatementParams::default());
+        assert_eq!(handle.params, None);
     }
 }
