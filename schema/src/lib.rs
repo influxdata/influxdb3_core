@@ -27,6 +27,9 @@ use snafu::{OptionExt, Snafu};
 /// The name of the timestamp column in the InfluxDB datamodel
 pub const TIME_COLUMN_NAME: &str = "time";
 
+/// The name of the timestamp column in the InfluxDB datamodel
+pub const SERIES_ID_COLUMN_NAME: &str = "_series_id";
+
 /// The name of the column specifying the source measurement for a row for an InfluxQL query.
 pub const INFLUXQL_MEASUREMENT_COLUMN_NAME: &str = "iox::measurement";
 /// The key identifying the schema-level metadata.
@@ -210,6 +213,7 @@ impl Schema {
                     InfluxColumnType::Tag => true,
                     InfluxColumnType::Field(_) => true,
                     InfluxColumnType::Timestamp => false,
+                    InfluxColumnType::SeriesId => false,
                 };
                 if field.is_nullable() != expected_nullable {
                     return Err(Error::Nullability {
@@ -487,6 +491,8 @@ impl Schema {
             .iter()
             .filter_map(|(column_type, field)| match column_type {
                 Tag => Some((Tag, field)),
+                // TODO - could series ID be a primary key?
+                SeriesId => None,
                 Field(_) => None,
                 Timestamp => Some((Timestamp, field)),
             })
@@ -564,8 +570,6 @@ pub enum InfluxFieldType {
     String,
     /// true or false
     Boolean,
-    /// An array of bytes with fixed size
-    FixedSizeBinary(i32),
 }
 
 impl From<InfluxFieldType> for ArrowDataType {
@@ -576,7 +580,6 @@ impl From<InfluxFieldType> for ArrowDataType {
             InfluxFieldType::UInteger => Self::UInt64,
             InfluxFieldType::String => Self::Utf8,
             InfluxFieldType::Boolean => Self::Boolean,
-            InfluxFieldType::FixedSizeBinary(size) => Self::FixedSizeBinary(size),
         }
     }
 }
@@ -591,7 +594,6 @@ impl TryFrom<ArrowDataType> for InfluxFieldType {
             ArrowDataType::UInt64 => Ok(Self::UInteger),
             ArrowDataType::Utf8 => Ok(Self::String),
             ArrowDataType::Boolean => Ok(Self::Boolean),
-            ArrowDataType::FixedSizeBinary(size) => Ok(Self::FixedSizeBinary(size)),
             _ => Err("No corresponding type in the InfluxDB data model"),
         }
     }
@@ -620,6 +622,12 @@ impl TryFrom<&String> for InfluxFieldType {
 /// [documentation](https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum InfluxColumnType {
+    /// Series ID
+    ///
+    /// A 32 byte SHA256 hash of the tagset used to uniquely identify
+    /// a time series.
+    SeriesId,
+
     /// Tag
     ///
     /// Note: tags are always stored as a Utf8, but eventually this
@@ -660,14 +668,8 @@ impl InfluxColumnType {
                 }
                 _ => false,
             },
+            Self::SeriesId => matches!(data_type, ArrowDataType::FixedSizeBinary(32)),
         }
-    }
-}
-
-fn fixed_size_binary_serialize(size: i32) -> &'static str {
-    match size {
-        32 => "iox::column_type::field::fixedsizebinary::32",
-        other => panic!("unsupported fixed size binary size: {other}"),
     }
 }
 
@@ -676,6 +678,7 @@ impl From<&InfluxColumnType> for &'static str {
     fn from(t: &InfluxColumnType) -> Self {
         match t {
             InfluxColumnType::Tag => "iox::column_type::tag",
+            InfluxColumnType::SeriesId => "iox::column_type::sid",
             InfluxColumnType::Field(InfluxFieldType::Float) => "iox::column_type::field::float",
             InfluxColumnType::Field(InfluxFieldType::Integer) => "iox::column_type::field::integer",
             InfluxColumnType::Field(InfluxFieldType::UInteger) => {
@@ -683,9 +686,6 @@ impl From<&InfluxColumnType> for &'static str {
             }
             InfluxColumnType::Field(InfluxFieldType::String) => "iox::column_type::field::string",
             InfluxColumnType::Field(InfluxFieldType::Boolean) => "iox::column_type::field::boolean",
-            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(size)) => {
-                fixed_size_binary_serialize(*size)
-            }
             InfluxColumnType::Timestamp => "iox::column_type::timestamp",
         }
     }
@@ -705,14 +705,12 @@ impl TryFrom<&str> for InfluxColumnType {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
             "iox::column_type::tag" => Ok(Self::Tag),
+            "iox::column_type::sid" => Ok(Self::SeriesId),
             "iox::column_type::field::float" => Ok(Self::Field(InfluxFieldType::Float)),
             "iox::column_type::field::integer" => Ok(Self::Field(InfluxFieldType::Integer)),
             "iox::column_type::field::uinteger" => Ok(Self::Field(InfluxFieldType::UInteger)),
             "iox::column_type::field::string" => Ok(Self::Field(InfluxFieldType::String)),
             "iox::column_type::field::boolean" => Ok(Self::Field(InfluxFieldType::Boolean)),
-            "iox::column_type::field::fixedsizebinary::32" => {
-                Ok(Self::Field(InfluxFieldType::FixedSizeBinary(32)))
-            }
             "iox::column_type::timestamp" => Ok(Self::Timestamp),
             _ => Err(format!("Unknown column type in metadata: {s:?}")),
         }
@@ -724,6 +722,7 @@ impl From<&InfluxColumnType> for ArrowDataType {
     fn from(t: &InfluxColumnType) -> Self {
         match t {
             InfluxColumnType::Tag => Self::Dictionary(Box::new(Self::Int32), Box::new(Self::Utf8)),
+            InfluxColumnType::SeriesId => Self::FixedSizeBinary(32),
             InfluxColumnType::Field(influxdb_field_type) => (*influxdb_field_type).into(),
             InfluxColumnType::Timestamp => TIME_DATA_TYPE(),
         }

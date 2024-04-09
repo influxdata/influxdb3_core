@@ -2698,7 +2698,9 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     for (t, f) in table_schema.iter() {
                         match t {
                             InfluxColumnType::Tag => {}
-                            InfluxColumnType::Field(_) | InfluxColumnType::Timestamp => {
+                            InfluxColumnType::Field(_)
+                            | InfluxColumnType::Timestamp
+                            | InfluxColumnType::SeriesId => {
                                 continue;
                             }
                         }
@@ -2773,7 +2775,9 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             for (t, f) in table_schema.iter() {
                 let t = match t {
                     InfluxColumnType::Field(t) => t,
-                    InfluxColumnType::Tag | InfluxColumnType::Timestamp => {
+                    InfluxColumnType::Tag
+                    | InfluxColumnType::Timestamp
+                    | InfluxColumnType::SeriesId => {
                         continue;
                     }
                 };
@@ -2783,7 +2787,6 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     InfluxFieldType::UInteger => "unsigned",
                     InfluxFieldType::String => "string",
                     InfluxFieldType::Boolean => "boolean",
-                    InfluxFieldType::FixedSizeBinary(_) => continue,
                 };
                 measurement_names_builder.append_value(&table);
                 field_key_builder.append_value(f.name());

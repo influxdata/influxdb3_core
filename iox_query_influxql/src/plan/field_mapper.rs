@@ -24,6 +24,7 @@ pub(crate) fn field_and_dimensions(
                     tag_set.insert(f.name().to_owned());
                 }
                 (InfluxColumnType::Timestamp, _) => {}
+                (InfluxColumnType::SeriesId, _) => {}
             }
         }
         (field_set, tag_set)

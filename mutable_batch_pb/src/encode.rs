@@ -64,6 +64,7 @@ fn encode_column(column_name: &str, column: &Column) -> PbColumn {
 
     let semantic_type = match column.influx_type() {
         InfluxColumnType::Tag => SemanticType::Tag,
+        InfluxColumnType::SeriesId => unimplemented!("series id is not implemented in iox"),
         InfluxColumnType::Field(_) => SemanticType::Field,
         InfluxColumnType::Timestamp => SemanticType::Time,
     };

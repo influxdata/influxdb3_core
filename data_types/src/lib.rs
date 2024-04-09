@@ -1248,6 +1248,7 @@ impl ColumnSummary {
 #[allow(missing_docs)]
 pub enum InfluxDbType {
     Tag,
+    SeriesId,
     Field,
     Timestamp,
 }

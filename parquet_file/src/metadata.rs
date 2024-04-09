@@ -881,6 +881,7 @@ fn read_statistics_from_parquet_row_group(
             name: field.name().clone(),
             influxdb_type: match iox_type {
                 InfluxColumnType::Tag => InfluxDbType::Tag,
+                InfluxColumnType::SeriesId => InfluxDbType::SeriesId,
                 InfluxColumnType::Field(_) => InfluxDbType::Field,
                 InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
             },

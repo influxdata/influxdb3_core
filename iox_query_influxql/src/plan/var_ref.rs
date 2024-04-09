@@ -22,9 +22,6 @@ pub(crate) fn field_type_to_var_ref_data_type(v: InfluxFieldType) -> VarRefDataT
         InfluxFieldType::Float => VarRefDataType::Float,
         InfluxFieldType::String => VarRefDataType::String,
         InfluxFieldType::Boolean => VarRefDataType::Boolean,
-        InfluxFieldType::FixedSizeBinary(_) => {
-            unimplemented!("cannot represent fixed size binary as a var ref data type")
-        }
     }
 }
 
@@ -34,6 +31,9 @@ pub(crate) fn influx_type_to_var_ref_data_type(
 ) -> Option<VarRefDataType> {
     match v {
         None => None,
+        Some(InfluxColumnType::SeriesId) => {
+            unimplemented!("cannot represent fixed size binary as a var ref data type")
+        }
         Some(InfluxColumnType::Tag) => Some(VarRefDataType::Tag),
         Some(InfluxColumnType::Field(ft)) => Some(field_type_to_var_ref_data_type(ft)),
         Some(InfluxColumnType::Timestamp) => Some(VarRefDataType::Timestamp),

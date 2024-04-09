@@ -3,6 +3,8 @@ use std::convert::TryInto;
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use snafu::{ResultExt, Snafu};
 
+use crate::SERIES_ID_COLUMN_NAME;
+
 use super::{InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME};
 
 /// Namespace schema creation / validation errors.
@@ -77,6 +79,7 @@ impl SchemaBuilder {
                 .field(column_name, influx_field_type.into())
                 .expect("just converted this from a valid type"),
             InfluxColumnType::Timestamp => self.timestamp(),
+            InfluxColumnType::SeriesId => self.series_id(),
         }
     }
 
@@ -96,6 +99,18 @@ impl SchemaBuilder {
         let influxdb_column_type = InfluxColumnType::Timestamp;
         let arrow_type = (&influxdb_column_type).into();
         self.add_column(TIME_COLUMN_NAME, false, influxdb_column_type, arrow_type)
+    }
+
+    /// Add the SeriesId column
+    pub fn series_id(&mut self) -> &mut Self {
+        let influxdb_column_type = InfluxColumnType::SeriesId;
+        let arrow_type = (&influxdb_column_type).into();
+        self.add_column(
+            SERIES_ID_COLUMN_NAME,
+            false,
+            influxdb_column_type,
+            arrow_type,
+        )
     }
 
     /// Set optional InfluxDB data model measurement name

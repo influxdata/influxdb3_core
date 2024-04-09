@@ -305,12 +305,12 @@ impl From<InfluxColumnType> for ColumnType {
     fn from(value: InfluxColumnType) -> Self {
         match value {
             InfluxColumnType::Tag => Self::Tag,
+            InfluxColumnType::SeriesId => Self::SeriesId,
             InfluxColumnType::Field(InfluxFieldType::Float) => Self::F64,
             InfluxColumnType::Field(InfluxFieldType::Integer) => Self::I64,
             InfluxColumnType::Field(InfluxFieldType::UInteger) => Self::U64,
             InfluxColumnType::Field(InfluxFieldType::String) => Self::String,
             InfluxColumnType::Field(InfluxFieldType::Boolean) => Self::Bool,
-            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => Self::SeriesId,
             InfluxColumnType::Timestamp => Self::Time,
         }
     }
@@ -326,7 +326,7 @@ impl From<ColumnType> for InfluxColumnType {
             ColumnType::String => Self::Field(InfluxFieldType::String),
             ColumnType::Time => Self::Timestamp,
             ColumnType::Tag => Self::Tag,
-            ColumnType::SeriesId => Self::Field(InfluxFieldType::FixedSizeBinary(32)),
+            ColumnType::SeriesId => Self::SeriesId,
         }
     }
 }
@@ -341,10 +341,7 @@ impl PartialEq<InfluxColumnType> for ColumnType {
             Self::String => matches!(got, InfluxColumnType::Field(InfluxFieldType::String)),
             Self::Time => matches!(got, InfluxColumnType::Timestamp),
             Self::Tag => matches!(got, InfluxColumnType::Tag),
-            Self::SeriesId => matches!(
-                got,
-                InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(32))
-            ),
+            Self::SeriesId => matches!(got, InfluxColumnType::SeriesId),
         }
     }
 }

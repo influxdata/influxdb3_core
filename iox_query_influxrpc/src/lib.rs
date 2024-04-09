@@ -913,6 +913,7 @@ impl InfluxRpcPlanner {
                 InfluxColumnType::Field(_) => Some(field.name().as_expr()),
                 InfluxColumnType::Timestamp => Some(field.name().as_expr()),
                 InfluxColumnType::Tag => None,
+                InfluxColumnType::SeriesId => None,
             })
             .collect::<Vec<_>>();
 

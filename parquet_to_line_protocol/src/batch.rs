@@ -121,7 +121,7 @@ fn field_values_iter<'a>(
                 // not a field
                 InfluxColumnType::Tag
                 | InfluxColumnType::Timestamp
-                | InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => return None,
+                | InfluxColumnType::SeriesId => return None,
             };
 
             Some(FieldColumn { name, value })

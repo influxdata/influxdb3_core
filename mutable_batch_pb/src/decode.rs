@@ -192,8 +192,8 @@ pub fn write_table_batch(batch: &mut MutableBatch, table_batch: &TableBatch) -> 
                 valid_mask,
                 RepeatLastElement::new(values.bool_values.iter().cloned()),
             ),
-            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => {
-                unimplemented!("fixed size binary is not supported in iox")
+            InfluxColumnType::SeriesId => {
+                unimplemented!("series ID is not supported in iox")
             }
             InfluxColumnType::Timestamp => {
                 ensure!(valid_mask.is_none(), NullTimeSnafu);
