@@ -664,6 +664,13 @@ impl InfluxColumnType {
     }
 }
 
+fn fixed_size_binary_serialize(size: i32) -> &'static str {
+    match size {
+        32 => "iox::column_type::field::fixedsizebinary::32",
+        other => panic!("unsupported fixed size binary size: {other}"),
+    }
+}
+
 /// "serialization" to strings that are stored in arrow metadata
 impl From<&InfluxColumnType> for &'static str {
     fn from(t: &InfluxColumnType) -> Self {
@@ -676,8 +683,8 @@ impl From<&InfluxColumnType> for &'static str {
             }
             InfluxColumnType::Field(InfluxFieldType::String) => "iox::column_type::field::string",
             InfluxColumnType::Field(InfluxFieldType::Boolean) => "iox::column_type::field::boolean",
-            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => {
-                "iox::column_type::field::fixedsizebinary"
+            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(size)) => {
+                fixed_size_binary_serialize(*size)
             }
             InfluxColumnType::Timestamp => "iox::column_type::timestamp",
         }
@@ -703,6 +710,9 @@ impl TryFrom<&str> for InfluxColumnType {
             "iox::column_type::field::uinteger" => Ok(Self::Field(InfluxFieldType::UInteger)),
             "iox::column_type::field::string" => Ok(Self::Field(InfluxFieldType::String)),
             "iox::column_type::field::boolean" => Ok(Self::Field(InfluxFieldType::Boolean)),
+            "iox::column_type::field::fixedsizebinary::32" => {
+                Ok(Self::Field(InfluxFieldType::FixedSizeBinary(32)))
+            }
             "iox::column_type::timestamp" => Ok(Self::Timestamp),
             _ => Err(format!("Unknown column type in metadata: {s:?}")),
         }
