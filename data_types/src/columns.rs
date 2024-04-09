@@ -295,6 +295,7 @@ impl TryFrom<i16> for ColumnType {
             x if x == Self::String as i16 => Ok(Self::String),
             x if x == Self::Time as i16 => Ok(Self::Time),
             x if x == Self::Tag as i16 => Ok(Self::Tag),
+            x if x == Self::SeriesId as i16 => Ok(Self::SeriesId),
             _ => Err(ColumnTypeProtoError {}),
         }
     }
