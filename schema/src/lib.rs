@@ -591,6 +591,7 @@ impl TryFrom<ArrowDataType> for InfluxFieldType {
             ArrowDataType::UInt64 => Ok(Self::UInteger),
             ArrowDataType::Utf8 => Ok(Self::String),
             ArrowDataType::Boolean => Ok(Self::Boolean),
+            ArrowDataType::FixedSizeBinary(size) => Ok(Self::FixedSizeBinary(size)),
             _ => Err("No corresponding type in the InfluxDB data model"),
         }
     }
