@@ -104,7 +104,9 @@ pub async fn serve(
         server_type.name(),
     );
 
-    let mut builder = hyper::Server::builder(addr).http2_adaptive_window(true);
+    let mut builder = hyper::Server::builder(addr)
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true);
     if let Some(x) = max_pending_reset_streams {
         builder = builder.http2_max_pending_accept_reset_streams(Some(x));
     }

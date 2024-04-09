@@ -235,6 +235,7 @@ mod test {
             Partitioning, Statistics,
         },
     };
+    use datafusion_util::config::table_parquet_options;
     use object_store::{path::Path, ObjectMeta};
     use schema::{InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
 
@@ -679,7 +680,12 @@ mod test {
             table_partition_cols: vec![],
             output_ordering: vec![order.to_vec()],
         };
-        Arc::new(ParquetExec::new(base_config, None, None))
+        Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ))
     }
 
     fn schema() -> SchemaRef {

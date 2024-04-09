@@ -25,6 +25,7 @@ use datafusion::{
         ExecutionPlan, PhysicalExpr,
     },
 };
+use datafusion_util::config::table_parquet_options;
 
 use crate::provider::{DeduplicateExec, RecordBatchesExec};
 
@@ -113,8 +114,12 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         output_ordering,
                         ..child_parquet.base_config().clone()
                     };
-                    let new_child =
-                        ParquetExec::new(base_config, child_parquet.predicate().cloned(), None);
+                    let new_child = ParquetExec::new(
+                        base_config,
+                        child_parquet.predicate().cloned(),
+                        None,
+                        table_parquet_options(),
+                    );
                     return Ok(Transformed::yes(Arc::new(new_child)));
                 } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
                     let filter_required_cols = collect_columns(child_filter.predicate());
@@ -752,7 +757,12 @@ mod tests {
                 },
             ]],
         };
-        let inner = ParquetExec::new(base_config, Some(expr_string_cmp("tag1", &schema)), None);
+        let inner = ParquetExec::new(
+            base_config,
+            Some(expr_string_cmp("tag1", &schema)),
+            None,
+            table_parquet_options(),
+        );
         let plan = Arc::new(
             ProjectionExec::try_new(
                 vec![
@@ -1346,7 +1356,12 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        let plan = Arc::new(ParquetExec::new(base_config, None, None));
+        let plan = Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ));
         let plan = Arc::new(UnionExec::new(vec![plan]));
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(

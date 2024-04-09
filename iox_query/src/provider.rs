@@ -31,7 +31,6 @@ use crate::{
 use snafu::{ResultExt, Snafu};
 
 mod adapter;
-mod cached_parquet_data;
 mod deduplicate;
 pub mod overlap;
 mod physical;

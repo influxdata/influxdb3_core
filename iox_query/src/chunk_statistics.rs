@@ -102,7 +102,7 @@ impl ChunkStatistics {
     }
 
     pub fn bucket_pruning_oracle(&self) -> Option<Arc<BucketPartitionPruningOracle>> {
-        self.bucket_pruning_oracle.as_ref().map(Arc::clone)
+        self.bucket_pruning_oracle.as_ref().cloned()
     }
 }
 

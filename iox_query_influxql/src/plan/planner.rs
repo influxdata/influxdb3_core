@@ -31,13 +31,15 @@ use datafusion::catalog::TableReference;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, ToDFSchema};
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::functions::expr_fn::date_bin;
+use datafusion::functions_array::expr_fn::make_array;
 use datafusion::logical_expr::expr::{AggregateFunctionDefinition, Alias, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::normalize_col;
 use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::logical_plan::Analyze;
 use datafusion::logical_expr::utils::{expr_as_column_expr, find_aggregate_exprs};
 use datafusion::logical_expr::{
-    binary_expr, col, date_bin, expr, expr::WindowFunction, lit, now, union, utils::conjunction,
+    binary_expr, col, expr, expr::WindowFunction, lit, now, union, utils::conjunction,
     AggregateFunction, AggregateUDF, Between, BuiltInWindowFunction, BuiltinScalarFunction,
     Distinct, EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan,
     LogicalPlanBuilder, Operator, PlanType, Projection, ScalarFunctionDefinition, ScalarUDF,
@@ -436,13 +438,19 @@ impl<'a> Context<'a> {
 pub struct InfluxQLToLogicalPlan<'a> {
     s: &'a dyn SchemaProvider,
     iox_ctx: IOxSessionContext,
+    date_bin: Arc<ScalarUDF>,
 }
 
 impl<'a> InfluxQLToLogicalPlan<'a> {
-    pub fn new(s: &'a dyn SchemaProvider, iox_ctx: &'a IOxSessionContext) -> Self {
+    pub fn new(
+        s: &'a dyn SchemaProvider,
+        iox_ctx: &'a IOxSessionContext,
+        date_bin: Arc<ScalarUDF>,
+    ) -> Self {
         Self {
             s,
             iox_ctx: iox_ctx.child_ctx("InfluxQLToLogicalPlan"),
+            date_bin,
         }
     }
 
@@ -1387,7 +1395,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 FillClause::None => unreachable!(),
             };
 
-            build_gap_fill_node(plan, time_column, fill_strategy, &ctx.projection_type)?
+            build_gap_fill_node(
+                plan,
+                time_column,
+                fill_strategy,
+                &ctx.projection_type,
+                &self.date_bin,
+            )?
         } else {
             plan
         };
@@ -2630,7 +2644,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         // - not null if it had any non-null values
                         //
                         // note that since we only have a single row, this is efficient
-                        .project([datafusion::prelude::array(
+                        .project([make_array(
                             tags.iter()
                                 .map(|tag| {
                                     let tag_col = Expr::Column(Column::from_name(*tag));
@@ -2878,9 +2892,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             let mut inputs = inputs
                                 .iter()
                                 .flat_map(|plan| match plan.as_ref() {
-                                    LogicalPlan::Union(Union { inputs, .. }) => {
-                                        inputs.iter().map(Arc::clone).collect::<Vec<_>>()
-                                    }
+                                    LogicalPlan::Union(Union { inputs, .. }) => inputs.to_vec(),
                                     _ => {
                                         vec![Arc::clone(plan)]
                                     }
@@ -3151,6 +3163,7 @@ fn build_gap_fill_node(
     time_column: &Expr,
     fill_strategy: FillStrategy,
     projection_type: &ProjectionType,
+    date_bin: &Arc<ScalarUDF>,
 ) -> Result<LogicalPlan> {
     let (expr, alias) = match time_column {
         Expr::Alias(Alias {
@@ -3163,9 +3176,9 @@ fn build_gap_fill_node(
 
     let date_bin_args = match expr {
         Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::DateBin),
+            func_def: ScalarFunctionDefinition::UDF(udf),
             args,
-        }) => args,
+        }) if udf.eq(date_bin) => args,
         _ => {
             // The InfluxQL planner adds the `date_bin` function,
             // so this condition represents an internal failure.
@@ -3609,7 +3622,12 @@ mod test {
         }
 
         let iox_ctx = IOxSessionContext::with_testing();
-        let planner = InfluxQLToLogicalPlan::new(&sp, &iox_ctx);
+        let date_bin = datafusion::functions::datetime::functions()
+            .iter()
+            .find(|fun| fun.name().eq("date_bin"))
+            .expect("should have date_bin UDF")
+            .to_owned();
+        let planner = InfluxQLToLogicalPlan::new(&sp, &iox_ctx, date_bin);
 
         planner.statement_to_plan(statements.pop().unwrap())
     }

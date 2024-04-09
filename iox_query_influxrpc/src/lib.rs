@@ -1279,9 +1279,7 @@ fn table_chunk_stream<'a>(
 > + 'a {
     futures::stream::iter(table_predicates)
         .filter_map(move |(table_name, predicate)| async move {
-            let Some(table_schema) = meta.table_schema(table_name) else {
-                return None;
-            };
+            let table_schema = meta.table_schema(table_name)?;
             let table_schema = Arc::new(table_schema);
             Some((table_name, table_schema, predicate))
         })

@@ -18,6 +18,9 @@
 //!
 //! * Complex replicated state machines
 //! * Forward compatibility challenges where newer data can't roundtrip through older servers
+//!
+//! While providing the following benefits:
+//!
 //! * Simple to introspect, debug and reason about
 //! * Predictable and easily quantifiable memory usage
 //!

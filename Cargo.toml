@@ -88,8 +88,8 @@ license = "MIT OR Apache-2.0"
 arrow = { version = "50.0.0", features = ["prettyprint", "chrono-tz"] }
 arrow-buffer = { version = "50.0.0" }
 arrow-flight = { version = "50.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "581e74785b876615d6a63db8c2e5ba372bf78828" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "581e74785b876615d6a63db8c2e5ba372bf78828" }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7" }
 hashbrown = { version = "0.14.3" }
 object_store = { version = "0.9.1" }
 parquet = { version = "50.0.0", features = ["object_store"] }

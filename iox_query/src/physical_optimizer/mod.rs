@@ -4,6 +4,7 @@ use datafusion::{execution::context::SessionState, physical_optimizer::PhysicalO
 
 pub(crate) use self::limits::ParquetFileMetrics;
 use self::{
+    cached_parquet_data::CachedParquetData,
     dedup::{
         dedup_null_columns::DedupNullColumns, dedup_sort_order::DedupSortOrder, split::SplitDedup,
     },
@@ -14,6 +15,7 @@ use self::{
     union::{nested_union::NestedUnion, one_union::OneUnion},
 };
 
+mod cached_parquet_data;
 mod chunk_extraction;
 mod dedup;
 mod limits;
@@ -45,6 +47,9 @@ pub fn register_iox_physical_optimizers(state: SessionState) -> SessionState {
 
     // Append DataFusion physical rules to the IOx-specific rules
     optimizers.append(&mut state.physical_optimizers().to_vec());
+
+    // install cached parquet readers AFTER DataFusion (re-)creates ParquetExec's
+    optimizers.push(Arc::new(CachedParquetData));
 
     // Add a rule to optimize plan with limit
     optimizers.push(Arc::new(OrderUnionSortedInputs));

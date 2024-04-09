@@ -118,6 +118,7 @@ mod tests {
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::Statistics;
+    use datafusion_util::config::table_parquet_options;
     use std::sync::Arc;
 
     #[test]
@@ -219,6 +220,11 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        Arc::new(ParquetExec::new(base_config, None, None))
+        Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ))
     }
 }

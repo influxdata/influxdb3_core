@@ -23,7 +23,9 @@ use datafusion::{
     physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
 };
-use datafusion_util::config::{iox_session_config, register_iox_object_store};
+use datafusion_util::config::{
+    iox_session_config, register_iox_object_store, table_parquet_options,
+};
 use object_store::{DynObjectStore, ObjectMeta};
 use observability_deps::tracing::*;
 use schema::Projection;
@@ -142,7 +144,7 @@ impl ParquetExecInput {
             // Parquet files ARE actually sorted but we don't care here since we just construct a `collect` plan.
             output_ordering: vec![],
         };
-        let exec = ParquetExec::new(base_config, None, None);
+        let exec = ParquetExec::new(base_config, None, None, table_parquet_options());
         let exec_schema = exec.schema();
         datafusion::physical_plan::collect(Arc::new(exec), session_ctx.task_ctx())
             .await
