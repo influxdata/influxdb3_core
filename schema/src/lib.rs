@@ -564,6 +564,8 @@ pub enum InfluxFieldType {
     String,
     /// true or false
     Boolean,
+    /// An array of bytes with fixed size
+    FixedSizeBinary(i32),
 }
 
 impl From<InfluxFieldType> for ArrowDataType {
@@ -574,6 +576,7 @@ impl From<InfluxFieldType> for ArrowDataType {
             InfluxFieldType::UInteger => Self::UInt64,
             InfluxFieldType::String => Self::Utf8,
             InfluxFieldType::Boolean => Self::Boolean,
+            InfluxFieldType::FixedSizeBinary(size) => Self::FixedSizeBinary(size),
         }
     }
 }
@@ -672,6 +675,9 @@ impl From<&InfluxColumnType> for &'static str {
             }
             InfluxColumnType::Field(InfluxFieldType::String) => "iox::column_type::field::string",
             InfluxColumnType::Field(InfluxFieldType::Boolean) => "iox::column_type::field::boolean",
+            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => {
+                "iox::column_type::field::fixedsizebinary"
+            }
             InfluxColumnType::Timestamp => "iox::column_type::timestamp",
         }
     }

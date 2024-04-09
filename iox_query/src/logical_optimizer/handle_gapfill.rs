@@ -4,14 +4,14 @@
 pub mod range_predicate;
 
 use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
-use datafusion::logical_expr::ScalarFunctionDefinition;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     error::{DataFusionError, Result},
+    functions::datetime::functions as datafusion_datetime_udfs,
     logical_expr::{
         expr::{Alias, ScalarFunction},
         utils::expr_to_columns,
-        Aggregate, BuiltinScalarFunction, Extension, LogicalPlan, Projection,
+        Aggregate, Extension, LogicalPlan, Projection, ScalarFunctionDefinition, ScalarUDF,
     },
     optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
     prelude::{col, Column, Expr},
@@ -342,7 +342,16 @@ fn replace_date_bin_gapfill(group_expr: &[Expr]) -> Result<Option<RewriteInfo>> 
 
     let date_bin_gapfill_index = dbg_idx.expect("should be found exactly one call");
 
-    let mut rewriter = DateBinGapfillRewriter { args: None };
+    let date_bin = datafusion_datetime_udfs()
+        .iter()
+        .find(|fun| fun.name().eq("date_bin"))
+        .ok_or(DataFusionError::Execution("no date_bin UDF found".into()))?
+        .to_owned();
+
+    let mut rewriter = DateBinGapfillRewriter {
+        args: None,
+        date_bin,
+    };
     let group_expr = group_expr
         .iter()
         .enumerate()
@@ -374,6 +383,7 @@ fn unwrap_alias(mut e: &Expr) -> &Expr {
 
 struct DateBinGapfillRewriter {
     args: Option<Vec<Expr>>,
+    date_bin: Arc<ScalarUDF>,
 }
 
 impl TreeNodeRewriter for DateBinGapfillRewriter {
@@ -398,7 +408,7 @@ impl TreeNodeRewriter for DateBinGapfillRewriter {
                 self.args = Some(args.clone());
                 Ok(Transformed::yes(
                     Expr::ScalarFunction(ScalarFunction {
-                        func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::DateBin),
+                        func_def: ScalarFunctionDefinition::UDF(Arc::clone(&self.date_bin)),
                         args,
                     })
                     .alias(orig_name),

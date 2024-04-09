@@ -2,14 +2,33 @@ use std::{collections::HashSet, sync::Arc};
 
 use datafusion::{
     common::{DataFusionError, Result as DataFusionResult},
-    execution::FunctionRegistry,
+    execution::{registry::MemoryFunctionRegistry, FunctionRegistry},
     logical_expr::{AggregateUDF, ScalarUDF, WindowUDF},
 };
 use once_cell::sync::Lazy;
 
 use crate::{gapfill, regex, sleep, to_timestamp, window};
 
-static REGISTRY: Lazy<IOxFunctionRegistry> = Lazy::new(IOxFunctionRegistry::new);
+/// Contains IOx UDFs
+static IOX_REGISTRY: Lazy<IOxFunctionRegistry> = Lazy::new(IOxFunctionRegistry::new);
+
+/// Contains IOx & Datafusion UDFs
+static ALL_REGISTRY: Lazy<Box<dyn FunctionRegistry + 'static + Send + Sync>> = Lazy::new(|| {
+    let mut registry = MemoryFunctionRegistry::new();
+    datafusion::functions::register_all(&mut registry).expect("should register datafusion UDF");
+
+    let iox_registry = IOxFunctionRegistry::new();
+    for fn_name in iox_registry.udfs() {
+        registry
+            .register_udf(
+                iox_registry
+                    .udf(&fn_name)
+                    .expect("iox registry is missing udf"),
+            )
+            .expect("should register iox UDF");
+    }
+    Box::new(registry)
+});
 
 /// Lookup for all DataFusion User Defined Functions used by IOx
 #[derive(Debug)]
@@ -67,7 +86,12 @@ impl FunctionRegistry for IOxFunctionRegistry {
     }
 }
 
-/// Return a reference to the global function registry
-pub(crate) fn instance() -> &'static IOxFunctionRegistry {
-    &REGISTRY
+/// Return a reference to the global iox function registry
+pub(crate) fn instance_iox() -> &'static IOxFunctionRegistry {
+    &IOX_REGISTRY
+}
+
+/// Return a reference to the global iox & datafusion function registry
+pub(crate) fn instance() -> &'static dyn FunctionRegistry {
+    &**ALL_REGISTRY
 }

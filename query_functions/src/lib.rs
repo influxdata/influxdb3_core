@@ -93,6 +93,11 @@ pub fn make_window_bound_expr(
 
 /// Return an [`FunctionRegistry`] with the implementations of IOx UDFs
 pub fn registry() -> &'static dyn FunctionRegistry {
+    registry::instance_iox()
+}
+
+/// Return an [`FunctionRegistry`] with the implementations of IOx UDFs and the datafusion-provided UDFs
+pub fn registry_all_udfs() -> &'static dyn FunctionRegistry {
     registry::instance()
 }
 

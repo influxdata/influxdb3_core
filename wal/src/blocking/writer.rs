@@ -46,6 +46,7 @@ impl OpenSegmentFileWriter {
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .context(SegmentCreateSnafu)?;
 

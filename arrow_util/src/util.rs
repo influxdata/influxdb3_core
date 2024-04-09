@@ -38,7 +38,7 @@ pub fn ensure_schema(
             // null values.
             batch
                 .column_by_name(output_field.name())
-                .map(Arc::clone)
+                .cloned()
                 .unwrap_or_else(|| new_null_array(output_field.data_type(), batch.num_rows()))
         })
         .collect();

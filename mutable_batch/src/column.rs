@@ -168,6 +168,9 @@ impl Column {
                 PackedStringArray::new_empty(row_count),
                 StatValues::new_all_null(total_count, distinct_count),
             ),
+            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => {
+                unimplemented!("this feature is not intended for iox")
+            }
             InfluxColumnType::Tag => ColumnData::Tag(
                 vec![NULL_DID; row_count],
                 Default::default(),

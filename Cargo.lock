@@ -220,7 +220,7 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "chrono",
- "chrono-tz",
+ "chrono-tz 0.8.6",
  "half",
  "hashbrown 0.14.3",
  "num",
@@ -1011,7 +1011,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d59ae0466b83e838b81a54256c39d5d7c20b9d7daa10510a242d9b75abd5936e"
 dependencies = [
  "chrono",
- "chrono-tz-build",
+ "chrono-tz-build 0.2.1",
+ "phf",
+]
+
+[[package]]
+name = "chrono-tz"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93698b29de5e97ad0ae26447b344c482a7284c737d9ddc5f9e52b74a336671bb"
+dependencies = [
+ "chrono",
+ "chrono-tz-build 0.3.0",
  "phf",
 ]
 
@@ -1020,6 +1031,17 @@ name = "chrono-tz-build"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "433e39f13c9a060046954e0592a8d0a4bcb1040125cbf91cb8ee58964cfb350f"
+dependencies = [
+ "parse-zoneinfo",
+ "phf",
+ "phf_codegen",
+]
+
+[[package]]
+name = "chrono-tz-build"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c088aee841df9c3041febbb73934cfc39708749bf96dc827e3359cd39ef11b1"
 dependencies = [
  "parse-zoneinfo",
  "phf",
@@ -1511,7 +1533,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1561,7 +1583,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1581,7 +1603,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "tokio",
 ]
@@ -1589,7 +1611,7 @@ dependencies = [
 [[package]]
 name = "datafusion-execution"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "arrow",
  "chrono",
@@ -1609,7 +1631,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1625,7 +1647,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1644,12 +1666,16 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-array"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "arrow",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
+ "itertools 0.12.1",
  "log",
  "paste",
 ]
@@ -1657,7 +1683,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1674,7 +1700,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1709,7 +1735,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1740,7 +1766,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "arrow",
  "chrono",
@@ -1754,7 +1780,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "36.0.0"
-source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=581e74785b876615d6a63db8c2e5ba372bf78828#581e74785b876615d6a63db8c2e5ba372bf78828"
+source = "git+https://github.com/influxdata/arrow-datafusion.git?rev=c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7#c2c43e1b2f74cfe1a22ea9d73c173215ccb9c3e7"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1762,6 +1788,7 @@ dependencies = [
  "datafusion-expr",
  "log",
  "sqlparser",
+ "strum 0.26.2",
 ]
 
 [[package]]
@@ -2712,7 +2739,7 @@ version = "0.1.0"
 dependencies = [
  "assert_matches",
  "chrono",
- "chrono-tz",
+ "chrono-tz 0.9.0",
  "insta",
  "iox_query_params",
  "nom",
@@ -2810,6 +2837,7 @@ dependencies = [
  "query_functions",
  "serde",
  "snafu 0.8.2",
+ "tokio",
  "tonic",
  "tonic-build",
  "workspace-hack",
@@ -3013,7 +3041,7 @@ dependencies = [
  "arrow",
  "assert_matches",
  "chrono",
- "chrono-tz",
+ "chrono-tz 0.9.0",
  "datafusion",
  "datafusion_util",
  "generated_types",
@@ -6047,9 +6075,9 @@ checksum = "d3543ca0810e71767052bdcdd5653f23998b192642a22c5164bfa6581e40a4a2"
 
 [[package]]
 name = "sysinfo"
-version = "0.30.8"
+version = "0.30.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b1a378e48fb3ce3a5cf04359c456c9c98ff689bcf1c1bc6e6a31f247686f275"
+checksum = "e9a84fe4cfc513b41cb2596b624e561ec9e7e1c4b46328e496ed56a53514ef2a"
 dependencies = [
  "cfg-if",
  "core-foundation-sys",
@@ -7292,7 +7320,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "indexmap 2.2.6",
- "itertools 0.11.0",
+ "itertools 0.12.1",
  "k8s-openapi",
  "kube-core",
  "lalrpop-util",
@@ -7339,6 +7367,7 @@ dependencies = [
  "sqlx-macros-core",
  "sqlx-postgres",
  "sqlx-sqlite",
+ "strum 0.26.2",
  "syn 1.0.109",
  "syn 2.0.58",
  "thrift",

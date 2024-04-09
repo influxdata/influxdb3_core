@@ -16,6 +16,7 @@ use datafusion::{
         ExecutionPlan, PhysicalExpr,
     },
 };
+use datafusion_util::config::table_parquet_options;
 
 use crate::provider::DeduplicateExec;
 
@@ -72,6 +73,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                             child_parquet.base_config().clone(),
                             both,
                             None,
+                            table_parquet_options(),
                         )),
                     )?);
                     return Ok(Transformed::yes(new_node));
@@ -317,6 +319,7 @@ mod tests {
                     base_config,
                     Some(predicate_tag(&schema)),
                     None,
+                    table_parquet_options(),
                 )),
             )
             .unwrap(),

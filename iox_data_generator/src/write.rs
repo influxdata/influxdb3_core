@@ -366,6 +366,7 @@ impl InnerPointsWriter {
 
                     let file = OpenOptions::new()
                         .create(true)
+                        .truncate(true)
                         .write(true)
                         .open(&filename)
                         .context(CantOpenParquetFileSnafu { filename })?;

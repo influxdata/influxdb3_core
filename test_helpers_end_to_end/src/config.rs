@@ -74,7 +74,7 @@ impl TestConfig {
         )
         // also copy a reference to the temp dir, if any, so it isn't
         // deleted too soon
-        .with_catalog_dir(other.catalog_dir.as_ref().map(Arc::clone))
+        .with_catalog_dir(other.catalog_dir.as_ref().cloned())
     }
 
     /// Create new catalog node w/o peers
@@ -221,7 +221,7 @@ impl TestConfig {
             catalog_schema_name: ingester_config.catalog_schema_name.clone(),
             object_store_dir: None,
             wal_dir: None,
-            catalog_dir: ingester_config.catalog_dir.as_ref().map(Arc::clone),
+            catalog_dir: ingester_config.catalog_dir.as_ref().cloned(),
             addrs: Arc::new(BindAddresses::default()),
             wait_for_ready: ingester_config.wait_for_ready,
         }

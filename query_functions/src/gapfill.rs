@@ -23,9 +23,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
-    logical_expr::{
-        BuiltinScalarFunction, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    },
+    logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
     physical_plan::ColumnarValue,
 };
 use once_cell::sync::Lazy;
@@ -79,7 +77,12 @@ impl ScalarUDFImpl for DateBinGapFillUDF {
 pub(crate) static DATE_BIN_GAPFILL: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
     // DATE_BIN_GAPFILL should have the same signature as DATE_BIN,
     // so that just adding _GAPFILL can turn a query into a gap-filling query.
-    let mut signatures = BuiltinScalarFunction::DateBin.signature();
+    let mut signatures = datafusion::functions::datetime::functions()
+        .iter()
+        .find(|fun| fun.name().eq("date_bin"))
+        .expect("should have date_bin UDF")
+        .signature()
+        .to_owned();
     // We don't want this to be optimized away before we can give a helpful error message
     signatures.volatility = Volatility::Volatile;
 

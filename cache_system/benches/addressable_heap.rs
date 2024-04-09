@@ -13,6 +13,7 @@ use rand::{prelude::SliceRandom, thread_rng, Rng};
 /// Payload (`V`) for testing.
 ///
 /// This is a 64bit-wide object which is enough to store a [`Box`] or a [`usize`].
+#[allow(dead_code)] // Never reads inner value
 #[derive(Debug, Clone, Default)]
 struct Payload([u8; 8]);
 

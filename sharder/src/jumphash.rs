@@ -154,7 +154,7 @@ where
     ) -> Self::Item {
         // A delete that does not specify a table is mapped to all shards.
         if table.is_empty() {
-            return self.shards.iter().map(Arc::clone).collect();
+            return self.shards.clone();
         }
 
         // A delete that specifies a table is mapped to the shard responsible

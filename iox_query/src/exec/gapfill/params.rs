@@ -8,7 +8,7 @@ use arrow::{
 use chrono::Duration;
 use datafusion::{
     error::{DataFusionError, Result},
-    physical_expr::datetime_expressions::date_bin,
+    functions::datetime::functions as datafusion_datetime_udfs,
     physical_plan::{expressions::Column, ColumnarValue},
     scalar::ScalarValue,
 };
@@ -75,6 +75,12 @@ impl GapFillParams {
             }
         };
 
+        let date_bin = datafusion_datetime_udfs()
+            .iter()
+            .find(|fun| fun.name().eq("date_bin"))
+            .ok_or(DataFusionError::Execution("no date_bin UDF found".into()))?
+            .to_owned();
+
         // Call date_bin on the timestamps to find the first and last time bins
         // for each series
         let mut args = vec![stride, i64_to_columnar_ts(first_ts)];
@@ -82,10 +88,10 @@ impl GapFillParams {
             args.push(v)
         }
         let first_ts = first_ts
-            .map(|_| extract_timestamp_nanos(&date_bin(&args)?))
+            .map(|_| extract_timestamp_nanos(&date_bin.invoke(&args)?))
             .transpose()?;
         args[1] = i64_to_columnar_ts(Some(last_ts));
-        let last_ts = extract_timestamp_nanos(&date_bin(&args)?)?;
+        let last_ts = extract_timestamp_nanos(&date_bin.invoke(&args)?)?;
 
         let fill_strategy = params
             .fill_strategy

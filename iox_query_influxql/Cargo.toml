@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-chrono-tz = { version = "0.8" }
+chrono-tz = { version = "0.9" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
 generated_types = { path = "../generated_types" }

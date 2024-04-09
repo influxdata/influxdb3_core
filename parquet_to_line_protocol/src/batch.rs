@@ -119,7 +119,9 @@ fn field_values_iter<'a>(
                     LPFieldValue::Boolean(as_boolean_array(arr).value(row_index))
                 }
                 // not a field
-                InfluxColumnType::Tag | InfluxColumnType::Timestamp => return None,
+                InfluxColumnType::Tag
+                | InfluxColumnType::Timestamp
+                | InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => return None,
             };
 
             Some(FieldColumn { name, value })
@@ -153,14 +155,7 @@ fn timestamp_value<'a>(
     let column_index = iox_schema
         .iter()
         .enumerate()
-        .filter_map(move |(column_index, (influx_column_type, _))| {
-            if influx_column_type == InfluxColumnType::Timestamp {
-                Some(column_index)
-            } else {
-                None
-            }
-        })
-        .next()
+        .find_map(|(i, (t, _))| (t == InfluxColumnType::Timestamp).then_some(i))
         .ok_or_else(|| "No timestamp column found in schema".to_string())?;
 
     // timestamps are always TimestampNanosecondArray's and should always have a timestamp value filled in

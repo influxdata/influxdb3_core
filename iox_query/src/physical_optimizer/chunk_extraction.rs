@@ -170,6 +170,7 @@ mod tests {
     use data_types::ChunkId;
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
+        config::TableParquetOptions,
         physical_plan::{expressions::Literal, filter::FilterExec},
         prelude::{col, lit},
         scalar::ScalarValue,
@@ -319,6 +320,7 @@ mod tests {
                         exec.base_config().clone(),
                         Some(Arc::new(Literal::new(ScalarValue::from(false)))),
                         None,
+                        TableParquetOptions::default(),
                     );
                     return Ok(Transformed::yes(Arc::new(exec)));
                 }

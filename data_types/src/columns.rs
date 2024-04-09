@@ -250,6 +250,7 @@ pub enum ColumnType {
     String = 5,
     Time = 6,
     Tag = 7,
+    SeriesId = 8,
 }
 
 impl ColumnType {
@@ -263,6 +264,7 @@ impl ColumnType {
             Self::String => "string",
             Self::Time => "time",
             Self::Tag => "tag",
+            Self::SeriesId => "seriesid",
         }
     }
 }
@@ -307,6 +309,7 @@ impl From<InfluxColumnType> for ColumnType {
             InfluxColumnType::Field(InfluxFieldType::UInteger) => Self::U64,
             InfluxColumnType::Field(InfluxFieldType::String) => Self::String,
             InfluxColumnType::Field(InfluxFieldType::Boolean) => Self::Bool,
+            InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(_)) => Self::SeriesId,
             InfluxColumnType::Timestamp => Self::Time,
         }
     }
@@ -322,6 +325,7 @@ impl From<ColumnType> for InfluxColumnType {
             ColumnType::String => Self::Field(InfluxFieldType::String),
             ColumnType::Time => Self::Timestamp,
             ColumnType::Tag => Self::Tag,
+            ColumnType::SeriesId => Self::Field(InfluxFieldType::FixedSizeBinary(32)),
         }
     }
 }
@@ -336,6 +340,10 @@ impl PartialEq<InfluxColumnType> for ColumnType {
             Self::String => matches!(got, InfluxColumnType::Field(InfluxFieldType::String)),
             Self::Time => matches!(got, InfluxColumnType::Timestamp),
             Self::Tag => matches!(got, InfluxColumnType::Tag),
+            Self::SeriesId => matches!(
+                got,
+                InfluxColumnType::Field(InfluxFieldType::FixedSizeBinary(32))
+            ),
         }
     }
 }
@@ -363,6 +371,7 @@ impl TryFrom<proto::ColumnType> for ColumnType {
             proto::ColumnType::String => Self::String,
             proto::ColumnType::Time => Self::Time,
             proto::ColumnType::Tag => Self::Tag,
+            proto::ColumnType::SeriesId => Self::SeriesId,
             proto::ColumnType::Unspecified => return Err("unknown column type"),
         })
     }
@@ -378,6 +387,7 @@ impl From<ColumnType> for proto::ColumnType {
             ColumnType::String => Self::String,
             ColumnType::Time => Self::Time,
             ColumnType::Tag => Self::Tag,
+            ColumnType::SeriesId => Self::SeriesId,
         }
     }
 }
