@@ -487,16 +487,22 @@ impl Schema {
     /// for what columns to include in the key columns
     pub fn primary_key(&self) -> Vec<&str> {
         use InfluxColumnType::*;
+        let mut has_series_id = false;
         let mut primary_keys: Vec<_> = self
             .iter()
             .filter_map(|(column_type, field)| match column_type {
                 Tag => Some((Tag, field)),
-                // TODO - could series ID be a primary key?
-                SeriesId => None,
+                SeriesId => {
+                    has_series_id = true;
+                    None
+                }
                 Field(_) => None,
                 Timestamp => Some((Timestamp, field)),
             })
             .collect();
+        if has_series_id {
+            return vec![SERIES_ID_COLUMN_NAME, TIME_COLUMN_NAME];
+        }
 
         // Now, sort lexographically (but put timestamp last)
         primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
