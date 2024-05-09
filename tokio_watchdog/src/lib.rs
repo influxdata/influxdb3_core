@@ -7,7 +7,10 @@ use observability_deps::tracing::{debug, warn};
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use std::time::{Duration, Instant};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 use metric::{DurationHistogram, Registry, U64Counter};
 use tokio::{
@@ -20,7 +23,7 @@ use tokio::{
 pub struct WatchdogConfig<'a> {
     handle: &'a Handle,
     metric_registry: &'a Registry,
-    runtime_name: &'static str,
+    runtime_name: String,
     tick_duration: Duration,
     warn_threshold: Duration,
     new_thread_hook: Option<Box<dyn FnOnce() + Send>>,
@@ -33,7 +36,7 @@ impl<'a> WatchdogConfig<'a> {
         Self {
             handle,
             metric_registry,
-            runtime_name: "tokio",
+            runtime_name: "tokio".to_owned(),
             tick_duration: Duration::from_millis(100),
             warn_threshold: Duration::from_millis(100),
             new_thread_hook: None,
@@ -42,9 +45,9 @@ impl<'a> WatchdogConfig<'a> {
 
     /// Set runtime name.
     #[must_use]
-    pub fn with_runtime_name(self, name: &'static str) -> Self {
+    pub fn with_runtime_name(self, name: &str) -> Self {
         Self {
-            runtime_name: name,
+            runtime_name: name.to_owned(),
             ..self
         }
     }
@@ -112,13 +115,19 @@ impl<'a> WatchdogConfig<'a> {
                 "tokio_watchdog_response_time",
                 "Response time of the tokio watchdog task",
             )
-            .recorder(&[("runtime", runtime_name)]);
+            .recorder([(
+                "runtime",
+                Cow::<'static, str>::from(runtime_name.to_owned()),
+            )]);
         let metric_hang = metric_registry
             .register_metric::<U64Counter>(
                 "tokio_watchdog_hangs",
                 "Number of hangs detected by the tokio watchdog",
             )
-            .recorder(&[("runtime", runtime_name)]);
+            .recorder([(
+                "runtime",
+                Cow::<'static, str>::from(runtime_name.to_owned()),
+            )]);
 
         handle.spawn(async move {
             loop {

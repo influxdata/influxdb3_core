@@ -1,5 +1,7 @@
+//! Synchronous reader & writer implementations of the IOx WAL.
+
 mod reader;
-pub use reader::{ClosedSegmentFileReader, Error as ReaderError, Result as ReaderResult};
+pub(crate) use reader::{ClosedSegmentReader, Error as ReaderError};
 
 mod writer;
-pub use writer::{Error as WriterError, OpenSegmentFileWriter, Result as WriterResult};
+pub(crate) use writer::{Error as WriterError, OpenSegmentFileWriter};

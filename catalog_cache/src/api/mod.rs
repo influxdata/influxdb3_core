@@ -1,7 +1,7 @@
 //! The remote API for the catalog cache
 
 use crate::CacheKey;
-use hyper::http::HeaderName;
+use hyper::http::{HeaderName, HeaderValue};
 
 pub mod client;
 
@@ -17,6 +17,9 @@ static GENERATION: HeaderName = HeaderName::from_static("x-influx-generation");
 /// The header used to make a conditional get request
 static GENERATION_NOT_MATCH: HeaderName =
     HeaderName::from_static("x-influx-if-generation-not-match");
+
+/// Value of Accept header for v2 list protocol
+static LIST_PROTOCOL_V2: HeaderValue = HeaderValue::from_static("application/x-list-v2");
 
 /// Defines the mapping to HTTP paths for given request types
 #[derive(Debug, Eq, PartialEq)]
@@ -147,11 +150,11 @@ mod tests {
         let returned = client.get(key).await.unwrap().unwrap();
         assert_eq!(v1, returned);
 
-        let err = client.get_if_modified(key, Some(2)).await.unwrap_err();
-        assert!(matches!(err, Error::NotModified), "{err}");
+        let r = client.get_if_modified(key, Some(2), None).await;
+        assert!(matches!(r, Err(Error::NotModified)), "{r:?}");
 
-        let returned = client.get_if_modified(key, Some(1)).await.unwrap().unwrap();
-        assert_eq!(v1, returned);
+        let returned = client.get_if_modified(key, Some(1), None).await;
+        assert_eq!(v1, returned.unwrap().unwrap());
 
         let v3 = CacheValue::new("3".into(), 3);
         assert!(client.put(key, &v3).await.unwrap());
@@ -167,6 +170,19 @@ mod tests {
 
         let expected = vec![ListEntry::new(key, v3), ListEntry::new(key2, v1)];
         assert_eq!(result, expected);
+
+        let key = CacheKey::Partition(2);
+        let value = CacheValue::new("foo".into(), 0).with_etag("1");
+        assert!(client.put(key, &value).await.unwrap());
+
+        let r = client.get_if_modified(key, Some(0), Some("1".into())).await;
+        assert!(matches!(r, Err(Error::NotModified)), "{r:?}");
+
+        let r = client.get_if_modified(key, Some(1), Some("1".into())).await;
+        assert!(matches!(r, Err(Error::NotModified)), "{r:?}");
+
+        let r = client.get_if_modified(key, None, Some("1".into())).await;
+        assert!(matches!(r, Err(Error::NotModified)), "{r:?}");
 
         serve.shutdown().await;
     }

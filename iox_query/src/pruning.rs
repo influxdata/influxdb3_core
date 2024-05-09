@@ -199,13 +199,13 @@ impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let data_type = self.column_type(column)?;
         let summaries = self.column_summaries(column);
-        collect_pruning_stats(data_type, summaries, Aggregate::Min)
+        collect_pruning_stats(&column.name, data_type, summaries, Aggregate::Min)
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
         let data_type = self.column_type(column)?;
         let summaries = self.column_summaries(column);
-        collect_pruning_stats(data_type, summaries, Aggregate::Max)
+        collect_pruning_stats(&column.name, data_type, summaries, Aggregate::Max)
     }
 
     fn num_containers(&self) -> usize {
@@ -219,6 +219,19 @@ impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
             .map(|x| x.map(|x| *x as u64));
 
         Some(Arc::new(UInt64Array::from_iter(null_counts)))
+    }
+
+    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        let row_counts = self
+            .summaries
+            .iter()
+            .map(|summary| match summary.stats.num_rows {
+                datafusion::common::stats::Precision::Absent => None,
+                datafusion::common::stats::Precision::Inexact(rows) => Some(rows as u64),
+                datafusion::common::stats::Precision::Exact(rows) => Some(rows as u64),
+            });
+
+        Some(Arc::new(UInt64Array::from_iter(row_counts)))
     }
 
     fn contained(&self, column: &Column, values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
@@ -237,18 +250,26 @@ impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
 /// Collects an [`ArrayRef`] containing the aggregate statistic corresponding to
 /// `aggregate` for each of the provided [`Statistics`]
 fn collect_pruning_stats<'a>(
+    column_name: &str,
     data_type: &DataType,
     statistics: impl Iterator<Item = Option<&'a ColumnStatistics>>,
     aggregate: Aggregate,
 ) -> Option<ArrayRef> {
     let null = ScalarValue::try_from(data_type).ok()?;
 
-    ScalarValue::iter_to_array(statistics.map(|stats| {
+    let stats = ScalarValue::iter_to_array(statistics.map(|stats| {
         stats
             .and_then(|stats| get_aggregate(stats, aggregate).cloned())
             .unwrap_or_else(|| null.clone())
-    }))
-    .ok()
+    }));
+
+    if let Err(e) = &stats {
+        warn!(%e, %column_name, "Failed to create pruning stats");
+    }
+    // Ignore the error and return None to allow the query to proceed (though pruning may be
+    // less effective as it won't have access to these statistics)
+
+    stats.ok()
 }
 
 /// Returns the aggregate statistic corresponding to `aggregate` from `stats`
@@ -673,6 +694,78 @@ mod test {
     }
 
     #[test]
+    fn test_pruned_is_not_null() {
+        test_helpers::maybe_start_logging();
+
+        // Initialise statistics that represent three partitions:
+        //
+        //   - my_tag=A (with no NULL values)
+        //   - my_tag=<NULL>
+        //   - my_tag=B (with 1 NULL value)
+        //
+        // The pruning predicate is `my_tag IS NOT NULL`.
+
+        let partitions: [Arc<dyn QueryChunk>; 3] = [
+            // Statistics for the my_tag=A partition.
+            //
+            // No nulls, so can't prune
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("A"),
+                    Some("A"),
+                    100,
+                    None,
+                    0,
+                ),
+            ),
+            // Statistics for the "my_tag=NULL" partition.
+            //
+            // It necessarily contains only NULL values (in this case, 10 rows with 10 nulls).
+            // All nulls, should be pruned
+            Arc::new(
+                TestChunk::new("bananas_table")
+                    .with_tag_column_with_nulls_and_full_stats("my_tag", None, None, 10, None, 10),
+            ),
+            // Statistics for the my_tag=B partition
+            //
+            // Has a single NULL value, but not all the values are NULL, so can't prune
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("B"),
+                    Some("B"),
+                    100,
+                    None,
+                    1,
+                ),
+            ),
+        ];
+
+        // Convert the chunks into pruning statistics.
+        let summaries = partitions
+            .iter()
+            .map(|c| Summary {
+                stats: c.stats(),
+                schema_ref: c.schema().as_arrow(),
+                pruning_oracle: None,
+            })
+            .collect::<Vec<_>>();
+
+        let table_schema = merge_schema(&partitions);
+        let pruning_stats = ChunkPruningStatistics::new(&table_schema, &summaries);
+
+        // Construct a predicate that should filter out all partitions except
+        // "my_tag=NULL".
+        let expr = col("my_tag").is_not_null();
+
+        let got = prune_summaries(pruning_stats, &expr).unwrap();
+
+        // Only the second partition should be pruned out.
+        assert_eq!(got.as_slice(), [true, false, true]);
+    }
+
+    #[test]
     fn test_pruned_multi_column() {
         test_helpers::maybe_start_logging();
         // column1 > 100 AND column2 < 5 where
@@ -903,5 +996,161 @@ mod test {
             &filter,
         );
         assert_eq!(result.expect("pruning succeeds"), vec![true]);
+    }
+
+    /// This test simulates a table with a tag-based partition template:
+    ///
+    /// ```
+    /// TagValue("my_tag")
+    /// ```
+    ///
+    /// Such that partitions are created for each distinct value of "my_tag".
+    ///
+    /// When these partitions are pruned with a predicate of "my_tag=A", only
+    /// one partition can be part of the result set, and the pruner can / should
+    /// determine that only this one partition (the one that contains my_tag=A
+    /// values) should be considered, discarding any others.
+    ///
+    /// Unfortunately this doesn't happen if a partition exists for
+    /// "my_tag=NULL".
+    #[test]
+    fn test_tag_partitioning_with_one_partition_value_null() {
+        // When one partition has a NULL value, the pruning doesn't work as
+        // expected.
+        //
+        // Initialise statistics that represent three partitions:
+        //
+        //   - my_tag=A
+        //   - my_tag=<NULL>
+        //   - my_tag=B
+        //
+        // Then query with a predicate of my_tag=A below.
+        //
+        // The pruning should only return the first partition, but it returns
+        // all three.
+        let partitions: [Arc<dyn QueryChunk>; 3] = [
+            // Statistics for the my_tag=A partition
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("A"),
+                    Some("A"),
+                    100,
+                    None,
+                    0,
+                ),
+            ),
+            // These statistics are for the "my_tag=NULL" partition.
+            //
+            // It necessarily contains only NULL values (in this case, 1 row).
+            Arc::new(
+                TestChunk::new("bananas_table")
+                    .with_tag_column_with_nulls_and_full_stats("my_tag", None, None, 1, None, 1),
+            ),
+            // Statistics for the my_tag=B partition
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("B"),
+                    Some("B"),
+                    100,
+                    None,
+                    0,
+                ),
+            ),
+        ];
+
+        // Convert the chunks into pruning statistics.
+        let summaries = partitions
+            .iter()
+            .map(|c| Summary {
+                stats: c.stats(),
+                schema_ref: c.schema().as_arrow(),
+                pruning_oracle: None,
+            })
+            .collect::<Vec<_>>();
+
+        let table_schema = merge_schema(&partitions);
+        let pruning_stats = ChunkPruningStatistics::new(&table_schema, &summaries);
+
+        // Construct a predicate that should filter out all partitions except
+        // "my_tag=A".
+        let expr = col("my_tag").eq(lit_dict("A"));
+
+        let got = prune_summaries(pruning_stats, &expr).unwrap();
+
+        // Only the first partition should be returned.
+        //
+        // BUG: this should be `[true, false, false]`, meaning only the one
+        // partition my_tag=A is relevant, not my_tag=B.
+        //
+        // See https://github.com/influxdata/influxdb_iox/issues/10826 /
+        // https://github.com/apache/arrow-datafusion/issues/7869
+        assert_eq!(got.as_slice(), [true, false, true]);
+
+        // When all the partitions has values, i.e. no NULL values, the pruning
+        // works as expected.
+        //
+        // Initialise statistics that represent three partitions:
+        //
+        //   - my_tag=A
+        //   - my_tag=B
+        //   - my_tag=C
+        //
+        // Then query with a predicate of my_tag=A below.
+        let partitions: [Arc<dyn QueryChunk>; 3] = [
+            // Statistics for the my_tag=A partition
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("A"),
+                    Some("A"),
+                    100,
+                    None,
+                    0,
+                ),
+            ),
+            // Statistics for the my_tag=B partition
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("B"),
+                    Some("B"),
+                    100,
+                    None,
+                    0,
+                ),
+            ),
+            // Statistics for the my_tag=C partition
+            Arc::new(
+                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
+                    "my_tag",
+                    Some("C"),
+                    Some("C"),
+                    100,
+                    None,
+                    0,
+                ),
+            ),
+        ];
+
+        // Convert the chunks into pruning statistics.
+        let summaries = partitions
+            .iter()
+            .map(|c| Summary {
+                stats: c.stats(),
+                schema_ref: c.schema().as_arrow(),
+                pruning_oracle: None,
+            })
+            .collect::<Vec<_>>();
+
+        let table_schema = merge_schema(&partitions);
+        let pruning_stats = ChunkPruningStatistics::new(&table_schema, &summaries);
+
+        let expr = col("my_tag").eq(lit_dict("A"));
+
+        let got = prune_summaries(pruning_stats, &expr).unwrap();
+
+        assert_eq!(got.as_slice(), [true, false, false]);
     }
 }

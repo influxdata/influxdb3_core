@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Once},
 };
 pub use tempfile;
+pub mod prometheus;
 pub mod timeout;
 pub mod tracing;
 

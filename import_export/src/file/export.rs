@@ -8,7 +8,10 @@ use influxdb_iox_client::{
     connection::Connection,
     store, table,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -56,19 +59,42 @@ impl RemoteExporter {
     /// If `output_directory` is specified, all files are written
     /// there otherwise files are exported to a directory named
     /// `table_name`.
+    ///
+    /// If the `file_uuids` are specified, then only a subset of parquet files
+    /// will be downloaded for the table. Otherwise, it downloads all
+    /// files within the table.
     pub async fn export_table(
         &mut self,
         output_directory: Option<PathBuf>,
         namespace_name: String,
         table_name: String,
+        file_uuids: Option<Vec<String>>,
     ) -> Result<()> {
         let output_directory = output_directory.unwrap_or_else(|| PathBuf::from(&table_name));
         fs::create_dir_all(&output_directory).await?;
 
-        let parquet_files = self
+        let parquet_files_in_table = self
             .catalog_client
             .get_parquet_files_by_namespace_table(&namespace_name, &table_name)
             .await?;
+
+        let parquet_files = if let Some(file_uuids) = file_uuids {
+            let files_to_collect = HashSet::<String>::from_iter(file_uuids.into_iter());
+            let parquet_files = parquet_files_in_table
+                .into_iter()
+                .filter(|pf| files_to_collect.contains(&pf.object_store_id))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                files_to_collect.len(),
+                parquet_files.len(),
+                "The provided uuids do not all exist within the table {}",
+                table_name
+            );
+            parquet_files
+        } else {
+            parquet_files_in_table
+        };
 
         // Export the metadata for the table. Since all
         // parquet_files are part of the same table, use the table_id
@@ -133,6 +159,15 @@ impl RemoteExporter {
             let file_path = output_directory.join(&filename);
             write_string_to_file(&partition_json, &file_path).await?;
         }
+
+        let columns = self
+            .catalog_client
+            .get_columns_by_table_id(table_id)
+            .await?;
+        let table_columns_json = serde_json::to_string_pretty(&columns)?;
+        let filename = format!("columns.{table_id}.json");
+        let file_path = output_directory.join(&filename);
+        write_string_to_file(&table_columns_json, &file_path).await?;
 
         Ok(())
     }

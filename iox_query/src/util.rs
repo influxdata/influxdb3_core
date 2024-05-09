@@ -114,7 +114,7 @@ pub fn df_physical_expr(
 
     // apply type coercion here to ensure types match
     trace!(%df_schema, "input schema");
-    let expr = simplifier.coerce(expr, Arc::clone(&df_schema))?;
+    let expr = simplifier.coerce(expr, &df_schema)?;
     trace!(%expr, "coerced logical expression");
 
     create_physical_expr(&expr, df_schema.as_ref(), &props)

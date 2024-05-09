@@ -16,16 +16,7 @@ use workspace_hack as _;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pin_project::{pin_project, pinned_drop};
-use std::{
-    num::NonZeroUsize,
-    panic::AssertUnwindSafe,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::oneshot::{error::RecvError, Receiver};
 use tokio_util::sync::CancellationToken;
 
@@ -75,21 +66,10 @@ pub enum JobError {
 /// Dropping the job will cancel its linked task.
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
-pub struct Job<T> {
+struct Job<T> {
     cancel: CancellationToken,
-    detached: bool,
     #[pin]
     rx: Receiver<Result<T, JobError>>,
-}
-
-impl<T> Job<T> {
-    /// Detached job so dropping it does not cancel it.
-    ///
-    /// You must ensure that this task eventually finishes, otherwise [`DedicatedExecutor::join`] may never return!
-    pub fn detach(mut self) {
-        // cannot destructure `Self` because we implement `Drop`, so we use a flag instead to prevent cancellation.
-        self.detached = true;
-    }
 }
 
 impl<T> Future for Job<T> {
@@ -110,9 +90,7 @@ impl<T> Future for Job<T> {
 #[pinned_drop]
 impl<T> PinnedDrop for Job<T> {
     fn drop(self: Pin<&mut Self>) {
-        if !self.detached {
-            self.cancel.cancel();
-        }
+        self.cancel.cancel();
     }
 }
 
@@ -121,9 +99,6 @@ impl<T> PinnedDrop for Job<T> {
 #[derive(Clone)]
 pub struct DedicatedExecutor {
     state: Arc<Mutex<State>>,
-
-    /// Number of threads
-    num_threads: NonZeroUsize,
 
     /// Used for testing.
     ///
@@ -169,9 +144,6 @@ impl Drop for State {
     }
 }
 
-/// The default worker priority (value passed to `libc::setpriority`);
-const WORKER_PRIORITY: i32 = 10;
-
 impl std::fmt::Debug for DedicatedExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid taking the mutex in debug formatting
@@ -181,9 +153,12 @@ impl std::fmt::Debug for DedicatedExecutor {
 
 /// [`DedicatedExecutor`] for testing purposes.
 static TESTING_EXECUTOR: Lazy<DedicatedExecutor> = Lazy::new(|| {
+    let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
+    runtime_builder.enable_all();
+
     DedicatedExecutor::new_inner(
         "testing",
-        NonZeroUsize::new(1).unwrap(),
+        runtime_builder,
         Arc::new(Registry::default()),
         true,
     )
@@ -207,49 +182,37 @@ impl DedicatedExecutor {
     /// happens when a runtime is dropped from within an asynchronous
     /// context.', .../tokio-1.4.0/src/runtime/blocking/shutdown.rs:51:21
     pub fn new(
-        thread_name: &'static str,
-        num_threads: NonZeroUsize,
+        name: &str,
+        runtime_builder: tokio::runtime::Builder,
         metric_registry: Arc<Registry>,
     ) -> Self {
-        Self::new_inner(thread_name, num_threads, metric_registry, false)
+        Self::new_inner(name, runtime_builder, metric_registry, false)
     }
 
     fn new_inner(
-        thread_name: &'static str,
-        num_threads: NonZeroUsize,
+        name: &str,
+        runtime_builder: tokio::runtime::Builder,
         metric_registry: Arc<Registry>,
         testing: bool,
     ) -> Self {
-        let thread_counter = Arc::new(AtomicUsize::new(1));
-
+        let name = name.to_owned();
         let (tx_tasks, mut rx_tasks) = tokio::sync::mpsc::unbounded_channel::<Task>();
         let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel();
 
         let thread = std::thread::Builder::new()
-            .name(format!("{thread_name} driver"))
+            .name(format!("{name} driver"))
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_name_fn(move || {
-                        format!(
-                            "{} {}",
-                            thread_name,
-                            thread_counter.fetch_add(1, Ordering::SeqCst)
-                        )
-                    })
-                    .worker_threads(num_threads.get())
-                    .on_thread_start(move || set_current_thread_priority(WORKER_PRIORITY))
-                    .build()
-                    .expect("Creating tokio runtime");
+                let mut runtime_builder = runtime_builder;
+                let runtime = runtime_builder.build().expect("Creating tokio runtime");
 
                 WatchdogConfig::new(runtime.handle(), &metric_registry)
-                    .with_runtime_name(thread_name)
+                    .with_runtime_name(&name)
                     .with_tick_duration(Duration::from_millis(100))
                     .with_warn_duration(Duration::from_millis(100))
                     .install();
 
                 #[cfg(tokio_unstable)]
-                setup_tokio_metrics(runtime.metrics(), thread_name, metric_registry);
+                setup_tokio_metrics(runtime.metrics(), &name, metric_registry);
                 #[cfg(not(tokio_unstable))]
                 let _ = metric_registry;
 
@@ -287,7 +250,6 @@ impl DedicatedExecutor {
 
         Self {
             state: Arc::new(Mutex::new(state)),
-            num_threads,
             testing,
         }
     }
@@ -299,17 +261,12 @@ impl DedicatedExecutor {
         TESTING_EXECUTOR.clone()
     }
 
-    /// Number of threads that back this executor.
-    pub fn num_threads(&self) -> NonZeroUsize {
-        self.num_threads
-    }
-
     /// Runs the specified Future (and any tasks it spawns) on the
     /// `DedicatedExecutor`.
     ///
     /// Currently all tasks are added to the tokio executor
     /// immediately and compete for the threadpool's resources.
-    pub fn spawn<T>(&self, task: T) -> Job<T::Output>
+    pub fn spawn<T>(&self, task: T) -> impl Future<Output = Result<T::Output, JobError>>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
@@ -348,15 +305,12 @@ impl DedicatedExecutor {
             warn!("tried to schedule task on an executor that was shutdown");
         }
 
-        Job {
-            rx,
-            cancel,
-            detached: false,
-        }
+        Job { rx, cancel }
     }
 
     /// Number of currently active tasks.
-    pub fn tasks(&self) -> usize {
+    #[cfg(test)]
+    fn tasks(&self) -> usize {
         let state = self.state.lock();
 
         // the strong count is always `1 + jobs` because of the Arc we hold within Self
@@ -406,18 +360,6 @@ impl DedicatedExecutor {
     }
 }
 
-#[cfg(unix)]
-fn set_current_thread_priority(prio: i32) {
-    // on linux setpriority sets the current thread's priority
-    // (as opposed to the current process).
-    unsafe { libc::setpriority(0, 0, prio) };
-}
-
-#[cfg(not(unix))]
-fn set_current_thread_priority(prio: i32) {
-    warn!("Setting worker thread priority not supported on this platform");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,18 +369,6 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::Barrier as AsyncBarrier;
-
-    #[cfg(unix)]
-    fn get_current_thread_priority() -> i32 {
-        // on linux setpriority sets the current thread's priority
-        // (as opposed to the current process).
-        unsafe { libc::getpriority(0, 0) }
-    }
-
-    #[cfg(not(unix))]
-    fn get_current_thread_priority() -> i32 {
-        WORKER_PRIORITY
-    }
 
     #[tokio::test]
     async fn basic() {
@@ -523,17 +453,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_priority() {
-        let exec = exec2();
-
-        let dedicated_task = exec.spawn(async move { get_current_thread_priority() });
-
-        assert_eq!(dedicated_task.await.unwrap(), WORKER_PRIORITY);
-
-        exec.join().await;
-    }
-
-    #[tokio::test]
     async fn tokio_spawn() {
         let exec = exec2();
 
@@ -541,17 +460,7 @@ mod tests {
         // executor
         let dedicated_task = exec.spawn(async move {
             // spawn separate tasks
-            let t1 = tokio::task::spawn(async {
-                let thread = std::thread::current();
-                let tname = thread.name().expect("thread is named");
-
-                assert!(
-                    tname.starts_with("Test DedicatedExecutor"),
-                    "Invalid thread name: {tname}",
-                );
-
-                25usize
-            });
+            let t1 = tokio::task::spawn(async { 25usize });
             t1.await.unwrap()
         });
 
@@ -733,38 +642,6 @@ mod tests {
         exec.join().await;
     }
 
-    #[tokio::test]
-    async fn detach_receiver() {
-        // create empty executor
-        let exec = exec();
-        assert_eq!(exec.tasks(), 0);
-
-        // create first task
-        // `detach()` consumes the task but doesn't abort the task (in contrast to `drop`). We'll proof the that the
-        // task is still running by linking it to a 2nd task using a barrier with size 3 (two tasks plus the main thread).
-        let barrier = Arc::new(AsyncBarrier::new(3));
-        let dedicated_task = exec.spawn(do_work_async(11, Arc::clone(&barrier)));
-        dedicated_task.detach();
-        assert_eq!(exec.tasks(), 1);
-
-        // create second task
-        let dedicated_task = exec.spawn(do_work_async(22, Arc::clone(&barrier)));
-        assert_eq!(exec.tasks(), 2);
-
-        // wait a bit just to make sure that our tasks doesn't get dropped
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(exec.tasks(), 2);
-
-        // tasks should be unblocked because they both wait on the same barrier
-        // unblock tasks
-        barrier.wait().await;
-        wait_for_tasks(&exec, 0).await;
-        let result = dedicated_task.await.unwrap();
-        assert_eq!(result, 22);
-
-        exec.join().await;
-    }
-
     /// Wait for the barrier and then return `result`
     async fn do_work(result: usize, barrier: Arc<Barrier>) -> usize {
         barrier.wait();
@@ -800,9 +677,13 @@ mod tests {
     }
 
     fn exec_with_threads(threads: usize) -> DedicatedExecutor {
+        let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        runtime_builder.worker_threads(threads);
+        runtime_builder.enable_all();
+
         DedicatedExecutor::new(
             "Test DedicatedExecutor",
-            NonZeroUsize::new(threads).unwrap(),
+            runtime_builder,
             Arc::new(Registry::default()),
         )
     }

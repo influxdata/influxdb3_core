@@ -99,12 +99,12 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::sync::OnceLock;
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
     error::Result as DataFusionResult,
-    logical_expr::{Signature, Volatility},
-    physical_plan::{udaf::AggregateUDF, Accumulator},
+    logical_expr::{function::AccumulatorArgs, AggregateUDF, Signature, Volatility},
+    physical_plan::{expressions::format_state_name, Accumulator},
     prelude::SessionContext,
 };
 
@@ -261,8 +261,8 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
         Ok(AggType::try_from_arg_types(arg_types, &self.name)?.return_type())
     }
 
-    fn accumulator(&self, arg: &DataType) -> DataFusionResult<Box<dyn Accumulator>> {
-        let agg_type = AggType::try_from_return_type(arg)?;
+    fn accumulator(&self, arg: AccumulatorArgs<'_>) -> DataFusionResult<Box<dyn Accumulator>> {
+        let agg_type = AggType::try_from_return_type(arg.data_type)?;
         let value_type = agg_type.value_type;
         let timezone = match agg_type.time_type {
             DataType::Timestamp(_, tz) => tz.clone(),
@@ -303,8 +303,22 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
         Ok(accumulator)
     }
 
-    fn state_type(&self, return_type: &DataType) -> DataFusionResult<Vec<DataType>> {
-        Ok(AggType::try_from_return_type(return_type)?.state_datatypes())
+    fn state_fields(
+        &self,
+        name: &str,
+        value_type: DataType,
+        _ordering_fields: Vec<arrow::datatypes::Field>,
+    ) -> DataFusionResult<Vec<arrow::datatypes::Field>> {
+        let fields = AggType::try_from_return_type(&value_type)?
+            .state_datatypes()
+            .into_iter()
+            .enumerate()
+            .map(|(i, data_type)| {
+                Field::new(format_state_name(name, &format!("{i}")), data_type, true)
+            })
+            .collect::<Vec<_>>();
+
+        Ok(fields)
     }
 }
 

@@ -20,6 +20,7 @@ service CatalogService {
   rpc NamespaceUpdateTableLimit(NamespaceUpdateTableLimitRequest) returns (NamespaceUpdateTableLimitResponse);
   rpc NamespaceUpdateColumnLimit(NamespaceUpdateColumnLimitRequest) returns (NamespaceUpdateColumnLimitResponse);
   rpc NamespaceSnapshot(NamespaceSnapshotRequest) returns (NamespaceSnapshotResponse);
+  rpc NamespaceSnapshotByName(NamespaceSnapshotByNameRequest) returns (NamespaceSnapshotByNameResponse);
 
   rpc TableCreate(TableCreateRequest) returns (TableCreateResponse);
   rpc TableGetById(TableGetByIdRequest) returns (TableGetByIdResponse);
@@ -141,7 +142,16 @@ message NamespaceSnapshotRequest {
   int64 namespace_id = 1;
 }
 
+message NamespaceSnapshotByNameRequest {
+  string name = 1;
+}
+
 message NamespaceSnapshotResponse {
+  catalog_cache.v1.Namespace namespace = 1;
+  uint64 generation = 2;
+}
+
+message NamespaceSnapshotByNameResponse {
   catalog_cache.v1.Namespace namespace = 1;
   uint64 generation = 2;
 }
@@ -495,6 +505,11 @@ message ColumnSet {
   repeated int64 column_ids = 1;
 }
 
+enum ParquetFileSource {
+    PARQUET_FILE_SOURCE_UNSPECIFIED = 0;
+    PARQUET_FILE_SOURCE_BULK_INGEST = 1;
+}
+
 message ParquetFileParams {
   int64 namespace_id = 1;
   int64 table_id = 2;
@@ -509,6 +524,7 @@ message ParquetFileParams {
   int64 created_at = 11;
   ColumnSet column_set = 12;
   int64 max_l0_created_at = 13;
+  ParquetFileSource source = 14;
 }
 
 message ParquetFile {
@@ -529,4 +545,5 @@ message ParquetFile {
   int64 created_at = 12;
   ColumnSet column_set = 13;
   int64 max_l0_created_at = 14;
+  ParquetFileSource source = 17;
 }

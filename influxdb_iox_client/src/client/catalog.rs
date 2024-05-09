@@ -50,6 +50,16 @@ impl Client {
         Ok(response.into_inner().partitions)
     }
 
+    /// Get the columns by table id
+    pub async fn get_columns_by_table_id(&mut self, table_id: i64) -> Result<Vec<Column>, Error> {
+        let response = self
+            .inner
+            .get_columns_by_table_id(GetColumnsByTableIdRequest { table_id })
+            .await?;
+
+        Ok(response.into_inner().columns)
+    }
+
     /// Get the Parquet file records by their namespace and table names
     pub async fn get_parquet_files_by_namespace_table(
         &mut self,

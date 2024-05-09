@@ -38,6 +38,7 @@ impl ParquetFileBuilder {
                 created_at: Timestamp::new(0),
                 column_set: ColumnSet::new(vec![]),
                 max_l0_created_at: Timestamp::new(0),
+                source: None,
             },
         }
     }
@@ -125,6 +126,7 @@ impl ParquetFileBuilder {
             created_at: self.file.created_at,
             column_set: self.file.column_set,
             max_l0_created_at: self.file.max_l0_created_at,
+            source: self.file.source,
         };
         (params, file)
     }

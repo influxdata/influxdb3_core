@@ -1,6 +1,7 @@
 //! This module implements an in-memory implementation of the iox_catalog interface. It can be
 //! used for testing or for an IOx designed to run without catalog persistence.
 
+use crate::interface::namespace_snapshot_by_name;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
@@ -9,7 +10,7 @@ use crate::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
         PartitionRepo, RepoCollection, Result, RootRepo, SoftDeletedRows, TableRepo,
     },
-    metrics::MetricDecorator,
+    metrics::CatalogMetrics,
 };
 use async_trait::async_trait;
 use data_types::snapshot::{root::RootSnapshot, table::TableSnapshot};
@@ -31,7 +32,7 @@ use parking_lot::Mutex;
 use snafu::ensure;
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Display, Formatter},
+    fmt::Formatter,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -40,16 +41,18 @@ use trace::ctx::SpanContext;
 /// In-memory catalog that implements the `RepoCollection` and individual repo traits from
 /// the catalog interface.
 pub struct MemCatalog {
-    metrics: Arc<metric::Registry>,
+    metrics: CatalogMetrics,
     collections: Arc<Mutex<MemCollections>>,
     time_provider: Arc<dyn TimeProvider>,
 }
 
 impl MemCatalog {
+    const NAME: &'static str = "memory";
+
     /// return new initialized [`MemCatalog`]
     pub fn new(metrics: Arc<metric::Registry>, time_provider: Arc<dyn TimeProvider>) -> Self {
         Self {
-            metrics,
+            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             collections: Default::default(),
             time_provider,
         }
@@ -131,12 +134,6 @@ pub struct MemTxn {
     time_provider: Arc<dyn TimeProvider>,
 }
 
-impl Display for MemCatalog {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Memory")
-    }
-}
-
 #[async_trait]
 impl Catalog for MemCatalog {
     async fn setup(&self) -> Result<(), Error> {
@@ -145,20 +142,16 @@ impl Catalog for MemCatalog {
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
         let collections = Arc::clone(&self.collections);
-        Box::new(MetricDecorator::new(
-            Box::new(MemTxn {
-                collections,
-                time_provider: self.time_provider(),
-            }),
-            Arc::clone(&self.metrics),
-            self.time_provider(),
-            "mem",
-        ))
+
+        Box::new(self.metrics.repos(Box::new(MemTxn {
+            collections,
+            time_provider: self.time_provider(),
+        })))
     }
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
-        Arc::clone(&self.metrics)
+        self.metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
@@ -169,6 +162,10 @@ impl Catalog for MemCatalog {
         Err(Error::NotImplemented {
             descr: "active applications".to_owned(),
         })
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
     }
 }
 
@@ -377,6 +374,10 @@ impl NamespaceRepo for MemTxn {
             .map(|x| x.value.clone());
 
         Ok(NamespaceSnapshot::encode(ns, tables, generation)?)
+    }
+
+    async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
+        namespace_snapshot_by_name(self, name).await
     }
 }
 

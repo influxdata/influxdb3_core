@@ -17,7 +17,7 @@ use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams,
-    PartitionId, SortKeyIds, TableId, Timestamp,
+    ParquetFileSource, PartitionId, SortKeyIds, TableId, Timestamp,
 };
 use data_types::{snapshot::partition::PartitionSnapshot, Column, PartitionHashId, PartitionKey};
 use futures::{future::try_join_all, stream::FuturesUnordered, Future, StreamExt};
@@ -558,7 +558,8 @@ where
 
 async fn test_table(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
-    let namespace = arbitrary_namespace(&mut *repos, "namespace_table_test").await;
+    let name = "namespace_table_test";
+    let namespace = arbitrary_namespace(&mut *repos, name).await;
 
     let ts1 = repos.namespaces().snapshot(namespace.id).await.unwrap();
     validate_namespace_snapshot(repos.as_mut(), &ts1).await;
@@ -574,6 +575,13 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
     let ts2 = repos.namespaces().snapshot(namespace.id).await.unwrap();
     validate_namespace_snapshot(repos.as_mut(), &ts2).await;
     assert_gt(ts2.generation(), ts1.generation());
+
+    let ts2_by_name = repos.namespaces().snapshot_by_name(name).await.unwrap();
+    assert_eq!(ts2.namespace().unwrap(), ts2_by_name.namespace().unwrap());
+    assert_ge(ts2_by_name.generation(), ts2.generation());
+
+    let err = repos.namespaces().snapshot_by_name("a").await.unwrap_err();
+    assert_matches!(err, Error::NotFound { .. });
 
     // The default template doesn't use any tag values, so no columns need to be created.
     let table_columns = repos.columns().list_by_table_id(t.id).await.unwrap();
@@ -2291,6 +2299,21 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap_err();
     assert_matches!(err, Error::NotFound { .. });
+
+    // Test that source can be inserted and queried
+    let params_with_source = ParquetFileParams {
+        source: Some(ParquetFileSource::BulkIngest),
+        ..arbitrary_parquet_file_params(&namespace, &table, &partition)
+    };
+    let parquet_file_with_source = repos
+        .parquet_files()
+        .create(params_with_source.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        parquet_file_with_source.source,
+        Some(ParquetFileSource::BulkIngest)
+    );
 }
 
 async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
@@ -3451,12 +3474,6 @@ impl<T: Catalog> TestCatalog<T> {
     }
 }
 
-impl<T: Catalog> Display for TestCatalog<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "test({})", self.inner)
-    }
-}
-
 #[async_trait]
 impl<T: Catalog> Catalog for TestCatalog<T> {
     async fn setup(&self) -> Result<(), Error> {
@@ -3477,6 +3494,10 @@ impl<T: Catalog> Catalog for TestCatalog<T> {
 
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
         self.inner.active_applications().await
+    }
+
+    fn name(&self) -> &'static str {
+        "test"
     }
 }
 

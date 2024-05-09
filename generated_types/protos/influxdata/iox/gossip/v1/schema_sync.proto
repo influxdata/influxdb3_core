@@ -3,6 +3,7 @@ package influxdata.iox.gossip.v1;
 option go_package = "github.com/influxdata/iox/gossip/v1";
 
 import "influxdata/iox/gossip/v1/schema.proto";
+import "influxdata/iox/gossip/v1/namespace.proto";
 
 // An RPC service provided by peers wishing to take part in anti-entropy of
 // their schema caches.

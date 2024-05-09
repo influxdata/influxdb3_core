@@ -91,14 +91,19 @@ pub fn make_window_bound_expr(
         ])
 }
 
-/// Return an [`FunctionRegistry`] with the implementations of IOx UDFs
+/// Return an [`FunctionRegistry`] with the implementations of IOx UDFs and the datafusion-provided UDFs
 pub fn registry() -> &'static dyn FunctionRegistry {
     registry::instance()
 }
 
-/// registers scalar functions so they can be invoked via SQL
-pub fn register_scalar_functions(ctx: &SessionContext) {
-    let registry = registry();
+/// Return an [`FunctionRegistry`] with the implementations of IOx UDFs only
+fn registry_iox_udfs() -> &'static dyn FunctionRegistry {
+    registry::instance_iox()
+}
+
+/// registers iox scalar functions into the [`SessionContext`] so they can be invoked via SQL
+pub fn register_iox_scalar_functions(ctx: &SessionContext) {
+    let registry = registry_iox_udfs();
     for f in registry.udfs() {
         let udf = registry.udf(&f).unwrap();
         ctx.register_udf(udf.as_ref().clone())

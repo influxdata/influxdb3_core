@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
-    logical_expr::{Signature, TypeSignature, Volatility},
-    physical_plan::Accumulator,
+    logical_expr::{function::AccumulatorArgs, Signature, TypeSignature, Volatility},
+    physical_plan::{expressions::format_state_name, Accumulator},
 };
 
 #[derive(Debug)]
@@ -47,12 +47,20 @@ impl AggregateUDFImpl for SpreadUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn accumulator(&self, arg: &DataType) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(SpreadAccumulator::new(arg.clone())?))
+    fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(SpreadAccumulator::new(arg.data_type.clone())?))
     }
 
-    fn state_type(&self, return_type: &DataType) -> Result<Vec<DataType>> {
-        Ok(vec![return_type.clone(), return_type.clone()])
+    fn state_fields(
+        &self,
+        name: &str,
+        value_type: DataType,
+        _ordering_fields: Vec<arrow::datatypes::Field>,
+    ) -> Result<Vec<arrow::datatypes::Field>> {
+        Ok(vec![
+            Field::new(format_state_name(name, "max"), value_type.clone(), true),
+            Field::new(format_state_name(name, "min"), value_type, true),
+        ])
     }
 }
 

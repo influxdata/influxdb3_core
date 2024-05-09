@@ -31,7 +31,6 @@ use crate::{
 use snafu::{ResultExt, Snafu};
 
 mod adapter;
-mod cached_parquet_data;
 mod deduplicate;
 pub mod overlap;
 mod physical;
@@ -299,14 +298,14 @@ impl TableProvider for ChunkTableProvider {
     }
 
     /// Filter pushdown specification
-    fn supports_filter_pushdown(
+    fn supports_filters_pushdown(
         &self,
-        _filter: &Expr,
-    ) -> DataFusionResult<TableProviderFilterPushDown> {
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         if self.deduplication {
-            Ok(TableProviderFilterPushDown::Exact)
+            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
         } else {
-            Ok(TableProviderFilterPushDown::Inexact)
+            Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
         }
     }
 

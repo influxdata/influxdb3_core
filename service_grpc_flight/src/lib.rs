@@ -21,7 +21,7 @@ use arrow_flight::{
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use authz::{extract_token, Authorizer};
 use data_types::NamespaceNameError;
@@ -32,7 +32,7 @@ use generated_types::influxdata::iox::querier::v1 as proto;
 use iox_query::{
     exec::IOxSessionContext,
     query_log::{QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
-    QueryNamespaceProvider,
+    QueryDatabase,
 };
 use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
 use observability_deps::tracing::{debug, info, warn};
@@ -572,31 +572,22 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 /// [Arrow Flight]: https://arrow.apache.org/docs/format/Flight.html
 /// [Arrow FlightSQL]: https://arrow.apache.org/docs/format/FlightSql.html
 #[derive(Debug)]
-struct FlightService<S>
-where
-    S: QueryNamespaceProvider,
-{
-    server: Arc<S>,
+struct FlightService {
+    server: Arc<dyn QueryDatabase>,
     authz: Option<Arc<dyn Authorizer>>,
 }
 
-pub fn make_server<S>(
-    server: Arc<S>,
+pub fn make_server(
+    server: Arc<dyn QueryDatabase>,
     authz: Option<Arc<dyn Authorizer>>,
-) -> FlightServer<impl Flight>
-where
-    S: QueryNamespaceProvider,
-{
+) -> FlightServer<impl Flight> {
     FlightServer::new(FlightService { server, authz })
 }
 
-impl<S> FlightService<S>
-where
-    S: QueryNamespaceProvider,
-{
+impl FlightService {
     /// Implementation of the `DoGet` method
     async fn run_do_get(
-        server: Arc<S>,
+        server: Arc<dyn QueryDatabase>,
         span_ctx: Option<SpanContext>,
         external_span_ctx: Option<RequestLogContext>,
         request: IoxGetRequest,
@@ -612,7 +603,7 @@ where
         let namespace_name = database.as_str();
 
         let db = server
-            .db(
+            .namespace(
                 namespace_name,
                 span_ctx.child_span("get namespace"),
                 is_debug,
@@ -705,10 +696,7 @@ where
 }
 
 #[tonic::async_trait]
-impl<S> Flight for FlightService<S>
-where
-    S: QueryNamespaceProvider,
-{
+impl Flight for FlightService {
     type HandshakeStream = TonicStream<HandshakeResponse>;
     type ListFlightsStream = TonicStream<FlightInfo>;
     type DoGetStream = TonicStream<FlightData>;
@@ -886,7 +874,7 @@ where
 
         let db = self
             .server
-            .db(
+            .namespace(
                 &namespace_name,
                 span_ctx.child_span("get namespace"),
                 is_debug,
@@ -930,6 +918,13 @@ where
         Ok(tonic::Response::new(flight_info))
     }
 
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not yet implemented"))
+    }
+
     async fn do_put(
         &self,
         request: Request<Streaming<FlightData>>,
@@ -966,7 +961,7 @@ where
 
         let db = self
             .server
-            .db(
+            .namespace(
                 &namespace_name,
                 span_ctx.child_span("get namespace"),
                 is_debug,
@@ -1022,7 +1017,7 @@ where
 
         let db = self
             .server
-            .db(
+            .namespace(
                 &namespace_name,
                 span_ctx.child_span("get namespace"),
                 is_debug,
@@ -1190,20 +1185,19 @@ struct GetStream {
     inner: BoxStream<'static, Result<FlightData, FlightError>>,
     permit_state: Arc<Mutex<Option<PermitAndToken>>>,
     done: bool,
+    /// keep ctx because it contains the sticky exec
+    ctx: Option<IOxSessionContext>,
 }
 
 impl GetStream {
-    async fn new<S>(
-        server: Arc<S>,
+    async fn new(
+        server: Arc<dyn QueryDatabase>,
         ctx: IOxSessionContext,
         physical_plan: Arc<dyn ExecutionPlan>,
         namespace_name: String,
         query: &RunQuery,
         query_completed_token: QueryCompletedToken<StatePlanned>,
-    ) -> Result<Self, tonic::Status>
-    where
-        S: QueryNamespaceProvider,
-    {
+    ) -> Result<Self, tonic::Status> {
         let app_metadata = proto::AppMetadata {};
 
         let schema = physical_plan.schema();
@@ -1248,11 +1242,14 @@ impl GetStream {
             inner,
             permit_state,
             done: false,
+            ctx: Some(ctx),
         })
     }
 
     #[must_use]
-    fn finish_stream(&self) -> Option<QueryCompletedToken<StatePermit>> {
+    fn finish_stream(&mut self) -> Option<QueryCompletedToken<StatePermit>> {
+        self.ctx.take();
+
         self.permit_state
             .lock()
             .expect("not poisened")
@@ -1415,7 +1412,7 @@ mod tests {
         test_storage.db_or_create("my_db").await;
 
         let service = FlightService {
-            server: Arc::clone(&test_storage),
+            server: Arc::clone(&test_storage) as _,
             authz: Option::<Arc<dyn Authorizer>>::None,
         };
         let ticket = Ticket {
@@ -1593,15 +1590,11 @@ mod tests {
         test_storage.db_or_create("bananas").await;
 
         let svc = FlightService {
-            server: Arc::clone(&test_storage),
+            server: Arc::clone(&test_storage) as _,
             authz: Some(Arc::new(MockAuthorizer {})),
         };
 
-        async fn assert_code(
-            svc: &FlightService<TestDatabaseStore>,
-            want: tonic::Code,
-            request: tonic::Request<arrow_flight::Ticket>,
-        ) {
+        async fn assert_code(svc: &FlightService, want: tonic::Code, request: Request<Ticket>) {
             let got = match svc.do_get(request).await {
                 Ok(_) => tonic::Code::Ok,
                 Err(e) => e.code(),
@@ -1706,14 +1699,14 @@ mod tests {
         test_storage.db_or_create("bananas").await;
 
         let svc = FlightService {
-            server: Arc::clone(&test_storage),
+            server: Arc::clone(&test_storage) as _,
             authz: Some(Arc::new(MockAuthorizer {})),
         };
 
         async fn assert_code(
-            svc: &FlightService<TestDatabaseStore>,
+            svc: &FlightService,
             want: tonic::Code,
-            request: tonic::Request<FlightDescriptor>,
+            request: Request<FlightDescriptor>,
         ) {
             let got = match svc.get_flight_info(request).await {
                 Ok(_) => tonic::Code::Ok,

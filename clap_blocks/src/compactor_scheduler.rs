@@ -211,7 +211,7 @@ pub struct CompactorSchedulerConfig {
         default_value = "4",
         action
     )]
-    pub min_num_l0_files_to_compact: usize,
+    pub min_num_l0_files_to_compact: u32,
 
     /// Minimum number of L1 files to compact to L2.
     ///
@@ -228,7 +228,35 @@ pub struct CompactorSchedulerConfig {
         default_value = "10",
         action
     )]
-    pub min_num_l1_files_to_compact: usize,
+    pub min_num_l1_files_to_compact: u32,
+
+    /// Minimum number of bytes in L0 files before considering for compaction to L1.
+    ///
+    /// Setting this value higher in general results in fewer overall
+    /// resources spent on compaction but more files per partition (and
+    /// thus less optimal query performance).
+    ///
+    /// File sizes are not considered unless this is set.
+    #[clap(
+        long = "compaction-min-num-l0-bytes-to-compact",
+        env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L0_BYTES_TO_COMPACT",
+        action
+    )]
+    pub min_num_l0_bytes_to_compact: Option<std::num::NonZeroU32>,
+
+    /// Minimum number of bytes in L1 files before considering for compaction to L2.
+    ///
+    /// Setting this value higher in general results in fewer overall
+    /// resources spent on compaction but more files per partition (and
+    /// thus less optimal query performance).
+    ///
+    /// File sizes are not considered unless this is set.
+    #[clap(
+        long = "compaction-min-num-l1-bytes-to-compact",
+        env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_BYTES_TO_COMPACT",
+        action
+    )]
+    pub min_num_l1_bytes_to_compact: Option<std::num::NonZeroU32>,
 
     /// When identifying undersized L2s for recompaction on a hot partition,
     /// if a large window size of files totals less than the per file target size,
@@ -362,6 +390,15 @@ pub struct CompactorSchedulerConfig {
         action
     )]
     pub cold_concurrency: usize,
+
+    /// Maximum duration of the per-partition compaction task in seconds.
+    #[clap(
+        long = "compaction-partition-timeout-secs",
+        env = "INFLUXDB_IOX_COMPACTION_PARTITION_TIMEOUT_SECS",
+        default_value = "1800",
+        action
+    )]
+    pub partition_timeout_secs: u64,
 
     /// Partition source config used by the local scheduler.
     #[clap(flatten)]

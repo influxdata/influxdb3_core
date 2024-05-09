@@ -43,6 +43,7 @@ pub mod statistics;
 pub mod util;
 
 use crate::exec::QueryConfig;
+use crate::query_log::QueryLogEntries;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 /// The name of the virtual column that represents the chunk order.
@@ -148,21 +149,24 @@ pub trait QueryNamespace: Debug + Send + Sync {
 /// virtual set of namespaces.
 ///
 /// This is the only entry point for the query engine. This trait and the traits reachable by it (e.g.
-/// [`QueryNamespace`]) are the only wait to access the catalog and payload data.
+/// [`QueryNamespace`]) are the only way to access the catalog and payload data.
 #[async_trait]
-pub trait QueryNamespaceProvider: std::fmt::Debug + Send + Sync + 'static {
+pub trait QueryDatabase: Debug + Send + Sync + 'static {
     /// Get namespace if it exists.
     ///
     /// System tables may contain debug information depending on `include_debug_info_tables`.
-    async fn db(
+    async fn namespace(
         &self,
         name: &str,
         span: Option<Span>,
         include_debug_info_tables: bool,
     ) -> Result<Option<Arc<dyn QueryNamespace>>, DataFusionError>;
 
-    /// Acquire concurrency-limiting sempahore
+    /// Acquire concurrency-limiting semapahore
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit;
+
+    /// Return the query log entries
+    fn query_log(&self) -> QueryLogEntries;
 }
 
 /// Raw data of a [`QueryChunk`].

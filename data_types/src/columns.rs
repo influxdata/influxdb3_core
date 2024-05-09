@@ -1,7 +1,8 @@
 //! Types having to do with columns.
 
 use super::TableId;
-use generated_types::influxdata::iox::{column_type::v1 as proto, gossip};
+use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+use generated_types::influxdata::iox::{catalog, column_type::v1 as proto, gossip};
 use influxdb_line_protocol::FieldValue;
 use schema::{builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, Schema};
 use snafu::Snafu;
@@ -194,6 +195,31 @@ impl Column {
     }
 }
 
+impl TryFrom<catalog::v1::Column> for Column {
+    type Error = Box<dyn std::error::Error>;
+
+    fn try_from(v: catalog::v1::Column) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: ColumnId::new(v.id),
+            table_id: TableId::new(v.table_id),
+            name: v.name,
+            column_type: ColumnType::try_from(v.column_type as i16)?,
+        })
+    }
+}
+
+impl From<Column> for catalog::v1::Column {
+    fn from(v: Column) -> Self {
+        let column_type: proto::ColumnType = v.column_type.into();
+        Self {
+            id: v.id.get(),
+            table_id: v.table_id.get(),
+            name: v.name,
+            column_type: column_type.into(),
+        }
+    }
+}
+
 /// The column id and its type for a column
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct ColumnSchema {
@@ -219,6 +245,34 @@ impl ColumnSchema {
                 | (FieldValue::String(_), ColumnType::String)
                 | (FieldValue::Boolean(_), ColumnType::Bool)
         )
+    }
+
+    /// returns true if the column matches the Arrow data type
+    pub fn matches_arrow_type(&self, arrow_type: &ArrowDataType) -> bool {
+        match (arrow_type, self.column_type) {
+            (ArrowDataType::Int64, ColumnType::I64)
+            | (ArrowDataType::UInt64, ColumnType::U64)
+            | (ArrowDataType::Float64, ColumnType::F64)
+            | (ArrowDataType::Utf8, ColumnType::String)
+            | (ArrowDataType::Utf8, ColumnType::Tag)
+            | (ArrowDataType::Boolean, ColumnType::Bool)
+            | (ArrowDataType::Timestamp(TimeUnit::Nanosecond, None), ColumnType::Time) => true,
+
+            (ArrowDataType::Dictionary(key_type, value_type), ColumnType::Tag)
+                if key_type.as_ref() == &ArrowDataType::Int32
+                    && value_type.as_ref() == &ArrowDataType::Utf8 =>
+            {
+                true
+            }
+
+            (ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)), ColumnType::Time)
+                if tz.as_ref() == "UTC" =>
+            {
+                true
+            }
+
+            _ => false,
+        }
     }
 
     /// Returns true if `mb_column` is of the same type as `self`.

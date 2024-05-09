@@ -93,14 +93,14 @@ async fn test_parquet_should_not_be_resorted() {
     - "           DeduplicateExec: [tag@1 ASC,time@2 ASC]"
     - "             SortPreservingMergeExec: [tag@1 ASC,time@2 ASC,__chunk_order@0 ASC]"
     - "               UnionExec"
-    - "                 SortExec: expr=[tag@1 ASC,time@2 ASC,__chunk_order@0 ASC]"
+    - "                 SortExec: expr=[tag@1 ASC,time@2 ASC,__chunk_order@0 ASC], preserve_partitioning=[true]"
     - "                   CoalesceBatchesExec: target_batch_size=8192"
     - "                     FilterExec: time@2 > 0 AND time@2 > 2"
     - "                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1"
     - "                         RecordBatchesExec: chunks=1, projection=[__chunk_order, tag, time]"
     - "                 CoalesceBatchesExec: target_batch_size=8192"
     - "                   FilterExec: time@2 > 0 AND time@2 > 2"
-    - "                     ParquetExec: file_groups={16 groups: [[2.parquet:0..125], [3.parquet:0..125], [2.parquet:125..250], [3.parquet:125..250], [2.parquet:250..375], ...]}, projection=[__chunk_order, tag, time], output_ordering=[tag@1 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=time@1 > 0 AND time@1 > 2, pruning_predicate=time_max@0 > 0 AND time_max@0 > 2, required_guarantees=[]"
+    - "                     ParquetExec: file_groups={16 groups: [[2.parquet:0..125], [3.parquet:0..125], [2.parquet:125..250], [3.parquet:125..250], [2.parquet:250..375], ...]}, projection=[__chunk_order, tag, time], output_ordering=[tag@1 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=time@1 > 0 AND time@1 > 2, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END AND CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 2 END, required_guarantees=[]"
     "###
     );
 }
@@ -200,7 +200,7 @@ async fn test_parquet_must_resorted() {
     - "             SortPreservingMergeExec: [tag@3 ASC,time@2 ASC,__chunk_order@0 ASC]"
     - "               CoalesceBatchesExec: target_batch_size=8192"
     - "                 FilterExec: tag@3 > foo AND time@2 > 2"
-    - "                   ParquetExec: file_groups={6 groups: [[1.parquet:0..1], [2.parquet:0..20000000], [2.parquet:20000000..40000000], [2.parquet:40000000..60000000], [2.parquet:60000000..80000000], ...]}, projection=[__chunk_order, field, time, tag], output_ordering=[tag@3 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=tag@1 > foo AND time@2 > 2, pruning_predicate=tag_max@0 > foo AND time_max@1 > 2, required_guarantees=[]"
+    - "                   ParquetExec: file_groups={6 groups: [[1.parquet:0..1], [2.parquet:0..20000000], [2.parquet:20000000..40000000], [2.parquet:40000000..60000000], [2.parquet:60000000..80000000], ...]}, projection=[__chunk_order, field, time, tag], output_ordering=[tag@3 ASC, time@2 ASC, __chunk_order@0 ASC], predicate=tag@1 > foo AND time@2 > 2, pruning_predicate=CASE WHEN tag_null_count@1 = tag_row_count@2 THEN false ELSE tag_max@0 > foo END AND CASE WHEN time_null_count@4 = time_row_count@5 THEN false ELSE time_max@3 > 2 END, required_guarantees=[]"
     "###
     );
 }

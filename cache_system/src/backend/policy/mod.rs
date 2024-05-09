@@ -1668,6 +1668,7 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[allow(dead_code)] // Inner arc never read
     struct DropTester<T>(Arc<()>, T)
     where
         T: Debug + Send + 'static;

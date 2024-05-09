@@ -48,19 +48,21 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) async fn perform(
     catalog: Arc<dyn Catalog>,
     cutoff: Duration,
+    bulk_ingest_cutoff: Duration,
     items: mpsc::Receiver<ObjectMeta>,
     deleter: mpsc::Sender<ObjectMeta>,
 ) -> Result<()> {
     let mut repositories = catalog.repositories();
     let parquet_files = repositories.parquet_files();
 
-    perform_inner(parquet_files, cutoff, items, deleter).await
+    perform_inner(parquet_files, cutoff, bulk_ingest_cutoff, items, deleter).await
 }
 
 /// Allows easier mocking of just `ParquetFileRepo` in tests.
 async fn perform_inner(
     parquet_files: &mut dyn ParquetFileRepo,
     cutoff: Duration,
+    bulk_ingest_cutoff: Duration,
     mut items: mpsc::Receiver<ObjectMeta>,
     deleter: mpsc::Sender<ObjectMeta>,
 ) -> Result<()> {
@@ -84,7 +86,10 @@ async fn perform_inner(
 
         if batch.len() >= CATALOG_BATCH_SIZE || timedout {
             let older_than = chrono::offset::Utc::now() - cutoff;
-            for item in should_delete(batch, older_than, parquet_files).await {
+            let bulk_ingest_older_than = chrono::offset::Utc::now() - bulk_ingest_cutoff;
+            for item in
+                should_delete(batch, older_than, bulk_ingest_older_than, parquet_files).await
+            {
                 deleter.send(item).await.context(DeleterExitedSnafu)?;
             }
             batch = Vec::with_capacity(100);
@@ -104,6 +109,7 @@ async fn perform_inner(
 async fn should_delete(
     items: Vec<ObjectMeta>,
     cutoff: DateTime<Utc>,
+    bulk_ingest_cutoff: DateTime<Utc>,
     parquet_files: &mut dyn ParquetFileRepo,
 ) -> Vec<ObjectMeta> {
     // to_delete is the vector we will return to the caller containing ObjectMeta we think should be deleted.
@@ -114,7 +120,25 @@ async fn should_delete(
     let mut to_check_in_catalog = Vec::with_capacity(items.len());
 
     for candidate in items {
-        if cutoff < candidate.last_modified {
+        if is_bulk_ingest_file(&candidate.location) {
+            if bulk_ingest_cutoff < candidate.last_modified {
+                debug!(
+                    location = %candidate.location,
+                    deleting = false,
+                    reason = "bulk ingest file too new",
+                    %bulk_ingest_cutoff,
+                    last_modified = %candidate.last_modified,
+                    "Ignoring object",
+                );
+                // Not old enough; do not delete
+                continue;
+            } else {
+                // Bulk ingest file is old enough. It won't be in the catalog, so don't check that,
+                // add it to the delete list.
+                to_delete.push(candidate);
+                continue;
+            }
+        } else if cutoff < candidate.last_modified {
             // expected to be a common reason to skip a file
             debug!(
                 location = %candidate.location,
@@ -224,13 +248,29 @@ async fn check_ids_exists_in_catalog(
         .context(FileExistsSnafu)
 }
 
+/// Check if a file's location matches the naming of bulk ingested files and thus the bulk ingest
+/// cutoff should apply rather than the regular cutoff.
+fn is_bulk_ingest_file(location: &object_store::path::Path) -> bool {
+    let mut parts: Vec<_> = location.parts().collect();
+    let filename = parts.pop();
+    let last_directory = parts.pop();
+
+    filename
+        .map(|f| f.as_ref().strip_suffix(".parquet").is_some())
+        .unwrap_or(false)
+        && last_directory
+            .map(|dir| dir.as_ref() == "bulk_ingest")
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use data_types::{
         ColumnId, ColumnSet, CompactionLevel, NamespaceId, ObjectStoreId, ParquetFile,
-        ParquetFileId, ParquetFileParams, PartitionId, TableId, Timestamp, TransitionPartitionId,
+        ParquetFileId, ParquetFileParams, PartitionId, PartitionKey, TableId, Timestamp,
+        TransitionPartitionId,
     };
     use iox_catalog::{
         interface::{Catalog, ParquetFileRepoExt},
@@ -241,6 +281,7 @@ mod tests {
     use object_store::path::Path;
     use once_cell::sync::Lazy;
     use parquet_file::ParquetFilePath;
+    use service_grpc_bulk_ingest::BulkIngestParquetFilePath;
     use std::{assert_eq, vec};
 
     static OLDER_TIME: Lazy<DateTime<Utc>> = Lazy::new(|| {
@@ -255,6 +296,8 @@ mod tests {
             .naive_utc()
             .and_utc()
     });
+    static BETWEEN_TIME: Lazy<DateTime<Utc>> =
+        Lazy::new(|| *OLDER_TIME + (*NEWER_TIME - *OLDER_TIME) / 2);
 
     async fn create_catalog_and_file() -> (Arc<dyn Catalog>, ParquetFile) {
         let metric_registry = Arc::new(metric::Registry::new());
@@ -287,6 +330,7 @@ mod tests {
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
             max_l0_created_at: Timestamp::new(1),
+            source: None,
         };
 
         let parquet_file = repos
@@ -313,6 +357,7 @@ mod tests {
         .object_store_path();
 
         let cutoff = *OLDER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *NEWER_TIME;
 
         let item = ObjectMeta {
@@ -323,7 +368,13 @@ mod tests {
             version: None,
         };
 
-        let results = should_delete(vec![item], cutoff, parquet_files).await;
+        let results = should_delete(
+            vec![item],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 0);
     }
 
@@ -345,6 +396,7 @@ mod tests {
         .object_store_path();
 
         let cutoff = *OLDER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *NEWER_TIME;
 
         let item = ObjectMeta {
@@ -355,7 +407,13 @@ mod tests {
             version: None,
         };
 
-        let results = should_delete(vec![item], cutoff, parquet_files).await;
+        let results = should_delete(
+            vec![item],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 0);
     }
 
@@ -369,6 +427,7 @@ mod tests {
         let parquet_files = repositories.parquet_files();
 
         let cutoff = *OLDER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *NEWER_TIME;
 
         let item = ObjectMeta {
@@ -379,7 +438,13 @@ mod tests {
             version: None,
         };
 
-        let results = should_delete(vec![item], cutoff, parquet_files).await;
+        let results = should_delete(
+            vec![item],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 0);
     }
 
@@ -398,6 +463,7 @@ mod tests {
         .object_store_path();
 
         let cutoff = *NEWER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *OLDER_TIME;
 
         let item = ObjectMeta {
@@ -408,7 +474,13 @@ mod tests {
             version: None,
         };
 
-        let results = should_delete(vec![item], cutoff, parquet_files).await;
+        let results = should_delete(
+            vec![item],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 0);
     }
 
@@ -430,6 +502,7 @@ mod tests {
         .object_store_path();
 
         let cutoff = *NEWER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *OLDER_TIME;
 
         let item = ObjectMeta {
@@ -439,7 +512,13 @@ mod tests {
             e_tag: None,
             version: None,
         };
-        let results = should_delete(vec![item.clone()], cutoff, parquet_files).await;
+        let results = should_delete(
+            vec![item.clone()],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], item);
     }
@@ -454,6 +533,7 @@ mod tests {
         let parquet_files = repositories.parquet_files();
 
         let cutoff = *NEWER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *OLDER_TIME;
 
         let item = ObjectMeta {
@@ -464,7 +544,13 @@ mod tests {
             version: None,
         };
 
-        let results = should_delete(vec![item.clone()], cutoff, parquet_files).await;
+        let results = should_delete(
+            vec![item.clone()],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], item);
     }
@@ -489,6 +575,7 @@ mod tests {
         };
 
         let cutoff = *NEWER_TIME;
+        let arbitrary_bulk_ingest_cutoff = *OLDER_TIME;
         let last_modified = *OLDER_TIME;
 
         let loc = ParquetFilePath::new(
@@ -516,8 +603,89 @@ mod tests {
         assert_eq!(pf, file_in_catalog);
 
         // because of the db error, there should be no results
-        let results = should_delete(vec![item.clone()], cutoff, &mut mocked_parquet_files).await;
+        let results = should_delete(
+            vec![item.clone()],
+            cutoff,
+            arbitrary_bulk_ingest_cutoff,
+            &mut mocked_parquet_files,
+        )
+        .await;
         assert_eq!(results.len(), 0);
+    }
+
+    async fn bulk_ingest_test(
+        cutoff: DateTime<Utc>,
+        bulk_ingest_cutoff: DateTime<Utc>,
+        last_modified: DateTime<Utc>,
+    ) -> Vec<ObjectMeta> {
+        let table_id = TableId::new(2);
+        let location = BulkIngestParquetFilePath::new(
+            NamespaceId::new(1),
+            table_id,
+            &TransitionPartitionId::new(table_id, &PartitionKey::from("2023-04-12")),
+            ObjectStoreId::new(),
+        )
+        .object_store_path()
+        .to_owned();
+
+        // The catalog shouldn't be contacted for bulk ingest files, so use a mock that errors
+        let mut mocked_parquet_files = ErrorParquetFileRepo {};
+
+        let item = ObjectMeta {
+            location,
+            last_modified,
+            size: 0,
+            e_tag: None,
+            version: None,
+        };
+
+        should_delete(
+            vec![item],
+            cutoff,
+            bulk_ingest_cutoff,
+            &mut mocked_parquet_files,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn dont_delete_bulk_ingest_file_newer_than_cutoff_and_newer_than_bulk_ingest_cutoff() {
+        let cutoff = *OLDER_TIME;
+        let bulk_ingest_cutoff = *BETWEEN_TIME;
+        let last_modified = *NEWER_TIME;
+
+        let results = bulk_ingest_test(cutoff, bulk_ingest_cutoff, last_modified).await;
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dont_delete_bulk_ingest_file_older_than_cutoff_and_newer_than_bulk_ingest_cutoff() {
+        let bulk_ingest_cutoff = *OLDER_TIME;
+        let last_modified = *BETWEEN_TIME;
+        let cutoff = *NEWER_TIME;
+
+        let results = bulk_ingest_test(cutoff, bulk_ingest_cutoff, last_modified).await;
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_bulk_ingest_file_newer_than_cutoff_but_older_than_bulk_ingest_cutoff() {
+        let cutoff = *OLDER_TIME;
+        let last_modified = *BETWEEN_TIME;
+        let bulk_ingest_cutoff = *NEWER_TIME;
+
+        let results = bulk_ingest_test(cutoff, bulk_ingest_cutoff, last_modified).await;
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_bulk_ingest_file_older_than_cutoff_and_older_than_bulk_ingest_cutoff() {
+        let last_modified = *OLDER_TIME;
+        let cutoff = *BETWEEN_TIME;
+        let bulk_ingest_cutoff = *NEWER_TIME;
+
+        let results = bulk_ingest_test(cutoff, bulk_ingest_cutoff, last_modified).await;
+        assert_eq!(results.len(), 1);
     }
 
     struct MockParquetFileRepo<'a> {
@@ -575,5 +743,108 @@ mod tests {
             self.create_upgrade_delete(partition_id, delete, upgrade, create, target_level)
                 .await
         }
+    }
+
+    struct ErrorParquetFileRepo {}
+
+    #[async_trait]
+    impl ParquetFileRepo for ErrorParquetFileRepo {
+        async fn flag_for_delete_by_retention(
+            &mut self,
+        ) -> iox_catalog::interface::Result<Vec<(PartitionId, ObjectStoreId)>> {
+            Err(iox_catalog::interface::Error::External {
+                source: String::from("should not have been called").into(),
+            })
+        }
+
+        async fn delete_old_ids_only(
+            &mut self,
+            _older_than: Timestamp,
+        ) -> iox_catalog::interface::Result<Vec<ObjectStoreId>> {
+            Err(iox_catalog::interface::Error::External {
+                source: String::from("should not have been called").into(),
+            })
+        }
+
+        async fn list_by_partition_not_to_delete_batch(
+            &mut self,
+            _partition_ids: Vec<PartitionId>,
+        ) -> iox_catalog::interface::Result<Vec<ParquetFile>> {
+            Err(iox_catalog::interface::Error::External {
+                source: String::from("should not have been called").into(),
+            })
+        }
+
+        async fn get_by_object_store_id(
+            &mut self,
+            _object_store_id: ObjectStoreId,
+        ) -> iox_catalog::interface::Result<Option<ParquetFile>> {
+            Err(iox_catalog::interface::Error::External {
+                source: String::from("should not have been called").into(),
+            })
+        }
+
+        async fn exists_by_object_store_id_batch(
+            &mut self,
+            _object_store_ids: Vec<ObjectStoreId>,
+        ) -> iox_catalog::interface::Result<Vec<ObjectStoreId>> {
+            Err(iox_catalog::interface::Error::External {
+                source: String::from("should not have been called").into(),
+            })
+        }
+
+        async fn create_upgrade_delete(
+            &mut self,
+            _partition_id: PartitionId,
+            _delete: &[ObjectStoreId],
+            _upgrade: &[ObjectStoreId],
+            _create: &[ParquetFileParams],
+            _target_level: CompactionLevel,
+        ) -> iox_catalog::interface::Result<Vec<ParquetFileId>> {
+            Err(iox_catalog::interface::Error::External {
+                source: String::from("should not have been called").into(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_is_bulk_ingest_file() {
+        use object_store::path::Path;
+
+        let table_id = TableId::new(2);
+        let bulk_ingest_file_path = BulkIngestParquetFilePath::new(
+            NamespaceId::new(1),
+            table_id,
+            &TransitionPartitionId::new(table_id, &PartitionKey::from("2024-04-16")),
+            ObjectStoreId::new(),
+        );
+        assert!(is_bulk_ingest_file(
+            bulk_ingest_file_path.object_store_path()
+        ));
+
+        let not_parquet = Path::from("/bulk_ingest/not-parquet.txt");
+        assert!(!is_bulk_ingest_file(&not_parquet));
+
+        let regular_ingest_file_path = ParquetFilePath::new(
+            NamespaceId::new(1),
+            table_id,
+            &TransitionPartitionId::new(table_id, &PartitionKey::from("2024-04-16")),
+            ObjectStoreId::new(),
+        );
+        assert!(!is_bulk_ingest_file(
+            &regular_ingest_file_path.object_store_path()
+        ));
+
+        let too_short = Path::from("hi");
+        assert!(!is_bulk_ingest_file(&too_short));
+
+        let too_early = Path::from("/bulk_ingest/another_directory/filename.parquet");
+        assert!(!is_bulk_ingest_file(&too_early));
+
+        let filename_contains_bulk_ingest = Path::from("/hi/bye/bulk_ingest.parquet");
+        assert!(!is_bulk_ingest_file(&filename_contains_bulk_ingest));
+
+        let not_exact_directory_match = Path::from("/hi/bye/aaabulk_ingestaaa/1.parquet");
+        assert!(!is_bulk_ingest_file(&not_exact_directory_match));
     }
 }

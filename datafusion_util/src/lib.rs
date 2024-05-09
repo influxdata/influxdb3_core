@@ -91,14 +91,28 @@ impl AsExpr for Expr {
     }
 }
 
+/// `coalsce` expr_fn function that returns the first non-null argument.
+///
+/// workaround for <https://github.com/apache/datafusion/issues/10320> issue in
+/// DataFusion. Should use [datafusion::prelude::coalesce]  when that is fixed
+pub fn coalesce(args: Vec<Expr>) -> Expr {
+    datafusion::functions::core::coalesce().call(args)
+}
+
 /// Creates an `Expr` that represents a Dictionary encoded string (e.g
 /// the type of constant that a tag would be compared to)
-pub fn lit_dict(value: &str) -> Expr {
+pub fn lit_dict(value: impl Into<String>) -> Expr {
+    lit(dict(value))
+}
+
+/// Creates an `ScalarValue` that represents a Dictionary encoded string (e.g
+/// the type of constant that a tag would be compared to)
+pub fn dict(value: impl Into<String>) -> ScalarValue {
     // expr has been type coerced
-    lit(ScalarValue::Dictionary(
+    ScalarValue::Dictionary(
         Box::new(DataType::Int32),
         Box::new(ScalarValue::new_utf8(value)),
-    ))
+    )
 }
 
 /// Creates expression like:

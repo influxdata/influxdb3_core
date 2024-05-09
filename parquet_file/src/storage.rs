@@ -3,7 +3,7 @@
 
 use crate::{
     metadata::{IoxMetadata, IoxParquetMetaData},
-    serialize::{self, CodecError},
+    serialize::{self, CodecError, ParallelParquetWriterOptions},
     ParquetFilePath,
 };
 use arrow::{
@@ -19,16 +19,19 @@ use datafusion::{
         physical_plan::{FileScanConfig, ParquetExec},
     },
     error::DataFusionError,
-    execution::memory_pool::MemoryPool,
+    execution::runtime_env::RuntimeEnv,
     physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
 };
-use datafusion_util::config::{iox_session_config, register_iox_object_store};
+use datafusion_util::config::{
+    iox_session_config, register_iox_object_store, table_parquet_options,
+};
 use object_store::{DynObjectStore, ObjectMeta};
 use observability_deps::tracing::*;
 use schema::Projection;
 use std::{
     fmt::Display,
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -53,6 +56,10 @@ pub enum UploadError {
     /// Uploading the Parquet file to object store failed.
     #[error("failed to upload to object storage: {0}")]
     Upload(#[from] object_store::Error),
+
+    /// Error in configuration.
+    #[error("failed to properly configure parquet upload: {0}")]
+    Config(#[from] DataFusionError),
 }
 
 impl From<UploadError> for DataFusionError {
@@ -63,6 +70,7 @@ impl From<UploadError> for DataFusionError {
             }
             UploadError::Metadata(e) => Self::External(Box::new(e)),
             UploadError::Upload(e) => Self::ObjectStore(e),
+            UploadError::Config(e) => Self::External(e.into()),
         }
     }
 }
@@ -134,6 +142,7 @@ impl ParquetExecInput {
                 partition_values: vec![],
                 range: None,
                 extensions: None,
+                statistics: None,
             }]],
             statistics,
             projection: None,
@@ -142,7 +151,7 @@ impl ParquetExecInput {
             // Parquet files ARE actually sorted but we don't care here since we just construct a `collect` plan.
             output_ordering: vec![],
         };
-        let exec = ParquetExec::new(base_config, None, None);
+        let exec = ParquetExec::new(base_config, None, None, table_parquet_options());
         let exec_schema = exec.schema();
         datafusion::physical_plan::collect(Arc::new(exec), session_ctx.task_ctx())
             .await
@@ -152,6 +161,45 @@ impl ParquetExecInput {
                 }
                 batches
             })
+    }
+}
+
+/// Inputs required for write upload.
+///
+/// Eventually these may be consumed separately when we
+/// separate encoding from upload.
+#[derive(Debug, Clone)]
+pub struct ParquetUploadInput {
+    // Store where the file is located.
+    object_store_url: ObjectStoreUrl,
+
+    // Path within the store.
+    object_store_path: object_store::path::Path,
+
+    /// The actual store referenced by [`object_store_url`](Self::object_store_url).
+    pub object_store: Arc<DynObjectStore>,
+}
+
+impl ParquetUploadInput {
+    fn try_new(
+        partition_id: &TransitionPartitionId,
+        meta: &IoxMetadata,
+        id: &StorageId,
+        object_store: Arc<DynObjectStore>,
+    ) -> Result<Self, DataFusionError> {
+        Ok(Self {
+            object_store_url: ObjectStoreUrl::parse(format!("iox://{}/", id))?,
+            object_store_path: ParquetFilePath::from((partition_id, meta)).object_store_path(),
+            object_store,
+        })
+    }
+
+    pub(crate) fn path(&self) -> &object_store::path::Path {
+        &self.object_store_path
+    }
+
+    pub(crate) fn object_store_url(&self) -> &ObjectStoreUrl {
+        &self.object_store_url
     }
 }
 
@@ -173,6 +221,9 @@ pub struct ParquetStorage {
 
     /// Storage ID to hook it into DataFusion.
     id: StorageId,
+
+    /// If some, then parallelized parquet writes will occur.
+    parquet_write_parallelization_settings: Option<ParallelParquetWriterOptions>,
 }
 
 impl Display for ParquetStorage {
@@ -189,7 +240,28 @@ impl ParquetStorage {
     /// Initialise a new [`ParquetStorage`] using `object_store` as the
     /// persistence layer.
     pub fn new(object_store: Arc<DynObjectStore>, id: StorageId) -> Self {
-        Self { object_store, id }
+        Self {
+            object_store,
+            id,
+            parquet_write_parallelization_settings: None,
+        }
+    }
+
+    /// Enable parquet write parallelism, and set the amount
+    /// of parallelization per row group and per column.
+    pub fn with_enabled_parallel_writes(
+        self,
+        num_row_group_writers: NonZeroUsize,
+        num_column_writers_across_row_groups: NonZeroUsize,
+    ) -> Self {
+        Self {
+            parquet_write_parallelization_settings: Some(ParallelParquetWriterOptions {
+                maximum_parallel_row_group_writers: num_row_group_writers.into(),
+                maximum_buffered_record_batches_per_stream: num_column_writers_across_row_groups
+                    .into(),
+            }),
+            ..self
+        }
     }
 
     /// Get underlying object store.
@@ -214,7 +286,8 @@ impl ParquetStorage {
     /// Push `batches`, a stream of [`RecordBatch`] instances, to object
     /// storage.
     ///
-    /// Any buffering needed is registered with the pool
+    /// Any buffering needed is registered with the pool provided by the [`RuntimeEnv`]. The
+    /// runtime itself is utilized if parallelized writes are enabled.
     ///
     /// # Retries
     ///
@@ -227,8 +300,27 @@ impl ParquetStorage {
         batches: SendableRecordBatchStream,
         partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
-        pool: Arc<dyn MemoryPool>,
+        runtime: Arc<RuntimeEnv>,
     ) -> Result<(IoxParquetMetaData, usize), UploadError> {
+        if let Some(parallel_writer_options) = &self.parquet_write_parallelization_settings {
+            let write_input = ParquetUploadInput::try_new(
+                partition_id,
+                meta,
+                &self.id(),
+                Arc::clone(&self.object_store),
+            )?;
+
+            return self
+                .parallel_upload(
+                    batches,
+                    write_input,
+                    meta,
+                    runtime,
+                    parallel_writer_options.to_owned(),
+                )
+                .await;
+        };
+
         let start = Instant::now();
 
         // Stream the record batches into a parquet file.
@@ -239,14 +331,16 @@ impl ParquetStorage {
         //
         // This is not a huge concern, as the resulting parquet files are
         // currently smallish on average.
-        let (data, parquet_file_meta) = serialize::to_parquet_bytes(batches, meta, pool).await?;
+        let (data, parquet_file_meta) =
+            serialize::to_parquet_bytes(batches, meta, Arc::clone(&runtime.memory_pool)).await?;
+        let num_rows = parquet_file_meta.num_rows;
 
         // Read the IOx-specific parquet metadata from the file metadata
         let parquet_meta =
             IoxParquetMetaData::try_from(parquet_file_meta).map_err(UploadError::Metadata)?;
         trace!(
             ?parquet_meta,
-            "IoxParquetMetaData coverted from Row Group Metadata (aka FileMetaData)"
+            "IoxParquetMetaData converted from Row Group Metadata (aka FileMetaData)"
         );
 
         // Derive the correct object store path from the metadata.
@@ -281,6 +375,57 @@ impl ParquetStorage {
                 "Succeeded uploading files to object storage on retry"
             );
         }
+
+        debug!(
+            %num_rows,
+            %file_size,
+            %path,
+            // includes the time to run the datafusion plan (that is the batches) & upload
+            total_time_to_create_and_upload_parquet=?(Instant::now() - start),
+            "Created and uploaded parquet file"
+        );
+
+        Ok((parquet_meta, file_size))
+    }
+
+    async fn parallel_upload(
+        &self,
+        batches: SendableRecordBatchStream,
+        upload_input: ParquetUploadInput,
+        meta: &IoxMetadata,
+        runtime: Arc<RuntimeEnv>,
+        parallel_writer_options: ParallelParquetWriterOptions,
+    ) -> Result<(IoxParquetMetaData, usize), UploadError> {
+        let start = Instant::now();
+
+        let parquet_file_meta = serialize::to_parquet_upload(
+            batches,
+            meta,
+            upload_input.clone(),
+            runtime,
+            parallel_writer_options,
+        )
+        .await?;
+        let num_rows = parquet_file_meta.num_rows;
+
+        // Read the IOx-specific parquet metadata from the file metadata
+        let parquet_meta =
+            IoxParquetMetaData::try_from(parquet_file_meta).map_err(UploadError::Metadata)?;
+        trace!(
+            ?parquet_meta,
+            "IoxParquetMetaData converted from Row Group Metadata (aka FileMetaData)"
+        );
+
+        let file_size = self.object_store.head(upload_input.path()).await?.size;
+
+        debug!(
+            %num_rows,
+            %file_size,
+            path=?upload_input.path(),
+            // includes the time to run the datafusion plan (that is the batches) & upload
+            total_time_to_create_and_upload_parquet=?(Instant::now() - start),
+            "Created and uploaded parquet file (parallelized)"
+        );
 
         Ok((parquet_meta, file_size))
     }
@@ -339,14 +484,17 @@ mod tests {
     use iox_time::Time;
     use std::collections::HashMap;
 
-    #[tokio::test]
-    async fn test_upload_metadata() {
-        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
-
-        let store = ParquetStorage::new(object_store, StorageId::from("iox"));
-
+    async fn test_upload_metadata(store: ParquetStorage) {
         let (partition_id, meta) = meta();
-        let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("a", to_string_array(&["value"; 8192 * 2])),
+            ("b", to_int_array(&[1; 8192 * 2])),
+            ("c", to_string_array(&["foo"; 8192 * 2])),
+            ("d", to_int_array(&[2; 8192 * 2])),
+        ])
+        .unwrap();
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.num_rows(), 8192 * 2);
 
         // Serialize & upload the record batches.
         let (file_meta, _file_size) = upload(&store, &partition_id, &meta, batch.clone()).await;
@@ -363,8 +511,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_normal_upload_metadata() {
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+        let store = ParquetStorage::new(object_store, StorageId::from("iox"));
+
+        test_upload_metadata(store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 20)]
+    async fn test_parallelized_upload_metadata() {
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+
+        // test with parallel column writers
+        let store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(6).unwrap(), // parallelized only column writing
+            );
+        test_upload_metadata(store).await;
+
+        // test with parallel rowgroup writers
+        let store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(2).unwrap(), // parallelized only rowgroup writing
+                NonZeroUsize::new(1).unwrap(),
+            );
+        test_upload_metadata(store).await;
+
+        // test with both parallelized column and rowgroup writers
+        let store = ParquetStorage::new(object_store, StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(6).unwrap(),
+            );
+        test_upload_metadata(store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[cfg(tokio_unstable)]
+    async fn test_default_upload_is_single_threaded() {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+
+        // confirm test runtime is multi-threaded
+        assert_eq!(
+            RuntimeFlavor::MultiThread,
+            Handle::current().runtime_flavor()
+        );
+
+        // store with default (single threaded) upload
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+        let store = ParquetStorage::new(object_store, StorageId::from("iox"));
+
+        // start upload on current thread
+        let mut batch = Vec::with_capacity(10_000);
+        for field in 0..100 {
+            batch.push((field.to_string(), to_string_array(&["value"])));
+        }
+        let batch = RecordBatch::try_from_iter(batch).unwrap();
+        let schema = batch.schema();
+        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
+
+        // examine rt metrics
+        let rt_metrics = Handle::current().metrics();
+        let mut additional_workers_utilized = 0;
+        for worker_id in 0..rt_metrics.num_blocking_threads() {
+            if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
+                additional_workers_utilized += 1;
+            }
+        }
+
+        assert_eq!(
+            additional_workers_utilized, 0,
+            "should be single threaded upload"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[cfg(tokio_unstable)]
+    async fn test_parallel_columns_upload_uses_multiple_threads() {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+
+        // confirm test runtime is multi-threaded
+        assert_eq!(
+            RuntimeFlavor::MultiThread,
+            Handle::current().runtime_flavor()
+        );
+
+        // store with multi-threaded upload
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+        let store = ParquetStorage::new(object_store, StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(6).unwrap(), // parallelized only column writing
+            );
+
+        // start upload on current thread
+        let mut batch = Vec::with_capacity(100);
+        for field in 0..100 {
+            batch.push((field.to_string(), to_string_array(&["value"])));
+        }
+        let batch = RecordBatch::try_from_iter(batch).unwrap();
+        assert_eq!(batch.num_columns(), 100);
+        assert_eq!(batch.num_rows(), 1);
+        let schema = batch.schema();
+        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
+
+        // examine rt metrics
+        let rt_metrics = Handle::current().metrics();
+        let mut additional_workers_utilized = 0;
+        for worker_id in 0..rt_metrics.num_blocking_threads() {
+            if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
+                additional_workers_utilized += 1;
+            }
+        }
+
+        // note: tokio rt model schedules spawned tasks onto any of it's threads.
+        // therefore the 6 column writers will be spawned on any of the 10 threads.
+        // the main pt is that we must have >= 6 (since 6 are running in parallel at any given time)
+        assert!(
+            additional_workers_utilized >= 6,
+            "should have distributed work to additional threads, when using parallelized column writers"
+        );
+        assert!(
+            additional_workers_utilized <= 10,
+            "cannot use more than the 10 threads available"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    #[cfg(tokio_unstable)]
+    async fn test_parallel_row_groups_upload_uses_multiple_threads() {
+        use arrow::datatypes::{DataType, Schema};
+        use tokio::runtime::{Handle, RuntimeFlavor};
+
+        // confirm test runtime is multi-threaded
+        assert_eq!(
+            RuntimeFlavor::MultiThread,
+            Handle::current().runtime_flavor()
+        );
+
+        // store with multi-threaded upload
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+        let max_parallel_rowgroups_possible = 6;
+        let store = ParquetStorage::new(object_store, StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(max_parallel_rowgroups_possible).unwrap(), // parallelized only rowgroup writing
+                NonZeroUsize::new(1).unwrap(),
+            );
+
+        // start upload on current thread
+        let num_batches = max_parallel_rowgroups_possible;
+        let col_1 = to_int_array(&[2; 8192 / 8 * 6]);
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![col_1]).expect("created new record batch");
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 8192 / 8 * num_batches);
+        let schema = batch.schema();
+        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
+
+        // examine rt metrics
+        let rt_metrics = Handle::current().metrics();
+        let mut additional_workers_utilized = 0;
+        for worker_id in 0..rt_metrics.num_blocking_threads() {
+            if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
+                additional_workers_utilized += 1;
+            }
+        }
+
+        // Since the record batches are streaming we may not utilize all rowgroup writers,
+        // but we should have utilized some additional threads.
+        assert!(
+            additional_workers_utilized >= 1,
+            "should have distributed work to additional threads, when using parallelized rowgroup writers"
+        );
+        assert!(
+            additional_workers_utilized <= 10,
+            "cannot use more than the 10 threads available"
+        );
+    }
+
+    #[tokio::test]
     async fn test_simple_roundtrip() {
-        let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("a", to_string_array(&["value"])),
+            ("b", to_int_array(&[1])),
+            ("c", to_string_array(&["foo"])),
+            ("d", to_int_array(&[2])),
+        ])
+        .unwrap();
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.num_rows(), 1);
+
         let schema = batch.schema();
 
         assert_roundtrip(batch.clone(), Projection::All, schema, batch).await;
@@ -379,6 +716,8 @@ mod tests {
             ("d", to_int_array(&[2])),
         ])
         .unwrap();
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.num_rows(), 1);
         let schema = batch.schema();
 
         let expected_batch = RecordBatch::try_from_iter([
@@ -396,6 +735,8 @@ mod tests {
             ("b", to_int_array(&[1])),
         ])
         .unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_rows(), 1);
         let schema = batch.schema();
 
         let expected_batch = RecordBatch::try_from_iter([("b", to_int_array(&[1]))]).unwrap();
@@ -409,6 +750,9 @@ mod tests {
             ("b", to_int_array(&[1])),
         ])
         .unwrap();
+        assert_eq!(file_batch.num_columns(), 2);
+        assert_eq!(file_batch.num_rows(), 1);
+
         let schema_batch = RecordBatch::try_from_iter([
             ("b", to_int_array(&[1])),
             ("a", to_string_array(&["value"])),
@@ -427,6 +771,9 @@ mod tests {
             ("d", to_int_array(&[2])),
         ])
         .unwrap();
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.num_rows(), 1);
+
         let schema_batch = RecordBatch::try_from_iter([
             ("b", to_int_array(&[1])),
             ("d", to_int_array(&[2])),
@@ -623,8 +970,18 @@ mod tests {
         batch: RecordBatch,
     ) -> (IoxParquetMetaData, usize) {
         let stream = Box::pin(MemoryStream::new(vec![batch]));
+        let runtime = Arc::new(RuntimeEnv {
+            memory_pool: unbounded_memory_pool(),
+            ..Default::default()
+        });
+        datafusion_util::config::register_iox_object_store(
+            &runtime,
+            store.id(),
+            Arc::clone(store.object_store()),
+        );
+
         store
-            .upload(stream, partition_id, meta, unbounded_memory_pool())
+            .upload(stream, partition_id, meta, runtime)
             .await
             .expect("should serialize and store sucessfully")
     }
@@ -654,13 +1011,102 @@ mod tests {
         expected_schema: SchemaRef,
         expected_batch: RecordBatch,
     ) {
+        // test the single threaded path
+        assert_roundtrip_single_thread(
+            upload_batch.clone(),
+            selection,
+            Arc::clone(&expected_schema),
+            expected_batch.clone(),
+        )
+        .await;
+        // test the multi threaded path
+        assert_roundtrip_multi_thread(upload_batch, selection, expected_schema, expected_batch)
+            .await;
+    }
+
+    async fn assert_roundtrip_single_thread(
+        upload_batch: RecordBatch,
+        selection: Projection<'_>,
+        expected_schema: SchemaRef,
+        expected_batch: RecordBatch,
+    ) {
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+        let store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"));
+
+        perform_assert_roundtrip(
+            store,
+            upload_batch,
+            selection,
+            expected_schema,
+            expected_batch,
+        )
+        .await;
+    }
+
+    async fn assert_roundtrip_multi_thread(
+        upload_batch: RecordBatch,
+        selection: Projection<'_>,
+        expected_schema: SchemaRef,
+        expected_batch: RecordBatch,
+    ) {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
 
-        let store = ParquetStorage::new(object_store, StorageId::from("iox"));
+        // test with parallel column writer
+        let parallel_store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(6).unwrap(), // parallelized only column writing
+            );
+        perform_assert_roundtrip(
+            parallel_store,
+            upload_batch.clone(),
+            selection,
+            Arc::clone(&expected_schema),
+            expected_batch.clone(),
+        )
+        .await;
 
+        // test with parallel rowgroup writers
+        let parallel_store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(6).unwrap(), // parallelized only rowgroup writing
+                NonZeroUsize::new(1).unwrap(),
+            );
+        perform_assert_roundtrip(
+            parallel_store,
+            upload_batch.clone(),
+            selection,
+            Arc::clone(&expected_schema),
+            expected_batch.clone(),
+        )
+        .await;
+
+        // test with both parallelized column and rowgroup writers
+        let parallel_store = ParquetStorage::new(object_store, StorageId::from("iox"))
+            .with_enabled_parallel_writes(
+                NonZeroUsize::new(3).unwrap(),
+                NonZeroUsize::new(3).unwrap(),
+            );
+        perform_assert_roundtrip(
+            parallel_store,
+            upload_batch,
+            selection,
+            expected_schema,
+            expected_batch,
+        )
+        .await;
+    }
+
+    async fn perform_assert_roundtrip(
+        store: ParquetStorage,
+        upload_batch: RecordBatch,
+        selection: Projection<'_>,
+        expected_schema: SchemaRef,
+        expected_batch: RecordBatch,
+    ) {
         // Serialize & upload the record batches.
         let (partition_id, meta) = meta();
-        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, upload_batch).await;
+        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, upload_batch.clone()).await;
 
         // And compare to the original input
         let actual_batch = download(
@@ -668,7 +1114,7 @@ mod tests {
             &partition_id,
             &meta,
             selection,
-            expected_schema,
+            Arc::clone(&expected_schema),
             file_size,
         )
         .await

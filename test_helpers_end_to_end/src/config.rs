@@ -74,7 +74,7 @@ impl TestConfig {
         )
         // also copy a reference to the temp dir, if any, so it isn't
         // deleted too soon
-        .with_catalog_dir(other.catalog_dir.as_ref().map(Arc::clone))
+        .with_catalog_dir(other.catalog_dir.as_ref().cloned())
     }
 
     /// Create new catalog node w/o peers
@@ -108,7 +108,9 @@ impl TestConfig {
     }
 
     /// Create a triplet of catalog cache nodes.
-    pub fn catalog_nodes(dsn: impl Into<String>) -> [Self; 3] {
+    ///
+    /// Also returns the catalog DSN
+    pub fn catalog_nodes(dsn: impl Into<String>) -> ([Self; 3], String) {
         let catalog_schema_name = random_catalog_schema_name();
         Self::catalog_nodes_with_catalog_schema_name(dsn, catalog_schema_name)
     }
@@ -116,7 +118,7 @@ impl TestConfig {
     pub fn catalog_nodes_with_catalog_schema_name(
         dsn: impl Into<String>,
         catalog_schema_name: String,
-    ) -> [Self; 3] {
+    ) -> ([Self; 3], String) {
         let dsn = Some(dsn.into());
 
         let n0 = Self::new_catalog(dsn.clone(), catalog_schema_name.clone());
@@ -136,7 +138,14 @@ impl TestConfig {
             n1.addrs().catalog_http_api().client_base(),
         ]);
 
-        [n0, n1, n2]
+        let catalog_service_url = format!(
+            "{};{};{}",
+            n0.addrs().catalog_grpc_api().client_base(),
+            n1.addrs().catalog_grpc_api().client_base(),
+            n2.addrs().catalog_grpc_api().client_base()
+        );
+
+        ([n0, n1, n2], catalog_service_url)
     }
 
     /// Create a minimal router configuration that doesn't connect to an ingester. If you need a
@@ -221,7 +230,7 @@ impl TestConfig {
             catalog_schema_name: ingester_config.catalog_schema_name.clone(),
             object_store_dir: None,
             wal_dir: None,
-            catalog_dir: ingester_config.catalog_dir.as_ref().map(Arc::clone),
+            catalog_dir: ingester_config.catalog_dir.as_ref().cloned(),
             addrs: Arc::new(BindAddresses::default()),
             wait_for_ready: ingester_config.wait_for_ready,
         }
@@ -383,6 +392,12 @@ impl TestConfig {
         self
     }
 
+    /// Remove an environment variable from the config
+    fn without_env(mut self, name: impl Into<String>) -> Self {
+        self.env.remove(&name.into());
+        self
+    }
+
     /// copy the specified environment variables from other; Panic's if they do not exist.
     ///
     /// Should not be called directly, but instead all mapping to
@@ -438,9 +453,15 @@ impl TestConfig {
     /// Configures this TestConfig to use the same object store as other
     pub fn with_existing_object_store(mut self, other: &Self) -> Self {
         // copy a reference to the temp dir, if any
-        self.object_store_dir = other.object_store_dir.clone();
+        self.object_store_dir.clone_from(&other.object_store_dir);
         self.copy_env("INFLUXDB_IOX_OBJECT_STORE", other)
             .copy_env("INFLUXDB_IOX_DB_DIR", other)
+    }
+
+    /// Removes object store configuration
+    pub fn with_memory_object_store(self) -> Self {
+        self.with_env("INFLUXDB_IOX_OBJECT_STORE", "memory")
+            .without_env("INFLUXDB_IOX_DB_DIR")
     }
 
     /// Configure maximum per-table query bytes for the querier.

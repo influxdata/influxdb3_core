@@ -39,7 +39,7 @@ pub enum Error {
     #[snafu(display("Unable to bind to listen for HTTP requests on {}: {}", addr, source))]
     StartListeningHttp {
         addr: SocketAddr,
-        source: hyper::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Unable to bind to listen for gRPC requests on {}: {}", addr, source))]
@@ -62,6 +62,26 @@ pub enum Error {
 
     #[snafu(display("Early server shutdown"))]
     LostServer,
+
+    #[snafu(display("Cannot set set gRPC kernel-side TCP send buffer size: {source}"))]
+    GrpcTcpKernelSendBufferSize {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Cannot set set gRPC kernel-side TCP receive buffer size: {source}"))]
+    GrpcTcpKernelReceiveBufferSize {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Cannot set set HTTP kernel-side TCP send buffer size: {source}"))]
+    HttpTcpKernelSendBufferSize {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Cannot set set HTTP kernel-side TCP receive buffer size: {source}"))]
+    HttpTcpKernelReceiveBufferSize {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -87,7 +107,11 @@ pub async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-pub async fn grpc_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+pub async fn grpc_listener(
+    addr: SocketAddr,
+    tcp_kernel_send_buffer_size: Option<usize>,
+    tcp_kernel_receive_buffer_size: Option<usize>,
+) -> Result<tokio::net::TcpListener> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .context(StartListeningGrpcSnafu { addr })?;
@@ -97,14 +121,139 @@ pub async fn grpc_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> 
         Err(_) => info!(%addr, "bound gRPC listener"),
     }
 
+    if let Some(send_buffer_size) = tcp_kernel_send_buffer_size {
+        set_tcp_kernel_send_buffer_size(&listener, send_buffer_size)
+            .context(GrpcTcpKernelSendBufferSizeSnafu)?;
+    }
+
+    if let Some(receive_buffer_size) = tcp_kernel_receive_buffer_size {
+        set_tcp_kernel_receive_buffer_size(&listener, receive_buffer_size)
+            .context(GrpcTcpKernelReceiveBufferSizeSnafu)?;
+    }
+
     Ok(listener)
 }
 
-pub async fn http_listener(addr: SocketAddr) -> Result<AddrIncoming> {
-    let listener = AddrIncoming::bind(&addr).context(StartListeningHttpSnafu { addr })?;
+pub async fn http_listener(
+    addr: SocketAddr,
+    tcp_kernel_send_buffer_size: Option<usize>,
+    tcp_kernel_receive_buffer_size: Option<usize>,
+) -> Result<AddrIncoming> {
+    let listener =
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| Error::StartListeningHttp {
+                addr,
+                source: Box::new(e),
+            })?;
+
+    if let Some(send_buffer_size) = tcp_kernel_send_buffer_size {
+        set_tcp_kernel_send_buffer_size(&listener, send_buffer_size)
+            .context(HttpTcpKernelSendBufferSizeSnafu)?;
+    }
+
+    if let Some(receive_buffer_size) = tcp_kernel_receive_buffer_size {
+        set_tcp_kernel_receive_buffer_size(&listener, receive_buffer_size)
+            .context(HttpTcpKernelReceiveBufferSizeSnafu)?;
+    }
+
+    let listener =
+        AddrIncoming::from_listener(listener).map_err(|e| Error::StartListeningHttp {
+            addr,
+            source: Box::new(e),
+        })?;
     info!(bind_addr=%listener.local_addr(), "bound HTTP listener");
 
     Ok(listener)
+}
+
+/// Set and check given socket option.
+///
+/// Calls [`setsockopt`] on the given listener and checks the result using [`getsocktopt`]. This check is required
+/// because some options silently accept out-of-range values.
+///
+/// Also some options are converted by the kernel when set (e.g. they are multiplied). The `return_conversion` should
+/// perform the same conversion so that the check can work properly.
+///
+///
+/// [`getsocktopt`]: https://linux.die.net/man/3/getsockopt
+/// [`setsockopt`]: https://linux.die.net/man/3/setsockopt
+#[cfg(unix)]
+fn set_and_check_sock_option<O, V, C>(
+    listener: &tokio::net::TcpListener,
+    opt: O,
+    val: &V,
+    return_conversion: C,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    O: nix::sys::socket::GetSockOpt<Val = V>
+        + nix::sys::socket::SetSockOpt<Val = V>
+        + std::fmt::Debug,
+    V: std::cmp::PartialEq + std::fmt::Debug,
+    C: for<'a> FnOnce(&'a V) -> V,
+{
+    nix::sys::socket::setsockopt(listener, opt, val)
+        .map_err(|e| format!("Cannot set {opt:?} to {val:?}: {e}"))?;
+
+    // setting an out-of-range value silently works
+    let current = nix::sys::socket::getsockopt(listener, opt)
+        .map_err(|e| format!("Cannot get {opt:?}: {e}"))?;
+
+    // Some socket options are silently converted/multiplied by the OS during SET and the changed value is returned
+    // during GET. So we need to make sure to check the converted value, not the original one.
+    let expected = return_conversion(val);
+
+    if current != expected {
+        return Err(format!(
+            "When setting {opt:?} to {val:?} the OS should have returned {expected:?} afterwards but we got {current:?}. Value is likely out of range"
+        ).into());
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_tcp_kernel_send_buffer_size(
+    listener: &tokio::net::TcpListener,
+    size: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_and_check_sock_option(listener, nix::sys::socket::sockopt::SndBuf, &size, |n| {
+        n * 2
+    })
+}
+
+#[cfg(not(unix))]
+fn set_tcp_kernel_send_buffer_size(
+    _listener: &tokio::net::TcpListener,
+    _size: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Err(
+        "Setting TCP kernel-side send buffer size is NOT supported on this operating system."
+            .to_string()
+            .into(),
+    )
+}
+
+#[cfg(unix)]
+fn set_tcp_kernel_receive_buffer_size(
+    listener: &tokio::net::TcpListener,
+    size: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    set_and_check_sock_option(listener, nix::sys::socket::sockopt::RcvBuf, &size, |n| {
+        n * 2
+    })
+}
+
+#[cfg(not(unix))]
+fn set_tcp_kernel_receive_buffer_size(
+    _listener: &tokio::net::TcpListener,
+    _size: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Err(
+        "Setting TCP kernel-side receive buffer size is NOT supported on this operating system."
+            .to_string()
+            .into(),
+    )
 }
 
 /// Instantiates the gRPC and optional HTTP listeners and returns a `Future` that completes when
@@ -279,4 +428,38 @@ pub async fn serve(
     info!(?server_type, "backend shutdown completed");
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    // The only test in this module currently only applies to linux; silence warnings on other
+    // platforms but leave this import here in case more tests are added in the future.
+    #[allow(unused_imports)]
+    use super::*;
+
+    /// Operatoring system have an allowed config range, but for Linux we at least know the lower bound of this range
+    /// and can use that for testing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_set_tcp_kernel_buffer_size() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let err = set_tcp_kernel_send_buffer_size(&listener, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "When setting SndBuf to 1 the OS should have returned 2 afterwards but we got 4608. Value is likely out of range"
+        );
+
+        set_tcp_kernel_send_buffer_size(&listener, 2304).unwrap();
+
+        let err = set_tcp_kernel_receive_buffer_size(&listener, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "When setting RcvBuf to 1 the OS should have returned 2 afterwards but we got 2304. Value is likely out of range"
+        );
+
+        set_tcp_kernel_receive_buffer_size(&listener, 1152).unwrap();
+    }
 }

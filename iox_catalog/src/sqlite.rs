@@ -1,6 +1,7 @@
 //! A SQLite backed implementation of the Catalog
 
-use crate::interface::{PartitionRepoExt, RootRepo};
+use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
+use crate::metrics::CatalogMetrics;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
@@ -9,21 +10,21 @@ use crate::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
         PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
     },
-    metrics::MetricDecorator,
 };
 use async_trait::async_trait;
-use data_types::snapshot::namespace::NamespaceSnapshot;
-use data_types::snapshot::root::RootSnapshot;
 use data_types::{
     partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
     },
-    snapshot::{partition::PartitionSnapshot, table::TableSnapshot},
+    snapshot::{
+        namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
+        table::TableSnapshot,
+    },
     Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables,
     Namespace, NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride,
-    NamespaceVersion, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, Partition,
-    PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId,
-    Timestamp,
+    NamespaceVersion, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams,
+    ParquetFileSource, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
+    SortKeyIds, Table, TableId, Timestamp,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use metric::Registry;
@@ -39,7 +40,6 @@ use sqlx::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Display,
     str::FromStr,
     sync::Arc,
 };
@@ -57,10 +57,9 @@ pub struct SqliteConnectionOptions {
 /// SQLite catalog.
 #[derive(Debug)]
 pub struct SqliteCatalog {
-    metrics: Arc<Registry>,
+    metrics: CatalogMetrics,
     pool: Pool<Sqlite>,
     time_provider: Arc<dyn TimeProvider>,
-    options: SqliteConnectionOptions,
 }
 
 /// transaction for [`SqliteCatalog`].
@@ -79,7 +78,7 @@ impl<'c> Executor<'c> for &'c mut SqliteTxnInner {
     type Database = Sqlite;
 
     #[allow(clippy::type_complexity)]
-    fn fetch_many<'e, 'q: 'e, E: 'q>(
+    fn fetch_many<'e, 'q, E>(
         self,
         query: E,
     ) -> futures::stream::BoxStream<
@@ -94,12 +93,13 @@ impl<'c> Executor<'c> for &'c mut SqliteTxnInner {
     >
     where
         'c: 'e,
-        E: sqlx::Execute<'q, Self::Database>,
+        'q: 'e,
+        E: sqlx::Execute<'q, Self::Database> + 'q,
     {
         self.pool.fetch_many(query)
     }
 
-    fn fetch_optional<'e, 'q: 'e, E: 'q>(
+    fn fetch_optional<'e, 'q, E>(
         self,
         query: E,
     ) -> futures::future::BoxFuture<
@@ -108,12 +108,13 @@ impl<'c> Executor<'c> for &'c mut SqliteTxnInner {
     >
     where
         'c: 'e,
-        E: sqlx::Execute<'q, Self::Database>,
+        'q: 'e,
+        E: sqlx::Execute<'q, Self::Database> + 'q,
     {
         self.pool.fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e, 'q>(
         self,
         sql: &'q str,
         parameters: &'e [<Self::Database as sqlx::Database>::TypeInfo],
@@ -123,39 +124,37 @@ impl<'c> Executor<'c> for &'c mut SqliteTxnInner {
     >
     where
         'c: 'e,
+        'q: 'e,
     {
         self.pool.prepare_with(sql, parameters)
     }
 
-    fn describe<'e, 'q: 'e>(
+    fn describe<'e, 'q>(
         self,
         sql: &'q str,
     ) -> futures::future::BoxFuture<'e, Result<sqlx::Describe<Self::Database>, sqlx::Error>>
     where
         'c: 'e,
+        'q: 'e,
     {
         self.pool.describe(sql)
     }
 }
 
 impl SqliteCatalog {
+    const NAME: &'static str = "sqlite";
+
     /// Connect to the catalog store.
     pub async fn connect(options: SqliteConnectionOptions, metrics: Arc<Registry>) -> Result<Self> {
         let opts = SqliteConnectOptions::from_str(&options.file_path)?.create_if_missing(true);
+        let time_provider = Arc::new(SystemProvider::new()) as _;
 
         let pool = SqlitePool::connect_with(opts).await?;
         Ok(Self {
-            metrics,
+            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             pool,
-            time_provider: Arc::new(SystemProvider::new()),
-            options,
+            time_provider,
         })
-    }
-}
-
-impl Display for SqliteCatalog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Sqlite(dsn='{}')", self.options.file_path)
     }
 }
 
@@ -168,22 +167,17 @@ impl Catalog for SqliteCatalog {
     }
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
-        Box::new(MetricDecorator::new(
-            Box::new(SqliteTxn {
-                inner: Mutex::new(SqliteTxnInner {
-                    pool: self.pool.clone(),
-                }),
-                time_provider: Arc::clone(&self.time_provider),
+        Box::new(self.metrics.repos(Box::new(SqliteTxn {
+            inner: Mutex::new(SqliteTxnInner {
+                pool: self.pool.clone(),
             }),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.time_provider),
-            "sqlite",
-        ))
+            time_provider: Arc::clone(&self.time_provider),
+        })))
     }
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<Registry> {
-        Arc::clone(&self.metrics)
+        self.metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
@@ -194,6 +188,10 @@ impl Catalog for SqliteCatalog {
         Err(Error::NotImplemented {
             descr: "active applications".to_owned(),
         })
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
     }
 }
 
@@ -523,6 +521,10 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             tables,
             generation as _,
         )?)
+    }
+
+    async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
+        namespace_snapshot_by_name(self, name).await
     }
 }
 
@@ -1353,6 +1355,7 @@ struct ParquetFilePod {
     created_at: Timestamp,
     column_set: Json<Vec<i64>>,
     max_l0_created_at: Timestamp,
+    source: Option<ParquetFileSource>,
 }
 
 impl From<ParquetFilePod> for ParquetFile {
@@ -1373,6 +1376,7 @@ impl From<ParquetFilePod> for ParquetFile {
             created_at: value.created_at,
             column_set: to_column_set(&value.column_set),
             max_l0_created_at: value.max_l0_created_at,
+            source: value.source,
         }
     }
 }
@@ -1449,7 +1453,7 @@ RETURNING object_store_id;
             r#"
 SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
        object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
-       compaction_level, created_at, column_set, max_l0_created_at
+       compaction_level, created_at, column_set, max_l0_created_at, source
 FROM parquet_file
 WHERE parquet_file.partition_id IN (SELECT value FROM json_each($1))
   AND parquet_file.to_delete IS NULL;
@@ -1473,7 +1477,7 @@ WHERE parquet_file.partition_id IN (SELECT value FROM json_each($1))
             r#"
 SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id, min_time,
        max_time, to_delete, file_size_bytes, row_count, compaction_level, created_at, column_set,
-       max_l0_created_at
+       max_l0_created_at, source
 FROM parquet_file
 WHERE object_store_id = $1;
              "#,
@@ -1580,6 +1584,7 @@ where
         created_at,
         column_set,
         max_l0_created_at,
+        source,
     } = parquet_file_params;
 
     let res = sqlx::query_as::<_, ParquetFilePod>(
@@ -1587,12 +1592,12 @@ where
 INSERT INTO parquet_file (
     table_id, partition_id, partition_hash_id, object_store_id,
     min_time, max_time, file_size_bytes,
-    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 )
+    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at, source )
+VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
 RETURNING
     id, table_id, partition_id, partition_hash_id, object_store_id, min_time, max_time, to_delete,
     file_size_bytes, row_count, compaction_level, created_at, namespace_id, column_set,
-    max_l0_created_at;
+    max_l0_created_at, source;
         "#,
     )
     .bind(table_id) // $1
@@ -1608,6 +1613,7 @@ RETURNING
     .bind(namespace_id) // $11
     .bind(from_column_set(&column_set)) // $12
     .bind(max_l0_created_at) // $13
+    .bind(source) // $14
     .fetch_one(executor)
     .await;
 
@@ -2333,6 +2339,32 @@ RETURNING *;
         let partition_template: Option<TablePartitionTemplateOverride> =
             record.try_get("partition_template").unwrap();
         assert!(partition_template.is_none());
+    }
+
+    #[tokio::test]
+    async fn can_round_trip_parquet_file_source() {
+        let sqlite = setup_db().await;
+        let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+        let mut repos = sqlite.repositories();
+        let namespace = arbitrary_namespace(&mut *repos, "ns6").await;
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
+        let key = "NoBananas";
+        let partition = repos
+            .partitions()
+            .create_or_get(key.into(), table.id)
+            .await
+            .unwrap();
+
+        let parquet_file_params = ParquetFileParams {
+            source: Some(ParquetFileSource::BulkIngest),
+            ..arbitrary_parquet_file_params(&namespace, &table, &partition)
+        };
+        let parquet_file = repos
+            .parquet_files()
+            .create(parquet_file_params.clone())
+            .await
+            .unwrap();
+        assert_eq!(parquet_file.source, Some(ParquetFileSource::BulkIngest));
     }
 
     #[tokio::test]

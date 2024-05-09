@@ -121,12 +121,13 @@ impl Display for Language {
     }
 }
 
-pub async fn run(
+pub async fn run_and_print_runtime(
     cluster: &mut MiniCluster,
     input_file_path: PathBuf,
     setup_name: String,
     contents: String,
     language: Language,
+    print_runtime: bool,
 ) -> Result<()> {
     // create output and expected output
     let test_name = input_file_path
@@ -154,8 +155,18 @@ pub async fn run(
         q.add_comments(&mut output);
         output.push(format!("-- {}: {}", language, q.text()));
         q.add_description(&mut output);
-        let results = run_query(cluster, q).await?;
-        output.extend(results);
+
+        if print_runtime {
+            let start = std::time::Instant::now();
+            let results = run_query(cluster, q).await?;
+            let duration = start.elapsed();
+            output.push(format!("-- Query took: {:?}", duration));
+            output.extend(results);
+        } else {
+            // Run the query and add the results to the output
+            let results = run_query(cluster, q).await?;
+            output.extend(results);
+        }
     }
 
     // Configure insta to send the results to query_tests/out/<test_name>.sql.snap

@@ -9,15 +9,16 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.79"
+async-trait = "0.1.80"
 backoff = { version = "0.1.0", path = "../backoff" }
+base64 = "0.22"
 catalog_cache = { path = "../catalog_cache" }
 client_util = { path = "../client_util" }
 data_types = { path = "../data_types" }
+futures = "0.3"
 generated_types = { path = "../generated_types" }
 hashbrown = "0.14"
 http = "0.2.11"
-futures = "0.3"
 iox_time = { version = "0.1.0", path = "../iox_time" }
 log = "0.4"
 metric = { version = "0.1.0", path = "../metric" }
@@ -25,12 +26,13 @@ mutable_batch = { path = "../mutable_batch" }
 observability_deps = { path = "../observability_deps" }
 once_cell = { version = "1.19", features = ["parking_lot"] }
 parking_lot = { version = "0.12" }
+ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 siphasher = "1.0"
 snafu = "0.8"
 sqlx = { version = "0.7.4", features = ["runtime-tokio-rustls", "postgres", "uuid", "sqlite"] }
 sqlx-hotswap-pool = { path = "../sqlx-hotswap-pool" }
-thiserror = "1.0.58"
+thiserror = "1.0.60"
 tokio = { version = "1.37", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
 tonic = { workspace = true }
 trace = { path = "../trace" }
@@ -42,7 +44,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 assert_matches = "1.5.0"
 dotenvy = "0.15.7"
 mutable_batch_lp = { path = "../mutable_batch_lp" }
-paste = "1.0.14"
+paste = "1.0.15"
 pretty_assertions = "1.4.0"
 proptest = { version = "1", default_features = false, features = ["std"] }
 rand = "0.8"

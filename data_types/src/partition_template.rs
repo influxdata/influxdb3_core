@@ -277,7 +277,7 @@ pub const PARTITION_KEY_PART_TRUNCATED: char = '#';
 pub const TAG_VALUE_KEY_TIME: &str = "time";
 
 /// The range of bucket quantities allowed for [`Bucket`] template parts.
-///    
+///
 /// [`Bucket`]: [`proto::template_part::Part::Bucket`]
 pub const ALLOWED_BUCKET_QUANTITIES: Range<u32> = Range {
     start: 1,
@@ -378,6 +378,13 @@ impl NamespacePartitionTemplateOverride {
     pub fn as_proto(&self) -> Option<&proto::PartitionTemplate> {
         self.0.as_ref().map(|v| v.inner())
     }
+
+    /// Loan out the application-type template parts of the contained partition
+    /// template for this namespace, as per the behaviour of
+    /// [`serialization::Wrapper::parts()`].
+    pub fn parts(&self) -> impl Iterator<Item = TemplatePart<'_>> {
+        serialization::Wrapper::parts(self.0.as_ref())
+    }
 }
 
 impl TryFrom<proto::PartitionTemplate> for NamespacePartitionTemplateOverride {
@@ -424,25 +431,11 @@ impl TablePartitionTemplateOverride {
         self.parts().count()
     }
 
-    /// Iterate through the protobuf parts and lend out what the `mutable_batch` crate needs to
-    /// build `PartitionKey`s. If this table doesn't have a custom template, use the application
-    /// default of partitioning by day.
+    /// Loan out the application-type template parts of the contained partition
+    /// template for this table, as per the behaviour of
+    /// [`serialization::Wrapper::parts()`].
     pub fn parts(&self) -> impl Iterator<Item = TemplatePart<'_>> {
-        self.0
-            .as_ref()
-            .map(|serialization_wrapper| serialization_wrapper.inner())
-            .unwrap_or_else(|| &PARTITION_BY_DAY_PROTO)
-            .parts
-            .iter()
-            .flat_map(|part| part.part.as_ref())
-            .map(|part| match part {
-                proto::template_part::Part::TagValue(value) => TemplatePart::TagValue(value),
-                proto::template_part::Part::TimeFormat(fmt) => TemplatePart::TimeFormat(fmt),
-                proto::template_part::Part::Bucket(proto::Bucket {
-                    tag_name,
-                    num_buckets,
-                }) => TemplatePart::Bucket(tag_name, *num_buckets),
-            })
+        serialization::Wrapper::parts(self.0.as_ref())
     }
 
     /// Size in bytes, including `self`.
@@ -516,8 +509,8 @@ impl TryFrom<Option<proto::PartitionTemplate>> for TablePartitionTemplateOverrid
 /// duplication.
 mod serialization {
     use super::{
-        ValidationError, ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
-        TAG_VALUE_KEY_TIME,
+        TemplatePart, ValidationError, ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
+        PARTITION_BY_DAY_PROTO, TAG_VALUE_KEY_TIME,
     };
     use chrono::{format::StrftimeItems, Utc};
     use generated_types::influxdata::iox::partition_template::v1 as proto;
@@ -545,6 +538,28 @@ mod serialization {
             proto: proto::PartitionTemplate,
         ) -> Self {
             Self(Arc::new(proto))
+        }
+
+        /// Iterate through the protobuf parts and lend out what information
+        /// necessary to build partition keys and restrict new templates.
+        ///
+        /// If `wrapper` doesn't have a custom template, this uses the
+        /// application default of [`PARTITION_BY_DAY_PROTO`].
+        pub(super) fn parts(wrapper: Option<&Self>) -> impl Iterator<Item = TemplatePart<'_>> {
+            wrapper
+                .map(|serialization_wrapper| serialization_wrapper.inner())
+                .unwrap_or_else(|| &PARTITION_BY_DAY_PROTO)
+                .parts
+                .iter()
+                .flat_map(|part| part.part.as_ref())
+                .map(|part| match part {
+                    proto::template_part::Part::TagValue(value) => TemplatePart::TagValue(value),
+                    proto::template_part::Part::TimeFormat(fmt) => TemplatePart::TimeFormat(fmt),
+                    proto::template_part::Part::Bucket(proto::Bucket {
+                        tag_name,
+                        num_buckets,
+                    }) => TemplatePart::Bucket(tag_name, *num_buckets),
+                })
         }
     }
 
@@ -605,7 +620,9 @@ mod serialization {
                             return Err(ValidationError::InvalidTagValue(value.into()));
                         }
 
-                        if value.contains(TAG_VALUE_KEY_TIME) {
+                        // "time" cannot be used due to the insane number of
+                        // partitions this would create.
+                        if value == TAG_VALUE_KEY_TIME {
                             return Err(ValidationError::InvalidTagValue(format!(
                                 "{TAG_VALUE_KEY_TIME} cannot be used"
                             )));
@@ -623,7 +640,7 @@ mod serialization {
                             return Err(ValidationError::InvalidTagValue(tag_name.into()));
                         }
 
-                        if tag_name.contains(TAG_VALUE_KEY_TIME) {
+                        if tag_name == TAG_VALUE_KEY_TIME {
                             return Err(ValidationError::InvalidTagValue(format!(
                                 "{TAG_VALUE_KEY_TIME} cannot be used"
                             )));
@@ -782,9 +799,9 @@ pub fn build_column_values<'a>(
     template: &'a TablePartitionTemplateOverride,
     partition_key: &'a str,
 ) -> impl Iterator<Item = (&'a str, ColumnValue<'a>)> {
-    // Exploded parts of the generated key on the "/" character.
+    // Exploded parts of the generated key on the "|" character.
     //
-    // Any uses of the "/" character within the partition key's user-provided
+    // Any uses of the "|" character within the partition key's user-provided
     // values are url encoded, so this is an unambiguous field separator.
     let key_parts = partition_key.split(PARTITION_KEY_DELIMITER);
 
@@ -1093,6 +1110,108 @@ mod tests {
         });
 
         assert_error!(err, ValidationError::TooManyParts { specified } if specified == 9);
+    }
+
+    /// Assert that attempting to use tag partitioning against the "time" column
+    /// returns an error, but succeeds when "time" is a substring.
+    #[test]
+    fn test_tag_partitioning_time() {
+        let err = serialization::Wrapper::try_from(proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("time".into())),
+            }],
+        });
+
+        assert_error!(
+            err.as_ref(),
+            ValidationError::InvalidTagValue(s) if s == "time cannot be used"
+        );
+
+        // Allow substring occurrences of "time".
+        assert_matches!(
+            serialization::Wrapper::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("time_prefix".into())),
+                }],
+            }),
+            Ok(_)
+        );
+
+        assert_matches!(
+            serialization::Wrapper::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("suffix_time".into())),
+                }],
+            }),
+            Ok(_)
+        );
+
+        assert_matches!(
+            serialization::Wrapper::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue(
+                        "banana_time_yeah".into()
+                    )),
+                }],
+            }),
+            Ok(_)
+        );
+    }
+
+    /// Assert that attempting to use bucket partitioning against the "time"
+    /// column returns an error, but succeeds when "time" is a substring.
+    #[test]
+    fn test_bucket_partitioning_time() {
+        let err = serialization::Wrapper::try_from(proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::Bucket(proto::Bucket {
+                    tag_name: "time".into(),
+                    num_buckets: 42,
+                })),
+            }],
+        });
+
+        assert_error!(
+            err.as_ref(),
+            ValidationError::InvalidTagValue(s) if s == "time cannot be used"
+        );
+
+        // Allow substring occurrences of "time".
+        assert_matches!(
+            serialization::Wrapper::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::Bucket(proto::Bucket {
+                        tag_name: "time_prefix".into(),
+                        num_buckets: 42
+                    })),
+                }],
+            }),
+            Ok(_)
+        );
+
+        assert_matches!(
+            serialization::Wrapper::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::Bucket(proto::Bucket {
+                        tag_name: "suffix_time".into(),
+                        num_buckets: 42
+                    })),
+                }],
+            }),
+            Ok(_)
+        );
+
+        assert_matches!(
+            serialization::Wrapper::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::Bucket(proto::Bucket {
+                        tag_name: "banana_time_yeah".into(),
+                        num_buckets: 42,
+                    })),
+                }],
+            }),
+            Ok(_)
+        );
     }
 
     #[test]
@@ -1779,13 +1898,15 @@ mod tests {
     /// breaking the system invariant that a given primary keys maps to a
     /// single partition.
     ///
-    /// You shouldn't be changing this!
+    /// You shouldn't be changing the values!
     #[test]
     fn test_default_template_fixture() {
         let ns = NamespacePartitionTemplateOverride::default();
+        let got_ns = ns.parts().collect::<Vec<_>>();
+        assert_matches!(got_ns.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
         let table = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
-        let got = table.parts().collect::<Vec<_>>();
-        assert_matches!(got.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
+        let got_table = table.parts().collect::<Vec<_>>();
+        assert_matches!(got_table.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
     }
 
     #[test]

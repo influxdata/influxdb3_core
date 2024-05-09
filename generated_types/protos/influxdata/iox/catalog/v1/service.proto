@@ -4,6 +4,7 @@ option go_package = "github.com/influxdata/iox/catalog/v1";
 
 import "influxdata/iox/catalog/v1/parquet_file.proto";
 import "influxdata/iox/catalog/v1/partition_identifier.proto";
+import "influxdata/iox/column_type/v1/type.proto";
 
 service CatalogService {
     // Get the parquet_file catalog records in the given partition
@@ -11,6 +12,9 @@ service CatalogService {
 
     // Get the partition catalog records by the table id
     rpc GetPartitionsByTableId(GetPartitionsByTableIdRequest) returns (GetPartitionsByTableIdResponse);
+
+    // Get the column catalog records by the table id
+    rpc GetColumnsByTableId(GetColumnsByTableIdRequest) returns (GetColumnsByTableIdResponse);
 
     // Get the parquet_file catalog records in the given namespace and table name
     rpc GetParquetFilesByNamespaceTable(GetParquetFilesByNamespaceTableRequest) returns (GetParquetFilesByNamespaceTableResponse);
@@ -68,6 +72,21 @@ message GetPartitionsByTableIdRequest {
 
 message GetPartitionsByTableIdResponse {
     repeated Partition partitions = 1;
+}
+
+message Column {
+    int64 id = 1;
+    int64 table_id = 2;
+    string name = 3;
+    influxdata.iox.column_type.v1.ColumnType column_type = 4;
+}
+
+message GetColumnsByTableIdRequest {
+    int64 table_id = 1;
+}
+
+message GetColumnsByTableIdResponse {
+    repeated Column columns = 1;
 }
 
 message GetParquetFilesByNamespaceTableRequest {

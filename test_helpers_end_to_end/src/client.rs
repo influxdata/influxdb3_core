@@ -1,5 +1,6 @@
 //! Client helpers for writing end to end ng tests
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use assert_cmd::Command;
 use data_types::{NamespaceId, TableId};
 use dml::{DmlMeta, DmlWrite};
 use futures::TryStreamExt;
@@ -12,8 +13,11 @@ use influxdb_iox_client::{
 use iox_query_params::StatementParam;
 use mutable_batch_lp::lines_to_batches;
 use mutable_batch_pb::encode::encode_write;
+use predicates::prelude::*;
 use std::{fmt::Display, time::Duration};
 use tonic::IntoRequest;
+
+use crate::TestConfig;
 
 /// Writes the line protocol to the write_base/api/v2/write endpoint (typically on the router)
 pub async fn write_to_router(
@@ -77,6 +81,69 @@ pub async fn write_to_ingester(
         )
         .await
         .unwrap();
+}
+
+/// Run a compaction job once on a given partition, and error if the job panics
+/// (e.g. if the catalog or parquet file is incorrect, or uncontrolled OOMing).
+///
+/// If the partition has no work to do, or successfully compacts the given partition,
+/// then the compactor run is successful.
+pub async fn run_compactor_once(config: TestConfig, data_dir: &str, partition_id: i64) {
+    Command::cargo_bin("influxdb_iox")
+        .unwrap()
+        .arg("run")
+        .arg("compactor")
+        .env(
+            "INFLUXDB_IOX_CATALOG_DSN",
+            config
+                .dsn()
+                .as_ref()
+                .unwrap_or(&format!("sqlite://{data_dir}/catalog.sqlite")),
+        )
+        .env(
+            "INFLUXDB_IOX_CATALOG_POSTGRES_SCHEMA_NAME",
+            config.catalog_schema_name(),
+        )
+        .envs(config.env())
+        .env(
+            "INFLUXDB_IOX_BIND_ADDR",
+            config.addrs().compactor_http_api().bind_addr().to_string(),
+        )
+        .env(
+            "INFLUXDB_IOX_GRPC_BIND_ADDR",
+            config.addrs().compactor_grpc_api().bind_addr().to_string(),
+        )
+        .env(
+            "INFLUXDB_IOX_GOSSIP_BIND_ADDR",
+            config
+                .addrs()
+                .compactor_gossip_api()
+                .bind_addr()
+                .to_string(),
+        )
+        .env(
+            "INFLUXDB_IOX_GOSSIP_SEED_LIST",
+            config
+                .addrs()
+                .all_gossip_apis()
+                .into_iter()
+                .map(|a| a.bind_addr().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .arg("--object-store=file")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--force-compact-partition")
+        .arg(format!("{partition_id}"))
+        .arg("--compaction-process-once")
+        .assert()
+        .stdout(
+            predicate::str::contains("cannot find column names for sort key")
+                .not()
+                .and(predicate::str::contains("clean compactor shutdown: JoinError::Panic").not()),
+        )
+        .success();
 }
 
 /// Performs http request to the specified endpoint.

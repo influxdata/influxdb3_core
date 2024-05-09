@@ -88,5 +88,6 @@ pub fn arbitrary_parquet_file_params(
         created_at: Timestamp::new(1),
         column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
         max_l0_created_at: Timestamp::new(1),
+        source: None,
     }
 }

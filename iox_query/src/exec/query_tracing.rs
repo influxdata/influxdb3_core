@@ -121,8 +121,8 @@ pub fn send_metrics_to_tracing(
     let operator_name: String = desc.chars().take_while(|x| *x != ':').collect();
 
     // Get the timings of the parent operator
-    let parent_start_time = parent_span.start.unwrap_or(default_end_time);
-    let parent_end_time = parent_span.end.unwrap_or(default_end_time);
+    let parent_start_ts = parent_span.start.unwrap_or(default_end_time);
+    let parent_end_ts = parent_span.end.unwrap_or(default_end_time);
 
     // A span for the operation, this is the aggregate of all the partition spans
     let mut operator_span = parent_span.child(operator_name.clone());
@@ -134,8 +134,8 @@ pub fn send_metrics_to_tracing(
     };
 
     // The total duration for this span and all its children and partitions
-    let mut operator_start_time = DateTime::<Utc>::MAX_UTC;
-    let mut operator_end_time = DateTime::<Utc>::MIN_UTC;
+    let mut operator_start_ts = DateTime::<Utc>::MAX_UTC;
+    let mut operator_end_ts = DateTime::<Utc>::MIN_UTC;
 
     match physical_plan.metrics() {
         None => {
@@ -144,36 +144,40 @@ pub fn send_metrics_to_tracing(
             operator_span
                 .metadata
                 .insert("missing_statistics".into(), "true".into());
+            operator_start_ts = parent_start_ts;
+            operator_end_ts = parent_end_ts;
         }
         Some(metrics) => {
             // Create a separate span for each partition in the operator
             for (partition, metrics) in partition_metrics(metrics) {
                 let (start_ts, end_ts) = get_timestamps(&metrics);
 
-                let partition_start_time = start_ts.unwrap_or(parent_start_time);
-                let partition_end_time = end_ts.unwrap_or(parent_end_time);
+                // only include timestamps from a partition when at least one timestamp is found.
+                // this prevents unexecuted streams from showing as if they had executed
+                let timestamp_found = start_ts.is_some() || end_ts.is_some();
+                if timestamp_found {
+                    operator_start_ts = operator_start_ts.min(start_ts.unwrap_or(parent_start_ts));
+                    operator_end_ts = operator_end_ts.max(end_ts.unwrap_or(parent_end_ts));
+                }
 
                 let partition_metrics = SpanMetrics {
                     output_rows: metrics.output_rows(),
                     elapsed_compute_nanos: metrics.elapsed_compute(),
                 };
-
-                operator_start_time = operator_start_time.min(partition_start_time);
-                operator_end_time = operator_end_time.max(partition_end_time);
-
                 // Update the aggregate totals in the operator span
                 operator_metrics.aggregate_child(&partition_metrics);
 
                 // Generate a span for the partition if
                 // - these metrics correspond to a partition
                 // - per partition tracing is enabled
-                if per_partition_tracing {
+                // - the partition has at least one timestamp recorded
+                if per_partition_tracing && timestamp_found {
                     if let Some(partition) = partition {
                         let mut partition_span =
                             operator_span.child(format!("{operator_name} ({partition})"));
 
-                        partition_span.start = Some(partition_start_time);
-                        partition_span.end = Some(partition_end_time);
+                        partition_span.start = Some(start_ts.unwrap_or(parent_start_ts));
+                        partition_span.end = Some(end_ts.unwrap_or(parent_end_ts));
 
                         partition_metrics.add_to_span(&mut partition_span);
 
@@ -184,31 +188,43 @@ pub fn send_metrics_to_tracing(
         }
     }
 
-    // If we've not encountered any metrics to determine the operator's start
-    // and end time, use those of the parent
-    if operator_start_time == DateTime::<Utc>::MAX_UTC {
-        operator_start_time = parent_span.start.unwrap_or(default_end_time);
+    // if no start and end time determined, skip the current span
+    if operator_start_ts == DateTime::<Utc>::MAX_UTC && operator_end_ts == DateTime::<Utc>::MIN_UTC
+    {
+        // skip current and recurse
+        for child in physical_plan.children() {
+            send_metrics_to_tracing(
+                parent_end_ts,
+                parent_span,
+                child.as_ref(),
+                per_partition_tracing,
+            );
+        }
+    } else {
+        // If we've encountered only one of start or end time, use value of the parent for the
+        // missing metric
+        if operator_start_ts == DateTime::<Utc>::MAX_UTC {
+            operator_start_ts = parent_span.start.unwrap_or(default_end_time);
+        } else if operator_end_ts == DateTime::<Utc>::MIN_UTC {
+            operator_end_ts = parent_span.end.unwrap_or(default_end_time);
+        }
+
+        operator_span.start = Some(operator_start_ts);
+        operator_span.end = Some(operator_end_ts);
+
+        // recurse
+        for child in physical_plan.children() {
+            send_metrics_to_tracing(
+                operator_end_ts,
+                &operator_span,
+                child.as_ref(),
+                per_partition_tracing,
+            );
+        }
+
+        operator_metrics.add_to_span(&mut operator_span);
+        operator_span.export();
     }
-
-    if operator_end_time == DateTime::<Utc>::MIN_UTC {
-        operator_end_time = parent_span.end.unwrap_or(default_end_time);
-    }
-
-    operator_span.start = Some(operator_start_time);
-    operator_span.end = Some(operator_end_time);
-
-    // recurse
-    for child in physical_plan.children() {
-        send_metrics_to_tracing(
-            operator_end_time,
-            &operator_span,
-            child.as_ref(),
-            per_partition_tracing,
-        );
-    }
-
-    operator_metrics.add_to_span(&mut operator_span);
-    operator_span.export();
 }
 
 #[derive(Debug)]
@@ -353,7 +369,7 @@ mod tests {
     #[test]
     fn name_truncation() {
         let name = "Foo: expr nonsense";
-        let exec = TestExec::new(name, Default::default());
+        let exec = TestExec::new(name, make_time_metric_set(Some(Utc::now()), None, None));
 
         let traces = TraceBuilder::new();
         send_metrics_to_tracing(Utc::now(), &traces.make_span(), &exec, true);
@@ -385,7 +401,7 @@ mod tests {
         // child1:   [ ts2 - ]      <-- only start timestamp
         // child2:   [ ts2 --- ts3] <-- both start and end timestamps
         // child3:   [     --- ts3] <-- only end timestamps (e.g. bad data)
-        // child4:   [     ]        <-- no timestamps
+        // child4:   [     ]        <-- no timestamps (did not run)
         // child5 (1): [   --- ts2]
         // child5 (2): [ ts2 --- ts3]
         // child5 (4): [ ts1 ---  ]
@@ -402,6 +418,8 @@ mod tests {
             "child3: baz",
             make_time_metric_set(None, Some(ts3), Some(1)),
         );
+
+        // no start + end time will not create a span
         exec.new_child("child4: bingo", make_time_metric_set(None, None, Some(1)));
         exec.new_child("child5: bongo", many_partition);
 
@@ -449,12 +467,8 @@ mod tests {
         );
         check_span(spans["TestExec - child3 (1)"], Some(ts1), Some(ts3), None);
 
-        check_span(
-            spans["TestExec - child4"],
-            Some(ts1),
-            Some(ts4),
-            Some("TestExec - child4: bingo"),
-        );
+        // check that child4 was skipped
+        assert!(!spans.contains_key("TestExec - child4"));
 
         check_span(
             spans["TestExec - child5"],
@@ -490,6 +504,11 @@ mod tests {
     fn metrics() {
         // given execution plan with execution time and compute spread across two partitions (1, and 2)
         let mut exec = TestExec::new("exec", Default::default());
+        let ts1 = Utc.timestamp_opt(1, 0).unwrap();
+        let ts2 = Utc.timestamp_opt(2, 0).unwrap();
+        let ts3 = Utc.timestamp_opt(3, 0).unwrap();
+        add_time_metrics(exec.metrics_mut(), Some(ts1), Some(ts2), Some(1));
+        add_time_metrics(exec.metrics_mut(), Some(ts1), Some(ts3), Some(2));
         add_output_rows(exec.metrics_mut(), 100, 1);
         add_output_rows(exec.metrics_mut(), 200, 2);
 

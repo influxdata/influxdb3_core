@@ -512,6 +512,7 @@ mod tests {
     use std::{collections::BTreeSet, sync::Arc};
 
     use super::*;
+    use datafusion::logical_expr::{LogicalPlan, Projection};
     use datafusion::{logical_expr::LogicalPlanBuilder, prelude::*};
 
     #[test]
@@ -563,6 +564,32 @@ mod tests {
         let predicate: proto::Predicate = predicate.try_into().unwrap();
         let base64 = encode_proto_predicate_as_base64(&predicate).unwrap();
         let predicate2 = decode_proto_predicate_from_base64(&base64).unwrap();
+        assert_eq!(predicate, predicate2);
+    }
+
+    #[tokio::test]
+    async fn udf_deserialization() {
+        // parse from sql, such that we are testing against the corresponding datafusion logical plan
+        let sql = "select date_bin('1 hour', timestamp '2000-05-05 12:10:00Z', timestamp '2000-05-05 12:00:00Z') = timestamp '2000-05-05 12:00:00Z'";
+        let ctx = SessionContext::default();
+
+        let df = ctx.sql(sql).await.expect("sql should parse");
+        let expr = if let LogicalPlan::Projection(Projection { expr, .. }) = df.logical_plan() {
+            expr.to_owned()
+        } else {
+            unreachable!("should not have failed to parse expression");
+        };
+
+        let filters = proto2::Filters::try_from(expr.clone()).expect("should serialize filter");
+        let filters: Vec<Expr> = filters.try_into().expect("should deserialize filter");
+        assert_eq!(expr.first().unwrap(), filters.first().unwrap());
+
+        let predicate = Predicate::default().with_exprs(expr);
+        let predicate2: proto::Predicate = predicate
+            .clone()
+            .try_into()
+            .expect("should serialize predicate");
+        let predicate2: Predicate = predicate2.try_into().expect("should deserialize predicate");
         assert_eq!(predicate, predicate2);
     }
 

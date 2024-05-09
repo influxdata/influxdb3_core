@@ -162,6 +162,7 @@ where
     {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.reset(); // otherwise first tick return immediately
         let state = State {
             inner: s.boxed(),
             schema: None,
@@ -313,32 +314,99 @@ mod tests {
     };
     use datafusion::assert_batches_eq;
     use futures::TryStreamExt;
-    use test_helpers::maybe_start_logging;
+    use test_helpers::{assert_contains, assert_not_contains, tracing::TracingCapture};
 
     use super::{test_util::make_stream_slow, *};
 
     type BatchStream = BoxStream<'static, Result<RecordBatch, FlightError>>;
     type FlightStream = BoxStream<'static, Result<FlightData, FlightError>>;
 
+    const LOG_KEEP_ALIVE: &str = "level = INFO; message = stream keep-alive";
+    const LOG_SCHEMA_TOO_LATE: &str =
+        "level = WARN; message = cannot send keep-alive because no schema was transmitted yet";
+
     #[tokio::test]
     #[should_panic(expected = "stream timeout")]
     async fn test_timeout() {
-        let s = make_test_stream(false);
+        let s = TestParams {
+            keep_alive: None,
+            ..Default::default()
+        }
+        .make_test_stream();
         let s = FlightRecordBatchStream::new_from_flight_data(s);
         s.collect::<Vec<_>>().await;
     }
 
     #[tokio::test]
     async fn test_keep_alive() {
-        maybe_start_logging();
+        let capture = TracingCapture::new();
 
-        let s = make_test_stream(true);
+        let s = TestParams::default().make_test_stream();
         let s = FlightRecordBatchStream::new_from_flight_data(s);
         let batches: Vec<_> = s.try_collect().await.unwrap();
         assert_batches_eq!(
             ["+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"],
             &batches
         );
+
+        let logs = filter_logs(capture);
+        assert_not_contains!(&logs, LOG_SCHEMA_TOO_LATE);
+        assert_contains!(&logs, LOG_KEEP_ALIVE);
+    }
+
+    #[tokio::test]
+    async fn test_too_slow() {
+        let capture = TracingCapture::new();
+
+        let s = TestParams {
+            slow_pre_encode: None,
+            slow_post_encode: Some(Duration::from_millis(200)),
+            keep_alive: Some(Duration::from_millis(100)),
+            panic: None,
+        }
+        .make_test_stream();
+        let s = FlightRecordBatchStream::new_from_flight_data(s);
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        assert_batches_eq!(
+            ["+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"],
+            &batches
+        );
+
+        let logs = filter_logs(capture);
+        assert_contains!(&logs, LOG_SCHEMA_TOO_LATE);
+        assert_contains!(&logs, LOG_KEEP_ALIVE);
+    }
+
+    #[tokio::test]
+    async fn test_no_keep_alive_required() {
+        let capture = TracingCapture::new();
+
+        let s = TestParams {
+            slow_pre_encode: None,
+            slow_post_encode: Some(Duration::from_millis(100)),
+            keep_alive: Some(Duration::from_millis(200)),
+            panic: Some(Duration::from_millis(500)),
+        }
+        .make_test_stream();
+        let s = FlightRecordBatchStream::new_from_flight_data(s);
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        assert_batches_eq!(
+            ["+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"],
+            &batches
+        );
+
+        let logs = filter_logs(capture);
+        assert_not_contains!(&logs, LOG_SCHEMA_TOO_LATE);
+        assert_not_contains!(&logs, LOG_KEEP_ALIVE);
+    }
+
+    fn filter_logs(capture: TracingCapture) -> String {
+        let lines = capture.to_string();
+        let lines = lines
+            .split('\n')
+            .filter(|line| !line.contains("level = TRACE") && !lines.contains("level = DEBUG"))
+            .collect::<Vec<_>>();
+        lines.join("\n")
     }
 
     /// Creates a stream like the query processing would do.
@@ -380,16 +448,57 @@ mod tests {
         .boxed()
     }
 
-    fn make_test_stream(keep_alive: bool) -> FlightStream {
-        let (s, schema) = make_query_result_stream();
-        let s = make_stream_slow(s, Duration::from_millis(500));
-        let s = make_flight_data_stream(s, schema);
-        let s = if keep_alive {
-            KeepAliveStream::new(s, Duration::from_millis(100)).boxed()
-        } else {
-            s
-        };
+    #[derive(Debug)]
+    struct TestParams {
+        slow_pre_encode: Option<Duration>,
+        slow_post_encode: Option<Duration>,
+        keep_alive: Option<Duration>,
+        panic: Option<Duration>,
+    }
 
-        panic_on_stream_timeout(s, Duration::from_millis(250))
+    impl Default for TestParams {
+        fn default() -> Self {
+            Self {
+                slow_pre_encode: Some(Duration::from_millis(500)),
+                slow_post_encode: None,
+                keep_alive: Some(Duration::from_millis(100)),
+                panic: Some(Duration::from_millis(250)),
+            }
+        }
+    }
+
+    impl TestParams {
+        fn make_test_stream(self) -> FlightStream {
+            let Self {
+                slow_pre_encode,
+                slow_post_encode,
+                keep_alive,
+                panic,
+            } = self;
+
+            let (s, schema) = make_query_result_stream();
+            let s = if let Some(slow_pre_encode) = slow_pre_encode {
+                make_stream_slow(s, slow_pre_encode)
+            } else {
+                s
+            };
+            let s = make_flight_data_stream(s, schema);
+            let s = if let Some(slow_post_encode) = slow_post_encode {
+                make_stream_slow(s, slow_post_encode)
+            } else {
+                s
+            };
+            let s = if let Some(keep_alive) = keep_alive {
+                KeepAliveStream::new(s, keep_alive).boxed()
+            } else {
+                s
+            };
+
+            if let Some(panic) = panic {
+                panic_on_stream_timeout(s, panic)
+            } else {
+                s
+            }
+        }
     }
 }

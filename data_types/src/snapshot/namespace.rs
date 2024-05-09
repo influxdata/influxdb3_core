@@ -3,6 +3,7 @@ use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
 use generated_types::influxdata::iox::partition_template::v1::PartitionTemplate;
 use snafu::{ResultExt, Snafu};
+use std::time::Duration;
 
 use crate::{
     Namespace, NamespaceId, NamespacePartitionTemplateOverride, NamespaceVersion,
@@ -183,6 +184,17 @@ impl NamespaceSnapshot {
     /// Get namespace ID.
     pub fn namespace_id(&self) -> NamespaceId {
         self.id
+    }
+
+    /// Returns the retention period if any
+    pub fn retention_period(&self) -> Option<Duration> {
+        self.retention_period_ns
+            .map(|x| Duration::from_nanos(x as _))
+    }
+
+    /// When this file was deleted if any
+    pub fn deleted_at(&self) -> Option<Timestamp> {
+        self.deleted_at
     }
 }
 

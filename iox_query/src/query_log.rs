@@ -243,7 +243,7 @@ impl QueryLogEntry {
 }
 
 /// Snapshot of the entries the [`QueryLog`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct QueryLogEntries {
     /// Entries.
     pub entries: VecDeque<Arc<QueryLogEntry>>,

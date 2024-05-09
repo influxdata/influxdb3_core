@@ -27,7 +27,7 @@ impl PhysicalOptimizerRule for SplitDedup {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(&|plan| {
+        plan.transform_up(|plan| {
             let Some(dedup_exec) = plan.as_any().downcast_ref::<DeduplicateExec>() else {
                 return Ok(Transformed::no(plan));
             };

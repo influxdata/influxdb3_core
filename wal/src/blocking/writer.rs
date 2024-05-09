@@ -24,9 +24,9 @@ use std::{
 /// amount of memory overhead for the lifetime of the writer.
 const SOFT_MAX_BUFFER_LEN: usize = 1024 * 128; // 128kiB
 
-/// Struct for writing data to a segment file in a wal
+/// Struct for synchronously writing data to an open WAL segment file.
 #[derive(Debug)]
-pub struct OpenSegmentFileWriter {
+pub(crate) struct OpenSegmentFileWriter {
     id: SegmentId,
     path: PathBuf,
     f: File,
@@ -36,7 +36,10 @@ pub struct OpenSegmentFileWriter {
 }
 
 impl OpenSegmentFileWriter {
-    pub fn new_in_directory(
+    /// Initialises a new [`OpenSegmentFileWriter`], creating the segment file
+    /// in `dir` and assigning it an id from the provided source (incrementing
+    /// the value to mark it as "used").
+    pub(crate) fn new_in_directory(
         dir: impl Into<PathBuf>,
         next_id_source: Arc<AtomicU64>,
     ) -> Result<Self> {
@@ -46,6 +49,7 @@ impl OpenSegmentFileWriter {
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .context(SegmentCreateSnafu)?;
 
@@ -70,11 +74,8 @@ impl OpenSegmentFileWriter {
         })
     }
 
-    pub fn id(&self) -> SegmentId {
-        self.id
-    }
-
-    pub fn write(&mut self, data: &[u8]) -> Result<WriteSummary> {
+    /// Write the opaque `data` as an entry in the active WAL segment.
+    pub(crate) fn write(&mut self, data: &[u8]) -> Result<WriteSummary> {
         // Ensure the write buffer is always empty before using it.
         self.buffer.clear();
         // And shrink the buffer below the maximum permitted size should the odd
@@ -136,7 +137,9 @@ impl OpenSegmentFileWriter {
         })
     }
 
-    pub fn close(self) -> Result<ClosedSegment> {
+    /// Closes this writer, consuming it and returning the resultant
+    /// [`ClosedSegment`].
+    pub(crate) fn close(self) -> Result<ClosedSegment> {
         let Self {
             id,
             path,
@@ -154,6 +157,7 @@ impl OpenSegmentFileWriter {
 }
 
 #[derive(Debug, Snafu)]
+#[allow(missing_docs)]
 pub enum Error {
     SegmentCreate {
         source: io::Error,
@@ -197,7 +201,8 @@ pub enum Error {
     },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+/// The result type returned by the synchronous [`OpenSegmentFileWriter`].
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A [`HasherWrapper`] acts as a [`Write`] decorator, recording the crc
 /// checksum of the data wrote to the inner [`Write`] implementation.

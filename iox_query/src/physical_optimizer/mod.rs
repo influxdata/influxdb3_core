@@ -4,16 +4,22 @@ use datafusion::{execution::context::SessionState, physical_optimizer::PhysicalO
 
 pub(crate) use self::limits::ParquetFileMetrics;
 use self::{
+    cached_parquet_data::CachedParquetData,
     dedup::{
         dedup_null_columns::DedupNullColumns, dedup_sort_order::DedupSortOrder, split::SplitDedup,
     },
     limits::CheckLimits,
     predicate_pushdown::PredicatePushdown,
     projection_pushdown::ProjectionPushdown,
-    sort::{order_union_sorted_inputs::OrderUnionSortedInputs, parquet_sortness::ParquetSortness},
+    sort::{
+        order_union_sorted_inputs::OrderUnionSortedInputs,
+        order_union_sorted_inputs_for_constants::OrderUnionSortedInputsForConstants,
+        parquet_sortness::ParquetSortness,
+    },
     union::{nested_union::NestedUnion, one_union::OneUnion},
 };
 
+mod cached_parquet_data;
 mod chunk_extraction;
 mod dedup;
 mod limits;
@@ -46,8 +52,14 @@ pub fn register_iox_physical_optimizers(state: SessionState) -> SessionState {
     // Append DataFusion physical rules to the IOx-specific rules
     optimizers.append(&mut state.physical_optimizers().to_vec());
 
-    // Add a rule to optimize plan with limit
+    // install cached parquet readers AFTER DataFusion (re-)creates ParquetExec's
+    optimizers.push(Arc::new(CachedParquetData));
+
+    // Add a rule to optimize plan that use ProgressiveEval
+    // for limit query
     optimizers.push(Arc::new(OrderUnionSortedInputs));
+    // for show tag values query
+    optimizers.push(Arc::new(OrderUnionSortedInputsForConstants));
 
     // Perform the limits check last giving the other rules the best chance
     // to keep the under the limit.

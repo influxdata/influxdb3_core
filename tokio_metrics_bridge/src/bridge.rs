@@ -24,7 +24,7 @@ use workspace_hack as _;
 /// [`Runtime`]: tokio::runtime::Runtime
 pub fn setup_tokio_metrics(
     runtime_metrics: RuntimeMetrics,
-    runtime_name: &'static str,
+    runtime_name: &str,
     registry: Arc<Registry>,
 ) {
     // Don't use the runtime_name directly as a instrument name, because this may confuse users when the name conflicts.
@@ -33,7 +33,7 @@ pub fn setup_tokio_metrics(
     let instrument = TokioInstrument::new(runtime_metrics, runtime_name);
     let mut guard = dispatcher.instruments.write();
 
-    match guard.entry(runtime_name) {
+    match guard.entry(runtime_name.to_owned()) {
         Entry::Vacant(v) => {
             v.insert(instrument);
         }
@@ -48,7 +48,7 @@ pub fn setup_tokio_metrics(
 #[derive(Debug, Clone, Default)]
 struct TokioInstrumentDispatcher {
     /// Maps from runtime name to the actual instrument.
-    instruments: Arc<RwLock<HashMap<&'static str, TokioInstrument>>>,
+    instruments: Arc<RwLock<HashMap<String, TokioInstrument>>>,
 }
 
 macro_rules! rt_metric {
@@ -281,15 +281,21 @@ struct TokioInstrument {
 }
 
 impl TokioInstrument {
-    fn new(runtime_metrics: RuntimeMetrics, runtime_name: &'static str) -> Self {
+    fn new(runtime_metrics: RuntimeMetrics, runtime_name: &str) -> Self {
         let workers = runtime_metrics.num_workers();
         Self {
             runtime_metrics,
-            attr_rt: Attributes::from(&[("runtime", runtime_name)]),
+            attr_rt: Attributes::from([(
+                "runtime",
+                Cow::<'static, str>::from(runtime_name.to_owned()),
+            )]),
             attr_worker: (0..workers)
                 .map(|w| {
                     Attributes::from([
-                        ("runtime", Cow::<'static, str>::from(runtime_name)),
+                        (
+                            "runtime",
+                            Cow::<'static, str>::from(runtime_name.to_owned()),
+                        ),
                         ("worker", Cow::<'static, str>::from(w.to_string())),
                     ])
                 })

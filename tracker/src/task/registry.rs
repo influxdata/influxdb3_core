@@ -20,9 +20,9 @@ impl FromStr for TaskId {
     }
 }
 
-impl ToString for TaskId {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 

@@ -129,11 +129,12 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
 use datafusion::logical_expr::{
-    binary_expr, cast, coalesce, lit, BinaryExpr, Expr, ExprSchemable, GetIndexedField, Operator,
+    binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, GetIndexedField, Operator,
 };
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::prelude::{when, Column};
+use datafusion_util::coalesce;
 use observability_deps::tracing::trace;
 use predicate::rpc_predicate::{iox_expr_rewrite, simplify_predicate};
 
@@ -172,7 +173,7 @@ pub(super) fn rewrite_conditional_expr(
         // The next step will fail with type errors if we don't do this.
         .and_then(|expr| {
             simplifier
-                .coerce(expr.data, Arc::clone(&schema.df_schema))
+                .coerce(expr.data, &schema.df_schema)
                 .map(Transformed::yes)
         })
         .map(|expr| log_rewrite(expr, "after coerce"))

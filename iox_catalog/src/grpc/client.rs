@@ -12,18 +12,16 @@ use data_types::snapshot::root::RootSnapshot;
 use futures::TryStreamExt;
 use http::HeaderName;
 use observability_deps::tracing::{debug, info, warn};
-use tonic::transport::{Channel, Uri};
+use tonic::transport::{Channel, Endpoint, Uri};
 use trace::ctx::SpanContext;
 use trace_http::ctx::format_jaeger_trace_context;
 
-use crate::interface::RootRepo;
-use crate::{
-    interface::{
-        CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-        RepoCollection, Result, SoftDeletedRows, TableRepo,
-    },
-    metrics::MetricDecorator,
+use crate::interface::{namespace_snapshot_by_name, RootRepo};
+use crate::interface::{
+    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
+    RepoCollection, Result, SoftDeletedRows, TableRepo,
 };
+use crate::metrics::CatalogMetrics;
 use backoff::{Backoff, BackoffError};
 use data_types::snapshot::partition::PartitionSnapshot;
 use data_types::{
@@ -52,7 +50,7 @@ type InstrumentedChannel = TraceService<Channel>;
 /// Builder for [`GrpcCatalogClient`].
 #[derive(Debug)]
 pub struct GrpcCatalogClientBuilder {
-    uri: Uri,
+    endpoints: Vec<Uri>,
     metrics: Arc<metric::Registry>,
     time_provider: Arc<dyn TimeProvider>,
     timeout: Duration,
@@ -64,7 +62,7 @@ impl GrpcCatalogClientBuilder {
     /// Build client.
     pub fn build(self) -> GrpcCatalogClient {
         let Self {
-            uri,
+            endpoints: uri,
             metrics,
             time_provider,
             timeout,
@@ -72,22 +70,34 @@ impl GrpcCatalogClientBuilder {
             trace_header_name,
         } = self;
 
-        let channel = TraceService::new_client(
-            Channel::builder(uri)
+        let channel = match uri.len() {
+            1 => Channel::builder(uri.into_iter().next().unwrap())
                 .timeout(timeout)
                 .connect_timeout(connect_timeout)
                 .connect_lazy(),
-            Arc::new(RequestMetrics::new(
-                Arc::clone(&metrics),
-                MetricFamily::GrpcClient,
-            )),
-            None,
-            "catalog",
-        );
+            _ => {
+                let endpoints = uri.into_iter().map(|uri| {
+                    Endpoint::from(uri)
+                        .timeout(timeout)
+                        .connect_timeout(connect_timeout)
+                });
+                Channel::balance_list(endpoints)
+            }
+        };
+
+        let req_metrics = Arc::new(RequestMetrics::new(
+            Arc::clone(&metrics),
+            MetricFamily::GrpcClient,
+        ));
+        let channel = TraceService::new_client(channel, req_metrics, None, "catalog");
 
         GrpcCatalogClient {
             channel,
-            metrics,
+            metrics: CatalogMetrics::new(
+                metrics,
+                Arc::clone(&time_provider),
+                GrpcCatalogClient::NAME,
+            ),
             time_provider,
             trace_header_name,
         }
@@ -119,32 +129,28 @@ impl GrpcCatalogClientBuilder {
 #[derive(Debug)]
 pub struct GrpcCatalogClient {
     channel: InstrumentedChannel,
-    metrics: Arc<metric::Registry>,
+    metrics: CatalogMetrics,
     time_provider: Arc<dyn TimeProvider>,
     trace_header_name: HeaderName,
 }
 
 impl GrpcCatalogClient {
+    const NAME: &'static str = "grpc_client";
+
     /// Create builder for new client.
     pub fn builder(
-        uri: Uri,
+        endpoints: Vec<Uri>,
         metrics: Arc<metric::Registry>,
         time_provider: Arc<dyn TimeProvider>,
     ) -> GrpcCatalogClientBuilder {
         GrpcCatalogClientBuilder {
-            uri,
+            endpoints,
             metrics,
             time_provider,
             timeout: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(2),
             trace_header_name: HeaderName::from_static("uber-trace-id"),
         }
-    }
-}
-
-impl std::fmt::Display for GrpcCatalogClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "grpc")
     }
 }
 
@@ -155,21 +161,16 @@ impl Catalog for GrpcCatalogClient {
     }
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
-        Box::new(MetricDecorator::new(
-            Box::new(GrpcCatalogClientRepos {
-                channel: self.channel.clone(),
-                span_ctx: None,
-                trace_header_name: self.trace_header_name.clone(),
-            }),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.time_provider),
-            "grpc_client",
-        ))
+        Box::new(self.metrics.repos(Box::new(GrpcCatalogClientRepos {
+            channel: self.channel.clone(),
+            span_ctx: None,
+            trace_header_name: self.trace_header_name.clone(),
+        })))
     }
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
-        Arc::clone(&self.metrics)
+        self.metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
@@ -180,6 +181,10 @@ impl Catalog for GrpcCatalogClient {
         Err(Error::NotImplemented {
             descr: "active applications".to_owned(),
         })
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
     }
 }
 
@@ -497,6 +502,28 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             })
             .await?;
 
+        let ns = resp.namespace.required().ctx("namespace")?;
+        let snapshot = NamespaceSnapshot::decode(ns, resp.generation)?;
+        Ok(snapshot)
+    }
+
+    async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
+        let req = proto::NamespaceSnapshotByNameRequest {
+            name: name.to_string(),
+        };
+        let r = self
+            .retry("namespace_snapshot", req, |req, mut client| async move {
+                client.namespace_snapshot_by_name(req).await
+            })
+            .await;
+
+        if matches!(r, Err(Error::NotImplemented { .. })) {
+            // Fallback logic for old servers
+            warn!("NamespaceSnapshotByName not implemented by remote, falling back");
+            return namespace_snapshot_by_name(self, name).await;
+        }
+
+        let resp = r?;
         let ns = resp.namespace.required().ctx("namespace")?;
         let snapshot = NamespaceSnapshot::decode(ns, resp.generation)?;
         Ok(snapshot)

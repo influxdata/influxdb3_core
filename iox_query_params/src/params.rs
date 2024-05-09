@@ -613,6 +613,10 @@ impl TryFrom<ArrayRef> for StatementParam {
             DataType::Decimal256(_, _) => unsupported_type("Decimal256"),
             DataType::Map(_, _) => unsupported_type("Map"),
             DataType::RunEndEncoded(_, _) => unsupported_type("RunEndEncoded"),
+            DataType::BinaryView => unsupported_type("BinaryView"),
+            DataType::Utf8View => unsupported_type("Utf8View"),
+            DataType::ListView(_) => unsupported_type("ListView"),
+            DataType::LargeListView(_) => unsupported_type("LargeListView"),
         }
     }
 }

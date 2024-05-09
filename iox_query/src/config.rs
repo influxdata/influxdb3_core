@@ -52,6 +52,13 @@ extensions_options! {
 
         /// Limit for the number of parquet files to scan in a single query. Zero means no limit.
         pub parquet_file_limit: usize, default = 0
+
+        /// Use an InfluxDB-specific parquet loader.
+        ///
+        /// Our custom loader currently has the following features:
+        /// - avoids excessive read request for parquet files
+        /// - decouples tokio IO/main-runtime from CPU-bound DataFusion runtime
+        pub use_cached_parquet_loader: bool, default = true
     }
 }
 

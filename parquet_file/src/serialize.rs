@@ -2,13 +2,18 @@
 //!
 //! [`RecordBatch`]: arrow::record_batch::RecordBatch
 
-use std::{io::Write, sync::Arc};
+use std::{collections::HashMap, io::Write, sync::Arc};
 
 use datafusion::{
-    error::DataFusionError, execution::memory_pool::MemoryPool,
-    physical_plan::SendableRecordBatchStream,
+    config::{ParquetOptions, TableParquetOptions},
+    datasource::{
+        file_format::parquet::ParquetSink, listing::ListingTableUrl, physical_plan::FileSinkConfig,
+    },
+    error::DataFusionError,
+    execution::{memory_pool::MemoryPool, runtime_env::RuntimeEnv, TaskContext},
+    physical_plan::{insert::DataSink, SendableRecordBatchStream},
 };
-use datafusion_util::config::BATCH_SIZE;
+use datafusion_util::config::{table_parquet_options, BATCH_SIZE};
 use futures::{pin_mut, TryStreamExt};
 use observability_deps::tracing::{debug, trace, warn};
 use parquet::{
@@ -18,7 +23,7 @@ use parquet::{
 };
 use thiserror::Error;
 
-use crate::{metadata::IoxMetadata, writer::TrackedMemoryArrowWriter};
+use crate::{metadata::IoxMetadata, storage::ParquetUploadInput, writer::TrackedMemoryArrowWriter};
 
 /// Parquet row group write size
 pub const ROW_GROUP_WRITE_SIZE: usize = 1024 * 1024;
@@ -150,7 +155,7 @@ where
     let writer_meta = writer.close()?;
     if writer_meta.num_rows == 0 {
         // throw warning if all input batches are empty
-        warn!("parquet serialisation encoded 0 rows");
+        warn!("parquet serialization encoded 0 rows");
         return Err(CodecError::NoRows);
     }
 
@@ -186,6 +191,94 @@ pub async fn to_parquet_bytes(
     trace!(?meta, "generated parquet file metadata");
 
     Ok((bytes, meta))
+}
+
+/// Settings related to writing parquet files in parallel
+///
+/// Currently, this is a near-direct copy of the setting [used in the ParquetSink](https://github.com/apache/datafusion/blob/f8c623fe045d70a87eac8dc8620b74ff73be56d5/datafusion/core/src/datasource/file_format/parquet.rs#L803-L804).
+///
+/// How the two config settings interact with each other is based upon [this implementation](https://github.com/apache/datafusion/blob/f8c623fe045d70a87eac8dc8620b74ff73be56d5/datafusion/core/src/datasource/file_format/parquet.rs#L983-L1017),
+/// where the separately spawned column writers have their outputs buffered to the row group serializers.
+#[derive(Debug, Clone, Copy)]
+pub struct ParallelParquetWriterOptions {
+    /// How many row groups may be serialized at once.
+    pub maximum_parallel_row_group_writers: usize,
+    /// How many columns may be written in parallel, across all row groups.
+    pub maximum_buffered_record_batches_per_stream: usize,
+}
+
+/// Performs a parallelized parquet encoding and upload to object_store.
+///
+/// Current implementation uses the [`ParquetSink`] from DataFusion,
+/// and uploads on the same threadpool as encoding.
+pub async fn to_parquet_upload(
+    batches: SendableRecordBatchStream,
+    meta: &IoxMetadata,
+    upload_input: ParquetUploadInput,
+    runtime: Arc<RuntimeEnv>,
+    parallel_writer_options: ParallelParquetWriterOptions,
+) -> Result<parquet::format::FileMetaData, CodecError> {
+    let table_path = ListingTableUrl::parse(format!("file:///{}", upload_input.path()))
+        .map_err(CodecError::DataFusion)?;
+    let object_store_url = upload_input.object_store_url();
+
+    // parquet options
+    let default_options = table_parquet_options();
+    let meta: Vec<KeyValue> = meta.try_into()?;
+    assert_eq!(
+        meta.len(),
+        1,
+        "expected IoxMetadata to convert into a single KeyValue"
+    );
+    let ParallelParquetWriterOptions {
+        maximum_parallel_row_group_writers,
+        maximum_buffered_record_batches_per_stream,
+    } = parallel_writer_options;
+    let parquet_options = TableParquetOptions {
+        global: ParquetOptions {
+            allow_single_file_parallelism: true,
+            maximum_parallel_row_group_writers,
+            maximum_buffered_record_batches_per_stream,
+            ..default_options.global
+        },
+        key_value_metadata: HashMap::from([(meta[0].key.clone(), meta[0].value.clone())]),
+        ..default_options
+    };
+
+    // make sink
+    let sink_config = FileSinkConfig {
+        object_store_url: object_store_url.clone(),
+        file_groups: vec![], // I believe this is unused in the ParquetSink path (is used for other DataSink impls).
+        table_paths: vec![table_path], // Sink location used by the demuxer. Single location means no splitting; not a collection of outputs.
+        output_schema: batches.schema(),
+        table_partition_cols: vec![], // should be empty, since we want sink to be a single parquet
+        overwrite: false,
+    };
+    let sink = ParquetSink::new(sink_config, parquet_options);
+
+    // run sink write_all task
+    let task_context = Arc::new(TaskContext::default().with_runtime(runtime));
+    let num_rows = sink
+        .write_all(batches, &task_context)
+        .await
+        .map_err(CodecError::DataFusion)?;
+
+    if num_rows == 0 {
+        // throw warning if all input batches are empty
+        warn!("parquet serialization encoded 0 rows");
+        return Err(CodecError::NoRows);
+    }
+
+    // get file metadata
+    let mut written_metas = sink.written().drain().collect::<Vec<_>>();
+    assert_eq!(
+        written_metas.len(),
+        1,
+        "should have written a single parquet file"
+    );
+    let writer_meta = written_metas.pop().unwrap().1;
+
+    Ok(writer_meta)
 }
 
 /// Helper to construct [`WriterProperties`] for a list of given [`KeyValue`] metadata values

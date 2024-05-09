@@ -174,7 +174,7 @@ pub(crate) fn rebase_expr(
 
 pub(crate) fn contains_expr(expr: &Expr, needle: &Expr) -> bool {
     let mut found = false;
-    expr.apply(&mut |expr| {
+    expr.apply(|expr| {
         if expr == needle {
             found = true;
             Ok(TreeNodeRecursion::Stop)
@@ -220,7 +220,7 @@ where
     F: Fn(&Expr) -> bool,
 {
     let mut exprs = vec![];
-    expr.apply(&mut |expr| {
+    expr.apply(|expr| {
         if test_fn(expr) {
             if !(exprs.contains(expr)) {
                 exprs.push(expr.clone())

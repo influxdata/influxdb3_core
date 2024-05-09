@@ -89,23 +89,22 @@ where
 {
     type Database = DB;
 
-    fn fetch_many<'e, 'q: 'e, E: 'q>(
+    fn fetch_many<'e, 'q, E>(
         self,
         query: E,
     ) -> BoxStream<'e, Result<Either<DB::QueryResult, DB::Row>, Error>>
     where
-        E: Execute<'q, Self::Database>,
+        'q: 'e,
+        E: Execute<'q, Self::Database> + 'q,
     {
         let pool = self.pool.read().expect("poisoned");
         pool.fetch_many(query)
     }
 
-    fn fetch_optional<'e, 'q: 'e, E: 'q>(
-        self,
-        query: E,
-    ) -> BoxFuture<'e, Result<Option<DB::Row>, Error>>
+    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<DB::Row>, Error>>
     where
-        E: Execute<'q, Self::Database>,
+        'q: 'e,
+        E: Execute<'q, Self::Database> + 'q,
     {
         let pool = self.pool.read().expect("poisoned");
         pool.fetch_optional(query)

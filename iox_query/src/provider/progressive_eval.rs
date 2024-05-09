@@ -150,12 +150,13 @@ impl ExecutionPlan for ProgressiveEvalExec {
     }
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
-        self.input()
+        let input_ordering = self
+            .input()
             .properties()
             .output_ordering()
-            .map(|_| None)
-            .into_iter()
-            .collect()
+            .map(PhysicalSortRequirement::from_sort_exprs);
+
+        vec![input_ordering]
     }
 
     /// ProgressiveEvalExec will only accept sorted input

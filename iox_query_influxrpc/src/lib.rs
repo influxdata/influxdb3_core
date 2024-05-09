@@ -257,14 +257,9 @@ impl InfluxRpcPlanner {
             &ctx,
             &self.meta,
         )
-        .try_filter_map(
-            |(table_name, table_schema, table_predicate, chunks)| async move {
-                let chunks_full = prune_chunks(&table_schema, chunks, &table_predicate);
-
-                Ok((!chunks_full.is_empty())
-                    .then_some((table_name, Some((table_predicate, chunks_full)))))
-            },
-        )
+        .try_filter_map(|(table_name, _, table_predicate, chunks)| async move {
+            Ok((!chunks.is_empty()).then_some((table_name, Some((table_predicate, chunks)))))
+        })
         .try_collect()
         .await?;
 
@@ -347,7 +342,7 @@ impl InfluxRpcPlanner {
             &ctx,
             &self.meta,
         )
-        .and_then(|(table_name, table_schema, predicate, chunks)| {
+        .and_then(|(table_name, _, predicate, chunks)| {
             let mut ctx = ctx.child_ctx("table");
             ctx.set_metadata("table", table_name.to_string());
 
@@ -355,7 +350,6 @@ impl InfluxRpcPlanner {
                 let mut chunks_full = vec![];
                 let mut known_columns = BTreeSet::new();
 
-                let chunks = prune_chunks(&table_schema, chunks, &predicate);
                 for chunk in cheap_chunk_first(chunks) {
                     // get only tag columns from metadata
                     let schema = chunk.schema();
@@ -476,10 +470,9 @@ impl InfluxRpcPlanner {
             &ctx,
             &self.meta,
         )
-        .and_then(|(table_name, table_schema, predicate, chunks)| async move {
+        .and_then(|(table_name, _, predicate, chunks)| async move {
             let mut chunks_full = vec![];
 
-            let chunks = prune_chunks(&table_schema, chunks, &predicate);
             for chunk in cheap_chunk_first(chunks) {
                 // use schema to validate column type
                 let schema = chunk.schema();
@@ -1279,9 +1272,7 @@ fn table_chunk_stream<'a>(
 > + 'a {
     futures::stream::iter(table_predicates)
         .filter_map(move |(table_name, predicate)| async move {
-            let Some(table_schema) = meta.table_schema(table_name) else {
-                return None;
-            };
+            let table_schema = meta.table_schema(table_name)?;
             let table_schema = Arc::new(table_schema);
             Some((table_name, table_schema, predicate))
         })
@@ -1433,13 +1424,7 @@ where
     P: Send,
 {
     table_chunk_stream(namespace, true, table_predicates, &ctx, &meta)
-        .and_then(|(table_name, table_schema, predicate, chunks)| async move {
-            let chunks = prune_chunks(&table_schema, chunks, &predicate);
-            Ok((table_name, predicate, chunks))
-        })
-        // rustc seems to heavily confused about the filter step here, esp. it dislikes `.try_filter` and even
-        // `.try_filter_map` requires some additional type annotations
-        .try_filter_map(|(table_name, predicate, chunks)| async move {
+        .try_filter_map(|(table_name, _, predicate, chunks)| async move {
             Ok((!chunks.is_empty()).then_some((table_name, predicate, chunks)))
                 as Result<Option<(&Arc<str>, Predicate, Vec<_>)>>
         })
@@ -1779,26 +1764,6 @@ fn make_selector_expr(agg: Aggregate, field: FieldExpr<'_>) -> Result<Expr> {
 fn cheap_chunk_first(mut chunks: Vec<Arc<dyn QueryChunk>>) -> Vec<Arc<dyn QueryChunk>> {
     chunks.sort_by_key(|chunk| Reverse(chunk.order()));
     chunks
-}
-
-fn prune_chunks(
-    table_schema: &Schema,
-    chunks: Vec<Arc<dyn QueryChunk>>,
-    predicate: &Predicate,
-) -> Vec<Arc<dyn QueryChunk>> {
-    use iox_query::pruning::prune_chunks;
-
-    let filters = predicate.filter_expr().into_iter().collect::<Vec<_>>();
-    let Ok(mask) = prune_chunks(table_schema, &chunks, &filters) else {
-        return chunks;
-    };
-
-    chunks
-        .into_iter()
-        .zip(mask)
-        .filter(|(_c, m)| *m)
-        .map(|(c, _m)| c)
-        .collect()
 }
 
 fn chunk_column_names(
