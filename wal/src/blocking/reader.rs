@@ -1,4 +1,4 @@
-use crate::{FileTypeIdentifier, SegmentEntry, SegmentIdBytes, SequencedWalOp};
+use crate::{FileTypeIdentifier, SegmentEntry, SegmentId, SegmentIdBytes, SequencedWalOp};
 use byteorder::{BigEndian, ReadBytesExt};
 use crc32fast::Hasher;
 use generated_types::influxdata::iox::wal::v1::WalOpBatch as ProtoWalOpBatch;
@@ -11,54 +11,75 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// A closed segment file reader over an `R`, tracking the number of compressed
-/// bytes read.
+/// A closed segment reader over an `R`, tracking the cumulative number of
+/// encoded bytes read from the reader.
 #[derive(Debug)]
-pub struct ClosedSegmentFileReader<R>(R, u64);
+pub(crate) struct ClosedSegmentReader<R> {
+    reader: R,
+    cumulative_bytes_read: u64,
 
-impl ClosedSegmentFileReader<BufReader<File>> {
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+    file_type_identifier: FileTypeIdentifier,
+    segment_id: SegmentId,
+}
+
+impl ClosedSegmentReader<BufReader<File>> {
+    /// A specialised constructor for a [`ClosedSegmentReader`] which wraps a
+    /// buffered file reader for the file at `path`.
+    pub(crate) fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let f = File::open(path).context(UnableToOpenFileSnafu { path })?;
-        let f = BufReader::new(f);
-        Ok(Self::new(f))
+        let file = File::open(path).context(UnableToOpenFileSnafu { path })?;
+        let file = BufReader::new(file);
+        Self::new(file)
     }
 }
 
-impl<R> ClosedSegmentFileReader<R>
+impl<R> ClosedSegmentReader<R>
 where
     R: Read,
 {
-    pub fn new(f: R) -> Self {
-        Self(f, 0)
+    /// Read the header of the WAL segment contained by R, returning its
+    /// [`FileTypeIdentifier`] and the encoded [`SegmentId`].
+    ///
+    /// [`SegmentId`]: crate::SegmentId
+    fn read_header(reader: &mut R) -> Result<(FileTypeIdentifier, SegmentIdBytes)> {
+        Ok((
+            read_array(reader).context(UnableToReadHeaderFieldSnafu {
+                field_name: "file type identifier",
+            })?,
+            read_array(reader).context(UnableToReadHeaderFieldSnafu {
+                field_name: "segment id bytes",
+            })?,
+        ))
     }
 
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let mut data = [0u8; N];
-        self.0
-            .read_exact(&mut data)
-            .context(UnableToReadArraySnafu { length: N })?;
-        self.1 += N as u64;
-        Ok(data)
-    }
+    /// Initialises a [`ClosedSegmentReader`] for synchronous reading of a
+    /// closed WAL segment from the given [`Read`] implementation, reading and
+    /// validating the segment file's header.
+    pub(crate) fn new(mut reader: R) -> Result<Self> {
+        // NOTE: The header must be read and validated.
+        let (file_type_identifier, segment_id_bytes) = Self::read_header(&mut reader)?;
 
-    pub fn read_header(&mut self) -> Result<(FileTypeIdentifier, SegmentIdBytes)> {
-        Ok((self.read_array()?, self.read_array()?))
+        Ok(Self {
+            reader,
+            cumulative_bytes_read: (file_type_identifier.len() + segment_id_bytes.len()) as u64,
+            file_type_identifier,
+            segment_id: SegmentId::from_bytes(segment_id_bytes),
+        })
     }
 
     fn one_entry(&mut self) -> Result<Option<SegmentEntry>> {
-        let expected_checksum = match self.0.read_u32::<BigEndian>() {
+        let expected_checksum = match self.reader.read_u32::<BigEndian>() {
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             other => other.context(UnableToReadChecksumSnafu)?,
         };
 
         let expected_len = self
-            .0
+            .reader
             .read_u32::<BigEndian>()
             .context(UnableToReadLengthSnafu)?
             .into();
 
-        let compressed_read = self.0.by_ref().take(expected_len);
+        let compressed_read = self.reader.by_ref().take(expected_len);
         let hashing_read = CrcReader::new(compressed_read);
         let mut decompressing_read = FrameDecoder::new(hashing_read);
 
@@ -76,8 +97,8 @@ where
         //
         // This accounting is done before checksum/length mismatch, if the data has still
         // been read in successfully.
-        self.1 += 2 * std::mem::size_of::<u32>() as u64;
-        self.1 += actual_compressed_len;
+        self.cumulative_bytes_read += 2 * std::mem::size_of::<u32>() as u64;
+        self.cumulative_bytes_read += actual_compressed_len;
 
         ensure!(
             expected_len == actual_compressed_len,
@@ -98,7 +119,12 @@ where
         Ok(Some(SegmentEntry { data }))
     }
 
-    pub fn next_batch(&mut self) -> Result<Option<Vec<SequencedWalOp>>> {
+    /// Reads the next entry in the closed WAL segment, decoding the contained
+    /// [`SequencedWalOp`] batch within.
+    ///
+    /// This method returns [`None`] when all entries have been read from the
+    /// segment.
+    pub(crate) fn next_batch(&mut self) -> Result<Option<Vec<SequencedWalOp>>> {
         if let Some(entry) = self.one_entry()? {
             let decoded =
                 ProtoWalOpBatch::decode(&*entry.data).context(UnableToDeserializeDataSnafu)?;
@@ -114,11 +140,29 @@ where
         Ok(None)
     }
 
-    /// Returns the total amount of bytes successfully read from this reader's
-    /// underlying file, in bytes.
-    pub fn bytes_read(&self) -> u64 {
-        self.1
+    /// Returns the cumulative count of encoded bytes successfully read from
+    /// the underlying reader.
+    pub(crate) fn bytes_read(&self) -> u64 {
+        self.cumulative_bytes_read
     }
+
+    /// Returns the [`FileTypeIdentifier`] read for this segment.
+    pub(crate) fn file_type_identifier(&self) -> &FileTypeIdentifier {
+        &self.file_type_identifier
+    }
+
+    /// Returns the WAL segment ID this reader is for.
+    pub(crate) fn segment_id(&self) -> SegmentId {
+        self.segment_id
+    }
+}
+
+fn read_array<const N: usize, R: Read>(reader: &mut R) -> Result<[u8; N], ReadArrayError> {
+    let mut data = [0u8; N];
+    reader
+        .read_exact(&mut data)
+        .context(UnableToReadArraySnafu { length: N })?;
+    Ok(data)
 }
 
 struct CrcReader<R> {
@@ -157,15 +201,16 @@ where
 }
 
 #[derive(Debug, Snafu)]
+#[allow(missing_docs)]
 pub enum Error {
     UnableToOpenFile {
         source: io::Error,
         path: PathBuf,
     },
 
-    UnableToReadArray {
-        source: io::Error,
-        length: usize,
+    UnableToReadHeaderField {
+        source: ReadArrayError,
+        field_name: &'static str,
     },
 
     UnableToReadChecksum {
@@ -203,7 +248,14 @@ pub enum Error {
     },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+#[derive(Debug, Snafu)]
+#[allow(missing_docs)]
+pub enum ReadArrayError {
+    UnableToReadArray { source: io::Error, length: usize },
+}
+
+/// The result type returned by the synchronous [`ClosedSegmentReader`].
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {
@@ -219,11 +271,10 @@ mod tests {
         let segment_file = FakeSegmentFile::new();
 
         let data = segment_file.data();
-        let mut reader = ClosedSegmentFileReader::new(data.as_slice());
+        let mut reader = ClosedSegmentReader::new(data.as_slice()).expect("must read header");
 
-        let (file_type_id, uuid) = reader.read_header().unwrap();
-        assert_eq!(&file_type_id, FILE_TYPE_IDENTIFIER);
-        assert_eq!(uuid, segment_file.id.as_bytes());
+        assert_eq!(reader.file_type_identifier(), FILE_TYPE_IDENTIFIER);
+        assert_eq!(reader.segment_id(), segment_file.id);
 
         let entry = reader.one_entry().unwrap();
         assert!(entry.is_none());
@@ -240,11 +291,10 @@ mod tests {
         segment_file.add_entry(entry_input_2.clone());
 
         let data = segment_file.data();
-        let mut reader = ClosedSegmentFileReader::new(data.as_slice());
+        let mut reader = ClosedSegmentReader::new(data.as_slice()).expect("must read header");
 
-        let (file_type_id, uuid) = reader.read_header().unwrap();
-        assert_eq!(&file_type_id, FILE_TYPE_IDENTIFIER);
-        assert_eq!(uuid, segment_file.id.as_bytes());
+        assert_eq!(reader.file_type_identifier(), FILE_TYPE_IDENTIFIER);
+        assert_eq!(reader.segment_id(), segment_file.id);
 
         let entry_output_1 = reader.one_entry().unwrap().unwrap();
         let expected_1 = SegmentEntry::from(&entry_input_1);
@@ -276,11 +326,10 @@ mod tests {
         segment_file.add_entry(good_entry_input);
 
         let data = segment_file.data();
-        let mut reader = ClosedSegmentFileReader::new(data.as_slice());
+        let mut reader = ClosedSegmentReader::new(data.as_slice()).expect("must read header");
 
-        let (file_type_id, uuid) = reader.read_header().unwrap();
-        assert_eq!(&file_type_id, FILE_TYPE_IDENTIFIER);
-        assert_eq!(uuid, segment_file.id.as_bytes());
+        assert_eq!(reader.file_type_identifier(), FILE_TYPE_IDENTIFIER);
+        assert_eq!(reader.segment_id(), segment_file.id);
 
         let read_fail = reader.one_entry();
         assert_matches!(read_fail, Err(Error::UnableToReadData { source: e }) => {
@@ -311,11 +360,10 @@ mod tests {
         segment_file.add_entry(good_entry_input);
 
         let data = segment_file.data();
-        let mut reader = ClosedSegmentFileReader::new(data.as_slice());
+        let mut reader = ClosedSegmentReader::new(data.as_slice()).expect("must read header");
 
-        let (file_type_id, uuid) = reader.read_header().unwrap();
-        assert_eq!(&file_type_id, FILE_TYPE_IDENTIFIER);
-        assert_eq!(uuid, segment_file.id.as_bytes());
+        assert_eq!(reader.file_type_identifier(), FILE_TYPE_IDENTIFIER);
+        assert_eq!(reader.segment_id(), segment_file.id);
 
         let read_fail = reader.one_entry();
         assert_matches!(read_fail, Err(Error::UnableToReadData { source: e }) => {
@@ -342,11 +390,10 @@ mod tests {
         segment_file.add_entry(good_entry_input.clone());
 
         let data = segment_file.data();
-        let mut reader = ClosedSegmentFileReader::new(data.as_slice());
+        let mut reader = ClosedSegmentReader::new(data.as_slice()).expect("must read header");
 
-        let (file_type_id, uuid) = reader.read_header().unwrap();
-        assert_eq!(&file_type_id, FILE_TYPE_IDENTIFIER);
-        assert_eq!(uuid, segment_file.id.as_bytes());
+        assert_eq!(reader.file_type_identifier(), FILE_TYPE_IDENTIFIER);
+        assert_eq!(reader.segment_id(), segment_file.id);
 
         let read_fail = reader.one_entry();
         assert_error!(read_fail, Error::ChecksumMismatch { .. });

@@ -250,11 +250,7 @@ fn normalize_predicate(
                 .and_then(|e| rewrite::iox_expr_rewrite(e.data))
                 .map(|e| log_rewrite(e, "rewrite"))
                 // apply type_coercing so datafuson simplification can deal with this
-                .and_then(|e| {
-                    simplifier
-                        .coerce(e.data, Arc::clone(&df_schema))
-                        .map(Transformed::yes)
-                })
+                .and_then(|e| simplifier.coerce(e.data, &df_schema).map(Transformed::yes))
                 .map(|e| log_rewrite(e, "coerce_expr"))
                 // Call DataFusion simplification logic
                 .and_then(|e| simplifier.simplify(e.data).map(Transformed::yes))

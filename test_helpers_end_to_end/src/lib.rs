@@ -14,8 +14,8 @@ mod data_generator;
 mod database;
 mod error;
 mod grpc;
-mod http_reverse_proxy;
 mod mini_cluster;
+pub mod query_tests;
 mod server_fixture;
 mod server_type;
 mod service_link;
@@ -30,11 +30,10 @@ pub use config::TestConfig;
 pub use data_generator::DataGenerator;
 pub use error::{check_flight_error, check_tonic_status};
 pub use grpc::GrpcRequestBuilder;
-pub use http_reverse_proxy::HttpReverseProxy;
 pub use mini_cluster::MiniCluster;
 pub use server_fixture::{ServerFixture, TestServer};
 pub use server_type::{AddAddrEnv, ServerType};
-pub use steps::{FCustom, Step, StepTest, StepTestState};
+pub use steps::{FCustom, MetricFn, Step, StepTest, StepTestState};
 pub use udp_listener::UdpCapture;
 
 /// Return a random string suitable for use as a namespace name

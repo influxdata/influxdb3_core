@@ -649,7 +649,7 @@ where
 {
     let (min, max) = data
         .into_iter()
-        .zip(valid.into_iter())
+        .zip(valid)
         .filter_map(|(v, valid)| if valid { Some(v) } else { None })
         .fold((None, None), |acc, v| {
             (

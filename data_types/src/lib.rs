@@ -349,11 +349,22 @@ pub struct Namespace {
     pub partition_template: NamespacePartitionTemplateOverride,
     /// The monotonically increasing counter tracking the version of this
     /// namespace's non-schema properties, as used across routers.
+    ///
+    /// It is a system invariant that exactly one [`NamespaceConfig`] value
+    /// exists across the cluster for any given `router_version` value. The
+    /// version value is used to identify the linearised changes (via the
+    /// catalog) to the [`NamespaceConfig`] to enable deterministic
+    /// last-writer-wins behaviour.
     pub router_version: NamespaceVersion,
 }
 
 /// A container for the mutable, non-schema configuration of a namespace and the
 /// version the configuration is associated with.
+///
+/// It is a system invariant that exactly one [`NamespaceConfig`] value exists
+/// across the cluster for any given `router_version` value. The version value
+/// is used to identify the linearised changes (via the catalog) to the
+/// [`NamespaceConfig`] to enable deterministic last-writer-wins behaviour.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Hash)]
 pub struct NamespaceConfig {
     /// The maximum number of tables permitted in this namespace.
@@ -653,6 +664,37 @@ impl From<generated_types::influxdata::iox::skipped_compaction::v1::SkippedCompa
     }
 }
 
+/// Whether the file was created via bulk ingest or not (For now. This may be expanded to
+/// distinguish between ingester and compactor in the future).
+///
+/// Currently, the value of the `source` field in the database will either be `NULL`/`None` or
+/// 1/`ParquetFileSource::BulkIngest`. The value of the `source` field in protobuf will either be
+/// `UNSPECIFIED`/0 or `BULK_INGEST`/1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[repr(i16)]
+pub enum ParquetFileSource {
+    /// The Parquet file was added through a bulk ingest migration process.
+    BulkIngest = 1,
+}
+
+impl ParquetFileSource {
+    /// Given an integer value from protobuf, create either `Some` variant if the integer
+    /// represents a valid variant or `None` if the integer is 0 or an invalid value. Infallible
+    /// for backwards compatibility. Can't be a `From` impl because of the orphan rule.
+    pub fn from_proto(value: i32) -> Option<Self> {
+        match value {
+            x if x == Self::BulkIngest as i32 => Some(Self::BulkIngest),
+            _ => None,
+        }
+    }
+
+    /// Given an optional source value, convert to an integer value for protobuf: the value's
+    /// associated integer if `Some` variant is specified, or 0 for `None`.
+    pub fn to_proto(value: Option<Self>) -> i32 {
+        value.map(|i| i as i32).unwrap_or_default()
+    }
+}
+
 /// Data for a parquet file reference that has been inserted in the catalog.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ParquetFile {
@@ -711,6 +753,8 @@ pub struct ParquetFile {
     pub column_set: ColumnSet,
     /// the max of created_at of all L0 files needed for file/chunk ordering for deduplication
     pub max_l0_created_at: Timestamp,
+    /// Which component created this Parquet file
+    pub source: Option<ParquetFileSource>,
 }
 
 impl ParquetFile {
@@ -734,6 +778,7 @@ impl ParquetFile {
             created_at: params.created_at,
             column_set: params.column_set,
             max_l0_created_at: params.max_l0_created_at,
+            source: params.source,
         }
     }
 
@@ -808,6 +853,7 @@ impl From<ParquetFile> for generated_types::influxdata::iox::catalog::v1::Parque
             created_at: v.created_at.get(),
             column_set: v.column_set.iter().map(|v| v.get()).collect(),
             max_l0_created_at: v.max_l0_created_at.get(),
+            source: ParquetFileSource::to_proto(v.source),
         }
     }
 }
@@ -861,6 +907,8 @@ pub struct ParquetFileParams {
     pub column_set: ColumnSet,
     /// the max of created_at of all L0 files
     pub max_l0_created_at: Timestamp,
+    /// Which component created this Parquet file
+    pub source: Option<ParquetFileSource>,
 }
 
 impl From<ParquetFile> for ParquetFileParams {
@@ -879,6 +927,7 @@ impl From<ParquetFile> for ParquetFileParams {
             created_at,
             column_set,
             max_l0_created_at,
+            source,
             ..
         } = value;
         Self {
@@ -895,6 +944,7 @@ impl From<ParquetFile> for ParquetFileParams {
             created_at,
             column_set,
             max_l0_created_at,
+            source,
         }
     }
 }
@@ -1345,10 +1395,10 @@ impl<T> StatValues<T> {
     /// updates the statistics keeping the min, max and incrementing count.
     ///
     /// The type plumbing exists to allow calling with `&str` on a `StatValues<String>`.
-    pub fn update<U: ?Sized>(&mut self, other: &U)
+    pub fn update<U>(&mut self, other: &U)
     where
         T: Borrow<U>,
-        U: ToOwned<Owned = T> + PartialOrd + IsNan,
+        U: ToOwned<Owned = T> + PartialOrd + IsNan + ?Sized,
     {
         self.total_count += 1;
         self.distinct_count = None;
@@ -1845,6 +1895,39 @@ pub struct FileRange {
     pub max: i64,
     /// The sum of the sizes of all files in the range
     pub cap: usize,
+}
+
+impl FileRange {
+    /// Splits the FileRange into two FileRanges at a given point, which will be
+    /// the first point of the second FileRange.
+    /// The split point is required to be within the range, and is taken as the first
+    /// (or starting) point of the second (or right) range.  The first (or left) range
+    /// ends at the point before the given split point.
+    /// The capacities of the two FileRanges are proportionally divided.
+    pub fn split_at(&self, point: i64) -> (Self, Self) {
+        assert!(
+            self.min < point && point <= self.max,
+            "point ({}) must be within range ({:?})",
+            point,
+            self
+        );
+
+        // Calculate the proportion of the capacity that goes to the first (left) range
+        let pct = (point - self.min) as f64 / (self.max - self.min + 1) as f64;
+        let cap1 = (self.cap as f64 * pct) as usize;
+        (
+            Self {
+                min: self.min,
+                max: point - 1,
+                cap: cap1,
+            },
+            Self {
+                min: point,
+                max: self.max,
+                cap: self.cap - cap1,
+            },
+        )
+    }
 }
 
 #[cfg(test)]

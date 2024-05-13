@@ -1,6 +1,8 @@
 //! # WAL
 //!
-//! This crate provides a local-disk WAL for the IOx ingestion pipeline.
+//! This crate provides a local-disk implementation of a Write-Ahead Log for the
+//! IOx write path.
+#![warn(missing_docs)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -31,21 +33,19 @@ use mutable_batch_pb::decode::decode_database_batch;
 use observability_deps::tracing::info;
 use writer_thread::WriterIoThreadHandle;
 
-use crate::blocking::{
-    ClosedSegmentFileReader as RawClosedSegmentFileReader, OpenSegmentFileWriter,
-};
+use crate::blocking::{ClosedSegmentReader as RawClosedSegmentReader, OpenSegmentFileWriter};
 
 pub mod blocking;
 mod writer_thread;
 
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 
-// The collection of error types that external clients can expect to handle.
-//
-// WARNING: None of these enum variants have doc comments, because it will
-// be used as the error message and thus obfuscate the inner error details.
+/// The collection of error types that external clients can expect to handle.
+///
+/// WARNING: None of these enum variants have doc comments, as they would
+/// be used as the error message and thus obfuscate the inner error details.
 #[derive(Debug, Snafu)]
-#[allow(missing_copy_implementations, missing_docs)]
+#[allow(missing_docs)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
     SegmentFileIdentifierMismatch {},
@@ -95,16 +95,16 @@ pub enum Error {
         source: tokio::sync::oneshot::error::RecvError,
     },
 
-    UnableToReadFileHeader {
-        source: blocking::ReaderError,
-    },
-
     UnableToReadEntries {
         source: blocking::ReaderError,
     },
 
     UnableToReadNextOps {
         source: blocking::ReaderError,
+    },
+
+    SegmentFileTruncated {
+        id: SegmentId,
     },
 
     InvalidId {
@@ -136,7 +136,11 @@ pub enum Error {
 }
 
 /// Errors that occur when decoding internal types from a WAL file.
+///
+/// WARNING: None of these enum variants have doc comments, as they woulld
+/// be used as the error message and thus obfuscate the inner error details.
 #[derive(Debug, Snafu)]
+#[allow(missing_docs)]
 #[snafu(visibility(pub(crate)))]
 pub enum DecodeError {
     UnableToCreateMutableBatch {
@@ -155,22 +159,26 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentId(u64);
 
+/// The opaque, encoded representation of a [`SegmentId`].
 pub type SegmentIdBytes = [u8; 8];
 
-#[allow(missing_docs)]
 impl SegmentId {
+    /// Constructs a new [`SegmentId`] with the provided value.
     pub const fn new(v: u64) -> Self {
         Self(v)
     }
 
+    /// Returns the primitive type value of this [`SegmentId`].
     pub fn get(&self) -> u64 {
         self.0
     }
 
+    /// Returns the encoded representation of this [`SegmentId`].
     pub fn as_bytes(&self) -> SegmentIdBytes {
         self.0.to_be_bytes()
     }
 
+    /// Decode the [`SegmentId`] from the given bytes.
     pub fn from_bytes(bytes: SegmentIdBytes) -> Self {
         let v = u64::from_be_bytes(bytes);
         Self::new(v)
@@ -191,7 +199,6 @@ pub(crate) fn build_segment_path(dir: impl Into<PathBuf>, id: SegmentId) -> Path
 }
 
 /// The first bytes written into a segment file to identify it and its version.
-// TODO: What's the expected way of upgrading -- what happens when we need version 31?
 type FileTypeIdentifier = [u8; 8];
 const FILE_TYPE_IDENTIFIER: &FileTypeIdentifier = b"INFLUXV3";
 /// File extension for segment files.
@@ -520,7 +527,10 @@ pub struct SegmentEntry {
 /// orderly shutdown.
 #[derive(Debug, Clone)]
 pub enum WriteResult {
+    /// The write was successful, with contextual details included in the
+    /// contained [`WriteSummary`].
     Ok(WriteSummary),
+    /// The write failed, with the reason for the error given as a string.
     Err(String),
 }
 
@@ -538,7 +548,7 @@ pub struct WriteSummary {
 /// Reader for a closed segment file
 pub struct ClosedSegmentFileReader {
     id: SegmentId,
-    file: RawClosedSegmentFileReader<BufReader<File>>,
+    file: RawClosedSegmentReader<BufReader<File>>,
 }
 
 impl Iterator for ClosedSegmentFileReader {
@@ -546,11 +556,20 @@ impl Iterator for ClosedSegmentFileReader {
 
     /// Read the next batch of sequenced WAL operations from the file
     fn next(&mut self) -> Option<Self::Item> {
-        self.file
-            .next_batch()
-            .context(UnableToReadNextOpsSnafu)
-            .transpose()
-            .map(|result| result.map(|batch| (batch, self.bytes_read())))
+        match self.file.next_batch() {
+            Ok(v) => Ok(v),
+            // In the case of an unexpected EOF, return the "public API" error
+            // for truncated segment file to let consumers react without digging
+            // deep into implementation errors.
+            Err(blocking::ReaderError::UnableToReadData { source })
+                if source.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                Err(SegmentFileTruncatedSnafu { id: self.id }.build())
+            }
+            e @ Err(_) => e.context(UnableToReadNextOpsSnafu),
+        }
+        .transpose()
+        .map(|result| result.map(|batch| (batch, self.bytes_read())))
     }
 }
 
@@ -569,19 +588,18 @@ impl ClosedSegmentFileReader {
     /// Open the segment file and read its header, ensuring it is a segment file and reading its id.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut file =
-            RawClosedSegmentFileReader::from_path(path).context(UnableToOpenFileSnafu { path })?;
-
-        let (file_type, id) = file.read_header().context(UnableToReadFileHeaderSnafu)?;
+        let file =
+            RawClosedSegmentReader::from_path(path).context(UnableToOpenFileSnafu { path })?;
 
         ensure!(
-            &file_type == FILE_TYPE_IDENTIFIER,
+            file.file_type_identifier() == FILE_TYPE_IDENTIFIER,
             SegmentFileIdentifierMismatchSnafu,
         );
 
-        let id = SegmentId::from_bytes(id);
-
-        Ok(Self { id, file })
+        Ok(Self {
+            id: file.segment_id(),
+            file,
+        })
     }
 }
 
@@ -596,7 +614,9 @@ impl std::fmt::Debug for ClosedSegmentFileReader {
 /// An in-memory representation of a WAL write operation entry.
 #[derive(Debug)]
 pub struct WriteOpEntry {
+    /// The namespace the write operation belongs to.
     pub namespace: NamespaceId,
+    /// Data written by the entry, per table.
     pub table_batches: HashMap<TableId, MutableBatch>,
 }
 
@@ -663,10 +683,12 @@ pub struct ClosedSegment {
 }
 
 impl ClosedSegment {
+    /// The unique [`SegmentId`] which identifies this WAL segment.
     pub fn id(&self) -> SegmentId {
         self.id
     }
 
+    /// The size of the encoded WAL segment, in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }

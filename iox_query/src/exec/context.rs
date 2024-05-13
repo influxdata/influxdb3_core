@@ -53,7 +53,7 @@ use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
 use executor::DedicatedExecutor;
 use futures::{Stream, StreamExt, TryStreamExt};
 use observability_deps::tracing::debug;
-use query_functions::{register_scalar_functions, selectors::register_selector_aggregates};
+use query_functions::{register_iox_scalar_functions, selectors::register_selector_aggregates};
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 use trace::{
     ctx::SpanContext,
@@ -285,7 +285,7 @@ impl IOxSessionConfig {
 
         let inner = SessionContext::new_with_state(state);
         register_selector_aggregates(&inner);
-        register_scalar_functions(&inner);
+        register_iox_scalar_functions(&inner);
         if let Some(default_catalog) = self.default_catalog {
             inner.register_catalog(DEFAULT_CATALOG, default_catalog);
         }
@@ -767,11 +767,6 @@ impl IOxSessionContext {
     /// Returns a new child span of the current context
     pub fn child_span(&self, name: &'static str) -> Option<Span> {
         self.recorder.child_span(name)
-    }
-
-    /// Number of currently active tasks.
-    pub fn tasks(&self) -> usize {
-        self.exec.tasks()
     }
 
     /// Retrieve the memory monitor for this context.

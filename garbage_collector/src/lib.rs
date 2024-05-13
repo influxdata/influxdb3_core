@@ -65,6 +65,7 @@ impl GarbageCollector {
         let dry_run = sub_config.dry_run;
         info!(
             objectstore_cutoff = %format_duration(sub_config.objectstore_cutoff),
+            bulk_ingest_objectstore_cutoff = %format_duration(sub_config.bulk_ingest_objectstore_cutoff),
             parquetfile_cutoff = %format_duration(sub_config.parquetfile_cutoff),
             parquetfile_sleep_interval = %format_duration(sub_config.parquetfile_sleep_interval()),
             objectstore_sleep_interval_minutes = %sub_config.objectstore_sleep_interval_minutes,
@@ -113,11 +114,19 @@ impl GarbageCollector {
             }
         })?;
 
+        let bulk_ingest_cutoff =
+            chrono::Duration::from_std(sub_config.bulk_ingest_objectstore_cutoff).map_err(|e| {
+                Error::CutoffError {
+                    message: e.to_string(),
+                }
+            })?;
+
         let os_checker = tokio::spawn(async move {
             select! {
                 ret = os_checker::perform(
                     cat,
                     cutoff,
+                    bulk_ingest_cutoff,
                     rx1,
                     tx2,
                 ) => {

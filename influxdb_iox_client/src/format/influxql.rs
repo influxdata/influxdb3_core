@@ -107,6 +107,9 @@ pub fn write_columnar(mut w: impl Write, batches: &[RecordBatch], options: Optio
 
     let mut table = new_table();
 
+    // A batch of data can include data of different tables
+    let mut curr_measurement = "";
+
     for batch in batches {
         let cols = col_indexes
             .iter()
@@ -136,7 +139,6 @@ pub fn write_columnar(mut w: impl Write, batches: &[RecordBatch], options: Optio
             })
             .collect::<Vec<_>>();
 
-        let mut curr_measurement = "";
         let mut curr_tag_values = iter::repeat("").take(tag_keys.len()).collect::<Vec<_>>();
 
         for row in 0..batch.num_rows() {

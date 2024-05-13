@@ -47,6 +47,46 @@ pub struct RunConfig {
     )]
     pub grpc_bind_address: SocketAddr,
 
+    /// Kernel-side TCP send buffer size for the gRPC server, in bytes.
+    ///
+    /// Will cause the server to fail to start if the value is out of range or if that setting is not supported on this
+    /// operating system.
+    #[clap(
+        long = "grpc-server-tcp-kernel-send-buffer-size",
+        env = "INFLUXDB_IOX_GRPC_SERVER_TCP_KERNEL_SEND_BUFFER_SIZE"
+    )]
+    pub grpc_server_tcp_kernel_send_buffer_size: Option<usize>,
+
+    /// Kernel-side TCP receive buffer size for the gRPC server, in bytes.
+    ///
+    /// Will cause the server to fail to start if the value is out of range or if that setting is not supported on this
+    /// operating system.
+    #[clap(
+        long = "grpc-server-tcp-kernel-receive-buffer-size",
+        env = "INFLUXDB_IOX_GRPC_SERVER_TCP_KERNEL_RECEIVE_BUFFER_SIZE"
+    )]
+    pub grpc_server_tcp_kernel_receive_buffer_size: Option<usize>,
+
+    /// Kernel-side TCP send buffer size for the HTTP server, in bytes.
+    ///
+    /// Will cause the server to fail to start if the value is out of range or if that setting is not supported on this
+    /// operating system.
+    #[clap(
+        long = "http-server-tcp-kernel-send-buffer-size",
+        env = "INFLUXDB_IOX_HTTP_SERVER_TCP_KERNEL_SEND_BUFFER_SIZE"
+    )]
+    pub http_server_tcp_kernel_send_buffer_size: Option<usize>,
+
+    /// Kernel-side TCP receive buffer size for the HTTP server, in bytes.
+    ///
+    /// Will cause the server to fail to start if the value is out of range or if that setting is not supported on this
+    /// operating system.
+    #[clap(
+        long = "http-server-tcp-kernel-receive-buffer-size",
+        env = "INFLUXDB_IOX_HTTP_SERVER_TCP_KERNEL_RECEIVE_BUFFER_SIZE"
+    )]
+    pub http_server_tcp_kernel_receive_buffer_size: Option<usize>,
+
     /// Maximum size of HTTP requests.
     #[clap(
         long = "max-http-request-size",
@@ -100,6 +140,10 @@ impl RunConfig {
             grpc_bind_address,
             max_http_request_size,
             http_max_pending_reset_streams: None,
+            grpc_server_tcp_kernel_send_buffer_size: None,
+            grpc_server_tcp_kernel_receive_buffer_size: None,
+            http_server_tcp_kernel_send_buffer_size: None,
+            http_server_tcp_kernel_receive_buffer_size: None,
         }
     }
 }

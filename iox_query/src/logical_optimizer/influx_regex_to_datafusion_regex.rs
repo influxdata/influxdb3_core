@@ -73,8 +73,8 @@ impl TreeNodeRewriter for InfluxRegexToDataFusionRegex {
 
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>, DataFusionError> {
         match expr {
-            Expr::ScalarFunction(ScalarFunction { func_def, mut args }) => {
-                let name = func_def.name();
+            Expr::ScalarFunction(ScalarFunction { func, mut args }) => {
+                let name = func.name();
                 if (args.len() == 2)
                     && ((name == REGEX_MATCH_UDF_NAME) || (name == REGEX_NOT_MATCH_UDF_NAME))
                 {
@@ -90,7 +90,7 @@ impl TreeNodeRewriter for InfluxRegexToDataFusionRegex {
                 }
 
                 Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
-                    func_def,
+                    func,
                     args,
                 })))
             }

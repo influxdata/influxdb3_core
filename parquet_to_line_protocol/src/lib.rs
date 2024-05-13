@@ -20,7 +20,9 @@ use datafusion::{
     physical_plan::{execute_stream, SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
 };
-use datafusion_util::config::{iox_session_config, register_iox_object_store};
+use datafusion_util::config::{
+    iox_session_config, register_iox_object_store, table_parquet_options,
+};
 use futures::{stream::BoxStream, StreamExt};
 use object_store::{
     local::LocalFileSystem, path::Path as ObjectStorePath, ObjectMeta, ObjectStore,
@@ -198,7 +200,7 @@ impl ParquetFileReader {
         let session_state = SessionState::new_with_config_rt(session_config, runtime);
 
         // Keep metadata so we can find the measurement name
-        let format = ParquetFormat::new().with_skip_metadata(Some(false));
+        let format = ParquetFormat::new().with_skip_metadata(false);
 
         // Use datafusion parquet reader to read the metadata from the
         // file.
@@ -235,6 +237,7 @@ impl ParquetFileReader {
                 partition_values: vec![],
                 range: None,
                 extensions: None,
+                statistics: Some(statistics.clone()),
             }]],
             statistics,
             projection: None,
@@ -246,7 +249,12 @@ impl ParquetFileReader {
         // set up enough datafusion context to do the real read session
         let predicate = None;
         let metadata_size_hint = None;
-        let exec = ParquetExec::new(base_config, predicate, metadata_size_hint);
+        let exec = ParquetExec::new(
+            base_config,
+            predicate,
+            metadata_size_hint,
+            table_parquet_options(),
+        );
 
         let object_store = Arc::clone(&self.object_store);
         register_iox_object_store(self.session_ctx.runtime_env(), "iox", object_store);

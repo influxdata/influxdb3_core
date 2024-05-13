@@ -501,7 +501,7 @@ async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Resu
         let table_names = vec!["columns", "df_settings", "tables", "views", "schemata"];
         for table_name in table_names {
             let schema_name = "information_schema";
-            let table_ref = TableReference::full(&catalog_name, schema_name, table_name);
+            let table_ref = TableReference::full(catalog_name.clone(), schema_name, table_name);
 
             let Some(table) = ctx.inner().table(table_ref).await.ok() else {
                 continue;

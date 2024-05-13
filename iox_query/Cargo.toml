@@ -30,7 +30,7 @@ executor = { path = "../executor"}
 futures = "0.3"
 hashbrown = { workspace = true }
 indexmap = { version = "2.2", features = ["std"] }
-itertools = "0.12.0"
+itertools = "0.12.1"
 iox_query_params = { path = "../iox_query_params" }
 iox_time = { path = "../iox_time" }
 metric = { path = "../metric" }

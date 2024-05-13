@@ -1,8 +1,8 @@
 use data_types::{
     partition_template::NamespacePartitionTemplateOverride, Column, ColumnId, ColumnSet,
     ColumnType, Namespace, NamespaceId, NamespaceVersion, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, SkippedCompaction, SortKeyIds, Table,
-    TableId, Timestamp,
+    ParquetFileId, ParquetFileParams, ParquetFileSource, Partition, PartitionId, SkippedCompaction,
+    SortKeyIds, Table, TableId, Timestamp,
 };
 use generated_types::influxdata::iox::catalog::v2 as proto;
 use uuid::Uuid;
@@ -364,6 +364,7 @@ pub(crate) fn serialize_parquet_file_params(
         created_at: params.created_at.get(),
         column_set: Some(serialize_column_set(&params.column_set)),
         max_l0_created_at: params.max_l0_created_at.get(),
+        source: ParquetFileSource::to_proto(params.source),
     }
 }
 
@@ -390,6 +391,7 @@ pub(crate) fn deserialize_parquet_file_params(
         created_at: Timestamp::new(params.created_at),
         column_set: deserialize_column_set(params.column_set.required().ctx("column_set")?),
         max_l0_created_at: Timestamp::new(params.max_l0_created_at),
+        source: ParquetFileSource::from_proto(params.source),
     })
 }
 
@@ -415,6 +417,7 @@ pub(crate) fn serialize_parquet_file(file: ParquetFile) -> proto::ParquetFile {
         created_at: file.created_at.get(),
         column_set: Some(serialize_column_set(&file.column_set)),
         max_l0_created_at: file.max_l0_created_at.get(),
+        source: ParquetFileSource::to_proto(file.source),
     }
 }
 
@@ -442,6 +445,7 @@ pub(crate) fn deserialize_parquet_file(file: proto::ParquetFile) -> Result<Parqu
         created_at: Timestamp::new(file.created_at),
         column_set: deserialize_column_set(file.column_set.required().ctx("column_set")?),
         max_l0_created_at: Timestamp::new(file.max_l0_created_at),
+        source: ParquetFileSource::from_proto(file.source),
     })
 }
 
@@ -701,6 +705,7 @@ mod tests {
             created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
             max_l0_created_at: Timestamp::new(11),
+            source: None,
         };
         let protobuf = serialize_parquet_file_params(&params);
         let params2 = deserialize_parquet_file_params(protobuf).unwrap();
@@ -725,6 +730,7 @@ mod tests {
             created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
             max_l0_created_at: Timestamp::new(11),
+            source: None,
         };
         let protobuf = serialize_parquet_file(file.clone());
         let file2 = deserialize_parquet_file(protobuf).unwrap();

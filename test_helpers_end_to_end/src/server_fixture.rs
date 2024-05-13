@@ -181,6 +181,11 @@ impl ServerFixture {
         self.server.addrs().catalog_grpc_api().client_base()
     }
 
+    /// Return all the addresses a test server could use.
+    pub fn addrs(&self) -> &BindAddresses {
+        self.server.addrs()
+    }
+
     /// Return log path for server process.
     pub fn log_path(&self) -> Box<Path> {
         self.server.log_path.clone()
@@ -194,6 +199,10 @@ impl ServerFixture {
     /// Get a weak reference to the underlying `TestServer`
     pub(crate) fn weak(&self) -> Weak<TestServer> {
         Arc::downgrade(&self.server)
+    }
+
+    pub fn catalog_schema_name(&self) -> &str {
+        self.server.test_config.catalog_schema_name()
     }
 }
 

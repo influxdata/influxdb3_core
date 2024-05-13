@@ -1,5 +1,6 @@
 //! Actual caching logic.
 
+use base64::Engine;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use catalog_cache::{
 use metric::{DurationHistogram, U64Counter};
 use observability_deps::tracing::{debug, warn};
 use trace::ctx::SpanContext;
-use trace::span::{SpanEvent, SpanExt, SpanRecorder};
+use trace::span::{Span, SpanEvent, SpanExt, SpanRecorder};
 
 use crate::cache::snapshot::SnapshotKey;
 use crate::{
@@ -98,9 +99,10 @@ where
         }
     }
 
-    pub(crate) fn repos(&self) -> CacheHandlerRepos<T> {
+    pub(crate) fn repos(&self, etag_min_payload_size: usize) -> CacheHandlerRepos<T> {
         CacheHandlerRepos {
             inner: Arc::clone(&self.inner),
+            etag_min_payload_size,
             span_ctx: None,
         }
     }
@@ -114,6 +116,7 @@ where
 {
     inner: Arc<CacheHandlerInner<T>>,
     span_ctx: Option<SpanContext>,
+    etag_min_payload_size: usize,
 }
 
 impl<T> CacheHandlerRepos<T>
@@ -135,20 +138,53 @@ where
     /// Get data from quorum cache.
     ///
     /// This method implements retries.
-    async fn get_quorum(&self, key: CacheKey) -> Result<Option<CacheValue>, QuorumError> {
+    async fn get_quorum(
+        &self,
+        key: CacheKey,
+        span: Option<Span>,
+    ) -> Result<Option<CacheValue>, QuorumError> {
+        let mut span_recorder = SpanRecorder::new(span);
         let mut backoff = Backoff::new(&self.inner.backoff_config);
 
         // Note: We don't use retry_with_backoff as some retries are expected in the event
         // of racing writers or only two available replicas. We should only log if
         // the deadline expires
-        loop {
+        let res = loop {
+            let mut span_recorder = span_recorder.child("retry round");
             match self.inner.cache.get(key).await {
-                Ok(val) => return Ok(val),
-                Err(e @ QuorumError::Quorum { .. }) => match backoff.next() {
-                    None => return Err(e), // Deadline exceeded
-                    Some(delay) => tokio::time::sleep(delay).await,
-                },
-                Err(e) => return Err(e),
+                Ok(val) => {
+                    span_recorder.ok("ok");
+                    break Ok(val);
+                }
+                Err(e @ QuorumError::Quorum { .. }) => {
+                    span_recorder.event(SpanEvent::new(format!("quorum error: {}", e)));
+
+                    match backoff.next() {
+                        None => {
+                            span_recorder.error("Deadline exceeded".to_owned());
+                            break Err(e);
+                        }
+                        Some(delay) => {
+                            span_recorder.ok(format!("sleep {}s", delay.as_secs_f32()));
+                            tokio::time::sleep(delay).await
+                        }
+                    }
+                }
+                Err(e) => {
+                    span_recorder.error(e.to_string());
+                    break Err(e);
+                }
+            }
+        };
+
+        match res {
+            Ok(val) => {
+                span_recorder.ok("ok");
+                Ok(val)
+            }
+            Err(e) => {
+                span_recorder.error(e.to_string());
+                Err(e)
             }
         }
     }
@@ -156,39 +192,54 @@ where
     /// Perform a snapshot
     ///
     /// If `refresh` is false will potentially await an existing snapshot request
-    async fn do_snapshot(&self, k: T::Key, refresh: bool) -> Result<T> {
+    async fn do_snapshot(&self, k: T::Key, refresh: bool, span: Option<Span>) -> Result<T> {
+        let mut span_recorder = SpanRecorder::new(span);
         let backing = Arc::clone(&self.inner.backing);
         let cache = Arc::clone(&self.inner.cache);
+        let min_etag = self.etag_min_payload_size;
 
         let fut = async move {
             let snapshot = T::snapshot(backing.as_ref(), k).await?;
             let generation = snapshot.generation();
             let data = snapshot.to_bytes();
 
-            debug!(what = T::NAME, key = k.get(), generation, "refresh",);
-            cache
-                .put(k.to_key(), CacheValue::new(data, generation))
-                .await
-                .map_err(|e| {
-                    warn!(
-                        what=T::NAME,
-                        key=k.get(),
-                        generation,
-                        %e,
-                        "quorum write failed",
-                    );
+            let mut value = CacheValue::new(data, generation);
 
-                    e
-                })?;
+            if value.data().len() >= min_etag {
+                let digest = ring::digest::digest(&ring::digest::SHA256, value.data());
+                value = value.with_etag(base64::prelude::BASE64_STANDARD.encode(digest));
+            }
+
+            debug!(what = T::NAME, key = k.get(), generation, "refresh");
+            cache.put(k.to_key(), value).await.map_err(|e| {
+                warn!(
+                    what=T::NAME,
+                    key=k.get(),
+                    generation,
+                    %e,
+                    "quorum write failed",
+                );
+
+                e
+            })?;
 
             Ok(snapshot)
         };
 
-        let snapshot = match refresh {
-            true => self.inner.loader.refresh(k, fut).await?,
-            false => self.inner.loader.load(k, fut).await?,
+        let snapshot_res = match refresh {
+            true => self.inner.loader.refresh(k, fut).await,
+            false => self.inner.loader.load(k, fut).await,
         };
-        Ok(snapshot)
+        match snapshot_res {
+            Ok(snapshot) => {
+                span_recorder.ok("ok");
+                Ok(snapshot)
+            }
+            Err(e) => {
+                span_recorder.error(e.to_string());
+                Err(e.into())
+            }
+        }
     }
 
     /// Refresh cached value of given snapshot.
@@ -198,7 +249,10 @@ where
     /// Note that this also performs a snapshot+write if the data was NOT cached yet.
     pub(crate) async fn refresh(&self, key: T::Key) -> Result<()> {
         let mut span_recorder = self.span_recorder("refresh");
-        match self.do_snapshot(key, true).await {
+        match self
+            .do_snapshot(key, true, span_recorder.child_span("snapshot"))
+            .await
+        {
             Ok(_) => {
                 span_recorder.ok("ok");
                 Ok(())
@@ -213,7 +267,10 @@ where
     /// Warm up cached value.
     pub(crate) async fn warm_up(&self, key: T::Key) -> Result<()> {
         let mut span_recorder = self.span_recorder("warm up");
-        match self.do_snapshot(key, false).await {
+        match self
+            .do_snapshot(key, false, span_recorder.child_span("snapshot"))
+            .await
+        {
             Ok(_) => {
                 span_recorder.ok("ok");
                 Ok(())
@@ -234,7 +291,10 @@ where
         let start = Instant::now();
         let key = k.to_key();
 
-        match self.get_quorum(key).await {
+        match self
+            .get_quorum(key, span_recorder.child_span("get quorum"))
+            .await
+        {
             Ok(Some(val)) => {
                 debug!(
                     what = T::NAME,
@@ -272,7 +332,10 @@ where
 
         self.inner.get_miss.record(start.elapsed());
 
-        match self.do_snapshot(k, false).await {
+        match self
+            .do_snapshot(k, false, span_recorder.child_span("snapshot"))
+            .await
+        {
             Ok(x) => {
                 span_recorder.ok("got new snapshot");
                 Ok(x)

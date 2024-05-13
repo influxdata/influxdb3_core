@@ -1,36 +1,14 @@
-//! The encoding mechanism for list streams
-//!
-//! This is capable of streaming both keys and values, this saves round-trips when hydrating
-//! a cache from a remote, and avoids creating a flood of HTTP GET requests
+//! The version 1 list protocol using a custom byte encoding
 
-use bytes::Bytes;
-use snafu::{ensure, Snafu};
-
-use crate::{CacheKey, CacheValue};
-
-/// Error type for list streams
-#[derive(Debug, Snafu)]
-#[allow(missing_copy_implementations, missing_docs)]
-pub enum Error {
-    #[snafu(display("Unexpected EOF whilst decoding list stream"))]
-    UnexpectedEOF,
-
-    #[snafu(display("List value of {size} bytes too large"))]
-    ValueTooLarge { size: usize },
-}
-
-/// Result type for list streams
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+use crate::api::list::{Error, ListEntry, Result, ValueTooLargeSnafu, MAX_VALUE_SIZE};
+use crate::CacheKey;
+use bytes::{Buf, Bytes};
+use futures::{stream, Stream};
+use reqwest::Response;
+use snafu::ensure;
 
 /// The size at which to flush [`Bytes`] from [`ListEncoder`]
 pub const FLUSH_SIZE: usize = 1024 * 1024; // Flush in 1MB blocks
-
-/// The maximum value size to send in a [`ListEntry`]
-///
-/// This primarily exists as a self-protection limit to prevent large or corrupted streams
-/// from swamping the client, but also mitigates Head-Of-Line blocking resulting from
-/// large cache values
-pub const MAX_VALUE_SIZE: usize = 1024 * 10;
 
 /// Encodes [`ListEntry`] as an iterator of [`Bytes`]
 ///
@@ -63,6 +41,12 @@ impl ListEncoder {
         self.max_value_size = size;
         self
     }
+
+    /// Override the flush size
+    pub fn with_flush_size(mut self, size: usize) -> Self {
+        self.flush_size = size;
+        self
+    }
 }
 
 impl Iterator for ListEncoder {
@@ -87,10 +71,10 @@ impl Iterator for ListEncoder {
         for entry in self.entries.iter().take(end_offset).skip(self.offset) {
             match &entry.data {
                 Some(d) if d.len() <= self.max_value_size => {
-                    buf.extend_from_slice(&entry.header(false).encode());
+                    buf.extend_from_slice(&ListHeader::new(entry, false).encode());
                     buf.extend_from_slice(d)
                 }
-                _ => buf.extend_from_slice(&entry.header(true).encode()),
+                _ => buf.extend_from_slice(&ListHeader::new(entry, true).encode()),
             }
         }
         self.offset = end_offset;
@@ -151,6 +135,32 @@ impl ListHeader {
             key: u128::from_le_bytes(buf[16..32].try_into().unwrap()),
         }
     }
+
+    /// Returns the [`ListHeader`] for a given [`ListEntry`]
+    fn new(entry: &ListEntry, head: bool) -> Self {
+        let generation = entry.generation;
+        let (flags, size) = match (head, &entry.data) {
+            (false, Some(data)) => (0, data.len() as u32),
+            _ => (Flags::HEAD, 0),
+        };
+
+        let (variant, key) = match entry.key() {
+            Some(CacheKey::Root) => (b'r', 0),
+            Some(CacheKey::Namespace(v)) => (b'n', v as _),
+            Some(CacheKey::Table(v)) => (b't', v as _),
+            Some(CacheKey::Partition(v)) => (b'p', v as _),
+            None => (0, 0),
+        };
+
+        Self {
+            size,
+            flags,
+            variant,
+            key,
+            generation,
+            reserved: 0,
+        }
+    }
 }
 
 /// The state for [`ListDecoder`]
@@ -202,7 +212,7 @@ impl ListDecoder {
     /// Decode an entry from `buf`, returning the number of bytes consumed
     ///
     /// This is meant to be used in combination with [`Self::flush`]
-    pub fn decode(&mut self, mut buf: &[u8]) -> Result<usize> {
+    pub fn decode(&mut self, mut buf: &[u8]) -> crate::api::list::Result<usize> {
         let initial = buf.len();
         while !buf.is_empty() {
             match &mut self.state {
@@ -237,14 +247,22 @@ impl ListDecoder {
     /// Returns `Ok(Some(entry))` if a record is fully decoded
     /// Returns `Ok(None)` if no in-progress record
     /// Otherwise returns an error
-    pub fn flush(&mut self) -> Result<Option<ListEntry>> {
+    pub fn flush(&mut self) -> crate::api::list::Result<Option<ListEntry>> {
         match std::mem::take(&mut self.state) {
             DecoderState::Body(header, value) if value.len() == header.size as usize => {
+                let key = match header.variant {
+                    b'r' => Some(CacheKey::Root),
+                    b't' => Some(CacheKey::Table(header.key as _)),
+                    b'n' => Some(CacheKey::Namespace(header.key as _)),
+                    b'p' => Some(CacheKey::Partition(header.key as _)),
+                    _ => None,
+                };
+
                 Ok(Some(ListEntry {
-                    variant: header.variant,
-                    key: header.key,
+                    key,
                     generation: header.generation,
                     data: ((header.flags & Flags::HEAD) == 0).then(|| value.into()),
+                    etag: None,
                 }))
             }
             DecoderState::Header(_, 0) => Ok(None),
@@ -253,87 +271,57 @@ impl ListDecoder {
     }
 }
 
-/// A key value pair encoded as part of a list
-///
-/// Unlike [`CacheKey`] and [`CacheValue`] this allows:
-///
-/// * Non-fatal handling of unknown key variants
-/// * The option to not include the value data, e.g. if too large
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ListEntry {
-    variant: u8,
-    generation: u64,
-    key: u128,
-    data: Option<Bytes>,
+struct ListStreamState {
+    response: Response,
+    current: Bytes,
+    decoder: ListDecoder,
 }
 
-impl ListEntry {
-    /// Create a new [`ListEntry`] from the provided key and value
-    pub fn new(key: CacheKey, value: CacheValue) -> Self {
-        let (variant, key) = match key {
-            CacheKey::Root => (b'r', 0),
-            CacheKey::Namespace(v) => (b'n', v as _),
-            CacheKey::Table(v) => (b't', v as _),
-            CacheKey::Partition(v) => (b'p', v as _),
-        };
-
+impl ListStreamState {
+    fn new(response: Response, max_value_size: usize) -> Self {
         Self {
-            key,
-            variant,
-            generation: value.generation,
-            data: Some(value.data),
+            response,
+            current: Default::default(),
+            decoder: ListDecoder::new().with_max_value_size(max_value_size),
         }
     }
+}
 
-    /// The key if it matches a known variant of [`CacheKey`]
-    ///
-    /// Returns `None` otherwise
-    pub fn key(&self) -> Option<CacheKey> {
-        match self.variant {
-            b'r' => Some(CacheKey::Root),
-            b't' => Some(CacheKey::Table(self.key as _)),
-            b'n' => Some(CacheKey::Namespace(self.key as _)),
-            b'p' => Some(CacheKey::Partition(self.key as _)),
-            _ => None,
+/// Decode [`ListEntry`] from a [`Response`]
+pub fn decode_response(
+    response: Response,
+    max_value_size: usize,
+) -> Result<impl Stream<Item = Result<ListEntry>>> {
+    let resp = response.error_for_status()?;
+    let state = ListStreamState::new(resp, max_value_size);
+    Ok(stream::try_unfold(state, |mut state| async move {
+        loop {
+            if state.current.is_empty() {
+                match state.response.chunk().await? {
+                    Some(new) => state.current = new,
+                    None => break,
+                }
+            }
+
+            let to_read = state.current.len();
+            let read = state.decoder.decode(&state.current)?;
+            state.current.advance(read);
+            if read != to_read {
+                break;
+            }
         }
-    }
-
-    /// The generation of this entry
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Returns the value data if present
-    pub fn value(&self) -> Option<&Bytes> {
-        self.data.as_ref()
-    }
-
-    /// Returns the [`ListHeader`] for a given [`ListEntry`]
-    fn header(&self, head: bool) -> ListHeader {
-        let generation = self.generation;
-        let (flags, size) = match (head, &self.data) {
-            (false, Some(data)) => (0, data.len() as u32),
-            _ => (Flags::HEAD, 0),
-        };
-
-        ListHeader {
-            size,
-            flags,
-            variant: self.variant,
-            key: self.key,
-            generation,
-            reserved: 0,
-        }
-    }
+        Ok(state.decoder.flush()?.map(|entry| (entry, state)))
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CacheKey, CacheValue};
     use bytes::Buf;
     use std::io::BufRead;
 
-    fn decode_entries<R: BufRead>(mut r: R) -> Result<Vec<ListEntry>> {
+    fn decode_entries<R: BufRead>(mut r: R) -> crate::api::list::Result<Vec<ListEntry>> {
         let mut decoder = ListDecoder::default();
         let iter = std::iter::from_fn(move || {
             loop {
@@ -359,17 +347,17 @@ mod tests {
             ListEntry::new(CacheKey::Namespace(2), CacheValue::new("test".into(), 32)),
             ListEntry::new(CacheKey::Namespace(6), CacheValue::new("3".into(), 4)),
             ListEntry {
-                variant: 0,
-                key: u128::MAX,
+                key: None,
                 generation: u64::MAX,
                 data: Some("unknown".into()),
+                etag: None,
             },
             ListEntry::new(CacheKey::Table(6), CacheValue::new("3".into(), 23)),
             ListEntry {
-                variant: b'p',
-                key: 45,
+                key: Some(CacheKey::Partition(45)),
                 generation: 23,
                 data: None,
+                etag: None,
             },
             ListEntry::new(
                 CacheKey::Partition(3),
@@ -409,13 +397,12 @@ mod tests {
             .map(|x| ListEntry::new(CacheKey::Namespace(x), CacheValue::new(data.clone(), 0)))
             .collect();
 
-        let mut encoder = ListEncoder::new(entries);
-        encoder.flush_size = 1024; // Lower limit for test
+        let encoder = ListEncoder::new(entries).with_flush_size(1024);
 
         let mut remaining = 1024;
         for block in encoder {
             let expected = remaining.min(7);
-            assert_eq!(block.len(), (data.len() + ListHeader::SIZE) * expected);
+            assert_eq!(block.len(), (data.len() + 32) * expected);
             let decoded = decode_entries(block.reader()).unwrap();
             assert_eq!(decoded.len(), expected);
             remaining -= expected;
@@ -439,8 +426,7 @@ mod tests {
             ),
         ];
 
-        let mut encoder = ListEncoder::new(entries);
-        encoder.max_value_size = 128; // Artificially lower limit for test
+        let encoder = ListEncoder::new(entries).with_max_value_size(128);
 
         let encoded: Vec<_> = encoder.collect();
         assert_eq!(encoded.len(), 1);
@@ -450,13 +436,11 @@ mod tests {
         assert_eq!(decoded[1].value(), None); // Should omit value that is too large
         assert_eq!(decoded[2].value().unwrap().len(), 128);
 
-        let mut decoder = ListDecoder::new();
-        decoder.max_size = 12;
+        let mut decoder = ListDecoder::new().with_max_value_size(12);
         let err = decoder.decode(&encoded[0]).unwrap_err().to_string();
         assert_eq!(err, "List value of 128 bytes too large");
 
-        let mut decoder = ListDecoder::new();
-        decoder.max_size = 128;
+        let mut decoder = ListDecoder::new().with_max_value_size(128);
 
         let consumed = decoder.decode(&encoded[0]).unwrap();
         let r = decoder.flush().unwrap().unwrap();

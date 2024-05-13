@@ -5,6 +5,8 @@ option go_package = "github.com/influxdata/iox/catalog_cache/v1";
 import "influxdata/iox/column_type/v1/type.proto";
 import "influxdata/iox/partition_template/v1/template.proto";
 import "influxdata/iox/skipped_compaction/v1/skipped_compaction.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/wrappers.proto";
 
 // A list of Message supporting efficient random access
 // See data_types::snapshot::list::MessageList
@@ -78,6 +80,11 @@ message Partition {
   optional int64 cold_compact_at = 12;
 }
 
+enum ParquetFileSource {
+    PARQUET_FILE_SOURCE_UNSPECIFIED = 0;
+    PARQUET_FILE_SOURCE_BULK_INGEST = 1;
+}
+
 message PartitionFile {
   // The identifier for a file
   UUID object_store_uuid = 1;
@@ -108,6 +115,9 @@ message PartitionFile {
 
   // Legacy sequential id
   int64 id = 10;
+
+  // Which component created this parquet file
+  ParquetFileSource source = 11;
 }
 
 message Table {
@@ -199,4 +209,18 @@ message RootNamespace {
   int64 id = 1;
   // The name of this namespace
   bytes name = 2;
+}
+
+message ListEntry {
+  oneof variant {
+    google.protobuf.Empty root = 1;
+    int64 namespace = 2;
+    int64 table = 3;
+    int64 partition = 4;
+  }
+
+  uint64 generation = 5;
+  string etag = 6;
+
+  google.protobuf.BytesValue data = 7;
 }

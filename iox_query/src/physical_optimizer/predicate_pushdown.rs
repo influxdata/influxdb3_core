@@ -16,6 +16,7 @@ use datafusion::{
         ExecutionPlan, PhysicalExpr,
     },
 };
+use datafusion_util::config::table_parquet_options;
 
 use crate::provider::DeduplicateExec;
 
@@ -29,7 +30,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(&|plan| {
+        plan.transform_down(|plan| {
             let plan_any = plan.as_any();
 
             if let Some(filter_exec) = plan_any.downcast_ref::<FilterExec>() {
@@ -72,6 +73,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                             child_parquet.base_config().clone(),
                             both,
                             None,
+                            table_parquet_options(),
                         )),
                     )?);
                     return Ok(Transformed::yes(new_node));
@@ -317,6 +319,7 @@ mod tests {
                     base_config,
                     Some(predicate_tag(&schema)),
                     None,
+                    table_parquet_options(),
                 )),
             )
             .unwrap(),
@@ -328,11 +331,11 @@ mod tests {
         ---
         input:
           - " FilterExec: tag1@0 = field@2"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
             - " FilterExec: tag1@0 = field@2"
-            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         "###
         );
     }

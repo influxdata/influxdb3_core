@@ -9,6 +9,7 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{sorts::sort::SortExec, ExecutionPlan},
 };
+use datafusion_util::config::table_parquet_options;
 use observability_deps::tracing::warn;
 
 use crate::config::IoxConfigExt;
@@ -31,7 +32,7 @@ impl PhysicalOptimizerRule for ParquetSortness {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(&|plan| {
+        plan.transform_down(|plan| {
             let Some(children_with_sort) = detect_children_with_desired_ordering(plan.as_ref())
             else {
                 return Ok(Transformed::no(plan));
@@ -162,8 +163,12 @@ impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
                 .collect(),
             ..base_config.clone()
         };
-        let new_parquet_exec =
-            ParquetExec::new(base_config, parquet_exec.predicate().cloned(), None);
+        let new_parquet_exec = ParquetExec::new(
+            base_config,
+            parquet_exec.predicate().cloned(),
+            None,
+            table_parquet_options(),
+        );
 
         // did this help?
         if new_parquet_exec.properties().output_ordering() == Some(self.desired_ordering) {
@@ -209,7 +214,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
@@ -220,11 +225,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         "###
         );
@@ -243,7 +248,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(DeduplicateExec::new(
             Arc::new(inner),
             ordering(["col2", "col1"], &schema),
@@ -278,7 +283,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_preserve_partitioning(true)
@@ -294,11 +299,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[true]"
           - "   ParquetExec: file_groups={2 groups: [[1.parquet, 2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[true]"
             - "   ParquetExec: file_groups={3 groups: [[1.parquet], [2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         "###
         );
@@ -326,7 +331,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
@@ -337,11 +342,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         "###
         );
@@ -360,7 +365,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col1", "col2"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
@@ -371,11 +376,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
         "###
         );
@@ -394,7 +399,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
@@ -405,11 +410,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3]"
         "###
         );
@@ -428,7 +433,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None);
+        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
         let plan = Arc::new(
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
@@ -444,11 +449,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         "###
         );
@@ -468,11 +473,11 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   PlaceholderRowExec"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   PlaceholderRowExec"
         "###
         );
@@ -491,7 +496,12 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let plan = Arc::new(ParquetExec::new(base_config, None, None));
+        let plan = Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ));
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
@@ -519,7 +529,12 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col1", "col2"], &schema)],
         };
-        let plan = Arc::new(ParquetExec::new(base_config, None, None));
+        let plan = Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ));
         let plan =
             Arc::new(SortExec::new(ordering(["col2", "col1"], &schema), plan).with_fetch(Some(42)));
         let plan =
@@ -530,13 +545,13 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC]"
-          - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
+          - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC]"
-            - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
+            - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
         "###
         );
@@ -555,7 +570,12 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col1", "col2"], &schema)],
         };
-        let plan = Arc::new(ParquetExec::new(base_config, None, None));
+        let plan = Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ));
         let plan =
             Arc::new(SortExec::new(ordering(["col1", "col2"], &schema), plan).with_fetch(Some(42)));
         let plan =
@@ -566,13 +586,13 @@ mod tests {
             @r###"
         ---
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
-          - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
+          - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
           - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC]"
-            - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
+            - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
             - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
         "###
         );
@@ -592,7 +612,12 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)],
         };
-        let plan_parquet = Arc::new(ParquetExec::new(base_config, None, None));
+        let plan_parquet = Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ));
         let plan_batches = Arc::new(RecordBatchesExec::new(vec![], Arc::clone(&schema), None));
 
         let plan = Arc::new(UnionExec::new(vec![plan_batches, plan_parquet]));
@@ -652,6 +677,7 @@ mod tests {
             partition_values: vec![],
             range: None,
             extensions: None,
+            statistics: None,
         }
     }
 

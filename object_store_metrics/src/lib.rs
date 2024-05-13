@@ -2,6 +2,7 @@
 
 #![allow(clippy::clone_on_ref_ptr)]
 
+use async_writer_metrics::AsyncWriterMetricsWrapper;
 use object_store::{GetOptions, GetResultPayload, PutOptions, PutResult};
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -24,7 +25,7 @@ use pin_project::{pin_project, pinned_drop};
 use object_store::{
     path::Path, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, Result,
 };
-use tokio::io::AsyncWrite;
+use tokio::{io::AsyncWrite, sync::Mutex, task::JoinSet};
 
 /// A typed name of a instance scope / shard to report the metrics under.
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ where
     }
 }
 
+mod async_writer_metrics;
 #[cfg(test)]
 mod dummy;
 
@@ -230,6 +232,8 @@ pub struct ObjectStoreMetrics {
     time_provider: Arc<dyn TimeProvider>,
 
     put: MetricsWithBytes,
+    put_multipart: Arc<MetricsWithBytes>,
+    inprogress_multipart: Mutex<JoinSet<()>>,
     get: MetricsWithBytes,
     get_range: MetricsWithBytes,
     get_ranges: MetricsWithBytes,
@@ -260,6 +264,8 @@ impl ObjectStoreMetrics {
             time_provider,
 
             put: MetricsWithBytes::new(registry, &shard, "put"),
+            put_multipart: Arc::new(MetricsWithBytes::new(registry, &shard, "put_multipart")),
+            inprogress_multipart: Default::default(),
             get: MetricsWithBytes::new(registry, &shard, "get"),
             get_range: MetricsWithBytes::new(registry, &shard, "get_range"),
             get_ranges: MetricsWithBytes::new(registry, &shard, "get_ranges"),
@@ -274,6 +280,11 @@ impl ObjectStoreMetrics {
             copy_if_not_exists: Metrics::new(registry, &shard, "copy_if_not_exists"),
             rename_if_not_exists: Metrics::new(registry, &shard, "rename_if_not_exists"),
         }
+    }
+
+    #[cfg(test)]
+    async fn close(&self) {
+        let _ = self.inprogress_multipart.lock().await.join_next().await;
     }
 }
 
@@ -296,13 +307,26 @@ impl ObjectStore for ObjectStoreMetrics {
 
     async fn put_multipart(
         &self,
-        _location: &Path,
+        location: &Path,
     ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        unimplemented!()
+        let t = self.time_provider.now();
+        let (multipart_id, inner) = self.inner.put_multipart(location).await?;
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let reporter = Arc::clone(&self.put_multipart);
+        self.inprogress_multipart.lock().await.spawn(async move {
+            if let Ok((res, bytes, t_end)) = rx.await {
+                reporter.record(t, t_end, res, bytes);
+            }
+        });
+
+        let measured_async_writer =
+            AsyncWriterMetricsWrapper::new(location, inner, Arc::clone(&self.time_provider), tx);
+        Ok((multipart_id, Box::new(measured_async_writer)))
     }
 
-    async fn abort_multipart(&self, _location: &Path, _multipart_id: &MultipartId) -> Result<()> {
-        unimplemented!()
+    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> Result<()> {
+        self.inner.abort_multipart(location, multipart_id).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -314,12 +338,12 @@ impl ObjectStore for ObjectStoreMetrics {
             Ok(mut res) => {
                 res.payload = match res.payload {
                     GetResultPayload::File(file, path) => {
-                        self.get.record(
-                            started_at,
-                            self.time_provider.now(),
-                            true,
-                            file.metadata().ok().map(|m| m.len()),
-                        );
+                        let file = tokio::fs::File::from_std(file);
+                        let size = file.metadata().await.ok().map(|m| m.len());
+                        let file = file.into_std().await;
+
+                        self.get
+                            .record(started_at, self.time_provider.now(), true, size);
                         GetResultPayload::File(file, path)
                     }
                     GetResultPayload::Stream(s) => {
@@ -688,13 +712,17 @@ where
 mod tests {
     use std::{
         io::{Error, ErrorKind},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
         time::Duration,
     };
 
-    use futures::{stream, TryStreamExt};
+    use futures::{future::ready, stream, TryStreamExt};
     use metric::Attributes;
     use std::io::Read;
+    use tokio::io::AsyncWriteExt;
 
     use dummy::DummyObjectStore;
     use object_store::{local::LocalFileSystem, memory::InMemory};
@@ -804,6 +832,361 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [("shard", "bananas"), ("op", "put"), ("result", "error")],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_multipart() {
+        let metrics = Arc::new(metric::Registry::default());
+        let store = Arc::new(InMemory::new());
+        let time = Arc::new(SystemProvider::new());
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+
+        let (_, mut async_writer) = store
+            .put_multipart(&Path::from("test"))
+            .await
+            .expect("should get async writer");
+        assert!(async_writer
+            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .await
+            .is_ok());
+        // demonstrate that it sums across bytes
+        assert!(async_writer
+            .write(&Bytes::from([42_u8, 42, 42].as_slice()))
+            .await
+            .is_ok());
+        drop(async_writer);
+        store.close().await;
+
+        assert_counter_value(
+            &metrics,
+            "object_store_transfer_bytes",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "success"),
+            ],
+            8,
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_duration",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "success"),
+            ],
+        );
+    }
+
+    struct NopeAsyncWriter;
+
+    impl AsyncWrite for NopeAsyncWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::prelude::v1::Result<usize, std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // tineout
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // tineout
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // tineout
+        }
+    }
+
+    #[derive(Debug)]
+    struct NopeObjectStore;
+
+    impl std::fmt::Display for NopeObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "NopeObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for NopeObjectStore {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+            Ok((MultipartId::new(), Box::new(NopeAsyncWriter)))
+        }
+
+        async fn abort_multipart(
+            &self,
+            _location: &Path,
+            _multipart_id: &MultipartId,
+        ) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn get_opts(&self, _location: &Path, _options: GetOptions) -> Result<GetResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn delete(&self, _location: &Path) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+            futures::stream::once(ready(Err(object_store::Error::NotImplemented))).boxed()
+        }
+
+        async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> Result<ListResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_multipart_fails() {
+        let metrics = Arc::new(metric::Registry::default());
+        // store returning erroring AsyncWriter
+        let store = Arc::new(NopeObjectStore);
+        let time = Arc::new(SystemProvider::new());
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+
+        let (_, mut async_writer) = store
+            .put_multipart(&Path::from("test"))
+            .await
+            .expect("should get async writer");
+        assert!(async_writer
+            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .await
+            .is_err());
+        drop(async_writer);
+        store.close().await;
+
+        assert_counter_value(
+            &metrics,
+            "object_store_transfer_bytes",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "error"),
+            ],
+            5,
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_duration",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "error"),
+            ],
+        );
+    }
+
+    #[derive(Default)]
+    struct WriteOnceAsyncWriter(AtomicBool /* has previous write */);
+
+    impl AsyncWrite for WriteOnceAsyncWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::prelude::v1::Result<usize, std::io::Error>> {
+            let has_previous_writes = self.0.load(Ordering::Acquire);
+            self.0.fetch_or(true, Ordering::AcqRel);
+
+            if has_previous_writes {
+                Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // timeout
+            } else {
+                Poll::Ready(Ok(buf.len()))
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // timeout
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
+            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // timeout
+        }
+    }
+
+    #[derive(Debug)]
+    struct WriteOnceObjectStore;
+
+    impl std::fmt::Display for WriteOnceObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "WriteOnceObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for WriteOnceObjectStore {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+            Ok((MultipartId::new(), Box::<WriteOnceAsyncWriter>::default()))
+        }
+
+        async fn abort_multipart(
+            &self,
+            _location: &Path,
+            _multipart_id: &MultipartId,
+        ) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn get_opts(&self, _location: &Path, _options: GetOptions) -> Result<GetResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn delete(&self, _location: &Path) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+            futures::stream::once(ready(Err(object_store::Error::NotImplemented))).boxed()
+        }
+
+        async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> Result<ListResult> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_multipart_delayed_write_failure() {
+        let metrics = Arc::new(metric::Registry::default());
+        // store returning erroring AsyncWriter
+        let store = Arc::new(WriteOnceObjectStore);
+        let time = Arc::new(SystemProvider::new());
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+
+        // FAILURE: one write ok, one write failure.
+        let (_, mut async_writer) = store
+            .put_multipart(&Path::from("test"))
+            .await
+            .expect("should get async writer");
+        // first write succeeds
+        assert!(async_writer
+            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .await
+            .is_ok());
+        // second write fails
+        assert!(async_writer
+            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .await
+            .is_err());
+        drop(async_writer);
+        store.close().await;
+
+        assert_counter_value(
+            &metrics,
+            "object_store_transfer_bytes",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "error"),
+            ],
+            10,
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_duration",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "error"),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_multipart_delayed_flush_failure() {
+        let metrics = Arc::new(metric::Registry::default());
+        // store returning erroring AsyncWriter
+        let store = Arc::new(WriteOnceObjectStore);
+        let time = Arc::new(SystemProvider::new());
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+
+        // FAILURE: one write ok, one flush failure.
+        let (_, mut async_writer) = store
+            .put_multipart(&Path::from("test"))
+            .await
+            .expect("should get async writer");
+        // first write succeeds
+        assert!(async_writer
+            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .await
+            .is_ok());
+        // flush fails
+        assert!(async_writer.flush().await.is_err());
+        drop(async_writer);
+        store.close().await;
+
+        assert_counter_value(
+            &metrics,
+            "object_store_transfer_bytes",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "error"),
+            ],
+            5,
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_duration",
+            [
+                ("shard", "bananas"),
+                ("op", "put_multipart"),
+                ("result", "error"),
+            ],
         );
     }
 

@@ -214,7 +214,7 @@ mod tests {
         - " ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
         - "   DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
         - "     SortPreservingMergeExec: [tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC]"
-        - "       SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC]"
+        - "       SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC], preserve_partitioning=[true]"
         - "         RecordBatchesExec: chunks=2, projection=[__chunk_order, field_int, field_int2, tag1, time]"
         "###
         );

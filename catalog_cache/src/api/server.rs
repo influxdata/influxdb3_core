@@ -1,15 +1,16 @@
 //! Server for the cache HTTP API
 
-use crate::api::list::{ListEncoder, ListEntry};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH};
+use crate::api::list::{v1, v2, ListEntry};
+use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2};
 use crate::local::CatalogCache;
 use crate::CacheValue;
 use futures::ready;
 use hyper::body::HttpBody;
-use hyper::header::{HeaderValue, ToStrError};
+use hyper::header::{HeaderValue, ToStrError, ETAG, IF_NONE_MATCH};
 use hyper::http::request::Parts;
 use hyper::service::Service;
-use hyper::{Body, Method, Request, Response, StatusCode};
+use hyper::{Body, HeaderMap, Method, Request, Response, StatusCode};
+use reqwest::header::CONTENT_TYPE;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::convert::Infallible;
 use std::future::Future;
@@ -38,6 +39,9 @@ enum Error {
     #[snafu(display("Invalid generation header: {source}"))]
     InvalidGeneration { source: std::num::ParseIntError },
 
+    #[snafu(display("Invalid etag header: {source}"))]
+    InvalidEtag { source: ToStrError },
+
     #[snafu(display("List query missing size"))]
     MissingSize,
 
@@ -56,6 +60,7 @@ impl Error {
             Self::InvalidGeneration { .. }
             | Self::MissingGeneration
             | Self::InvalidSize { .. }
+            | Self::InvalidEtag { .. }
             | Self::MissingSize
             | Self::BadHeader { .. } => StatusCode::BAD_REQUEST,
         };
@@ -141,33 +146,48 @@ impl CatalogRequestFuture {
 
                     let iter = self.state.cache.list();
                     let entries = iter.map(|(k, v)| ListEntry::new(k, v)).collect();
-                    let encoder = ListEncoder::new(entries).with_max_value_size(size);
 
-                    let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
-                    let response = Response::builder().body(Body::wrap_stream(stream))?;
+                    let response = match self.parts.headers.get(CONTENT_TYPE) {
+                        Some(x) if x == LIST_PROTOCOL_V2 => {
+                            let encoder = v2::ListEncoder::new(entries).with_max_value_size(size);
+                            let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
+                            Response::builder().body(Body::wrap_stream(stream))?
+                        }
+                        _ => {
+                            let encoder = v1::ListEncoder::new(entries).with_max_value_size(size);
+                            let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
+                            Response::builder().body(Body::wrap_stream(stream))?
+                        }
+                    };
+
                     return Ok(response);
                 }
                 _ => StatusCode::METHOD_NOT_ALLOWED,
             },
             Some(RequestPath::Resource(key)) => match self.parts.method {
                 Method::GET => match self.state.cache.get(key) {
-                    Some(value) => match self.parts.headers.get(&GENERATION_NOT_MATCH) {
-                        Some(h) if parse_generation(h)? == value.generation => {
-                            StatusCode::NOT_MODIFIED
+                    Some(value) => {
+                        let mut builder = Response::builder().header(&GENERATION, value.generation);
+                        if let Some(x) = &value.etag {
+                            builder = builder.header(ETAG, x.as_ref())
                         }
-                        _ => {
-                            let response = Response::builder()
-                                .header(&GENERATION, value.generation)
-                                .body(value.data.into())?;
-                            return Ok(response);
-                        }
-                    },
+
+                        return Ok(match check_preconditions(&value, &self.parts.headers)? {
+                            Some(s) => builder.status(s).body(Body::empty())?,
+                            None => builder.body(value.data.into())?,
+                        });
+                    }
                     None => StatusCode::NOT_FOUND,
                 },
                 Method::PUT => {
                     let headers = &self.parts.headers;
                     let generation = headers.get(&GENERATION).context(MissingGenerationSnafu)?;
-                    let value = CacheValue::new(body.into(), parse_generation(generation)?);
+                    let mut value = CacheValue::new(body.into(), parse_generation(generation)?);
+
+                    if let Some(x) = headers.get(ETAG) {
+                        let etag = x.to_str().context(InvalidEtagSnafu)?.to_string();
+                        value = value.with_etag(etag);
+                    }
 
                     match self.state.cache.insert(key, value)? {
                         true => StatusCode::OK,
@@ -187,6 +207,26 @@ impl CatalogRequestFuture {
         *response.status_mut() = status;
         Ok(response)
     }
+}
+
+fn check_preconditions(
+    value: &CacheValue,
+    headers: &HeaderMap,
+) -> Result<Option<StatusCode>, Error> {
+    if let Some(v) = headers.get(&GENERATION_NOT_MATCH) {
+        if value.generation == parse_generation(v)? {
+            return Ok(Some(StatusCode::NOT_MODIFIED));
+        }
+    }
+    if let Some(etag) = &value.etag {
+        if let Some(v) = headers.get(&IF_NONE_MATCH) {
+            if etag.as_bytes() == v.as_bytes() {
+                return Ok(Some(StatusCode::NOT_MODIFIED));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn parse_generation(value: &HeaderValue) -> Result<u64, Error> {

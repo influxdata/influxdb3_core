@@ -1,11 +1,11 @@
 use std::io::Write;
 
-use crate::snapshot_comparison::Language;
 use crate::{
     check_flight_error, run_influxql, run_influxql_with_params, run_sql, run_sql_with_params,
     snapshot_comparison, try_run_influxql, try_run_influxql_with_params, try_run_sql,
     try_run_sql_with_params, MiniCluster,
 };
+use crate::{snapshot_comparison::Language, ServerType};
 use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_sorted_eq;
 use futures::future::BoxFuture;
@@ -14,7 +14,10 @@ use iox_query_params::StatementParams;
 use observability_deps::tracing::info;
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
-use test_helpers::assert_contains;
+use test_helpers::{
+    assert_contains,
+    prometheus::{self, MetricSet},
+};
 use tokio::time;
 
 const MAX_QUERY_RETRY_TIME_SEC: u64 = 20;
@@ -166,7 +169,25 @@ pub type FCustom =
     Box<dyn for<'b> Fn(&'b mut StepTestState<'_>) -> BoxFuture<'b, ()> + Send + Sync>;
 
 /// Function to do custom validation on metrics. Expected to panic on validation failure.
-pub(crate) type MetricsValidationFn = Box<dyn Fn(&mut StepTestState<'_>, String) + Send + Sync>;
+
+/// A boxed function that validates prometheus metrics for a server.
+///
+/// ```rust
+/// # use test_helpers_end_to_end::*;
+/// # let _v: MetricFn =
+/// Box::new(|metrics| {
+///     let value = metrics
+///         .metric("grpc_requests_total")
+///         .labels([
+///             ("path", "/write"),
+///             ("response", "bananas"),
+///         ])
+///         .unwrap_counter();
+///
+///     assert_eq!(value, 42.0);
+/// });
+/// ```
+pub type MetricFn = Box<dyn Fn(MetricSet) + Send + Sync>;
 
 /// Possible test steps that a test can perform
 #[allow(missing_debug_implementations)]
@@ -399,12 +420,12 @@ pub enum Step {
     ///     crate::server_fixture::GRACEFUL_SERVER_STOP_TIMEOUT
     GracefulStopIngesters,
 
-    /// Retrieve the metrics and verify the results using the provided
-    /// validation function.
+    /// Read the prometheus metrics endpoint for the specified [`ServerType`]
+    /// and assert the metric values it reports.
     ///
     /// The validation function is expected to panic on validation
     /// failure.
-    VerifiedMetrics(MetricsValidationFn),
+    Metrics(ServerType, MetricFn),
 
     /// A custom step that can be used to implement special cases that
     /// are only used once.
@@ -436,6 +457,11 @@ where
 
     /// run the test.
     pub async fn run(self) {
+        self.run_and_print_runtime(false).await;
+    }
+
+    /// run the test.
+    pub async fn run_and_print_runtime(self, print_runtime: bool) {
         let Self { cluster, steps } = self;
 
         let mut state = StepTestState {
@@ -619,12 +645,13 @@ where
                         "====Begin running SQL queries in file {}",
                         input_path.display()
                     );
-                    snapshot_comparison::run(
+                    snapshot_comparison::run_and_print_runtime(
                         state.cluster,
                         input_path.into(),
                         setup_name.into(),
                         contents.into(),
                         Language::Sql,
+                        print_runtime,
                     )
                     .await
                     .unwrap();
@@ -765,12 +792,13 @@ where
                         "====Begin running InfluxQL queries in file {}",
                         input_path.display()
                     );
-                    snapshot_comparison::run(
+                    snapshot_comparison::run_and_print_runtime(
                         state.cluster,
                         input_path.into(),
                         setup_name.into(),
                         contents.into(),
                         Language::InfluxQL,
+                        print_runtime,
                     )
                     .await
                     .unwrap();
@@ -962,24 +990,39 @@ where
 
                     state.cluster_mut().gracefully_stop_ingesters().await;
                 }
-                Step::VerifiedMetrics(verify) => {
-                    info!("====Begin validating metrics");
-
-                    let cluster = state.cluster();
-                    let http_base = cluster.router().router_http_base();
-                    let url = format!("{http_base}/metrics");
-
-                    let client = reqwest::Client::new();
-                    let metrics = client.get(&url).send().await.unwrap().text().await.unwrap();
-
-                    verify(&mut state, metrics);
-
-                    info!("====Done validating metrics");
-                }
                 Step::Custom(f) => {
                     info!("====Begin custom step");
                     f(&mut state).await;
                     info!("====Done custom step");
+                }
+                Step::Metrics(server, f) => {
+                    let addr = match server {
+                        ServerType::Ingester => state
+                            .cluster()
+                            .ingester()
+                            .addrs()
+                            .ingester_http_api()
+                            .client_base(),
+                        ServerType::Router => state
+                            .cluster()
+                            .router()
+                            .addrs()
+                            .router_http_api()
+                            .client_base(),
+                        ServerType::Querier => state
+                            .cluster()
+                            .querier()
+                            .addrs()
+                            .querier_http_api()
+                            .client_base(),
+                        _ => unimplemented!("server type not supported for metric lookup"),
+                    };
+
+                    let metrics = prometheus::scrape(format!("{addr}/metrics").as_str())
+                        .await
+                        .expect("failed to scrape metric endpoint");
+
+                    f(metrics);
                 }
             }
         }

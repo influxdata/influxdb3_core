@@ -11,6 +11,7 @@ use data_types::{
     ColumnId, CompactionLevel, NamespaceId, ObjectStoreId, PartitionHashId, PartitionId,
     PartitionKey, TableId, Timestamp, TransitionPartitionId,
 };
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_util::{unbounded_memory_pool, MemoryStream};
 use iox_time::Time;
 use object_store::DynObjectStore;
@@ -86,8 +87,13 @@ async fn test_decoded_iox_metadata() {
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
     let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
+    let runtime = Arc::new(RuntimeEnv {
+        memory_pool: unbounded_memory_pool(),
+        ..Default::default()
+    });
+
     let (iox_parquet_meta, file_size) = storage
-        .upload(stream, &partition_id, &meta, unbounded_memory_pool())
+        .upload(stream, &partition_id, &meta, runtime)
         .await
         .expect("failed to serialize & persist record batch");
 
@@ -215,9 +221,14 @@ async fn test_empty_parquet_file_panic() {
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
     let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
+    let runtime = Arc::new(RuntimeEnv {
+        memory_pool: unbounded_memory_pool(),
+        ..Default::default()
+    });
+
     // Serialising empty data should cause a panic for human investigation.
     let err = storage
-        .upload(stream, &partition_id, &meta, unbounded_memory_pool())
+        .upload(stream, &partition_id, &meta, runtime)
         .await
         .expect_err("empty file should raise an error");
 
@@ -319,8 +330,13 @@ async fn test_decoded_many_columns_with_null_cols_iox_metadata() {
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
     let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
+    let runtime = Arc::new(RuntimeEnv {
+        memory_pool: unbounded_memory_pool(),
+        ..Default::default()
+    });
+
     let (iox_parquet_meta, file_size) = storage
-        .upload(stream, &partition_id, &meta, unbounded_memory_pool())
+        .upload(stream, &partition_id, &meta, runtime)
         .await
         .expect("failed to serialize & persist record batch");
 
@@ -406,8 +422,13 @@ async fn test_derive_parquet_file_params() {
     let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
     let storage = ParquetStorage::new(object_store, StorageId::from("iox"));
 
+    let runtime = Arc::new(RuntimeEnv {
+        memory_pool: unbounded_memory_pool(),
+        ..Default::default()
+    });
+
     let (iox_parquet_meta, file_size) = storage
-        .upload(stream, &partition_id, &meta, unbounded_memory_pool())
+        .upload(stream, &partition_id, &meta, runtime)
         .await
         .expect("failed to serialize & persist record batch");
 

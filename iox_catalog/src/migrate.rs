@@ -2330,9 +2330,10 @@ mod tests {
             }])
             .unwrap();
 
-            let err = test_utils::test_migration(&migrator, setup_pool)
-                .await
-                .unwrap_err();
+            let err =
+                test_utils::test_migration::<_, _, HotSwapPool<Postgres>>(&migrator, setup_pool)
+                    .await
+                    .unwrap_err();
 
             assert_eq!(
                 err.to_string(),
@@ -2358,9 +2359,10 @@ mod tests {
             }])
             .unwrap();
 
-            let err = test_utils::test_migration(&migrator, setup_pool)
-                .await
-                .unwrap_err();
+            let err =
+                test_utils::test_migration::<_, _, HotSwapPool<Postgres>>(&migrator, setup_pool)
+                    .await
+                    .unwrap_err();
 
             assert_eq!(
                 err.to_string(),
@@ -2406,9 +2408,10 @@ mod tests {
             ])
             .unwrap();
 
-            let err = test_utils::test_migration(&migrator, setup_pool)
-                .await
-                .unwrap_err();
+            let err =
+                test_utils::test_migration::<_, _, HotSwapPool<Postgres>>(&migrator, setup_pool)
+                    .await
+                    .unwrap_err();
 
             assert_eq!(
                 err.to_string(),

@@ -32,7 +32,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to list replica: {source}"))]
-    List { source: ClientError },
+    List { source: crate::api::list::Error },
 
     #[snafu(display("Local cache error: {source}"), context(false))]
     Local { source: crate::local::Error },
@@ -73,8 +73,9 @@ impl QuorumCatalogCache {
         let local = self.local.get(key);
 
         let local_generation = local.as_ref().map(|x| x.generation);
-        let fut1 = self.replicas[0].get_if_modified(key, local_generation);
-        let fut2 = self.replicas[1].get_if_modified(key, local_generation);
+        let local_etag = local.as_ref().and_then(|x| x.etag());
+        let fut1 = self.replicas[0].get_if_modified(key, local_generation, local_etag.cloned());
+        let fut2 = self.replicas[1].get_if_modified(key, local_generation, local_etag.cloned());
         pin_mut!(fut1);
         pin_mut!(fut2);
 
@@ -190,7 +191,7 @@ impl QuorumCatalogCache {
         let mut list = self.replicas[0].list(Some(0));
         while let Some(entry) = list.next().await.transpose().context(ListSnafu)? {
             if let Some(k) = entry.key() {
-                generations.insert(k, entry.generation());
+                generations.insert(k, entry);
             }
         }
 
@@ -223,15 +224,17 @@ impl QuorumCatalogCache {
                 }
             };
 
-            let Some(generation) = generations.get(&k) else {
+            let Some(first) = generations.get(&k) else {
                 continue;
             };
 
-            if *generation == entry.generation() {
+            if first.generation() == entry.generation()
+                || matches!((first.etag(), entry.etag()), (Some(a), Some(b)) if a == b)
+            {
                 inserted_elements += 1;
                 inserted_bytes += v.len();
 
-                let value = CacheValue::new(v.clone(), *generation);
+                let value = CacheValue::new(v.clone(), first.generation());
                 // In the case that local already has the given version
                 // this will be a no-op
                 self.local.insert(k, value)?;

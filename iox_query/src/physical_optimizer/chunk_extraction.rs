@@ -170,6 +170,7 @@ mod tests {
     use data_types::ChunkId;
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
+        config::TableParquetOptions,
         physical_plan::{expressions::Literal, filter::FilterExec},
         prelude::{col, lit},
         scalar::ScalarValue,
@@ -313,12 +314,13 @@ mod tests {
         let schema = chunk.schema().as_arrow();
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         let plan = plan
-            .transform_down(&|plan| {
+            .transform_down(|plan| {
                 if let Some(exec) = plan.as_any().downcast_ref::<ParquetExec>() {
                     let exec = ParquetExec::new(
                         exec.base_config().clone(),
                         Some(Arc::new(Literal::new(ScalarValue::from(false)))),
                         None,
+                        TableParquetOptions::default(),
                     );
                     return Ok(Transformed::yes(Arc::new(exec)));
                 }

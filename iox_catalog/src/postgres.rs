@@ -1,6 +1,7 @@
 //! A Postgres backed implementation of the Catalog
 
-use crate::interface::{PartitionRepoExt, RootRepo};
+use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
+use crate::metrics::CatalogMetrics;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
@@ -9,7 +10,6 @@ use crate::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
         PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
     },
-    metrics::MetricDecorator,
     migrate::IOxMigrator,
 };
 use async_trait::async_trait;
@@ -39,7 +39,6 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     env,
-    fmt::Display,
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -117,7 +116,7 @@ impl Default for PostgresConnectionOptions {
 /// PostgreSQL catalog.
 #[derive(Debug)]
 pub struct PostgresCatalog {
-    metrics: Arc<metric::Registry>,
+    metrics: CatalogMetrics,
     pool: HotSwapPool<Postgres>,
 
     // keep around in the background
@@ -129,18 +128,21 @@ pub struct PostgresCatalog {
 }
 
 impl PostgresCatalog {
+    const NAME: &'static str = "postgres";
+
     /// Connect to the catalog store.
     pub async fn connect(
         options: PostgresConnectionOptions,
         metrics: Arc<metric::Registry>,
     ) -> Result<Self> {
         let (pool, refresh_task) = new_pool(&options, Arc::clone(&metrics)).await?;
+        let time_provider = Arc::new(SystemProvider::new()) as _;
 
         Ok(Self {
             pool,
             refresh_task: Arc::new(refresh_task),
-            metrics,
-            time_provider: Arc::new(SystemProvider::new()),
+            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
+            time_provider,
             options,
         })
     }
@@ -152,18 +154,6 @@ impl PostgresCatalog {
     #[cfg(test)]
     pub(crate) fn into_pool(self) -> HotSwapPool<Postgres> {
         self.pool
-    }
-}
-
-impl Display for PostgresCatalog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            // Do not include dsn in log as it may have credentials
-            // that should not end up in the log
-            "Postgres(dsn=OMITTED, schema_name='{}')",
-            self.schema_name()
-        )
     }
 }
 
@@ -188,7 +178,7 @@ impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
     type Database = Postgres;
 
     #[allow(clippy::type_complexity)]
-    fn fetch_many<'e, 'q: 'e, E: 'q>(
+    fn fetch_many<'e, 'q, E>(
         self,
         query: E,
     ) -> futures::stream::BoxStream<
@@ -203,12 +193,13 @@ impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
     >
     where
         'c: 'e,
-        E: sqlx::Execute<'q, Self::Database>,
+        'q: 'e,
+        E: sqlx::Execute<'q, Self::Database> + 'q,
     {
         self.pool.fetch_many(query)
     }
 
-    fn fetch_optional<'e, 'q: 'e, E: 'q>(
+    fn fetch_optional<'e, 'q, E>(
         self,
         query: E,
     ) -> futures::future::BoxFuture<
@@ -217,12 +208,13 @@ impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
     >
     where
         'c: 'e,
-        E: sqlx::Execute<'q, Self::Database>,
+        'q: 'e,
+        E: sqlx::Execute<'q, Self::Database> + 'q,
     {
         self.pool.fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e, 'q>(
         self,
         sql: &'q str,
         parameters: &'e [<Self::Database as sqlx::Database>::TypeInfo],
@@ -232,16 +224,18 @@ impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
     >
     where
         'c: 'e,
+        'q: 'e,
     {
         self.pool.prepare_with(sql, parameters)
     }
 
-    fn describe<'e, 'q: 'e>(
+    fn describe<'e, 'q>(
         self,
         sql: &'q str,
     ) -> futures::future::BoxFuture<'e, Result<sqlx::Describe<Self::Database>, sqlx::Error>>
     where
         'c: 'e,
+        'q: 'e,
     {
         self.pool.describe(sql)
     }
@@ -267,23 +261,18 @@ impl Catalog for PostgresCatalog {
     }
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
-        Box::new(MetricDecorator::new(
-            Box::new(PostgresTxn {
-                inner: PostgresTxnInner {
-                    pool: self.pool.clone(),
-                },
-                refresh_task: Arc::clone(&self.refresh_task),
-                time_provider: Arc::clone(&self.time_provider),
-            }),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.time_provider),
-            "postgres",
-        ))
+        Box::new(self.metrics.repos(Box::new(PostgresTxn {
+            inner: PostgresTxnInner {
+                pool: self.pool.clone(),
+            },
+            refresh_task: Arc::clone(&self.refresh_task),
+            time_provider: Arc::clone(&self.time_provider),
+        })))
     }
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
-        Arc::clone(&self.metrics)
+        self.metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
@@ -307,6 +296,10 @@ impl Catalog for PostgresCatalog {
             .into_iter()
             .map(|row| row.get("application_name"))
             .collect())
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
     }
 }
 
@@ -1018,6 +1011,10 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         tx.commit().await?;
 
         Ok(NamespaceSnapshot::encode(ns, tables, generation as _)?)
+    }
+
+    async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
+        namespace_snapshot_by_name(self, name).await
     }
 }
 
@@ -1800,7 +1797,7 @@ RETURNING object_store_id;
             r#"
 SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
        object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
-       compaction_level, created_at, column_set, max_l0_created_at
+       compaction_level, created_at, column_set, max_l0_created_at, source
 FROM parquet_file
 WHERE parquet_file.partition_id = ANY($1)
   AND parquet_file.to_delete IS NULL;
@@ -1820,7 +1817,7 @@ WHERE parquet_file.partition_id = ANY($1)
             r#"
 SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id, min_time,
        max_time, to_delete, file_size_bytes, row_count, compaction_level, created_at, column_set,
-       max_l0_created_at
+       max_l0_created_at, source
 FROM parquet_file
 WHERE object_store_id = $1;
              "#,
@@ -1922,6 +1919,7 @@ where
         created_at,
         column_set,
         max_l0_created_at,
+        source,
     } = parquet_file_params;
 
     let query = sqlx::query_scalar::<_, ParquetFileId>(
@@ -1929,8 +1927,8 @@ where
 INSERT INTO parquet_file (
     table_id, partition_id, partition_hash_id, object_store_id,
     min_time, max_time, file_size_bytes,
-    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 )
+    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at, source )
+VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
 RETURNING id;
         "#,
     )
@@ -1946,7 +1944,8 @@ RETURNING id;
     .bind(created_at) // $10
     .bind(namespace_id) // $11
     .bind(column_set) // $12
-    .bind(max_l0_created_at); // $13
+    .bind(max_l0_created_at) // $13
+    .bind(source); // $14
 
     let parquet_file_id = query.fetch_one(executor).await.map_err(|e| {
         if is_unique_violation(&e) {
@@ -2192,8 +2191,8 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interface::ParquetFileRepoExt;
     use crate::{
+        interface::ParquetFileRepoExt,
         postgres::test_utils::{
             create_db, maybe_skip_integration, setup_db, setup_db_no_migration,
             setup_db_no_migration_with_app_name,
@@ -2237,7 +2236,7 @@ mod tests {
         maybe_skip_integration!();
         maybe_start_logging();
 
-        test_migration(&MIGRATOR, || async {
+        test_migration::<_, _, HotSwapPool<Postgres>>(&MIGRATOR, || async {
             setup_db_no_migration().await.into_pool()
         })
         .await
@@ -3101,7 +3100,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
         let postgres = setup_db_no_migration().await;
 
         let mut reporter = RawReporter::default();
-        postgres.metrics.report(&mut reporter);
+        postgres.metrics().report(&mut reporter);
         assert_eq!(
             reporter
                 .metric("sqlx_postgres_connections")

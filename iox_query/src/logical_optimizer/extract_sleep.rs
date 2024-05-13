@@ -89,14 +89,14 @@ impl TreeNodeRewriter for Rewriter {
 
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>, DataFusionError> {
         match expr {
-            Expr::ScalarFunction(ScalarFunction { func_def, mut args }) => {
-                if func_def.name() == SLEEP_UDF_NAME {
+            Expr::ScalarFunction(ScalarFunction { func, mut args }) => {
+                if func.name() == SLEEP_UDF_NAME {
                     self.found_exprs.append(&mut args);
                     return Ok(Transformed::yes(lit(ScalarValue::Null)));
                 }
 
                 Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
-                    func_def,
+                    func,
                     args,
                 })))
             }

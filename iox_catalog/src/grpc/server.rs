@@ -305,6 +305,23 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         }))
     }
 
+    async fn namespace_snapshot_by_name(
+        &self,
+        request: Request<proto::NamespaceSnapshotByNameRequest>,
+    ) -> Result<Response<proto::NamespaceSnapshotByNameResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+        let snapshot = repos
+            .namespaces()
+            .snapshot_by_name(&req.name)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::NamespaceSnapshotByNameResponse {
+            generation: snapshot.generation(),
+            namespace: Some(snapshot.into()),
+        }))
+    }
+
     async fn table_create(
         &self,
         request: Request<proto::TableCreateRequest>,

@@ -4,8 +4,8 @@ use crate::snapshot::list::MessageList;
 use crate::snapshot::mask::{BitMask, BitMaskBuilder};
 use crate::{
     ColumnId, ColumnSet, CompactionLevelProtoError, NamespaceId, ObjectStoreId, ParquetFile,
-    ParquetFileId, Partition, PartitionHashId, PartitionHashIdError, PartitionId,
-    SkippedCompaction, SortKeyIds, TableId, Timestamp,
+    ParquetFileId, ParquetFileSource, Partition, PartitionHashId, PartitionHashIdError,
+    PartitionId, SkippedCompaction, SortKeyIds, TableId, Timestamp,
 };
 use bytes::Bytes;
 use generated_types::influxdata::iox::{
@@ -110,6 +110,7 @@ impl PartitionSnapshot {
                     created_at: file.created_at.0,
                     max_l0_created_at: file.max_l0_created_at.0,
                     column_mask: Some(mask.finish().into()),
+                    source: file.source.map(|i| i as i32).unwrap_or_default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -200,6 +201,7 @@ impl PartitionSnapshot {
             created_at: Timestamp(file.created_at),
             column_set,
             max_l0_created_at: Timestamp(file.max_l0_created_at),
+            source: ParquetFileSource::from_proto(file.source),
         })
     }
 

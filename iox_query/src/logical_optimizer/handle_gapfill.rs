@@ -4,14 +4,14 @@
 pub mod range_predicate;
 
 use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
-use datafusion::logical_expr::ScalarFunctionDefinition;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     error::{DataFusionError, Result},
+    functions::datetime::functions as datafusion_datetime_udfs,
     logical_expr::{
         expr::{Alias, ScalarFunction},
         utils::expr_to_columns,
-        Aggregate, BuiltinScalarFunction, Extension, LogicalPlan, Projection,
+        Aggregate, Extension, LogicalPlan, Projection, ScalarUDF,
     },
     optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
     prelude::{col, Column, Expr},
@@ -214,8 +214,11 @@ fn build_gapfill_node(
 
     // Make sure the time output to the gapfill node matches what the
     // aggregate output was.
-    let time_column =
-        col(new_aggr_plan.schema().fields()[date_bin_gapfill_index].qualified_column());
+    let time_column = col(datafusion::common::Column::from(
+        new_aggr_plan
+            .schema()
+            .qualified_field(date_bin_gapfill_index),
+    ));
 
     let LogicalPlan::Aggregate(aggr) = &new_aggr_plan else {
         return Err(DataFusionError::Internal(format!(
@@ -225,9 +228,13 @@ fn build_gapfill_node(
     };
     let mut new_group_expr: Vec<_> = aggr
         .schema
-        .fields()
         .iter()
-        .map(|f| Expr::Column(f.qualified_column()))
+        .map(|(qualifier, field)| {
+            Expr::Column(datafusion::common::Column::from((
+                qualifier,
+                field.as_ref(),
+            )))
+        })
         .collect();
     let aggr_expr = new_group_expr.split_off(aggr.group_expr.len());
 
@@ -342,7 +349,16 @@ fn replace_date_bin_gapfill(group_expr: &[Expr]) -> Result<Option<RewriteInfo>> 
 
     let date_bin_gapfill_index = dbg_idx.expect("should be found exactly one call");
 
-    let mut rewriter = DateBinGapfillRewriter { args: None };
+    let date_bin = datafusion_datetime_udfs()
+        .iter()
+        .find(|fun| fun.name().eq("date_bin"))
+        .ok_or(DataFusionError::Execution("no date_bin UDF found".into()))?
+        .to_owned();
+
+    let mut rewriter = DateBinGapfillRewriter {
+        args: None,
+        date_bin,
+    };
     let group_expr = group_expr
         .iter()
         .enumerate()
@@ -374,13 +390,14 @@ fn unwrap_alias(mut e: &Expr) -> &Expr {
 
 struct DateBinGapfillRewriter {
     args: Option<Vec<Expr>>,
+    date_bin: Arc<ScalarUDF>,
 }
 
 impl TreeNodeRewriter for DateBinGapfillRewriter {
     type Node = Expr;
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match &expr {
-            Expr::ScalarFunction(fun) if fun.func_def.name() == DATE_BIN_GAPFILL_UDF_NAME => {
+            Expr::ScalarFunction(fun) if fun.name() == DATE_BIN_GAPFILL_UDF_NAME => {
                 Ok(Transformed::new(expr, true, TreeNodeRecursion::Jump))
             }
             _ => Ok(Transformed::no(expr)),
@@ -392,13 +409,13 @@ impl TreeNodeRewriter for DateBinGapfillRewriter {
         // so that everything stays wired up.
         let orig_name = expr.display_name()?;
         match expr {
-            Expr::ScalarFunction(ScalarFunction { func_def, args })
-                if func_def.name() == DATE_BIN_GAPFILL_UDF_NAME =>
+            Expr::ScalarFunction(ScalarFunction { func, args })
+                if func.name() == DATE_BIN_GAPFILL_UDF_NAME =>
             {
                 self.args = Some(args.clone());
                 Ok(Transformed::yes(
                     Expr::ScalarFunction(ScalarFunction {
-                        func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::DateBin),
+                        func: Arc::clone(&self.date_bin),
                         args,
                     })
                     .alias(orig_name),
@@ -501,7 +518,7 @@ impl TreeNodeRewriter for FillFnRewriter {
     type Node = Expr;
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match &expr {
-            Expr::ScalarFunction(fun) if udf_to_fill_strategy(fun.func_def.name()).is_some() => {
+            Expr::ScalarFunction(fun) if udf_to_fill_strategy(fun.name()).is_some() => {
                 Ok(Transformed::new(expr, true, TreeNodeRecursion::Jump))
             }
             _ => Ok(Transformed::no(expr)),
@@ -511,13 +528,11 @@ impl TreeNodeRewriter for FillFnRewriter {
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         let orig_name = expr.display_name()?;
         match expr {
-            Expr::ScalarFunction(ref fun)
-                if udf_to_fill_strategy(fun.func_def.name()).is_none() =>
-            {
+            Expr::ScalarFunction(ref fun) if udf_to_fill_strategy(fun.name()).is_none() => {
                 Ok(Transformed::no(expr))
             }
             Expr::ScalarFunction(mut fun) => {
-                let fs = udf_to_fill_strategy(fun.func_def.name()).expect("must be a fill fn");
+                let fs = udf_to_fill_strategy(fun.name()).expect("must be a fill fn");
                 let arg = fun.args.remove(0);
                 self.add_fill_strategy(arg.clone(), fs)?;
                 Ok(Transformed::yes(arg.alias(orig_name)))
@@ -543,7 +558,7 @@ impl FillFnRewriter {
 
 fn count_udf(e: &Expr, name: &str) -> Result<usize> {
     let mut count = 0;
-    e.apply(&mut |expr| {
+    e.apply(|expr| {
         if matches_udf(expr, name) {
             count += 1;
         }
@@ -555,7 +570,7 @@ fn count_udf(e: &Expr, name: &str) -> Result<usize> {
 fn matches_udf(e: &Expr, name: &str) -> bool {
     matches!(
         e,
-        Expr::ScalarFunction(fun) if fun.func_def.name() == name
+        Expr::ScalarFunction(fun) if fun.name() == name
     )
 }
 
@@ -590,7 +605,7 @@ mod test {
     use datafusion::logical_expr::builder::table_scan_with_filters;
     use datafusion::logical_expr::{logical_plan, LogicalPlan, LogicalPlanBuilder};
     use datafusion::optimizer::optimizer::Optimizer;
-    use datafusion::optimizer::OptimizerContext;
+    use datafusion::optimizer::{OptimizerContext, OptimizerRule};
     use datafusion::prelude::{avg, case, col, lit, min, Expr};
     use datafusion::scalar::ScalarValue;
     use datafusion_util::lit_timestamptz_nano;
@@ -650,14 +665,16 @@ mod test {
             .call(vec![arg]))
     }
 
-    fn optimize(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
+
+    fn optimize(plan: &LogicalPlan) -> Result<LogicalPlan> {
         let optimizer = Optimizer::with_rules(vec![Arc::new(HandleGapFill)]);
-        optimizer.optimize_recursively(&optimizer.rules[0], plan, &OptimizerContext::new())
+        optimizer.optimize(plan.clone(), &OptimizerContext::new(), observe)
     }
 
     fn assert_optimizer_err(plan: &LogicalPlan, expected: &str) {
         match optimize(plan) {
-            Ok(plan) => assert_eq!(format!("{}", plan.unwrap().display_indent()), "an error"),
+            Ok(plan) => assert_eq!(format!("{}", plan.display_indent()), "an error"),
             Err(ref e) => {
                 let actual = e.to_string();
                 if expected.is_empty() || !actual.contains(expected) {
@@ -669,21 +686,15 @@ mod test {
 
     fn assert_optimization_skipped(plan: &LogicalPlan) -> Result<()> {
         let new_plan = optimize(plan)?;
-        if new_plan.is_none() {
-            return Ok(());
-        }
         assert_eq!(
             format!("{}", plan.display_indent()),
-            format!("{}", new_plan.unwrap().display_indent())
+            format!("{}", new_plan.display_indent())
         );
         Ok(())
     }
 
     fn format_optimized_plan(plan: &LogicalPlan) -> Result<Vec<String>> {
-        let plan = optimize(plan)?
-            .expect("plan should have been optimized")
-            .display_indent()
-            .to_string();
+        let plan = optimize(plan)?.display_indent().to_string();
         Ok(plan.split('\n').map(|s| s.to_string()).collect())
     }
 

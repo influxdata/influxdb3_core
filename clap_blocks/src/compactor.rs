@@ -8,6 +8,36 @@ use crate::{
 
 use super::compactor_scheduler::CompactorSchedulerConfig;
 
+/// CLI config for parquet encoding
+#[derive(Debug, Copy, Clone, clap::Parser, PartialEq)]
+pub struct ParquetWriteConfig {
+    /// Number of row groups to encode in parallel.
+    ///
+    /// If not provided, will default to 1.
+    ///
+    /// Note: increasing this value may increase the memory usage.
+    #[clap(
+        long = "compaction-parquet-write-row-group-parallelism",
+        env = "INFLUXDB_IOX_COMPACTION_PARQUET_WRITE_ROW_GROUP_PARALLELISM",
+        default_value = "1"
+    )]
+    pub num_row_groups_in_parallel: usize,
+
+    /// Number of columns (across all row groups) to encode in parallel.
+    ///
+    /// Note: increasing this value may increase the memory usage depending
+    /// on either a high number of columns, or >1 row groups being parallelized.
+    ///
+    /// If the `num_row_groups_in_parallel` is explicitly set (not-default), this will
+    /// default to a desired number of threads based upon the number of cores.
+    #[clap(
+        long = "compaction-parquet-write-column-parallelism",
+        env = "INFLUXDB_IOX_COMPACTION_PARQUET_WRITE_COLUMN_PARALLELISM",
+        required = false
+    )]
+    pub num_columns_in_parallel: Option<usize>,
+}
+
 /// CLI config for compactor
 #[derive(Debug, Clone, clap::Parser)]
 pub struct CompactorConfig {
@@ -18,6 +48,13 @@ pub struct CompactorConfig {
     /// Parquet write hint config.
     #[clap(flatten)]
     pub parquet_write_hint_config: ParquetWriteHintConfig,
+
+    /// Enable writing parquet files in parallel. If enabled, the compactor
+    /// will use multiple cores and multi-part uploads when creating parquet files.
+    /// Note this feature is in development, and is expected to help when writing
+    /// large highly compressible parquet files.
+    #[clap(flatten)]
+    pub parquet_write_parallelism: Option<ParquetWriteConfig>,
 
     /// Configuration for the compactor scheduler
     #[clap(flatten)]
@@ -103,15 +140,6 @@ pub struct CompactorConfig {
     )]
     pub exec_mem_pool_percent: u64,
 
-    /// Maximum duration of the per-partition compaction task in seconds.
-    #[clap(
-        long = "compaction-partition-timeout-secs",
-        env = "INFLUXDB_IOX_COMPACTION_PARTITION_TIMEOUT_SECS",
-        default_value = "1800",
-        action
-    )]
-    pub partition_timeout_secs: u64,
-
     /// Shadow mode.
     ///
     /// This will NOT write / commit any output to the object store or catalog.
@@ -159,4 +187,73 @@ pub struct CompactorConfig {
         action
     )]
     pub max_partition_fetch_queries_per_second: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn default_compactor_does_not_have_parallel_writes() {
+        let config = CompactorConfig::try_parse_from(["my_binary"]).unwrap();
+        assert!(
+            config.parquet_write_parallelism.is_none(),
+            "should have no parallelized writes are set, when no compactor options are set"
+        );
+    }
+
+    #[test]
+    fn configured_compactor_does_not_have_parallel_writes_by_default() {
+        let config = CompactorConfig::try_parse_from([
+            "my_binary",
+            "--max-partition-fetch-queries-per-second",
+            "1000",
+        ])
+        .unwrap();
+        assert!(
+            config.max_partition_fetch_queries_per_second.is_some(),
+            "should have a configured compactor"
+        );
+        assert!(
+            config.parquet_write_parallelism.is_none(),
+            "should have no parallelized writes are set, even when other compactor options are set"
+        );
+    }
+
+    #[test]
+    fn can_specify_parallel_writes_via_parallel_columns() {
+        let config = CompactorConfig::try_parse_from([
+            "my_binary",
+            "--compaction-parquet-write-column-parallelism",
+            "3",
+        ])
+        .unwrap();
+        assert!(config.parquet_write_parallelism.is_some());
+        assert_eq!(
+            config.parquet_write_parallelism.unwrap(),
+            ParquetWriteConfig {
+                num_row_groups_in_parallel: 1,
+                num_columns_in_parallel: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn can_specify_parallel_writes_via_parallel_rowgroups() {
+        let config = CompactorConfig::try_parse_from([
+            "my_binary",
+            "--compaction-parquet-write-row-group-parallelism",
+            "2",
+        ])
+        .unwrap();
+        assert!(config.parquet_write_parallelism.is_some());
+        assert_eq!(
+            config.parquet_write_parallelism.unwrap(),
+            ParquetWriteConfig {
+                num_row_groups_in_parallel: 2,
+                num_columns_in_parallel: None, // later in call stack, will default to a number based on the cores
+            }
+        );
+    }
 }

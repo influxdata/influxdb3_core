@@ -15,11 +15,7 @@ use data_types::{
 use iox_time::TimeProvider;
 use snafu::Snafu;
 use std::collections::HashSet;
-use std::{
-    collections::HashMap,
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use trace::ctx::SpanContext;
 
 /// An error wrapper detailing the reason for a compare-and-swap failure.
@@ -182,7 +178,7 @@ impl SoftDeletedRows {
 
 /// Methods for working with the catalog.
 #[async_trait]
-pub trait Catalog: Send + Sync + Debug + Display {
+pub trait Catalog: Send + Sync + Debug {
     /// Setup catalog for usage and apply possible migrations.
     async fn setup(&self) -> Result<(), Error>;
 
@@ -202,6 +198,9 @@ pub trait Catalog: Send + Sync + Debug + Display {
     ///
     /// This is only implemented for some backends, others may return [`NotImplemented`](Error::NotImplemented).
     async fn active_applications(&self) -> Result<HashSet<String>, Error>;
+
+    /// Machine-readable name.
+    fn name(&self) -> &'static str;
 }
 
 /// Methods for working with the catalog's various repositories (collections of entities).
@@ -299,6 +298,26 @@ pub trait NamespaceRepo: Send + Sync {
 
     /// Obtain a namespace snapshot
     async fn snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot>;
+
+    /// Obtain a namespace snapshot by name
+    async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot>;
+}
+
+/// Fallback logic for [`NamespaceRepo::snapshot_by_name`]
+///
+/// This is not a default implementation to avoid accidental fallback behaviour
+/// and to allow the gRPC client to use this based on the server response
+pub(crate) async fn namespace_snapshot_by_name(
+    repo: &mut impl NamespaceRepo,
+    name: &str,
+) -> Result<NamespaceSnapshot> {
+    let ns = repo
+        .get_by_name(name, SoftDeletedRows::ExcludeDeleted)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            descr: name.to_string(),
+        })?;
+    repo.snapshot(ns.id).await
 }
 
 /// Functions for working with tables in the catalog

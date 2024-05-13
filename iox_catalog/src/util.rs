@@ -269,7 +269,7 @@ pub async fn list_schemas(
 /// In a backoff loop, retry calling the compare-and-swap sort key catalog function if the catalog
 /// returns a query error unrelated to the CAS operation.
 ///
-/// Returns with a value of `Ok` containing the new sort key if:
+/// Returns with a value of `Ok` if:
 ///
 /// - No concurrent updates were detected
 /// - A concurrent update was detected, but the other update resulted in the same value this update

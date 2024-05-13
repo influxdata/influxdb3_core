@@ -5,7 +5,7 @@ use crate::Sharder;
 thread_local! {
     /// A per-thread counter incremented once per call to
     /// [`RoundRobin::next()`].
-    static COUNTER: RefCell<usize>  = RefCell::new(0);
+    static COUNTER: RefCell<usize> = const { RefCell::new(0) };
 }
 
 /// A round-robin sharder (with no data locality) that arbitrarily maps to `T`

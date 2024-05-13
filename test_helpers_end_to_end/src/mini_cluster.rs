@@ -2,8 +2,7 @@ use crate::{
     dump_log_to_stdout, log_command, rand_id,
     server_type::AddAddrEnv,
     service_link::{link_services, LinkableService},
-    try_request_http, write_to_ingester, write_to_router, HttpReverseProxy, ServerFixture,
-    TestConfig, TestServer,
+    try_request_http, write_to_ingester, write_to_router, ServerFixture, TestConfig, TestServer,
 };
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use arrow_flight::{
@@ -56,9 +55,6 @@ pub struct MiniCluster {
     /// Standard optional compactor configuration, to be used on-demand
     compactor_config: Option<TestConfig>,
 
-    /// Catalog reverse proxy.
-    catalog_reverse_proxy: Option<Arc<HttpReverseProxy>>,
-
     /// Catalog cache servers.
     catalog: Vec<ServerFixture>,
 
@@ -110,7 +106,6 @@ impl MiniCluster {
         querier: Option<ServerFixture>,
         compactor_config: Option<TestConfig>,
         catalog: Vec<ServerFixture>,
-        catalog_reverse_proxy: Option<Arc<HttpReverseProxy>>,
     ) -> Self {
         let org_id = rand_id();
         let bucket_id = rand_id();
@@ -123,7 +118,6 @@ impl MiniCluster {
             parquet_cache: None, // currently, parquet cache is not tested with shared servers
             compactor_config,
             catalog,
-            catalog_reverse_proxy,
 
             org_id,
             bucket_id,
@@ -219,15 +213,9 @@ impl MiniCluster {
     /// querier. Save config for a compactor, but the compactor service should be run on-demand in
     /// tests using `compactor run-once` rather than using `run compactor`.
     pub async fn create_non_shared(database_url: String) -> Self {
-        let catalog_configs = TestConfig::catalog_nodes(&database_url);
-        let catalog_reverse_proxy = Arc::new(HttpReverseProxy::new(
-            catalog_configs
-                .iter()
-                .map(|cfg| cfg.addrs().catalog_grpc_api().client_base()),
-        ));
+        let (catalog_configs, dsn) = TestConfig::catalog_nodes(&database_url);
 
-        let ingester_config =
-            TestConfig::new_ingester(format!("http://{}", catalog_reverse_proxy.addr()));
+        let ingester_config = TestConfig::new_ingester(dsn);
         let router_config = TestConfig::new_router(&ingester_config);
         let querier_config = TestConfig::new_querier(&ingester_config);
         let compactor_config = TestConfig::new_compactor(&ingester_config);
@@ -236,7 +224,6 @@ impl MiniCluster {
         Self::new()
             .with_catalog(catalog_configs)
             .await
-            .with_catalog_reverse_proxy(catalog_reverse_proxy)
             .with_ingester(ingester_config)
             .await
             .with_router(router_config)
@@ -251,17 +238,9 @@ impl MiniCluster {
     /// compactor service should be run on-demand in tests using `compactor run-once` rather than
     /// using `run compactor`.
     pub async fn create_non_shared_never_persist(database_url: String) -> Self {
-        let catalog_configs = TestConfig::catalog_nodes(&database_url);
-        let catalog_reverse_proxy = Arc::new(HttpReverseProxy::new(
-            catalog_configs
-                .iter()
-                .map(|cfg| cfg.addrs().catalog_grpc_api().client_base()),
-        ));
+        let (catalog_configs, dsn) = TestConfig::catalog_nodes(&database_url);
 
-        let ingester_config = TestConfig::new_ingester_never_persist(format!(
-            "http://{}",
-            catalog_reverse_proxy.addr()
-        ));
+        let ingester_config = TestConfig::new_ingester_never_persist(dsn);
         let router_config = TestConfig::new_router(&ingester_config);
         let querier_config = TestConfig::new_querier(&ingester_config);
         let compactor_config = TestConfig::new_compactor(&ingester_config);
@@ -270,7 +249,6 @@ impl MiniCluster {
         Self::new()
             .with_catalog(catalog_configs)
             .await
-            .with_catalog_reverse_proxy(catalog_reverse_proxy)
             .with_ingester(ingester_config)
             .await
             .with_router(router_config)
@@ -290,15 +268,9 @@ impl MiniCluster {
         database_url: String,
         authz_addr: impl Into<String> + Clone + Send,
     ) -> Self {
-        let catalog_configs = TestConfig::catalog_nodes(&database_url);
-        let catalog_reverse_proxy = Arc::new(HttpReverseProxy::new(
-            catalog_configs
-                .iter()
-                .map(|cfg| cfg.addrs().catalog_grpc_api().client_base()),
-        ));
+        let (catalog_configs, dsn) = TestConfig::catalog_nodes(&database_url);
 
-        let ingester_config =
-            TestConfig::new_ingester(format!("http://{}", catalog_reverse_proxy.addr()));
+        let ingester_config = TestConfig::new_ingester(dsn);
         let router_config =
             TestConfig::new_router(&ingester_config).with_single_tenancy(authz_addr.clone());
         let querier_config =
@@ -309,7 +281,6 @@ impl MiniCluster {
         Self::new_based_on_tenancy(true)
             .with_catalog(catalog_configs)
             .await
-            .with_catalog_reverse_proxy(catalog_reverse_proxy)
             .with_ingester(ingester_config)
             .await
             .with_router(router_config)
@@ -334,7 +305,6 @@ impl MiniCluster {
     pub async fn with_router(mut self, router_config: TestConfig) -> Self {
         assert!(self.router.is_none());
         let fixture = ServerFixture::create(router_config).await;
-        self.add_catalog_reverse_proxy_client(fixture.strong());
         self.add_ingester_client(fixture.strong());
         self.router = Some(fixture);
         self
@@ -343,7 +313,6 @@ impl MiniCluster {
     /// create an ingester with the specified configuration;
     pub async fn with_ingester(mut self, ingester_config: TestConfig) -> Self {
         let fixture = ServerFixture::create(ingester_config).await;
-        self.add_catalog_reverse_proxy_client(fixture.strong());
         self.ingesters.push(fixture);
         self
     }
@@ -359,7 +328,6 @@ impl MiniCluster {
     pub async fn with_querier(mut self, querier_config: TestConfig) -> Self {
         assert!(self.querier.is_none());
         let fixture = ServerFixture::create(querier_config).await;
-        self.add_catalog_reverse_proxy_client(fixture.strong());
         self.add_ingester_client(fixture.strong());
         self.querier = Some(fixture);
         self
@@ -373,7 +341,6 @@ impl MiniCluster {
     /// create a parquet_cache server with the specified configuration;
     pub async fn with_parquet_cache(mut self, parquet_cache_config: TestConfig) -> Self {
         let fixture = ServerFixture::create(parquet_cache_config).await;
-        self.add_catalog_reverse_proxy_client(fixture.strong());
         self.parquet_cache = Some(fixture);
         self
     }
@@ -383,27 +350,6 @@ impl MiniCluster {
         assert!(self.catalog.is_empty());
         self.catalog = ServerFixture::create_multiple(catalog_configs).await;
         self
-    }
-
-    fn add_catalog_client(&self, client: Arc<dyn LinkableService>) {
-        for catalog in &self.catalog {
-            let catalog = catalog.strong();
-            link_services(catalog, Arc::clone(&client));
-        }
-    }
-
-    /// Register catalog reverse proxy.
-    pub fn with_catalog_reverse_proxy(mut self, proxy: Arc<HttpReverseProxy>) -> Self {
-        assert!(self.catalog_reverse_proxy.is_none());
-        self.add_catalog_client(Arc::clone(&proxy) as _);
-        self.catalog_reverse_proxy = Some(proxy);
-        self
-    }
-
-    fn add_catalog_reverse_proxy_client(&self, client: Arc<dyn LinkableService>) {
-        if let Some(proxy) = &self.catalog_reverse_proxy {
-            link_services(Arc::clone(proxy) as _, client);
-        }
     }
 
     /// Retrieve the underlying router server, if set
@@ -820,7 +766,6 @@ struct SharedServers {
     querier: Option<Weak<TestServer>>,
     compactor_config: Option<TestConfig>,
     catalog: Vec<Weak<TestServer>>,
-    catalog_reverse_proxy: Option<Weak<HttpReverseProxy>>,
 }
 
 /// Deferred creation of a mini cluster
@@ -830,7 +775,6 @@ struct CreatableMiniCluster {
     querier: Option<Arc<TestServer>>,
     compactor_config: Option<TestConfig>,
     catalog: Vec<Arc<TestServer>>,
-    catalog_reverse_proxy: Option<Arc<HttpReverseProxy>>,
 }
 
 async fn create_if_needed(server: Option<Arc<TestServer>>) -> Option<ServerFixture> {
@@ -860,7 +804,6 @@ impl CreatableMiniCluster {
             querier,
             compactor_config,
             catalog,
-            catalog_reverse_proxy,
         } = self;
 
         let router_fixture = create_if_needed(router).await;
@@ -874,7 +817,6 @@ impl CreatableMiniCluster {
             querier_fixture,
             compactor_config,
             catalog_fixtures,
-            catalog_reverse_proxy,
         )
     }
 }
@@ -888,7 +830,6 @@ impl SharedServers {
             querier: cluster.querier.as_ref().map(|c| c.weak()),
             compactor_config: cluster.compactor_config.clone(),
             catalog: cluster.catalog.iter().map(|c| c.weak()).collect(),
-            catalog_reverse_proxy: cluster.catalog_reverse_proxy.as_ref().map(Arc::downgrade),
         }
     }
 
@@ -904,7 +845,6 @@ impl SharedServers {
             querier: server_from_weak(self.querier.as_ref())?,
             compactor_config: self.compactor_config.clone(),
             catalog: servers_from_weak(&self.catalog)?,
-            catalog_reverse_proxy: server_from_weak(self.catalog_reverse_proxy.as_ref())?,
         })
     }
 }

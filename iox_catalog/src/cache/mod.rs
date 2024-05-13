@@ -1,5 +1,8 @@
 //! Cache layer.
 
+/// Minimum size of payload to compute ETags for
+const ETAG_MIN_PAYLOAD_SIZE: usize = 128 * 1024;
+
 mod handler;
 mod loader;
 mod snapshot;
@@ -31,13 +34,11 @@ use iox_time::TimeProvider;
 use trace::ctx::SpanContext;
 
 use crate::interface::RootRepo;
-use crate::{
-    interface::{
-        CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-        RepoCollection, Result, SoftDeletedRows, TableRepo,
-    },
-    metrics::MetricDecorator,
+use crate::interface::{
+    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
+    RepoCollection, Result, SoftDeletedRows, TableRepo,
 };
+use crate::metrics::CatalogMetrics;
 
 use self::handler::{CacheHandlerCatalog, CacheHandlerRepos};
 use self::snapshot::RootKey;
@@ -46,9 +47,10 @@ use self::snapshot::RootKey;
 #[derive(Debug)]
 pub struct CachingCatalog {
     backing: Arc<dyn Catalog>,
-    metrics: Arc<metric::Registry>,
+    metrics: CatalogMetrics,
     time_provider: Arc<dyn TimeProvider>,
     quorum_fanout: usize,
+    etag_min_payload_size: usize,
     partitions: CacheHandlerCatalog<PartitionSnapshot>,
     tables: CacheHandlerCatalog<TableSnapshot>,
     namespaces: CacheHandlerCatalog<NamespaceSnapshot>,
@@ -56,6 +58,8 @@ pub struct CachingCatalog {
 }
 
 impl CachingCatalog {
+    const NAME: &'static str = "cache";
+
     /// Create new caching catalog.
     ///
     /// Sets:
@@ -106,20 +110,15 @@ impl CachingCatalog {
 
         Self {
             backing,
-            metrics,
+            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             time_provider,
             quorum_fanout,
             partitions,
             tables,
             namespaces,
             root,
+            etag_min_payload_size: ETAG_MIN_PAYLOAD_SIZE,
         }
-    }
-}
-
-impl std::fmt::Display for CachingCatalog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "caching")
     }
 }
 
@@ -130,24 +129,19 @@ impl Catalog for CachingCatalog {
     }
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
-        Box::new(MetricDecorator::new(
-            Box::new(Repos {
-                backing: self.backing.repositories(),
-                quorum_fanout: self.quorum_fanout,
-                tables: self.tables.repos(),
-                partitions: self.partitions.repos(),
-                namespaces: self.namespaces.repos(),
-                root: self.root.repos(),
-            }),
-            Arc::clone(&self.metrics),
-            self.time_provider(),
-            "cache",
-        ))
+        Box::new(self.metrics.repos(Box::new(Repos {
+            backing: self.backing.repositories(),
+            quorum_fanout: self.quorum_fanout,
+            tables: self.tables.repos(self.etag_min_payload_size),
+            partitions: self.partitions.repos(self.etag_min_payload_size),
+            namespaces: self.namespaces.repos(self.etag_min_payload_size),
+            root: self.root.repos(self.etag_min_payload_size),
+        })))
     }
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
-        Arc::clone(&self.metrics)
+        self.metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
@@ -158,6 +152,10 @@ impl Catalog for CachingCatalog {
         Err(Error::NotImplemented {
             descr: "active applications".to_owned(),
         })
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
     }
 }
 
@@ -272,35 +270,17 @@ impl NamespaceRepo for Repos {
     }
 
     async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>> {
-        let root = self.root.get(RootKey).await?;
-        let namespaces = root.namespaces().collect::<Result<Vec<_>, _>>()?;
-
-        futures::stream::iter(namespaces)
-            .map(|n| {
-                let this = &self;
-                async move {
-                    let snapshot = match this.namespaces.get(n.id()).await {
-                        Ok(s) => s,
-                        Err(Error::NotFound { .. }) => {
-                            return Ok(futures::stream::empty().boxed());
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    };
-
-                    let ns = snapshot.namespace()?;
-
-                    match filter_namespace(ns, deleted) {
-                        Some(ns) => Ok(futures::stream::once(async move { Ok(ns) }).boxed()),
-                        None => Ok(futures::stream::empty().boxed()),
-                    }
-                }
-            })
-            .buffer_unordered(self.quorum_fanout)
-            .try_flatten()
-            .try_collect::<Vec<_>>()
-            .await
+        // This method is called infrequently by the routers to warm their caches
+        // and will load data on all namespaces including a number that aren't
+        // in the working set.
+        //
+        // Rather than polluting our caches we just read through for this data
+        //
+        // There are potential future consistency issues with this approach, see
+        // https://github.com/influxdata/influxdb_iox/pull/10407#discussion_r1526046175,
+        // but if/when such data dependencies are introduced into namespace data
+        // we can potentially revisit this design
+        self.backing.namespaces().list(deleted).await
     }
 
     async fn get_by_id(
@@ -385,6 +365,11 @@ impl NamespaceRepo for Repos {
 
     async fn snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot> {
         self.namespaces.get(namespace_id).await
+    }
+
+    async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
+        let id = self.namespace_id_by_name(name).await?;
+        self.namespaces.get(id).await
     }
 }
 
@@ -1077,11 +1062,13 @@ mod tests {
     use generated_types::prost::Message;
     use iox_time::SystemProvider;
     use metric::{Attributes, DurationHistogram, Metric, U64Counter};
+    use std::fmt::Debug;
     use test_helpers::maybe_start_logging;
 
     use crate::{interface_tests::TestCatalog, mem::MemCatalog};
 
     use super::*;
+    use crate::cache::snapshot::Snapshot;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -1201,6 +1188,41 @@ mod tests {
         let s4 = repos.tables().snapshot(table.id).await.unwrap();
         assert_ne!(s4.generation(), s3.generation());
         assert_ne!(s4.generation(), s2.generation());
+    }
+
+    #[tokio::test]
+    async fn test_etag() {
+        let (catalog, cache) = catalog();
+
+        let mut repos = catalog.repositories();
+        repos
+            .namespaces()
+            .create(&NamespaceName::new("123456789").unwrap(), None, None, None)
+            .await
+            .unwrap();
+
+        let key = CacheKey::Root;
+        let s1 = repos.root().snapshot().await.unwrap();
+
+        let val = cache.peers()[0].get(key).await.unwrap().unwrap();
+        let etag = val.etag().unwrap();
+        assert_eq!(s1.generation(), val.generation()); // Snapshot generation should match
+
+        // Insert a new snapshot
+        let next_gen = val.generation() + 1;
+        let new_val = CacheValue::new(val.data().clone(), next_gen).with_etag(Arc::clone(etag));
+        cache.local().insert(key, new_val).unwrap();
+
+        // Should use local version even though remotes only have previous version
+        let s2 = repos.root().snapshot().await.unwrap();
+        assert_eq!(s2.generation(), next_gen);
+
+        cache.local().delete(key).unwrap();
+
+        // Note that the generation can travel backwards now but only for identical payloads
+        let s3 = repos.root().snapshot().await.unwrap();
+        assert_eq!(s1.generation(), s3.generation());
+        assert_eq!(s1.to_bytes(), s3.to_bytes());
     }
 
     #[tokio::test]
@@ -1339,10 +1361,10 @@ mod tests {
     fn catalog() -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
         let metrics = Arc::new(metric::Registry::default());
         let time_provider = Arc::new(SystemProvider::new()) as _;
-        let backing = Arc::new(MemCatalog::new(metrics, Arc::clone(&time_provider)));
-
-        // use new metrics registry so the two layers don't double-count
-        let metrics = Arc::new(metric::Registry::default());
+        let backing = Arc::new(MemCatalog::new(
+            Arc::clone(&metrics),
+            Arc::clone(&time_provider),
+        ));
 
         let peer0 = TestCacheServer::bind_ephemeral(&metrics);
         let peer1 = TestCacheServer::bind_ephemeral(&metrics);
@@ -1351,8 +1373,9 @@ mod tests {
             Arc::new([peer0.client(), peer1.client()]),
         ));
 
-        let caching_catalog =
+        let mut caching_catalog =
             CachingCatalog::new(Arc::clone(&cache), backing, metrics, time_provider, 10);
+        caching_catalog.etag_min_payload_size = 2;
 
         let test_catalog = TestCatalog::new(caching_catalog);
         test_catalog.hold_onto(peer0);

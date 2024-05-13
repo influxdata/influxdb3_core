@@ -68,9 +68,13 @@ impl SchemaPivotNode {
         // datafusion knows not to opimize them away)
         let exprs = input
             .schema()
-            .fields()
             .iter()
-            .map(|field| Expr::Column(field.qualified_column()))
+            .map(|(qualifier, field)| {
+                Expr::Column(datafusion::common::Column::from((
+                    qualifier,
+                    field.as_ref(),
+                )))
+            })
             .collect::<Vec<_>>();
 
         Self {

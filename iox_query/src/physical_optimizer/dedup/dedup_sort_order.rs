@@ -50,7 +50,7 @@ impl PhysicalOptimizerRule for DedupSortOrder {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(&|plan| {
+        plan.transform_up(|plan| {
             let plan_any = plan.as_any();
 
             if let Some(dedup_exec) = plan_any.downcast_ref::<DeduplicateExec>() {

@@ -28,7 +28,7 @@ impl PhysicalOptimizerRule for OneUnion {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(&|plan| {
+        plan.transform_up(|plan| {
             let plan_any = plan.as_any();
 
             if let Some(union_exec) = plan_any.downcast_ref::<UnionExec>() {

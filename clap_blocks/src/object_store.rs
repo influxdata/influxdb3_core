@@ -1,5 +1,6 @@
 //! CLI handling for object store config (via CLI arguments and environment variables).
 
+use async_trait::async_trait;
 use futures::TryStreamExt;
 use non_empty_string::NonEmptyString;
 use object_store::{
@@ -11,9 +12,8 @@ use object_store::{
 use observability_deps::tracing::{info, warn};
 use snafu::{ResultExt, Snafu};
 use std::{convert::Infallible, fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
+use url::Url;
 use uuid::Uuid;
-
-use crate::parquet_cache::ParquetCacheClientConfig;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
@@ -223,10 +223,6 @@ pub struct ObjectStoreConfig {
         action
     )]
     pub object_store_connection_limit: NonZeroUsize,
-
-    /// Optional config for the cache client.
-    #[clap(flatten)]
-    pub parquet_cache_config: Option<ParquetCacheClientConfig>,
 }
 
 impl ObjectStoreConfig {
@@ -253,7 +249,6 @@ impl ObjectStoreConfig {
             google_service_account: Default::default(),
             object_store,
             object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
-            parquet_cache_config: Default::default(),
         }
     }
 }
@@ -427,55 +422,92 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
         Some(ObjectStoreType::Google) => new_gcs(config)?,
         Some(ObjectStoreType::S3) => new_s3(config)?,
         Some(ObjectStoreType::Azure) => new_azure(config)?,
-        Some(ObjectStoreType::File) => match config.database_directory.as_ref() {
-            Some(db_dir) => {
-                info!(?db_dir, object_store_type = "Directory", "Object Store");
-                fs::create_dir_all(db_dir)
-                    .context(CreatingDatabaseDirectorySnafu { path: db_dir })?;
-
-                let store = object_store::local::LocalFileSystem::new_with_prefix(db_dir)
-                    .context(CreateLocalFileSystemSnafu { path: db_dir })?;
-                Arc::new(store)
-            }
-            None => MissingObjectStoreConfigSnafu {
-                object_store: ObjectStoreType::File,
-                missing: "data-dir",
-            }
-            .fail()?,
-        },
+        Some(ObjectStoreType::File) => new_local_file_system(config)?,
     };
 
-    if let Some(cache_config) = &config.parquet_cache_config {
-        let cache = parquet_cache::make_client(
-            cache_config.namespace_addr.clone(),
-            Arc::clone(&remote_store),
-        );
-        info!(?cache_config, "Parquet cache enabled");
-        Ok(cache)
-    } else {
-        Ok(remote_store)
+    Ok(remote_store)
+}
+
+fn new_local_file_system(
+    config: &ObjectStoreConfig,
+) -> Result<Arc<object_store::local::LocalFileSystem>, ParseError> {
+    match config.database_directory.as_ref() {
+        Some(db_dir) => {
+            info!(?db_dir, object_store_type = "Directory", "Object Store");
+            fs::create_dir_all(db_dir).context(CreatingDatabaseDirectorySnafu { path: db_dir })?;
+
+            let store = object_store::local::LocalFileSystem::new_with_prefix(db_dir)
+                .context(CreateLocalFileSystemSnafu { path: db_dir })?;
+            Ok(Arc::new(store))
+        }
+        None => MissingObjectStoreConfigSnafu {
+            object_store: ObjectStoreType::File,
+            missing: "data-dir",
+        }
+        .fail()?,
     }
 }
 
-/// The `object_store::signer::Signer` trait is only implemented for AWS currently, so when the AWS
-/// feature is enabled and the configured object store is S3, return a signer.
+/// The `object_store::signer::Signer` trait is implemented for AWS and local file systems, so when
+/// the AWS feature is enabled and the configured object store is S3 or the local file system,
+/// return a signer.
 #[cfg(feature = "aws")]
 pub fn make_presigned_url_signer(
     config: &ObjectStoreConfig,
 ) -> Result<Option<Arc<dyn object_store::signer::Signer>>, ParseError> {
     match &config.object_store {
         Some(ObjectStoreType::S3) => Ok(Some(Arc::new(build_s3(config)?))),
+        Some(ObjectStoreType::File) => Ok(Some(Arc::new(LocalUploadSigner::new(config)?))),
         _ => Ok(None),
     }
 }
 
-/// The `object_store::signer::Signer` trait is only implemented for AWS currently, so if the AWS
-/// feature isn't enabled, don't return a signer.
+/// The `object_store::signer::Signer` trait is implemented for AWS and local file systems, so if
+/// the AWS feature isn't enabled, only return a signer for local file systems.
 #[cfg(not(feature = "aws"))]
 pub fn make_presigned_url_signer(
-    _config: &ObjectStoreConfig,
+    config: &ObjectStoreConfig,
 ) -> Result<Option<Arc<dyn object_store::signer::Signer>>, ParseError> {
-    Ok(None)
+    match &config.object_store {
+        Some(ObjectStoreType::File) => Ok(Some(Arc::new(LocalUploadSigner::new(config)?))),
+        _ => Ok(None),
+    }
+}
+
+/// An implementation of `object_store::signer::Signer` suitable for local testing, where IOx
+/// all-in-one mode is running on the same machine that `bulk_ingester` is running. Does NOT
+/// actually create presigned URLs; only returns the given path resolved to an absolute `file://`
+/// URL that the bulk ingester can write directly to only if the bulk ingester is running on the
+/// same system.
+///
+/// Again, will not work and not intended to work in production, but is useful in local testing.
+#[derive(Debug)]
+pub struct LocalUploadSigner {
+    inner: Arc<object_store::local::LocalFileSystem>,
+}
+
+impl LocalUploadSigner {
+    fn new(config: &ObjectStoreConfig) -> Result<Self, ParseError> {
+        Ok(Self {
+            inner: new_local_file_system(config)?,
+        })
+    }
+}
+
+#[async_trait]
+impl object_store::signer::Signer for LocalUploadSigner {
+    async fn signed_url(
+        &self,
+        _method: reqwest::Method,
+        path: &Path,
+        _expires_in: Duration,
+    ) -> Result<Url, object_store::Error> {
+        self.inner.path_to_filesystem(path).and_then(|path| {
+            Url::from_file_path(&path).map_err(|_| object_store::Error::InvalidPath {
+                source: object_store::path::Error::InvalidPath { path },
+            })
+        })
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -595,18 +627,10 @@ mod tests {
 
         assert!(make_presigned_url_signer(&config).unwrap().is_some());
 
-        // Even with the aws feature on, any other object store shouldn't create a signer.
-        let root = TempDir::new().unwrap();
-        let root_path = root.path().to_str().unwrap();
-
-        let config = ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "file",
-            "--data-dir",
-            root_path,
-        ])
-        .unwrap();
+        // Even with the aws feature on, object stores (other than local files) shouldn't create a
+        // signer.
+        let config =
+            ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap();
 
         let signer = make_presigned_url_signer(&config).unwrap();
         assert!(signer.is_none(), "Expected None, got {signer:?}");
@@ -752,27 +776,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn valid_cache_config() {
+    #[tokio::test]
+    async fn local_url_signer() {
         let root = TempDir::new().unwrap();
         let root_path = root.path().to_str().unwrap();
+        let parquet_file_path = "1/2/something.parquet";
 
-        let config = ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "file",
-            "--data-dir",
-            root_path,
-            "--parquet-cache-namespace-addr",
-            "http://k8s-noninstance-general-service-route:8080",
-        ])
+        let signer = make_presigned_url_signer(
+            &ObjectStoreConfig::try_parse_from([
+                "server",
+                "--object-store",
+                "file",
+                "--data-dir",
+                root_path,
+            ])
+            .unwrap(),
+        )
+        .unwrap()
         .unwrap();
 
-        let object_store = make_object_store(&config).unwrap().to_string();
-        assert!(
-            object_store.starts_with("DataCacheObjectStore"),
-            "{}",
-            object_store
-        )
+        let object_store_parquet_file_path = Path::parse(parquet_file_path).unwrap();
+        let upload_url = signer
+            .signed_url(
+                reqwest::Method::PUT,
+                &object_store_parquet_file_path,
+                Duration::from_secs(100),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upload_url.as_str(),
+            &format!(
+                "file://{}",
+                std::fs::canonicalize(root.path())
+                    .unwrap()
+                    .join(parquet_file_path)
+                    .display()
+            )
+        );
     }
 }

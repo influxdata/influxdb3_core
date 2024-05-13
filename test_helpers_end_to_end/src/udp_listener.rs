@@ -22,13 +22,13 @@ pub struct Message {
 
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Message({} bytes: {}", self.data.len(), self.to_string())
+        write!(f, "Message({} bytes: {}", self.data.len(), self)
     }
 }
 
-impl ToString for Message {
-    fn to_string(&self) -> String {
-        String::from_utf8_lossy(&self.data).to_string()
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        String::from_utf8_lossy(&self.data).fmt(f)
     }
 }
 

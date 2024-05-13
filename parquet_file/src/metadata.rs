@@ -91,7 +91,7 @@ use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, CompactionLevelProtoError, InfluxDbType,
     NamespaceId, ObjectStoreId, ParquetFileParams, PartitionHashId, PartitionId, PartitionKey,
-    StatValues, Statistics, TableId, Timestamp,
+    StatValues, Statistics, TableId, Timestamp, TimestampMinMax,
 };
 use generated_types::influxdata::iox::ingester::v1 as proto;
 use iox_time::Time;
@@ -117,6 +117,7 @@ use schema::{
 };
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{convert::TryInto, fmt::Debug, mem, sync::Arc};
+use thiserror::Error;
 use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol, TOutputProtocol};
 use uuid::Uuid;
 
@@ -487,6 +488,10 @@ impl IoxMetadata {
             created_at: Timestamp::from(self.creation_timestamp),
             column_set: ColumnSet::new(columns),
             max_l0_created_at: Timestamp::from(self.max_l0_created_at),
+            // Currently, we're only setting the `source` field if the Parquet file is being
+            // created by bulk ingest, which does not use this code path. So for now, always set
+            // `source` to `None` here.
+            source: None,
         }
     }
 
@@ -1014,6 +1019,65 @@ fn extract_iox_statistics(
             column: column_name.to_string(),
             expected: iox_type,
             actual: parquet_stats.clone(),
+        }),
+    }
+}
+
+/// Extract the minimum time and maximum time contained in the time column in this Parquet file,
+/// according to the Parquet metadata.
+///
+/// The only IOx-specific attribute the Parquet file needs is a column named `time` of type `i64`,
+/// so this is appropriate to use with, for example, bulk ingested Parquet files that weren't
+/// necessarily created by IOx.
+pub fn file_timestamp_min_max(
+    parquet_metadata: &ParquetMetaData,
+) -> Result<Option<TimestampMinMax>, TimestampMinMaxError> {
+    let timestamp_min_maxes = parquet_metadata
+        .row_groups()
+        .iter()
+        .map(timestamp_min_max)
+        .collect::<Result<Vec<_>, _>>()?;
+    let file_timestamp_min_max = timestamp_min_maxes
+        .into_iter()
+        .reduce(|acc, i| acc.union(&i));
+
+    Ok(file_timestamp_min_max)
+}
+
+/// Errors that may happen while collecting the min and max timestamps
+#[allow(missing_docs)]
+#[derive(Debug, Error)]
+pub enum TimestampMinMaxError {
+    #[error("Could not convert Parquet schema to Arrow schema: {0}")]
+    SchemaConversion(#[from] parquet::errors::ParquetError),
+
+    #[error("Could not find a time column")]
+    NoTimeColumnFound,
+
+    #[error("Could not find time column statistics")]
+    NoColumnStatisticsFound,
+
+    #[error("Expected time column to have type Int64; instead found {actual:?}")]
+    IncorrectTimeColumnType { actual: parquet::basic::Type },
+}
+
+fn timestamp_min_max(
+    row_group: &ParquetRowGroupMetaData,
+) -> Result<TimestampMinMax, TimestampMinMaxError> {
+    let statistics = row_group
+        .columns()
+        .iter()
+        .find(|c| c.column_descr().name() == schema::TIME_COLUMN_NAME)
+        .ok_or(TimestampMinMaxError::NoTimeColumnFound)?
+        .statistics()
+        .ok_or(TimestampMinMaxError::NoColumnStatisticsFound)?;
+
+    match statistics {
+        ParquetStatistics::Int64(inner_stats) => {
+            Ok(TimestampMinMax::new(*inner_stats.min(), *inner_stats.max()))
+        }
+        other => Err(TimestampMinMaxError::IncorrectTimeColumnType {
+            actual: other.physical_type(),
         }),
     }
 }

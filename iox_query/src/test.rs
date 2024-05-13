@@ -2,6 +2,7 @@
 //!
 //! AKA it is a Mock
 
+use crate::query_log::QueryLogEntries;
 use crate::{
     exec::{
         stringset::{StringSet, StringSetRef},
@@ -9,8 +10,7 @@ use crate::{
     },
     pruning::prune_chunks,
     query_log::{QueryLog, StateReceived},
-    QueryChunk, QueryChunkData, QueryCompletedToken, QueryNamespace, QueryNamespaceProvider,
-    QueryText,
+    QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace, QueryText,
 };
 use arrow::array::{BooleanArray, Float64Array};
 use arrow::datatypes::SchemaRef;
@@ -102,9 +102,9 @@ impl Default for TestDatabaseStore {
 }
 
 #[async_trait]
-impl QueryNamespaceProvider for TestDatabaseStore {
+impl QueryDatabase for TestDatabaseStore {
     /// Retrieve the database specified name
-    async fn db(
+    async fn namespace(
         &self,
         name: &str,
         _span: Option<Span>,
@@ -120,6 +120,10 @@ impl QueryNamespaceProvider for TestDatabaseStore {
             .acquire_owned(span)
             .await
             .unwrap()
+    }
+
+    fn query_log(&self) -> QueryLogEntries {
+        QueryLogEntries::default()
     }
 }
 
@@ -257,7 +261,7 @@ impl QueryNamespace for TestDatabase {
         // Note: unlike Db this does not register a catalog provider
         let mut cmd = self
             .executor
-            .new_execution_config()
+            .new_session_config()
             .with_default_catalog(Arc::new(TestDatabaseCatalogProvider::from_test_database(
                 self,
             )))

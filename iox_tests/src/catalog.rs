@@ -10,6 +10,7 @@ use data_types::{
     Namespace, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile, ParquetFileParams,
     Partition, PartitionId, SortKeyIds, Table, TableSchema, Timestamp, TransitionPartitionId,
 };
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::metrics::Count;
 use datafusion_util::{unbounded_memory_pool, MemoryStream};
 use generated_types::influxdata::iox::partition_template::v1::PartitionTemplate;
@@ -84,7 +85,6 @@ impl TestCatalog {
             ParquetStorage::new(Arc::clone(&object_store) as _, StorageId::from("iox"));
         let exec = Arc::new(Executor::new_with_config_and_executor(
             ExecutorConfig {
-                num_threads: exec.num_threads(),
                 target_query_partitions,
                 object_stores: HashMap::from([(
                     parquet_store.id(),
@@ -610,6 +610,7 @@ impl TestPartition {
             compaction_level,
             column_set,
             max_l0_created_at: Timestamp::new(max_l0_created_at),
+            source: None,
         };
 
         let mut repos = self.catalog.catalog.repositories();
@@ -837,8 +838,13 @@ async fn create_parquet_file(
     record_batch: RecordBatch,
 ) -> usize {
     let stream = Box::pin(MemoryStream::new(vec![record_batch]));
+    let runtime = Arc::new(RuntimeEnv {
+        memory_pool: unbounded_memory_pool(),
+        ..Default::default()
+    });
+
     let (_meta, file_size) = store
-        .upload(stream, partition_id, metadata, unbounded_memory_pool())
+        .upload(stream, partition_id, metadata, runtime)
         .await
         .expect("persisting parquet file should succeed");
     file_size

@@ -7,10 +7,11 @@ use arrow::{
     array::{cast, Array, ArrayRef},
     datatypes::{DataType, Field},
 };
-use datafusion::logical_expr::AggregateUDFImpl;
+use datafusion::logical_expr::{function::AccumulatorArgs, AggregateUDFImpl};
 use datafusion::{
     common::Result,
     logical_expr::{Accumulator, Signature, Volatility},
+    physical_expr::expressions::format_state_name,
     scalar::ScalarValue,
 };
 use itertools::Itertools;
@@ -49,18 +50,26 @@ impl AggregateUDFImpl for ModeUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn accumulator(&self, arg: &DataType) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(ModeAccumulator::new(arg.clone())))
+    fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(ModeAccumulator::new(arg.data_type.clone())))
     }
 
-    fn state_type(&self, return_type: &DataType) -> Result<Vec<DataType>> {
+    fn state_fields(
+        &self,
+        name: &str,
+        value_type: DataType,
+        _ordering_fields: Vec<Field>,
+    ) -> Result<Vec<Field>> {
+        let item_list = DataType::List(Arc::new(Field::new("item", value_type.clone(), true)));
+        let timestamp_list = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
+            true,
+        )));
+
         Ok(vec![
-            DataType::List(Arc::new(Field::new("item", return_type.clone(), true))),
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
-                true,
-            ))),
+            Field::new(format_state_name(name, "value"), item_list, true),
+            Field::new(format_state_name(name, "timestamp"), timestamp_list, true),
         ])
     }
 }

@@ -1,4 +1,5 @@
 mod select;
+mod source_field_names;
 
 use crate::aggregate::{MODE, PERCENTILE, SPREAD};
 use crate::error;
@@ -7,6 +8,7 @@ use crate::plan::planner::select::{
     fields_to_exprs_no_nulls, make_tag_key_column_meta, plan_with_sort, ProjectionInfo, Selector,
     SelectorWindowOrderBy,
 };
+use crate::plan::planner::source_field_names::SourceFieldNamesVisitor;
 use crate::plan::planner_time_range_expression::time_range_to_df_expr;
 use crate::plan::rewriter::{find_table_names, rewrite_statement, ProjectionType};
 use crate::plan::udf::{
@@ -31,16 +33,18 @@ use datafusion::catalog::TableReference;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, ToDFSchema};
 use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::execution::FunctionRegistry;
+use datafusion::functions::expr_fn::{date_bin, now};
+use datafusion::functions_array::expr_fn::make_array;
 use datafusion::logical_expr::expr::{AggregateFunctionDefinition, Alias, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::normalize_col;
 use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::logical_plan::Analyze;
-use datafusion::logical_expr::utils::{expr_as_column_expr, find_aggregate_exprs};
+use datafusion::logical_expr::utils::{disjunction, expr_as_column_expr, find_aggregate_exprs};
 use datafusion::logical_expr::{
-    binary_expr, col, date_bin, expr, expr::WindowFunction, lit, now, union, utils::conjunction,
-    AggregateFunction, AggregateUDF, Between, BuiltInWindowFunction, BuiltinScalarFunction,
-    Distinct, EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan,
-    LogicalPlanBuilder, Operator, PlanType, Projection, ScalarFunctionDefinition, ScalarUDF,
+    binary_expr, col, expr, expr::WindowFunction, lit, union, AggregateFunction, AggregateUDF,
+    Between, BuiltInWindowFunction, Distinct, EmptyRelation, Explain, Expr, ExprSchemable,
+    Extension, LogicalPlan, LogicalPlanBuilder, Operator, PlanType, Projection, ScalarUDF,
     TableSource, ToStringifiedPlan, Union, WindowFrame, WindowFrameBound, WindowFrameUnits,
     WindowFunctionDefinition,
 };
@@ -70,6 +74,7 @@ use influxdb_influxql_parser::show_tag_values::{ShowTagValuesStatement, WithKeyC
 use influxdb_influxql_parser::simple_from_clause::ShowFromClause;
 use influxdb_influxql_parser::time_range::{split_cond, ReduceContext, TimeRange};
 use influxdb_influxql_parser::timestamp::Timestamp;
+use influxdb_influxql_parser::visit::Visitable;
 use influxdb_influxql_parser::{
     common::{MeasurementName, WhereClause},
     expression::Expr as IQLExpr,
@@ -95,7 +100,7 @@ use schema::{
 use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::iter;
-use std::ops::{Bound, ControlFlow, Deref, Not, Range};
+use std::ops::{Bound, ControlFlow, Deref, Range};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -436,13 +441,19 @@ impl<'a> Context<'a> {
 pub struct InfluxQLToLogicalPlan<'a> {
     s: &'a dyn SchemaProvider,
     iox_ctx: IOxSessionContext,
+    date_bin: Arc<ScalarUDF>,
 }
 
 impl<'a> InfluxQLToLogicalPlan<'a> {
-    pub fn new(s: &'a dyn SchemaProvider, iox_ctx: &'a IOxSessionContext) -> Self {
+    pub fn new(
+        s: &'a dyn SchemaProvider,
+        iox_ctx: &'a IOxSessionContext,
+        date_bin: Arc<ScalarUDF>,
+    ) -> Self {
         Self {
             s,
             iox_ctx: iox_ctx.child_ctx("InfluxQLToLogicalPlan"),
+            date_bin,
         }
     }
 
@@ -495,7 +506,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         // We'll specify the `plan_type` column as the "measurement name", so that it may be
         // grouped into tables in the output when formatted as InfluxQL tabular format.
         let measurement_column_index = schema
-            .index_of_column_by_name(None, "plan_type")?
+            .index_of_column_by_name(None, "plan_type")
             .ok_or_else(|| error::map::internal("unable to find plan_type column"))?
             as u32;
 
@@ -595,13 +606,11 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     project(
                         input.clone(),
                         iter::once(lit_dict(table_name).alias(INFLUXQL_MEASUREMENT_COLUMN_NAME))
-                            .chain(
-                                input
-                                    .schema()
-                                    .fields()
-                                    .iter()
-                                    .map(|expr| Expr::Column(expr.unqualified_column())),
-                            ),
+                            .chain(input.schema().iter().map(|(_qualifier, field)| {
+                                Expr::Column(datafusion::common::Column::new_unqualified(
+                                    field.name(),
+                                ))
+                            })),
                     )
                 }
             }
@@ -728,7 +737,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn union_from(&self, ctx: &Context<'_>, select: &Select) -> Result<Option<LogicalPlan>> {
         let mut plans = Vec::new();
         for ds in &select.from {
-            let Some(plan) = self.plan_from_data_source(ctx, ds)? else {
+            let Some(plan) = self.plan_from_data_source(ctx, ds, &select.fields)? else {
                 continue;
             };
 
@@ -876,23 +885,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         };
 
         // Wrap the plan in a `LogicalPlan::Projection` from the select expressions
-        let mut plan = project(input, select_exprs)?;
-
-        // generate a predicate to filter out all rows where all field values are `NULL`,
-        // like:
-        //
-        //   NOT (field1 IS NULL AND field2 IS NULL AND ...)
-        plan = match conjunction(fields.iter().filter_map(|f| {
-            if matches!(f.data_type, Some(InfluxColumnType::Field(_))) {
-                Some(f.name.as_expr().is_null())
-            } else {
-                None
-            }
-        })) {
-            Some(expr) => LogicalPlanBuilder::from(plan).filter(expr.not())?.build()?,
-            None => plan,
-        };
-
+        let plan = project(input, select_exprs)?;
         LogicalPlanBuilder::from(plan).distinct()?.build()
     }
 
@@ -932,26 +925,10 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
         let (plan, select_exprs) =
             self.select_window(ctx, input, select_exprs, group_by_tag_set)?;
+        let plan = filter_window_nulls(plan)?;
 
         // Wrap the plan in a `LogicalPlan::Projection` from the select expressions
-        let plan = project(plan, select_exprs)?;
-
-        // InfluxQL OG physical operators for
-
-        // generate a predicate to filter rows where all field values of the row are `NULL`,
-        // like:
-        //
-        //   NOT (field1 IS NULL AND field2 IS NULL AND ...)
-        match conjunction(fields.iter().filter_map(|f| {
-            if matches!(f.data_type, Some(InfluxColumnType::Field(_))) {
-                Some(f.name.as_expr().is_null())
-            } else {
-                None
-            }
-        })) {
-            Some(expr) => LogicalPlanBuilder::from(plan).filter(expr.not())?.build(),
-            None => Ok(plan),
-        }
+        project(plan, select_exprs)
     }
 
     /// Plan "WindowAggregate" SELECT queries. These are queries that use
@@ -972,24 +949,10 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             self.select_aggregate(ctx, input, fields, select_exprs, group_by_tag_set)?;
 
         let (plan, select_exprs) = self.select_window(ctx, plan, select_exprs, group_by_tag_set)?;
+        let plan = filter_window_nulls(plan)?;
 
         // Wrap the plan in a `LogicalPlan::Projection` from the select expressions
-        let plan = project(plan, select_exprs)?;
-
-        // generate a predicate to filter rows where all field values of the row are `NULL`,
-        // like:
-        //
-        //   NOT (field1 IS NULL AND field2 IS NULL AND ...)
-        match conjunction(fields.iter().filter_map(|f| {
-            if matches!(f.data_type, Some(InfluxColumnType::Field(_))) {
-                Some(f.name.as_expr().is_null())
-            } else {
-                None
-            }
-        })) {
-            Some(expr) => LogicalPlanBuilder::from(plan).filter(expr.not())?.build(),
-            None => Ok(plan),
-        }
+        project(plan, select_exprs)
     }
 
     /// Plan "WindowAggregateMixed" SELECT queries. These are queries that use
@@ -1387,7 +1350,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 FillClause::None => unreachable!(),
             };
 
-            build_gap_fill_node(plan, time_column, fill_strategy, &ctx.projection_type)?
+            build_gap_fill_node(
+                plan,
+                time_column,
+                fill_strategy,
+                &ctx.projection_type,
+                &self.date_bin,
+            )?
         } else {
             plan
         };
@@ -1530,11 +1499,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             // neither of which should be passed to udf_to_expr
             .map_err(|err| error::map::internal(format!("display_name: {err}")))?;
 
-        let Expr::ScalarFunction(ScalarFunction { func_def, args }) = e else {
+        let Expr::ScalarFunction(ScalarFunction { func, args }) = e else {
             return error::internal(format!("udf_to_expr: unexpected expression: {e}"));
-        };
-        let ScalarFunctionDefinition::UDF(udf) = func_def else {
-            return error::internal(format!("udf_to_expr: unexpected function: {func_def:?}"));
         };
 
         fn derivative_unit(ctx: &Context<'_>, args: &[Expr]) -> Result<ScalarValue> {
@@ -1563,7 +1529,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
         }
 
-        match udf::WindowFunction::try_from_scalar_udf(Arc::clone(&udf)) {
+        match udf::WindowFunction::try_from_scalar_udf(Arc::clone(&func)) {
             Some(udf::WindowFunction::MovingAverage) => Ok(Expr::WindowFunction(WindowFunction {
                 fun: MOVING_AVERAGE.clone(),
                 args,
@@ -1669,7 +1635,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .alias(alias)),
             None => error::internal(format!(
                 "unexpected user-defined window function: {}",
-                udf.name()
+                func.name()
             )),
         }
     }
@@ -1752,9 +1718,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             // Prepare new projection.
             let proj_exprs = input
                 .schema()
-                .fields()
                 .iter()
-                .map(|expr| Expr::Column(expr.unqualified_column()))
+                .map(|(_qualifier, field)| Expr::Column(Column::new_unqualified(field.name())))
                 .collect::<Vec<_>>();
 
             let plan = LogicalPlanBuilder::from(input)
@@ -2292,43 +2257,38 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .map(|e| self.expr_to_df_expr(scope, e, schema))
             .collect::<Result<Vec<Expr>>>()?;
 
-        match BuiltinScalarFunction::from_str(call.name.as_str()) {
-            Ok(builtin_scalar_function) => {
-                match builtin_scalar_function {
-                    BuiltinScalarFunction::Log => {
-                        if args.len() != 2 {
-                            error::query("invalid number of arguments for log, expected 2, got 1")
-                        } else {
-                            let arg1 = args.pop().unwrap();
-                            let arg0 = args.pop().unwrap();
-                            // reverse args
-                            Ok(datafusion::prelude::log(arg1, arg0))
-                        }
-                    }
-                    fun => Ok(Expr::ScalarFunction(ScalarFunction {
-                        func_def: ScalarFunctionDefinition::BuiltIn(fun),
-                        args,
-                    })),
+        let func = self
+            .iox_ctx
+            .inner()
+            .state()
+            .udf(call.name.as_str())
+            .map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "There is no UDF function named {}",
+                    call.name.as_str()
+                ))
+            })?;
+
+        match call.name.as_str() {
+            // log function
+            //
+            // Note in InfluxQL log() params order is different than that in DataFusion.
+            //   DataFusion supports log(base, x)
+            //   InfluxQL supports log(x, base)
+            //   e.g in DataFusion log(base, x) == in InfluxQL log(x, base)
+            //
+            // https://github.com/apache/datafusion/blob/5d4468579481b36e53333c62bfd2440af1de1155/datafusion/functions/src/math/log.rs#L90
+            "log" => {
+                if args.len() != 2 {
+                    error::query("invalid number of arguments for log, expected 2, got 1")
+                } else {
+                    let arg1 = args.pop().unwrap();
+                    let arg0 = args.pop().unwrap();
+                    // reverse args
+                    Ok(datafusion::prelude::log(arg1, arg0))
                 }
             }
-            Err(_e) => {
-                // If we can't find a built-in function with the specified name, try looking for
-                // user defined functions. DataFusion is in the process of migrating away from BuiltInScalarFunction
-                // https://github.com/apache/arrow-datafusion/issues/8045
-                let udf = self
-                    .s
-                    .get_function_meta(call.name.as_str())
-                    .ok_or_else(|| {
-                        DataFusionError::Plan(format!(
-                            "There is no built-in function nor UDF function named {}",
-                            call.name.as_str()
-                        ))
-                    })?;
-                Ok(Expr::ScalarFunction(ScalarFunction {
-                    func_def: ScalarFunctionDefinition::UDF(udf),
-                    args,
-                }))
-            }
+            _ => Ok(Expr::ScalarFunction(ScalarFunction { func, args })),
         }
     }
 
@@ -2422,20 +2382,36 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         self.plan_condition_time_range(cond.as_ref(), time_range, plan, schema)
     }
 
-    /// Generate a logical plan for the specified `DataSource`.
+    /// Generate a logical plan for the specified `DataSource`. If the data source is a table then
+    /// the plan will include a filter to ensure that at least one of the fields used in the query is
+    /// not NULL. This ensures that the output is compatible with older versions of InfluxDB.
     fn plan_from_data_source(
         &self,
         ctx: &Context<'_>,
         ds: &DataSource,
+        fields: &Vec<Field>,
     ) -> Result<Option<LogicalPlan>> {
         match ds {
             DataSource::Table(table_name) if table_name == ctx.table_name => {
                 // `rewrite_statement` guarantees the table should exist
                 let source = self.s.get_table_provider(table_name)?;
                 let table_ref = TableReference::bare(table_name.to_owned());
-                Ok(Some(
-                    LogicalPlanBuilder::scan(table_ref, source, None)?.build()?,
-                ))
+                let mut builder = LogicalPlanBuilder::scan(table_ref, Arc::clone(&source), None)?;
+
+                let mut field_set = BTreeSet::new();
+                for field in fields {
+                    field.expr.accept(SourceFieldNamesVisitor(&mut field_set))?;
+                }
+                let expr = disjunction(
+                    field_set
+                        .iter()
+                        .filter(|&name| source.schema().field_with_name(name).is_ok())
+                        .map(|name| Expr::Column(Column::from_name(name)).is_not_null()),
+                );
+                if let Some(expr) = expr {
+                    builder = builder.filter(expr)?;
+                }
+                Ok(Some(builder.build()?))
             }
             DataSource::Table(_) => Ok(None),
             DataSource::Subquery(select) => Ok(self.subquery_to_plan(ctx, select)?),
@@ -2630,7 +2606,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         // - not null if it had any non-null values
                         //
                         // note that since we only have a single row, this is efficient
-                        .project([datafusion::prelude::array(
+                        .project([make_array(
                             tags.iter()
                                 .map(|tag| {
                                     let tag_col = Expr::Column(Column::from_name(*tag));
@@ -2858,7 +2834,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             for key in keys {
                 let idx = plan
                     .schema()
-                    .index_of_column_by_name(None, key)?
+                    .index_of_column_by_name(None, key)
                     .expect("where is the key?");
 
                 let plan = LogicalPlanBuilder::from(plan.clone())
@@ -2878,9 +2854,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             let mut inputs = inputs
                                 .iter()
                                 .flat_map(|plan| match plan.as_ref() {
-                                    LogicalPlan::Union(Union { inputs, .. }) => {
-                                        inputs.iter().map(Arc::clone).collect::<Vec<_>>()
-                                    }
+                                    LogicalPlan::Union(Union { inputs, .. }) => inputs.to_vec(),
                                     _ => {
                                         vec![Arc::clone(plan)]
                                     }
@@ -3151,6 +3125,7 @@ fn build_gap_fill_node(
     time_column: &Expr,
     fill_strategy: FillStrategy,
     projection_type: &ProjectionType,
+    date_bin: &Arc<ScalarUDF>,
 ) -> Result<LogicalPlan> {
     let (expr, alias) = match time_column {
         Expr::Alias(Alias {
@@ -3162,10 +3137,7 @@ fn build_gap_fill_node(
     };
 
     let date_bin_args = match expr {
-        Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::DateBin),
-            args,
-        }) => args,
+        Expr::ScalarFunction(ScalarFunction { func: udf, args }) if udf.eq(date_bin) => args,
         _ => {
             // The InfluxQL planner adds the `date_bin` function,
             // so this condition represents an internal failure.
@@ -3190,7 +3162,7 @@ fn build_gap_fill_node(
                 // beyond Union operators. We are working around the limitation by traversing the
                 // tree until we find the first operator which specifies a filter predicate.
                 let mut time_range: Option<Range<Bound<Expr>>> = None;
-                _ = input.apply(&mut |n| match n {
+                _ = input.apply(|n| match n {
                     plan @ (LogicalPlan::Filter(_) | LogicalPlan::TableScan(_)) => {
                         time_range = Some(match find_time_range(plan, &time_col)? {
                             // Follow the InfluxQL behaviour to use an upper bound of `now` when
@@ -3243,9 +3215,8 @@ fn build_gap_fill_node(
     };
     let mut new_group_expr: Vec<_> = aggr
         .schema
-        .fields()
         .iter()
-        .map(|f| Expr::Column(f.qualified_column()))
+        .map(|(qualifier, field)| Expr::Column(Column::from((qualifier, field.as_ref()))))
         .collect();
     let aggr_expr = new_group_expr.split_off(aggr.group_expr.len());
 
@@ -3258,8 +3229,8 @@ fn build_gap_fill_node(
 
     let time_column = col(input
         .schema()
-        .field_with_unqualified_name(alias)
-        .map(|f| f.qualified_column())?);
+        .qualified_field_with_unqualified_name(alias)
+        .map(Column::from)?);
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(GapFill::try_new(
@@ -3287,10 +3258,11 @@ fn plan_with_metadata(plan: LogicalPlan, metadata: &InfluxQlMetadata) -> Result<
         let mut md = schema.metadata().clone();
         md.insert(INFLUXQL_METADATA_KEY.to_owned(), data);
 
-        Ok(Arc::new(DFSchema::new_with_metadata(
-            schema.fields().clone(),
-            md,
-        )?))
+        let qualified_fields = schema
+            .iter()
+            .map(|(qualifier, field)| (qualifier.cloned(), Arc::clone(field)))
+            .collect();
+        Ok(Arc::new(DFSchema::new_with_metadata(qualified_fields, md)?))
     }
 
     // Reconstruct the plan, altering the first node which defines the output schema
@@ -3544,6 +3516,23 @@ fn window_partition_by(
     parition_by
 }
 
+fn filter_window_nulls(plan: LogicalPlan) -> Result<LogicalPlan> {
+    if let LogicalPlan::Window(window) = &plan {
+        let filter = disjunction(window.window_expr.iter().filter_map(|expr| {
+            expr.display_name()
+                .ok()
+                .map(|name| Expr::Column(Column::from_name(name)).is_not_null())
+        }));
+        if let Some(filter) = filter {
+            LogicalPlanBuilder::from(plan).filter(filter)?.build()
+        } else {
+            Ok(plan)
+        }
+    } else {
+        Ok(plan)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -3609,7 +3598,12 @@ mod test {
         }
 
         let iox_ctx = IOxSessionContext::with_testing();
-        let planner = InfluxQLToLogicalPlan::new(&sp, &iox_ctx);
+        let date_bin = datafusion::functions::datetime::functions()
+            .iter()
+            .find(|fun| fun.name().eq("date_bin"))
+            .expect("should have date_bin UDF")
+            .to_owned();
+        let planner = InfluxQLToLogicalPlan::new(&sp, &iox_ctx, date_bin);
 
         planner.statement_to_plan(statements.pop().unwrap())
     }
@@ -4293,7 +4287,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, value AS value [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Projection: cpu.time AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // project a wildcard
@@ -4302,7 +4297,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, usage_idle AS usage_idle, value AS value [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, value:Float64;N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, value:Float64;N]
                       Projection: cpu.time AS time, cpu.usage_idle AS usage_idle, cpu.usage_system AS value [time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, value:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
 
@@ -4316,7 +4312,8 @@ mod test {
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Projection: TimestampNanosecond(0, Some("UTC")) AS time, AVG(cpu.usage_idle) AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                         Aggregate: groupBy=[[]], aggr=[[AVG(cpu.usage_idle)]] [AVG(cpu.usage_idle):Float64;N]
-                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 assert_snapshot!(plan("SELECT value FROM (SELECT mean(usage_idle) AS value FROM cpu GROUP BY TIME(10s))"), @r###"
@@ -4326,7 +4323,8 @@ mod test {
                       Projection: time, AVG(cpu.usage_idle) AS value [time:Timestamp(Nanosecond, Some("UTC"));N, value:Float64;N]
                         Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
                           Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
 
@@ -4339,8 +4337,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, value AS value [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Distinct: [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                        Filter: NOT value IS NULL [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                          Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
+                        Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                             TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
@@ -4350,8 +4348,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, value * Float64(0.99) AS value [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Distinct: [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                        Filter: NOT value IS NULL [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                          Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
+                        Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                             TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
@@ -4364,8 +4362,8 @@ mod test {
                         Aggregate: groupBy=[[cpu]], aggr=[[selector_max(value, time)]] [cpu:Dictionary(Int32, Utf8);N, selector_max(value,time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                           Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, value:Float64;N]
                             Distinct: [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, value:Float64;N]
-                              Filter: NOT value IS NULL [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, value:Float64;N]
-                                Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.cpu AS cpu, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, value:Float64;N]
+                              Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.cpu AS cpu, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, value:Float64;N]
+                                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                   TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4379,7 +4377,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, value AS value [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                     Sort: time DESC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Projection: cpu.time AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // Subquery is a time ascending (default); parent is descending
@@ -4388,7 +4387,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, value AS value [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Projection: cpu.time AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
         }
@@ -4409,12 +4409,14 @@ mod test {
                       Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), a:Float64;N]
                         Projection: TimestampNanosecond(0, Some("UTC")) AS time, AVG(cpu.usage_idle) AS a [time:Timestamp(Nanosecond, Some("UTC")), a:Float64;N]
                           Aggregate: groupBy=[[]], aggr=[[AVG(cpu.usage_idle)]] [AVG(cpu.usage_idle):Float64;N]
-                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                     Projection: CAST(NULL AS Float64) AS a, b AS b, time AS time [a:Float64;N, b:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
                       Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), b:Float64;N]
                         Projection: TimestampNanosecond(0, Some("UTC")) AS time, AVG(cpu.usage_user) AS b [time:Timestamp(Nanosecond, Some("UTC")), b:Float64;N]
                           Aggregate: groupBy=[[]], aggr=[[AVG(cpu.usage_user)]] [AVG(cpu.usage_user):Float64;N]
-                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            Filter: cpu.usage_user IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // selector with repeated table
@@ -4427,9 +4429,11 @@ mod test {
                 Aggregate: groupBy=[[]], aggr=[[selector_last(usage_idle, time)]] [selector_last(usage_idle,time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                   Union [time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
                     Projection: cpu.time AS time, cpu.usage_idle AS usage_idle [time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                     Projection: cpu.time AS time, cpu.usage_idle AS usage_idle [time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // different tables for each subquery
@@ -4443,12 +4447,14 @@ mod test {
                   Aggregate: groupBy=[[]], aggr=[[selector_last(value, time)]] [selector_last(value,time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
                       Projection: cpu.time AS time, cpu.usage_idle AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, (selector_last(value,time))[time] AS time, (selector_last(value,time))[value] AS last [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, last:Float64;N]
                   Aggregate: groupBy=[[]], aggr=[[selector_last(CAST(value AS Float64), time)]] [selector_last(value,time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                     Sort: time ASC NULLS LAST [time:Timestamp(Nanosecond, Some("UTC")), value:Int64;N]
                       Projection: disk.time AS time, disk.bytes_free AS value [time:Timestamp(Nanosecond, Some("UTC")), value:Int64;N]
-                        TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                        Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                          TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
         }
 
@@ -4458,14 +4464,16 @@ mod test {
             assert_snapshot!(plan("SELECT usage_idle, time FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // validate time column may be aliased
             assert_snapshot!(plan("SELECT usage_idle, time AS timestamp FROM cpu"), @r###"
             Sort: timestamp ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), timestamp:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS timestamp, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), timestamp:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -4477,23 +4485,23 @@ mod test {
                 // no aggregates
                 assert_snapshot!(plan("SELECT DIFFERENCE(usage_idle) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), difference:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), difference:Float64;N]
-                    Filter: NOT difference IS NULL [time:Timestamp(Nanosecond, Some("UTC")), difference:Float64;N]
-                      Projection: cpu.time AS time, difference(cpu.usage_idle) AS difference [time:Timestamp(Nanosecond, Some("UTC")), difference:Float64;N]
-                        WindowAggr: windowExpr=[[difference(cpu.usage_idle) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS difference(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, difference(cpu.usage_idle):Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, difference(cpu.usage_idle) AS difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), difference:Float64;N]
+                    Filter: difference(cpu.usage_idle) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, difference(cpu.usage_idle):Float64;N]
+                      WindowAggr: windowExpr=[[difference(cpu.usage_idle) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS difference(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, difference(cpu.usage_idle):Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // aggregate
                 assert_snapshot!(plan("SELECT DIFFERENCE(MEAN(usage_idle)) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, difference:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, difference:Float64;N]
-                    Filter: NOT difference IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, difference:Float64;N]
-                      Projection: time, difference(AVG(cpu.usage_idle)) AS difference [time:Timestamp(Nanosecond, Some("UTC"));N, difference:Float64;N]
-                        WindowAggr: windowExpr=[[difference(AVG(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS difference(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, difference(AVG(cpu.usage_idle)):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, difference(AVG(cpu.usage_idle)) AS difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, difference:Float64;N]
+                    Filter: difference(AVG(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, difference(AVG(cpu.usage_idle)):Float64;N]
+                      WindowAggr: windowExpr=[[difference(AVG(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS difference(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, difference(AVG(cpu.usage_idle)):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4503,23 +4511,23 @@ mod test {
                 // no aggregates
                 assert_snapshot!(plan("SELECT NON_NEGATIVE_DIFFERENCE(usage_idle) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_negative_difference:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_negative_difference:Float64;N]
-                    Filter: NOT non_negative_difference IS NULL [time:Timestamp(Nanosecond, Some("UTC")), non_negative_difference:Float64;N]
-                      Projection: cpu.time AS time, non_negative_difference(cpu.usage_idle) AS non_negative_difference [time:Timestamp(Nanosecond, Some("UTC")), non_negative_difference:Float64;N]
-                        WindowAggr: windowExpr=[[non_negative_difference(cpu.usage_idle) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, non_negative_difference(cpu.usage_idle):Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, non_negative_difference(cpu.usage_idle) AS non_negative_difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_negative_difference:Float64;N]
+                    Filter: non_negative_difference(cpu.usage_idle) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, non_negative_difference(cpu.usage_idle):Float64;N]
+                      WindowAggr: windowExpr=[[non_negative_difference(cpu.usage_idle) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, non_negative_difference(cpu.usage_idle):Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // aggregate
                 assert_snapshot!(plan("SELECT NON_NEGATIVE_DIFFERENCE(MEAN(usage_idle)) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_difference:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_difference:Float64;N]
-                    Filter: NOT non_negative_difference IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_difference:Float64;N]
-                      Projection: time, non_negative_difference(AVG(cpu.usage_idle)) AS non_negative_difference [time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_difference:Float64;N]
-                        WindowAggr: windowExpr=[[non_negative_difference(AVG(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, non_negative_difference(AVG(cpu.usage_idle)):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_difference(AVG(cpu.usage_idle)) AS non_negative_difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_difference:Float64;N]
+                    Filter: non_negative_difference(AVG(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, non_negative_difference(AVG(cpu.usage_idle)):Float64;N]
+                      WindowAggr: windowExpr=[[non_negative_difference(AVG(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, non_negative_difference(AVG(cpu.usage_idle)):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4529,23 +4537,23 @@ mod test {
                 // no aggregates
                 assert_snapshot!(plan("SELECT MOVING_AVERAGE(usage_idle, 3) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), moving_average:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, moving_average [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), moving_average:Float64;N]
-                    Filter: NOT moving_average IS NULL [time:Timestamp(Nanosecond, Some("UTC")), moving_average:Float64;N]
-                      Projection: cpu.time AS time, moving_average(cpu.usage_idle,Int64(3)) AS moving_average [time:Timestamp(Nanosecond, Some("UTC")), moving_average:Float64;N]
-                        WindowAggr: windowExpr=[[moving_average(cpu.usage_idle, Int64(3)) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS moving_average(cpu.usage_idle,Int64(3))]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, moving_average(cpu.usage_idle,Int64(3)):Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, moving_average(cpu.usage_idle,Int64(3)) AS moving_average [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), moving_average:Float64;N]
+                    Filter: moving_average(cpu.usage_idle,Int64(3)) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, moving_average(cpu.usage_idle,Int64(3)):Float64;N]
+                      WindowAggr: windowExpr=[[moving_average(cpu.usage_idle, Int64(3)) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS moving_average(cpu.usage_idle,Int64(3))]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, moving_average(cpu.usage_idle,Int64(3)):Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // aggregate
                 assert_snapshot!(plan("SELECT MOVING_AVERAGE(MEAN(usage_idle), 3) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, moving_average:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, moving_average [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, moving_average:Float64;N]
-                    Filter: NOT moving_average IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, moving_average:Float64;N]
-                      Projection: time, moving_average(AVG(cpu.usage_idle),Int64(3)) AS moving_average [time:Timestamp(Nanosecond, Some("UTC"));N, moving_average:Float64;N]
-                        WindowAggr: windowExpr=[[moving_average(AVG(cpu.usage_idle), Int64(3)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS moving_average(AVG(cpu.usage_idle),Int64(3))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, moving_average(AVG(cpu.usage_idle),Int64(3)):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, moving_average(AVG(cpu.usage_idle),Int64(3)) AS moving_average [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, moving_average:Float64;N]
+                    Filter: moving_average(AVG(cpu.usage_idle),Int64(3)) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, moving_average(AVG(cpu.usage_idle),Int64(3)):Float64;N]
+                      WindowAggr: windowExpr=[[moving_average(AVG(cpu.usage_idle), Int64(3)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS moving_average(AVG(cpu.usage_idle),Int64(3))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, moving_average(AVG(cpu.usage_idle),Int64(3)):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
@@ -4564,23 +4572,23 @@ mod test {
                 // no aggregates
                 assert_snapshot!(plan("SELECT DERIVATIVE(usage_idle) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), derivative:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), derivative:Float64;N]
-                    Filter: NOT derivative IS NULL [time:Timestamp(Nanosecond, Some("UTC")), derivative:Float64;N]
-                      Projection: cpu.time AS time, derivative(cpu.usage_idle) AS derivative [time:Timestamp(Nanosecond, Some("UTC")), derivative:Float64;N]
-                        WindowAggr: windowExpr=[[derivative(cpu.usage_idle, IntervalMonthDayNano("1000000000"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS derivative(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, derivative(cpu.usage_idle):Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, derivative(cpu.usage_idle) AS derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), derivative:Float64;N]
+                    Filter: derivative(cpu.usage_idle) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, derivative(cpu.usage_idle):Float64;N]
+                      WindowAggr: windowExpr=[[derivative(cpu.usage_idle, IntervalMonthDayNano("1000000000"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS derivative(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, derivative(cpu.usage_idle):Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // aggregate
                 assert_snapshot!(plan("SELECT DERIVATIVE(MEAN(usage_idle)) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, derivative:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, derivative:Float64;N]
-                    Filter: NOT derivative IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, derivative:Float64;N]
-                      Projection: time, derivative(AVG(cpu.usage_idle)) AS derivative [time:Timestamp(Nanosecond, Some("UTC"));N, derivative:Float64;N]
-                        WindowAggr: windowExpr=[[derivative(AVG(cpu.usage_idle), IntervalMonthDayNano("10000000000"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS derivative(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, derivative(AVG(cpu.usage_idle)):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, derivative(AVG(cpu.usage_idle)) AS derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, derivative:Float64;N]
+                    Filter: derivative(AVG(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, derivative(AVG(cpu.usage_idle)):Float64;N]
+                      WindowAggr: windowExpr=[[derivative(AVG(cpu.usage_idle), IntervalMonthDayNano("10000000000"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS derivative(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, derivative(AVG(cpu.usage_idle)):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4590,36 +4598,36 @@ mod test {
                 // no aggregates
                 assert_snapshot!(plan("SELECT NON_NEGATIVE_DERIVATIVE(usage_idle) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_negative_derivative:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_negative_derivative:Float64;N]
-                    Filter: NOT non_negative_derivative IS NULL [time:Timestamp(Nanosecond, Some("UTC")), non_negative_derivative:Float64;N]
-                      Projection: cpu.time AS time, non_negative_derivative(cpu.usage_idle) AS non_negative_derivative [time:Timestamp(Nanosecond, Some("UTC")), non_negative_derivative:Float64;N]
-                        WindowAggr: windowExpr=[[non_negative_derivative(cpu.usage_idle, IntervalMonthDayNano("1000000000"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, non_negative_derivative(cpu.usage_idle):Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, non_negative_derivative(cpu.usage_idle) AS non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_negative_derivative:Float64;N]
+                    Filter: non_negative_derivative(cpu.usage_idle) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, non_negative_derivative(cpu.usage_idle):Float64;N]
+                      WindowAggr: windowExpr=[[non_negative_derivative(cpu.usage_idle, IntervalMonthDayNano("1000000000"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, non_negative_derivative(cpu.usage_idle):Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // aggregate
                 assert_snapshot!(plan("SELECT NON_NEGATIVE_DERIVATIVE(MEAN(usage_idle)) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                    Filter: NOT non_negative_derivative IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                      Projection: time, non_negative_derivative(AVG(cpu.usage_idle)) AS non_negative_derivative [time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                        WindowAggr: windowExpr=[[non_negative_derivative(AVG(cpu.usage_idle), IntervalMonthDayNano("10000000000"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, non_negative_derivative(AVG(cpu.usage_idle)):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative(AVG(cpu.usage_idle)) AS non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
+                    Filter: non_negative_derivative(AVG(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, non_negative_derivative(AVG(cpu.usage_idle)):Float64;N]
+                      WindowAggr: windowExpr=[[non_negative_derivative(AVG(cpu.usage_idle), IntervalMonthDayNano("10000000000"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, non_negative_derivative(AVG(cpu.usage_idle)):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // selector
                 assert_snapshot!(plan("SELECT NON_NEGATIVE_DERIVATIVE(LAST(usage_idle)) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                    Filter: NOT non_negative_derivative IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                      Projection: time, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]) AS non_negative_derivative [time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
-                        WindowAggr: windowExpr=[[non_negative_derivative((selector_last(cpu.usage_idle,cpu.time))[value], IntervalMonthDayNano("10000000000"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value])]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]) AS non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, non_negative_derivative:Float64;N]
+                    Filter: non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]):Float64;N]
+                      WindowAggr: windowExpr=[[non_negative_derivative((selector_last(cpu.usage_idle,cpu.time))[value], IntervalMonthDayNano("10000000000"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value])]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4629,23 +4637,23 @@ mod test {
                 // no aggregates
                 assert_snapshot!(plan("SELECT CUMULATIVE_SUM(usage_idle) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cumulative_sum:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cumulative_sum [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cumulative_sum:Float64;N]
-                    Filter: NOT cumulative_sum IS NULL [time:Timestamp(Nanosecond, Some("UTC")), cumulative_sum:Float64;N]
-                      Projection: cpu.time AS time, cumulative_sum(cpu.usage_idle) AS cumulative_sum [time:Timestamp(Nanosecond, Some("UTC")), cumulative_sum:Float64;N]
-                        WindowAggr: windowExpr=[[cumumlative_sum(cpu.usage_idle) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS cumulative_sum(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, cumulative_sum(cpu.usage_idle):Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cumulative_sum(cpu.usage_idle) AS cumulative_sum [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cumulative_sum:Float64;N]
+                    Filter: cumulative_sum(cpu.usage_idle) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, cumulative_sum(cpu.usage_idle):Float64;N]
+                      WindowAggr: windowExpr=[[cumumlative_sum(cpu.usage_idle) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS cumulative_sum(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, cumulative_sum(cpu.usage_idle):Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
 
                 // aggregate
                 assert_snapshot!(plan("SELECT CUMULATIVE_SUM(MEAN(usage_idle)) FROM cpu GROUP BY TIME(10s)"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cumulative_sum:Float64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cumulative_sum [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cumulative_sum:Float64;N]
-                    Filter: NOT cumulative_sum IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, cumulative_sum:Float64;N]
-                      Projection: time, cumulative_sum(AVG(cpu.usage_idle)) AS cumulative_sum [time:Timestamp(Nanosecond, Some("UTC"));N, cumulative_sum:Float64;N]
-                        WindowAggr: windowExpr=[[cumumlative_sum(AVG(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS cumulative_sum(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, cumulative_sum(AVG(cpu.usage_idle)):Float64;N]
-                          GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                            Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
-                              Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cumulative_sum(AVG(cpu.usage_idle)) AS cumulative_sum [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cumulative_sum:Float64;N]
+                    Filter: cumulative_sum(AVG(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, cumulative_sum(AVG(cpu.usage_idle)):Float64;N]
+                      WindowAggr: windowExpr=[[cumumlative_sum(AVG(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS cumulative_sum(AVG(cpu.usage_idle))]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N, cumulative_sum(AVG(cpu.usage_idle)):Float64;N]
+                        GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                          Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4659,7 +4667,8 @@ mod test {
                       GapFill: groupBy=[time], aggr=[[AVG(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
                         Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[AVG(cpu.usage_idle)]] [time:Timestamp(Nanosecond, Some("UTC"));N, AVG(cpu.usage_idle):Float64;N]
                           Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
 
@@ -4667,10 +4676,10 @@ mod test {
             fn test_elapsed() {
                 assert_snapshot!(plan("SELECT ELAPSED(usage_idle) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, elapsed [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                    Filter: NOT elapsed IS NULL [time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                      Projection: cpu.time AS time, elapsed(cpu.usage_idle) AS elapsed [time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                        WindowAggr: windowExpr=[[elapsed(cpu.usage_idle, IntervalMonthDayNano("1"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS elapsed(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, elapsed(cpu.usage_idle):Int64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, elapsed(cpu.usage_idle) AS elapsed [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
+                    Filter: elapsed(cpu.usage_idle) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, elapsed(cpu.usage_idle):Int64;N]
+                      WindowAggr: windowExpr=[[elapsed(cpu.usage_idle, IntervalMonthDayNano("1"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS elapsed(cpu.usage_idle)]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, elapsed(cpu.usage_idle):Int64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4679,10 +4688,10 @@ mod test {
             fn test_elapsed_with_unit() {
                 assert_snapshot!(plan("SELECT ELAPSED(usage_idle, 1s) FROM cpu"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, elapsed [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                    Filter: NOT elapsed IS NULL [time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                      Projection: cpu.time AS time, elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000")) AS elapsed [time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
-                        WindowAggr: windowExpr=[[elapsed(cpu.usage_idle, IntervalMonthDayNano("1000000000"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000"))]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000")):Int64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000")) AS elapsed [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), elapsed:Int64;N]
+                    Filter: elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000")) IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000")):Int64;N]
+                      WindowAggr: windowExpr=[[elapsed(cpu.usage_idle, IntervalMonthDayNano("1000000000"), cpu.time) ORDER BY [cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000"))]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, elapsed(cpu.usage_idle,IntervalMonthDayNano("1000000000")):Int64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
@@ -4695,48 +4704,49 @@ mod test {
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, distinct [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
                 Distinct: [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
-                  Filter: NOT distinct IS NULL [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
-                    Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
+                  Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                       TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT DISTINCT(usage_idle) FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, distinct [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
                 Distinct: [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
-                  Filter: NOT distinct IS NULL [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
-                    Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
+                  Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC")), distinct:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                       TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT DISTINCT usage_idle FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cpu, distinct [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
                 Distinct: [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
-                  Filter: NOT distinct IS NULL [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
-                    Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.cpu AS cpu, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
+                  Projection: TimestampNanosecond(0, Some("UTC")) AS time, cpu.cpu AS cpu, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                       TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT COUNT(DISTINCT usage_idle) FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, coalesce_struct(COUNT(DISTINCT cpu.usage_idle), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N]
                 Aggregate: groupBy=[[]], aggr=[[COUNT(DISTINCT cpu.usage_idle)]] [COUNT(DISTINCT cpu.usage_idle):Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT DISTINCT(usage_idle) FROM cpu GROUP BY time(1s)"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, distinct:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, distinct [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, distinct:Float64;N]
                 Distinct: [time:Timestamp(Nanosecond, Some("UTC"));N, distinct:Float64;N]
-                  Filter: NOT distinct IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, distinct:Float64;N]
-                    Projection: date_bin(IntervalMonthDayNano("1000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC"));N, distinct:Float64;N]
-                      Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: date_bin(IntervalMonthDayNano("1000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC"));N, distinct:Float64;N]
+                    Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                         TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT DISTINCT(usage_idle) FROM cpu GROUP BY time(1s), cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cpu, distinct [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
                 Distinct: [time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
-                  Filter: NOT distinct IS NULL [time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
-                    Projection: date_bin(IntervalMonthDayNano("1000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time, cpu.cpu AS cpu, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
-                      Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Projection: date_bin(IntervalMonthDayNano("1000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time, cpu.cpu AS cpu, cpu.usage_idle AS distinct [time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, distinct:Float64;N]
+                    Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                         TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
@@ -4767,7 +4777,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, last:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, (selector_last(cpu.usage_idle,cpu.time))[time] AS time, (selector_last(cpu.usage_idle,cpu.time))[value] AS last [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, last:Float64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4777,7 +4788,8 @@ mod test {
                 Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, last:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, (selector_last(cpu.usage_idle,cpu.time))[time] AS time, cpu.cpu AS cpu, (selector_last(cpu.usage_idle,cpu.time))[value] AS last [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, last:Float64;N]
                     Aggregate: groupBy=[[cpu.cpu]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [cpu:Dictionary(Int32, Utf8);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4789,7 +4801,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time)]], time_column=time, stride=IntervalMonthDayNano("5000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("5000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4801,7 +4814,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[selector_first(cpu.usage_idle,cpu.time)]], time_column=time, stride=IntervalMonthDayNano("5000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("5000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[selector_first(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4811,7 +4825,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), last:Float64;N, first:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, (selector_last(cpu.usage_idle,cpu.time))[value] AS last, (selector_first(cpu.usage_idle,cpu.time))[value] AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), last:Float64;N, first:Float64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_last(cpu.usage_idle, cpu.time), selector_first(cpu.usage_idle, cpu.time)]] [selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4820,7 +4835,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), last:Float64;N, count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, (selector_last(cpu.usage_idle,cpu.time))[value] AS last, coalesce_struct(COUNT(cpu.usage_idle), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), last:Float64;N, count:Int64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_last(cpu.usage_idle, cpu.time), COUNT(cpu.usage_idle)]] [selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, COUNT(cpu.usage_idle):Int64;N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4830,7 +4846,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, last:Float64;N, usage_system:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, (selector_last(cpu.usage_idle,cpu.time,cpu.usage_system))[time] AS time, (selector_last(cpu.usage_idle,cpu.time,cpu.usage_system))[value] AS last, (selector_last(cpu.usage_idle,cpu.time,cpu.usage_system))[other_1] AS usage_system [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, last:Float64;N, usage_system:Float64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_last(cpu.usage_idle, cpu.time, cpu.usage_system)]] [selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4841,7 +4858,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time,cpu.usage_system)]], time_column=time, stride=IntervalMonthDayNano("5000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("5000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time, cpu.usage_system)]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4852,7 +4870,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time,cpu.usage_system)]], time_column=time, stride=IntervalMonthDayNano("5000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("5000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time, cpu.usage_system)]] [time:Timestamp(Nanosecond, Some("UTC"));N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                            TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4861,7 +4880,8 @@ mod test {
                 Sort: time ASC NULLS LAST, first_1 ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, first:Float64;N, first_1:Dictionary(Int32, Utf8);N]
                   Projection: Dictionary(Int32, Utf8("name_clash")) AS iox::measurement, (selector_first(name_clash.f,name_clash.time,name_clash.first))[time] AS time, (selector_first(name_clash.f,name_clash.time,name_clash.first))[value] AS first, (selector_first(name_clash.f,name_clash.time,name_clash.first))[other_1] AS first_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, first:Float64;N, first_1:Dictionary(Int32, Utf8);N]
                     Aggregate: groupBy=[[]], aggr=[[selector_first(name_clash.f, name_clash.time, name_clash.first)]] [selector_first(name_clash.f,name_clash.time,name_clash.first):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Dictionary(Int32, Utf8), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: name_clash [f:Float64;N, first:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                      Filter: name_clash.f IS NOT NULL [f:Float64;N, first:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                        TableScan: name_clash [f:Float64;N, first:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
                 "###);
             }
             #[test]
@@ -4871,7 +4891,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, first:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, (selector_first(cpu.usage_idle,cpu.time))[time] AS time, (selector_first(cpu.usage_idle,cpu.time))[value] AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, first:Float64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_first(cpu.usage_idle, cpu.time)]] [selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4880,7 +4901,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, max:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, (selector_max(cpu.usage_idle,cpu.time))[time] AS time, (selector_max(cpu.usage_idle,cpu.time))[value] AS max [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, max:Float64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_max(cpu.usage_idle, cpu.time)]] [selector_max(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
             #[test]
@@ -4889,7 +4911,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, min:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, (selector_min(cpu.usage_idle,cpu.time))[time] AS time, (selector_min(cpu.usage_idle,cpu.time))[value] AS min [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, min:Float64;N]
                     Aggregate: groupBy=[[]], aggr=[[selector_min(cpu.usage_idle, cpu.time)]] [selector_min(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
             }
 
@@ -4914,7 +4937,8 @@ mod test {
                 Filter: percent_row_number(Float64(50)) ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING = ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, percent_row_number(Float64(50)) ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64;N]
                   WindowAggr: windowExpr=[[percent_row_number(Float64(50)) ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS percent_row_number(Float64(50)) ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, ROW_NUMBER() ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, percent_row_number(Float64(50)) ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64;N]
                     Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT percentile(usage_idle,50),usage_system FROM cpu WHERE time >= 0 AND time < 60000000000 GROUP BY cpu"), @r###"
@@ -4924,28 +4948,32 @@ mod test {
                   WindowAggr: windowExpr=[[percent_row_number(Float64(50)) PARTITION BY [cpu.cpu] ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS percent_row_number(Float64(50)) PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, ROW_NUMBER() PARTITION BY [cpu.cpu] ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, percent_row_number(Float64(50)) PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING:UInt64;N]
                     Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                       Filter: cpu.time >= TimestampNanosecond(0, None) AND cpu.time <= TimestampNanosecond(59999999999, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT percentile(usage_idle,50), percentile(usage_idle,90) FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), percentile:Float64;N, percentile_1:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, percentile(cpu.usage_idle,Int64(50)) AS percentile, percentile(cpu.usage_idle,Int64(90)) AS percentile_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), percentile:Float64;N, percentile_1:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[percentile(cpu.usage_idle, Int64(50)), percentile(cpu.usage_idle, Int64(90))]] [percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT percentile(usage_idle,50), percentile(usage_idle,90) FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, percentile:Float64;N, percentile_1:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, cpu.cpu AS cpu, percentile(cpu.usage_idle,Int64(50)) AS percentile, percentile(cpu.usage_idle,Int64(90)) AS percentile_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, percentile:Float64;N, percentile_1:Float64;N]
                 Aggregate: groupBy=[[cpu.cpu]], aggr=[[percentile(cpu.usage_idle, Int64(50)), percentile(cpu.usage_idle, Int64(90))]] [cpu:Dictionary(Int32, Utf8);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT percentile(usage_idle,50), percentile(usage_idle,90) FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, percentile:Float64;N, percentile_1:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, cpu.cpu AS cpu, percentile(cpu.usage_idle,Int64(50)) AS percentile, percentile(cpu.usage_idle,Int64(90)) AS percentile_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, percentile:Float64;N, percentile_1:Float64;N]
                 Aggregate: groupBy=[[cpu.cpu]], aggr=[[percentile(cpu.usage_idle, Int64(50)), percentile(cpu.usage_idle, Int64(90))]] [cpu:Dictionary(Int32, Utf8);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT percentile(usage_idle,50), percentile(usage_idle,90) FROM cpu WHERE time >= 0 AND time < 60000000000 GROUP BY time(10s), cpu"), @r###"
@@ -4954,7 +4982,8 @@ mod test {
                 GapFill: groupBy=[time, cpu.cpu], aggr=[[percentile(cpu.usage_idle,Int64(50)), percentile(cpu.usage_idle,Int64(90))]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Included(Literal(TimestampNanosecond(0, None)))..Included(Literal(TimestampNanosecond(59999999999, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
                   Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), cpu.time, TimestampNanosecond(0, Some("UTC"))) AS time, cpu.cpu]], aggr=[[percentile(cpu.usage_idle, Int64(50)), percentile(cpu.usage_idle, Int64(90))]] [time:Timestamp(Nanosecond, Some("UTC"));N, cpu:Dictionary(Int32, Utf8);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
                     Filter: cpu.time >= TimestampNanosecond(0, None) AND cpu.time <= TimestampNanosecond(59999999999, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -4965,7 +4994,8 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.usage_idle AS top [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), top:Float64;N]
                 Filter: ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(10) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                   WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [cpu.usage_idle DESC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT top(usage_idle,10),cpu FROM cpu"), @r###"
@@ -4973,7 +5003,8 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.usage_idle AS top, cpu.cpu AS cpu [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), top:Float64;N, cpu:Dictionary(Int32, Utf8);N]
                 Filter: ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(10) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                   WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [cpu.usage_idle DESC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT top(usage_idle,10) FROM cpu GROUP BY cpu"), @r###"
@@ -4981,7 +5012,8 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS top [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, top:Float64;N]
                 Filter: ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(10) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                   WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu.cpu] ORDER BY [cpu.usage_idle DESC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT top(usage_idle,cpu,10) FROM cpu"), @r###"
@@ -4991,7 +5023,8 @@ mod test {
                   WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [cpu.usage_idle DESC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N, ROW_NUMBER() ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                     Filter: ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(1) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                       WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu.cpu] ORDER BY [cpu.usage_idle DESC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle DESC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -5002,7 +5035,8 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.usage_idle AS bottom [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bottom:Float64;N]
                 Filter: ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(10) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                   WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT bottom(usage_idle,10),cpu FROM cpu"), @r###"
@@ -5010,7 +5044,8 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.usage_idle AS bottom, cpu.cpu AS cpu [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bottom:Float64;N, cpu:Dictionary(Int32, Utf8);N]
                 Filter: ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(10) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                   WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT bottom(usage_idle,10) FROM cpu GROUP BY cpu"), @r###"
@@ -5018,7 +5053,8 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS bottom [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, bottom:Float64;N]
                 Filter: ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(10) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                   WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu.cpu] ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT bottom(usage_idle,cpu,10) FROM cpu"), @r###"
@@ -5028,7 +5064,8 @@ mod test {
                   WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N, ROW_NUMBER() ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                     Filter: ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= Int64(1) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
                       WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu.cpu] ORDER BY [cpu.usage_idle ASC NULLS LAST, cpu.time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]] [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N, ROW_NUMBER() PARTITION BY [cpu] ORDER BY [usage_idle ASC NULLS LAST, time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW:UInt64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -5040,7 +5077,8 @@ mod test {
             assert_snapshot!(plan("SELECT LOG(usage_idle, 8) FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), log:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, log(Int64(8), cpu.usage_idle) AS log [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), log:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // Fallible
@@ -5137,9 +5175,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, time ASC NULLS LAST, cpu ASC NULLS LAST, device ASC NULLS LAST, host ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_used:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_used:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.host AS host, CAST(cpu.cpu AS Utf8) AS cpu, CAST(NULL AS Utf8) AS device, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_used [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_used:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, disk.host AS host, CAST(NULL AS Utf8) AS cpu, CAST(disk.device AS Utf8) AS device, CAST(NULL AS Float64) AS usage_idle, disk.bytes_used AS bytes_used [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_used:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_used IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // nonexistent
@@ -5147,7 +5187,8 @@ mod test {
             assert_snapshot!(plan("SELECT host, usage_idle FROM cpu, non_existent"), @r###"
             Sort: time ASC NULLS LAST, host ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.host AS host, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // multiple of same measurement
@@ -5156,9 +5197,11 @@ mod test {
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time AS time, host AS host, usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), host:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
                 Union [host:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
                   Projection: cpu.host AS host, cpu.time AS time, cpu.usage_idle AS usage_idle [host:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                   Projection: cpu.host AS host, cpu.time AS time, cpu.usage_idle AS usage_idle [host:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N]
-                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                      TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -5169,7 +5212,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: data.time >= TimestampNanosecond(1672531190000000001, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###
             );
             assert_snapshot!(
@@ -5177,7 +5221,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: data.time >= TimestampNanosecond(1081478025000000001, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###
             );
             assert_snapshot!(
@@ -5196,7 +5241,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: data.time >= TimestampNanosecond(1672531190000000001, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###
             );
 
@@ -5221,7 +5267,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: CAST(data.foo AS Utf8) LIKE Utf8("%f%") [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
 
             // regular expression for a numeric field is rewritten to `false`
@@ -5229,7 +5276,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: Boolean(false) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
 
             // regular expression for a non-existent field is rewritten to `false`
@@ -5238,7 +5286,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: Boolean(false) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###
             );
 
@@ -5248,7 +5297,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: data.foo IS NULL OR CAST(data.foo AS Utf8) NOT LIKE Utf8("%f%") [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
 
             // regular expression for a numeric field is rewritten to `false`
@@ -5256,7 +5306,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: Boolean(false) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
 
             // regular expression for a non-existent field is rewritten to `false`
@@ -5265,7 +5316,8 @@ mod test {
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Filter: Boolean(false) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###
             );
         }
@@ -5276,19 +5328,22 @@ mod test {
             assert_snapshot!(plan("SELECT f64_field::integer FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Int64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, CAST(data.f64_field AS Int64) AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Int64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT i64_field::float FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, CAST(data.i64_field AS Float64) AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.i64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
 
             // use field selector
             assert_snapshot!(plan("SELECT bool_field::field FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Boolean;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.bool_field AS bool_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Boolean;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.bool_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
 
             // invalid column reference
@@ -5299,17 +5354,20 @@ mod test {
             assert_snapshot!(plan("SELECT f64_field::string FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, NULL AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT f64_field::boolean FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, NULL AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT str_field::boolean FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, NULL AS str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.str_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
         }
 
@@ -5319,25 +5377,29 @@ mod test {
             Explain [plan_type:Utf8, plan:Utf8]
               Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("EXPLAIN VERBOSE SELECT foo, f64_field FROM data"), @r###"
             Explain [plan_type:Utf8, plan:Utf8]
               Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("EXPLAIN ANALYZE SELECT foo, f64_field FROM data"), @r###"
             Analyze [plan_type:Utf8, plan:Utf8]
               Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("EXPLAIN ANALYZE VERBOSE SELECT foo, f64_field FROM data"), @r###"
             Analyze [plan_type:Utf8, plan:Utf8]
               Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
                 Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("EXPLAIN SHOW MEASUREMENTS"), @r###"
             Explain [plan_type:Utf8, plan:Utf8]
@@ -5364,7 +5426,8 @@ mod test {
               Explain [plan_type:Utf8, plan:Utf8]
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, NULL AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
-                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
         }
 
@@ -5374,135 +5437,160 @@ mod test {
             assert_snapshot!(plan("SELECT f64_field::float FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, all_types.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT f64_field::unsigned FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:UInt64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.f64_field AS UInt64) AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:UInt64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT f64_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Int64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.f64_field AS Int64) AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Int64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT f64_field::string FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT f64_field::boolean FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
 
             // Integer casting
             assert_snapshot!(plan("SELECT i64_field::float FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.i64_field AS Float64) AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Float64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT i64_field::unsigned FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:UInt64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.i64_field AS UInt64) AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:UInt64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT i64_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Int64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, all_types.i64_field AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Int64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT i64_field::string FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT i64_field::boolean FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
 
             // Unsigned casting
             assert_snapshot!(plan("SELECT u64_field::float FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.u64_field AS Float64) AS u64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Float64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT u64_field::unsigned FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, all_types.u64_field AS u64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT u64_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Int64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.u64_field AS Int64) AS u64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Int64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT u64_field::string FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS u64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT u64_field::boolean FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS u64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), u64_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
 
             // String casting
             assert_snapshot!(plan("SELECT str_field::float FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.str_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT str_field::unsigned FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.str_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT str_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.str_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT str_field::string FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Utf8;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, all_types.str_field AS str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Utf8;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.str_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT str_field::boolean FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), str_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.str_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
 
             // Boolean casting
             assert_snapshot!(plan("SELECT bool_field::float FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS bool_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.bool_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT bool_field::unsigned FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS bool_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.bool_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT bool_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS bool_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.bool_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT bool_field::string FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS bool_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.bool_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT bool_field::boolean FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Boolean;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, all_types.bool_field AS bool_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), bool_field:Boolean;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.bool_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
 
             // Validate various projection expressions with casts
@@ -5510,13 +5598,15 @@ mod test {
             assert_snapshot!(plan("SELECT f64_field::integer + i64_field + u64_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field_i64_field_u64_field:Int64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, CAST(all_types.f64_field AS Int64) + all_types.i64_field + CAST(all_types.u64_field AS Int64) AS f64_field_i64_field_u64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field_i64_field_u64_field:Int64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL OR all_types.i64_field IS NOT NULL OR all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
 
             assert_snapshot!(plan("SELECT f64_field::integer + i64_field + str_field::integer FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field_i64_field_str_field:Null;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, NULL AS f64_field_i64_field_str_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field_i64_field_str_field:Null;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.f64_field IS NOT NULL OR all_types.i64_field IS NOT NULL OR all_types.str_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
         }
 
@@ -5526,13 +5616,15 @@ mod test {
             assert_snapshot!(plan("SELECT i64_field / i64_field FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field_i64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, coalesce(CAST(all_types.i64_field AS Float64) / CAST(all_types.i64_field AS Float64), Float64(0)) AS i64_field_i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), i64_field_i64_field:Float64;N]
-                TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
             assert_snapshot!(plan("SELECT sum(i64_field) / sum(i64_field) FROM all_types"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), sum_sum:Float64;N]
               Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, coalesce(CAST(SUM(all_types.i64_field) AS Float64) / CAST(SUM(all_types.i64_field) AS Float64), Float64(0)) AS sum_sum [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), sum_sum:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[SUM(all_types.i64_field)]] [SUM(all_types.i64_field):Int64;N]
-                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                  Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
+                    TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), u64_field:UInt64;N]
             "###);
         }
 
@@ -5543,7 +5635,8 @@ mod test {
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
                 Filter: data.time <= TimestampNanosecond(1667181719999999999, None) AND Boolean(true) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                    TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
         }
 
@@ -5553,14 +5646,16 @@ mod test {
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu_usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, spread(cpu.usage_idle) AS cpu_usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu_usage_idle:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[spread(cpu.usage_idle)]] [spread(cpu.usage_idle):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT SPREAD(*) FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), spread_usage_idle:Float64;N, spread_usage_system:Float64;N, spread_usage_user:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, spread(cpu.usage_idle) AS spread_usage_idle, spread(cpu.usage_system) AS spread_usage_system, spread(cpu.usage_user) AS spread_usage_user [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), spread_usage_idle:Float64;N, spread_usage_system:Float64;N, spread_usage_user:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[spread(cpu.usage_idle), spread(cpu.usage_system), spread(cpu.usage_user)]] [spread(cpu.usage_idle):Float64;N, spread(cpu.usage_system):Float64;N, spread(cpu.usage_user):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL OR cpu.usage_user IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -5570,14 +5665,16 @@ mod test {
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu_usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, mode(cpu.usage_idle,cpu.time) AS cpu_usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu_usage_idle:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[mode(cpu.usage_idle, cpu.time)]] [mode(cpu.usage_idle,cpu.time):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             assert_snapshot!(plan("SELECT MODE(*) FROM cpu"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), mode_usage_idle:Float64;N, mode_usage_system:Float64;N, mode_usage_user:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, mode(cpu.usage_idle,cpu.time) AS mode_usage_idle, mode(cpu.usage_system,cpu.time) AS mode_usage_system, mode(cpu.usage_user,cpu.time) AS mode_usage_user [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), mode_usage_idle:Float64;N, mode_usage_system:Float64;N, mode_usage_user:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[mode(cpu.usage_idle, cpu.time), mode(cpu.usage_system, cpu.time), mode(cpu.usage_user, cpu.time)]] [mode(cpu.usage_idle,cpu.time):Float64;N, mode(cpu.usage_system,cpu.time):Float64;N, mode(cpu.usage_user,cpu.time):Float64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL OR cpu.usage_user IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
     }
@@ -5595,20 +5692,23 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N]
                     Aggregate: groupBy=[[]], aggr=[[COUNT(data.f64_field)]] [COUNT(data.f64_field):Int64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 assert_snapshot!(plan("SELECT COUNT(f64_field) FROM data GROUP BY non_existent"), @r###"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_existent:Null;N, count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, NULL AS non_existent, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), non_existent:Null;N, count:Int64;N]
                     Aggregate: groupBy=[[]], aggr=[[COUNT(data.f64_field)]] [COUNT(data.f64_field):Int64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
                 assert_snapshot!(plan("SELECT COUNT(f64_field) FROM data GROUP BY foo"), @r###"
                 Sort: foo ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, data.foo AS foo, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                     Aggregate: groupBy=[[data.foo]], aggr=[[COUNT(data.f64_field)]] [foo:Dictionary(Int32, Utf8);N, COUNT(data.f64_field):Int64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // The `COUNT(f64_field)` aggregate is only projected ones in the Aggregate and reused in the projection
@@ -5616,7 +5716,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N, count_count:Int64;N, count_1:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count, coalesce_struct(COUNT(data.f64_field), Int64(0)) + coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count_count, coalesce_struct(COUNT(data.f64_field), Int64(0)) * Int64(3) AS count_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N, count_count:Int64;N, count_1:Int64;N]
                     Aggregate: groupBy=[[]], aggr=[[COUNT(data.f64_field)]] [COUNT(data.f64_field):Int64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // non-existent tags are excluded from the Aggregate groupBy and Sort operators
@@ -5624,7 +5725,8 @@ mod test {
                 Sort: foo ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, non_existent:Null;N, count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, data.foo AS foo, NULL AS non_existent, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, non_existent:Null;N, count:Int64;N]
                     Aggregate: groupBy=[[data.foo]], aggr=[[COUNT(data.f64_field)]] [foo:Dictionary(Int32, Utf8);N, COUNT(data.f64_field):Int64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // Aggregate expression is projected once and reused in final projection
@@ -5632,7 +5734,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N, count_1:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count, coalesce_struct(COUNT(data.f64_field), Int64(0)) * Int64(2) AS count_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), count:Int64;N, count_1:Int64;N]
                     Aggregate: groupBy=[[]], aggr=[[COUNT(data.f64_field)]] [COUNT(data.f64_field):Int64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // Aggregate expression selecting non-existent field
@@ -5647,7 +5750,8 @@ mod test {
                 Sort: foo ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, mean_mean:Null;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, data.foo AS foo, NULL AS mean_mean [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, mean_mean:Null;N]
                     Aggregate: groupBy=[[data.foo]], aggr=[[]] [foo:Dictionary(Int32, Utf8);N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // Aggregate expression selecting tag, should treat as non-existent
@@ -5655,7 +5759,8 @@ mod test {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), mean:Float64;N, mean_mean:Null;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, AVG(data.f64_field) AS mean, NULL AS mean_mean [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), mean:Float64;N, mean_mean:Null;N]
                     Aggregate: groupBy=[[]], aggr=[[AVG(data.f64_field)]] [AVG(data.f64_field):Float64;N]
-                      TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                      Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // Fallible
@@ -5684,7 +5789,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, count:Int64;N]
                     Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
 
                 // supports offset parameter
@@ -5693,7 +5799,8 @@ mod test {
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, count:Int64;N]
                     Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(5000000000, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                        TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                        Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5706,7 +5813,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5719,7 +5827,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1667181719999999999, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1667181719999999999, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5732,7 +5841,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Included(Literal(TimestampNanosecond(1667181600000000000, None)))..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time >= TimestampNanosecond(1667181600000000000, None) AND data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5745,7 +5855,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Included(Literal(TimestampNanosecond(1667181600000000000, None)))..Included(Literal(TimestampNanosecond(1667181719999999999, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time >= TimestampNanosecond(1667181600000000000, None) AND data.time <= TimestampNanosecond(1667181719999999999, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5757,7 +5868,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5769,7 +5881,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5781,7 +5894,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[LOCF(COUNT(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5793,7 +5907,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5805,7 +5920,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[INTERPOLATE(COUNT(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5818,7 +5934,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5831,7 +5948,8 @@ mod test {
                     GapFill: groupBy=[time], aggr=[[COUNT(data.f64_field), AVG(data.f64_field)]], time_column=time, stride=IntervalMonthDayNano("10000000000"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None))) [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N, AVG(data.f64_field):Float64;N]
                       Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000000000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field), AVG(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N, AVG(data.f64_field):Float64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                          TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                          Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5845,7 +5963,8 @@ mod test {
                         Sort: foo ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                           Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, data.foo AS foo, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                             Aggregate: groupBy=[[data.foo]], aggr=[[COUNT(data.f64_field)]] [foo:Dictionary(Int32, Utf8);N, COUNT(data.f64_field):Int64;N]
-                              TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                              Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5859,7 +5978,8 @@ mod test {
                         Sort: foo ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                           Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, data.foo AS foo, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                             Aggregate: groupBy=[[data.foo]], aggr=[[COUNT(data.f64_field)]] [foo:Dictionary(Int32, Utf8);N, COUNT(data.f64_field):Int64;N]
-                              TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                              Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5873,7 +5993,8 @@ mod test {
                         Sort: foo ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                           Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, data.foo AS foo, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, count:Int64;N]
                             Aggregate: groupBy=[[data.foo]], aggr=[[COUNT(data.f64_field)]] [foo:Dictionary(Int32, Utf8);N, COUNT(data.f64_field):Int64;N]
-                              TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                              Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                 "###);
             }
 
@@ -5900,7 +6021,8 @@ mod test {
                       Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, coalesce_struct(COUNT(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC"));N, count:Int64;N]
                         Aggregate: groupBy=[[date_bin(IntervalMonthDayNano("10000"), data.time, TimestampNanosecond(0, Some("UTC"))) AS time]], aggr=[[COUNT(data.f64_field)]] [time:Timestamp(Nanosecond, Some("UTC"));N, COUNT(data.f64_field):Int64;N]
                           Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
-                            TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                            Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                              TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
                     "###);
                 }
             }
@@ -5918,42 +6040,50 @@ mod test {
             assert_snapshot!(plan("SELECT f64_field FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT time, f64_field FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT time as timestamp, f64_field FROM data"), @r###"
             Sort: timestamp ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), timestamp:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS timestamp, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), timestamp:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT foo, f64_field FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT foo, f64_field, i64_field FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N, i64_field:Int64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field AS f64_field, data.i64_field AS i64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N, i64_field:Int64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL OR data.i64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT /^f/ FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.f64_field AS f64_field, data.foo AS foo [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT * FROM data"), @r###"
             Sort: time ASC NULLS LAST, bar ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, with space:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.TIME AS TIME, data.bar AS bar, data.bool_field AS bool_field, data.f64_field AS f64_field, data.foo AS foo, data.i64_field AS i64_field, data.mixedCase AS mixedCase, data.str_field AS str_field, data.with space AS with space [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, with space:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.TIME IS NOT NULL OR data.bool_field IS NOT NULL OR data.f64_field IS NOT NULL OR data.i64_field IS NOT NULL OR data.mixedCase IS NOT NULL OR data.str_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT TIME FROM data"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), TIME:Boolean;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.TIME AS TIME [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), TIME:Boolean;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.TIME IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###); // TIME is a field
         }
 
@@ -5963,22 +6093,26 @@ mod test {
             assert_snapshot!(plan("SELECT foo, f64_field + f64_field FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field_f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field + data.f64_field AS f64_field_f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field_f64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT foo, sin(f64_field) FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, sin:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, sin(data.f64_field) AS sin [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, sin:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT foo, atan2(f64_field, 2) FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, atan2(data.f64_field, Int64(2)) AS atan2 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT foo, f64_field + 0.5 FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field + Float64(0.5) AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
-                TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, Some("UTC")), with space:Float64;N]
             "###);
         }
 
@@ -5988,56 +6122,64 @@ mod test {
             assert_snapshot!(plan("SELECT usage_idle FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // Sort should be cpu, time
             assert_snapshot!(plan("SELECT cpu, usage_idle FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // Sort should be cpu, region, time
             assert_snapshot!(plan("SELECT usage_idle FROM cpu GROUP BY cpu, region"), @r###"
             Sort: cpu ASC NULLS LAST, region ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.region AS region, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // Sort should be cpu, region, time
             assert_snapshot!(plan("SELECT usage_idle FROM cpu GROUP BY region, cpu"), @r###"
             Sort: cpu ASC NULLS LAST, region ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.region AS region, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // Sort should be cpu, time, region
             assert_snapshot!(plan("SELECT region, usage_idle FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST, region ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.region AS region, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // If a tag specified in a GROUP BY does not exist in the measurement, it should be omitted from the sort
             assert_snapshot!(plan("SELECT usage_idle FROM cpu GROUP BY cpu, non_existent"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, non_existent:Null;N, usage_idle:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, NULL AS non_existent, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, non_existent:Null;N, usage_idle:Float64;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // If a tag specified in a projection does not exist in the measurement, it should be omitted from the sort
             assert_snapshot!(plan("SELECT usage_idle, cpu, non_existent FROM cpu GROUP BY cpu"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, cpu:Dictionary(Int32, Utf8);N, non_existent:Null;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.usage_idle AS usage_idle, cpu.cpu AS cpu, NULL AS non_existent [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, cpu:Dictionary(Int32, Utf8);N, non_existent:Null;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
 
             // If a non-existent field is included in the GROUP BY and projection, it should not be duplicated
             assert_snapshot!(plan("SELECT usage_idle, non_existent FROM cpu GROUP BY cpu, non_existent"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N, non_existent:Null;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS usage_idle, NULL AS non_existent [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N, non_existent:Null;N]
-                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -6048,9 +6190,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(cpu.cpu AS Utf8) AS cpu, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(NULL AS Utf8) AS cpu, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // Sort should be iox::measurement, cpu, device, time
@@ -6058,9 +6202,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, cpu ASC NULLS LAST, device ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(cpu.cpu AS Utf8) AS cpu, CAST(NULL AS Utf8) AS device, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(NULL AS Utf8) AS cpu, CAST(disk.device AS Utf8) AS device, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // Sort should be iox::measurement, cpu, time, device
@@ -6068,9 +6214,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, cpu ASC NULLS LAST, time ASC NULLS LAST, device ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(cpu.cpu AS Utf8) AS cpu, CAST(NULL AS Utf8) AS device, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(NULL AS Utf8) AS cpu, CAST(disk.device AS Utf8) AS device, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Utf8;N, device:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // Sort should be iox::measurement, cpu, device, time
@@ -6078,9 +6226,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, cpu ASC NULLS LAST, device ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(NULL AS Utf8) AS device, CAST(cpu.cpu AS Utf8) AS cpu, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(disk.device AS Utf8) AS device, CAST(NULL AS Utf8) AS cpu, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // Sort should be iox::measurement, device, time, cpu
@@ -6088,9 +6238,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, device ASC NULLS LAST, time ASC NULLS LAST, cpu ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(NULL AS Utf8) AS device, CAST(cpu.cpu AS Utf8) AS cpu, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(disk.device AS Utf8) AS device, CAST(NULL AS Utf8) AS cpu, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // If a tag specified in a GROUP BY does not exist across all measurements, it should be omitted from the sort
@@ -6098,9 +6250,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, device ASC NULLS LAST, time ASC NULLS LAST, cpu ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, non_existent:Null;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, non_existent:Null;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(NULL AS Utf8) AS device, NULL AS non_existent, CAST(cpu.cpu AS Utf8) AS cpu, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, non_existent:Null;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(disk.device AS Utf8) AS device, NULL AS non_existent, CAST(NULL AS Utf8) AS cpu, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, non_existent:Null;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
 
             // If a tag specified in a projection does not exist across all measurements, it should be omitted from the sort
@@ -6108,9 +6262,11 @@ mod test {
             Sort: iox::measurement ASC NULLS LAST, device ASC NULLS LAST, time ASC NULLS LAST, cpu ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N, non_existent:Null;N]
               Union [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N, non_existent:Null;N]
                 Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, CAST(NULL AS Utf8) AS device, CAST(cpu.cpu AS Utf8) AS cpu, cpu.usage_idle AS usage_idle, CAST(NULL AS Int64) AS bytes_free, NULL AS non_existent [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N, non_existent:Null;N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 Projection: Dictionary(Int32, Utf8("disk")) AS iox::measurement, disk.time AS time, CAST(disk.device AS Utf8) AS device, CAST(NULL AS Utf8) AS cpu, CAST(NULL AS Float64) AS usage_idle, disk.bytes_free AS bytes_free, NULL AS non_existent [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), device:Utf8;N, cpu:Utf8;N, usage_idle:Float64;N, bytes_free:Int64;N, non_existent:Null;N]
-                  TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: disk.bytes_free IS NOT NULL [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: disk [bytes_free:Int64;N, bytes_used:Int64;N, device:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
             "###);
         }
 
@@ -6123,7 +6279,8 @@ mod test {
                   WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu] ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS iox::row]] [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N, iox::row:UInt64;N]
                     Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
                       Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT usage_idle FROM cpu GROUP BY cpu OFFSET 1"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
@@ -6132,7 +6289,8 @@ mod test {
                   WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu] ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS iox::row]] [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N, iox::row:UInt64;N]
                     Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
                       Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT usage_idle FROM cpu GROUP BY cpu LIMIT 1 OFFSET 1"), @r###"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
@@ -6141,7 +6299,8 @@ mod test {
                   WindowAggr: windowExpr=[[ROW_NUMBER() PARTITION BY [cpu] ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS iox::row]] [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N, iox::row:UInt64;N]
                     Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
                       Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, cpu.cpu AS cpu, cpu.usage_idle AS usage_idle [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), cpu:Dictionary(Int32, Utf8);N, usage_idle:Float64;N]
-                        TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                        Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                          TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 
@@ -6151,13 +6310,15 @@ mod test {
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Null;N, first:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, NULL AS foo, (selector_first(cpu.usage_idle,cpu.time))[value] AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Null;N, first:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[selector_first(cpu.usage_idle, cpu.time)]] [selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
             assert_snapshot!(plan("SELECT count(foo) as foo, first(usage_idle) from cpu group by foo"), @r###"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Null;N, foo_1:Null;N, first:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, TimestampNanosecond(0, Some("UTC")) AS time, NULL AS foo, (coalesce_struct(selector_first(cpu.usage_idle,cpu.time,NULL), Struct({value:0.0,time:1970-01-01T00:00:00Z,other_1:})))[other_1] AS foo_1, (selector_first(cpu.usage_idle,cpu.time,NULL))[value] AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, Some("UTC")), foo:Null;N, foo_1:Null;N, first:Float64;N]
                 Aggregate: groupBy=[[]], aggr=[[selector_first(cpu.usage_idle, cpu.time, NULL)]] [selector_first(cpu.usage_idle,cpu.time,NULL):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, Some("UTC")), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Null, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
-                  TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                  Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                    TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC")), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
             "###);
         }
 

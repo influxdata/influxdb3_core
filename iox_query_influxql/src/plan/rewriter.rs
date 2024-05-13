@@ -478,7 +478,7 @@ fn field_list_normalize_time(stmt: &mut Select) {
 
         // time aliases in subqueries is ignored
         if is_subquery {
-            c.name = "time".to_owned()
+            c.name = "time".to_string()
         }
 
         if let Expr::VarRef(VarRef {

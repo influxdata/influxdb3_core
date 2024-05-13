@@ -63,6 +63,11 @@ pub fn make_struct_datatype<'a>(
 /// - `value`
 /// - `time`
 /// - `other_{1..}` (depending on the other input to the selector function).
+///
+/// If `value` is `NULL`, the whole struct will be `NULL`. Neither the
+/// time-based, nor value-based selectors will select a `value` that is
+/// `NULL` so this is used as a proxy to indicate that no row met the
+/// criteria to be selected.
 pub fn make_struct_scalar<'a>(
     value: &'a ScalarValue,
     time: &'a ScalarValue,
@@ -75,13 +80,18 @@ pub fn make_struct_scalar<'a>(
 
     let other_types: Vec<_> = scalars[2..].iter().map(|s| s.data_type()).collect();
     let fields = make_struct_fields(&value.data_type(), &time.data_type(), &other_types);
-    let mut builder = ScalarStructBuilder::new();
 
-    for (field, scalar) in fields.iter().zip(scalars) {
-        builder = builder.with_scalar(Arc::clone(field), scalar);
+    if value.is_null() {
+        Ok(ScalarStructBuilder::new_null(fields))
+    } else {
+        let mut builder = ScalarStructBuilder::new();
+
+        for (field, scalar) in fields.iter().zip(scalars) {
+            builder = builder.with_scalar(Arc::clone(field), scalar);
+        }
+
+        builder.build()
     }
-
-    builder.build()
 }
 
 /// Contains types of the aggregator.

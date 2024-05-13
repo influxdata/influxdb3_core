@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::{borrow::Cow, sync::Arc};
+use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 
@@ -204,6 +204,19 @@ impl From<i64> for MetaValue {
     }
 }
 
+impl From<bool> for MetaValue {
+    fn from(v: bool) -> Self {
+        Self::Bool(v)
+    }
+}
+
+/// Record a [`Duration`] using a millisecond string representation.
+impl From<Duration> for MetaValue {
+    fn from(v: Duration) -> Self {
+        Self::String(format!("{}ms", v.as_millis()).into())
+    }
+}
+
 /// Utility for instrumenting code that produces [`Span`].
 ///
 /// If a [`SpanRecorder`] is created from a [`Span`] it will update the start timestamp
@@ -280,11 +293,23 @@ impl SpanRecorder {
         }
     }
 
+    /// Returns mutable access to the inner [`Span`] metadata.
+    pub fn metadata_mut(&mut self) -> Option<&mut HashMap<Cow<'static, str>, MetaValue>> {
+        self.span.as_mut().map(|v| &mut v.metadata)
+    }
+
     /// Record an event on the contained `Span` if any
     pub fn event(&mut self, event: SpanEvent) {
         if let Some(span) = self.span.as_mut() {
             span.event(event);
         }
+    }
+
+    /// Record an event on the inner `Span` with the specified `msg`.
+    pub fn event_msg(&mut self, msg: impl Into<Cow<'static, str>>) {
+        if let Some(s) = &mut self.span {
+            s.event(SpanEvent::new(msg));
+        };
     }
 
     /// Record success on the contained `Span` if any

@@ -20,7 +20,7 @@ If you add a new file to this directory, please add a brief description of it he
 
 # parquet directory
 
-- `influxql_log_*.parquet` - Data exported from TSM for the purposes of testing bulk ingest. Notably
-  NOT generated with IOx.
-- `sql_query_log_*.parquet` - Data exported from TSM for the purposes of testing bulk ingest.
-  Notably NOT generated with IOx.
+- `influxql_logs/influxql_log_*.parquet` - Data exported from TSM for the purposes of testing bulk
+  ingest. Notably NOT generated with IOx.
+- `sql_query_logs/sql_query_log_*.parquet` - Data exported from TSM for the purposes of testing
+  bulk ingest. Notably NOT generated with IOx.

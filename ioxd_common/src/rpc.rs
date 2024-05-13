@@ -5,7 +5,7 @@ use std::sync::Arc;
 pub use generated_types::FileDescriptorSet;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tonic::{body::BoxBody, transport::NamedService, Code};
+use tonic::{body::BoxBody, server::NamedService, Code};
 use tonic_health::server::HealthReporter;
 use trace_http::ctx::TraceHeaderParser;
 

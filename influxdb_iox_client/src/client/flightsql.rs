@@ -401,12 +401,9 @@ impl FlightSqlClient {
         cmd: arrow_flight::sql::Any,
     ) -> Result<FlightRecordBatchStream> {
         let FlightInfo {
-            schema: _,
             flight_descriptor: _,
             mut endpoint,
-            total_records: _,
-            total_bytes: _,
-            ordered: _,
+            ..
         } = self.get_flight_info_for_command(cmd).await?;
 
         let flight_endpoint = endpoint.pop().ok_or_else(|| {

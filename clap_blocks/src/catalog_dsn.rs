@@ -65,6 +65,8 @@ pub struct CatalogDsnConfig {
     ///
     /// Memory (ephemeral, only useful for testing): `memory`
     ///
+    /// Catalog service: `http://catalog-service-0:8080; http://catalog-service-1:8080`
+    ///
     #[clap(long = "catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN", action)]
     pub dsn: Option<String>,
 
@@ -172,8 +174,13 @@ impl CatalogDsnConfig {
             ))
         } else if dsn.starts_with("http://") || dsn.starts_with("https://") {
             info!("Catalog: gRPC");
-            let uri = dsn.parse().context(InvalidUriSnafu)?;
-            let grpc = GrpcCatalogClient::builder(uri, metrics, time_provider)
+            let endpoints = dsn
+                .split(';')
+                .map(|x| x.parse())
+                .collect::<Result<_, _>>()
+                .context(InvalidUriSnafu)?;
+
+            let grpc = GrpcCatalogClient::builder(endpoints, metrics, time_provider)
                 .timeout(self.timeout)
                 .connect_timeout(self.connect_timeout)
                 .trace_header_name(

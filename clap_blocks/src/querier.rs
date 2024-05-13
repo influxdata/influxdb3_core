@@ -26,6 +26,21 @@ pub struct QuerierConfig {
     )]
     pub num_query_threads: Option<NonZeroUsize>,
 
+    /// The number of DataFusion target partitions.
+    ///
+    /// Sets the "fan-out" to parallelize an individual query. Higher numbers allow potentially better CPU usage for
+    /// long-running queries, but also come with higher overhead for short-running queries.
+    ///
+    /// Should not be higher than `--num-query-threads`/`INFLUXDB_IOX_NUM_QUERY_THREADS`.
+    ///
+    /// Defaults to `--num-query-threads`/`INFLUXDB_IOX_NUM_QUERY_THREADS` or -- if not specified -- the CPU core count.
+    #[clap(
+        long = "num-query-partitions",
+        env = "INFLUXDB_IOX_NUM_QUERY_PARTITIONS",
+        action
+    )]
+    pub num_query_partitions: Option<NonZeroUsize>,
+
     /// Size of memory pool used during query exec, in bytes.
     ///
     /// If queries attempt to allocate more than this many bytes
@@ -58,6 +73,20 @@ pub struct QuerierConfig {
         value_delimiter = ','
     )]
     pub ingester_addresses: Vec<IngesterAddress>,
+
+    /// Optional replication factor for ingestion.
+    ///
+    /// This value specifies the total number of copies of data after
+    /// replication, defaulting to 1.
+    ///
+    /// The querier uses this information to determine how many ingesters
+    /// should respond to a read before considering the read complete.
+    #[clap(
+        long = "rpc-write-replicas",
+        env = "INFLUXDB_IOX_RPC_WRITE_REPLICAS",
+        default_value = "1"
+    )]
+    pub ingester_write_replicas: NonZeroUsize,
 
     /// Size of the RAM cache used to store catalog metadata information in bytes.
     ///

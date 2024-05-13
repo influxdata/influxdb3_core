@@ -7,13 +7,10 @@
 
 use crate::plan::util::find_exprs_in_exprs;
 use crate::{error, NUMERICS};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
-    logical_expr::{
-        Expr, ScalarFunctionDefinition, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-        Volatility,
-    },
+    logical_expr::{Expr, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
     physical_plan::ColumnarValue,
 };
 use once_cell::sync::Lazy;
@@ -52,10 +49,7 @@ pub(super) fn find_window_udfs(exprs: &[Expr]) -> Vec<Expr> {
         let Expr::ScalarFunction(fun) = nested_expr else {
             return false;
         };
-        let ScalarFunctionDefinition::UDF(udf) = &fun.func_def else {
-            return false;
-        };
-        WindowFunction::try_from_scalar_udf(Arc::clone(udf)).is_some()
+        WindowFunction::try_from_scalar_udf(Arc::clone(&fun.func)).is_some()
     })
 }
 
@@ -308,6 +302,10 @@ static DERIVATIVE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
                             dt.clone(),
                             DataType::Duration(TimeUnit::Nanosecond),
                         ]),
+                        TypeSignature::Exact(vec![
+                            dt.clone(),
+                            DataType::Interval(IntervalUnit::MonthDayNano),
+                        ]),
                     ]
                 })
                 .collect(),
@@ -363,6 +361,10 @@ static NON_NEGATIVE_DERIVATIVE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
                         TypeSignature::Exact(vec![
                             dt.clone(),
                             DataType::Duration(TimeUnit::Nanosecond),
+                        ]),
+                        TypeSignature::Exact(vec![
+                            dt.clone(),
+                            DataType::Interval(IntervalUnit::MonthDayNano),
                         ]),
                     ]
                 })

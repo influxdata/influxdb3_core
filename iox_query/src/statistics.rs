@@ -28,6 +28,16 @@ use observability_deps::tracing::trace;
 use crate::provider::{DeduplicateExec, RecordBatchesExec};
 use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
+/// During the initial partition pruning pass (driving statistics from partition
+/// keys), the row count and null count statistics for each partition
+/// remain unknown.
+///
+/// In cases where "a column is known to be entirely NULL," the row count and
+/// null count statistics should be identical. Use this constant to assign
+/// identical values to both the row count and null count statistics for columns
+/// identified as entirely NULL.
+pub static NULL_COLUMN_INDICATOR: Precision<usize> = Precision::Inexact(1);
+
 /// Aggregates DataFusion [statistics](DFStatistics).
 #[derive(Debug)]
 pub struct DFStatsAggregator<'a> {
@@ -40,7 +50,7 @@ pub struct DFStatsAggregator<'a> {
 }
 
 impl<'a> DFStatsAggregator<'a> {
-    /// Creates new aggregator the the given schema.
+    /// Creates new aggregator the given schema.
     ///
     /// This will start with:
     ///
@@ -189,7 +199,7 @@ struct DFStatsAggregatorCol {
     min_value: Option<Precision<ScalarValue>>,
 }
 
-/// build DF statitics for given chunks and a schema
+/// build DF statistics for given chunks and a schema
 pub fn build_statistics_for_chunks(
     chunks: &[Arc<dyn QueryChunk>],
     schema: SchemaRef,
@@ -250,7 +260,7 @@ pub fn compute_stats_column_min_max(
 }
 
 /// Traverse the physical plan and build statistics min max for the given column each node
-/// Note: This is a temproray solution until DF's statistics is more mature
+/// Note: This is a temporary solution until DF's statistics is more mature
 /// <https://github.com/apache/arrow-datafusion/issues/8078>
 struct StatisticsVisitor<'a> {
     column_name: &'a str, //String,  // todo: not sure enough
@@ -310,8 +320,8 @@ impl ExecutionPlanVisitor for StatisticsVisitor<'_> {
         }
         // Non leaf node
         else {
-            // These are cases the stats will be unioned of their children's
-            //   Sort, Dediplicate, Filter, Repartition, Union, SortPreservingMerge, CoalesceBatches
+            // These are cases the stats will be the union of their children's
+            //   Sort, Deduplicate, Filter, Repartition, Union, SortPreservingMerge, CoalesceBatches
             let union_stats = if plan.as_any().downcast_ref::<SortExec>().is_some()
                 || plan.as_any().downcast_ref::<DeduplicateExec>().is_some()
                 || plan.as_any().downcast_ref::<FilterExec>().is_some()
@@ -351,7 +361,7 @@ impl ExecutionPlanVisitor for StatisticsVisitor<'_> {
                     .expect("No statistics for input plan");
 
                 if union_stats {
-                    // Convervatively union min max
+                    // Conservatively union min max
                     statistics.null_count = statistics.null_count.add(&input_statistics.null_count);
                     statistics.max_value = statistics.max_value.max(&input_statistics.max_value);
                     statistics.min_value = statistics.min_value.min(&input_statistics.min_value);
@@ -398,7 +408,7 @@ pub fn column_statistics_min_max(
     }
 }
 
-/// Get statsistics min max of given column name on given plans
+/// Get statistics min max of given column name on given plans
 /// Return None if one of the inputs does not have statistics or  does not include the column
 pub fn statistics_min_max(
     plans: &[Arc<dyn ExecutionPlan>],

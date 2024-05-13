@@ -3,11 +3,14 @@ package influxdata.iox.gossip.v1;
 option go_package = "github.com/influxdata/iox/gossip/v1";
 
 import "google/protobuf/timestamp.proto";
+import "influxdata/iox/partition_template/v1/template.proto";
 
 // A message exchanged via the IOx gossip mechanism to inform listeners of
 // non-schema changes to cluster namespace state.
 message NamespaceMessage {
   oneof event {
+    // A new namespace was created.
+    NamespaceCreated namespace_created = 1;
     // An existing namespace was updated.
     NamespaceUpdated namespace_updated = 2;
   }
@@ -20,7 +23,39 @@ message NamespaceMessage {
   google.protobuf.Timestamp sent_at = 15;
 }
 
-// An update to the non-schema properties of a namespace occurred.
+// Initialisation of a new namespace occured in the sending peer.
+//
+// If the receiving peer already knows of this namespace and its tracked version
+// value is greater, this is a no-op.
+message NamespaceCreated {
+  string namespace_name = 1;
+  int64 namespace_id = 2;
+
+  // Immutable fields.
+  //
+  // Fields below this line MUST be immutable for the lifetime of a table -
+  // there is no merge stategy for them.
+  influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 3;
+
+  // Mutable fields.
+  //
+  // Fields below this line may change over the lifetime of the namespace, and
+  // may differ on the receiving node when it receives this message.
+  //
+  // If these values differ, the receiving node MUST use the values associated 
+  // with the greater `router_version` value (between the cached & received
+  // values).
+  uint64 max_columns_per_table = 4;
+  uint64 max_tables = 5;
+  optional int64 retention_period_ns = 6;
+
+  // A snapshot of the monotonically increasing counter which tracks the version
+  // of this namespace's non-schema properties. 
+  int64 router_version = 7;
+}
+
+// An update to the non-schema properties of a namespace occurred in the sending
+// peer.
 message NamespaceUpdated {
   // Namespace ID
   int64 id = 1;

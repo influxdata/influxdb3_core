@@ -25,6 +25,7 @@ use datafusion::{
         ExecutionPlan, PhysicalExpr,
     },
 };
+use datafusion_util::config::table_parquet_options;
 
 use crate::provider::{DeduplicateExec, RecordBatchesExec};
 
@@ -39,7 +40,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(&|plan| {
+        plan.transform_down(|plan| {
             let plan_any = plan.as_any();
 
             if let Some(projection_exec) = plan_any.downcast_ref::<ProjectionExec>() {
@@ -113,8 +114,12 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         output_ordering,
                         ..child_parquet.base_config().clone()
                     };
-                    let new_child =
-                        ParquetExec::new(base_config, child_parquet.predicate().cloned(), None);
+                    let new_child = ParquetExec::new(
+                        base_config,
+                        child_parquet.predicate().cloned(),
+                        None,
+                        table_parquet_options(),
+                    );
                     return Ok(Transformed::yes(Arc::new(new_child)));
                 } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
                     let filter_required_cols = collect_columns(child_filter.predicate());
@@ -752,7 +757,12 @@ mod tests {
                 },
             ]],
         };
-        let inner = ParquetExec::new(base_config, Some(expr_string_cmp("tag1", &schema)), None);
+        let inner = ParquetExec::new(
+            base_config,
+            Some(expr_string_cmp("tag1", &schema)),
+            None,
+            table_parquet_options(),
+        );
         let plan = Arc::new(
             ProjectionExec::try_new(
                 vec![
@@ -771,10 +781,10 @@ mod tests {
         ---
         input:
           - " ProjectionExec: expr=[tag2@2 as tag2, tag3@1 as tag3]"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
-            - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+            - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         "###
         );
 
@@ -994,12 +1004,12 @@ mod tests {
         ---
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
-          - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC]"
+          - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[false]"
           - "     Test"
         output:
           Ok:
             - " ProjectionExec: expr=[tag1@0 as tag1]"
-            - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC]"
+            - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[false]"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
         "###
@@ -1040,12 +1050,12 @@ mod tests {
         ---
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
-          - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC]"
+          - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[true]"
           - "     Test"
         output:
           Ok:
             - " ProjectionExec: expr=[tag1@0 as tag1]"
-            - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC]"
+            - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[true]"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
         "###
@@ -1346,7 +1356,12 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        let plan = Arc::new(ParquetExec::new(base_config, None, None));
+        let plan = Arc::new(ParquetExec::new(
+            base_config,
+            None,
+            None,
+            table_parquet_options(),
+        ));
         let plan = Arc::new(UnionExec::new(vec![plan]));
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(

@@ -1,16 +1,16 @@
 //! Client for the cache HTTP API
 
-use crate::api::list::{ListDecoder, ListEntry, MAX_VALUE_SIZE};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH};
+use crate::api::list::{v1, v2, ListEntry, MAX_VALUE_SIZE};
+use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2};
 use crate::{CacheKey, CacheValue};
-use bytes::{Buf, Bytes};
 use futures::prelude::*;
 use futures::stream::BoxStream;
 use hyper::client::connect::dns::{GaiResolver, Name};
+use hyper::header::{ToStrError, ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use hyper::service::Service;
 use metric::DurationHistogram;
 use reqwest::dns::{Resolve, Resolving};
-use reqwest::{Client, Response, StatusCode, Url};
+use reqwest::{Client, StatusCode, Url};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,18 +42,18 @@ pub enum Error {
     #[snafu(display("Invalid generation value"))]
     InvalidGeneration,
 
+    #[snafu(display("Invalid etag: {source}"))]
+    InvalidEtag { source: ToStrError },
+
     #[snafu(display("Not modified"))]
     NotModified,
-
-    #[snafu(display("Error decoding list stream: {source}"), context(false))]
-    ListStream { source: crate::api::list::Error },
 }
 
 /// Result type for [`CatalogCacheClient`]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// The type returned by [`CatalogCacheClient::list`]
-pub type ListStream = BoxStream<'static, Result<ListEntry>>;
+pub type ListStream = BoxStream<'static, Result<ListEntry, crate::api::list::Error>>;
 
 /// Builder for [`CatalogCacheClient`].
 #[derive(Debug)]
@@ -194,7 +194,7 @@ impl CatalogCacheClient {
 
     /// Retrieve the given value from the remote cache, if present
     pub async fn get(&self, key: CacheKey) -> Result<Option<CacheValue>> {
-        self.get_if_modified(key, None).await
+        self.get_if_modified(key, None, None).await
     }
 
     /// Retrieve the given value from the remote cache, if present
@@ -204,11 +204,15 @@ impl CatalogCacheClient {
         &self,
         key: CacheKey,
         generation: Option<u64>,
+        etag: Option<Arc<str>>,
     ) -> Result<Option<CacheValue>> {
         let url = self.url(RequestPath::Resource(key));
         let mut req = self.client.get(url).timeout(self.get_request_timeout);
         if let Some(generation) = generation {
             req = req.header(&GENERATION_NOT_MATCH, generation)
+        }
+        if let Some(etag) = etag {
+            req = req.header(IF_NONE_MATCH, etag.as_ref())
         }
 
         let resp = req.send().await.context(GetSnafu)?;
@@ -229,9 +233,13 @@ impl CatalogCacheClient {
             .and_then(|v| v.parse().ok())
             .context(InvalidGenerationSnafu)?;
 
-        let data = resp.bytes().await.context(GetSnafu)?;
+        let etag = match resp.headers().get(ETAG) {
+            Some(etag) => Some(etag.to_str().context(InvalidEtagSnafu)?.into()),
+            None => None,
+        };
 
-        Ok(Some(CacheValue::new(data, generation)))
+        let data = resp.bytes().await.context(GetSnafu)?;
+        Ok(Some(CacheValue::new(data, generation).with_etag_opt(etag)))
     }
 
     /// Upsert the given key-value pair to the remote cache
@@ -241,9 +249,13 @@ impl CatalogCacheClient {
     pub async fn put(&self, key: CacheKey, value: &CacheValue) -> Result<bool> {
         let url = self.url(RequestPath::Resource(key));
 
-        let response = self
-            .client
-            .put(url)
+        let mut builder = self.client.put(url);
+
+        if let Some(etag) = value.etag() {
+            builder = builder.header(ETAG, etag.as_ref());
+        }
+
+        let response = builder
             .timeout(self.put_request_timeout)
             .header(&GENERATION, value.generation)
             .body(value.data.clone())
@@ -268,56 +280,23 @@ impl CatalogCacheClient {
         let fut = self
             .client
             .get(url)
+            .header(ACCEPT, &LIST_PROTOCOL_V2)
             .timeout(self.list_request_timeout)
             .send();
 
-        futures::stream::once(fut.map_err(|source| Error::List { source }))
-            .and_then(move |response| futures::future::ready(list_stream(response, size)))
+        futures::stream::once(fut.map_err(Into::into))
+            .and_then(move |response| {
+                let stream = match response.headers().get(CONTENT_TYPE) {
+                    Some(x) if x == LIST_PROTOCOL_V2 => {
+                        v2::decode_response(response).map(|x| x.boxed())
+                    }
+                    _ => v1::decode_response(response, size).map(|x| x.boxed()),
+                };
+                futures::future::ready(stream)
+            })
             .try_flatten()
             .boxed()
     }
-}
-
-struct ListStreamState {
-    response: Response,
-    current: Bytes,
-    decoder: ListDecoder,
-}
-
-impl ListStreamState {
-    fn new(response: Response, max_value_size: usize) -> Self {
-        Self {
-            response,
-            current: Default::default(),
-            decoder: ListDecoder::new().with_max_value_size(max_value_size),
-        }
-    }
-}
-
-fn list_stream(
-    response: Response,
-    max_value_size: usize,
-) -> Result<impl Stream<Item = Result<ListEntry>>> {
-    let resp = response.error_for_status().context(ListSnafu)?;
-    let state = ListStreamState::new(resp, max_value_size);
-    Ok(stream::try_unfold(state, |mut state| async move {
-        loop {
-            if state.current.is_empty() {
-                match state.response.chunk().await.context(ListSnafu)? {
-                    Some(new) => state.current = new,
-                    None => break,
-                }
-            }
-
-            let to_read = state.current.len();
-            let read = state.decoder.decode(&state.current)?;
-            state.current.advance(read);
-            if read != to_read {
-                break;
-            }
-        }
-        Ok(state.decoder.flush()?.map(|entry| (entry, state)))
-    }))
 }
 
 /// A custom [`Resolve`] that collects [`ResolverMetrics`]

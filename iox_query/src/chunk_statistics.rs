@@ -15,9 +15,12 @@ use crate::pruning_oracle::{
     BucketInfo, BucketPartitionPruningOracle, BucketPartitionPruningOracleBuilder,
 };
 
+use crate::statistics::NULL_COLUMN_INDICATOR;
+
 /// Represent known min/max values for a specific column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRange {
+    pub null_count: Arc<Precision<usize>>,
     pub min_value: Arc<Precision<ScalarValue>>,
     pub max_value: Arc<Precision<ScalarValue>>,
     /// The server-side bucketing bucket ID of the column for this partition.
@@ -30,6 +33,7 @@ pub struct ColumnRange {
 impl ColumnRange {
     pub fn size(&self) -> usize {
         std::mem::size_of::<Self>()
+            + std::mem::size_of_val(&self.null_count)
             + size_of_precision(&self.min_value)
             + size_of_precision(&self.max_value)
             + self
@@ -60,19 +64,25 @@ fn size_of_precision(v: &Precision<ScalarValue>) -> usize {
 /// These ranges apply to ALL rows (esp. in ALL files and ingester chunks) within in given partition.
 pub type ColumnRanges = Arc<HashMap<Arc<str>, ColumnRange>>;
 
-/// Returns the min/max values for the range, if present
-fn range_to_min_max_stats(
+/// Returns the null_count/min/max values for the range, if present
+fn range_to_null_min_max_stats(
     range: Option<&ColumnRange>,
-) -> (Precision<ScalarValue>, Precision<ScalarValue>) {
+) -> (
+    Precision<usize>,
+    Precision<ScalarValue>,
+    Precision<ScalarValue>,
+) {
     let Some(range) = range else {
-        return (Precision::Absent, Precision::Absent);
+        return (Precision::Absent, Precision::Absent, Precision::Absent);
     };
+
+    let null_count = range.null_count.as_ref().clone();
 
     let min_value = range.min_value.as_ref().clone();
 
     let max_value = range.max_value.as_ref().clone();
 
-    (min_value, max_value)
+    (null_count, min_value, max_value)
 }
 
 /// A container type to bundle the statistics and the server-side bucketing information
@@ -102,7 +112,7 @@ impl ChunkStatistics {
     }
 
     pub fn bucket_pruning_oracle(&self) -> Option<Arc<BucketPartitionPruningOracle>> {
-        self.bucket_pruning_oracle.as_ref().map(Arc::clone)
+        self.bucket_pruning_oracle.as_ref().cloned()
     }
 }
 
@@ -115,13 +125,15 @@ pub fn create_chunk_statistics(
 ) -> ChunkStatistics {
     let mut columns = Vec::with_capacity(schema.len());
     let mut pruning_oracle_builder = BucketPartitionPruningOracleBuilder::default();
+    let mut num_rows = option_to_precision(row_count);
 
     for (t, field) in schema.iter() {
         let stats = match t {
             InfluxColumnType::Timestamp => {
                 // prefer explicitely given time range but fall back to column ranges
-                let (min_value, max_value) = match ts_min_max {
+                let (_, min_value, max_value) = match ts_min_max {
                     Some(ts_min_max) => (
+                        Precision::Absent, // it does not matter what to put here becaues this value is ignored
                         Precision::Exact(timestamptz_nano(ts_min_max.min)),
                         Precision::Exact(timestamptz_nano(ts_min_max.max)),
                     ),
@@ -129,7 +141,7 @@ pub fn create_chunk_statistics(
                         let range =
                             ranges.and_then(|ranges| ranges.get::<str>(field.name().as_ref()));
 
-                        range_to_min_max_stats(range)
+                        range_to_null_min_max_stats(range)
                     }
                 };
                 ColumnStatistics {
@@ -142,7 +154,35 @@ pub fn create_chunk_statistics(
             _ => {
                 let range = ranges.and_then(|ranges| ranges.get::<str>(field.name().as_ref()));
 
-                let (min_value, max_value) = range_to_min_max_stats(range);
+                let (mut null_count, min_value, max_value) = range_to_null_min_max_stats(range);
+
+                // If the column is NULL, make the null count and the row count identical
+                // so that DataFusion can use this information to prune the partition.
+                //
+                // The way DataFusion works to prune out partitions with columns that
+                // are entirely NULL is as follows:
+                //
+                // 1. For a given predicate, e.g. "x = 10", DataFusion will rewrite it to:
+                //    ```
+                //    CASE
+                //      WHEN x_null_count = x_row_count THEN false
+                //      ELSE x_min <= 10 AND 10 <= x_max
+                //    END
+                //    ```
+                //
+                // 2. For a given partition with statistics, DataFusion will compare the NULL
+                //    count and row count values to determine whether to prune this partition
+                //    or not.
+                if null_count == NULL_COLUMN_INDICATOR {
+                    match row_count {
+                        Some(row_count) => {
+                            null_count = Precision::Exact(row_count);
+                        }
+                        None => {
+                            num_rows = NULL_COLUMN_INDICATOR.clone();
+                        }
+                    }
+                }
 
                 // If the column is a tag, and there is any server-side bucketing information,
                 // add the bucket info to the pruning oracle builder.
@@ -154,7 +194,7 @@ pub fn create_chunk_statistics(
                 }
 
                 ColumnStatistics {
-                    null_count: Precision::Absent,
+                    null_count,
                     min_value,
                     max_value,
                     distinct_count: Precision::Absent,
@@ -163,8 +203,6 @@ pub fn create_chunk_statistics(
         };
         columns.push(stats)
     }
-
-    let num_rows = option_to_precision(row_count);
 
     // If there is no server-side bucketing information,
     // don't include it in the statistics, i.e. None.
@@ -186,6 +224,7 @@ pub fn create_chunk_statistics(
 
 #[cfg(test)]
 mod tests {
+    use datafusion_util::dict;
     use schema::{InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME};
 
     use super::*;
@@ -225,22 +264,25 @@ mod tests {
             (
                 Arc::from("tag1"),
                 ColumnRange {
-                    min_value: Arc::new(Precision::Exact(ScalarValue::from("aaa"))),
-                    max_value: Arc::new(Precision::Exact(ScalarValue::from("bbb"))),
+                    null_count: Arc::new(Precision::Absent),
+                    min_value: Arc::new(Precision::Exact(dict("aaa"))),
+                    max_value: Arc::new(Precision::Exact(dict("bbb"))),
                     bucket_info: None,
                 },
             ),
             (
                 Arc::from("tag3"), // does not exist in schema
                 ColumnRange {
-                    min_value: Arc::new(Precision::Exact(ScalarValue::from("ccc"))),
-                    max_value: Arc::new(Precision::Exact(ScalarValue::from("ddd"))),
+                    null_count: Arc::new(Precision::Absent),
+                    min_value: Arc::new(Precision::Exact(dict("ccc"))),
+                    max_value: Arc::new(Precision::Exact(dict("ddd"))),
                     bucket_info: None,
                 },
             ),
             (
                 Arc::from("field_integer"),
                 ColumnRange {
+                    null_count: Arc::new(Precision::Absent),
                     min_value: Arc::new(Precision::Exact(ScalarValue::from(10i64))),
                     max_value: Arc::new(Precision::Exact(ScalarValue::from(20i64))),
                     bucket_info: None,
@@ -259,8 +301,8 @@ mod tests {
                     // tag1
                     ColumnStatistics {
                         null_count: Precision::Absent,
-                        min_value: Precision::Exact(ScalarValue::from("aaa")),
-                        max_value: Precision::Exact(ScalarValue::from("bbb")),
+                        min_value: Precision::Exact(dict("aaa")),
+                        max_value: Precision::Exact(dict("bbb")),
                         distinct_count: Precision::Absent,
                     },
                     // tag2
@@ -301,6 +343,7 @@ mod tests {
         let ranges = Arc::new(HashMap::from([(
             Arc::from(TIME_COLUMN_NAME),
             ColumnRange {
+                null_count: Arc::new(Precision::Absent),
                 min_value: Arc::new(Precision::Exact(timestamptz_nano(12))),
                 max_value: Arc::new(Precision::Exact(timestamptz_nano(22))),
                 bucket_info: None,
@@ -339,6 +382,7 @@ mod tests {
         let ranges = Arc::new(HashMap::from([(
             Arc::from(TIME_COLUMN_NAME),
             ColumnRange {
+                null_count: Arc::new(Precision::Absent),
                 min_value: Arc::new(Precision::Exact(timestamptz_nano(12))),
                 max_value: Arc::new(Precision::Exact(timestamptz_nano(22))),
                 bucket_info: None,

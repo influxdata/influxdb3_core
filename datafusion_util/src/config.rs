@@ -1,5 +1,6 @@
 use std::{fmt::Display, sync::Arc};
 
+use datafusion::config::{ParquetOptions, TableParquetOptions};
 use datafusion::{
     config::ConfigOptions, execution::runtime_env::RuntimeEnv, prelude::SessionConfig,
 };
@@ -23,6 +24,7 @@ pub fn iox_session_config() -> SessionConfig {
     options.execution.parquet.reorder_filters = true;
     options.execution.time_zone = TIME_DATA_TIMEZONE().map(|s| s.to_string());
     options.optimizer.repartition_sorts = true;
+    options.optimizer.prefer_existing_union = true;
 
     SessionConfig::from(options)
         .with_batch_size(BATCH_SIZE)
@@ -31,6 +33,21 @@ pub fn iox_session_config() -> SessionConfig {
         .with_default_catalog_and_schema(DEFAULT_CATALOG, DEFAULT_SCHEMA)
         // Tell the datafusion optimizer to avoid repartitioning sorted inputs
         .with_prefer_existing_sort(true)
+}
+
+/// Return a TableParquetOptions object configured for IOx
+/// This is a workaround until DataFusion supports retrieving these options from the ParquetExec
+/// <https://github.com/apache/arrow-datafusion/issues/9908>
+pub fn table_parquet_options() -> TableParquetOptions {
+    TableParquetOptions {
+        global: ParquetOptions {
+            // should match the configuration in `iox_session_config`
+            pushdown_filters: true,
+            reorder_filters: true,
+            ..ParquetOptions::default()
+        },
+        ..TableParquetOptions::default()
+    }
 }
 
 /// Register the "IOx" object store provider for URLs of the form "iox://{id}

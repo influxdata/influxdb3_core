@@ -18,6 +18,9 @@
 //!
 //! * Complex replicated state machines
 //! * Forward compatibility challenges where newer data can't roundtrip through older servers
+//!
+//! While providing the following benefits:
+//!
 //! * Simple to introspect, debug and reason about
 //! * Predictable and easily quantifiable memory usage
 //!
@@ -42,6 +45,7 @@
 
 #![warn(missing_docs)]
 
+use std::sync::Arc;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -95,22 +99,49 @@ pub struct CacheValue {
     data: Bytes,
     /// The generation of this cache data
     generation: u64,
+    /// The optional etag
+    etag: Option<Arc<str>>,
 }
 
 impl CacheValue {
     /// Create a new [`CacheValue`] with the provided `data` and `generation`
     pub fn new(data: Bytes, generation: u64) -> Self {
-        Self { data, generation }
+        Self {
+            data,
+            generation,
+            etag: None,
+        }
+    }
+
+    /// Sets the etag
+    pub fn with_etag(self, etag: impl Into<Arc<str>>) -> Self {
+        Self {
+            etag: Some(etag.into()),
+            ..self
+        }
+    }
+
+    /// Sets the etag
+    pub fn with_etag_opt(self, etag: Option<Arc<str>>) -> Self {
+        Self { etag, ..self }
     }
 
     /// The data stored for this cache
+    #[inline]
     pub fn data(&self) -> &Bytes {
         &self.data
     }
 
     /// The generation of this cache data
+    #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The etag if any
+    #[inline]
+    pub fn etag(&self) -> Option<&Arc<str>> {
+        self.etag.as_ref()
     }
 }
 

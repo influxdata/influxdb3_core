@@ -45,9 +45,6 @@ const TESTING_MEM_POOL_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 /// Configuration for an Executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-    /// Number of threads per thread pool
-    pub num_threads: NonZeroUsize,
-
     /// Target parallelism for query execution
     pub target_query_partitions: NonZeroUsize,
 
@@ -64,7 +61,6 @@ pub struct ExecutorConfig {
 impl ExecutorConfig {
     pub fn testing() -> Self {
         Self {
-            num_threads: NonZeroUsize::new(1).unwrap(),
             target_query_partitions: NonZeroUsize::new(1).unwrap(),
             object_stores: HashMap::default(),
             metric_registry: Arc::new(Registry::default()),
@@ -77,8 +73,8 @@ impl Display for ExecutorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "num_threads={}, target_query_partitions={}, mem_pool_size={}",
-            self.num_threads, self.target_query_partitions, self.mem_pool_size
+            "target_query_partitions={}, mem_pool_size={}",
+            self.target_query_partitions, self.mem_pool_size
         )
     }
 }
@@ -105,36 +101,6 @@ impl Display for Executor {
 }
 
 impl Executor {
-    /// Creates a new executor with a two dedicated thread pools, each
-    /// with num_threads
-    pub fn new(
-        name: &'static str,
-        num_threads: NonZeroUsize,
-        mem_pool_size: usize,
-        metric_registry: Arc<Registry>,
-    ) -> Self {
-        Self::new_with_config(
-            name,
-            ExecutorConfig {
-                num_threads,
-                target_query_partitions: num_threads,
-                object_stores: HashMap::default(),
-                metric_registry,
-                mem_pool_size,
-            },
-        )
-    }
-
-    /// Create new executor based on a specific config.
-    pub fn new_with_config(name: &'static str, config: ExecutorConfig) -> Self {
-        let executor = DedicatedExecutor::new(
-            name,
-            config.num_threads,
-            Arc::clone(&config.metric_registry),
-        );
-        Self::new_with_config_and_executor(config, executor)
-    }
-
     /// Get testing executor that runs a on single thread and a low memory bound
     /// to preserve resources.
     pub fn new_testing() -> Self {
@@ -153,8 +119,6 @@ impl Executor {
         config: ExecutorConfig,
         executor: DedicatedExecutor,
     ) -> Self {
-        assert_eq!(config.num_threads, executor.num_threads());
-
         let runtime_config = RuntimeConfig::new()
             .with_disk_manager(DiskManagerConfig::Disabled)
             .with_memory_limit(config.mem_pool_size, 1.0);
@@ -189,10 +153,10 @@ impl Executor {
         }
     }
 
-    /// Return a new execution config, suitable for executing a new query or system task.
+    /// Return a new ession config, suitable for executing a new query or system task.
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
-    pub fn new_execution_config(&self) -> IOxSessionConfig {
+    pub fn new_session_config(&self) -> IOxSessionConfig {
         IOxSessionConfig::new(self.executor.clone(), Arc::clone(&self.runtime))
             .with_target_partitions(self.config.target_query_partitions)
     }
@@ -201,7 +165,7 @@ impl Executor {
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
     pub fn new_context(&self) -> IOxSessionContext {
-        self.new_execution_config().build()
+        self.new_session_config().build()
     }
 
     /// Initializes shutdown.
@@ -222,6 +186,11 @@ impl Executor {
     /// Returns the memory pool associated with this `Executor`
     pub fn pool(&self) -> Arc<dyn MemoryPool> {
         Arc::clone(&self.runtime.memory_pool)
+    }
+
+    /// Returns the runtime associated with this `Executor`
+    pub fn runtime(&self) -> Arc<RuntimeEnv> {
+        Arc::clone(&self.runtime)
     }
 
     /// Returns underlying config.

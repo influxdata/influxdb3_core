@@ -18,6 +18,9 @@ use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol};
 
 mod span;
 
+/// Defines the desired UDP socket send buffer size in bytes.
+const WANT_SOCKET_SEND_BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MiB
+
 /// A key=value pair for span annotations.
 #[derive(Debug, Clone)]
 pub struct JaegerTag {
@@ -114,6 +117,9 @@ impl JaegerAgentExporter {
         socket.set_nonblocking(true)?;
         socket.connect(remote_addr)?;
 
+        // Attempt to grow the socket send buffer.
+        let socket = set_send_buffer_size(socket, WANT_SOCKET_SEND_BUFFER_SIZE);
+
         let client = AgentSyncClient::new(
             TCompactInputProtocol::new(NoopReader::default()),
             TCompactOutputProtocol::new(MessageWriter::new(socket)),
@@ -161,6 +167,54 @@ impl JaegerAgentExporter {
             stats: None,
         }
     }
+}
+
+/// Attempt to increase the socket send buffer size to `want`.
+///
+/// If the buffer size cannot be set, a lower value is attempted until the
+/// buffer is expanded (to this lower value) or the initial buffer size is
+/// reached.
+///
+/// This method never shrinks the buffer size.
+fn set_send_buffer_size(socket: UdpSocket, mut want: usize) -> UdpSocket {
+    let sock2_sock = socket2::Socket::from(socket);
+
+    // The starting socket size.
+    //
+    // If this isn't known, try to grow the buffer until the target reduces to
+    // 1024 bytes. If none of the grow attempts are successful before hitting
+    // the current size (or 1024 bytes if unknown) then leave the default value
+    // as-is.
+    let starting_size = sock2_sock.send_buffer_size().ok().unwrap_or(1024);
+
+    // Attempt to set the desired buffer size.
+    //
+    // If setting the desired size fails, incrementally reduce the requested
+    // buffer size until it either succeeds, or reaches the starting value
+    // (never shrink the buffer smaller than the starting value).
+    while want > starting_size {
+        match sock2_sock.set_send_buffer_size(want) {
+            Ok(_) => break,
+            Err(e) => {
+                warn!(
+                    starting_size,
+                    want,
+                    error=%e,
+                    "failed to grow udp socket buffer size"
+                );
+                // Halve the desired buffer size for the next attempt.
+                want /= 2;
+            }
+        };
+    }
+
+    // The actual value set is the greater of the last tried value, or the
+    // starting value if all attempts failed.
+    let got = want.max(starting_size);
+
+    debug!(buffer_size=%got, "resized udp socket send buffer");
+
+    UdpSocket::from(sock2_sock)
 }
 
 #[async_trait]
@@ -560,5 +614,32 @@ mod tests {
             NonZeroU64::new(1_000).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_send_buffer_size() {
+        const EXCESSIVE_BUFFER_SIZE: usize = 100 * 1024 * 1024;
+
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("must bind random UDP socket");
+        let socket2 = socket2::Socket::from(socket);
+
+        // Shrink the socket to a tiny buffer size, and then try and grow it to
+        // something bigger.
+        socket2.set_send_buffer_size(1).unwrap();
+
+        let socket = UdpSocket::from(socket2);
+        let socket = set_send_buffer_size(socket, EXCESSIVE_BUFFER_SIZE);
+
+        // Convert it back into a socket2 socket to inspect.
+        let socket2 = socket2::Socket::from(socket);
+
+        // The system running the test almost certainly does not allow 100MiB
+        // socket buffers, but it should still have been expanded to something
+        // bigger than 1 as a result of the backoff logic.
+        assert!(socket2.send_buffer_size().unwrap() > 1);
+
+        // But it shouldn't have gone full bananas and set something more than
+        // what was asked for.
+        assert!(socket2.send_buffer_size().unwrap() <= EXCESSIVE_BUFFER_SIZE);
     }
 }

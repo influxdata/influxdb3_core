@@ -169,6 +169,8 @@ impl HashBucketsEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+    use rand::{thread_rng, Rng};
 
     #[test]
     fn test_collision() {
@@ -215,5 +217,22 @@ mod tests {
         assert!(contains("bongos"));
         assert!(contains("bananas"));
         assert!(!contains("windows"));
+    }
+
+    #[test]
+    fn test_deterministic() {
+        // It is important that HashBuckets is deterministic for ETag matching to work
+        let mut rng = thread_rng();
+        let data: Vec<Vec<u8>> = (0..20)
+            .map(|_| (0..rng.gen_range(0..20)).map(|_| rng.gen()).collect())
+            .collect();
+
+        let build = || {
+            let mut builder = HashBucketsEncoder::new(data.len());
+            data.iter().for_each(|x| builder.push(x.as_ref()));
+            generated::HashBuckets::from(builder.finish()).encode_to_vec()
+        };
+
+        assert_eq!(build(), build());
     }
 }
