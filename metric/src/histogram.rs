@@ -130,7 +130,7 @@ impl MetricObserver for U64Histogram {
 #[macro_export]
 macro_rules! assert_histogram {
     (
-        $metrics:ident,
+        $metrics:expr,
         $hist:ty,
         $name:expr,
         $(labels = $attr:expr,)*

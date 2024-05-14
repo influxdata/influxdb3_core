@@ -41,7 +41,7 @@ impl MetricObserver for U64Counter {
 #[macro_export]
 macro_rules! assert_counter {
     (
-        $metrics:ident,
+        $metrics:expr,
         $counter:ty,
         $name:expr,
         $(labels = $attr:expr,)*

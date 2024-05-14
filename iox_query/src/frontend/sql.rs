@@ -20,7 +20,7 @@ impl SqlQueryPlanner {
         params: impl Into<ParamValues> + Send,
         ctx: &IOxSessionContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let ctx = ctx.child_ctx("SqlQueryPlanner::query");
+        let ctx = ctx.child_ctx("sql_query_planner");
         ctx.sql_to_physical_plan_with_params(query, params).await
     }
 }

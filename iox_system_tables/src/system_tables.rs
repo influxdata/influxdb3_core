@@ -8,6 +8,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -24,7 +25,11 @@ pub trait IoxSystemTable: Send + Sync {
     fn schema(&self) -> SchemaRef;
 
     /// Get the contents of the system table
-    async fn scan(&self) -> DataFusionResult<RecordBatch>;
+    async fn scan(
+        &self,
+        filters: Option<Vec<Expr>>,
+        limit: Option<usize>,
+    ) -> DataFusionResult<RecordBatch>;
 }
 
 /// Adapter that makes any `IoxSystemTable` a DataFusion `TableProvider`
@@ -57,9 +62,8 @@ where
         &self,
         _ctx: &SessionState,
         projection: Option<&Vec<usize>>,
-        // It would be cool to push projection and limit down
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let schema = self.table.schema();
         let projected_schema = match projection.as_ref() {
@@ -71,11 +75,21 @@ where
             Arc::clone(&self.table),
             projected_schema,
             projection.cloned(),
+            filters,
+            limit,
         )))
     }
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // provide `Inexact` so DataFusion will push down the predicates
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 
@@ -86,16 +100,26 @@ pub struct SystemTableExecutionPlan<T> {
     projection: Option<Vec<usize>>,
     /// Cache holding plan properties like equivalences, output partitioning, output ordering etc.
     cache: PlanProperties,
+    filters: Option<Vec<Expr>>,
+    limit: Option<usize>,
 }
 
 impl<T> SystemTableExecutionPlan<T> {
-    fn new(table: Arc<T>, projected_schema: SchemaRef, projection: Option<Vec<usize>>) -> Self {
+    fn new(
+        table: Arc<T>,
+        projected_schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Self {
         let cache = Self::compute_properties(Arc::clone(&projected_schema));
         Self {
             table,
             projected_schema,
             projection,
             cache,
+            filters: (!filters.is_empty()).then(|| filters.to_vec()),
+            limit,
         }
     }
 
@@ -148,8 +172,10 @@ impl<T: IoxSystemTable + 'static> ExecutionPlan for SystemTableExecutionPlan<T> 
         let batch_size = context.session_config().batch_size();
         let table = Arc::clone(&self.table);
         let projection = self.projection.clone();
+        let filters = self.filters.clone();
+        let limit = self.limit;
         let stream = futures::stream::once(async move {
-            let batch = table.scan().await?;
+            let batch = table.scan(filters, limit).await?;
             let batch = match projection {
                 Some(projection) => batch.project(&projection)?,
                 None => batch,

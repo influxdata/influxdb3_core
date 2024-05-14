@@ -30,7 +30,7 @@ impl Planner {
     /// Create a new planner that will plan queries using the provided context
     pub(crate) fn new(ctx: &IOxSessionContext) -> Self {
         Self {
-            ctx: ctx.child_ctx("Planner"),
+            ctx: ctx.child_ctx("flight_planner"),
         }
     }
 
@@ -43,7 +43,7 @@ impl Planner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = SqlQueryPlanner::new();
         let query = query.as_ref();
-        let ctx = self.ctx.child_ctx("planner sql");
+        let ctx = self.ctx.child_ctx("planner_sql");
 
         planner.query(query, params, &ctx).await
     }
@@ -57,7 +57,7 @@ impl Planner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = InfluxQLQueryPlanner::new();
         let query = query.as_ref();
-        let ctx = self.ctx.child_ctx("planner influxql");
+        let ctx = self.ctx.child_ctx("planner_influxql");
 
         planner.query(query, params, &ctx).await
     }
@@ -71,7 +71,7 @@ impl Planner {
         cmd: FlightSQLCommand,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let namespace_name = namespace_name.as_ref();
-        let ctx = self.ctx.child_ctx("planner flight_sql_do_get");
+        let ctx = self.ctx.child_ctx("planner_flight_sql_do_get");
 
         FlightSQLPlanner::do_get(namespace_name, namespace, cmd, &ctx)
             .await
@@ -87,7 +87,7 @@ impl Planner {
         cmd: FlightSQLCommand,
     ) -> Result<Bytes> {
         let namespace_name = namespace_name.into();
-        let ctx = self.ctx.child_ctx("planner flight_sql_do_action");
+        let ctx = self.ctx.child_ctx("planner_flight_sql_do_action");
 
         FlightSQLPlanner::do_action(namespace_name, namespace, cmd, &ctx)
             .await
@@ -104,7 +104,7 @@ impl Planner {
         data: Peekable<Streaming<FlightData>>,
     ) -> Result<Bytes> {
         let namespace_name = namespace_name.into();
-        let ctx = self.ctx.child_ctx("planner flight_sql_do_put");
+        let ctx = self.ctx.child_ctx("planner_flight_sql_do_put");
 
         FlightSQLPlanner::do_put(namespace_name, namespace, cmd, data, &ctx)
             .await
@@ -120,7 +120,7 @@ impl Planner {
         cmd: FlightSQLCommand,
     ) -> Result<SchemaRef> {
         let namespace_name = namespace_name.into();
-        let ctx = self.ctx.child_ctx("planner flight_sql_get_flight_info");
+        let ctx = self.ctx.child_ctx("planner_flight_sql_get_flight_info");
 
         FlightSQLPlanner::get_schema(namespace_name, cmd, &ctx)
             .await
