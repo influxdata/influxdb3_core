@@ -150,7 +150,7 @@ where
         // of racing writers or only two available replicas. We should only log if
         // the deadline expires
         let res = loop {
-            let mut span_recorder = span_recorder.child("retry round");
+            let mut span_recorder = span_recorder.child("retry_round");
             match self.inner.cache.get(key).await {
                 Ok(val) => {
                     span_recorder.ok("ok");
@@ -292,7 +292,7 @@ where
         let key = k.to_key();
 
         match self
-            .get_quorum(key, span_recorder.child_span("get quorum"))
+            .get_quorum(key, span_recorder.child_span("get_quorum"))
             .await
         {
             Ok(Some(val)) => {

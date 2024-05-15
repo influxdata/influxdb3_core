@@ -605,7 +605,7 @@ impl FlightService {
         let db = server
             .namespace(
                 namespace_name,
-                span_ctx.child_span("get namespace"),
+                span_ctx.child_span("get_namespace"),
                 is_debug,
             )
             .await
@@ -876,7 +876,7 @@ impl Flight for FlightService {
             .server
             .namespace(
                 &namespace_name,
-                span_ctx.child_span("get namespace"),
+                span_ctx.child_span("get_namespace"),
                 is_debug,
             )
             .await
@@ -963,7 +963,7 @@ impl Flight for FlightService {
             .server
             .namespace(
                 &namespace_name,
-                span_ctx.child_span("get namespace"),
+                span_ctx.child_span("get_namespace"),
                 is_debug,
             )
             .await
@@ -1019,7 +1019,7 @@ impl Flight for FlightService {
             .server
             .namespace(
                 &namespace_name,
-                span_ctx.child_span("get namespace"),
+                span_ctx.child_span("get_namespace"),
                 is_debug,
             )
             .await
@@ -1217,7 +1217,7 @@ impl GetStream {
         // acquire token (after planning)
         let permit_state: Arc<Mutex<Option<PermitAndToken>>> = Default::default();
         let permit_state_captured = Arc::clone(&permit_state);
-        let permit_span = ctx.child_span("query rate limit semaphore");
+        let permit_span = ctx.child_span("query_rate_limit_semaphore");
         let query_results = futures::stream::once(async move {
             let permit = server.acquire_semaphore(permit_span).await;
             let query_completed_token = query_completed_token.permit();

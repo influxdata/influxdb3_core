@@ -260,7 +260,7 @@ impl IOxSessionConfig {
 
     /// Create an ExecutionContext suitable for executing DataFusion plans
     pub fn build(self) -> IOxSessionContext {
-        let maybe_span = self.span_ctx.child_span("Query Execution");
+        let maybe_span = self.span_ctx.child_span("query_planning");
         let recorder = SpanRecorder::new(maybe_span);
 
         // attach span to DataFusion session

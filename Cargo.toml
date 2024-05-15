@@ -89,8 +89,8 @@ license = "MIT OR Apache-2.0"
 arrow = { version = "51.0.0", features = ["prettyprint", "chrono-tz"] }
 arrow-buffer = { version = "51.0.0" }
 arrow-flight = { version = "51.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "e0245296792eabdc35e83e8c5872345ff38c1fdf" }
-datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "e0245296792eabdc35e83e8c5872345ff38c1fdf" }
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "5fac581efbaffd0e6a9edf931182517524526afd" }
+datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "5fac581efbaffd0e6a9edf931182517524526afd" }
 hashbrown = { version = "0.14.5" }
 object_store = { version = "0.9.1" }
 parquet = { version = "51.0.0", features = ["object_store"] }

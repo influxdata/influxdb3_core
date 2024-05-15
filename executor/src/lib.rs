@@ -13,44 +13,27 @@ use tokio_watchdog::WatchdogConfig;
 use tokio_metrics_bridge as _;
 use workspace_hack as _;
 
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use pin_project::{pin_project, pinned_drop};
-use std::{panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::oneshot::{error::RecvError, Receiver};
-use tokio_util::sync::CancellationToken;
+use parking_lot::RwLock;
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+use tokio::{
+    runtime::Handle,
+    sync::{oneshot::error::RecvError, Notify},
+    task::JoinSet,
+};
 
 use futures::{
     future::{BoxFuture, Shared},
-    ready, Future, FutureExt, TryFutureExt,
+    Future, FutureExt, TryFutureExt,
 };
 
 use observability_deps::tracing::warn;
 
-/// Task that can be added to the executor-internal queue.
-///
-/// Every task within the executor is represented by a [`Job`] that can be polled by the API user.
-struct Task {
-    fut: Pin<Box<dyn Future<Output = ()> + Send>>,
-    cancel: CancellationToken,
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
-    #[allow(dead_code)]
-    task_ref: Arc<()>,
-}
-
-impl Task {
-    /// Run task.
-    ///
-    /// This runs the payload or cancels if the linked [`Job`] is dropped.
-    async fn run(self) {
-        tokio::select! {
-            _ = self.cancel.cancelled() => (),
-            _ = self.fut => (),
-        }
-    }
-}
-
-/// Errors occuring when polling [`Job`].
+/// Errors occuring when polling [`DedicatedExecutor::spawn`].
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
 pub enum JobError {
@@ -61,44 +44,11 @@ pub enum JobError {
     Panic { msg: String },
 }
 
-/// Job within the executor.
-///
-/// Dropping the job will cancel its linked task.
-#[pin_project(PinnedDrop)]
-#[derive(Debug)]
-struct Job<T> {
-    cancel: CancellationToken,
-    #[pin]
-    rx: Receiver<Result<T, JobError>>,
-}
-
-impl<T> Future for Job<T> {
-    type Output = Result<T, JobError>;
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.project();
-        match ready!(this.rx.poll(cx)) {
-            Ok(res) => std::task::Poll::Ready(res),
-            Err(_) => std::task::Poll::Ready(Err(JobError::WorkerGone)),
-        }
-    }
-}
-
-#[pinned_drop]
-impl<T> PinnedDrop for Job<T> {
-    fn drop(self: Pin<&mut Self>) {
-        self.cancel.cancel();
-    }
-}
-
 /// Runs futures (and any `tasks` that are `tokio::task::spawned` by
 /// them) on a separate tokio Executor
 #[derive(Clone)]
 pub struct DedicatedExecutor {
-    state: Arc<Mutex<State>>,
+    state: Arc<RwLock<State>>,
 
     /// Used for testing.
     ///
@@ -107,19 +57,25 @@ pub struct DedicatedExecutor {
 }
 
 /// Runs futures (and any `tasks` that are `tokio::task::spawned` by
-/// them) on a separate tokio Executor
+/// them) on a separate tokio Executor.
+///
+/// The state is only used by the "outer" API, not by the newly created runtime. The new runtime waits for
+/// [`start_shutdown`](Self::start_shutdown) and signals the completion via
+/// [`completed_shutdown`](Self::completed_shutdown) (for which is owns the sender side).
 struct State {
-    /// Channel for requests -- the dedicated executor takes requests
-    /// from here and runs them.
+    /// Runtime handle.
     ///
-    /// This is `None` if we triggered shutdown.
-    requests: Option<tokio::sync::mpsc::UnboundedSender<Task>>,
+    /// This is `None` when the executor is shutting down.
+    handle: Option<Handle>,
+
+    /// If notified, the executor tokio runtime will begin to shutdown.
+    ///
+    /// We could implement this by checking `handle.is_none()` in regular intervals but requires regular wake-ups and
+    /// locking of the state. Just using a proper async signal is nicer.
+    start_shutdown: Arc<Notify>,
 
     /// Receiver side indicating that shutdown is complete.
     completed_shutdown: Shared<BoxFuture<'static, Result<(), Arc<RecvError>>>>,
-
-    /// Task counter (uses Arc strong count).
-    task_refs: Arc<()>,
 
     /// The inner thread that can be used to join during drop.
     thread: Option<std::thread::JoinHandle<()>>,
@@ -129,9 +85,10 @@ struct State {
 // share their inner state.
 impl Drop for State {
     fn drop(&mut self) {
-        if self.requests.is_some() {
+        if self.handle.is_some() {
             warn!("DedicatedExecutor dropped without calling shutdown()");
-            self.requests = None;
+            self.handle = None;
+            self.start_shutdown.notify_one();
         }
 
         // do NOT poll the shared future if we are panicking due to https://github.com/rust-lang/futures-rs/issues/2575
@@ -152,17 +109,7 @@ impl std::fmt::Debug for DedicatedExecutor {
 }
 
 /// [`DedicatedExecutor`] for testing purposes.
-static TESTING_EXECUTOR: Lazy<DedicatedExecutor> = Lazy::new(|| {
-    let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
-    runtime_builder.enable_all();
-
-    DedicatedExecutor::new_inner(
-        "testing",
-        runtime_builder,
-        Arc::new(Registry::default()),
-        true,
-    )
-});
+static TESTING_EXECUTOR: OnceLock<DedicatedExecutor> = OnceLock::new();
 
 impl DedicatedExecutor {
     /// Creates a new `DedicatedExecutor` with a dedicated tokio
@@ -196,8 +143,12 @@ impl DedicatedExecutor {
         testing: bool,
     ) -> Self {
         let name = name.to_owned();
-        let (tx_tasks, mut rx_tasks) = tokio::sync::mpsc::unbounded_channel::<Task>();
+
+        let notify_shutdown = Arc::new(Notify::new());
+        let notify_shutdown_captured = Arc::clone(&notify_shutdown);
+
         let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel();
+        let (tx_handle, rx_handle) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name(format!("{name} driver"))
@@ -217,39 +168,41 @@ impl DedicatedExecutor {
                 let _ = metric_registry;
 
                 runtime.block_on(async move {
-                    // Dropping the tokio runtime only waits for tasks to yield not to complete
+                    // Enable the "notified" receiver BEFORE sending the runtime handle back to the constructor thread
+                    // (i.e .the one that runs `new`) to avoid the potential (but unlikely) race that the shutdown is
+                    // started right after the constructor finishes and the new runtime calls
+                    // `notify_shutdown_captured.notified().await`.
                     //
-                    // We therefore use a RwLock to wait for tasks to complete
-                    let join = Arc::new(tokio::sync::RwLock::new(()));
+                    // Tokio provides an API for that by calling `enable` on the `notified` future (this requires
+                    // pinning though).
+                    let shutdown = notify_shutdown_captured.notified();
+                    let mut shutdown = std::pin::pin!(shutdown);
+                    shutdown.as_mut().enable();
 
-                    while let Some(task) = rx_tasks.recv().await {
-                        let join = Arc::clone(&join);
-                        let handle = join.read_owned().await;
-
-                        tokio::task::spawn(async move {
-                            task.run().await;
-                            std::mem::drop(handle);
-                        });
+                    if tx_handle.send(Handle::current()).is_err() {
+                        return;
                     }
+                    shutdown.await;
+                });
 
-                    // Wait for all tasks to finish
-                    let _guard = join.write().await;
+                runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
 
-                    // signal shutdown, but it's OK if the other side is gone
-                    tx_shutdown.send(()).ok();
-                })
+                // send shutdown "done" signal
+                tx_shutdown.send(()).ok();
             })
             .expect("executor setup");
 
+        let handle = rx_handle.recv().expect("driver started");
+
         let state = State {
-            requests: Some(tx_tasks),
-            task_refs: Arc::new(()),
+            handle: Some(handle),
+            start_shutdown: notify_shutdown,
             completed_shutdown: rx_shutdown.map_err(Arc::new).boxed().shared(),
             thread: Some(thread),
         };
 
         Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(RwLock::new(state)),
             testing,
         }
     }
@@ -258,7 +211,19 @@ impl DedicatedExecutor {
     ///
     /// Internal state may be shared with other tests.
     pub fn new_testing() -> Self {
-        TESTING_EXECUTOR.clone()
+        TESTING_EXECUTOR
+            .get_or_init(|| {
+                let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
+                runtime_builder.enable_all();
+
+                Self::new_inner(
+                    "testing",
+                    runtime_builder,
+                    Arc::new(Registry::default()),
+                    true,
+                )
+            })
+            .clone()
     }
 
     /// Runs the specified Future (and any tasks it spawns) on the
@@ -271,50 +236,39 @@ impl DedicatedExecutor {
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        let fut = Box::pin(async move {
-            let task_output = AssertUnwindSafe(task).catch_unwind().await.map_err(|e| {
-                let s = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else {
-                    "unknown internal error".to_string()
-                };
-
-                JobError::Panic { msg: s }
-            });
-
-            if tx.send(task_output).is_err() {
-                warn!("Spawned task output ignored: receiver dropped")
-            }
-        });
-        let cancel = CancellationToken::new();
-        let mut state = self.state.lock();
-        let task = Task {
-            fut,
-            cancel: cancel.clone(),
-            task_ref: Arc::clone(&state.task_refs),
+        let handle = {
+            let state = self.state.read();
+            state.handle.clone()
         };
 
-        if let Some(requests) = &mut state.requests {
-            // would fail if someone has started shutdown
-            requests.send(task).ok();
-        } else {
-            warn!("tried to schedule task on an executor that was shutdown");
+        let Some(handle) = handle else {
+            return futures::future::err(JobError::WorkerGone).boxed();
+        };
+
+        // use JoinSet implement "cancel on drop"
+        let mut join_set = JoinSet::new();
+        join_set.spawn_on(task, &handle);
+        async move {
+            join_set
+                .join_next()
+                .await
+                .expect("just spawned task")
+                .map_err(|e| match e.try_into_panic() {
+                    Ok(e) => {
+                        let s = if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown internal error".to_string()
+                        };
+
+                        JobError::Panic { msg: s }
+                    }
+                    Err(_) => JobError::WorkerGone,
+                })
         }
-
-        Job { rx, cancel }
-    }
-
-    /// Number of currently active tasks.
-    #[cfg(test)]
-    fn tasks(&self) -> usize {
-        let state = self.state.lock();
-
-        // the strong count is always `1 + jobs` because of the Arc we hold within Self
-        Arc::strong_count(&state.task_refs).saturating_sub(1)
+        .boxed()
     }
 
     /// signals shutdown of this executor and any Clones
@@ -325,8 +279,9 @@ impl DedicatedExecutor {
 
         // hang up the channel which will cause the dedicated thread
         // to quit
-        let mut state = self.state.lock();
-        state.requests = None;
+        let mut state = self.state.write();
+        state.handle = None;
+        state.start_shutdown.notify_one();
     }
 
     /// Stops all subsequent task executions, and waits for the worker
@@ -350,7 +305,7 @@ impl DedicatedExecutor {
 
         // get handle mutex is held
         let handle = {
-            let state = self.state.lock();
+            let state = self.state.read();
             state.completed_shutdown.clone()
         };
 
@@ -399,6 +354,11 @@ mod tests {
         assert_eq!(dedicated_task.await.unwrap(), 42);
 
         exec.join().await;
+    }
+
+    #[tokio::test]
+    async fn drop_empty_exec() {
+        exec();
     }
 
     #[tokio::test]
@@ -529,18 +489,21 @@ mod tests {
 
     #[tokio::test]
     async fn executor_shutdown_while_task_running() {
-        let barrier = Arc::new(Barrier::new(2));
-        let captured = Arc::clone(&barrier);
+        let barrier_1 = Arc::new(Barrier::new(2));
+        let captured_1 = Arc::clone(&barrier_1);
+        let barrier_2 = Arc::new(Barrier::new(2));
+        let captured_2 = Arc::clone(&barrier_2);
 
         let exec = exec();
         let dedicated_task = exec.spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-            do_work(42, captured).await
+            captured_1.wait();
+            do_work(42, captured_2).await
         });
+        barrier_1.wait();
 
         exec.shutdown();
         // block main thread until completion of the outstanding task
-        barrier.wait();
+        barrier_2.wait();
 
         // task should complete successfully
         assert_eq!(dedicated_task.await.unwrap(), 42);
@@ -615,29 +578,57 @@ mod tests {
     async fn drop_receiver() {
         // create empty executor
         let exec = exec();
-        assert_eq!(exec.tasks(), 0);
 
         // create first blocked task
-        let barrier1 = Arc::new(AsyncBarrier::new(2));
-        let dedicated_task1 = exec.spawn(do_work_async(11, Arc::clone(&barrier1)));
-        assert_eq!(exec.tasks(), 1);
+        let barrier1_pre = Arc::new(AsyncBarrier::new(2));
+        let barrier1_pre_captured = Arc::clone(&barrier1_pre);
+        let barrier1_post = Arc::new(AsyncBarrier::new(2));
+        let barrier1_post_captured = Arc::clone(&barrier1_post);
+        let dedicated_task1 = exec.spawn(async move {
+            barrier1_pre_captured.wait().await;
+            do_work_async(11, barrier1_post_captured).await
+        });
+        barrier1_pre.wait().await;
 
         // create second blocked task
-        let barrier2 = Arc::new(AsyncBarrier::new(2));
-        let dedicated_task2 = exec.spawn(do_work_async(22, Arc::clone(&barrier2)));
-        assert_eq!(exec.tasks(), 2);
+        let barrier2_pre = Arc::new(AsyncBarrier::new(2));
+        let barrier2_pre_captured = Arc::clone(&barrier2_pre);
+        let barrier2_post = Arc::new(AsyncBarrier::new(2));
+        let barrier2_post_captured = Arc::clone(&barrier2_post);
+        let dedicated_task2 = exec.spawn(async move {
+            barrier2_pre_captured.wait().await;
+            do_work_async(22, barrier2_post_captured).await
+        });
+        barrier2_pre.wait().await;
 
         // cancel task
         drop(dedicated_task1);
 
         // cancelation might take a short while
-        wait_for_tasks(&exec, 1).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if Arc::strong_count(&barrier1_post) == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await
+            }
+        })
+        .await
+        .unwrap();
 
         // unblock other task
-        barrier2.wait().await;
+        barrier2_post.wait().await;
         assert_eq!(dedicated_task2.await.unwrap(), 22);
-        wait_for_tasks(&exec, 0).await;
-        assert_eq!(exec.tasks(), 0);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if Arc::strong_count(&barrier2_post) == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await
+            }
+        })
+        .await
+        .unwrap();
 
         exec.join().await;
     }
@@ -652,20 +643,6 @@ mod tests {
     async fn do_work_async(result: usize, barrier: Arc<AsyncBarrier>) -> usize {
         barrier.wait().await;
         result
-    }
-
-    // waits for up to 1 sec for the correct number of tasks
-    async fn wait_for_tasks(exec: &DedicatedExecutor, num: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if exec.tasks() == num {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("Did not find expected num tasks within a second")
     }
 
     fn exec() -> DedicatedExecutor {

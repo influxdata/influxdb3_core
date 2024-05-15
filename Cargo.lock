@@ -1414,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "ahash",
  "arrow",
@@ -1465,7 +1465,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "ahash",
  "arrow",
@@ -1485,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "tokio",
 ]
@@ -1493,7 +1493,7 @@ dependencies = [
 [[package]]
 name = "datafusion-execution"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "chrono",
@@ -1513,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "ahash",
  "arrow",
@@ -1530,7 +1530,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -1556,7 +1556,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1571,7 +1571,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-array"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1590,7 +1590,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1608,7 +1608,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "ahash",
  "arrow",
@@ -1638,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "ahash",
  "arrow",
@@ -1681,7 +1681,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "chrono",
@@ -1695,7 +1695,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "38.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=e0245296792eabdc35e83e8c5872345ff38c1fdf#e0245296792eabdc35e83e8c5872345ff38c1fdf"
+source = "git+https://github.com/apache/datafusion.git?rev=5fac581efbaffd0e6a9edf931182517524526afd#5fac581efbaffd0e6a9edf931182517524526afd"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1883,12 +1883,9 @@ dependencies = [
  "futures",
  "metric",
  "observability_deps",
- "once_cell",
  "parking_lot",
- "pin-project",
  "snafu 0.8.2",
  "tokio",
- "tokio-util",
  "tokio_metrics_bridge",
  "tokio_watchdog",
  "workspace-hack",
