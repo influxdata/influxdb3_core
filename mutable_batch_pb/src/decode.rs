@@ -199,6 +199,7 @@ pub fn write_table_batch(batch: &mut MutableBatch, table_batch: &TableBatch) -> 
                     RepeatLastElement::new(values.i64_values.iter().cloned()),
                 )
             }
+            InfluxColumnType::Key => unimplemented!("series key is not yet implemented in IOx"),
         }
         .context(WriteSnafu {
             column: &column.column_name,

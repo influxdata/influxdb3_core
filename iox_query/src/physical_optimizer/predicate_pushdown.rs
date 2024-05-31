@@ -40,7 +40,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
 
                 let child_any = child.as_any();
                 if child_any.downcast_ref::<EmptyExec>().is_some() {
-                    return Ok(Transformed::yes(child));
+                    return Ok(Transformed::yes(Arc::clone(child)));
                 } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
                     let new_inputs = child_union
                         .inputs()
@@ -97,7 +97,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                         let mut new_node: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(
                             Arc::new(FilterExec::try_new(
                                 conjunction(pushdown).expect("not empty"),
-                                grandchild,
+                                Arc::clone(grandchild),
                             )?),
                             child_dedup.sort_keys().to_vec(),
                             child_dedup.use_chunk_order_col(),

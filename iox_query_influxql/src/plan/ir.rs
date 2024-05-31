@@ -22,6 +22,8 @@ use super::SchemaProvider;
 
 /// A set of tag keys.
 pub(super) type TagSet = HashSet<String>;
+/// A set of series keys.
+pub(super) type SeriesKeySet = HashSet<String>;
 
 /// Represents a validated and normalized top-level [`SelectStatement`].
 #[derive(Debug, Default, Clone)]
@@ -65,6 +67,10 @@ pub(super) struct Select {
     /// The set of possible tags for the selection, by combining
     /// the tag sets of all inputs via the `FROM` clause.
     pub(super) tag_set: TagSet,
+
+    /// The set of all possible series key columns for the selection, by combining
+    /// the series key sets for all inputs via the `FROM` clause.
+    pub(super) series_key_set: SeriesKeySet,
 
     /// The [fill] clause specifies the fill behaviour for the selection. If the value is [`None`],
     /// it is the same behavior as `fill(null)`.

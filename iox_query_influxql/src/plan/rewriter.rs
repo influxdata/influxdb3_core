@@ -30,6 +30,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::{ControlFlow, Deref, DerefMut};
 
+use super::ir::SeriesKeySet;
+
 /// Recursively rewrite the specified [`SelectStatement`] by performing a series of passes
 /// to validate and normalize the statement.
 pub(super) fn rewrite_statement(
@@ -100,6 +102,7 @@ impl RewriteSelect {
 
         let from = self.expand_from(s, stmt)?;
         let tag_set = from_tag_set(s, &from);
+        let series_key_set = from_series_key_set(s, &from);
         let (fields, group_by) = self
             .expand_projection(s, stmt, &from, &tag_set)
             .map_err(|e| e.context("expand projection"))?;
@@ -165,6 +168,7 @@ impl RewriteSelect {
             time_range,
             group_by,
             tag_set,
+            series_key_set,
             fill,
             order_by: stmt.order_by,
             limit: stmt.limit,
@@ -252,8 +256,11 @@ impl RewriteSelect {
         let (has_field_wildcard, has_group_by_wildcard) = has_wildcards(stmt);
 
         let (fields, mut group_by) = if has_field_wildcard || has_group_by_wildcard {
-            let (field_set, mut tag_set) = from_field_and_dimensions(s, from)?;
+            let (field_set, mut tag_set, series_key_set) = from_field_and_dimensions(s, from)?;
 
+            // TODO: currently am ignoring series keys in group by, and not sure the implications of
+            // that. I think tags are only allowed in group by's, which is where some of this logic
+            // is coming from...
             if !has_group_by_wildcard {
                 if let Some(group_by) = &stmt.group_by {
                     // Remove any explicitly listed tags in the GROUP BY clause, so they are not
@@ -278,6 +285,10 @@ impl RewriteSelect {
                             .chain(tag_set.iter().map(|tag| VarRef {
                                 name: tag.clone().into(),
                                 data_type: Some(VarRefDataType::Tag),
+                            }))
+                            .chain(series_key_set.iter().map(|tag| VarRef {
+                                name: tag.clone().into(),
+                                data_type: Some(VarRefDataType::Key),
                             }))
                             .sorted()
                             .collect::<Vec<_>>()
@@ -565,18 +576,38 @@ fn from_tag_set(s: &dyn SchemaProvider, from: &[DataSource]) -> TagSet {
     tag_set
 }
 
+fn from_series_key_set(s: &dyn SchemaProvider, from: &[DataSource]) -> SeriesKeySet {
+    let mut series_key_set = SeriesKeySet::new();
+
+    for ds in from {
+        match ds {
+            DataSource::Table(table_name) => {
+                if let Some(table) = s.table_schema(table_name) {
+                    series_key_set.extend(table.series_keys_iter().map(|f| f.name().to_owned()));
+                }
+            }
+            DataSource::Subquery(q) => series_key_set.extend(q.series_key_set.clone()),
+        }
+    }
+
+    series_key_set
+}
+
 /// Determine the merged fields and tags of the `FROM` clause.
 fn from_field_and_dimensions(
     s: &dyn SchemaProvider,
     from: &[DataSource],
-) -> Result<(FieldTypeMap, TagSet)> {
+) -> Result<(FieldTypeMap, TagSet, SeriesKeySet)> {
     let mut fs = FieldTypeMap::new();
     let mut ts = TagSet::new();
+    let mut sks = SeriesKeySet::new();
 
     for tr in from {
         match tr {
             DataSource::Table(name) => {
-                let Some((field_set, tag_set)) = field_and_dimensions(s, name.as_str()) else {
+                let Some((field_set, tag_set, series_key_set)) =
+                    field_and_dimensions(s, name.as_str())
+                else {
                     continue;
                 };
 
@@ -595,6 +626,7 @@ fn from_field_and_dimensions(
                 }
 
                 ts.extend(tag_set);
+                sks.extend(series_key_set);
             }
             DataSource::Subquery(select) => {
                 for f in &select.fields {
@@ -624,7 +656,7 @@ fn from_field_and_dimensions(
             }
         }
     }
-    Ok((fs, ts))
+    Ok((fs, ts, sks))
 }
 
 /// Returns a tuple indicating whether the specifies `SELECT` statement

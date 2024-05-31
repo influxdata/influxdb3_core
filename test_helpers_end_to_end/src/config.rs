@@ -83,6 +83,8 @@ impl TestConfig {
             .with_env("INFLUXDB_IOX_CATALOG_CACHE_WARMUP_DELAY", "100ms")
             // disable bypass detection by default
             .with_bypass_detection(false)
+            // speed up tests
+            .with_env("INFLUXDB_IOX_CATALOG_CACHE_WRITE_BATCH_DELAY", "10ms")
     }
 
     /// Enable/disable catalog cache bypass detection
@@ -266,6 +268,7 @@ impl TestConfig {
         self
             // Hard code query threads so query plans do not vary based on environment
             .with_env("INFLUXDB_IOX_NUM_QUERY_THREADS", "4")
+            .with_env("INFLUXDB_IOX_NUM_QUERY_PARTITIONS", "4")
             .with_env(
                 "INFLUXDB_IOX_DATAFUSION_CONFIG",
                 "iox.influxql_metadata_cutoff:1990-01-01T00:00:00Z",

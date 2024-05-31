@@ -18,18 +18,18 @@ futures = "0.3"
 handlebars = "5.1"
 humantime = "2.1.0"
 influxdb2_client = { path = "../influxdb2_client" }
-itertools = "0.12.1"
+itertools = "0.13.0"
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 mutable_batch = { path = "../mutable_batch" }
 parquet_file = { path = "../parquet_file" }
-rand = { version = "0.8.3", features = ["small_rng"] }
+rand = { version = "0.8.5", features = ["small_rng"] }
 regex = "1.10"
 schema = { path = "../schema" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.117"
 snafu = "0.8"
-tokio = { version = "1.37", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
-toml = "0.8.12"
+tokio = { version = "1.38", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+toml = "0.8.14"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", default_features = false }

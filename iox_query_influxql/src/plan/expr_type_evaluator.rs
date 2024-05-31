@@ -118,6 +118,7 @@ impl<'a> TypeEvaluator<'a> {
                         | VarRefDataType::String
                         | VarRefDataType::Boolean
                         | VarRefDataType::Tag
+                        | VarRefDataType::Key
                 ) =>
             {
                 Some(dt)

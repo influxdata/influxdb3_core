@@ -89,19 +89,19 @@ license = "MIT OR Apache-2.0"
 arrow = { version = "51.0.0", features = ["prettyprint", "chrono-tz"] }
 arrow-buffer = { version = "51.0.0" }
 arrow-flight = { version = "51.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "5fac581efbaffd0e6a9edf931182517524526afd" }
-datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "5fac581efbaffd0e6a9edf931182517524526afd" }
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "168ee122f39fa2c94efaf7711225139c8df55e7b" }
+datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "168ee122f39fa2c94efaf7711225139c8df55e7b" }
 hashbrown = { version = "0.14.5" }
 object_store = { version = "0.9.1" }
 parquet = { version = "51.0.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
 pbjson-types = { version = "0.6.0" }
-prost = { version = "0.12.4" }
-prost-build = { version = "0.12.4" }
-prost-types = { version = "0.12.4" }
+prost = { version = "0.12.6" }
+prost-build = { version = "0.12.6" }
+prost-types = { version = "0.12.6" }
 smallvec = { version = "1.13.2", features = ["union"] }
-sqlparser = { version = "0.45.0" }
+sqlparser = { version = "0.47.0" }
 tonic = { version = "0.11.0", features = ["tls", "tls-roots"] }
 tonic-build = { version = "0.11.0" }
 tonic-health = { version = "0.11.0" }

@@ -170,6 +170,8 @@ impl TryFrom<ArrowSchemaRef> for Schema {
 
 const MEASUREMENT_METADATA_KEY: &str = "iox::measurement::name";
 const COLUMN_METADATA_KEY: &str = "iox::column::type";
+const SERIES_KEY_METADATA_KEY: &str = "iox::series::key";
+const SERIES_KEY_METADATA_SEP: &str = "/";
 
 impl Schema {
     /// Create a new Schema wrapper over the schema
@@ -208,6 +210,7 @@ impl Schema {
 
                 let expected_nullable = match influxdb_column_type {
                     InfluxColumnType::Tag => true,
+                    InfluxColumnType::Key => false,
                     InfluxColumnType::Field(_) => true,
                     InfluxColumnType::Timestamp => false,
                 };
@@ -242,6 +245,7 @@ impl Schema {
     /// used only by the SchemaBuilder.
     pub(crate) fn new_from_parts(
         measurement: Option<String>,
+        series_key: Option<Vec<String>>,
         fields: impl Iterator<Item = (ArrowField, InfluxColumnType)>,
         sort_columns: bool,
     ) -> Result<Self> {
@@ -249,6 +253,13 @@ impl Schema {
 
         if let Some(measurement) = measurement {
             metadata.insert(MEASUREMENT_METADATA_KEY.to_string(), measurement);
+        }
+
+        if let Some(series_key) = series_key {
+            metadata.insert(
+                SERIES_KEY_METADATA_KEY.to_string(),
+                series_key.join(SERIES_KEY_METADATA_SEP),
+            );
         }
 
         let mut fields: Vec<ArrowField> = fields
@@ -337,6 +348,16 @@ impl Schema {
     pub fn tags_iter(&self) -> impl Iterator<Item = &ArrowField> {
         self.iter().filter_map(|(influx_column_type, field)| {
             if matches!(influx_column_type, InfluxColumnType::Tag) {
+                Some(field)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn series_keys_iter(&self) -> impl Iterator<Item = &ArrowField> {
+        self.iter().filter_map(|(influx_column_type, field)| {
+            if matches!(influx_column_type, InfluxColumnType::Key) {
                 Some(field)
             } else {
                 None
@@ -483,31 +504,50 @@ impl Schema {
     /// for what columns to include in the key columns
     pub fn primary_key(&self) -> Vec<&str> {
         use InfluxColumnType::*;
-        let mut primary_keys: Vec<_> = self
-            .iter()
-            .filter_map(|(column_type, field)| match column_type {
-                Tag => Some((Tag, field)),
-                Field(_) => None,
-                Timestamp => Some((Timestamp, field)),
-            })
-            .collect();
+        self.inner
+            .metadata()
+            .get(SERIES_KEY_METADATA_KEY)
+            .map_or_else(
+                // Use tags, in lexicographical order
+                || {
+                    let mut primary_keys: Vec<_> = self
+                        .iter()
+                        .filter_map(|(column_type, field)| match column_type {
+                            Tag => Some((Tag, field)),
+                            // although series key columns are part of the primary key, we expect
+                            // them listed in the metadata, so ignore it here:
+                            Key => None,
+                            Field(_) => None,
+                            Timestamp => Some((Timestamp, field)),
+                        })
+                        .collect();
 
-        // Now, sort lexographically (but put timestamp last)
-        primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
-            match (a_column_type, b_column_type) {
-                (Tag, Tag) => a.name().cmp(b.name()),
-                (Timestamp, Tag) => Ordering::Greater,
-                (Tag, Timestamp) => Ordering::Less,
-                (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
-                _ => panic!("Unexpected types in key summary"),
-            }
-        });
+                    // Now, sort lexographically (but put timestamp last)
+                    primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
+                        match (a_column_type, b_column_type) {
+                            (Tag, Tag) => a.name().cmp(b.name()),
+                            (Timestamp, Tag) => Ordering::Greater,
+                            (Tag, Timestamp) => Ordering::Less,
+                            (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
+                            _ => panic!("Unexpected types in key summary"),
+                        }
+                    });
 
-        // Take just the names
-        primary_keys
-            .into_iter()
-            .map(|(_column_type, field)| field.name().as_str())
-            .collect()
+                    // Take just the names
+                    primary_keys
+                        .into_iter()
+                        .map(|(_column_type, field)| field.name().as_str())
+                        .collect()
+                },
+                // Use the series key, stored in the metadata
+                |v| {
+                    v.split(SERIES_KEY_METADATA_SEP)
+                        // This assumes that, as documented, `time_iter` only produces the single
+                        // time column:
+                        .chain(self.time_iter().map(|f| f.name().as_str()))
+                        .collect()
+                },
+            )
     }
 
     /// Estimate memory consumption in bytes of the schema.
@@ -528,6 +568,13 @@ impl Schema {
                 .sum::<usize>();
 
         size_self + size_inner + size_fields + size_metadata
+    }
+
+    pub fn series_key(&self) -> Option<Vec<&str>> {
+        self.inner
+            .metadata()
+            .get(SERIES_KEY_METADATA_KEY)
+            .map(|s| s.split(SERIES_KEY_METADATA_SEP).collect())
     }
 }
 
@@ -622,6 +669,11 @@ pub enum InfluxColumnType {
     /// should allow for both Utf8 and Dictionary
     Tag,
 
+    /// Key
+    ///
+    /// For storing members of a series key
+    Key,
+
     /// Field: Data of type in InfluxDB Data model
     Field(InfluxFieldType),
 
@@ -643,6 +695,7 @@ impl InfluxColumnType {
                 }
                 _ => false,
             },
+            Self::Key => matches!(data_type, ArrowDataType::Utf8),
             Self::Field(_) => {
                 let default_type: ArrowDataType = self.into();
                 data_type == &default_type
@@ -665,6 +718,7 @@ impl From<&InfluxColumnType> for &'static str {
     fn from(t: &InfluxColumnType) -> Self {
         match t {
             InfluxColumnType::Tag => "iox::column_type::tag",
+            InfluxColumnType::Key => "iox::column_type::key",
             InfluxColumnType::Field(InfluxFieldType::Float) => "iox::column_type::field::float",
             InfluxColumnType::Field(InfluxFieldType::Integer) => "iox::column_type::field::integer",
             InfluxColumnType::Field(InfluxFieldType::UInteger) => {
@@ -691,6 +745,7 @@ impl TryFrom<&str> for InfluxColumnType {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
             "iox::column_type::tag" => Ok(Self::Tag),
+            "iox::column_type::key" => Ok(Self::Key),
             "iox::column_type::field::float" => Ok(Self::Field(InfluxFieldType::Float)),
             "iox::column_type::field::integer" => Ok(Self::Field(InfluxFieldType::Integer)),
             "iox::column_type::field::uinteger" => Ok(Self::Field(InfluxFieldType::UInteger)),
@@ -707,6 +762,7 @@ impl From<&InfluxColumnType> for ArrowDataType {
     fn from(t: &InfluxColumnType) -> Self {
         match t {
             InfluxColumnType::Tag => Self::Dictionary(Box::new(Self::Int32), Box::new(Self::Utf8)),
+            InfluxColumnType::Key => Self::Utf8,
             InfluxColumnType::Field(influxdb_field_type) => (*influxdb_field_type).into(),
             InfluxColumnType::Timestamp => TIME_DATA_TYPE(),
         }

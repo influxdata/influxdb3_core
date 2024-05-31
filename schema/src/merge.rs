@@ -155,6 +155,8 @@ impl<'a> SchemaMerger<'a> {
     pub fn build(mut self) -> Schema {
         let schema = Schema::new_from_parts(
             self.measurement.take(),
+            // TODO: should the series key be merged? here I just ignore it
+            Option::<Vec<String>>::None,
             self.fields.drain().map(|x| x.1),
             true,
         )

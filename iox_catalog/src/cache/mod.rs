@@ -3,9 +3,13 @@
 /// Minimum size of payload to compute ETags for
 const ETAG_MIN_PAYLOAD_SIZE: usize = 128 * 1024;
 
+mod batcher;
 mod handler;
 mod loader;
 mod snapshot;
+
+#[cfg(test)]
+mod test_utils;
 
 use std::time::Duration;
 use std::{
@@ -13,6 +17,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::constants::MAX_PARQUET_L0_FILES_PER_PARTITION;
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use catalog_cache::api::quorum::QuorumCatalogCache;
@@ -43,6 +48,28 @@ use crate::metrics::CatalogMetrics;
 use self::handler::{CacheHandlerCatalog, CacheHandlerRepos};
 use self::snapshot::RootKey;
 
+/// Parameters for [`CachingCatalog`].
+#[derive(Debug)]
+pub struct CachingCatalogParams {
+    /// quorum-based cache
+    pub cache: Arc<QuorumCatalogCache>,
+
+    /// underlying backing catalog
+    pub backing: Arc<dyn Catalog>,
+
+    /// metrics registry
+    pub metrics: Arc<metric::Registry>,
+
+    /// time provider, used for metrics
+    pub time_provider: Arc<dyn TimeProvider>,
+
+    /// number of concurrent quorum operations that a single request can trigger
+    pub quorum_fanout: usize,
+
+    /// Delay of batched write operations.
+    pub batch_delay: Duration,
+}
+
 /// Caching catalog.
 #[derive(Debug)]
 pub struct CachingCatalog {
@@ -50,7 +77,6 @@ pub struct CachingCatalog {
     metrics: CatalogMetrics,
     time_provider: Arc<dyn TimeProvider>,
     quorum_fanout: usize,
-    etag_min_payload_size: usize,
     partitions: CacheHandlerCatalog<PartitionSnapshot>,
     tables: CacheHandlerCatalog<TableSnapshot>,
     namespaces: CacheHandlerCatalog<NamespaceSnapshot>,
@@ -61,20 +87,20 @@ impl CachingCatalog {
     const NAME: &'static str = "cache";
 
     /// Create new caching catalog.
-    ///
-    /// Sets:
-    /// - `cache`: quorum-based cache
-    /// - `backing`: underlying backing catalog
-    /// - `metrics`: metrics registry
-    /// - `time_provider`: time provider, used for metrics
-    /// - `quorum_fanout`: number of concurrent quorum operations that a single request can trigger
-    pub fn new(
-        cache: Arc<QuorumCatalogCache>,
-        backing: Arc<dyn Catalog>,
-        metrics: Arc<metric::Registry>,
-        time_provider: Arc<dyn TimeProvider>,
-        quorum_fanout: usize,
-    ) -> Self {
+    pub fn new(params: CachingCatalogParams) -> Self {
+        Self::new_inner(params, ETAG_MIN_PAYLOAD_SIZE)
+    }
+
+    fn new_inner(params: CachingCatalogParams, etag_min_payload_size: usize) -> Self {
+        let CachingCatalogParams {
+            cache,
+            backing,
+            metrics,
+            time_provider,
+            quorum_fanout,
+            batch_delay,
+        } = params;
+
         // We set a more aggressive backoff configuration than normal as we expect latencies to be low
         let backoff_config = Arc::new(BackoffConfig {
             init_backoff: Duration::from_millis(10),
@@ -88,24 +114,36 @@ impl CachingCatalog {
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
+            etag_min_payload_size,
+            Arc::clone(&time_provider),
+            batch_delay,
         );
         let tables = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
+            etag_min_payload_size,
+            Arc::clone(&time_provider),
+            batch_delay,
         );
         let namespaces = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
+            etag_min_payload_size,
+            Arc::clone(&time_provider),
+            batch_delay,
         );
         let root = CacheHandlerCatalog::new(
             Arc::clone(&backing),
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
+            etag_min_payload_size,
+            Arc::clone(&time_provider),
+            batch_delay,
         );
 
         Self {
@@ -117,7 +155,6 @@ impl CachingCatalog {
             tables,
             namespaces,
             root,
-            etag_min_payload_size: ETAG_MIN_PAYLOAD_SIZE,
         }
     }
 }
@@ -132,10 +169,10 @@ impl Catalog for CachingCatalog {
         Box::new(self.metrics.repos(Box::new(Repos {
             backing: self.backing.repositories(),
             quorum_fanout: self.quorum_fanout,
-            tables: self.tables.repos(self.etag_min_payload_size),
-            partitions: self.partitions.repos(self.etag_min_payload_size),
-            namespaces: self.namespaces.repos(self.etag_min_payload_size),
-            root: self.root.repos(self.etag_min_payload_size),
+            tables: self.tables.repos(),
+            partitions: self.partitions.repos(),
+            namespaces: self.namespaces.repos(),
+            root: self.root.repos(),
         })))
     }
 
@@ -578,7 +615,7 @@ impl PartitionRepo for Repos {
             .backing
             .partitions()
             .create_or_get(key, table_id)
-            .with_refresh(self.tables.refresh(table_id))
+            .with_refresh(self.tables.refresh_batched(table_id))
             .await?;
 
         Ok(p)
@@ -868,7 +905,7 @@ impl ParquetFileRepo for Repos {
         &mut self,
         partition_ids: Vec<PartitionId>,
     ) -> Result<Vec<ParquetFile>> {
-        futures::stream::iter(prepare_set(partition_ids))
+        let res = futures::stream::iter(prepare_set(partition_ids))
             .map(|p_id| {
                 let this = &self;
                 async move {
@@ -896,7 +933,16 @@ impl ParquetFileRepo for Repos {
             .buffer_unordered(self.quorum_fanout)
             .try_flatten()
             .try_collect::<Vec<_>>()
-            .await
+            .await?;
+
+        // Apply the MAX_PARQUET_L0_FILES_PER_PARTITION limit on L0 files, taking the first N files sorted by max_l0_created_at
+        let (mut initial_level, mut files): (Vec<ParquetFile>, Vec<ParquetFile>) = res
+            .into_iter()
+            .partition(|file| file.compaction_level == CompactionLevel::Initial);
+        initial_level.sort_by(|a, b| a.max_l0_created_at.cmp(&b.max_l0_created_at));
+        initial_level.truncate(MAX_PARQUET_L0_FILES_PER_PARTITION as usize);
+        files.append(&mut initial_level);
+        Ok(files)
     }
 
     async fn get_by_object_store_id(
@@ -933,7 +979,7 @@ impl ParquetFileRepo for Repos {
             .backing
             .parquet_files()
             .create_upgrade_delete(partition_id, delete, upgrade, create, target_level)
-            .with_refresh(self.partitions.refresh(partition_id))
+            .with_refresh(self.partitions.refresh_batched(partition_id))
             .await?;
 
         Ok(res)
@@ -1058,12 +1104,14 @@ mod tests {
     use catalog_cache::local::CatalogCache;
     use catalog_cache::CacheValue;
     use catalog_cache::{api::server::test_util::TestCacheServer, CacheKey};
+    use data_types::ColumnSet;
     use generated_types::influxdata::iox::catalog_cache::v1 as proto;
     use generated_types::prost::Message;
-    use iox_time::SystemProvider;
-    use metric::{Attributes, DurationHistogram, Metric, U64Counter};
+    use iox_time::{MockProvider, SystemProvider, Time};
+    use metric::{Attributes, DurationHistogram, Metric};
     use std::fmt::Debug;
     use test_helpers::maybe_start_logging;
+    use test_utils::AssertPendingExt;
 
     use crate::{interface_tests::TestCatalog, mem::MemCatalog};
 
@@ -1122,8 +1170,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_metric_get(&metrics, "partition", "miss", 1);
-        assert_metric_get(&metrics, "partition", "hit", 2);
+        assert_metric_cache_get(&metrics, "partition", "miss", 1);
+        assert_metric_cache_get(&metrics, "partition", "hit", 2);
+        assert_metric_cache_put(&metrics, "partition", 1);
 
         let histogram = metrics
             .get_instrument::<Metric<DurationHistogram>>("dns_request_duration")
@@ -1358,9 +1407,145 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_write_batching() {
+        // maybe_start_logging();
+
+        let batch_delay = Duration::from_secs(1);
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_millis(0).unwrap()));
+        let (catalog, _cache) = catalog_with_params(Arc::clone(&time_provider) as _, batch_delay);
+
+        let mut repos = catalog.repositories();
+
+        let ns = repos
+            .namespaces()
+            .create(&NamespaceName::new("ns").unwrap(), None, None, None)
+            .await
+            .unwrap();
+        let table = repos
+            .tables()
+            .create("t", Default::default(), ns.id)
+            .await
+            .unwrap();
+
+        // check PUT metrics:
+        // - root:
+        //   - created namespace
+        // - namespace:
+        //   - created namespace
+        //   - created table
+        // - table:
+        //   - created table
+        assert_metric_cache_put(&catalog.metrics(), "root", 1);
+        assert_metric_cache_put(&catalog.metrics(), "namespace", 2);
+        assert_metric_cache_put(&catalog.metrics(), "table", 1);
+
+        let key = PartitionKey::from("p");
+
+        let mut repos_1 = catalog.repositories();
+        let mut fut_1 = repos_1.partitions().create_or_get(key.clone(), table.id);
+        fut_1.assert_pending().await;
+
+        let mut repos_2 = catalog.repositories();
+        let mut fut_2 = repos_2.partitions().create_or_get(key.clone(), table.id);
+        fut_2.assert_pending().await;
+
+        time_provider.inc(batch_delay);
+
+        let partition_1 = fut_1.await.unwrap();
+        let partition_2 = fut_2.await.unwrap();
+        assert_eq!(partition_1, partition_2);
+
+        // We perform two ops to the backing catalog (to avoid combining failures) but only one additional quorum PUT
+        // (for the table)
+        //
+        // Note that we don't perform a quorum PUT for the partition since we `create_or_get` is often used as as "get"
+        // instead of "create" and we don't always wanna issue a "load" for that.
+        assert_metric_mem_catalog(&catalog.metrics(), "partition_create_or_get", 2);
+        assert_metric_cache_put(&catalog.metrics(), "root", 1);
+        assert_metric_cache_put(&catalog.metrics(), "namespace", 2);
+        assert_metric_cache_put(&catalog.metrics(), "table", 2);
+        assert_metric_cache_put(&catalog.metrics(), "partition", 0);
+
+        let params_1 = ParquetFileParams {
+            namespace_id: ns.id,
+            table_id: table.id,
+            partition_id: partition_1.id,
+            partition_hash_id: partition_1.hash_id().cloned(),
+            object_store_id: ObjectStoreId::new(),
+            min_time: Timestamp::new(0),
+            max_time: Timestamp::new(1),
+            file_size_bytes: 3,
+            row_count: 4,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(5),
+            column_set: ColumnSet::new([]),
+            max_l0_created_at: Timestamp::new(6),
+            source: None,
+        };
+        let params_2 = ParquetFileParams {
+            object_store_id: ObjectStoreId::new(),
+            ..params_1.clone()
+        };
+
+        let mut repos_1 = catalog.repositories();
+        let create_1 = vec![params_1.clone()];
+        let mut fut_1 = repos_1.parquet_files().create_upgrade_delete(
+            partition_1.id,
+            &[],
+            &[],
+            &create_1,
+            CompactionLevel::Initial,
+        );
+        fut_1.assert_pending().await;
+
+        let mut repos_2 = catalog.repositories();
+        let create_2 = vec![params_2.clone()];
+        let mut fut_2 = repos_2.parquet_files().create_upgrade_delete(
+            partition_2.id,
+            &[],
+            &[],
+            &create_2,
+            CompactionLevel::Initial,
+        );
+        fut_2.assert_pending().await;
+
+        time_provider.inc(batch_delay);
+
+        fut_1.await.unwrap();
+        fut_2.await.unwrap();
+
+        assert_metric_mem_catalog(&catalog.metrics(), "parquet_create_upgrade_delete", 2);
+        assert_metric_cache_put(&catalog.metrics(), "root", 1);
+        assert_metric_cache_put(&catalog.metrics(), "namespace", 2);
+        assert_metric_cache_put(&catalog.metrics(), "table", 2);
+        assert_metric_cache_put(&catalog.metrics(), "partition", 1);
+
+        let files = repos
+            .parquet_files()
+            .list_by_partition_not_to_delete_batch(vec![partition_1.id])
+            .await
+            .unwrap();
+        let mut file_uuids_actual = files.iter().map(|f| f.object_store_id).collect::<Vec<_>>();
+        file_uuids_actual.sort();
+        let mut file_uuids_expected = vec![params_1.object_store_id, params_2.object_store_id];
+        file_uuids_expected.sort();
+        assert_eq!(file_uuids_actual, file_uuids_expected);
+    }
+
     fn catalog() -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
+        catalog_with_params(
+            Arc::new(SystemProvider::new()),
+            // speed up tests
+            Duration::ZERO,
+        )
+    }
+
+    fn catalog_with_params(
+        time_provider: Arc<dyn TimeProvider>,
+        batch_delay: Duration,
+    ) -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
         let metrics = Arc::new(metric::Registry::default());
-        let time_provider = Arc::new(SystemProvider::new()) as _;
         let backing = Arc::new(MemCatalog::new(
             Arc::clone(&metrics),
             Arc::clone(&time_provider),
@@ -1373,9 +1558,17 @@ mod tests {
             Arc::new([peer0.client(), peer1.client()]),
         ));
 
-        let mut caching_catalog =
-            CachingCatalog::new(Arc::clone(&cache), backing, metrics, time_provider, 10);
-        caching_catalog.etag_min_payload_size = 2;
+        let caching_catalog = CachingCatalog::new_inner(
+            CachingCatalogParams {
+                cache: Arc::clone(&cache),
+                backing,
+                metrics,
+                time_provider,
+                quorum_fanout: 10,
+                batch_delay,
+            },
+            2,
+        );
 
         let test_catalog = TestCatalog::new(caching_catalog);
         test_catalog.hold_onto(peer0);
@@ -1384,22 +1577,51 @@ mod tests {
     }
 
     #[track_caller]
-    fn assert_metric_get(
+    fn assert_metric_cache_get(
         metrics: &metric::Registry,
         variant: &'static str,
         result: &'static str,
         expected: u64,
     ) {
         let actual = metrics
-            .get_instrument::<Metric<U64Counter>>("iox_catalog_cache_get")
+            .get_instrument::<Metric<DurationHistogram>>("iox_catalog_cache_op")
             .expect("failed to read metric")
             .get_observer(&Attributes::from(&[
+                ("op", "get"),
                 ("variant", variant),
                 ("result", result),
             ]))
             .expect("failed to get observer")
             .fetch();
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual.sample_count(), expected);
+    }
+
+    #[track_caller]
+    fn assert_metric_cache_put(metrics: &metric::Registry, variant: &'static str, expected: u64) {
+        let actual = metrics
+            .get_instrument::<Metric<DurationHistogram>>("iox_catalog_cache_op")
+            .expect("failed to read metric")
+            .get_observer(&Attributes::from(&[("op", "put"), ("variant", variant)]))
+            .expect("failed to get observer")
+            .fetch();
+
+        assert_eq!(actual.sample_count(), expected);
+    }
+
+    #[track_caller]
+    fn assert_metric_mem_catalog(metrics: &metric::Registry, op: &'static str, expected: u64) {
+        let actual = metrics
+            .get_instrument::<Metric<DurationHistogram>>("catalog_op_duration")
+            .expect("failed to read metric")
+            .get_observer(&Attributes::from(&[
+                ("type", "memory"),
+                ("op", op),
+                ("result", "success"),
+            ]))
+            .expect("failed to get observer")
+            .fetch();
+
+        assert_eq!(actual.sample_count(), expected);
     }
 }

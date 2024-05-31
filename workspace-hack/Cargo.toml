@@ -30,7 +30,6 @@ bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env", "string"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "string", "suggestions", "usage"] }
-concurrent-queue = { version = "2" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
@@ -84,7 +83,6 @@ signature = { version = "2", default-features = false, features = ["digest", "ra
 similar = { version = "2", features = ["inline"] }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-sqlparser = { version = "0.45", features = ["visitor"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "sqlite", "uuid"] }
 sqlx-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.7", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
@@ -178,7 +176,7 @@ async-compression = { version = "0.4", default-features = false, features = ["bz
 bitflags = { version = "2", default-features = false, features = ["std"] }
 linux-raw-sys = { version = "0.4", default-features = false, features = ["elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
 rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
@@ -200,7 +198,7 @@ spin = { version = "0.9" }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
 rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
@@ -221,7 +219,7 @@ spin = { version = "0.9" }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
 rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }

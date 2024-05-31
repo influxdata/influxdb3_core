@@ -128,9 +128,7 @@ use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
-use datafusion::logical_expr::{
-    binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, GetIndexedField, Operator,
-};
+use datafusion::logical_expr::{binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, Operator};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::prelude::{when, Column};
@@ -431,13 +429,6 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
             Expr::AggregateFunction(AggregateFunction { ref args, .. } )
             | Expr::WindowFunction(WindowFunction { ref args, .. } ) => match &args[0] {
                Expr::Column(Column { ref name, ..  }) if schema.is_tag_field(name) => yes(lit(ScalarValue::Null)),
-               _ => no(expr),
-            }
-
-            // If the InfluxQL query used a selector on a tag column,  like `last(tag_col)`
-            // then there will be an indexed field. Convert this to `NULL` as well.
-            Expr::GetIndexedField(GetIndexedField { expr: ref e, .. }) => match e.as_ref() {
-               Expr::Literal(ScalarValue::Null) => yes(lit(ScalarValue::Null)),
                _ => no(expr),
             }
 

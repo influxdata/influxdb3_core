@@ -266,6 +266,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
         return Err(ParseError {
             message: "unexpected eof".into(),
             pos: 0,
+            details: None,
         });
     }
 
@@ -278,13 +279,15 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
             return Err(ParseError {
                 message: message.into(),
                 pos: input.offset(pos),
+                details: None,
             })
         }
         // any other error indicates an invalid expression
-        Err(_) => {
+        Err(e) => {
             return Err(ParseError {
                 message: "invalid conditional expression".into(),
                 pos: input.offset(i),
+                details: Some(e.to_string()),
             })
         }
     };
@@ -296,6 +299,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
         return Err(ParseError {
             message: "invalid conditional expression".into(),
             pos: input.offset(i),
+            details: None,
         });
     }
 

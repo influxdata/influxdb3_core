@@ -1,4 +1,4 @@
-use crate::plan::ir::TagSet;
+use crate::plan::ir::{SeriesKeySet, TagSet};
 use crate::plan::var_ref::{field_type_to_var_ref_data_type, influx_type_to_var_ref_data_type};
 use crate::plan::SchemaProvider;
 use influxdb_influxql_parser::expression::VarRefDataType;
@@ -10,10 +10,11 @@ pub(crate) type FieldTypeMap = HashMap<String, VarRefDataType>;
 pub(crate) fn field_and_dimensions(
     s: &dyn SchemaProvider,
     name: &str,
-) -> Option<(FieldTypeMap, TagSet)> {
+) -> Option<(FieldTypeMap, TagSet, SeriesKeySet)> {
     s.table_schema(name).map(|iox| {
         let mut field_set = FieldTypeMap::new();
         let mut tag_set = TagSet::new();
+        let mut series_key_set = SeriesKeySet::new();
 
         for col in iox.iter() {
             match col {
@@ -23,10 +24,13 @@ pub(crate) fn field_and_dimensions(
                 (InfluxColumnType::Tag, f) => {
                     tag_set.insert(f.name().to_owned());
                 }
+                (InfluxColumnType::Key, f) => {
+                    series_key_set.insert(f.name().to_owned());
+                }
                 (InfluxColumnType::Timestamp, _) => {}
             }
         }
-        (field_set, tag_set)
+        (field_set, tag_set, series_key_set)
     })
 }
 
@@ -52,7 +56,7 @@ mod test {
         let namespace = MockSchemaProvider::default();
 
         // Measurement exists
-        let (field_set, tag_set) = field_and_dimensions(&namespace, "cpu").unwrap();
+        let (field_set, tag_set, _) = field_and_dimensions(&namespace, "cpu").unwrap();
         assert_eq!(
             field_set,
             FieldTypeMap::from([

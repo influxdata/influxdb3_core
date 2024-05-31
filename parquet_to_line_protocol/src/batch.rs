@@ -120,6 +120,7 @@ fn field_values_iter<'a>(
                 }
                 // not a field
                 InfluxColumnType::Tag | InfluxColumnType::Timestamp => return None,
+                InfluxColumnType::Key => unimplemented!("series key is not yet implemented in IOx"),
             };
 
             Some(FieldColumn { name, value })

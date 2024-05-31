@@ -116,7 +116,8 @@ async fn route_request(
     let content_length = req.headers().get("content-length").cloned();
 
     let response = match (method.clone(), uri.path()) {
-        (Method::GET, "/health") => Ok(health(server_type.as_ref())),
+        (Method::GET, "/health") => Ok(check_response(server_type.is_healthy())),
+        (Method::GET, "/ready") => Ok(check_response(server_type.is_ready())),
         (Method::GET, "/metrics") => handle_metrics(server_type.as_ref()),
         _ => server_type
             .route_http_request(req)
@@ -142,8 +143,9 @@ async fn route_request(
     }
 }
 
-fn health(server_type: &dyn ServerType) -> Response<Body> {
-    match server_type.is_healthy() {
+/// Returns HTTP 200 when `is_ok` is true, and a 5xx otherwise.
+fn check_response(is_ok: bool) -> Response<Body> {
+    match is_ok {
         true => {
             let response_body = "OK";
             Response::new(Body::from(response_body.to_string()))

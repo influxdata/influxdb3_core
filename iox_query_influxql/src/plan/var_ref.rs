@@ -10,7 +10,10 @@ pub(crate) fn var_ref_data_type_to_data_type(v: VarRefDataType) -> Option<DataTy
         VarRefDataType::Unsigned => Some(DataType::UInt64),
         VarRefDataType::String => Some(DataType::Utf8),
         VarRefDataType::Boolean => Some(DataType::Boolean),
-        VarRefDataType::Tag | VarRefDataType::Field | VarRefDataType::Timestamp => None,
+        VarRefDataType::Tag
+        | VarRefDataType::Field
+        | VarRefDataType::Timestamp
+        | VarRefDataType::Key => None,
     }
 }
 
@@ -31,6 +34,7 @@ pub(crate) fn influx_type_to_var_ref_data_type(
 ) -> Option<VarRefDataType> {
     match v {
         None => None,
+        Some(InfluxColumnType::Key) => Some(VarRefDataType::Key),
         Some(InfluxColumnType::Tag) => Some(VarRefDataType::Tag),
         Some(InfluxColumnType::Field(ft)) => Some(field_type_to_var_ref_data_type(ft)),
         Some(InfluxColumnType::Timestamp) => Some(VarRefDataType::Timestamp),
@@ -49,6 +53,7 @@ pub(crate) fn var_ref_data_type_to_influx_type(
         Some(VarRefDataType::Boolean) => Some(InfluxColumnType::Field(InfluxFieldType::Boolean)),
         Some(VarRefDataType::Tag) => Some(InfluxColumnType::Tag),
         Some(VarRefDataType::Timestamp) => Some(InfluxColumnType::Timestamp),
+        Some(VarRefDataType::Key) => Some(InfluxColumnType::Key),
         Some(VarRefDataType::Field) | None => None,
     }
 }

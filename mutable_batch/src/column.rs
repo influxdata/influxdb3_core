@@ -173,6 +173,7 @@ impl Column {
                 Default::default(),
                 StatValues::new_all_null(total_count, distinct_count),
             ),
+            InfluxColumnType::Key => unimplemented!("series key is not yet implemented in IOx"),
         };
 
         Self {

@@ -225,7 +225,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                     let plan = wrap_user_into_projections(
                         &dedup_required_cols,
                         &column_names,
-                        input,
+                        Arc::clone(input),
                         |plan| {
                             let sort_keys = reassign_sort_exprs_columns(
                                 child_dedup.sort_keys(),
@@ -1711,7 +1711,7 @@ mod tests {
             &self.cache
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 

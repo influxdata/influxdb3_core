@@ -252,6 +252,8 @@ pub enum VarRefDataType {
     Field,
     /// Represents a tag.
     Tag,
+    /// Represents a series key column.
+    Key,
     /// Represents a timestamp.
     Timestamp,
 }
@@ -284,6 +286,7 @@ impl Display for VarRefDataType {
             Self::Tag => f.write_str("tag"),
             Self::Field => f.write_str("field"),
             Self::Timestamp => f.write_str("timestamp"),
+            Self::Key => f.write_str("key"),
         }
     }
 }

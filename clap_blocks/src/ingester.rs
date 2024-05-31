@@ -39,6 +39,16 @@ pub struct IngesterConfig {
     )]
     pub wal_rotation_period_seconds: u64,
 
+    /// The size in bytes which the ingester will aim to rotate the active WAL
+    /// segment at, in order approximately bound WAL segment file sizes.
+    #[clap(
+        long = "wal-segment-size-soft-limit-bytes",
+        env = "INFLUXDB_IOX_WAL_SEGMENT_SIZE_SOFT_LIMIT_BYTES",
+        default_value = "512000000", // 512,000,000
+        action
+    )]
+    pub wal_segment_size_soft_limit_bytes: NonZeroUsize,
+
     /// Sets how many queries the ingester will handle simultaneously before
     /// rejecting further incoming requests.
     #[clap(
@@ -56,7 +66,7 @@ pub struct IngesterConfig {
         default_value = "5",
         action
     )]
-    pub persist_max_parallelism: usize,
+    pub persist_max_parallelism: NonZeroUsize,
 
     /// The maximum number of persist tasks that can be queued at any one time.
     ///
@@ -68,7 +78,7 @@ pub struct IngesterConfig {
         default_value = "250",
         action
     )]
-    pub persist_queue_depth: usize,
+    pub persist_queue_depth: NonZeroUsize,
 
     /// The limit at which a partition's estimated persistence cost causes it to
     /// be queued for persistence.
@@ -102,4 +112,22 @@ pub struct IngesterConfig {
         env = "INFLUXDB_IOX_MAX_PARTITIONS_PER_NAMESPACE"
     )]
     pub max_partitions_per_namespace: Option<NonZeroUsize>,
+
+    /// Limit the memory usage of the ingester by applying a soft usage limit,
+    /// specified in bytes or as a percentage (expressed as 'N%').
+    ///
+    /// Once this limit is reached, this ingester stops accepting write requests
+    /// until the memory usage drops below 2/3rds of this value.
+    ///
+    /// This limit is inexact, and recovery requires allocating additional
+    /// memory to reduce the overall memory pressure. Provide at least 10%
+    /// headroom between this limit and any hard cap imposed on this process.
+    ///
+    /// This limit is applied to the resident set size of the process.
+    #[cfg(feature = "jemalloc")]
+    #[clap(
+        long = "ram-soft-limit-bytes",
+        env = "INFLUXDB_IOX_RAM_SOFT_LIMIT_BYTES"
+    )]
+    pub ram_soft_limit_bytes: Option<crate::memory_size::MemorySize>,
 }

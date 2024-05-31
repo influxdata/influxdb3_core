@@ -159,6 +159,17 @@ pub struct CatalogConfig {
     )]
     pub quorum_fanout: usize,
 
+    /// Maximum delay of write operations that are bundled into a batch.
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/11092>.
+    #[clap(
+        long = "catalog-cache-write-batch-delay",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_WRITE_BATCH_DELAY",
+        default_value = "0s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub write_batch_delay: Duration,
+
     /// gRPC server timeout.
     #[clap(
         long = "catalog-cache-grpc-server-timeout",

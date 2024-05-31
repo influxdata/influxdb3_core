@@ -139,12 +139,8 @@ impl ExtensionPlanner for IOxExtensionPlanner {
                 split_exprs,
             )) as Arc<dyn ExecutionPlan>)
         } else if let Some(gap_fill) = any.downcast_ref::<GapFill>() {
-            let gap_fill_exec = plan_gap_fill(
-                session_state.execution_props(),
-                gap_fill,
-                logical_inputs,
-                physical_inputs,
-            )?;
+            let gap_fill_exec =
+                plan_gap_fill(session_state, gap_fill, logical_inputs, physical_inputs)?;
             Some(Arc::new(gap_fill_exec) as Arc<dyn ExecutionPlan>)
         } else if let Some(sleep) = any.downcast_ref::<SleepNode>() {
             let sleep = sleep.plan(planner, logical_inputs, physical_inputs, session_state)?;

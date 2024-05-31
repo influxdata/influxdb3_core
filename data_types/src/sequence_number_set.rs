@@ -10,8 +10,11 @@ pub struct SequenceNumberSet(croaring::Treemap);
 
 impl SequenceNumberSet {
     /// Add the specified [`SequenceNumber`] to the set.
-    pub fn add(&mut self, n: SequenceNumber) {
-        self.0.add(n.get() as _);
+    ///
+    /// Returns `true` if this call added `n` to the set, or `false` if `n` was
+    /// already present in the set.
+    pub fn add(&mut self, n: SequenceNumber) -> bool {
+        self.0.add_checked(n.get() as _)
     }
 
     /// Remove the specified [`SequenceNumber`] to the set, if present.
@@ -66,6 +69,11 @@ impl SequenceNumberSet {
         let mut map = BTreeMap::new();
         map.insert(0, croaring::Bitmap::with_container_capacity(n));
         Self(croaring::Treemap { map })
+    }
+
+    /// Return `true` if `other` intersects with `self`.
+    pub fn is_intersected_by(&self, other: &Self) -> bool {
+        !self.0.and(&other.0).is_empty()
     }
 }
 
@@ -238,7 +246,7 @@ mod tests {
     /// This matches how the ingester allocates [`SequenceNumber`] - from a u64
     /// source.
     fn sequence_number_vec() -> impl Strategy<Value = Vec<SequenceNumber>> {
-        prop::collection::vec(0..u64::MAX, 0..1024)
+        prop::collection::vec(0_u64..512, 0..1024)
             .prop_map(|vec| vec.into_iter().map(SequenceNumber::new).collect())
     }
 
@@ -272,6 +280,10 @@ mod tests {
 
             // The set intersections should be equal.
             assert_eq!(set_intersection, known_intersection);
+
+            // If there is an intersection then is_intersected_by must return
+            // true.
+            assert_eq!(!set_intersection.is_empty(), set_a.is_intersected_by(&set_b));
         }
 
         /// Perform a SequenceNumberSet remove_set test comparing the results to

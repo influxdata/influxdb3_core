@@ -23,6 +23,9 @@ pub struct SchemaBuilder {
     /// The fields, in order
     fields: Vec<(ArrowField, InfluxColumnType)>,
 
+    /// The elements in the series key
+    series_key: Option<Vec<String>>,
+
     /// If the builder has been consumed
     finished: bool,
 }
@@ -36,8 +39,19 @@ impl SchemaBuilder {
         Self {
             measurement: Default::default(),
             fields: Vec::with_capacity(n),
+            series_key: None,
             finished: Default::default(),
         }
+    }
+
+    /// Add a new tag column to this schema, as part of the series key
+    pub fn series_key(&mut self, column_name: impl Into<String>) -> &mut Self {
+        let sk = self.series_key.get_or_insert_with(Vec::new);
+        let column_name = column_name.into();
+        sk.push(column_name.clone());
+        let influxdb_column_type = InfluxColumnType::Key;
+        let arrow_type = (&influxdb_column_type).into();
+        self.add_column(column_name, false, influxdb_column_type, arrow_type)
     }
 
     /// Add a new tag column to this schema. By default tags are
@@ -73,6 +87,7 @@ impl SchemaBuilder {
     ) -> &mut Self {
         match column_type {
             InfluxColumnType::Tag => self.tag(column_name),
+            InfluxColumnType::Key => self.series_key(column_name),
             InfluxColumnType::Field(influx_field_type) => self
                 .field(column_name, influx_field_type.into())
                 .expect("just converted this from a valid type"),
@@ -132,8 +147,13 @@ impl SchemaBuilder {
         assert!(!self.finished, "build called multiple times");
         self.finished = true;
 
-        Schema::new_from_parts(self.measurement.take(), self.fields.drain(..), false)
-            .context(ValidatingSchemaSnafu)
+        Schema::new_from_parts(
+            self.measurement.take(),
+            self.series_key.take(),
+            self.fields.drain(..),
+            false,
+        )
+        .context(ValidatingSchemaSnafu)
     }
 
     /// Internal helper method to add a column definition

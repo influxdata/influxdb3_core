@@ -26,4 +26,4 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [dev-dependencies]
 datafusion = { workspace = true }
 proptest = { version = "1.4.0", default-features = false, features = ["std"] }
-rand = "0.8.3"
+rand = "0.8.5"

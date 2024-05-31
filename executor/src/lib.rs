@@ -3,6 +3,8 @@
 
 #![warn(missing_docs)]
 
+mod io;
+
 use metric::Registry;
 use snafu::Snafu;
 #[cfg(tokio_unstable)]
@@ -30,6 +32,8 @@ use futures::{
 };
 
 use observability_deps::tracing::warn;
+
+pub use io::{register_current_runtime_for_io, register_io_runtime, spawn_io};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
@@ -123,11 +127,26 @@ impl DedicatedExecutor {
     /// thread to install a Tokio runtime "context"
     /// <https://stackoverflow.com/questions/62536566>
     ///
-    /// If you try to do this from a async context you see something like
+    /// If you try to do this from an async context you see something like
     /// thread 'plan::stringset::tests::test_builder_plan' panicked at 'Cannot
     /// drop a runtime in a context where blocking is not allowed. This
     /// happens when a runtime is dropped from within an asynchronous
     /// context.', .../tokio-1.4.0/src/runtime/blocking/shutdown.rs:51:21
+    ///
+    /// # IO Scheduling
+    ///
+    /// IO, such as network calls, should not be performed on the runtime managed
+    /// by [`DedicatedExecutor`]. As tokio is a cooperative scheduler, long-running
+    /// CPU tasks will not be preempted and can therefore starve servicing of other tasks.
+    /// This manifests in long poll-latencies, where a task is ready to run but isn't
+    /// being scheduled to run. For CPU-bound work this isn't a problem as there is no
+    /// external party, however, for IO tasks, long poll latencies can prevent timely
+    /// servicing of IO, which can have a significant detrimental effect.
+    ///
+    /// As such if [`DedicatedExecutor::new`] is called within the context of
+    /// an existing tokio runtime, this will be passed to [`register_io_runtime`]
+    /// by all threads spawned by the executor. This will allow scheduling IO
+    /// outside the context of [`DedicatedExecutor`] using [`spawn_io`].
     pub fn new(
         name: &str,
         runtime_builder: tokio::runtime::Builder,
@@ -150,11 +169,15 @@ impl DedicatedExecutor {
         let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel();
         let (tx_handle, rx_handle) = std::sync::mpsc::channel();
 
+        let io_handle = tokio::runtime::Handle::try_current().ok();
         let thread = std::thread::Builder::new()
             .name(format!("{name} driver"))
             .spawn(move || {
                 let mut runtime_builder = runtime_builder;
-                let runtime = runtime_builder.build().expect("Creating tokio runtime");
+                let runtime = runtime_builder
+                    .on_thread_start(move || register_io_runtime(io_handle.clone()))
+                    .build()
+                    .expect("Creating tokio runtime");
 
                 WatchdogConfig::new(runtime.handle(), &metric_registry)
                     .with_runtime_name(&name)
@@ -214,7 +237,12 @@ impl DedicatedExecutor {
         TESTING_EXECUTOR
             .get_or_init(|| {
                 let mut runtime_builder = tokio::runtime::Builder::new_current_thread();
-                runtime_builder.enable_all();
+
+                // only enable `time` but NOT the IO integration since IO shouldn't run on the DataFusion runtime
+                // See:
+                // - https://github.com/influxdata/influxdb_iox/issues/10803
+                // - https://github.com/influxdata/influxdb_iox/pull/11030
+                runtime_builder.enable_time();
 
                 Self::new_inner(
                     "testing",
@@ -323,7 +351,7 @@ mod tests {
         sync::{Arc, Barrier},
         time::Duration,
     };
-    use tokio::sync::Barrier as AsyncBarrier;
+    use tokio::{net::TcpListener, sync::Barrier as AsyncBarrier};
 
     #[tokio::test]
     async fn basic() {
@@ -663,5 +691,39 @@ mod tests {
             runtime_builder,
             Arc::new(Registry::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn test_io_runtime() {
+        let io_runtime_id = std::thread::current().id();
+        let dedicated = exec();
+        dedicated
+            .spawn(async move {
+                let dedicated_id = std::thread::current().id();
+                let spawned = spawn_io(async move { std::thread::current().id() }).await;
+
+                assert_ne!(dedicated_id, spawned);
+                assert_eq!(io_runtime_id, spawned);
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_that_testing_executor_prevents_io() {
+        let exec = DedicatedExecutor::new_testing();
+
+        let io_disabled = exec
+            .spawn(async move {
+                // the only way (I've found) to test if IO is enabled is to use it and observer if tokio panics
+                TcpListener::bind("127.0.0.1:0")
+                    .catch_unwind()
+                    .await
+                    .is_err()
+            })
+            .await
+            .unwrap();
+
+        assert!(io_disabled)
     }
 }

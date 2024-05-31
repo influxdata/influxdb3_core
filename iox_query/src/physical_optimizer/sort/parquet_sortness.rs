@@ -98,6 +98,7 @@ fn detect_children_with_desired_ordering(
                     .map(|requirement| requirement.expect("just checked"))
                     .map(PhysicalSortRequirement::to_sort_exprs),
             )
+            .map(|(arc, sort_exprs)| (Arc::clone(arc), sort_exprs))
             .collect(),
     )
 }

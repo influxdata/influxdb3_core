@@ -14,11 +14,12 @@ backoff = { version = "0.1.0", path = "../backoff" }
 base64 = "0.22"
 catalog_cache = { path = "../catalog_cache" }
 client_util = { path = "../client_util" }
+dashmap = "5.5"
 data_types = { path = "../data_types" }
 futures = "0.3"
 generated_types = { path = "../generated_types" }
 hashbrown = "0.14"
-http = "0.2.11"
+http = "0.2.12"
 iox_time = { version = "0.1.0", path = "../iox_time" }
 log = "0.4"
 metric = { version = "0.1.0", path = "../metric" }
@@ -32,8 +33,8 @@ siphasher = "1.0"
 snafu = "0.8"
 sqlx = { version = "0.7.4", features = ["runtime-tokio-rustls", "postgres", "uuid", "sqlite"] }
 sqlx-hotswap-pool = { path = "../sqlx-hotswap-pool" }
-thiserror = "1.0.60"
-tokio = { version = "1.37", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
+thiserror = "1.0.61"
+tokio = { version = "1.38", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
 tonic = { workspace = true }
 trace = { path = "../trace" }
 trace_http = { path = "../trace_http" }

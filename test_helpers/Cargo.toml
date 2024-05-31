@@ -17,8 +17,8 @@ parking_lot = "0.12"
 prometheus-parse = "0.2.5"
 reqwest = { version = "0.12.4", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 tempfile = "3.10.1"
-thiserror = "1.0.60"
-tokio = { version = "1.37.0", default_features = false, features = ["time"] }
+thiserror = "1.0.61"
+tokio = { version = "1.38.0", default_features = false, features = ["time"] }
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

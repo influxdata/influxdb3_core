@@ -33,7 +33,7 @@ use std::{
     fmt::{Display, Write},
     mem::{self, size_of_val},
     num::{FpCategory, NonZeroU64},
-    ops::{Add, Deref, Sub},
+    ops::{Add, AddAssign, Deref, Sub},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -181,6 +181,12 @@ impl Add<u64> for SequenceNumber {
 
     fn add(self, other: u64) -> Self {
         Self(self.0 + other)
+    }
+}
+
+impl AddAssign<u64> for SequenceNumber {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs;
     }
 }
 
@@ -1298,6 +1304,7 @@ impl ColumnSummary {
 #[allow(missing_docs)]
 pub enum InfluxDbType {
     Tag,
+    Key,
     Field,
     Timestamp,
 }

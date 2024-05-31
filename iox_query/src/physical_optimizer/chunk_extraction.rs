@@ -171,6 +171,7 @@ mod tests {
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
         config::TableParquetOptions,
+        execution::context::SessionContext,
         physical_plan::{expressions::Literal, filter::FilterExec},
         prelude::{col, lit},
         scalar::ScalarValue,
@@ -272,8 +273,14 @@ mod tests {
         let chunk1 = chunk(1);
         let schema = chunk1.schema().as_arrow();
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk1)], 2);
+
         let plan = FilterExec::try_new(
-            df_physical_expr(plan.schema(), col("tag1").eq(lit("foo"))).unwrap(),
+            df_physical_expr(
+                &SessionContext::new().state(),
+                plan.schema(),
+                col("tag1").eq(lit("foo")),
+            )
+            .unwrap(),
             plan,
         )
         .unwrap();

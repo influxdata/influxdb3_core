@@ -126,13 +126,7 @@ impl ParquetExecInput {
         session_ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         // Compute final (output) schema after selection
-        let schema = Arc::new(
-            projection
-                .project_schema(&schema)
-                .as_ref()
-                .clone()
-                .with_metadata(Default::default()),
-        );
+        let schema = Arc::new(projection.project_schema(&schema).as_ref().clone());
         let statistics = Statistics::new_unknown(&schema);
         let base_config = FileScanConfig {
             object_store_url: self.object_store_url.clone(),
@@ -574,7 +568,10 @@ mod tests {
         // examine rt metrics
         let rt_metrics = Handle::current().metrics();
         let mut additional_workers_utilized = 0;
-        for worker_id in 0..rt_metrics.num_blocking_threads() {
+        for worker_id in 0..rt_metrics.num_workers()
+            + rt_metrics.num_blocking_threads()
+            + rt_metrics.num_idle_blocking_threads()
+        {
             if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
                 additional_workers_utilized += 1;
             }
@@ -619,7 +616,10 @@ mod tests {
         // examine rt metrics
         let rt_metrics = Handle::current().metrics();
         let mut additional_workers_utilized = 0;
-        for worker_id in 0..rt_metrics.num_blocking_threads() {
+        for worker_id in 0..rt_metrics.num_workers()
+            + rt_metrics.num_blocking_threads()
+            + rt_metrics.num_idle_blocking_threads()
+        {
             if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
                 additional_workers_utilized += 1;
             }
@@ -627,14 +627,17 @@ mod tests {
 
         // note: tokio rt model schedules spawned tasks onto any of it's threads.
         // therefore the 6 column writers will be spawned on any of the 10 threads.
-        // the main pt is that we must have >= 6 (since 6 are running in parallel at any given time)
+        //
+        // The configuration is a maximum of how many threads to be used, and the min being at least 1
+        // additional thread spawned (for a column writer not on the main thread).
         assert!(
-            additional_workers_utilized >= 6,
-            "should have distributed work to additional threads, when using parallelized column writers"
+            additional_workers_utilized > 1,
+            "should have distributed work to additional threads (>1 thread total), when using parallelized column writers; but found {additional_workers_utilized} threads",
         );
         assert!(
             additional_workers_utilized <= 10,
-            "cannot use more than the 10 threads available"
+            "{} additional worker threads;cannot use more than the 10 threads available",
+            additional_workers_utilized,
         );
     }
 
@@ -672,7 +675,10 @@ mod tests {
         // examine rt metrics
         let rt_metrics = Handle::current().metrics();
         let mut additional_workers_utilized = 0;
-        for worker_id in 0..rt_metrics.num_blocking_threads() {
+        for worker_id in 0..rt_metrics.num_workers()
+            + rt_metrics.num_blocking_threads()
+            + rt_metrics.num_idle_blocking_threads()
+        {
             if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
                 additional_workers_utilized += 1;
             }
@@ -681,8 +687,8 @@ mod tests {
         // Since the record batches are streaming we may not utilize all rowgroup writers,
         // but we should have utilized some additional threads.
         assert!(
-            additional_workers_utilized >= 1,
-            "should have distributed work to additional threads, when using parallelized rowgroup writers"
+            additional_workers_utilized > 1,
+            "should have distributed work to additional threads (>1 thread total), when using parallelized rowgroup writers; but found {additional_workers_utilized} threads"
         );
         assert!(
             additional_workers_utilized <= 10,
@@ -897,6 +903,49 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_schema_arrow_metadata_preserved() {
+        // Setup
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
+        let store = ParquetStorage::new(object_store, StorageId::from("iox"));
+        let (partition_id, meta) = meta();
+
+        // Create a basic record batch:
+        let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
+
+        // Extend the created record batch with schema metadata:
+        let schema = Arc::new(
+            batch
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(HashMap::from([(
+                    String::from("iox::measurement::name"),
+                    String::from("foo"),
+                )])),
+        );
+
+        // Recreate the batch with the added metadata in the schema:
+        let upload_batch =
+            RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+
+        // Serialize & upload the record batches, then download it:
+        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, upload_batch.clone()).await;
+        let downloaded_batch = download(
+            &store,
+            &partition_id,
+            &meta,
+            Projection::All,
+            schema,
+            file_size,
+        )
+        .await
+        .unwrap();
+
+        // Check the uploaded and downloaded batches, including their schema, are equal.
+        assert_eq!(upload_batch, downloaded_batch);
     }
 
     #[tokio::test]
