@@ -740,7 +740,8 @@ mod tests {
             create: &[ParquetFileParams],
             target_level: CompactionLevel,
         ) -> iox_catalog::interface::Result<Vec<ParquetFileId>> {
-            self.create_upgrade_delete(partition_id, delete, upgrade, create, target_level)
+            self.inner
+                .create_upgrade_delete(partition_id, delete, upgrade, create, target_level)
                 .await
         }
     }
