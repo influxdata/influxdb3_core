@@ -96,6 +96,26 @@ const IOX_FLIGHT_PARQUET_FILES_RESPONSE_TRAILER: &str = "x-influxdata-parquet-fi
 /// Trailer that describes the peak memory usage of a query.
 const IOX_FLIGHT_MAX_MEMORY_RESPONSE_TRAILER: &str = "x-influxdata-max-memory-bytes";
 
+/// Trailer that describes the latency to planning from ingester response.
+const IOX_FLIGHT_INGESTER_LATENCY_PLAN_RESPONSE_TRAILER: &str =
+    "x-influxdata-ingester-latency-plan";
+
+/// Trailer that describes the latency to all data from ingester response.
+const IOX_FLIGHT_INGESTER_LATENCY_DATA_RESPONSE_TRAILER: &str =
+    "x-influxdata-ingester-latency-data";
+
+/// Trailer that describes the total response rows from the ingester.
+const IOX_FLIGHT_INGESTER_RESPONSE_ROWS_RESPONSE_TRAILER: &str =
+    "x-influxdata-ingester-response-rows";
+
+/// Trailer that describes the total partition count from the ingester.
+const IOX_FLIGHT_INGESTER_PATITION_COUNT_RESPONSE_TRAILER: &str =
+    "x-influxdata-ingester-partition-count";
+
+/// Trailer that describes the total response bytes from the ingester.
+const IOX_FLIGHT_INGESTER_RESPONSE_BYTES_RESPONSE_TRAILER: &str =
+    "x-influxdata-ingester-response-bytes";
+
 /// In which interval should the `DoGet` stream send empty messages as keep alive markers?
 const DO_GET_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -600,7 +620,9 @@ impl FlightService {
             params,
             is_debug,
         } = request;
-        let namespace_name = database.as_str();
+        let namespace: Arc<str> = database.into();
+        let namespace_name = Arc::clone(&namespace);
+        let namespace_name = namespace_name.as_ref();
 
         let db = server
             .namespace(
@@ -631,29 +653,28 @@ impl FlightService {
         );
 
         let ctx = db.new_query_context(span_ctx, query_config);
-        let physical_plan_res = match &query {
-            RunQuery::Sql(sql_query) => Planner::new(&ctx)
-                .sql(sql_query, params)
-                .await
-                .with_context(|_| PlanningSnafu {
-                    namespace_name,
-                    query: query.to_string(),
-                }),
-            RunQuery::InfluxQL(sql_query) => Planner::new(&ctx)
-                .influxql(sql_query, params)
-                .await
-                .with_context(|_| PlanningSnafu {
-                    namespace_name,
-                    query: query.to_string(),
-                }),
-            RunQuery::FlightSQL(msg) => Planner::new(&ctx)
-                .flight_sql_do_get(namespace_name, db, msg.clone())
-                .await
-                .with_context(|_| PlanningSnafu {
-                    namespace_name,
-                    query: query.to_string(),
-                }),
-        };
+        let planner = Planner::new(&ctx);
+        let query = Arc::new(query);
+
+        let q = Arc::clone(&query);
+        let ns = Arc::clone(&namespace);
+        // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
+        let physical_plan_res = ctx
+            .run(async move {
+                match q.as_ref() {
+                    RunQuery::Sql(sql_query) => planner.sql(sql_query, params).await,
+                    RunQuery::InfluxQL(sql_query) => planner.influxql(sql_query, params).await,
+                    RunQuery::FlightSQL(msg) => {
+                        planner.flight_sql_do_get(&ns, db, msg.clone()).await
+                    }
+                }
+            })
+            .await
+            .with_context(|_| PlanningSnafu {
+                namespace_name,
+                query: query.to_string(),
+            });
+
         let (physical_plan, query_completed_token) = match physical_plan_res {
             Ok(physical_plan) => {
                 let query_completed_token =
@@ -681,7 +702,7 @@ impl FlightService {
         let output = output.map(move |res| {
             if let Err(e) = &res {
                 info!(
-                    %database,
+                    %namespace,
                     %query,
                     trace=external_span_ctx.format_jaeger().as_str(),
                     %e,
@@ -886,8 +907,16 @@ impl Flight for FlightService {
             })?;
 
         let ctx = db.new_query_context(span_ctx, None);
-        let schema = Planner::new(&ctx)
-            .flight_sql_get_flight_info_schema(&namespace_name, cmd.clone())
+        let ns_name = namespace_name.clone();
+        let planner = Planner::new(&ctx);
+        let cmd_captured = cmd.clone();
+        // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
+        let schema = ctx
+            .run(async move {
+                planner
+                    .flight_sql_get_flight_info_schema(&ns_name, cmd_captured)
+                    .await
+            })
             .await
             .context(PlanningSnafu {
                 namespace_name: &namespace_name,
@@ -973,8 +1002,16 @@ impl Flight for FlightService {
             })?;
 
         let ctx = db.new_query_context(span_ctx, None);
-        let app_metadata = Planner::new(&ctx)
-            .flight_sql_do_put(&namespace_name, db, cmd.clone(), stream)
+        let planner = Planner::new(&ctx);
+        let name_captured = namespace_name.clone();
+        let cmd_captured = cmd.clone();
+        // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
+        let app_metadata = ctx
+            .run(async move {
+                planner
+                    .flight_sql_do_put(&name_captured, db, cmd_captured, stream)
+                    .await
+            })
             .await
             .context(PlanningSnafu {
                 namespace_name: &namespace_name,
@@ -1029,8 +1066,16 @@ impl Flight for FlightService {
             })?;
 
         let ctx = db.new_query_context(span_ctx, query_config.as_ref());
-        let body = Planner::new(&ctx)
-            .flight_sql_do_action(&namespace_name, db, cmd.clone())
+        let planner = Planner::new(&ctx);
+        let name_captured = namespace_name.clone();
+        let cmd_captured = cmd.clone();
+        // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
+        let body = ctx
+            .run(async move {
+                planner
+                    .flight_sql_do_action(&name_captured, db, cmd_captured)
+                    .await
+            })
             .await
             .context(PlanningSnafu {
                 namespace_name: &namespace_name,
@@ -1341,6 +1386,7 @@ impl QueryResponseMetadata {
             success: _,
             running: _,
             phase: _,
+            ingester_metrics,
         } = state.as_ref();
 
         Self::write_trailer_duration(
@@ -1370,6 +1416,31 @@ impl QueryResponseMetadata {
             *parquet_files,
         );
         Self::write_trailer_count(md, IOX_FLIGHT_MAX_MEMORY_RESPONSE_TRAILER, *max_memory);
+        Self::write_trailer_duration(
+            md,
+            IOX_FLIGHT_INGESTER_LATENCY_PLAN_RESPONSE_TRAILER,
+            ingester_metrics.map(|x| x.latency_to_plan),
+        );
+        Self::write_trailer_duration(
+            md,
+            IOX_FLIGHT_INGESTER_LATENCY_DATA_RESPONSE_TRAILER,
+            ingester_metrics.map(|x| x.latency_to_full_data),
+        );
+        Self::write_trailer_count(
+            md,
+            IOX_FLIGHT_INGESTER_RESPONSE_ROWS_RESPONSE_TRAILER,
+            ingester_metrics.map(|x| x.response_rows as i64),
+        );
+        Self::write_trailer_count(
+            md,
+            IOX_FLIGHT_INGESTER_PATITION_COUNT_RESPONSE_TRAILER,
+            ingester_metrics.map(|x| x.partition_count as i64),
+        );
+        Self::write_trailer_count(
+            md,
+            IOX_FLIGHT_INGESTER_RESPONSE_BYTES_RESPONSE_TRAILER,
+            ingester_metrics.map(|x| x.response_size as i64),
+        );
     }
 }
 

@@ -128,9 +128,7 @@ use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
-use datafusion::logical_expr::{
-    binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, GetIndexedField, Operator,
-};
+use datafusion::logical_expr::{binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, Operator};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::prelude::{when, Column};
@@ -400,6 +398,12 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
                     (.., DataType::Timestamp(..)) => no(expr),
 
                     //
+                    // Two duration literals (represented in Datafusion as Intervals) are allowed as operands
+                    // and should pass through to DataFusion.
+                    //
+                    (DataType::Interval(..), _, DataType::Interval(..)) => no(expr),
+
+                    //
                     // Unhandled binary expressions with conditional operators
                     // should return `false`.
                     //
@@ -431,13 +435,6 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
             Expr::AggregateFunction(AggregateFunction { ref args, .. } )
             | Expr::WindowFunction(WindowFunction { ref args, .. } ) => match &args[0] {
                Expr::Column(Column { ref name, ..  }) if schema.is_tag_field(name) => yes(lit(ScalarValue::Null)),
-               _ => no(expr),
-            }
-
-            // If the InfluxQL query used a selector on a tag column,  like `last(tag_col)`
-            // then there will be an indexed field. Convert this to `NULL` as well.
-            Expr::GetIndexedField(GetIndexedField { expr: ref e, .. }) => match e.as_ref() {
-               Expr::Literal(ScalarValue::Null) => yes(lit(ScalarValue::Null)),
                _ => no(expr),
             }
 
@@ -675,6 +672,44 @@ mod test {
 
         let expr = binary_expr("tag0".as_expr(), Operator::RegexNotMatch, lit("foo"));
         assert_eq!(rewrite(expr), r#"tag0 !~ Utf8("foo")"#);
+
+        // duration expressions
+        let expr = binary_expr(
+            lit(ScalarValue::IntervalMonthDayNano(Some(1))),
+            Operator::Lt,
+            lit(ScalarValue::IntervalMonthDayNano(Some(1000000000))),
+        );
+        assert_eq!(
+            rewrite(expr),
+            r#"IntervalMonthDayNano("1") < IntervalMonthDayNano("1000000000")"#
+        );
+
+        let expr = lit(ScalarValue::IntervalMonthDayNano(Some(1)))
+            + lit(ScalarValue::IntervalMonthDayNano(Some(1000000000)));
+        assert_eq!(
+            rewrite(expr),
+            r#"IntervalMonthDayNano("1") + IntervalMonthDayNano("1000000000")"#
+        );
+    }
+
+    /// Verifies that some conditional operators between invalid types are rewritten as boolean FALSE
+    #[test]
+    fn test_unhandled_operand_types() {
+        test_helpers::maybe_start_logging();
+        let schemas = new_schema();
+        let rewrite = |expr| {
+            rewrite_expr(expr, &schemas)
+                .map(|t| t.data)
+                .unwrap()
+                .to_string()
+        };
+        // Duration + integer operators
+        let expr = binary_expr(
+            lit("1"),
+            Operator::Eq,
+            lit(ScalarValue::IntervalMonthDayNano(Some(1000000000))),
+        );
+        assert_eq!(rewrite(expr), "Boolean(false)");
     }
 
     fn execution_props() -> ExecutionProps {

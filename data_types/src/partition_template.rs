@@ -96,13 +96,23 @@
 //! allow splitting graphemes, but by being conservative we give ourselves this
 //! option - we can't easily do the reverse!
 //!
-//! ## Part Limit & Maximum Key Size
+//! ## Part Limits & Maximum Key Size
 //!
 //! The number of parts in a partition template is limited to 8
 //! ([`MAXIMUM_NUMBER_OF_TEMPLATE_PARTS`]), validated at creation time.
 //!
 //! Together with the above value truncation, this bounds the maximum length of
 //! a partition key to 1,607 bytes (1.57 KiB).
+//!
+//! ### Required Parts
+//!
+//! Any partition template for a _newly_ created record (namespace or table)
+//! MUST contain a [`TemplatePart::TimeFormat`] part. Partition templates for
+//! pre-existing records are allowed to forgoe this requirement as no reasonable
+//! migration path existed at the time this extra validation was introduced.
+//!
+//! Partitioning without time has bad long-term performance implications, but
+//! existing tables set up in this way must continue to operate in some manner.
 //!
 //! ### Reserved Characters
 //!
@@ -235,6 +245,13 @@ pub enum ValidationError {
     /// [`Bucket`]: [`proto::template_part::Part::Bucket`]
     #[error("tag name value cannot be repeated in partition template: {0}")]
     RepeatedTagValue(String),
+
+    /// An attempt to make a new partition template without a [`TimeFormat`]
+    /// part has been made. This is not allowed.
+    ///
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
+    #[error("partition template must include a time format part")]
+    TimeFormatPartRequired,
 }
 
 /// The maximum number of template parts a custom partition template may specify, to limit the
@@ -364,6 +381,19 @@ pub fn bucket_for_tag_value(tag_value: &str, num_buckets: u32) -> u32 {
 ///
 /// Internally this type is [`None`] when no namespace-level override is
 /// specified, resulting in the default being used.
+///
+/// When creating a partition template for a namespace that does not yet have a
+/// record you MUST use [`try_new()`]. This performs additional validation
+/// checks which are not done by [`try_from()`].
+///
+/// This discrepancy exists because the additional validation checks were
+/// added at a later date to prevent creation of typically problematic
+/// partitioning schemes. Some clusters may already contain namespaces with
+/// these schemes in their catalog and must continue to function, as they
+/// were valid at time of creation and are still 'operable'.
+///
+/// [`try_new()`]: NamespacePartitionTemplateOverride::try_new()
+/// [`try_from()`]: NamespacePartitionTemplateOverride::try_from()
 #[derive(Debug, PartialEq, Clone, Default, sqlx::Type, Hash)]
 #[sqlx(transparent, no_pg_array)]
 pub struct NamespacePartitionTemplateOverride(Option<serialization::Wrapper>);
@@ -372,6 +402,31 @@ impl NamespacePartitionTemplateOverride {
     /// A const "default" impl for testing.
     pub const fn const_default() -> Self {
         Self(None)
+    }
+
+    /// When a new namespace is created, the request to do so may include a
+    /// custom partition template. This must be validated before use, with
+    /// additional constraints applied to new namespaces.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template
+    /// specified is invalid. If `partition_template` does not contain a
+    /// [`TimeFormat`] part it will also be rejected.
+    ///    
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
+    pub fn try_new(partition_template: proto::PartitionTemplate) -> Result<Self, ValidationError> {
+        let namespace_template = Self::try_from(partition_template)?;
+
+        let template_contains_time_format = namespace_template
+            .parts()
+            .any(|p| matches!(p, TemplatePart::TimeFormat(_)));
+
+        if !template_contains_time_format {
+            return Err(ValidationError::TimeFormatPartRequired);
+        }
+
+        Ok(namespace_template)
     }
 
     /// Return the protobuf representation of this template.
@@ -390,6 +445,15 @@ impl NamespacePartitionTemplateOverride {
 impl TryFrom<proto::PartitionTemplate> for NamespacePartitionTemplateOverride {
     type Error = ValidationError;
 
+    /// An existing namepsace pulled from the catalog may contain a valid, but since
+    /// disallowed partition template that would fail the validation checks
+    /// performed by [`NamespacePartitionTemplateOverride::try_new()`].
+    ///
+    /// This function
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template specified is invalid.
     fn try_from(partition_template: proto::PartitionTemplate) -> Result<Self, Self::Error> {
         Ok(Self(Some(serialization::Wrapper::try_from(
             partition_template,
@@ -398,19 +462,74 @@ impl TryFrom<proto::PartitionTemplate> for NamespacePartitionTemplateOverride {
 }
 
 /// A partition template specified by a table record.
+///
+/// When creating a partition template for a table that does not yet have a
+/// record you MUST use [`try_new()`]. This performs additional validation
+/// checks which are not done by [`try_from_existing()`].
+///
+/// This discrepancy exists because the additional validation checks were
+/// added at a later date to prevent creation of typically problematic
+/// partitioning schemes. Some clusters may already contain tables with these
+/// schemes in their catalog and must continue to function, as they were valid
+/// at time of creation and are still 'operable'.
+///  
+///
+/// [`try_new()`]: TablePartitionTemplateOverride::try_new()
+/// [`try_from_existing()`]: TablePartitionTemplateOverride::try_from_existing()
 #[derive(Debug, PartialEq, Eq, Clone, Default, sqlx::Type, Hash)]
 #[sqlx(transparent, no_pg_array)]
 pub struct TablePartitionTemplateOverride(Option<serialization::Wrapper>);
 
 impl TablePartitionTemplateOverride {
-    /// When a table is being explicitly created, the creation request might have contained a
-    /// custom partition template for that table. If the custom partition template is present, use
+    /// When a new table is being explicitly created, the request to do so may
+    /// include a custom partition template which overrides the namespace level
+    /// partitioning scheme. If the custom partition template is present, use
     /// it. Otherwise, use the namespace's partition template.
     ///
     /// # Errors
     ///
-    /// This function will return an error if the custom partition template specified is invalid.
+    /// This function will return an error if the custom partition template
+    /// specified is invalid. If `custom_table_template` does not contain a
+    /// [`TimeFormat`] part it will also be rejected.
+    ///    
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
     pub fn try_new(
+        custom_table_template: Option<proto::PartitionTemplate>,
+        namespace_template: &NamespacePartitionTemplateOverride,
+    ) -> Result<Self, ValidationError> {
+        // If a custom table template was specified for the new table and no
+        // part in it is a [`TimeFormat`] part then it should not be created.
+        if custom_table_template
+            .as_ref()
+            .is_some_and(|table_template| {
+                !table_template.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        proto::TemplatePart {
+                            part: Some(proto::template_part::Part::TimeFormat(..))
+                        }
+                    )
+                })
+            })
+        {
+            return Err(ValidationError::TimeFormatPartRequired);
+        }
+
+        let table = Self::try_from_existing(custom_table_template, namespace_template)?;
+
+        Ok(table)
+    }
+
+    /// An existing table pulled from the catalog may contain a valid, but since
+    /// disallowed partition template that would fail the validation checks
+    /// performed by [`TablePartitionTemplateOverride::try_new()`].
+    ///
+    /// This function
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template specified is invalid.
+    pub fn try_from_existing(
         custom_table_template: Option<proto::PartitionTemplate>,
         namespace_template: &NamespacePartitionTemplateOverride,
     ) -> Result<Self, ValidationError> {
@@ -1073,6 +1192,35 @@ mod tests {
         let err = serialization::Wrapper::try_from(proto::PartitionTemplate { parts: vec![] });
 
         assert_error!(err, ValidationError::NoParts);
+    }
+
+    #[test]
+    fn new_namespace_template_requires_time_format() {
+        // Without tag value
+        assert_matches!(
+            NamespacePartitionTemplateOverride::try_new(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("region".into())),
+                }]
+            }),
+            Err(ValidationError::TimeFormatPartRequired)
+        );
+        // Adding tag value to same template results in acceptance.
+        assert_matches!(
+            NamespacePartitionTemplateOverride::try_new(proto::PartitionTemplate {
+                parts: vec![
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TagValue("region".into())),
+                    },
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                    },
+                ]
+            }),
+            Ok(v) => {
+                assert_eq!(v.parts().count(), 2);
+            }
+        );
     }
 
     #[test]
@@ -1904,7 +2052,7 @@ mod tests {
         let ns = NamespacePartitionTemplateOverride::default();
         let got_ns = ns.parts().collect::<Vec<_>>();
         assert_matches!(got_ns.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
-        let table = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
+        let table = TablePartitionTemplateOverride::try_from_existing(None, &ns).unwrap();
         let got_table = table.parts().collect::<Vec<_>>();
         assert_matches!(got_table.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
     }
@@ -1912,7 +2060,7 @@ mod tests {
     #[test]
     fn len_of_default_template_is_1() {
         let ns = NamespacePartitionTemplateOverride::default();
-        let t = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
+        let t = TablePartitionTemplateOverride::try_from_existing(None, &ns).unwrap();
 
         assert_eq!(t.len(), 1);
     }
@@ -1927,18 +2075,23 @@ mod tests {
             })
             .unwrap();
         let table_template =
-            TablePartitionTemplateOverride::try_new(None, &namespace_template).unwrap();
+            TablePartitionTemplateOverride::try_from_existing(None, &namespace_template).unwrap();
 
         assert_eq!(table_template.len(), 1);
         assert_eq!(table_template.0, namespace_template.0);
     }
 
     #[test]
-    fn custom_table_template_specified_ignores_namespace_template() {
+    fn custom_table_template_with_time_specified_overrides_namespace_template() {
         let custom_table_template = proto::PartitionTemplate {
-            parts: vec![proto::TemplatePart {
-                part: Some(proto::template_part::Part::TagValue("region".into())),
-            }],
+            parts: vec![
+                proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("region".into())),
+                },
+                proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TimeFormat("%Y".into())),
+                },
+            ],
         };
         let namespace_template =
             NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
@@ -1947,9 +2100,43 @@ mod tests {
                 }],
             })
             .unwrap();
-        let table_template = TablePartitionTemplateOverride::try_new(
+        let table_template = TablePartitionTemplateOverride::try_from_existing(
             Some(custom_table_template.clone()),
             &namespace_template,
+        )
+        .unwrap();
+
+        assert_eq!(table_template.len(), 2);
+        assert_eq!(table_template.0.unwrap().inner(), &custom_table_template);
+    }
+
+    #[test]
+    fn new_custom_table_template_requires_time_specified() {
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("region".into())),
+            }],
+        };
+        assert_matches!(
+            TablePartitionTemplateOverride::try_new(
+                Some(custom_table_template.clone()),
+                &NamespacePartitionTemplateOverride::default(),
+            ),
+            Err(ValidationError::TimeFormatPartRequired)
+        );
+    }
+
+    #[test]
+    fn existing_custom_table_template_does_not_require_time_specified() {
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("region".into())),
+            }],
+        };
+
+        let table_template = TablePartitionTemplateOverride::try_from_existing(
+            Some(custom_table_template.clone()),
+            &NamespacePartitionTemplateOverride::default(),
         )
         .unwrap();
 
@@ -2003,7 +2190,7 @@ mod tests {
         let namespace_json_str: String = buf.iter().map(extract_sqlite_argument_text).collect();
         assert_eq!(namespace_json_str, expected_json_str);
 
-        let table = TablePartitionTemplateOverride::try_new(None, &namespace).unwrap();
+        let table = TablePartitionTemplateOverride::try_from_existing(None, &namespace).unwrap();
         let mut buf = Default::default();
         let _ = <TablePartitionTemplateOverride as Encode<'_, sqlx::Sqlite>>::encode_by_ref(
             &table, &mut buf,
@@ -2019,13 +2206,13 @@ mod tests {
             + std::mem::size_of::<proto::PartitionTemplate>();
 
         let first_string = "^";
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::TagValue(first_string.into())),
                 }],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template ");
 
@@ -2035,13 +2222,13 @@ mod tests {
         );
 
         let second_string = "region";
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::TagValue(second_string.into())),
                 }],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template ");
 
@@ -2051,7 +2238,7 @@ mod tests {
         );
 
         let time_string = "year-%Y";
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![
                     proto::TemplatePart {
@@ -2062,7 +2249,7 @@ mod tests {
                     },
                 ],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template ");
         assert_eq!(
@@ -2074,7 +2261,7 @@ mod tests {
                 + time_string.len()
         );
 
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::Bucket(proto::Bucket {
@@ -2083,7 +2270,7 @@ mod tests {
                     })),
                 }],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template");
         assert_eq!(

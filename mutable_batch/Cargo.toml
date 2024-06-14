@@ -15,7 +15,7 @@ arrow_util = { path = "../arrow_util" }
 data_types = { path = "../data_types" }
 hashbrown = { workspace = true }
 iox_time = { path = "../iox_time" }
-itertools = "0.12"
+itertools = "0.13"
 proptest = { version = "1.4.0", default-features = false, optional = true }
 schema = { path = "../schema" }
 snafu = "0.8"

@@ -41,11 +41,20 @@ message TableBatch {
     // (the time column is always last in the sort order).
     repeated Column columns = 2;
 
+    // The series key for 
+    optional SeriesKey series_key = 5;
+
     // Length of all columns in this table batch.
     // This count includes null and non-null values.
     //
     // All columns in a TableBatch must have equal length.
     uint32 row_count = 3;
+}
+
+// The names of columns that are part of a table's series key
+message SeriesKey {
+    // The column names, in their correct order
+    repeated string members = 1;
 }
 
 // A list of strings encoded as a contiguous string payload and a list of

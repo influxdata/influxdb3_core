@@ -66,6 +66,8 @@ pub struct MutableBatch {
     /// Columns contained within this MutableBatch
     columns: Vec<Column>,
 
+    series_key: Option<Vec<String>>,
+
     /// The number of rows in this MutableBatch
     row_count: usize,
 }
@@ -76,6 +78,7 @@ impl MutableBatch {
         Self {
             column_names: Default::default(),
             columns: Default::default(),
+            series_key: None,
             row_count: 0,
         }
     }
@@ -92,11 +95,16 @@ impl MutableBatch {
                     schema_builder.influx_column(column_name, column.influx_type());
                 }
 
+                if let Some(sk) = self.series_key.as_ref() {
+                    schema_builder.with_series_key(sk);
+                }
+
                 schema_builder
                     .build()
                     .context(InternalSchemaSnafu)?
                     .sort_fields_by_name()
             }
+            // TODO: do we include the series key when projecting subset of columns?
             Projection::Some(cols) => {
                 for col in cols {
                     let column = self.column(col)?;
@@ -255,8 +263,33 @@ impl MutableBatch {
         Self {
             column_names: self.column_names.clone(),
             columns: self.columns.iter_mut().map(|v| v.split_off(n)).collect(),
+            series_key: self.series_key.clone(),
             row_count: right_row_count,
         }
+    }
+
+    /// Get the series key, if the batch has one
+    pub fn series_key(&self) -> Option<&[String]> {
+        self.series_key.as_deref()
+    }
+
+    /// Set the series key for this batch
+    pub fn set_series_key<I>(&mut self, columns: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        self.series_key = Some(
+            columns
+                .into_iter()
+                .map(|c| c.as_ref().to_string())
+                .collect(),
+        )
+    }
+
+    /// Is this a new MutableBatch that has not been written to yet
+    pub fn is_new(&self) -> bool {
+        self.columns.is_empty() && self.row_count == 0 && self.series_key.is_none()
     }
 }
 
@@ -531,6 +564,7 @@ pub mod arbitrary {
                 let c = MutableBatch {
                     column_names: [(column_name(&v), 0)].into_iter().collect(),
                     row_count: v.len(),
+                    series_key: None,
                     columns: vec![v],
                 };
 

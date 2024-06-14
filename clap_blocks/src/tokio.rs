@@ -39,7 +39,8 @@ macro_rules! tokio_rt_config {
         name = $name:ident ,
         num_threads_arg = $num_threads_arg:expr ,
         num_threads_env = $num_threads_env:expr ,
-        default_thread_priority = $default_thread_priority:expr $(,)?
+        default_thread_priority = $default_thread_priority:expr,
+        enable_io = $enable_io:expr $(,)?
     ) => {
         paste! {
             #[doc = "CLI config for tokio " $name " runtime."]
@@ -168,8 +169,13 @@ macro_rules! tokio_rt_config {
                         }
                     };
 
-                    // enable all subsystem
-                    builder.enable_all();
+                    // enable subsystems
+                    // - always enable timers
+                    // - only enable IO for some runtimes (per macro parameter), see https://github.com/influxdata/influxdb_iox/issues/10803
+                    builder.enable_time();
+                    if $enable_io {
+                        builder.enable_io();
+                    }
 
                     // set up proper thread names
                     let thread_counter = Arc::new(AtomicUsize::new(1));
@@ -246,6 +252,7 @@ tokio_rt_config!(
     num_threads_arg = "num-threads",
     num_threads_env = "INFLUXDB_IOX_NUM_THREADS",
     default_thread_priority = None,
+    enable_io = true,
 );
 
 tokio_rt_config!(
@@ -253,6 +260,8 @@ tokio_rt_config!(
     num_threads_arg = "datafusion-num-threads",
     num_threads_env = "INFLUXDB_IOX_DATAFUSION_NUM_THREADS",
     default_thread_priority = "10",
+    // see https://github.com/influxdata/influxdb_iox/issues/10803
+    enable_io = false,
 );
 
 #[cfg(test)]
@@ -260,7 +269,9 @@ mod tests {
     use super::*;
 
     use clap::Parser;
-    use std::ffi::OsString;
+    use futures::FutureExt;
+    use std::{ffi::OsString, future::Future};
+    use tokio::net::TcpListener;
 
     #[cfg(unix)]
     #[test]
@@ -303,14 +314,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_io() {
+        assert_runtime_thread_property_async(
+            TokioIoConfig::parse_from(std::iter::empty::<OsString>())
+                .builder()
+                .unwrap(),
+            || async move {
+                assert!(is_io_enabled().await);
+            },
+        );
+        assert_runtime_thread_property_async(
+            TokioDatafusionConfig::parse_from(std::iter::empty::<OsString>())
+                .builder()
+                .unwrap(),
+            || async move {
+                assert!(!is_io_enabled().await);
+            },
+        );
+    }
+
     #[track_caller]
-    fn assert_runtime_thread_property<F>(mut builder: tokio::runtime::Builder, f: F)
+    fn assert_runtime_thread_property<F>(builder: tokio::runtime::Builder, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
+        assert_runtime_thread_property_async(builder, || async move { f() });
+    }
+
+    #[track_caller]
+    fn assert_runtime_thread_property_async<F, Fut>(mut builder: tokio::runtime::Builder, f: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let rt = builder.build().unwrap();
         rt.block_on(async move {
-            tokio::spawn(async move { f() }).await.unwrap();
+            tokio::spawn(async move { f().await }).await.unwrap();
         });
     }
 
@@ -327,5 +367,13 @@ mod tests {
         let tname = thread.name().expect("thread is named");
 
         assert!(tname.starts_with(prefix), "Invalid thread name: {tname}",);
+    }
+
+    async fn is_io_enabled() -> bool {
+        // the only way (I've found) to test if IO is enabled is to use it and observer if tokio panics
+        TcpListener::bind("127.0.0.1:0")
+            .catch_unwind()
+            .await
+            .is_ok()
     }
 }

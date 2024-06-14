@@ -103,7 +103,10 @@ use arrow::datatypes::{DataType, Field};
 use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
     error::Result as DataFusionResult,
-    logical_expr::{function::AccumulatorArgs, AggregateUDF, Signature, Volatility},
+    logical_expr::{
+        function::{AccumulatorArgs, StateFieldsArgs},
+        AggregateUDF, Signature, Volatility,
+    },
     physical_plan::{expressions::format_state_name, Accumulator},
     prelude::SessionContext,
 };
@@ -305,16 +308,18 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
 
     fn state_fields(
         &self,
-        name: &str,
-        value_type: DataType,
-        _ordering_fields: Vec<arrow::datatypes::Field>,
+        args: StateFieldsArgs<'_>,
     ) -> DataFusionResult<Vec<arrow::datatypes::Field>> {
-        let fields = AggType::try_from_return_type(&value_type)?
+        let fields = AggType::try_from_return_type(args.return_type)?
             .state_datatypes()
             .into_iter()
             .enumerate()
             .map(|(i, data_type)| {
-                Field::new(format_state_name(name, &format!("{i}")), data_type, true)
+                Field::new(
+                    format_state_name(args.name, &format!("{i}")),
+                    data_type,
+                    true,
+                )
             })
             .collect::<Vec<_>>();
 

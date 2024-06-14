@@ -25,13 +25,13 @@ pbjson-types = { workspace = true }
 prost = { workspace = true }
 schema = { path = "../schema" }
 snafu = "0.8"
-thiserror = "1.0.60"
+thiserror = "1.0.61"
 thrift = "0.17"
-tokio = { version = "1.37", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1.38", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = { version = "0.13", default-features = false }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-rand = "0.8.3"
+rand = "0.8.5"
 test_helpers = { version = "0.1.0", path = "../test_helpers" }

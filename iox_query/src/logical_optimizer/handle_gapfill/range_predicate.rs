@@ -34,7 +34,7 @@ struct TimeRangeVisitor {
     range: TimeRange,
 }
 
-impl TreeNodeVisitor for TimeRangeVisitor {
+impl TreeNodeVisitor<'_> for TimeRangeVisitor {
     type Node = LogicalPlan;
 
     fn f_down(&mut self, plan: &LogicalPlan) -> Result<TreeNodeRecursion> {
@@ -118,9 +118,9 @@ impl TimeRange {
     // this time range to reflect that.
     fn with_expr(self, schema: &DFSchema, time_col: &Column, expr: &Expr) -> Result<Self> {
         let is_time_col = |e| -> Result<bool> {
-            match Expr::try_into_col(e) {
-                Ok(col) => Ok(schema.index_of_column(&col)? == schema.index_of_column(time_col)?),
-                Err(_) => Ok(false),
+            match Expr::try_as_col(e) {
+                Some(col) => Ok(schema.index_of_column(col)? == schema.index_of_column(time_col)?),
+                None => Ok(false),
             }
         };
 

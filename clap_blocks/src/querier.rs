@@ -33,7 +33,10 @@ pub struct QuerierConfig {
     ///
     /// Should not be higher than `--num-query-threads`/`INFLUXDB_IOX_NUM_QUERY_THREADS`.
     ///
-    /// Defaults to `--num-query-threads`/`INFLUXDB_IOX_NUM_QUERY_THREADS` or -- if not specified -- the CPU core count.
+    /// Defaults to the minimum of:
+    /// - constant: `4`
+    /// - half of query threads: half of `--num-query-threads`/`INFLUXDB_IOX_NUM_QUERY_THREADS` or -- if not specified
+    ///   -- half of the the CPU core count, but at least 1
     #[clap(
         long = "num-query-partitions",
         env = "INFLUXDB_IOX_NUM_QUERY_PARTITIONS",

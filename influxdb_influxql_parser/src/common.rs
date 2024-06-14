@@ -19,10 +19,24 @@ use std::ops::{Deref, DerefMut};
 
 /// A error returned when parsing an InfluxQL query, expressions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{message} at pos {pos}")]
 pub struct ParseError {
     pub(crate) message: String,
     pub(crate) pos: usize,
+    pub(crate) details: Option<String>,
+}
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self {
+            message,
+            pos,
+            details,
+        } = self;
+        match details {
+            Some(details) => write!(f, "{message} at pos {pos}. {details}"),
+            None => write!(f, "{message} at pos {pos}"),
+        }
+    }
 }
 
 /// Represents a measurement name as either an identifier or a regular expression.

@@ -25,28 +25,9 @@ pub(crate) enum Error {
 impl From<Error> for CatalogError {
     fn from(err: Error) -> Self {
         match &err {
-            Error::Catalog { source } => match source.as_ref() {
-                Self::External { .. } => Self::External {
-                    source: Box::new(err),
-                },
-                Self::AlreadyExists { descr } => Self::AlreadyExists {
-                    descr: descr.clone(),
-                },
-                Self::LimitExceeded { descr } => Self::LimitExceeded {
-                    descr: descr.clone(),
-                },
-                Self::NotFound { descr } => Self::NotFound {
-                    descr: descr.clone(),
-                },
-                Self::Malformed { descr } => Self::Malformed {
-                    descr: descr.clone(),
-                },
-                Self::NotImplemented { descr } => Self::NotImplemented {
-                    descr: descr.clone(),
-                },
-            },
+            Error::Catalog { source } => source.as_ref().clone(),
             Error::Join { .. } => Self::External {
-                source: Box::new(err),
+                source: Arc::new(err),
             },
         }
     }

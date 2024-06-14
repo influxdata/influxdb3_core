@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::str::FromStr;
 
 use crate::{
     check_flight_error, run_influxql, run_influxql_with_params, run_sql, run_sql_with_params,
@@ -8,6 +9,7 @@ use crate::{
 use crate::{snapshot_comparison::Language, ServerType};
 use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_sorted_eq;
+use data_types::{ObjectStoreId, ParquetFile};
 use futures::future::BoxFuture;
 use http::StatusCode;
 use iox_query_params::StatementParams;
@@ -115,6 +117,43 @@ impl<'a> StepTestState<'a> {
             .await
             .map(|parquet_files| parquet_files.len())
             .unwrap_or_default()
+    }
+
+    /// Get object_store_ids for parquet files
+    pub async fn get_object_store_ids(&self, table_name: &str) -> Vec<ObjectStoreId> {
+        let connection = self.cluster.router().router_grpc_connection();
+        let mut catalog_client = influxdb_iox_client::catalog::Client::new(connection);
+
+        catalog_client
+            .get_parquet_files_by_namespace_table(self.cluster.namespace(), table_name)
+            .await
+            .map(|parquet_files| {
+                parquet_files
+                    .into_iter()
+                    .map(|pf| {
+                        ObjectStoreId::from_str(&pf.object_store_id).expect("should be valid uuid")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get parquet_file by table_name
+    pub async fn get_parquet_file_by_table_name(
+        &self,
+        namespace_name: &str,
+        table_name: &str,
+    ) -> Vec<ParquetFile> {
+        let connection = self.cluster.router().router_grpc_connection();
+        let mut catalog_client = influxdb_iox_client::catalog::Client::new(connection);
+
+        catalog_client
+            .get_parquet_files_by_namespace_table(namespace_name, table_name)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pf| pf.try_into().expect("should be valid parquet file"))
+            .collect()
     }
 
     /// waits for `MAX_QUERY_RETRY_TIME_SEC` for the database to

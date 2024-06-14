@@ -50,6 +50,16 @@ impl Client {
         Ok(response.into_inner().partitions)
     }
 
+    /// Get the partition by id
+    pub async fn get_partition_by_id(&mut self, id: i64) -> Result<Option<Partition>, Error> {
+        let response = self
+            .inner
+            .get_partition_by_id(GetPartitionByIdRequest { id })
+            .await?;
+
+        Ok(response.into_inner().partition)
+    }
+
     /// Get the columns by table id
     pub async fn get_columns_by_table_id(&mut self, table_id: i64) -> Result<Vec<Column>, Error> {
         let response = self

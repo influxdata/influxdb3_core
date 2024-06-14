@@ -241,6 +241,7 @@ fn test_data(lp: &str) -> DatabaseBatch {
                 table_id,
                 mut columns,
                 row_count,
+                series_key,
             } = table_batch;
 
             columns.sort_by(|a, b| a.column_name.cmp(&b.column_name));
@@ -249,6 +250,7 @@ fn test_data(lp: &str) -> DatabaseBatch {
                 table_id,
                 columns,
                 row_count,
+                series_key,
             }
         })
         .collect();

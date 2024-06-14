@@ -30,7 +30,6 @@ bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env", "string"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "string", "suggestions", "usage"] }
-concurrent-queue = { version = "2" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
@@ -82,9 +81,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 similar = { version = "2", features = ["inline"] }
-smallvec = { version = "1", default-features = false, features = ["union"] }
+smallvec = { version = "1", default-features = false, features = ["const_generics", "union"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-sqlparser = { version = "0.45", features = ["visitor"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "sqlite", "uuid"] }
 sqlx-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.7", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
@@ -101,8 +99,6 @@ tracing-core = { version = "0.1" }
 tracing-log = { version = "0.2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
 twox-hash = { version = "1" }
-unicode-bidi = { version = "0.3" }
-unicode-normalization = { version = "0.1" }
 url = { version = "2" }
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", features = ["derive", "std"] }
@@ -154,7 +150,7 @@ ring = { version = "0.17", features = ["std"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
-smallvec = { version = "1", default-features = false, features = ["union"] }
+smallvec = { version = "1", default-features = false, features = ["const_generics", "union"] }
 sqlx-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-macros = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "json", "migrate", "postgres", "sqlite", "uuid"] }
 sqlx-macros-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "json", "migrate", "postgres", "sqlite", "uuid"] }
@@ -162,13 +158,11 @@ sqlx-postgres = { version = "0.7", default-features = false, features = ["any", 
 sqlx-sqlite = { version = "0.7", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2", default-features = false, features = ["i128"] }
 syn-dff4ba8e3ae991db = { package = "syn", version = "1", features = ["full", "visit-mut"] }
-syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log", "max_level_trace", "release_max_level_trace"] }
 tracing-core = { version = "0.1" }
-unicode-bidi = { version = "0.3" }
-unicode-normalization = { version = "0.1" }
 url = { version = "2" }
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", features = ["derive", "std"] }
@@ -178,7 +172,7 @@ async-compression = { version = "0.4", default-features = false, features = ["bz
 bitflags = { version = "2", default-features = false, features = ["std"] }
 linux-raw-sys = { version = "0.4", default-features = false, features = ["elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
 rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
@@ -200,7 +194,7 @@ spin = { version = "0.9" }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
 rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
@@ -221,7 +215,7 @@ spin = { version = "0.9" }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
 rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }

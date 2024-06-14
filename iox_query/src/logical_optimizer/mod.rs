@@ -12,12 +12,13 @@ mod handle_gapfill;
 mod influx_regex_to_datafusion_regex;
 pub use handle_gapfill::range_predicate;
 
-/// Register IOx-specific logical [`OptimizerRule`]s with the SessionContext
+/// Register IOx-specific logical [`OptimizerRule`]s and [`AnalyzerRule`]s with the SessionContext
 ///
 /// [`OptimizerRule`]: datafusion::optimizer::OptimizerRule
+/// [`AnalyzerRule`]: datafusion::optimizer::AnalyzerRule
 pub fn register_iox_logical_optimizers(state: SessionState) -> SessionState {
     state
         .add_optimizer_rule(Arc::new(InfluxRegexToDataFusionRegex::new()))
         .add_optimizer_rule(Arc::new(ExtractSleep::new()))
-        .add_optimizer_rule(Arc::new(HandleGapFill::new()))
+        .add_analyzer_rule(Arc::new(HandleGapFill::new()))
 }

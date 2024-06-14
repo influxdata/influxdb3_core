@@ -3,6 +3,7 @@
 use arrow_util::bitset::{iter_set_positions, BitSet};
 use dml::DmlWrite;
 use generated_types::influxdata::pbdata::v1::column::SemanticType;
+use generated_types::influxdata::pbdata::v1::SeriesKey;
 use generated_types::influxdata::pbdata::v1::{
     column::Values as PbValues, Column as PbColumn, DatabaseBatch, InternedStrings, PackedStrings,
     TableBatch,
@@ -44,6 +45,9 @@ pub fn encode_batch(table_id: i64, batch: &MutableBatch) -> TableBatch {
             })
             .collect(),
         row_count: batch.rows() as u32,
+        series_key: batch.series_key().map(|sk| SeriesKey {
+            members: sk.to_owned(),
+        }),
         table_id,
     }
 }

@@ -16,9 +16,9 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{metrics::ExecutionPlanMetricsSet, ExecutionPlan},
 };
+use executor::spawn_io;
 use futures::{future::Shared, prelude::future::BoxFuture, FutureExt};
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
-use tokio::{runtime::Handle, task::JoinSet};
 
 use crate::{config::IoxConfigExt, provider::PartitionedFileExt};
 
@@ -66,9 +66,6 @@ impl PhysicalOptimizerRule for CachedParquetData {
                 .clone()
                 .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
                     Arc::clone(&ext.object_store),
-                    // use the same tokio runtime as planning for IO during execution
-                    // (at the time of writing, this was the main/IO runtime
-                    Handle::current(),
                 )));
             Ok(Transformed::yes(Arc::new(parquet_exec)))
         })
@@ -92,16 +89,12 @@ impl PhysicalOptimizerRule for CachedParquetData {
 #[derive(Debug)]
 struct CachedParquetFileReaderFactory {
     object_store: Arc<DynObjectStore>,
-    runtime_handle: Handle,
 }
 
 impl CachedParquetFileReaderFactory {
     /// Create new factory based on the given object store.
-    pub(crate) fn new(object_store: Arc<DynObjectStore>, runtime_handle: Handle) -> Self {
-        Self {
-            object_store,
-            runtime_handle,
-        }
+    pub(crate) fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self { object_store }
     }
 }
 
@@ -118,21 +111,10 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 
         let object_store = Arc::clone(&self.object_store);
         let location = file_meta.object_meta.location.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let data = async move {
-            let mut task = JoinSet::new();
-            task.spawn_on(
-                async move {
-                    let res = object_store.get(&location).await.map_err(Arc::new)?;
-                    res.bytes().await.map_err(Arc::new)
-                },
-                &runtime_handle,
-            );
-            task.join_next()
-                .await
-                .expect("just added task")
-                .map_err(|e| Arc::new(ObjectStoreError::JoinError { source: e }))?
-        }
+        let data = spawn_io(async move {
+            let res = object_store.get(&location).await.map_err(Arc::new)?;
+            res.bytes().await.map_err(Arc::new)
+        })
         .boxed()
         .shared();
 

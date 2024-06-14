@@ -55,6 +55,22 @@ pub enum Error {
 
     #[snafu(display("cannot infer type for column: {}", column))]
     InvalidType { column: String },
+
+    #[snafu(display("attempted write of batch with unexpected series key"))]
+    UnexpectedSeriesKey,
+
+    #[snafu(display("attempted write of batch that was missing series key"))]
+    MissingSeriesKey,
+
+    #[snafu(display("attempted write of batch with incorrect series key, expected \
+        [{}], got [{}]", expected.join(", "), got.join(", ")))]
+    IncorrectSeriesKey {
+        expected: Vec<String>,
+        got: Vec<String>,
+    },
+
+    #[snafu(display("series key column ({name}) should not contain nulls"))]
+    NullSeriesKey { name: String },
 }
 
 /// Result type for pbdata conversion
@@ -76,6 +92,27 @@ pub fn decode_database_batch(database_batch: &DatabaseBatch) -> Result<HashMap<i
 /// Writes the provided [`TableBatch`] to a [`MutableBatch`] on error any changes made
 /// to `batch` are reverted
 pub fn write_table_batch(batch: &mut MutableBatch, table_batch: &TableBatch) -> Result<()> {
+    match (
+        batch.is_new(),
+        batch.series_key(),
+        table_batch.series_key.as_ref(),
+    ) {
+        (true, None, None) | (false, None, None) => (),
+        (true, None, Some(sk)) => batch.set_series_key(&sk.members),
+        (false, None, Some(_)) => return UnexpectedSeriesKeySnafu.fail(),
+        (false, Some(_), None) => return MissingSeriesKeySnafu.fail(),
+        (false, Some(a), Some(b)) => {
+            if a != b.members.as_slice() {
+                return IncorrectSeriesKeySnafu {
+                    expected: a.iter().map(Into::into).collect::<Vec<_>>(),
+                    got: b.members.clone(),
+                }
+                .fail();
+            }
+        }
+        _ => unreachable!(),
+    }
+
     let to_insert = table_batch.row_count as usize;
     if to_insert == 0 {
         return Ok(());
@@ -95,11 +132,27 @@ pub fn write_table_batch(batch: &mut MutableBatch, table_batch: &TableBatch) -> 
     // Batch must contain a time column
     ensure!(columns.contains(TIME_COLUMN_NAME), MissingTimeSnafu);
 
+    let series_key = batch
+        .series_key()
+        .map(|k| k.iter().map(|s| s.to_owned()).collect::<HashSet<String>>());
+
     let mut writer = Writer::new(batch, to_insert);
     for column in &table_batch.columns {
         let influx_type = pb_column_type(column)?;
         let valid_mask = compute_valid_mask(&column.null_mask, to_insert);
         let valid_mask = valid_mask.as_deref();
+
+        if series_key
+            .as_ref()
+            .is_some_and(|sk| sk.contains(&column.column_name))
+        {
+            ensure!(
+                valid_mask.is_none(),
+                NullSeriesKeySnafu {
+                    name: column.column_name.to_owned()
+                }
+            );
+        }
 
         // Already verified has values
         let values = column.values.as_ref().unwrap();
@@ -623,6 +676,7 @@ mod tests {
             ],
             row_count: 5,
             table_id: 42,
+            series_key: None,
         };
 
         let mut batch = MutableBatch::new();
@@ -762,6 +816,7 @@ mod tests {
             ],
             row_count: 6,
             table_id: 42,
+            series_key: None,
         };
 
         let mut batch = MutableBatch::new();
@@ -795,6 +850,7 @@ mod tests {
                 ],
                 row_count: 6,
                 table_id: 42,
+                series_key: None,
             };
 
             let err = write_table_batch(&mut batch, &table_batch)
@@ -902,6 +958,7 @@ mod tests {
             ],
             row_count: 10,
             table_id: 42,
+            series_key: None,
         };
 
         let mut batch = MutableBatch::new();
@@ -939,6 +996,7 @@ mod tests {
             )],
             row_count: 9,
             table_id: 42,
+            series_key: None,
         };
 
         let mut batch = MutableBatch::new();
@@ -1041,6 +1099,7 @@ mod tests {
             ],
             row_count: 9,
             table_id: 42,
+            series_key: None,
         };
 
         let mut batch = MutableBatch::new();
@@ -1070,6 +1129,7 @@ mod tests {
             columns: vec![with_i64(column("time", SemanticType::Time), vec![], vec![])],
             row_count: 9,
             table_id: 42,
+            series_key: None,
         };
 
         let mut batch = MutableBatch::new();

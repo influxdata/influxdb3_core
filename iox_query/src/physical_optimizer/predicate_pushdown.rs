@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRewriter},
     config::ConfigOptions,
-    datasource::physical_plan::ParquetExec,
+    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
     error::{DataFusionError, Result},
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
@@ -40,7 +40,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
 
                 let child_any = child.as_any();
                 if child_any.downcast_ref::<EmptyExec>().is_some() {
-                    return Ok(Transformed::yes(child));
+                    return Ok(Transformed::yes(Arc::clone(child)));
                 } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
                     let new_inputs = child_union
                         .inputs()
@@ -56,6 +56,10 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                     let new_union = UnionExec::new(new_inputs);
                     return Ok(Transformed::yes(Arc::new(new_union)));
                 } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
+                    let mut builder = ParquetExecBuilder::new_with_options(
+                        child_parquet.base_config().clone(),
+                        table_parquet_options(),
+                    );
                     let existing = child_parquet
                         .predicate()
                         .map(split_conjunction)
@@ -66,15 +70,12 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                             .chain(split_conjunction(filter_exec.predicate()))
                             .cloned(),
                     );
-
+                    if let Some(predicate) = both {
+                        builder = builder.with_predicate(predicate);
+                    }
                     let new_node = Arc::new(FilterExec::try_new(
                         Arc::clone(filter_exec.predicate()),
-                        Arc::new(ParquetExec::new(
-                            child_parquet.base_config().clone(),
-                            both,
-                            None,
-                            table_parquet_options(),
-                        )),
+                        builder.build_arc(),
                     )?);
                     return Ok(Transformed::yes(new_node));
                 } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
@@ -97,7 +98,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                         let mut new_node: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(
                             Arc::new(FilterExec::try_new(
                                 conjunction(pushdown).expect("not empty"),
-                                grandchild,
+                                Arc::clone(grandchild),
                             )?),
                             child_dedup.sort_keys().to_vec(),
                             child_dedup.use_chunk_order_col(),
@@ -312,18 +313,10 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        let plan = Arc::new(
-            FilterExec::try_new(
-                predicate_mixed(&schema),
-                Arc::new(ParquetExec::new(
-                    base_config,
-                    Some(predicate_tag(&schema)),
-                    None,
-                    table_parquet_options(),
-                )),
-            )
-            .unwrap(),
-        );
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
+            .with_predicate(predicate_tag(&schema));
+        let plan =
+            Arc::new(FilterExec::try_new(predicate_mixed(&schema), builder.build_arc()).unwrap());
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
