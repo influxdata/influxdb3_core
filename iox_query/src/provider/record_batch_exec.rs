@@ -1,5 +1,6 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
+use crate::ingester::{IngesterChunk, MetricDecoratorStream};
 use crate::statistics::build_statistics_for_chunks;
 use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
@@ -130,7 +131,7 @@ impl ExecutionPlan for RecordBatchesExec {
         &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         // no inputs
         vec![]
     }
@@ -169,6 +170,20 @@ impl ExecutionPlan for RecordBatchesExec {
             CHUNK_ORDER_COLUMN_NAME,
             ScalarValue::from(chunk.order().get()),
         )]);
+
+        // If these are ingester chunks, we want to decorate with the MetricDecorator
+        // so we can accumulate ingester <=> querier metrics in the query log/system tables/etc.
+        let instrumented_query_chunk = chunk.as_any().downcast_ref::<IngesterChunk>();
+        let stream = if let Some(iq_metrics) = instrumented_query_chunk {
+            Box::pin(MetricDecoratorStream::new(
+                stream,
+                iq_metrics.metrics(),
+                self.metrics.clone(),
+            ))
+        } else {
+            stream
+        };
+
         let adapter = Box::pin(
             SchemaAdapterStream::try_new(stream, schema, &virtual_columns, baseline_metrics)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?,

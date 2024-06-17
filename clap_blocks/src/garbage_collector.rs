@@ -107,6 +107,9 @@ pub struct GarbageCollectorConfig {
     /// Number of minutes to sleep between iterations of the retention code.
     /// Defaults to 35 minutes to reduce incidence of it running at the same time as the parquet
     /// file deleter.
+    ///
+    /// If the Garbage Collecter cannot keep up with retention at this call frequency, it
+    /// will reduce the interval (potentially down to 1m) until it can keep up.
     #[clap(
         long,
         default_value_t = 35,

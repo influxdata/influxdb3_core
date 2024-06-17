@@ -1,8 +1,12 @@
 use std::{ops::Range, sync::Arc};
 
+use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::{
+        tree_node::{Transformed, TreeNode},
+        Statistics,
+    },
     config::ConfigOptions,
     datasource::physical_plan::{
         FileMeta, ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory,
@@ -16,9 +20,10 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{metrics::ExecutionPlanMetricsSet, ExecutionPlan},
 };
+use executor::spawn_io;
 use futures::{future::Shared, prelude::future::BoxFuture, FutureExt};
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
-use tokio::{runtime::Handle, task::JoinSet};
+use observability_deps::tracing::warn;
 
 use crate::{config::IoxConfigExt, provider::PartitionedFileExt};
 
@@ -66,9 +71,7 @@ impl PhysicalOptimizerRule for CachedParquetData {
                 .clone()
                 .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
                     Arc::clone(&ext.object_store),
-                    // use the same tokio runtime as planning for IO during execution
-                    // (at the time of writing, this was the main/IO runtime
-                    Handle::current(),
+                    ext.table_schema.clone(),
                 )));
             Ok(Transformed::yes(Arc::new(parquet_exec)))
         })
@@ -92,15 +95,15 @@ impl PhysicalOptimizerRule for CachedParquetData {
 #[derive(Debug)]
 struct CachedParquetFileReaderFactory {
     object_store: Arc<DynObjectStore>,
-    runtime_handle: Handle,
+    table_schema: Option<SchemaRef>,
 }
 
 impl CachedParquetFileReaderFactory {
     /// Create new factory based on the given object store.
-    pub(crate) fn new(object_store: Arc<DynObjectStore>, runtime_handle: Handle) -> Self {
+    pub(crate) fn new(object_store: Arc<DynObjectStore>, table_schema: Option<SchemaRef>) -> Self {
         Self {
             object_store,
-            runtime_handle,
+            table_schema,
         }
     }
 }
@@ -118,21 +121,10 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 
         let object_store = Arc::clone(&self.object_store);
         let location = file_meta.object_meta.location.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let data = async move {
-            let mut task = JoinSet::new();
-            task.spawn_on(
-                async move {
-                    let res = object_store.get(&location).await.map_err(Arc::new)?;
-                    res.bytes().await.map_err(Arc::new)
-                },
-                &runtime_handle,
-            );
-            task.join_next()
-                .await
-                .expect("just added task")
-                .map_err(|e| Arc::new(ObjectStoreError::JoinError { source: e }))?
-        }
+        let data = spawn_io(async move {
+            let res = object_store.get(&location).await.map_err(Arc::new)?;
+            res.bytes().await.map_err(Arc::new)
+        })
         .boxed()
         .shared();
 
@@ -141,6 +133,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             file_metrics: Some(file_metrics),
             metadata_size_hint,
             data,
+            table_schema: self.table_schema.clone(),
         }))
     }
 }
@@ -155,6 +148,8 @@ struct CachedFileReader {
     file_metrics: Option<ParquetFileMetrics>,
     metadata_size_hint: Option<usize>,
     data: Shared<BoxFuture<'static, Result<Bytes, Arc<ObjectStoreError>>>>,
+    // todo: will remove the option when we also pass metadata index here
+    table_schema: Option<SchemaRef>,
 }
 
 impl AsyncFileReader for CachedFileReader {
@@ -214,6 +209,7 @@ impl AsyncFileReader for CachedFileReader {
                 file_metrics: None,
                 metadata_size_hint: self.metadata_size_hint,
                 data: self.data.clone(),
+                table_schema: self.table_schema.clone(),
             };
 
             let mut loader = MetadataLoader::load(&mut this, file_size, prefetch).await?;
@@ -221,7 +217,27 @@ impl AsyncFileReader for CachedFileReader {
                 .load_page_index(preload_column_index, preload_offset_index)
                 .await?;
 
-            Ok(Arc::new(loader.finish()))
+            let metadata = loader.finish();
+
+            if let Some(_table_schema) = &self.table_schema {
+                let file_statistics: Option<Statistics> = None;
+                // todo: turn this on after upgrading DF with https://github.com/apache/datafusion/pull/10880/files
+                // file_statitics = statistics_from_parquet_meta(metadata, table_schema);
+
+                // Note for self: while working on https://github.com/influxdata/influxdb_iox/pull/11282, I think
+                // we can easily see if this file meta is already available in the index, if so, we do not need to cache
+                // it again here because all files are inmmutable
+
+                if let Some(_file_statistics) = file_statistics {
+                    // todo: add the file statistics to the metadata index in next PR
+                    // https://github.com/influxdata/influxdb_iox/issues/11232
+                } else {
+                    // log a warning that we cannot collect statitics for this file
+                    warn!(file_path = %self.meta.location, "Cannot collect statistics for file")
+                }
+            }
+
+            Ok(Arc::new(metadata))
         })
     }
 }

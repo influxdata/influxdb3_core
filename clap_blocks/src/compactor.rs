@@ -90,7 +90,7 @@ pub struct CompactorConfig {
     #[clap(
         long = "compaction-partition-scratchpad-concurrency",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_SCRATCHPAD_CONCURRENCY",
-        default_value = "10",
+        default_value = "20",
         action
     )]
     pub compaction_partition_scratchpad_concurrency: NonZeroUsize,

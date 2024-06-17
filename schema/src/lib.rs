@@ -116,6 +116,11 @@ pub enum Error {
         column_name
     ))]
     WrongTimeColumnName { column_name: String },
+
+    #[snafu(display(
+        "The series key contains a column that was not present in fields when building"
+    ))]
+    MissingSeriesKeyColumn,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -169,6 +174,8 @@ impl TryFrom<ArrowSchemaRef> for Schema {
 }
 
 const MEASUREMENT_METADATA_KEY: &str = "iox::measurement::name";
+const SERIES_KEY_METADATA_KEY: &str = "iox::series::key";
+const SERIES_KEY_METADATA_SEPARATOR: &str = "/";
 const COLUMN_METADATA_KEY: &str = "iox::column::type";
 
 impl Schema {
@@ -181,6 +188,10 @@ impl Schema {
         {
             // All column names must be unique
             let mut field_names = HashSet::with_capacity(inner.fields().len());
+            let series_key = inner.metadata.get(SERIES_KEY_METADATA_KEY).map(|s| {
+                s.split(SERIES_KEY_METADATA_SEPARATOR)
+                    .collect::<Vec<&str>>()
+            });
 
             for field in inner.fields() {
                 let column_name = field.name();
@@ -206,10 +217,16 @@ impl Schema {
                     });
                 }
 
-                let expected_nullable = match influxdb_column_type {
-                    InfluxColumnType::Tag => true,
-                    InfluxColumnType::Field(_) => true,
-                    InfluxColumnType::Timestamp => false,
+                let expected_nullable = match (
+                    series_key
+                        .as_ref()
+                        .is_some_and(|sk| sk.contains(&column_name.as_str())),
+                    influxdb_column_type,
+                ) {
+                    (true, _) => false,
+                    (false, InfluxColumnType::Tag) => true,
+                    (false, InfluxColumnType::Field(_)) => true,
+                    (false, InfluxColumnType::Timestamp) => false,
                 };
                 if field.is_nullable() != expected_nullable {
                     return Err(Error::Nullability {
@@ -240,15 +257,30 @@ impl Schema {
     /// Create and validate a new Schema, creating metadata to
     /// represent the the various parts. This method is intended to be
     /// used only by the SchemaBuilder.
-    pub(crate) fn new_from_parts(
+    pub(crate) fn new_from_parts<SK>(
         measurement: Option<String>,
         fields: impl Iterator<Item = (ArrowField, InfluxColumnType)>,
+        series_key: Option<SK>,
         sort_columns: bool,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        SK: IntoIterator,
+        SK::Item: AsRef<str>,
+    {
         let mut metadata = HashMap::new();
 
         if let Some(measurement) = measurement {
             metadata.insert(MEASUREMENT_METADATA_KEY.to_string(), measurement);
+        }
+
+        if let Some(sk) = series_key {
+            metadata.insert(
+                SERIES_KEY_METADATA_KEY.to_string(),
+                sk.into_iter()
+                    .map(|k| k.as_ref().to_string())
+                    .collect::<Vec<_>>()
+                    .join(SERIES_KEY_METADATA_SEPARATOR),
+            );
         }
 
         let mut fields: Vec<ArrowField> = fields
@@ -268,6 +300,13 @@ impl Schema {
             ArrowSchemaRef::new(ArrowSchema::new_with_metadata(fields, metadata)).try_into()?;
 
         Ok(record)
+    }
+
+    pub fn series_key(&self) -> Option<Vec<&str>> {
+        self.inner
+            .metadata
+            .get(SERIES_KEY_METADATA_KEY)
+            .map(|v| v.split(SERIES_KEY_METADATA_SEPARATOR).collect())
     }
 
     /// Returns true if the sort_key includes all primary key cols
@@ -417,7 +456,7 @@ impl Schema {
                     .map(|i| self.field(*i).1.name().to_string())
                     .collect::<HashSet<_>>();
 
-                // Add missing PK columnns (tags and time) as they are needed for deduplication
+                // Add missing PK columnns as they are needed for deduplication
                 let pk = self.primary_key();
                 for col in pk {
                     columns.insert(col.to_string());
@@ -479,35 +518,49 @@ impl Schema {
 
     /// Return columns used for the "primary key" in this table.
     ///
-    /// Currently this relies on the InfluxDB data model annotations
-    /// for what columns to include in the key columns
+    /// This will use the series key if present in the schema, otherwise will revert to
+    /// the InfluxDB data model annotations for what columns to include
     pub fn primary_key(&self) -> Vec<&str> {
         use InfluxColumnType::*;
-        let mut primary_keys: Vec<_> = self
-            .iter()
-            .filter_map(|(column_type, field)| match column_type {
-                Tag => Some((Tag, field)),
-                Field(_) => None,
-                Timestamp => Some((Timestamp, field)),
-            })
-            .collect();
+        self.inner
+            .metadata
+            .get(SERIES_KEY_METADATA_KEY)
+            .map_or_else(
+                // use tags in lexicographical order
+                || {
+                    let mut primary_keys: Vec<_> = self
+                        .iter()
+                        .filter_map(|(column_type, field)| match column_type {
+                            Tag => Some((Tag, field)),
+                            Field(_) => None,
+                            Timestamp => Some((Timestamp, field)),
+                        })
+                        .collect();
 
-        // Now, sort lexographically (but put timestamp last)
-        primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
-            match (a_column_type, b_column_type) {
-                (Tag, Tag) => a.name().cmp(b.name()),
-                (Timestamp, Tag) => Ordering::Greater,
-                (Tag, Timestamp) => Ordering::Less,
-                (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
-                _ => panic!("Unexpected types in key summary"),
-            }
-        });
+                    // Now, sort lexographically (but put timestamp last)
+                    primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
+                        match (a_column_type, b_column_type) {
+                            (Tag, Tag) => a.name().cmp(b.name()),
+                            (Timestamp, Tag) => Ordering::Greater,
+                            (Tag, Timestamp) => Ordering::Less,
+                            (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
+                            _ => panic!("Unexpected types in key summary"),
+                        }
+                    });
 
-        // Take just the names
-        primary_keys
-            .into_iter()
-            .map(|(_column_type, field)| field.name().as_str())
-            .collect()
+                    // Take just the names
+                    primary_keys
+                        .into_iter()
+                        .map(|(_column_type, field)| field.name().as_str())
+                        .collect()
+                },
+                // use the series key
+                |v| {
+                    v.split(SERIES_KEY_METADATA_SEPARATOR)
+                        .chain(self.time_iter().map(|f| f.name().as_str()))
+                        .collect()
+                },
+            )
     }
 
     /// Estimate memory consumption in bytes of the schema.

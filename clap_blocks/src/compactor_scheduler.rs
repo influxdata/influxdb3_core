@@ -58,7 +58,7 @@ pub struct PartitionSourceConfigForLocalScheduler {
     #[clap(
         long = "compaction_partition_minute_threshold",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_MINUTE_THRESHOLD",
-        default_value = "10",
+        default_value = "20",
         action
     )]
     pub compaction_partition_minute_threshold: u64,
@@ -151,7 +151,7 @@ impl CompactorSchedulerGossipConfig {
 }
 
 /// CLI config for compactor scheduler.
-#[derive(Debug, Clone, Default, clap::Parser)]
+#[derive(Debug, Clone, clap::Parser)]
 pub struct CompactorSchedulerConfig {
     /// Scheduler type to use.
     #[clap(
@@ -211,7 +211,7 @@ pub struct CompactorSchedulerConfig {
         default_value = "4",
         action
     )]
-    pub min_num_l0_files_to_compact: u32,
+    pub min_num_l0_files_to_compact: std::num::NonZeroU32,
 
     /// Minimum number of L1 files to compact to L2.
     ///
@@ -225,10 +225,10 @@ pub struct CompactorSchedulerConfig {
     #[clap(
         long = "compaction-min-num-l1-files-to-compact",
         env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_FILES_TO_COMPACT",
-        default_value = "10",
+        default_value = "4",
         action
     )]
-    pub min_num_l1_files_to_compact: u32,
+    pub min_num_l1_files_to_compact: std::num::NonZeroU32,
 
     /// Minimum number of bytes in L0 files before considering for compaction to L1.
     ///
@@ -240,9 +240,10 @@ pub struct CompactorSchedulerConfig {
     #[clap(
         long = "compaction-min-num-l0-bytes-to-compact",
         env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L0_BYTES_TO_COMPACT",
+        default_value = "10485760", // 10 megabytes
         action
     )]
-    pub min_num_l0_bytes_to_compact: Option<std::num::NonZeroU32>,
+    pub min_num_l0_bytes_to_compact: std::num::NonZeroU32,
 
     /// Minimum number of bytes in L1 files before considering for compaction to L2.
     ///
@@ -254,9 +255,10 @@ pub struct CompactorSchedulerConfig {
     #[clap(
         long = "compaction-min-num-l1-bytes-to-compact",
         env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_BYTES_TO_COMPACT",
+        default_value = "104857600", // 100 megabytes
         action
     )]
-    pub min_num_l1_bytes_to_compact: Option<std::num::NonZeroU32>,
+    pub min_num_l1_bytes_to_compact: std::num::NonZeroU32,
 
     /// When identifying undersized L2s for recompaction on a hot partition,
     /// if a large window size of files totals less than the per file target size,
@@ -310,11 +312,11 @@ pub struct CompactorSchedulerConfig {
     ///
     /// This value must be between (0, 100)
     ///
-    /// Default is 20
+    /// Default is 5
     #[clap(
         long = "compaction-percentage-max-file_size",
         env = "INFLUXDB_IOX_COMPACTION_PERCENTAGE_MAX_FILE_SIZE",
-        default_value = "20",
+        default_value = "5",
         action
     )]
     pub percentage_max_file_size: u16,
@@ -323,11 +325,11 @@ pub struct CompactorSchedulerConfig {
     ///
     /// Eventually, this will be the only way to select partitions.
     ///
-    /// Default is false
+    /// Default is true
     #[clap(
         long = "compaction-priority-based-selection",
         env = "INFLUXDB_IOX_COMPACTION_PRIORITY_BASED_SELECTION",
-        default_value = "false",
+        default_value = "true",
         action
     )]
     pub priority_based_selection: bool,
@@ -362,7 +364,7 @@ pub struct CompactorSchedulerConfig {
     #[clap(
         long = "compaction-split-percentage",
         env = "INFLUXDB_IOX_COMPACTION_SPLIT_PERCENTAGE",
-        default_value = "80",
+        default_value = "90",
         action
     )]
     pub split_percentage: u16,
@@ -391,11 +393,18 @@ pub struct CompactorSchedulerConfig {
     )]
     pub cold_concurrency: usize,
 
-    /// Maximum duration of the per-partition compaction task in seconds.
+    /// Default soft stop timeout for compaction jobs.
+    /// After this much time as passed, the compaction job won't start more work,
+    /// as a courtesy to the other partitions.  The intent of the soft stop is to
+    /// share resources among partitions.
+    /// Based on column count and observed run time, this soft stop can be scaled up to 5x.
+    /// There is also a hard stop, set to HARD_TIMEOUT_SCALER * this value.  Jobs will be
+    /// aborted if that expires, and partitions that haven't made progress in that time
+    /// will be put on the skip table.
     #[clap(
         long = "compaction-partition-timeout-secs",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_TIMEOUT_SECS",
-        default_value = "1800",
+        default_value = "600",
         action
     )]
     pub partition_timeout_secs: u64,

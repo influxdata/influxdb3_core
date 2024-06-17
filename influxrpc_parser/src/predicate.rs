@@ -100,6 +100,7 @@ fn build_node(expr: &Expr, strings_are_regex: bool) -> Result<RPCNode> {
             expr,
             data_type,
             format: None,
+            kind: _,
         } => match data_type {
             sqlparser::ast::DataType::Custom(ident, _modifiers) => {
                 if let Some(Ident { value, .. }) = ident.0.first() {

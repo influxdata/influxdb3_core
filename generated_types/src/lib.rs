@@ -49,8 +49,8 @@ pub mod influxdata {
             impl TimestampRange {
                 pub fn max() -> Self {
                     TimestampRange {
-                        start: std::i64::MIN,
-                        end: std::i64::MAX,
+                        start: i64::MIN,
+                        end: i64::MAX,
                     }
                 }
             }
@@ -66,6 +66,18 @@ pub mod influxdata {
 
     pub mod iox {
         pub mod authz {
+            pub mod pusher {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/influxdata.iox.authz.pusher.v1.rs"
+                    ));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/influxdata.iox.authz.pusher.v1.serde.rs"
+                    ));
+                }
+            }
             pub mod v1 {
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.authz.v1.rs"));
                 include!(concat!(

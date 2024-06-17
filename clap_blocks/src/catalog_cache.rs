@@ -159,6 +159,28 @@ pub struct CatalogConfig {
     )]
     pub quorum_fanout: usize,
 
+    /// Maximum delay of operations effecting the partition snapshot
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/11092>.
+    #[clap(
+        long = "catalog-cache-partition-linger",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_PARTITION_LINGER",
+        default_value = "0s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub partition_linger: Duration,
+
+    /// Linger timeout for writes impacting the table snapshot
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/11092>.
+    #[clap(
+        long = "catalog-cache-table-linger",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_TABLE_LINGER",
+        default_value = "0s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub table_linger: Duration,
+
     /// gRPC server timeout.
     #[clap(
         long = "catalog-cache-grpc-server-timeout",

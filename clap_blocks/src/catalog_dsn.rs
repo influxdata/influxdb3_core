@@ -46,6 +46,10 @@ fn default_idle_timeout() -> String {
     humantime::format_duration(PostgresConnectionOptions::DEFAULT_IDLE_TIMEOUT).to_string()
 }
 
+fn default_statement_timeout() -> String {
+    humantime::format_duration(PostgresConnectionOptions::DEFAULT_STATEMENT_TIMEOUT).to_string()
+}
+
 fn default_hotswap_poll_interval_timeout() -> String {
     humantime::format_duration(PostgresConnectionOptions::DEFAULT_HOTSWAP_POLL_INTERVAL).to_string()
 }
@@ -115,6 +119,17 @@ pub struct CatalogDsnConfig {
     )]
     pub idle_timeout: Duration,
 
+    /// Set a maximum duration for individual statements.
+    ///
+    /// Note: Currently only supported by postgres catalog
+    #[clap(
+        long = "catalog-statement-timeout",
+        env = "INFLUXDB_IOX_CATALOG_IDLE_TIMEOUT",
+        default_value = default_statement_timeout(),
+        value_parser = humantime::parse_duration,
+    )]
+    pub statement_timeout: Duration,
+
     /// If the DSN points to a file (i.e. starts with `dsn-file://`), this sets the interval how often the the file
     /// should be polled for updates.
     ///
@@ -151,6 +166,7 @@ impl CatalogDsnConfig {
                 max_conns: self.max_catalog_connections,
                 connect_timeout: self.connect_timeout,
                 idle_timeout: self.idle_timeout,
+                statement_timeout: self.statement_timeout,
                 hotswap_poll_interval: self.hotswap_poll_interval,
             };
             Ok(Arc::new(

@@ -55,15 +55,8 @@ impl ParquetFilePath {
     }
 
     /// Get partition ID.
-    ///
-    /// Returns a string to handle both deprecated and deterministic partition IDs.
-    pub fn raw_partition_id(&self) -> String {
-        match &self.partition_id {
-            TransitionPartitionId::Deprecated(partition_id) => partition_id.get().to_string(),
-            TransitionPartitionId::Deterministic(partition_hash_id) => {
-                partition_hash_id.to_string()
-            }
-        }
+    pub fn partition_id(&self) -> String {
+        self.partition_id.to_string()
     }
 
     /// Get object-store path.

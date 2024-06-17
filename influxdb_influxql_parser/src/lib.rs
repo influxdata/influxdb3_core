@@ -80,13 +80,15 @@ pub fn parse_statements(input: &str) -> ParseResult {
                 return Err(ParseError {
                     message: message.into(),
                     pos: input.offset(pos),
+                    details: None,
                 })
             }
             // any other error indicates an invalid statement
-            Err(_) => {
+            Err(e) => {
                 return Err(ParseError {
-                    message: "invalid SQL statement".into(),
+                    message: "invalid InfluxQL statement".to_string(),
                     pos: input.offset(i),
+                    details: Some(e.to_string()),
                 })
             }
         }
@@ -167,10 +169,16 @@ mod test {
 
         // Returns error for invalid statement
         let got = parse_statements("BAD SQL").unwrap_err();
-        assert_eq!(got.to_string(), "invalid SQL statement at pos 0");
+        assert_eq!(
+            got.to_string(),
+            "invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"BAD SQL\", Tag)"
+        );
 
         // Returns error for invalid statement after first
         let got = parse_statements("SHOW MEASUREMENTS;BAD SQL").unwrap_err();
-        assert_eq!(got.to_string(), "invalid SQL statement at pos 18");
+        assert_eq!(
+            got.to_string(),
+            "invalid InfluxQL statement at pos 18. Parsing Error: Nom(\"BAD SQL\", Tag)"
+        );
     }
 }

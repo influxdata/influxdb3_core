@@ -171,6 +171,8 @@ mod tests {
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
         config::TableParquetOptions,
+        datasource::physical_plan::parquet::ParquetExecBuilder,
+        execution::context::SessionContext,
         physical_plan::{expressions::Literal, filter::FilterExec},
         prelude::{col, lit},
         scalar::ScalarValue,
@@ -272,8 +274,14 @@ mod tests {
         let chunk1 = chunk(1);
         let schema = chunk1.schema().as_arrow();
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk1)], 2);
+
         let plan = FilterExec::try_new(
-            df_physical_expr(plan.schema(), col("tag1").eq(lit("foo"))).unwrap(),
+            df_physical_expr(
+                &SessionContext::new().state(),
+                plan.schema(),
+                col("tag1").eq(lit("foo")),
+            )
+            .unwrap(),
             plan,
         )
         .unwrap();
@@ -316,13 +324,12 @@ mod tests {
         let plan = plan
             .transform_down(|plan| {
                 if let Some(exec) = plan.as_any().downcast_ref::<ParquetExec>() {
-                    let exec = ParquetExec::new(
+                    let builder = ParquetExecBuilder::new_with_options(
                         exec.base_config().clone(),
-                        Some(Arc::new(Literal::new(ScalarValue::from(false)))),
-                        None,
                         TableParquetOptions::default(),
-                    );
-                    return Ok(Transformed::yes(Arc::new(exec)));
+                    )
+                    .with_predicate(Arc::new(Literal::new(ScalarValue::from(false))));
+                    return Ok(Transformed::yes(builder.build_arc()));
                 }
                 Ok(Transformed::no(plan))
             })

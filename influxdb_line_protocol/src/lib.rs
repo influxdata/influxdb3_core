@@ -75,6 +75,7 @@
 
 pub mod builder;
 pub use builder::LineProtocolBuilder;
+pub mod v3;
 
 use fmt::Display;
 use log::debug;
@@ -153,6 +154,9 @@ pub enum Error {
 
     #[snafu(display(r#"Tag Set Malformed"#))]
     TagSetMalformed,
+
+    #[snafu(display(r#"Series Key Malformed"#))]
+    SeriesKeyMalformed,
 
     // TODO: Replace this with specific failures.
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]
@@ -446,7 +450,7 @@ impl fmt::Display for EscapedStr<'_> {
 }
 
 impl<'a> EscapedStr<'a> {
-    fn from_slices(v: &[&'a str]) -> EscapedStr<'a> {
+    fn from_slices(v: &[&'a str]) -> Self {
         match v.len() {
             0 => EscapedStr::SingleSlice(""),
             1 => EscapedStr::SingleSlice(v[0]),

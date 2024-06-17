@@ -2,6 +2,7 @@ use crate::error;
 use arrow::array::{as_list_array, Array, ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use datafusion::common::{downcast_value, DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::function::StateFieldsArgs;
 use datafusion::logical_expr::{
     function::AccumulatorArgs, Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility,
 };
@@ -56,16 +57,16 @@ impl AggregateUDFImpl for PercentileUDF {
         Ok(Box::new(PercentileAccumulator::new(arg.data_type.clone())))
     }
 
-    fn state_fields(
-        &self,
-        name: &str,
-        value_type: DataType,
-        _ordering_fields: Vec<arrow::datatypes::Field>,
-    ) -> Result<Vec<arrow::datatypes::Field>> {
-        let value_list = DataType::List(Arc::new(Field::new("item", value_type, true)));
+    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<arrow::datatypes::Field>> {
+        let value_list =
+            DataType::List(Arc::new(Field::new("item", args.return_type.clone(), true)));
         Ok(vec![
-            Field::new(format_state_name(name, "value"), value_list, true),
-            Field::new(format_state_name(name, "count"), DataType::Float64, true),
+            Field::new(format_state_name(args.name, "value"), value_list, true),
+            Field::new(
+                format_state_name(args.name, "count"),
+                DataType::Float64,
+                true,
+            ),
         ])
     }
 }

@@ -18,6 +18,7 @@ fn main() -> Result<()> {
 ///
 /// Creates:
 ///
+/// - `influxdata.iox.authz.pusher.v1.rs`
 /// - `influxdata.iox.authz.v1.rs`
 /// - `influxdata.iox.bulk_ingest.v1.rs`
 /// - `influxdata.iox.catalog.v1.rs`
@@ -35,6 +36,7 @@ fn main() -> Result<()> {
 /// - `influxdata.platform.storage.rs`
 fn generate_grpc_types(root: &Path) -> Result<()> {
     let authz_path = root.join("influxdata/iox/authz/v1");
+    let authz_pusher_path = root.join("influxdata/iox/authz/pusher/v1");
     let bulk_ingest_path = root.join("influxdata/iox/bulk_ingest/v1");
     let catalog_cache_path = root.join("influxdata/iox/catalog_cache/v1");
     let catalog_v1_path = root.join("influxdata/iox/catalog/v1");
@@ -58,6 +60,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
 
     let proto_files = vec![
         authz_path.join("authz.proto"),
+        authz_pusher_path.join("pusher.proto"),
         bulk_ingest_path.join("service.proto"),
         catalog_cache_path.join("value.proto"),
         catalog_v1_path.join("parquet_file.proto"),

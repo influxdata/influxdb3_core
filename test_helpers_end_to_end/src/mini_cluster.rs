@@ -233,6 +233,35 @@ impl MiniCluster {
             .with_compactor_config(compactor_config)
     }
 
+    /// Similar to [`MiniCluster::create_non_shared`], except that more config options are able to be set.
+    ///
+    /// Save config for a compactor, but the compactor service should be run on-demand in
+    /// tests using `compactor run-once` rather than using `run compactor`.
+    pub async fn create_non_shared_from_config(
+        config: TestConfig,
+        catalog_configs: Option<[TestConfig; 3]>,
+    ) -> Self {
+        let ingester_config = TestConfig::new_ingester_from_config(&config);
+        let router_config = TestConfig::new_router(&ingester_config);
+        let querier_config = TestConfig::new_querier(&ingester_config);
+        let compactor_config = TestConfig::new_compactor(&ingester_config);
+
+        let cluster = if let Some(catalog_configs) = catalog_configs {
+            Self::new().with_catalog(catalog_configs).await
+        } else {
+            Self::new()
+        };
+
+        cluster
+            .with_ingester(ingester_config)
+            .await
+            .with_router(router_config)
+            .await
+            .with_querier(querier_config)
+            .await
+            .with_compactor_config(compactor_config)
+    }
+
     /// Create a non-shared MiniCluster that has a router, ingester set to essentially
     /// never persist data (except on-demand), and querier. Save config for a compactor, but the
     /// compactor service should be run on-demand in tests using `compactor run-once` rather than

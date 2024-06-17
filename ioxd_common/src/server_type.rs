@@ -83,4 +83,9 @@ pub trait ServerType: std::fmt::Debug + Send + Sync + 'static {
     fn is_healthy(&self) -> bool {
         true
     }
+
+    /// Return `true` if the service is ready to service requests.
+    fn is_ready(&self) -> bool {
+        self.is_healthy()
+    }
 }

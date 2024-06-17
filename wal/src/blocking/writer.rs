@@ -137,6 +137,11 @@ impl OpenSegmentFileWriter {
         })
     }
 
+    /// Returns a record of the total bytes written to this segment file.
+    pub(crate) fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
     /// Closes this writer, consuming it and returning the resultant
     /// [`ClosedSegment`].
     pub(crate) fn close(self) -> Result<ClosedSegment> {
@@ -149,9 +154,7 @@ impl OpenSegmentFileWriter {
         Ok(ClosedSegment {
             id,
             path,
-            size: bytes_written
-                .try_into()
-                .expect("bytes_written did not fit in size type"),
+            size: bytes_written as _,
         })
     }
 }

@@ -15,7 +15,7 @@ use arrow_flight::{
         CommandGetCatalogs, CommandGetCrossReference, CommandGetDbSchemas, CommandGetExportedKeys,
         CommandGetImportedKeys, CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes,
         CommandGetTables, CommandGetXdbcTypeInfo, CommandStatementQuery,
-        DoPutPreparedStatementResult, ProstMessageExt,
+        DoPutPreparedStatementResult,
     },
     FlightData, IpcMessage, SchemaAsIpc,
 };
@@ -320,7 +320,7 @@ impl FlightSQLPlanner {
                 let result = DoPutPreparedStatementResult {
                     prepared_statement_handle: Some(prepared_statement_handle.try_into()?),
                 };
-                Ok(result.as_any().encode_to_vec().into())
+                Ok(result.encode_to_vec().into())
             }
             _ => ProtocolSnafu {
                 cmd: format!("{cmd:?}"),

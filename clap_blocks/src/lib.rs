@@ -6,6 +6,7 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+pub mod auth;
 pub mod bulk_ingest;
 pub mod catalog_cache;
 pub mod catalog_dsn;

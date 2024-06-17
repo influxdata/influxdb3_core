@@ -249,30 +249,7 @@ impl ColumnSchema {
 
     /// returns true if the column matches the Arrow data type
     pub fn matches_arrow_type(&self, arrow_type: &ArrowDataType) -> bool {
-        match (arrow_type, self.column_type) {
-            (ArrowDataType::Int64, ColumnType::I64)
-            | (ArrowDataType::UInt64, ColumnType::U64)
-            | (ArrowDataType::Float64, ColumnType::F64)
-            | (ArrowDataType::Utf8, ColumnType::String)
-            | (ArrowDataType::Utf8, ColumnType::Tag)
-            | (ArrowDataType::Boolean, ColumnType::Bool)
-            | (ArrowDataType::Timestamp(TimeUnit::Nanosecond, None), ColumnType::Time) => true,
-
-            (ArrowDataType::Dictionary(key_type, value_type), ColumnType::Tag)
-                if key_type.as_ref() == &ArrowDataType::Int32
-                    && value_type.as_ref() == &ArrowDataType::Utf8 =>
-            {
-                true
-            }
-
-            (ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)), ColumnType::Time)
-                if tz.as_ref() == "UTC" =>
-            {
-                true
-            }
-
-            _ => false,
-        }
+        self.column_type.matches_arrow_type(arrow_type)
     }
 
     /// Returns true if `mb_column` is of the same type as `self`.
@@ -287,7 +264,7 @@ impl TryFrom<&gossip::v1::Column> for ColumnSchema {
     fn try_from(v: &gossip::v1::Column) -> Result<Self, Self::Error> {
         Ok(Self {
             id: ColumnId::new(v.column_id),
-            column_type: ColumnType::try_from(v.column_type as i16)?,
+            column_type: ColumnType::try_from(v.column_type())?,
         })
     }
 }
@@ -319,6 +296,34 @@ impl ColumnType {
             Self::Tag => "tag",
         }
     }
+
+    /// returns true if this type matches the Arrow data type
+    pub fn matches_arrow_type(&self, arrow_type: &ArrowDataType) -> bool {
+        match (arrow_type, self) {
+            (ArrowDataType::Int64, ColumnType::I64)
+            | (ArrowDataType::UInt64, ColumnType::U64)
+            | (ArrowDataType::Float64, ColumnType::F64)
+            | (ArrowDataType::Utf8, ColumnType::String)
+            | (ArrowDataType::Utf8, ColumnType::Tag)
+            | (ArrowDataType::Boolean, ColumnType::Bool)
+            | (ArrowDataType::Timestamp(TimeUnit::Nanosecond, None), ColumnType::Time) => true,
+
+            (ArrowDataType::Dictionary(key_type, value_type), ColumnType::Tag)
+                if key_type.as_ref() == &ArrowDataType::Int32
+                    && value_type.as_ref() == &ArrowDataType::Utf8 =>
+            {
+                true
+            }
+
+            (ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)), ColumnType::Time)
+                if tz.as_ref() == "UTC" =>
+            {
+                true
+            }
+
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ColumnType {
@@ -326,6 +331,37 @@ impl std::fmt::Display for ColumnType {
         let s = self.as_str();
 
         write!(f, "{s}")
+    }
+}
+
+impl TryFrom<&ArrowDataType> for ColumnType {
+    type Error = &'static str;
+
+    fn try_from(value: &ArrowDataType) -> Result<Self, Self::Error> {
+        match value {
+            ArrowDataType::Int64 => Ok(Self::I64),
+            ArrowDataType::UInt64 => Ok(Self::U64),
+            ArrowDataType::Float64 => Ok(Self::F64),
+
+            // Note this unconditionally converts to String; this column might be Tag though.
+            // This is what works for the bulk ingester; this may not work for your use case!
+            ArrowDataType::Utf8 => Ok(Self::String),
+
+            ArrowDataType::Boolean => Ok(Self::Bool),
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(Self::Time),
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if tz.as_ref() == "UTC" => {
+                Ok(Self::Time)
+            }
+
+            ArrowDataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &ArrowDataType::Int32
+                    && value_type.as_ref() == &ArrowDataType::Utf8 =>
+            {
+                Ok(Self::Tag)
+            }
+
+            _ => Err("No corresponding type in the InfluxDB data model"),
+        }
     }
 }
 
@@ -876,7 +912,7 @@ mod tests {
         let proto = gossip::v1::Column {
             name: "bananas".to_string(),
             column_id: 42,
-            column_type: gossip::v1::column::ColumnType::String as _,
+            column_type: proto::ColumnType::String as _,
         };
 
         let got = ColumnSchema::try_from(&proto).expect("should succeed");

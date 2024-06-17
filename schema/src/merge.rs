@@ -33,6 +33,26 @@ pub enum Error {
         existing_column_type: InfluxColumnType,
         new_column_type: InfluxColumnType,
     },
+
+    #[snafu(display(
+        "Schema Merge Error: Incompatible series keys when merging schema. Existing key: [{}], new key: [{}]",
+        existing_key.join(", "),
+        new_key.join(", ")
+    ))]
+    TryMergeIncompatibleSeriesKey {
+        existing_key: Vec<String>,
+        new_key: Vec<String>,
+    },
+
+    #[snafu(display(
+        "Schema Merge Error: tried to merge a schema that has no series key with one that does"
+    ))]
+    TryMergeNonSeriesKey,
+
+    #[snafu(display(
+        "Schema Merge Error: tried to merge a schema that has a series key with one that does not"
+    ))]
+    TryMergeIntoNonSeriesKey,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -69,6 +89,8 @@ pub struct SchemaMerger<'a> {
     fields: HashMap<String, (Field, InfluxColumnType)>,
     /// The measurement name if any
     measurement: Option<String>,
+    /// The series key if any
+    series_key: Option<Vec<String>>,
     /// Interner, if any.
     interner: Option<&'a mut SchemaInterner>,
 }
@@ -84,6 +106,7 @@ impl<'a> SchemaMerger<'a> {
         SchemaMerger {
             fields: self.fields,
             measurement: self.measurement,
+            series_key: None,
             interner: Some(interner),
         }
     }
@@ -106,9 +129,40 @@ impl<'a> SchemaMerger<'a> {
             _ => {}
         }
 
+        self.merge_series_key(other.series_key())?;
+
         // Merge fields
         for (column_type, field) in other.iter() {
             self.merge_field(field, column_type)?;
+        }
+
+        Ok(self)
+    }
+
+    pub fn merge_series_key(&mut self, other: Option<Vec<&str>>) -> Result<&mut Self> {
+        let this = self.series_key.as_deref();
+
+        match (this, other) {
+            (None, None) => (),
+            (None, Some(new)) => {
+                if self.fields.is_empty() {
+                    // this is the first merge, since the fields are empty, so set the
+                    // series key this time:
+                    self.series_key = Some(new.into_iter().map(|v| v.to_string()).collect());
+                } else {
+                    return TryMergeIntoNonSeriesKeySnafu.fail();
+                }
+            }
+            (Some(_), None) => return TryMergeNonSeriesKeySnafu.fail(),
+            (Some(a), Some(b)) => {
+                if a != b {
+                    return TryMergeIncompatibleSeriesKeySnafu {
+                        existing_key: a.iter().map(Into::into).collect::<Vec<String>>(),
+                        new_key: b.into_iter().map(Into::into).collect::<Vec<String>>(),
+                    }
+                    .fail();
+                }
+            }
         }
 
         Ok(self)
@@ -156,6 +210,7 @@ impl<'a> SchemaMerger<'a> {
         let schema = Schema::new_from_parts(
             self.measurement.take(),
             self.fields.drain().map(|x| x.1),
+            self.series_key.take(),
             true,
         )
         .expect("failed to build merged schema");

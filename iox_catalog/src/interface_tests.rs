@@ -27,6 +27,7 @@ use metric::{Observation, RawReporter};
 use parking_lot::Mutex;
 
 use crate::{
+    constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
     interface::{
         CasFailure, Catalog, Error, ParquetFileRepoExt, PartitionRepoExt, RepoCollection,
         SoftDeletedRows,
@@ -592,7 +593,8 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .tables()
         .create(
             "test_table",
-            TablePartitionTemplateOverride::try_new(None, &namespace.partition_template).unwrap(),
+            TablePartitionTemplateOverride::try_from_existing(None, &namespace.partition_template)
+                .unwrap(),
             namespace.id,
         )
         .await;
@@ -697,7 +699,8 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .tables()
         .create(
             "definitely_unique",
-            TablePartitionTemplateOverride::try_new(None, &latest.partition_template).unwrap(),
+            TablePartitionTemplateOverride::try_from_existing(None, &latest.partition_template)
+                .unwrap(),
             latest.id,
         )
         .await
@@ -705,7 +708,7 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
     assert!(matches!(err, Error::LimitExceeded { .. }));
 
     // Create a table with a partition template other than the default
-    let custom_table_template = TablePartitionTemplateOverride::try_new(
+    let custom_table_template = TablePartitionTemplateOverride::try_from_existing(
         Some(proto::PartitionTemplate {
             parts: vec![
                 proto::TemplatePart {
@@ -781,9 +784,11 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap();
     // Create a table without specifying the partition template
-    let custom_table_template =
-        TablePartitionTemplateOverride::try_new(None, &custom_namespace.partition_template)
-            .unwrap();
+    let custom_table_template = TablePartitionTemplateOverride::try_from_existing(
+        None,
+        &custom_namespace.partition_template,
+    )
+    .unwrap();
     let table_templated_by_namespace = repos
         .tables()
         .create(
@@ -795,7 +800,8 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(
         table_templated_by_namespace.partition_template,
-        TablePartitionTemplateOverride::try_new(None, &custom_namespace_template).unwrap()
+        TablePartitionTemplateOverride::try_from_existing(None, &custom_namespace_template)
+            .unwrap()
     );
 
     // Tag columns should be created for tags used in the template
@@ -2313,6 +2319,53 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     assert_eq!(
         parquet_file_with_source.source,
         Some(ParquetFileSource::BulkIngest)
+    );
+
+    // Test that MAX_PARQUET_L0_FILES_PER_PARTITION limit is applied
+    let partition4 = repos
+        .partitions()
+        .create_or_get("four".into(), table.id)
+        .await
+        .unwrap();
+
+    // Create more files than can be returned in a single query, with known (and differing) max_l0_created_at
+    for i in 0..(MAX_PARQUET_L0_FILES_PER_PARTITION + 10) {
+        let f_params = ParquetFileParams {
+            object_store_id: ObjectStoreId::new(),
+            partition_id: partition4.id,
+            max_l0_created_at: Timestamp::new(i),
+            min_time: Timestamp::new(0),
+            max_time: Timestamp::new(10),
+            compaction_level: CompactionLevel::Initial,
+            ..f8_params.clone()
+        };
+        let _ = repos
+            .parquet_files()
+            .create_upgrade_delete(
+                partition4.id,
+                &[],
+                &[],
+                &[f_params],
+                CompactionLevel::Initial,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Make sure we get the right number of files, and the oldest files.
+    let files = repos
+        .parquet_files()
+        .list_by_partition_not_to_delete_batch(vec![partition4.id])
+        .await
+        .unwrap();
+    assert_eq!(files.len(), MAX_PARQUET_L0_FILES_PER_PARTITION as usize);
+    let max_l0_created_ats = files
+        .iter()
+        .map(|f| f.max_l0_created_at.get())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        max_l0_created_ats,
+        (0..MAX_PARQUET_L0_FILES_PER_PARTITION).collect::<Vec<_>>()
     );
 }
 

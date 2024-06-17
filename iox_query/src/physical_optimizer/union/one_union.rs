@@ -34,7 +34,7 @@ impl PhysicalOptimizerRule for OneUnion {
             if let Some(union_exec) = plan_any.downcast_ref::<UnionExec>() {
                 let mut children = union_exec.children();
                 if children.len() == 1 {
-                    return Ok(Transformed::yes(children.remove(0)));
+                    return Ok(Transformed::yes(Arc::clone(children.remove(0))));
                 }
             }
 

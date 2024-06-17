@@ -116,7 +116,8 @@ async fn route_request(
     let content_length = req.headers().get("content-length").cloned();
 
     let response = match (method.clone(), uri.path()) {
-        (Method::GET, "/health") => Ok(health(server_type.as_ref())),
+        (Method::GET, "/health") => Ok(check_response(server_type.is_healthy(), "OK")),
+        (Method::GET, "/ready") => Ok(check_response(server_type.is_ready(), "READY")),
         (Method::GET, "/metrics") => handle_metrics(server_type.as_ref()),
         _ => server_type
             .route_http_request(req)
@@ -142,12 +143,11 @@ async fn route_request(
     }
 }
 
-fn health(server_type: &dyn ServerType) -> Response<Body> {
-    match server_type.is_healthy() {
-        true => {
-            let response_body = "OK";
-            Response::new(Body::from(response_body.to_string()))
-        }
+/// Returns HTTP 200 with a body of `response_body` when `is_ok` is true, and a
+/// 5xx with no body otherwise.
+fn check_response(is_ok: bool, response_body: &'static str) -> Response<Body> {
+    match is_ok {
+        true => Response::new(Body::from(response_body)),
         false => {
             let mut resp = Response::new(Body::empty());
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;

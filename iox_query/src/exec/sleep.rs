@@ -83,8 +83,12 @@ impl UserDefinedLogicalNodeCore for SleepNode {
         write!(f, "{}: duration=[{}]", self.name(), duration)
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-        Self::new(inputs[0].clone(), exprs.to_vec())
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::common::Result<Self> {
+        Ok(Self::new(inputs[0].clone(), exprs.to_vec()))
     }
 }
 
@@ -148,8 +152,8 @@ impl ExecutionPlan for SleepExpr {
         &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(

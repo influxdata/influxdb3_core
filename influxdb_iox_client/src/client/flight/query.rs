@@ -86,10 +86,7 @@ impl<'c, State> QueryBuilder<'c, State> {
 
 impl<'c> QueryBuilder<'c, NoQuery> {
     /// internal constructor. use [`super::Client::query`] as the public constructor
-    pub(crate) fn new(
-        client: &'c mut Client,
-        database: impl Into<String> + Send,
-    ) -> QueryBuilder<'c, NoQuery> {
+    pub(crate) fn new(client: &'c mut Client, database: impl Into<String> + Send) -> Self {
         QueryBuilder {
             client,
             database: database.into(),

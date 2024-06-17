@@ -5,6 +5,7 @@ use crate::interface::namespace_snapshot_by_name;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
+        MAX_PARQUET_L0_FILES_PER_PARTITION,
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
@@ -1001,12 +1002,20 @@ impl ParquetFileRepo for MemTxn {
         let partition_ids = partition_ids.into_iter().collect::<HashSet<_>>();
         let stage = self.collections.lock();
 
-        Ok(stage
+        let (mut l0s, others): (Vec<ParquetFile>, Vec<ParquetFile>) = stage
             .parquet_files
             .iter()
             .filter(|f| partition_ids.contains(&f.partition_id) && f.to_delete.is_none())
             .cloned()
-            .collect())
+            .partition(|f| f.compaction_level == CompactionLevel::Initial);
+
+        l0s.sort_by(|a, b| a.max_l0_created_at.cmp(&b.max_l0_created_at));
+        let l0s: Vec<ParquetFile> = l0s
+            .into_iter()
+            .take(MAX_PARQUET_L0_FILES_PER_PARTITION as usize)
+            .collect();
+
+        Ok(l0s.into_iter().chain(others.into_iter()).collect())
     }
 
     async fn get_by_object_store_id(

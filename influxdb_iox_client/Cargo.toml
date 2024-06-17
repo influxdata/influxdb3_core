@@ -26,13 +26,13 @@ influxdb-line-protocol = { path = "../influxdb_line_protocol"}
 iox_query_params = { path = "../iox_query_params" }
 generated_types = { path = "../generated_types" }
 prost = { workspace = true }
-rand = "0.8.3"
+rand = "0.8.5"
 reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 schema = { path = "../schema" }
 serde_json = "1.0.117"
-tokio = { version = "1.37", features = ["macros", "parking_lot", "rt-multi-thread"] }
+tokio = { version = "1.38", features = ["macros", "parking_lot", "rt-multi-thread"] }
 tokio-stream = "0.1.15"
-thiserror = "1.0.60"
+thiserror = "1.0.61"
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 

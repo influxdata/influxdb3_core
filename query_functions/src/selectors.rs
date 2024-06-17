@@ -103,7 +103,10 @@ use arrow::datatypes::{DataType, Field};
 use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
     error::Result as DataFusionResult,
-    logical_expr::{function::AccumulatorArgs, AggregateUDF, Signature, Volatility},
+    logical_expr::{
+        function::{AccumulatorArgs, StateFieldsArgs},
+        AggregateUDF, Signature, Volatility,
+    },
     physical_plan::{expressions::format_state_name, Accumulator},
     prelude::SessionContext,
 };
@@ -305,16 +308,18 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
 
     fn state_fields(
         &self,
-        name: &str,
-        value_type: DataType,
-        _ordering_fields: Vec<arrow::datatypes::Field>,
+        args: StateFieldsArgs<'_>,
     ) -> DataFusionResult<Vec<arrow::datatypes::Field>> {
-        let fields = AggType::try_from_return_type(&value_type)?
+        let fields = AggType::try_from_return_type(args.return_type)?
             .state_datatypes()
             .into_iter()
             .enumerate()
             .map(|(i, data_type)| {
-                Field::new(format_state_name(name, &format!("{i}")), data_type, true)
+                Field::new(
+                    format_state_name(args.name, &format!("{i}")),
+                    data_type,
+                    true,
+                )
             })
             .collect::<Vec<_>>();
 
@@ -1179,7 +1184,7 @@ mod test {
         pub async fn run_cases_err(selector: AggregateUDF, name: &str) {
             run_case_err(
                 selector.call(vec![]),
-                &format!("Error during planning: {name} requires at least 2 arguments, got 0"),
+                &format!("Error during planning: Error during planning: [data_types_with_aggregate_udf] Coercion from [] to the signature VariadicAny failed. and No function matches the given name and argument types '{name}()'. You might need to add explicit type casts.\n\tCandidate functions:\n\t{name}(Any, .., Any)"),
             )
             .await;
 

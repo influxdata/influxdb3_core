@@ -13,26 +13,22 @@ use arrow::{
 };
 
 use data_types::TimestampMinMax;
-use datafusion::common::stats::Precision;
 use datafusion::physical_expr::{analyze, AnalysisContext, ExprBoundaries};
 use datafusion::{
     self,
     common::ToDFSchema,
     datasource::{provider_as_source, MemTable},
     error::DataFusionError,
-    execution::context::ExecutionProps,
     logical_expr::{interval_arithmetic::Interval, LogicalPlan, LogicalPlanBuilder},
-    optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext},
-    physical_expr::create_physical_expr,
     physical_plan::{
         expressions::{col as physical_col, PhysicalSortExpr},
         PhysicalExpr,
     },
     prelude::{Column, Expr},
 };
+use datafusion::{common::stats::Precision, execution::context::SessionState};
 
 use itertools::Itertools;
-use observability_deps::tracing::trace;
 use schema::{sort::SortKey, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
@@ -103,21 +99,12 @@ pub fn arrow_sort_key_exprs(
 
 /// Build a datafusion physical expression from a logical one
 pub fn df_physical_expr(
+    session_state: &SessionState,
     schema: ArrowSchemaRef,
     expr: Expr,
 ) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
     let df_schema = Arc::clone(&schema).to_dfschema_ref()?;
-
-    let props = ExecutionProps::new();
-    let simplifier =
-        ExprSimplifier::new(SimplifyContext::new(&props).with_schema(Arc::clone(&df_schema)));
-
-    // apply type coercion here to ensure types match
-    trace!(%df_schema, "input schema");
-    let expr = simplifier.coerce(expr, &df_schema)?;
-    trace!(%expr, "coerced logical expression");
-
-    create_physical_expr(&expr, df_schema.as_ref(), &props)
+    session_state.create_physical_expr(expr, df_schema.as_ref())
 }
 
 /// Return min and max for column `time` of the given set of record batches by
@@ -177,6 +164,7 @@ pub fn compute_timenanosecond_min_max_for_one_record_batch(
 /// order. Any fileds that are not constrained by the expression will
 /// have an unbounded interval.
 pub fn calculate_field_intervals(
+    session_state: &SessionState,
     schema: ArrowSchemaRef,
     expr: Expr,
 ) -> Result<Vec<Interval>, DataFusionError> {
@@ -199,7 +187,7 @@ pub fn calculate_field_intervals(
 
     let context = AnalysisContext::new(boundaries);
     let analysis_result = analyze(
-        &df_physical_expr(Arc::clone(&schema), expr)?,
+        &df_physical_expr(session_state, Arc::clone(&schema), expr)?,
         context,
         &schema,
     )?;
@@ -216,12 +204,13 @@ pub fn calculate_field_intervals(
 /// Determine the possible maximum range for the named field in the
 /// ['ArrowSchema'] once the ['Expr'] has been applied.
 pub fn calculate_field_interval(
+    session_state: &SessionState,
     schema: ArrowSchemaRef,
     expr: Expr,
     name: &str,
 ) -> Result<Interval, DataFusionError> {
     let idx = schema.index_of(name)?;
-    let mut intervals = calculate_field_intervals(Arc::clone(&schema), expr)?;
+    let mut intervals = calculate_field_intervals(session_state, Arc::clone(&schema), expr)?;
     Ok(intervals.swap_remove(idx))
 }
 
@@ -229,6 +218,7 @@ pub fn calculate_field_interval(
 mod tests {
     use datafusion::common::rounding::next_down;
     use datafusion::common::ScalarValue;
+    use datafusion::execution::context::SessionContext;
     use datafusion::logical_expr::{col, lit};
     use schema::{builder::SchemaBuilder, InfluxFieldType, TIME_DATA_TIMEZONE};
 
@@ -248,6 +238,7 @@ mod tests {
 
     #[test]
     fn test_calculate_field_intervals() {
+        let session_state = SessionContext::new().state();
         let schema = SchemaBuilder::new()
             .timestamp()
             .influx_field("a", InfluxFieldType::Float)
@@ -259,7 +250,7 @@ mod tests {
             .and(col("time").lt(lit("2020-01-02T00:00:00Z")))
             .and(col("a").gt_eq(lit(1000000.0)))
             .and(col("a").lt(lit(2000000.0)));
-        let intervals = calculate_field_intervals(schema, expr).unwrap();
+        let intervals = calculate_field_intervals(&session_state, schema, expr).unwrap();
         // 2020-01-01T00:00:00Z == 1577836800000000000
         // 2020-01-02T00:00:00Z == 1577923200000000000
         assert_eq!(
@@ -273,6 +264,7 @@ mod tests {
 
     #[test]
     fn test_calculate_field_intervals_no_constraints() {
+        let session_state = SessionContext::new().state();
         let schema = SchemaBuilder::new()
             .timestamp()
             .influx_field("a", InfluxFieldType::Float)
@@ -281,7 +273,7 @@ mod tests {
             .as_arrow();
         // must be a predicate (boolean expression)
         let expr = lit("test").eq(lit("foo"));
-        let intervals = calculate_field_intervals(schema, expr).unwrap();
+        let intervals = calculate_field_intervals(&session_state, schema, expr).unwrap();
         assert_eq!(
             vec![time_interval(None, None), f64_interval(None, None)],
             intervals
@@ -290,6 +282,7 @@ mod tests {
 
     #[test]
     fn test_calculate_field_interval() {
+        let session_state = SessionContext::new().state();
         let schema = SchemaBuilder::new()
             .timestamp()
             .influx_field("a", InfluxFieldType::Float)
@@ -305,13 +298,17 @@ mod tests {
         // Note
         // 2020-01-01T00:00:00Z == 1577836800000000000
         // 2020-01-02T00:00:00Z == 1577923200000000000
-        let interval = calculate_field_interval(Arc::clone(&schema), expr.clone(), "time").unwrap();
+        let interval =
+            calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "time")
+                .unwrap();
         assert_eq!(
             time_interval(Some(1577836800000000000), Some(1577923200000000000 - 1),),
             interval
         );
 
-        let interval = calculate_field_interval(Arc::clone(&schema), expr.clone(), "a").unwrap();
+        let interval =
+            calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "a")
+                .unwrap();
         assert_eq!(
             f64_interval(Some(1000000.0), Some(next_down(2000000.0))),
             interval
@@ -319,7 +316,7 @@ mod tests {
 
         assert_eq!(
             "Arrow error: Schema error: Unable to get field named \"b\". Valid fields: [\"time\", \"a\"]",
-            calculate_field_interval(Arc::clone(&schema), expr.clone(), "b").unwrap_err().to_string(),
+            calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "b").unwrap_err().to_string(),
         );
     }
 }

@@ -13,11 +13,11 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["pem"] }
 futures = "0.3"
-http = "0.2.11"
+http = "0.2.12"
 humantime = "2.1.0"
 iox_catalog = { path = "../iox_catalog" }
 iox_time = { path = "../iox_time" }
-itertools = "0.12.1"
+itertools = "0.13.0"
 metric = { path = "../metric" }
 non-empty-string = "0.2.4"
 object_store = { workspace = true }
@@ -26,12 +26,13 @@ paste = "1.0.15"
 reqwest = { version = "0.11", default-features = false }
 snafu = "0.8"
 sysinfo = "0.30.12"
-tokio = { version = "1.37", features = ["rt-multi-thread"] }
+tokio = { version = "1.38", features = ["rt-multi-thread"] }
 trace_exporters = { path = "../trace_exporters" }
 trogging = { path = "../trogging", default-features = false, features = ["clap"] }
-url = "2.4"
+url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+versioned_file_store = { path = "../versioned_file_store" }
 
 # use libc on unix like platforms to set worker priority of the tokio runtime workers
 [target."cfg(unix)".dependencies.libc]
@@ -45,3 +46,4 @@ test_helpers = { path = "../test_helpers" }
 azure = ["object_store/azure"] # Optional Azure Object store support
 gcp = ["object_store/gcp"] # Optional GCP object store support
 aws = ["object_store/aws"] # Optional AWS / S3 object store support
+jemalloc = [] # Provide jemalloc-specific config options.

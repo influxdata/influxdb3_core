@@ -220,8 +220,8 @@ impl ExecutionPlan for DeduplicateExec {
         vec![false]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -1201,7 +1201,7 @@ mod test {
             &self.cache
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 

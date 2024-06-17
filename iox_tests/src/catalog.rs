@@ -219,7 +219,7 @@ impl TestNamespace {
             .tables()
             .create(
                 name,
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     template,
                     &self.namespace.partition_template,
                 )

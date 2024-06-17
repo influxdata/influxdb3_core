@@ -262,7 +262,7 @@ impl TableProvider for ChunkTableProvider {
 
             if let Some(expr) = maybe_expr {
                 Arc::new(FilterExec::try_new(
-                    df_physical_expr(plan.schema(), expr)?,
+                    df_physical_expr(ctx, plan.schema(), expr)?,
                     plan,
                 )?)
             } else {
