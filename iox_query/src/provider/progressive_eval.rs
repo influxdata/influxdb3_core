@@ -49,7 +49,7 @@ use crate::config::IoxConfigExt;
 /// │ ╔═══╦═══╗               │  │
 /// │ ║ M ║ N ║               │──┘                             │
 /// │ ╚═══╩═══╝               │                Output only include top record batches that cover top N rows
-/// └─────────────────────────┘                
+/// └─────────────────────────┘
 ///   Stream 2
 ///
 ///
@@ -165,8 +165,8 @@ impl ExecutionPlan for ProgressiveEvalExec {
         vec![true]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::<dyn ExecutionPlan>::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -470,7 +470,7 @@ impl Stream for ProgressiveEvalStream {
         }
 
         // Have reached the fetch limit
-        if self.produced >= self.fetch.unwrap_or(std::usize::MAX) {
+        if self.produced >= self.fetch.unwrap_or(usize::MAX) {
             return Poll::Ready(None);
         }
 
@@ -1757,7 +1757,7 @@ mod tests {
             &self.cache
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             // this is a leaf node and has no children
             vec![]
         }

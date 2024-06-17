@@ -32,6 +32,7 @@ pub mod chunk_statistics;
 pub mod config;
 pub mod exec;
 pub mod frontend;
+pub mod ingester;
 pub mod logical_optimizer;
 pub mod physical_optimizer;
 pub mod plan;

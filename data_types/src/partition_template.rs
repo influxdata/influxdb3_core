@@ -96,13 +96,23 @@
 //! allow splitting graphemes, but by being conservative we give ourselves this
 //! option - we can't easily do the reverse!
 //!
-//! ## Part Limit & Maximum Key Size
+//! ## Part Limits & Maximum Key Size
 //!
 //! The number of parts in a partition template is limited to 8
 //! ([`MAXIMUM_NUMBER_OF_TEMPLATE_PARTS`]), validated at creation time.
 //!
 //! Together with the above value truncation, this bounds the maximum length of
 //! a partition key to 1,607 bytes (1.57 KiB).
+//!
+//! ### Required Parts
+//!
+//! Any partition template for a _newly_ created record (namespace or table)
+//! MUST contain a [`TemplatePart::TimeFormat`] part. Partition templates for
+//! pre-existing records are allowed to forgoe this requirement as no reasonable
+//! migration path existed at the time this extra validation was introduced.
+//!
+//! Partitioning without time has bad long-term performance implications, but
+//! existing tables set up in this way must continue to operate in some manner.
 //!
 //! ### Reserved Characters
 //!
@@ -235,6 +245,13 @@ pub enum ValidationError {
     /// [`Bucket`]: [`proto::template_part::Part::Bucket`]
     #[error("tag name value cannot be repeated in partition template: {0}")]
     RepeatedTagValue(String),
+
+    /// An attempt to make a new partition template without a [`TimeFormat`]
+    /// part has been made. This is not allowed.
+    ///
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
+    #[error("partition template must include a time format part")]
+    TimeFormatPartRequired,
 }
 
 /// The maximum number of template parts a custom partition template may specify, to limit the
@@ -364,6 +381,19 @@ pub fn bucket_for_tag_value(tag_value: &str, num_buckets: u32) -> u32 {
 ///
 /// Internally this type is [`None`] when no namespace-level override is
 /// specified, resulting in the default being used.
+///
+/// When creating a partition template for a namespace that does not yet have a
+/// record you MUST use [`try_new()`]. This performs additional validation
+/// checks which are not done by [`try_from()`].
+///
+/// This discrepancy exists because the additional validation checks were
+/// added at a later date to prevent creation of typically problematic
+/// partitioning schemes. Some clusters may already contain namespaces with
+/// these schemes in their catalog and must continue to function, as they
+/// were valid at time of creation and are still 'operable'.
+///
+/// [`try_new()`]: NamespacePartitionTemplateOverride::try_new()
+/// [`try_from()`]: NamespacePartitionTemplateOverride::try_from()
 #[derive(Debug, PartialEq, Clone, Default, sqlx::Type, Hash)]
 #[sqlx(transparent, no_pg_array)]
 pub struct NamespacePartitionTemplateOverride(Option<serialization::Wrapper>);
@@ -372,6 +402,31 @@ impl NamespacePartitionTemplateOverride {
     /// A const "default" impl for testing.
     pub const fn const_default() -> Self {
         Self(None)
+    }
+
+    /// When a new namespace is created, the request to do so may include a
+    /// custom partition template. This must be validated before use, with
+    /// additional constraints applied to new namespaces.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template
+    /// specified is invalid. If `partition_template` does not contain a
+    /// [`TimeFormat`] part it will also be rejected.
+    ///
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
+    pub fn try_new(partition_template: proto::PartitionTemplate) -> Result<Self, ValidationError> {
+        let namespace_template = Self::try_from(partition_template)?;
+
+        let template_contains_time_format = namespace_template
+            .parts()
+            .any(|p| matches!(p, TemplatePart::TimeFormat(_)));
+
+        if !template_contains_time_format {
+            return Err(ValidationError::TimeFormatPartRequired);
+        }
+
+        Ok(namespace_template)
     }
 
     /// Return the protobuf representation of this template.
@@ -390,6 +445,15 @@ impl NamespacePartitionTemplateOverride {
 impl TryFrom<proto::PartitionTemplate> for NamespacePartitionTemplateOverride {
     type Error = ValidationError;
 
+    /// An existing namepsace pulled from the catalog may contain a valid, but since
+    /// disallowed partition template that would fail the validation checks
+    /// performed by [`NamespacePartitionTemplateOverride::try_new()`].
+    ///
+    /// This function
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template specified is invalid.
     fn try_from(partition_template: proto::PartitionTemplate) -> Result<Self, Self::Error> {
         Ok(Self(Some(serialization::Wrapper::try_from(
             partition_template,
@@ -398,19 +462,74 @@ impl TryFrom<proto::PartitionTemplate> for NamespacePartitionTemplateOverride {
 }
 
 /// A partition template specified by a table record.
+///
+/// When creating a partition template for a table that does not yet have a
+/// record you MUST use [`try_new()`]. This performs additional validation
+/// checks which are not done by [`try_from_existing()`].
+///
+/// This discrepancy exists because the additional validation checks were
+/// added at a later date to prevent creation of typically problematic
+/// partitioning schemes. Some clusters may already contain tables with these
+/// schemes in their catalog and must continue to function, as they were valid
+/// at time of creation and are still 'operable'.
+///
+///
+/// [`try_new()`]: TablePartitionTemplateOverride::try_new()
+/// [`try_from_existing()`]: TablePartitionTemplateOverride::try_from_existing()
 #[derive(Debug, PartialEq, Eq, Clone, Default, sqlx::Type, Hash)]
 #[sqlx(transparent, no_pg_array)]
 pub struct TablePartitionTemplateOverride(Option<serialization::Wrapper>);
 
 impl TablePartitionTemplateOverride {
-    /// When a table is being explicitly created, the creation request might have contained a
-    /// custom partition template for that table. If the custom partition template is present, use
+    /// When a new table is being explicitly created, the request to do so may
+    /// include a custom partition template which overrides the namespace level
+    /// partitioning scheme. If the custom partition template is present, use
     /// it. Otherwise, use the namespace's partition template.
     ///
     /// # Errors
     ///
-    /// This function will return an error if the custom partition template specified is invalid.
+    /// This function will return an error if the custom partition template
+    /// specified is invalid. If `custom_table_template` does not contain a
+    /// [`TimeFormat`] part it will also be rejected.
+    ///
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
     pub fn try_new(
+        custom_table_template: Option<proto::PartitionTemplate>,
+        namespace_template: &NamespacePartitionTemplateOverride,
+    ) -> Result<Self, ValidationError> {
+        // If a custom table template was specified for the new table and no
+        // part in it is a [`TimeFormat`] part then it should not be created.
+        if custom_table_template
+            .as_ref()
+            .is_some_and(|table_template| {
+                !table_template.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        proto::TemplatePart {
+                            part: Some(proto::template_part::Part::TimeFormat(..))
+                        }
+                    )
+                })
+            })
+        {
+            return Err(ValidationError::TimeFormatPartRequired);
+        }
+
+        let table = Self::try_from_existing(custom_table_template, namespace_template)?;
+
+        Ok(table)
+    }
+
+    /// An existing table pulled from the catalog may contain a valid, but since
+    /// disallowed partition template that would fail the validation checks
+    /// performed by [`TablePartitionTemplateOverride::try_new()`].
+    ///
+    /// This function
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template specified is invalid.
+    pub fn try_from_existing(
         custom_table_template: Option<proto::PartitionTemplate>,
         namespace_template: &NamespacePartitionTemplateOverride,
     ) -> Result<Self, ValidationError> {
@@ -798,7 +917,7 @@ where
 pub fn build_column_values<'a>(
     template: &'a TablePartitionTemplateOverride,
     partition_key: &'a str,
-) -> impl Iterator<Item = (&'a str, ColumnValue<'a>)> {
+) -> impl Iterator<Item = (&'a str, Option<ColumnValue<'a>>)> {
     // Exploded parts of the generated key on the "|" character.
     //
     // Any uses of the "|" character within the partition key's user-provided
@@ -816,25 +935,22 @@ pub fn build_column_values<'a>(
     // placed here to validate this property.
 
     // Produce an iterator of (template_part, template_value)
-    template_parts
-        .zip(key_parts)
-        .filter_map(|(template, value)| {
-            if value == PARTITION_KEY_VALUE_NULL_STR {
-                None
-            } else {
-                match template {
-                    TemplatePart::TagValue(col_name) => {
-                        Some((col_name, parse_part_tag_value(value)?))
-                    }
-                    TemplatePart::TimeFormat(format) => {
-                        Some((TIME_COLUMN_NAME, parse_part_time_format(value, format)?))
-                    }
-                    TemplatePart::Bucket(col_name, num_buckets) => {
-                        Some((col_name, parse_part_bucket(value, num_buckets)?))
-                    }
-                }
-            }
-        })
+    template_parts.zip(key_parts).map(|(template, value)| {
+        let name = match template {
+            TemplatePart::TagValue(col_name) => col_name,
+            TemplatePart::TimeFormat(_) => TIME_COLUMN_NAME,
+            TemplatePart::Bucket(col_name, _) => col_name,
+        };
+        let value = (value != PARTITION_KEY_VALUE_NULL_STR)
+            .then(|| match template {
+                TemplatePart::TagValue(_) => parse_part_tag_value(value),
+                TemplatePart::TimeFormat(format) => parse_part_time_format(value, format),
+                TemplatePart::Bucket(_, num_buckets) => parse_part_bucket(value, num_buckets),
+            })
+            .flatten();
+
+        (name, value)
+    })
 }
 
 fn parse_part_tag_value(value: &str) -> Option<ColumnValue<'_>> {
@@ -1073,6 +1189,35 @@ mod tests {
         let err = serialization::Wrapper::try_from(proto::PartitionTemplate { parts: vec![] });
 
         assert_error!(err, ValidationError::NoParts);
+    }
+
+    #[test]
+    fn new_namespace_template_requires_time_format() {
+        // Without tag value
+        assert_matches!(
+            NamespacePartitionTemplateOverride::try_new(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("region".into())),
+                }]
+            }),
+            Err(ValidationError::TimeFormatPartRequired)
+        );
+        // Adding tag value to same template results in acceptance.
+        assert_matches!(
+            NamespacePartitionTemplateOverride::try_new(proto::PartitionTemplate {
+                parts: vec![
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TagValue("region".into())),
+                    },
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                    },
+                ]
+            }),
+            Ok(v) => {
+                assert_eq!(v.parts().count(), 2);
+            }
+        );
     }
 
     #[test]
@@ -1520,10 +1665,10 @@ mod tests {
         ],
         partition_key = "2023|bananas|plátanos|5",
         want = [
-            (TIME_COLUMN_NAME, year(2023)),
-            ("a", identity("bananas")),
-            ("b", identity("plátanos")),
-            ("c", bucket(5, 10)),
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(identity("bananas"))),
+            ("b", Some(identity("plátanos"))),
+            ("c", Some(bucket(5, 10))),
         ]
     );
 
@@ -1536,7 +1681,12 @@ mod tests {
             TemplatePart::Bucket("c", 10),
         ],
         partition_key = "2023|!|plátanos|!",
-        want = [(TIME_COLUMN_NAME, year(2023)), ("b", identity("plátanos")),]
+        want = [
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", None),
+            ("b", Some(identity("plátanos"))),
+            ("c", None),
+        ]
     );
 
     test_build_column_values!(
@@ -1548,7 +1698,12 @@ mod tests {
             TemplatePart::Bucket("c", 10),
         ],
         partition_key = "2023|!|!|!",
-        want = [(TIME_COLUMN_NAME, year(2023)),]
+        want = [
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", None),
+            ("b", None),
+            ("c", None)
+        ]
     );
 
     test_build_column_values!(
@@ -1561,10 +1716,10 @@ mod tests {
         ],
         partition_key = "2023|cat%7Cdog|%21|8",
         want = [
-            (TIME_COLUMN_NAME, year(2023)),
-            ("a", identity("cat|dog")),
-            ("b", identity("!")),
-            ("c", bucket(8, 10)),
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(identity("cat|dog"))),
+            ("b", Some(identity("!"))),
+            ("c", Some(bucket(8, 10))),
         ]
     );
 
@@ -1578,9 +1733,10 @@ mod tests {
         ],
         partition_key = "2023|%2550|!|9",
         want = [
-            (TIME_COLUMN_NAME, year(2023)),
-            ("a", identity("%50")),
-            ("c", bucket(9, 10)),
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(identity("%50"))),
+            ("b", None),
+            ("c", Some(bucket(9, 10))),
         ]
     );
 
@@ -1594,9 +1750,10 @@ mod tests {
         ],
         partition_key = "2023|^|!|0",
         want = [
-            (TIME_COLUMN_NAME, year(2023)),
-            ("a", identity("")),
-            ("c", bucket(0, 10)),
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(identity(""))),
+            ("b", None),
+            ("c", Some(bucket(0, 10))),
         ]
     );
 
@@ -1609,7 +1766,12 @@ mod tests {
             TemplatePart::Bucket("c", 10),
         ],
         partition_key = "2023|BANANAS#|!|!|!",
-        want = [(TIME_COLUMN_NAME, year(2023)), ("a", prefix("BANANAS")),]
+        want = [
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(prefix("BANANAS"))),
+            ("b", None),
+            ("c", None)
+        ]
     );
 
     test_build_column_values!(
@@ -1622,8 +1784,10 @@ mod tests {
         ],
         partition_key = "2023|%28%E3%83%8E%E0%B2%A0%E7%9B%8A%E0%B2%A0%29%E3%83%8E%E5%BD%A1%E2%94%BB%E2%94%81%E2%94%BB#|!|!",
         want = [
-            (TIME_COLUMN_NAME, year(2023)),
-            ("a", prefix("(ノಠ益ಠ)ノ彡┻━┻")),
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(prefix("(ノಠ益ಠ)ノ彡┻━┻"))),
+            ("b", None),
+            ("c", None),
         ]
     );
 
@@ -1635,7 +1799,11 @@ mod tests {
             TemplatePart::TagValue("b"),
         ],
         partition_key = "2023|%E0%AE%A8%E0%AE%BF#|!",
-        want = [(TIME_COLUMN_NAME, year(2023)), ("a", prefix("நி")),]
+        want = [
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(prefix("நி"))),
+            ("b", None),
+        ]
     );
 
     test_build_column_values!(
@@ -1647,8 +1815,9 @@ mod tests {
         ],
         partition_key = "2023|is%7Cnot%21ambiguous%2510%23|!",
         want = [
-            (TIME_COLUMN_NAME, year(2023)),
-            ("a", identity("is|not!ambiguous%10#")),
+            (TIME_COLUMN_NAME, Some(year(2023))),
+            ("a", Some(identity("is|not!ambiguous%10#"))),
+            ("b", None),
         ]
     );
 
@@ -1656,14 +1825,14 @@ mod tests {
         datetime_fixed,
         template = [TemplatePart::TimeFormat("foo"),],
         partition_key = "foo",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         datetime_null,
         template = [TemplatePart::TimeFormat("%Y"),],
         partition_key = "!",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
@@ -1672,10 +1841,10 @@ mod tests {
         partition_key = "2023",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1685,10 +1854,10 @@ mod tests {
         partition_key = "2023-09",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 9, 1, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2023, 10, 1, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1698,10 +1867,10 @@ mod tests {
         partition_key = "2023-12",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 12, 1, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1711,10 +1880,10 @@ mod tests {
         partition_key = "2023-09-01",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 9, 1, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2023, 9, 2, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1724,10 +1893,10 @@ mod tests {
         partition_key = "2023-09-30",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 9, 30, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2023, 10, 1, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1737,10 +1906,10 @@ mod tests {
         partition_key = "2023-12-31",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 12, 31, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1750,10 +1919,10 @@ mod tests {
         partition_key = "01-09-2023",
         want = [(
             TIME_COLUMN_NAME,
-            ColumnValue::Datetime {
+            Some(ColumnValue::Datetime {
                 begin: Utc.with_ymd_and_hms(2023, 9, 1, 0, 0, 0).unwrap(),
                 end: Utc.with_ymd_and_hms(2023, 9, 2, 0, 0, 0).unwrap(),
-            },
+            }),
         )]
     );
 
@@ -1766,9 +1935,9 @@ mod tests {
         ],
         partition_key = "1|2|3",
         want = [
-            ("a", bucket(1, 41)),
-            ("b", bucket(2, 91)),
-            ("c", bucket(3, 144)),
+            ("a", Some(bucket(1, 41))),
+            ("b", Some(bucket(2, 91))),
+            ("c", Some(bucket(3, 144))),
         ]
     );
 
@@ -1810,49 +1979,49 @@ mod tests {
         datetime_not_compact_y_d,
         template = [TemplatePart::TimeFormat("%Y-%d"),],
         partition_key = "2023-01",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         datetime_not_compact_m,
         template = [TemplatePart::TimeFormat("%m"),],
         partition_key = "01",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         datetime_not_compact_d,
         template = [TemplatePart::TimeFormat("%d"),],
         partition_key = "01",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         datetime_range_unimplemented_y_m_d_h,
         template = [TemplatePart::TimeFormat("%Y-%m-%dT%H"),],
         partition_key = "2023-12-31T00",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         datetime_range_unimplemented_y_m_d_h_m,
         template = [TemplatePart::TimeFormat("%Y-%m-%dT%H:%M"),],
         partition_key = "2023-12-31T00:00",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         datetime_range_unimplemented_y_m_d_h_m_s,
         template = [TemplatePart::TimeFormat("%Y-%m-%dT%H:%M:%S"),],
         partition_key = "2023-12-31T00:00:00",
-        want = []
+        want = [(TIME_COLUMN_NAME, None)]
     );
 
     test_build_column_values!(
         empty_tag_only,
         template = [TemplatePart::TagValue("a")],
         partition_key = "!",
-        want = []
+        want = [("a", None)]
     );
 
     #[test]
@@ -1904,7 +2073,7 @@ mod tests {
         let ns = NamespacePartitionTemplateOverride::default();
         let got_ns = ns.parts().collect::<Vec<_>>();
         assert_matches!(got_ns.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
-        let table = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
+        let table = TablePartitionTemplateOverride::try_from_existing(None, &ns).unwrap();
         let got_table = table.parts().collect::<Vec<_>>();
         assert_matches!(got_table.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
     }
@@ -1912,7 +2081,7 @@ mod tests {
     #[test]
     fn len_of_default_template_is_1() {
         let ns = NamespacePartitionTemplateOverride::default();
-        let t = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
+        let t = TablePartitionTemplateOverride::try_from_existing(None, &ns).unwrap();
 
         assert_eq!(t.len(), 1);
     }
@@ -1927,18 +2096,23 @@ mod tests {
             })
             .unwrap();
         let table_template =
-            TablePartitionTemplateOverride::try_new(None, &namespace_template).unwrap();
+            TablePartitionTemplateOverride::try_from_existing(None, &namespace_template).unwrap();
 
         assert_eq!(table_template.len(), 1);
         assert_eq!(table_template.0, namespace_template.0);
     }
 
     #[test]
-    fn custom_table_template_specified_ignores_namespace_template() {
+    fn custom_table_template_with_time_specified_overrides_namespace_template() {
         let custom_table_template = proto::PartitionTemplate {
-            parts: vec![proto::TemplatePart {
-                part: Some(proto::template_part::Part::TagValue("region".into())),
-            }],
+            parts: vec![
+                proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("region".into())),
+                },
+                proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TimeFormat("%Y".into())),
+                },
+            ],
         };
         let namespace_template =
             NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
@@ -1947,9 +2121,43 @@ mod tests {
                 }],
             })
             .unwrap();
-        let table_template = TablePartitionTemplateOverride::try_new(
+        let table_template = TablePartitionTemplateOverride::try_from_existing(
             Some(custom_table_template.clone()),
             &namespace_template,
+        )
+        .unwrap();
+
+        assert_eq!(table_template.len(), 2);
+        assert_eq!(table_template.0.unwrap().inner(), &custom_table_template);
+    }
+
+    #[test]
+    fn new_custom_table_template_requires_time_specified() {
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("region".into())),
+            }],
+        };
+        assert_matches!(
+            TablePartitionTemplateOverride::try_new(
+                Some(custom_table_template.clone()),
+                &NamespacePartitionTemplateOverride::default(),
+            ),
+            Err(ValidationError::TimeFormatPartRequired)
+        );
+    }
+
+    #[test]
+    fn existing_custom_table_template_does_not_require_time_specified() {
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("region".into())),
+            }],
+        };
+
+        let table_template = TablePartitionTemplateOverride::try_from_existing(
+            Some(custom_table_template.clone()),
+            &NamespacePartitionTemplateOverride::default(),
         )
         .unwrap();
 
@@ -2003,7 +2211,7 @@ mod tests {
         let namespace_json_str: String = buf.iter().map(extract_sqlite_argument_text).collect();
         assert_eq!(namespace_json_str, expected_json_str);
 
-        let table = TablePartitionTemplateOverride::try_new(None, &namespace).unwrap();
+        let table = TablePartitionTemplateOverride::try_from_existing(None, &namespace).unwrap();
         let mut buf = Default::default();
         let _ = <TablePartitionTemplateOverride as Encode<'_, sqlx::Sqlite>>::encode_by_ref(
             &table, &mut buf,
@@ -2019,13 +2227,13 @@ mod tests {
             + std::mem::size_of::<proto::PartitionTemplate>();
 
         let first_string = "^";
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::TagValue(first_string.into())),
                 }],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template ");
 
@@ -2035,13 +2243,13 @@ mod tests {
         );
 
         let second_string = "region";
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::TagValue(second_string.into())),
                 }],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template ");
 
@@ -2051,7 +2259,7 @@ mod tests {
         );
 
         let time_string = "year-%Y";
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![
                     proto::TemplatePart {
@@ -2062,7 +2270,7 @@ mod tests {
                     },
                 ],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template ");
         assert_eq!(
@@ -2074,7 +2282,7 @@ mod tests {
                 + time_string.len()
         );
 
-        let template = TablePartitionTemplateOverride::try_new(
+        let template = TablePartitionTemplateOverride::try_from_existing(
             Some(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::Bucket(proto::Bucket {
@@ -2083,7 +2291,7 @@ mod tests {
                     })),
                 }],
             }),
-            &NamespacePartitionTemplateOverride::default(),
+            &Default::default(),
         )
         .expect("failed to create table partition template");
         assert_eq!(

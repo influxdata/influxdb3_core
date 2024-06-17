@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use data_types::{
     partition_template::NamespacePartitionTemplateOverride, Column, ColumnId, ColumnSet,
     ColumnType, Namespace, NamespaceId, NamespaceVersion, ObjectStoreId, ParquetFile,
@@ -53,7 +55,9 @@ impl std::error::Error for Error {}
 
 impl From<Error> for crate::interface::Error {
     fn from(e: Error) -> Self {
-        Self::External { source: e.into() }
+        Self::External {
+            source: Arc::new(e),
+        }
     }
 }
 
@@ -129,7 +133,8 @@ pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
 
     match status.code() {
         tonic::Code::Internal => Error::External {
-            source: status.message().to_owned().into(),
+            source: Box::<dyn std::error::Error + Send + Sync>::from(status.message().to_owned())
+                .into(),
         },
         tonic::Code::AlreadyExists => Error::AlreadyExists {
             descr: status.message().to_owned(),
@@ -147,7 +152,7 @@ pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
             descr: status.message().to_owned(),
         },
         _ => Error::External {
-            source: Box::new(status),
+            source: Arc::new(status),
         },
     }
 }
@@ -484,7 +489,7 @@ mod tests {
             descr: "foo".to_owned(),
         });
         assert_error_roundtrip(Error::External {
-            source: "foo".to_owned().into(),
+            source: Box::<dyn std::error::Error + Send + Sync>::from("foo".to_owned()).into(),
         });
         assert_error_roundtrip(Error::LimitExceeded {
             descr: "foo".to_owned(),
@@ -558,10 +563,12 @@ mod tests {
             id: TableId::new(1),
             namespace_id: NamespaceId::new(2),
             name: "table".to_owned(),
-            partition_template: TablePartitionTemplateOverride::try_new(
+            // Using `try_from_existing()` to ensure round-tripping uses the
+            // more permissive validation than used by `try_new()`.
+            partition_template: TablePartitionTemplateOverride::try_from_existing(
                 Some(proto::PartitionTemplate {
                     parts: vec![proto::TemplatePart {
-                        part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                        part: Some(proto::template_part::Part::TagValue("bananas".into())),
                     }],
                 }),
                 &NamespacePartitionTemplateOverride::const_default(),

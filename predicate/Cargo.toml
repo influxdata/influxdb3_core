@@ -10,16 +10,15 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-chrono = { version = "0.4", default-features = false }
+async-trait = "0.1.80"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
-itertools = "0.12"
+futures = "0.3"
+itertools = "0.13"
 observability_deps = { path = "../observability_deps" }
 query_functions = { path = "../query_functions"}
 schema = { path = "../schema" }
-snafu = "0.8"
-sqlparser = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

@@ -5,7 +5,7 @@ use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
 use mutable_batch::{writer::Writer, MutableBatch, TimestampSummary};
 use schema::Projection;
-use std::{f64::NAN, num::NonZeroU64};
+use std::num::NonZeroU64;
 
 fn get_stats(batch: &MutableBatch) -> Vec<(&str, Statistics)> {
     let mut stats: Vec<_> = batch
@@ -439,7 +439,7 @@ fn test_nan_stats() {
     let mut writer = Writer::new(&mut batch, 3);
 
     writer
-        .write_f64("f64", None, vec![4.2, NAN, 2.4].into_iter())
+        .write_f64("f64", None, vec![4.2, f64::NAN, 2.4].into_iter())
         .unwrap();
 
     writer.commit();

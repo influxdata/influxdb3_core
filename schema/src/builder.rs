@@ -3,6 +3,8 @@ use std::convert::TryInto;
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use snafu::{ResultExt, Snafu};
 
+use crate::MissingSeriesKeyColumnSnafu;
+
 use super::{InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME};
 
 /// Namespace schema creation / validation errors.
@@ -23,6 +25,9 @@ pub struct SchemaBuilder {
     /// The fields, in order
     fields: Vec<(ArrowField, InfluxColumnType)>,
 
+    /// The series key, if defined
+    series_key: Option<Vec<String>>,
+
     /// If the builder has been consumed
     finished: bool,
 }
@@ -37,7 +42,26 @@ impl SchemaBuilder {
             measurement: Default::default(),
             fields: Vec::with_capacity(n),
             finished: Default::default(),
+            series_key: None,
         }
+    }
+
+    pub fn series_key(&self) -> Option<&[String]> {
+        self.series_key.as_deref()
+    }
+
+    pub fn with_series_key<I>(&mut self, columns: I) -> &mut Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        self.series_key = Some(
+            columns
+                .into_iter()
+                .map(|c| c.as_ref().to_string())
+                .collect(),
+        );
+        self
     }
 
     /// Add a new tag column to this schema. By default tags are
@@ -132,8 +156,37 @@ impl SchemaBuilder {
         assert!(!self.finished, "build called multiple times");
         self.finished = true;
 
-        Schema::new_from_parts(self.measurement.take(), self.fields.drain(..), false)
-            .context(ValidatingSchemaSnafu)
+        // enforce non-nullable based on series key membership
+        if let Some(sk) = self.series_key.as_ref() {
+            self.fields = self
+                .fields
+                .drain(..)
+                .map(|(f, t)| {
+                    if sk.contains(f.name()) {
+                        (f.with_nullable(false), t)
+                    } else {
+                        (f, t)
+                    }
+                })
+                .collect();
+
+            if sk
+                .iter()
+                .any(|k| self.fields.iter().all(|(f, _)| f.name() != k))
+            {
+                return MissingSeriesKeyColumnSnafu
+                    .fail()
+                    .context(ValidatingSchemaSnafu);
+            }
+        }
+
+        Schema::new_from_parts(
+            self.measurement.take(),
+            self.fields.drain(..),
+            self.series_key.take(),
+            false,
+        )
+        .context(ValidatingSchemaSnafu)
     }
 
     /// Internal helper method to add a column definition

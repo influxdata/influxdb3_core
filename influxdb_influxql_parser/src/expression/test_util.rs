@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 /// Constructs an [crate::expression::arithmetic::Expr::VarRef] expression.
 #[macro_export]
 macro_rules! var_ref {

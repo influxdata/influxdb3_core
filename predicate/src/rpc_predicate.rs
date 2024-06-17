@@ -7,12 +7,14 @@ mod value_rewrite;
 use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 use crate::Predicate;
 
+use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::ToDFSchema;
 use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::context::ExecutionProps;
+use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::prelude::{lit, Expr};
+use futures::{StreamExt, TryStreamExt};
 use observability_deps::tracing::{debug, trace};
 use schema::Schema;
 use std::collections::BTreeSet;
@@ -125,20 +127,22 @@ impl InfluxRpcPredicate {
     /// transformations applied.
     ///
     /// Returns a list of (TableName, [`Predicate`])
-    pub fn table_predicates(
+    pub async fn table_predicates(
         &self,
+        session_ctx: &SessionContext,
         table_info: &dyn QueryNamespaceMeta,
-    ) -> DataFusionResult<Vec<(Arc<str>, Predicate)>> {
+        concurrent_jobs: usize,
+    ) -> DataFusionResult<Vec<(Arc<str>, Option<Schema>, Predicate)>> {
         let table_names = match &self.table_names {
             Some(table_names) => itertools::Either::Left(table_names.iter().cloned()),
             None => itertools::Either::Right(table_info.table_names().into_iter()),
         };
 
-        table_names
-            .map(|table| {
-                let schema = table_info.table_schema(&table);
-                let predicate = match schema {
-                    Some(schema) => normalize_predicate(&table, schema, &self.inner)?,
+        futures::stream::iter(table_names)
+            .map(|table| async move {
+                let schema = table_info.table_schema(&table).await;
+                let predicate = match &schema {
+                    Some(schema) => normalize_predicate(session_ctx, &table, schema, &self.inner)?,
                     None => {
                         // if we don't know about this table, we can't
                         // do any predicate specialization. This can
@@ -148,9 +152,12 @@ impl InfluxRpcPredicate {
                         self.inner.clone()
                     }
                 };
-                Ok((Arc::from(table), predicate))
+
+                Ok((Arc::from(table), schema, predicate))
             })
-            .collect()
+            .buffered(concurrent_jobs)
+            .try_collect()
+            .await
     }
 
     /// Returns the table names this predicate is restricted to if any
@@ -165,14 +172,13 @@ impl InfluxRpcPredicate {
 }
 
 /// Information required to normalize predicates
-pub trait QueryNamespaceMeta {
+#[async_trait]
+pub trait QueryNamespaceMeta: Send + Sync {
     /// Returns a list of table names in this namespace
     fn table_names(&self) -> Vec<String>;
 
     /// Schema for a specific table if the table exists.
-    ///
-    /// TODO: Make this return Option<&Schema>
-    fn table_schema(&self, table_name: &str) -> Option<Schema>;
+    async fn table_schema(&self, table_name: &str) -> Option<Schema>;
 }
 
 /// Predicate that has been "specialized" / normalized for a
@@ -206,8 +212,9 @@ pub trait QueryNamespaceMeta {
 /// ("field1" > 34.2 OR "field2" > 34.2 OR "fieldn" > 34.2)
 /// ```
 fn normalize_predicate(
+    session_ctx: &SessionContext,
     table_name: &str,
-    schema: Schema,
+    schema: &Schema,
     predicate: &Predicate,
 ) -> DataFusionResult<Predicate> {
     let mut predicate = predicate.clone();
@@ -244,7 +251,7 @@ fn normalize_predicate(
                 // in the table's schema as tags. Replace any column references that
                 // do not exist, or that are not tags, with NULL.
                 // Field values always use `_value` as a name and are handled above.
-                .and_then(|e| e.data.transform(&|e| missing_tag_to_null(&schema, e)))
+                .and_then(|e| e.data.transform(&|e| missing_tag_to_null(schema, e)))
                 .map(|e| log_rewrite(e, "missing_columums"))
                 // apply IOx specific rewrites (that unlock other simplifications)
                 .and_then(|e| rewrite::iox_expr_rewrite(e.data))
@@ -273,7 +280,7 @@ fn normalize_predicate(
     predicate.value_expr = field_value_exprs;
 
     // save any field projections
-    field_projections.add_to_predicate(predicate)
+    field_projections.add_to_predicate(session_ctx, predicate)
 }
 
 fn log_rewrite(expr: Transformed<Expr>, description: &str) -> Transformed<Expr> {
@@ -288,6 +295,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType;
     use datafusion::{
+        execution::context::SessionContext,
         prelude::{col, lit},
         scalar::ScalarValue,
     };
@@ -297,8 +305,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_coerced() {
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new().with_expr(col("t1").eq(lit("f1"))),
         )
         .unwrap();
@@ -311,8 +320,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_field_rewrite() {
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new().with_expr(col("_field").eq(lit("f1"))),
         )
         .unwrap();
@@ -325,8 +335,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_field_rewrite_multi_field() {
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new()
                 .with_expr(col("_field").eq(lit("f1")).or(col("_field").eq(lit("f2")))),
         )
@@ -342,8 +353,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_field_non_existent_field() {
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new().with_expr(col("_field").eq(lit("not_a_field"))),
         )
         .unwrap();
@@ -359,8 +371,9 @@ mod tests {
     fn test_normalize_predicate_field_non_tag() {
         // should treat
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new().with_expr(col("not_a_tag").eq(lit("blarg"))),
         )
         .unwrap();
@@ -372,8 +385,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_field_rewrite_multi_field_unsupported() {
         let err = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new()
                 // predicate refers to a column other than _field which is not supported
                 .with_expr(
@@ -392,8 +406,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_field_rewrite_not_eq() {
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new().with_expr(col("_field").not_eq(lit("f1"))),
         )
         .unwrap();
@@ -406,8 +421,9 @@ mod tests {
     #[test]
     fn test_normalize_predicate_field_rewrite_field_multi_expressions() {
         let predicate = normalize_predicate(
+            &SessionContext::new(),
             "table",
-            schema(),
+            &schema(),
             &Predicate::new()
                 // put = and != predicates in *different* exprs
                 .with_expr(col("_field").eq(lit("f1")))

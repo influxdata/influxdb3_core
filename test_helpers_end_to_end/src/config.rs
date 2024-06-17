@@ -83,6 +83,8 @@ impl TestConfig {
             .with_env("INFLUXDB_IOX_CATALOG_CACHE_WARMUP_DELAY", "100ms")
             // disable bypass detection by default
             .with_bypass_detection(false)
+            // speed up tests
+            .with_env("INFLUXDB_IOX_CATALOG_CACHE_WRITE_BATCH_DELAY", "10ms")
     }
 
     /// Enable/disable catalog cache bypass detection
@@ -266,6 +268,7 @@ impl TestConfig {
         self
             // Hard code query threads so query plans do not vary based on environment
             .with_env("INFLUXDB_IOX_NUM_QUERY_THREADS", "4")
+            .with_env("INFLUXDB_IOX_NUM_QUERY_PARTITIONS", "4")
             .with_env(
                 "INFLUXDB_IOX_DATAFUSION_CONFIG",
                 "iox.influxql_metadata_cutoff:1990-01-01T00:00:00Z",
@@ -377,6 +380,11 @@ impl TestConfig {
         &self.object_store_dir
     }
 
+    /// Method to enable quick&dirty env-based feature flats.
+    pub fn with_feature_flag(self, flag: &'static str) -> Self {
+        self.with_env(flag, "true")
+    }
+
     // copy a reference to the catalog temp dir, if any
     fn with_catalog_dir(mut self, catalog_dir: Option<Arc<TempDir>>) -> Self {
         self.catalog_dir = catalog_dir;
@@ -396,6 +404,10 @@ impl TestConfig {
     fn without_env(mut self, name: impl Into<String>) -> Self {
         self.env.remove(&name.into());
         self
+    }
+
+    pub fn get_env(&self, name: impl Into<String>) -> Option<String> {
+        self.env.get(&name.into()).cloned()
     }
 
     /// copy the specified environment variables from other; Panic's if they do not exist.
@@ -440,6 +452,16 @@ impl TestConfig {
         let object_store_string = tmpdir.path().display().to_string();
         self.object_store_dir = Some(Arc::new(tmpdir));
         self.with_env("INFLUXDB_IOX_OBJECT_STORE", "file")
+            .with_env("INFLUXDB_IOX_DB_DIR", object_store_string)
+    }
+
+    /// Configures a new versioned object store
+    pub fn with_new_versioned_object_store(mut self) -> Self {
+        let tmpdir = TempDir::new().expect("cannot create tmp dir");
+
+        let object_store_string = tmpdir.path().display().to_string();
+        self.object_store_dir = Some(Arc::new(tmpdir));
+        self.with_env("INFLUXDB_IOX_OBJECT_STORE", "versioned-file")
             .with_env("INFLUXDB_IOX_DB_DIR", object_store_string)
     }
 

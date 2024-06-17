@@ -10,7 +10,7 @@ use datafusion::{
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{FileScanConfig, ParquetExec},
+        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
     },
     physical_expr::PhysicalSortExpr,
     physical_plan::{empty::EmptyExec, expressions::Column, union::UnionExec, ExecutionPlan},
@@ -29,6 +29,8 @@ pub struct PartitionedFileExt {
     pub chunk: Arc<dyn QueryChunk>,
     pub output_sort_key_memo: Option<SortKey>,
     pub object_store: Arc<DynObjectStore>,
+    // todo: will remove option when we have metadata index to pass here
+    pub table_schema: Option<SchemaRef>,
 }
 
 /// Holds a list of chunks that all have the same "URL" and
@@ -125,7 +127,7 @@ fn combine_sort_key(
 ///
 /// Record batch chunks will be turned into a single [`RecordBatchesExec`].
 ///
-/// Parquet chunks will be turned into a [`ParquetExec`] per store, each of them with
+/// Parquet chunks will be turned into a [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) per store, each of them with
 /// [`target_partitions`](datafusion::execution::context::SessionConfig::target_partitions) file groups.
 ///
 /// If this function creates more than one physical node, they will be combined using an [`UnionExec`]. Otherwise, a
@@ -138,10 +140,11 @@ fn combine_sort_key(
 /// For empty inputs (i.e. no chunks), this will create a single [`EmptyExec`] node with appropriate schema.
 ///
 /// # Predicates
-/// The give `predicate` will only be applied to [`ParquetExec`] nodes since they are the only node type benifiting from
+/// The give `predicate` will only be applied to [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) nodes since they are the only node type benifiting from
 /// pushdown ([`RecordBatchesExec`] has NO builtin filter function). Delete predicates are NOT applied at all. The
 /// caller is responsible for wrapping the output node into appropriate filter nodes.
 pub fn chunks_to_physical_nodes(
+    // schema that includes all columns of all given chunks. This schema may just cover a subset of columns of the Table
     schema: &SchemaRef,
     output_sort_key: Option<&SortKey>,
     chunks: Vec<Arc<dyn QueryChunk>>,
@@ -226,6 +229,8 @@ pub fn chunks_to_physical_nodes(
                         chunk,
                         output_sort_key_memo: output_sort_key.cloned(),
                         object_store: Arc::clone(&object_store),
+                        // TODO: when metadata index is available, that index and this table schema will be passed here
+                        table_schema: None,
                     })),
                     statistics: None,
                 }
@@ -280,12 +285,9 @@ pub fn chunks_to_physical_nodes(
             table_partition_cols,
             output_ordering,
         };
-        let meta_size_hint = None;
 
-        let parquet_exec =
-            ParquetExec::new(base_config, None, meta_size_hint, table_parquet_options());
-
-        output_nodes.push(Arc::new(parquet_exec));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        output_nodes.push(builder.build_arc());
     }
 
     assert!(!output_nodes.is_empty());
@@ -317,6 +319,7 @@ where
 mod tests {
     use datafusion::{
         common::stats::Precision,
+        datasource::physical_plan::ParquetExec,
         physical_plan::{ColumnStatistics, Statistics},
     };
     use schema::{sort::SortKeyBuilder, InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME};

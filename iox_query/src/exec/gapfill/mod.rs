@@ -18,12 +18,12 @@ use arrow::{compute::SortOptions, datatypes::SchemaRef};
 use datafusion::{
     common::DFSchemaRef,
     error::{DataFusionError, Result},
-    execution::{context::TaskContext, memory_pool::MemoryConsumer},
-    logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
-    physical_expr::{
-        create_physical_expr, execution_props::ExecutionProps, EquivalenceProperties,
-        PhysicalSortExpr, PhysicalSortRequirement,
+    execution::{
+        context::{SessionState, TaskContext},
+        memory_pool::MemoryConsumer,
     },
+    logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
+    physical_expr::{EquivalenceProperties, PhysicalSortExpr, PhysicalSortRequirement},
     physical_plan::{
         expressions::Column,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
@@ -241,19 +241,18 @@ impl UserDefinedLogicalNodeCore for GapFill {
         )
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         let mut group_expr: Vec<_> = exprs.to_vec();
         let mut aggr_expr = group_expr.split_off(self.group_expr.len());
         let param_expr = aggr_expr.split_off(self.aggr_expr.len());
         let params = self.params.from_template(&param_expr, &aggr_expr);
         Self::try_new(Arc::new(inputs[0].clone()), group_expr, aggr_expr, params)
-            .expect("should not fail")
     }
 }
 
 /// Called by the extension planner to plan a [GapFill] node.
 pub(crate) fn plan_gap_fill(
-    execution_props: &ExecutionProps,
+    session_state: &SessionState,
     gap_fill: &GapFill,
     logical_inputs: &[&LogicalPlan],
     physical_inputs: &[Arc<dyn ExecutionPlan>],
@@ -276,26 +275,31 @@ pub(crate) fn plan_gap_fill(
     let group_expr: Result<Vec<_>> = gap_fill
         .group_expr
         .iter()
-        .map(|e| create_physical_expr(e, input_dfschema, execution_props))
+        .map(|e| session_state.create_physical_expr(e.clone(), input_dfschema))
         .collect();
     let group_expr = group_expr?;
 
     let aggr_expr: Result<Vec<_>> = gap_fill
         .aggr_expr
         .iter()
-        .map(|e| create_physical_expr(e, input_dfschema, execution_props))
+        .map(|e| session_state.create_physical_expr(e.clone(), input_dfschema))
         .collect();
     let aggr_expr = aggr_expr?;
 
-    let logical_time_column = gap_fill.params.time_column.try_into_col()?;
+    let Some(logical_time_column) = gap_fill.params.time_column.try_as_col() else {
+        return Err(DataFusionError::Internal(
+            "GapFillExec: time column must be a `Column` expression".to_string(),
+        ));
+    };
     let time_column = Column::new_with_schema(&logical_time_column.name, input_schema)?;
 
-    let stride = create_physical_expr(&gap_fill.params.stride, input_dfschema, execution_props)?;
+    let stride =
+        session_state.create_physical_expr(gap_fill.params.stride.clone(), input_dfschema)?;
 
     let time_range = &gap_fill.params.time_range;
     let time_range = try_map_range(time_range, |b| {
         try_map_bound(b.as_ref(), |e| {
-            create_physical_expr(e, input_dfschema, execution_props)
+            session_state.create_physical_expr(e.clone(), input_dfschema)
         })
     })?;
 
@@ -303,7 +307,7 @@ pub(crate) fn plan_gap_fill(
         .params
         .origin
         .as_ref()
-        .map(|e| create_physical_expr(e, input_dfschema, execution_props))
+        .map(|e| session_state.create_physical_expr(e.clone(), input_dfschema))
         .transpose()?;
 
     let fill_strategy = gap_fill
@@ -312,7 +316,7 @@ pub(crate) fn plan_gap_fill(
         .iter()
         .map(|(e, fs)| {
             Ok((
-                create_physical_expr(e, input_dfschema, execution_props)?,
+                session_state.create_physical_expr(e.clone(), input_dfschema)?,
                 *fs,
             ))
         })
@@ -499,8 +503,8 @@ impl ExecutionPlan for GapFillExec {
         vec![true]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -661,7 +665,9 @@ mod test {
             + bound_extract(&gapfill.params.time_range.start).iter().count()
             + bound_extract(&gapfill.params.time_range.end).iter().count();
         assert_eq!(want_exprs, exprs.len());
-        let gapfill_ft = gapfill_as_node.from_template(&exprs, &[scan]);
+        let gapfill_ft = gapfill_as_node
+            .with_exprs_and_inputs(exprs, vec![scan])
+            .expect("should be able to create a new `UserDefinedLogicalNode` node");
         let gapfill_ft = gapfill_ft
             .as_any()
             .downcast_ref::<GapFill>()
