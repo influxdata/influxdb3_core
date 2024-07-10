@@ -71,7 +71,9 @@ impl SeriesSetConverter {
         tag_columns: Arc<Vec<Arc<str>>>,
         field_columns: FieldColumns,
         it: SendableRecordBatchStream,
-    ) -> Result<impl Stream<Item = Result<SeriesSet, DataFusionError>>, DataFusionError> {
+        memory_pool: Arc<dyn MemoryPool>,
+    ) -> Result<impl Stream<Item = Result<SeriesSet, DataFusionError>> + Send, DataFusionError>
+    {
         assert_eq!(
             tag_columns.as_ref(),
             &{
@@ -97,6 +99,7 @@ impl SeriesSetConverter {
                     Box::new(DataFusionError::External(Box::new(e))),
                 )
             })?;
+        let reservation = MemoryConsumer::new("SeriesSet Converter").register(&memory_pool);
 
         Ok(SeriesSetConverterStream {
             result_buffer: VecDeque::default(),
@@ -109,6 +112,7 @@ impl SeriesSetConverter {
             field_indexes,
             table_name,
             tag_columns,
+            reservation,
         })
     }
 
@@ -303,6 +307,9 @@ struct SeriesSetConverterStream {
     /// This may be `None` when the stream was fully drained. We need to remember that fact so we don't pull a
     /// finished stream (which may panic).
     it: Option<SendableRecordBatchStream>,
+
+    // Memory reservation used to track memory for the [`SeriesSet`]s and [`RecordBatch`]es.
+    reservation: MemoryReservation,
 }
 
 impl Stream for SeriesSetConverterStream {
@@ -314,6 +321,7 @@ impl Stream for SeriesSetConverterStream {
         loop {
             // drain results
             if let Some(sset) = this.result_buffer.pop_front() {
+                this.reservation.shrink(sset.memory_size());
                 return Poll::Ready(Some(Ok(sset)));
             }
 
@@ -341,6 +349,7 @@ impl Stream for SeriesSetConverterStream {
                                 continue;
                             }
 
+                            this.reservation.try_grow(batch.get_array_memory_size())?;
                             this.open_batches.push(batch)
                         }
                         None => {
@@ -448,7 +457,10 @@ impl Stream for SeriesSetConverterStream {
                         this.it.is_none(),
                         "Fully flushed all open batches but the input stream still has data?!"
                     );
-                    this.open_batches.drain(..);
+                    this.open_batches.drain(..).for_each(|record_batch| {
+                        this.reservation
+                            .shrink(record_batch.get_array_memory_size())
+                    });
                 } else {
                     // need to keep the open bit
                     // do NOT use `batch` here because it contains data for all open batches, we just need the last one
@@ -462,7 +474,12 @@ impl Stream for SeriesSetConverterStream {
                             .checked_sub(offset)
                             .expect("underflow"),
                     );
-                    this.open_batches.drain(..);
+                    this.open_batches.drain(..).for_each(|record_batch| {
+                        this.reservation
+                            .shrink(record_batch.get_array_memory_size())
+                    });
+                    this.reservation
+                        .try_grow(last_batch.get_array_memory_size())?;
                     this.open_batches.push(last_batch);
                 }
 
@@ -490,7 +507,12 @@ impl Stream for SeriesSetConverterStream {
                         start_row = end_row;
                         series_set
                     })
-                    .collect();
+                    .map(|series_set| {
+                        this.reservation
+                            .try_grow(series_set.memory_size())
+                            .map(|_| series_set)
+                    })
+                    .collect::<Result<VecDeque<_>, DataFusionError>>()?;
             }
         }
     }
@@ -860,6 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_convert_empty() {
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
         let schema = test_schema();
         let empty_iterator = stream_from_schema(schema);
 
@@ -867,7 +890,14 @@ mod tests {
         let tag_columns = [];
         let field_columns = [];
 
-        let results = convert(table_name, &tag_columns, &field_columns, empty_iterator).await;
+        let results = convert(
+            memory_pool,
+            table_name,
+            &tag_columns,
+            &field_columns,
+            empty_iterator,
+        )
+        .await;
         assert_eq!(results.len(), 0);
     }
 
@@ -884,6 +914,7 @@ mod tests {
     #[tokio::test]
     async fn test_convert_single_series_no_tags() {
         // single series
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
         let schema = test_schema();
         let inputs = parse_to_iterators(schema, &["one,ten,10.0,1,1000", "one,ten,10.1,2,2000"]);
         for (i, input) in inputs.into_iter().enumerate() {
@@ -892,7 +923,14 @@ mod tests {
             let table_name = "foo";
             let tag_columns = [];
             let field_columns = ["float_field"];
-            let results = convert(table_name, &tag_columns, &field_columns, input).await;
+            let results = convert(
+                Arc::clone(&memory_pool),
+                table_name,
+                &tag_columns,
+                &field_columns,
+                input,
+            )
+            .await;
 
             assert_eq!(results.len(), 1);
 
@@ -915,6 +953,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_convert_single_series_no_tags_nulls() {
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
+
         // single series
         let schema = test_schema();
 
@@ -927,7 +967,14 @@ mod tests {
             let table_name = "foo";
             let tag_columns = [];
             let field_columns = ["float_field"];
-            let results = convert(table_name, &tag_columns, &field_columns, input).await;
+            let results = convert(
+                Arc::clone(&memory_pool),
+                table_name,
+                &tag_columns,
+                &field_columns,
+                input,
+            )
+            .await;
 
             assert_eq!(results.len(), 1);
 
@@ -950,6 +997,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_convert_single_series_one_tag() {
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
+
         // single series
         let schema = test_schema();
         let inputs = parse_to_iterators(schema, &["one,ten,10.0,1,1000", "one,ten,10.1,2,2000"]);
@@ -961,7 +1010,14 @@ mod tests {
             let table_name = "bar";
             let tag_columns = ["tag_a"];
             let field_columns = ["float_field"];
-            let results = convert(table_name, &tag_columns, &field_columns, input).await;
+            let results = convert(
+                Arc::clone(&memory_pool),
+                table_name,
+                &tag_columns,
+                &field_columns,
+                input,
+            )
+            .await;
 
             assert_eq!(results.len(), 1);
 
@@ -984,6 +1040,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_convert_single_series_one_tag_more_rows() {
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
+
         // single series
         let schema = test_schema();
         let inputs = parse_to_iterators(
@@ -1002,7 +1060,14 @@ mod tests {
             let table_name = "bar";
             let tag_columns = ["tag_a"];
             let field_columns = ["float_field"];
-            let results = convert(table_name, &tag_columns, &field_columns, input).await;
+            let results = convert(
+                Arc::clone(&memory_pool),
+                table_name,
+                &tag_columns,
+                &field_columns,
+                input,
+            )
+            .await;
 
             assert_eq!(results.len(), 1);
 
@@ -1026,6 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_convert_one_tag_multi_series() {
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
         let schema = test_schema();
 
         let inputs = parse_to_iterators(
@@ -1045,7 +1111,14 @@ mod tests {
             let table_name = "foo";
             let tag_columns = ["tag_a"];
             let field_columns = ["int_field"];
-            let results = convert(table_name, &tag_columns, &field_columns, input).await;
+            let results = convert(
+                Arc::clone(&memory_pool),
+                table_name,
+                &tag_columns,
+                &field_columns,
+                input,
+            )
+            .await;
 
             assert_eq!(results.len(), 2);
 
@@ -1084,6 +1157,7 @@ mod tests {
     // two tag columns, three series
     #[tokio::test]
     async fn test_convert_two_tag_multi_series() {
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
         let schema = test_schema();
 
         let inputs = parse_to_iterators(
@@ -1103,7 +1177,14 @@ mod tests {
             let table_name = "foo";
             let tag_columns = ["tag_a", "tag_b"];
             let field_columns = ["int_field"];
-            let results = convert(table_name, &tag_columns, &field_columns, input).await;
+            let results = convert(
+                Arc::clone(&memory_pool),
+                table_name,
+                &tag_columns,
+                &field_columns,
+                input,
+            )
+            .await;
 
             assert_eq!(results.len(), 3);
 
@@ -1170,11 +1251,12 @@ mod tests {
 
         // Input has one row that has no value (NULL value) for tag_b, which is its own series
         let input = stream_from_batch(batch.schema(), batch);
+        let memory_pool = Arc::new(GreedyMemoryPool::new(usize::MAX)) as _;
 
         let table_name = "foo";
         let tag_columns = ["tag_a", "tag_b"];
         let field_columns = ["int_field"];
-        let results = convert(table_name, &tag_columns, &field_columns, input).await;
+        let results = convert(memory_pool, table_name, &tag_columns, &field_columns, input).await;
 
         assert_eq!(results.len(), 2);
 
@@ -1209,6 +1291,7 @@ mod tests {
 
     /// Test helper: run conversion and return a Vec
     pub async fn convert<'a>(
+        memory_pool: Arc<dyn MemoryPool>,
         table_name: &'a str,
         tag_columns: &'a [&'a str],
         field_columns: &'a [&'a str],
@@ -1221,7 +1304,7 @@ mod tests {
         let field_columns = FieldColumns::from(field_columns);
 
         converter
-            .convert(table_name, tag_columns, field_columns, it)
+            .convert(table_name, tag_columns, field_columns, it, memory_pool)
             .await
             .expect("Conversion happened without error")
             .try_collect()

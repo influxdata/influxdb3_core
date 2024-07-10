@@ -39,13 +39,13 @@ impl<T> std::fmt::Display for CasFailure<T> {
     }
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Clone, Debug, Snafu)]
 #[allow(missing_docs)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("unhandled external error: {source}"))]
     External {
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: Arc<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("already exists: {descr}"))]
@@ -67,7 +67,7 @@ pub enum Error {
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -81,7 +81,7 @@ impl From<sqlx::migrate::MigrateError> for Error {
 impl From<data_types::snapshot::partition::Error> for Error {
     fn from(e: data_types::snapshot::partition::Error) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -89,7 +89,7 @@ impl From<data_types::snapshot::partition::Error> for Error {
 impl From<data_types::snapshot::table::Error> for Error {
     fn from(e: data_types::snapshot::table::Error) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -97,7 +97,7 @@ impl From<data_types::snapshot::table::Error> for Error {
 impl From<data_types::snapshot::namespace::Error> for Error {
     fn from(e: data_types::snapshot::namespace::Error) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -105,7 +105,7 @@ impl From<data_types::snapshot::namespace::Error> for Error {
 impl From<data_types::snapshot::root::Error> for Error {
     fn from(e: data_types::snapshot::root::Error) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -113,7 +113,7 @@ impl From<data_types::snapshot::root::Error> for Error {
 impl From<catalog_cache::api::quorum::Error> for Error {
     fn from(e: catalog_cache::api::quorum::Error) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -121,7 +121,7 @@ impl From<catalog_cache::api::quorum::Error> for Error {
 impl From<generated_types::prost::DecodeError> for Error {
     fn from(e: generated_types::prost::DecodeError) -> Self {
         Self::External {
-            source: Box::new(e),
+            source: Arc::new(e),
         }
     }
 }
@@ -512,6 +512,12 @@ pub trait PartitionRepo: Send + Sync {
     /// longer needed.
     async fn list_old_style(&mut self) -> Result<Vec<Partition>>;
 
+    /// Delete empty partitions more than a day outside the retention interval
+    ///
+    /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
+    /// changes. The caller MAY call this method again if the result was NOT empty.
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>>;
+
     /// Obtain a partition snapshot
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
 }
@@ -600,6 +606,9 @@ pub trait ParquetFileRepo: Send + Sync {
     /// [`to_delete`](ParquetFile::to_delete).
     ///
     /// The output order is undefined, non-existing partitions are not part of the output.
+    /// The number of L1 and L2 file counts are unlimited, but a maximum of
+    /// `MAX_PARQUET_L0_FILES_PER_PARTITION` L0 files are returned per partition, with the returned
+    /// files being the oldest L0s.
     async fn list_by_partition_not_to_delete_batch(
         &mut self,
         partition_ids: Vec<PartitionId>,

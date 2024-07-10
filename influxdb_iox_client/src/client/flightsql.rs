@@ -552,11 +552,9 @@ impl FlightSqlClient {
         &self,
         put_result: &PutResult,
     ) -> std::result::Result<Option<Bytes>, ArrowError> {
-        let any = Any::decode(&*put_result.app_metadata)
+        let result: DoPutPreparedStatementResult = Message::decode(&*put_result.app_metadata)
             .map_err(|err| ArrowError::IpcError(err.to_string()))?;
-        Ok(any
-            .unpack::<DoPutPreparedStatementResult>()?
-            .and_then(|result| result.prepared_statement_handle))
+        Ok(result.prepared_statement_handle)
     }
 
     /// Execute a SQL query on the server using [`CommandStatementQuery`]

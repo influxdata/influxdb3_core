@@ -114,6 +114,7 @@ mod tests {
     use arrow::datatypes::Schema;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
     use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::union::UnionExec;
@@ -220,11 +221,7 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        Arc::new(ParquetExec::new(
-            base_config,
-            None,
-            None,
-            table_parquet_options(),
-        ))
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        builder.build_arc()
     }
 }

@@ -219,7 +219,7 @@ impl TestNamespace {
             .tables()
             .create(
                 name,
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     template,
                     &self.namespace.partition_template,
                 )
@@ -900,6 +900,11 @@ impl TestParquetFile {
             .collect();
         let table_schema: Schema = table_columns.clone().try_into().unwrap();
         table_schema.select_by_names(&selection[..]).unwrap()
+    }
+
+    /// Get object store id.
+    pub fn object_store_id(&self) -> ObjectStoreId {
+        self.parquet_file.object_store_id
     }
 }
 

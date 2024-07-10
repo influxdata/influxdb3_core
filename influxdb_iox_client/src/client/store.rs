@@ -5,7 +5,7 @@ use crate::error::Error;
 
 use client_util::connection::GrpcConnection;
 use futures_util::stream::BoxStream;
-use tonic::Status;
+pub use tonic::Status;
 
 /// Re-export generated_types
 pub mod generated_types {
@@ -35,6 +35,44 @@ impl Client {
         let response = self
             .inner
             .get_parquet_file_by_object_store_id(GetParquetFileByObjectStoreIdRequest { uuid })
+            .await?;
+
+        Ok(Box::pin(response.into_inner()))
+    }
+
+    /// Get the parquet file data by its object store path, including different versions.
+    ///
+    /// Lookup by object_store_id only requires catalog data in order to build the path. Instead,
+    /// provide the ability to request versioned objects directly.
+    pub async fn get_parquet_file_by_object_store_path(
+        &mut self,
+        path: String,
+        version: Option<String>,
+    ) -> Result<BoxStream<'static, Result<GetParquetFileByObjectStorePathResponse, Status>>, Error>
+    {
+        let response = self
+            .inner
+            .get_parquet_file_by_object_store_path(GetParquetFileByObjectStorePathRequest {
+                path,
+                version,
+            })
+            .await?;
+
+        Ok(Box::pin(response.into_inner()))
+    }
+
+    /// List the parquet files located with the path prefix.
+    /// Search is recursive (e.g. searching `prefix/` includes `prefix/<other/paths>/uuid.parquet`.
+    pub async fn list_parquet_files_by_path_filter(
+        &mut self,
+        prefix: ParquetFilePathFilter,
+    ) -> Result<BoxStream<'static, Result<ListParquetFilesByPathFilterResponse, Status>>, Error>
+    {
+        let response = self
+            .inner
+            .list_parquet_files_by_path_filter(ListParquetFilesByPathFilterRequest {
+                prefix: Some(prefix),
+            })
             .await?;
 
         Ok(Box::pin(response.into_inner()))

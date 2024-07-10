@@ -192,18 +192,9 @@ impl LinesConverter {
 /// Converts the provided lines of line protocol to a set of [`MutableBatch`]
 /// keyed by measurement name
 pub fn lines_to_batches(lines: &str, default_time: i64) -> Result<HashMap<String, MutableBatch>> {
-    Ok(lines_to_batches_stats(lines, default_time)?.0)
-}
-
-/// Converts the provided lines of line protocol to a set of [`MutableBatch`]
-/// keyed by measurement name, and a set of statistics about the converted line protocol
-pub fn lines_to_batches_stats(
-    lines: &str,
-    default_time: i64,
-) -> Result<(HashMap<String, MutableBatch>, PayloadStatistics)> {
     let mut converter = LinesConverter::new(default_time);
     converter.write_lp(lines)?;
-    converter.finish()
+    Ok(converter.finish()?.0)
 }
 
 /// An error applying an already-parsed line protocol line ([`ParsedLine`]) to a

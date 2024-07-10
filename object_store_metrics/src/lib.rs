@@ -2,8 +2,11 @@
 
 #![allow(clippy::clone_on_ref_ptr)]
 
-use async_writer_metrics::AsyncWriterMetricsWrapper;
-use object_store::{GetOptions, GetResultPayload, PutOptions, PutResult};
+use multipart_upload_metrics::MultipartUploadWrapper;
+use object_store::{
+    GetOptions, GetResultPayload, MultipartUpload, PutMultipartOpts, PutOptions, PutPayload,
+    PutResult,
+};
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -22,10 +25,8 @@ use iox_time::{SystemProvider, Time, TimeProvider};
 use metric::{DurationHistogram, Metric, U64Counter};
 use pin_project::{pin_project, pinned_drop};
 
-use object_store::{
-    path::Path, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, Result,
-};
-use tokio::{io::AsyncWrite, sync::Mutex, task::JoinSet};
+use object_store::{path::Path, GetResult, ListResult, ObjectMeta, ObjectStore, Result};
+use tokio::{sync::Mutex, task::JoinSet};
 
 /// A typed name of a instance scope / shard to report the metrics under.
 #[derive(Debug, Clone)]
@@ -40,9 +41,9 @@ where
     }
 }
 
-mod async_writer_metrics;
 #[cfg(test)]
 mod dummy;
+mod multipart_upload_metrics;
 
 #[derive(Debug, Clone)]
 struct Metrics {
@@ -296,21 +297,27 @@ impl std::fmt::Display for ObjectStoreMetrics {
 
 #[async_trait]
 impl ObjectStore for ObjectStoreMetrics {
-    async fn put_opts(&self, location: &Path, bytes: Bytes, opts: PutOptions) -> Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
         let t = self.time_provider.now();
-        let size = bytes.len();
+        let size = bytes.content_length();
         let res = self.inner.put_opts(location, bytes, opts).await;
         self.put
             .record(t, self.time_provider.now(), res.is_ok(), Some(size as _));
         res
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        _opts: PutMultipartOpts,
+    ) -> Result<Box<dyn MultipartUpload>> {
         let t = self.time_provider.now();
-        let (multipart_id, inner) = self.inner.put_multipart(location).await?;
+        let inner = self.inner.put_multipart(location).await?;
 
         let (tx, rx) = futures::channel::oneshot::channel();
         let reporter = Arc::clone(&self.put_multipart);
@@ -320,13 +327,9 @@ impl ObjectStore for ObjectStoreMetrics {
             }
         });
 
-        let measured_async_writer =
-            AsyncWriterMetricsWrapper::new(location, inner, Arc::clone(&self.time_provider), tx);
-        Ok((multipart_id, Box::new(measured_async_writer)))
-    }
-
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> Result<()> {
-        self.inner.abort_multipart(location, multipart_id).await
+        let multipart_upload =
+            MultipartUploadWrapper::new(inner, Arc::clone(&self.time_provider), tx);
+        Ok(Box::new(multipart_upload))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -710,22 +713,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::ready;
     use std::{
         io::{Error, ErrorKind},
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
+        sync::Arc,
         time::Duration,
     };
 
-    use futures::{future::ready, stream, TryStreamExt};
+    use futures::{stream, FutureExt, TryStreamExt};
     use metric::Attributes;
     use std::io::Read;
-    use tokio::io::AsyncWriteExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use dummy::DummyObjectStore;
-    use object_store::{local::LocalFileSystem, memory::InMemory};
+    use object_store::{local::LocalFileSystem, memory::InMemory, UploadPart};
 
     use super::*;
 
@@ -789,7 +790,7 @@ mod tests {
         store
             .put(
                 &Path::from("test"),
-                Bytes::from([42_u8, 42, 42, 42, 42].as_slice()),
+                PutPayload::from([42_u8, 42, 42, 42, 42].as_slice()),
             )
             .await
             .expect("put should succeed");
@@ -817,7 +818,7 @@ mod tests {
         store
             .put(
                 &Path::from("test"),
-                Bytes::from([42_u8, 42, 42, 42, 42].as_slice()),
+                PutPayload::from([42_u8, 42, 42, 42, 42].as_slice()),
             )
             .await
             .expect_err("put should error");
@@ -842,20 +843,20 @@ mod tests {
         let time = Arc::new(SystemProvider::new());
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
-        let (_, mut async_writer) = store
+        let mut multipart_upload = store
             .put_multipart(&Path::from("test"))
             .await
-            .expect("should get async writer");
-        assert!(async_writer
-            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .expect("should get multipart upload");
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
             .await
             .is_ok());
         // demonstrate that it sums across bytes
-        assert!(async_writer
-            .write(&Bytes::from([42_u8, 42, 42].as_slice()))
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
             .await
             .is_ok());
-        drop(async_writer);
+        drop(multipart_upload);
         store.close().await;
 
         assert_counter_value(
@@ -879,29 +880,21 @@ mod tests {
         );
     }
 
-    struct NopeAsyncWriter;
+    #[derive(Debug)]
+    struct NopeMultipartUpload;
 
-    impl AsyncWrite for NopeAsyncWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &[u8],
-        ) -> Poll<std::prelude::v1::Result<usize, std::io::Error>> {
-            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // tineout
+    #[async_trait]
+    impl MultipartUpload for NopeMultipartUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            async move { Err(object_store::Error::NotImplemented) }.boxed()
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
-            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // tineout
+        async fn complete(&mut self) -> Result<PutResult> {
+            Err(object_store::Error::NotImplemented)
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
-            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // tineout
+        async fn abort(&mut self) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
         }
     }
 
@@ -919,24 +912,21 @@ mod tests {
         async fn put_opts(
             &self,
             _location: &Path,
-            _bytes: Bytes,
+            _payload: PutPayload,
             _opts: PutOptions,
         ) -> Result<PutResult> {
             Err(object_store::Error::NotImplemented)
         }
 
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-            Ok((MultipartId::new(), Box::new(NopeAsyncWriter)))
+        async fn put_multipart(&self, _location: &Path) -> Result<Box<dyn MultipartUpload>> {
+            Ok(Box::new(NopeMultipartUpload))
         }
 
-        async fn abort_multipart(
+        async fn put_multipart_opts(
             &self,
             _location: &Path,
-            _multipart_id: &MultipartId,
-        ) -> Result<()> {
+            _opts: PutMultipartOpts,
+        ) -> Result<Box<dyn MultipartUpload>> {
             Err(object_store::Error::NotImplemented)
         }
 
@@ -968,20 +958,20 @@ mod tests {
     #[tokio::test]
     async fn test_put_multipart_fails() {
         let metrics = Arc::new(metric::Registry::default());
-        // store returning erroring AsyncWriter
+        // store returning erroring MultipartUpload
         let store = Arc::new(NopeObjectStore);
         let time = Arc::new(SystemProvider::new());
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
-        let (_, mut async_writer) = store
+        let mut multipart_upload = store
             .put_multipart(&Path::from("test"))
             .await
-            .expect("should get async writer");
-        assert!(async_writer
-            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+            .expect("should get multipart upload");
+        assert!(multipart_upload
+            .put_part(PutPayload::from(Bytes::from(vec![42_u8, 42, 42, 42, 42])))
             .await
             .is_err());
-        drop(async_writer);
+        drop(multipart_upload);
         store.close().await;
 
         assert_counter_value(
@@ -1005,37 +995,30 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct WriteOnceAsyncWriter(AtomicBool /* has previous write */);
+    #[derive(Default, Debug)]
+    struct WriteOnceMultipartUpload(AtomicBool /* has previous write */);
 
-    impl AsyncWrite for WriteOnceAsyncWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::prelude::v1::Result<usize, std::io::Error>> {
+    #[async_trait]
+    impl MultipartUpload for WriteOnceMultipartUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
             let has_previous_writes = self.0.load(Ordering::Acquire);
             self.0.fetch_or(true, Ordering::AcqRel);
-
-            if has_previous_writes {
-                Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // timeout
-            } else {
-                Poll::Ready(Ok(buf.len()))
+            async move {
+                if has_previous_writes {
+                    Err(object_store::Error::NotImplemented)
+                } else {
+                    Ok(())
+                }
             }
+            .boxed()
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
-            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // timeout
+        async fn complete(&mut self) -> Result<PutResult> {
+            Err(object_store::Error::NotImplemented)
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::prelude::v1::Result<(), std::io::Error>> {
-            Poll::Ready(Err(std::io::Error::from_raw_os_error(1460))) // timeout
+        async fn abort(&mut self) -> Result<()> {
+            Err(object_store::Error::NotImplemented)
         }
     }
 
@@ -1053,24 +1036,21 @@ mod tests {
         async fn put_opts(
             &self,
             _location: &Path,
-            _bytes: Bytes,
+            _payload: PutPayload,
             _opts: PutOptions,
         ) -> Result<PutResult> {
             Err(object_store::Error::NotImplemented)
         }
 
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-            Ok((MultipartId::new(), Box::<WriteOnceAsyncWriter>::default()))
+        async fn put_multipart(&self, _location: &Path) -> Result<Box<dyn MultipartUpload>> {
+            Ok(Box::<WriteOnceMultipartUpload>::default())
         }
 
-        async fn abort_multipart(
+        async fn put_multipart_opts(
             &self,
             _location: &Path,
-            _multipart_id: &MultipartId,
-        ) -> Result<()> {
+            _opts: PutMultipartOpts,
+        ) -> Result<Box<dyn MultipartUpload>> {
             Err(object_store::Error::NotImplemented)
         }
 
@@ -1102,27 +1082,27 @@ mod tests {
     #[tokio::test]
     async fn test_put_multipart_delayed_write_failure() {
         let metrics = Arc::new(metric::Registry::default());
-        // store returning erroring AsyncWriter
+        // store returning erroring MultipartUpload
         let store = Arc::new(WriteOnceObjectStore);
         let time = Arc::new(SystemProvider::new());
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         // FAILURE: one write ok, one write failure.
-        let (_, mut async_writer) = store
+        let mut multipart_upload = store
             .put_multipart(&Path::from("test"))
             .await
-            .expect("should get async writer");
+            .expect("should get multipart upload");
         // first write succeeds
-        assert!(async_writer
-            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
             .await
             .is_ok());
         // second write fails
-        assert!(async_writer
-            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
             .await
             .is_err());
-        drop(async_writer);
+        drop(multipart_upload);
         store.close().await;
 
         assert_counter_value(
@@ -1149,24 +1129,24 @@ mod tests {
     #[tokio::test]
     async fn test_put_multipart_delayed_flush_failure() {
         let metrics = Arc::new(metric::Registry::default());
-        // store returning erroring AsyncWriter
+        // store returning erroring MultiPartUpload
         let store = Arc::new(WriteOnceObjectStore);
         let time = Arc::new(SystemProvider::new());
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
         // FAILURE: one write ok, one flush failure.
-        let (_, mut async_writer) = store
+        let mut multipart_upload = store
             .put_multipart(&Path::from("test"))
             .await
-            .expect("should get async writer");
+            .expect("should get multipart upload");
         // first write succeeds
-        assert!(async_writer
-            .write(&Bytes::from([42_u8, 42, 42, 42, 42].as_slice()))
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
             .await
             .is_ok());
         // flush fails
-        assert!(async_writer.flush().await.is_err());
-        drop(async_writer);
+        assert!(multipart_upload.complete().await.is_err());
+        drop(multipart_upload);
         store.close().await;
 
         assert_counter_value(
@@ -1195,11 +1175,11 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         store
-            .put(&Path::from("bar"), Bytes::default())
+            .put(&Path::from("bar"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1225,15 +1205,15 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         store
-            .put(&Path::from("bar"), Bytes::default())
+            .put(&Path::from("bar"), PutPayload::default())
             .await
             .unwrap();
         store
-            .put(&Path::from("baz"), Bytes::default())
+            .put(&Path::from("baz"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1407,7 +1387,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::from_static(b"bar"))
+            .put(&Path::from("foo"), PutPayload::from_static(b"bar"))
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1455,7 +1435,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1478,7 +1458,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1505,7 +1485,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1548,7 +1528,7 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1600,15 +1580,15 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let store = Arc::new(InMemory::new());
         store
-            .put(&Path::from("foo"), Bytes::default())
+            .put(&Path::from("foo"), PutPayload::default())
             .await
             .unwrap();
         store
-            .put(&Path::from("bar"), Bytes::default())
+            .put(&Path::from("bar"), PutPayload::default())
             .await
             .unwrap();
         store
-            .put(&Path::from("baz"), Bytes::default())
+            .put(&Path::from("baz"), PutPayload::default())
             .await
             .unwrap();
         let time = Arc::new(SystemProvider::new());
@@ -1665,10 +1645,10 @@ mod tests {
         let time = Arc::new(SystemProvider::new());
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
-        let data = [42_u8, 42, 42, 42, 42];
+        let data = Bytes::from(vec![42_u8, 42, 42, 42, 42]);
         let path = Path::from("test");
         store
-            .put(&path, Bytes::copy_from_slice(&data))
+            .put(&path, PutPayload::from(data.clone()))
             .await
             .expect("put should succeed");
 
@@ -1678,7 +1658,7 @@ mod tests {
                 let mut contents = vec![];
                 file.read_to_end(&mut contents)
                     .expect("failed to read file data");
-                assert_eq!(contents, &data);
+                assert_eq!(Bytes::from(contents), data);
             }
             v => panic!("not a file: {v:?}"),
         }
@@ -1748,10 +1728,10 @@ mod tests {
         let time = Arc::new(SystemProvider::new());
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
 
-        let data = [42_u8, 42, 42, 42, 42];
+        let data = Bytes::from(vec![42_u8, 42, 42, 42, 42]);
         let path = Path::from("test");
         store
-            .put(&path, Bytes::copy_from_slice(&data))
+            .put(&path, PutPayload::from(data.clone()))
             .await
             .expect("put should succeed");
 

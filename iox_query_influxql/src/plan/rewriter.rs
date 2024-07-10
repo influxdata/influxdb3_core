@@ -77,12 +77,35 @@ fn rewrite_select(s: &dyn SchemaProvider, stmt: &SelectStatement) -> Result<Sele
 /// * `SLIMIT` and `SOFFSET` don't work as expected per issue [#7571]
 /// * This issue [is noted](https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-slimit-clause) in our official documentation
 ///
+/// # Database prefix in qualified measurement name
+///
+/// Measurement selectors that qualify a database - for example `database..measurement` - are
+/// currently not supported in InfluxDB 3.0. See [EAR#5194]
+///
 /// [#7571]: https://github.com/influxdata/influxdb/issues/7571
+/// [EAR#5194]: https://github.com/influxdata/EAR/issues/5194
 fn check_features(stmt: &SelectStatement) -> Result<()> {
     if stmt.series_limit.is_some() || stmt.series_offset.is_some() {
         return error::not_implemented("SLIMIT or SOFFSET");
     }
+    check_qualified_measurements(stmt)?;
+    Ok(())
+}
 
+fn check_qualified_measurements(stmt: &SelectStatement) -> Result<()> {
+    for ms in &*stmt.from {
+        match ms {
+            MeasurementSelection::Name(QualifiedMeasurementName {
+                database: Some(_), ..
+            }) => {
+                return error::not_implemented(
+                    "database prefix in qualified measurement syntax".to_string(),
+                );
+            }
+            MeasurementSelection::Subquery(q) => check_qualified_measurements(q)?,
+            _ => (),
+        }
+    }
     Ok(())
 }
 

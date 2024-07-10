@@ -2,16 +2,28 @@
 
 use std::{str::FromStr, sync::OnceLock};
 
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use observability_deps::tracing::info;
+use sysinfo::System;
 
 /// Memory size.
 ///
 /// # Parsing
 /// This can be parsed from strings in one of the following formats:
 ///
-/// - **absolute:** just use a non-negative number to specify the absolute bytes, e.g. `1024`
-/// - **relative:** use percentage between 0 and 100 (both inclusive) to specify a relative amount of the totally
-///   available memory size, e.g. `50%`
+/// - **absolute:** just use a non-negative number to specify the absolute
+///   bytes, e.g. `1024`
+/// - **relative:** use percentage between 0 and 100 (both inclusive) to specify
+///   a relative amount of the totally available memory size, e.g. `50%`
+///
+/// # Limits
+///
+/// Memory limits are read from the following, stopping when a valid value is
+/// found:
+///
+///   - `/sys/fs/cgroup/memory/memory.limit_in_bytes` (cgroup)
+///   - `/sys/fs/cgroup/memory.max` (cgroup2)
+///   - Platform specific syscall (infallible)
+///
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemorySize(usize);
 
@@ -63,12 +75,25 @@ pub fn total_mem_bytes() -> usize {
     // Keep this in a global state so that we only need to inspect the system once during IOx startup.
     static TOTAL_MEM_BYTES: OnceLock<usize> = OnceLock::new();
 
-    *TOTAL_MEM_BYTES.get_or_init(|| {
-        let sys = System::new_with_specifics(
-            RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
-        );
-        sys.total_memory() as usize
-    })
+    *TOTAL_MEM_BYTES.get_or_init(get_memory_limit)
+}
+
+/// Resolve the amount of memory available to this process.
+///
+/// This attempts to find a cgroup limit first, before falling back to the
+/// amount of system RAM available.
+fn get_memory_limit() -> usize {
+    let mut sys = System::new();
+    sys.refresh_memory();
+
+    let limit = sys
+        .cgroup_limits()
+        .map(|v| v.total_memory)
+        .unwrap_or_else(|| sys.total_memory()) as usize;
+
+    info!(%limit, "detected process memory available");
+
+    limit
 }
 
 #[cfg(test)]

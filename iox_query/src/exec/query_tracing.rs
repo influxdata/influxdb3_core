@@ -654,6 +654,10 @@ mod tests {
     }
 
     impl ExecutionPlan for TestExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -666,8 +670,10 @@ mod tests {
             unimplemented!()
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-            self.children.clone()
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.children
+                .iter()
+                .collect::<Vec<&Arc<dyn ExecutionPlan>>>()
         }
 
         fn with_new_children(

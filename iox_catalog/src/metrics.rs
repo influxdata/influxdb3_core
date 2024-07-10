@@ -312,6 +312,7 @@ decorate! {
             partition_update_cold_compact = update_cold_compact(&mut self, partition_id: PartitionId, cold_compact_at: Timestamp) -> Result<()>;
             partition_get_in_skipped_compactions = get_in_skipped_compactions(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<SkippedCompaction>>;
             partition_list_old_style = list_old_style(&mut self) -> Result<Vec<Partition>>;
+            partition_delete_by_retention = delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>>;
             partition_snapshot = snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
         ],
     },

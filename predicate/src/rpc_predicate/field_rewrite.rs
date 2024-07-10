@@ -7,9 +7,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::utils::split_conjunction_owned;
-use datafusion::physical_expr::create_physical_expr;
-use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_plan::ColumnarValue;
 use datafusion::prelude::{lit, Expr};
 use schema::Schema;
@@ -106,7 +105,11 @@ impl FieldProjectionRewriter {
     ///
     /// Uses arrow evaluation kernels to support arbitrary predicates,
     /// including regex etc
-    pub(crate) fn add_to_predicate(self, predicate: Predicate) -> DataFusionResult<Predicate> {
+    pub(crate) fn add_to_predicate(
+        self,
+        session_ctx: &SessionContext,
+        predicate: Predicate,
+    ) -> DataFusionResult<Predicate> {
         // Common case is that there are no _field predicates, in
         // which case we are done
         if self.field_predicates.is_empty() {
@@ -136,11 +139,10 @@ impl FieldProjectionRewriter {
         // Ceremony to prepare to evaluate the predicates
         let input_schema = batch.schema();
         let input_df_schema: DFSchema = input_schema.as_ref().clone().try_into().unwrap();
-        let props = ExecutionProps::default();
         let exprs = self
             .field_predicates
             .into_iter()
-            .map(|expr| create_physical_expr(&expr, &input_df_schema, &props))
+            .map(|expr| session_ctx.create_physical_expr(expr, &input_df_schema))
             .collect::<DataFusionResult<Vec<_>>>()
             .map_err(|e| DataFusionError::Internal(format!("Unsupported _field predicate: {e}")))?;
 
@@ -226,7 +228,7 @@ struct ColumnReferencesFinder {
     saw_non_field_reference: bool,
 }
 
-impl TreeNodeVisitor for ColumnReferencesFinder {
+impl TreeNodeVisitor<'_> for ColumnReferencesFinder {
     type Node = Expr;
     fn f_down(&mut self, expr: &Expr) -> DataFusionResult<TreeNodeRecursion> {
         if let Expr::Column(col) = expr {
@@ -250,7 +252,10 @@ impl TreeNodeVisitor for ColumnReferencesFinder {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use datafusion::prelude::{case, col};
+    use datafusion::{
+        execution::context::SessionContext,
+        prelude::{case, col},
+    };
     use schema::builder::SchemaBuilder;
     use test_helpers::assert_contains;
 
@@ -436,7 +441,9 @@ mod tests {
             let rewritten = rewriter.rewrite_field_exprs(input).map(|t| t.data).unwrap();
             assert_eq!(rewritten, exp_expr);
 
-            let predicate = rewriter.add_to_predicate(Predicate::new()).unwrap();
+            let predicate = rewriter
+                .add_to_predicate(&SessionContext::new(), Predicate::new())
+                .unwrap();
 
             let actual_field_columns = predicate
                 .field_columns
@@ -475,7 +482,7 @@ mod tests {
                 // check for error in rewrite_field_exprs
                 rewriter.rewrite_field_exprs(input)?;
                 // check for error adding to predicate
-                rewriter.add_to_predicate(Predicate::new())
+                rewriter.add_to_predicate(&SessionContext::new(), Predicate::new())
             };
 
             let err = run_case().expect_err("Expected error rewriting, but was successful");

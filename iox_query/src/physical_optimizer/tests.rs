@@ -9,7 +9,8 @@ use arrow::datatypes::DataType;
 use datafusion::{
     common::DFSchema,
     datasource::provider_as_source,
-    logical_expr::{col, count, lit, Expr, ExprSchemable, LogicalPlanBuilder},
+    functions_aggregate::expr_fn::count,
+    logical_expr::{col, lit, Expr, ExprSchemable, LogicalPlanBuilder},
     scalar::ScalarValue,
 };
 use executor::DedicatedExecutor;

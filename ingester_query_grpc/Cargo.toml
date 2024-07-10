@@ -15,7 +15,7 @@ base64 = "0.22"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
-flatbuffers = "23.5.26"
+flatbuffers = "24.3.25"
 pbjson = { workspace = true }
 predicate = { path = "../predicate" }
 prost = { workspace = true }
@@ -31,4 +31,4 @@ prost-build = { workspace = true }
 pbjson-build = { workspace = true }
 
 [dev-dependencies]
-tokio = "1.37.0"
+tokio = "1.38.0"

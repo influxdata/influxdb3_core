@@ -9,16 +9,16 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.80"
+async-trait = "0.1.81"
 dotenvy = "0.15.7"
 observability_deps = { path = "../observability_deps" }
-ordered-float = "4.2.0"
+ordered-float = "4.2.1"
 parking_lot = "0.12"
 prometheus-parse = "0.2.5"
-reqwest = { version = "0.12.4", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12.5", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 tempfile = "3.10.1"
-thiserror = "1.0.60"
-tokio = { version = "1.37.0", default_features = false, features = ["time"] }
+thiserror = "1.0.61"
+tokio = { version = "1.38.0", default-features = false, features = ["time"] }
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

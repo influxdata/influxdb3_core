@@ -1060,6 +1060,29 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let p = proto::PartitionDeleteByRetentionRequest {};
+
+        let res = self
+            .retry(
+                "partition_delete_by_retention",
+                p,
+                |data, mut client| async move {
+                    buffer_stream_response(client.partition_delete_by_retention(data).await).await
+                },
+            )
+            .await?
+            .into_iter()
+            .map(|res| {
+                (
+                    TableId::new(res.table_id),
+                    PartitionId::new(res.partition_id),
+                )
+            })
+            .collect();
+        Ok(res)
+    }
+
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
         let p = proto::PartitionSnapshotRequest {
             partition_id: partition_id.get(),

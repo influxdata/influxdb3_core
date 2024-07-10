@@ -62,6 +62,12 @@ impl<T> JumpHash<T> {
     pub fn shards(&self) -> &[T] {
         &self.shards
     }
+
+    /// Consume the sharder, returning a type that can be used as an iterator
+    /// over the owned shards.
+    pub fn into_inner(self) -> impl IntoIterator<Item = T> {
+        self.shards
+    }
 }
 
 impl<T> JumpHash<T> {

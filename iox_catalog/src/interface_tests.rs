@@ -1,12 +1,4 @@
 //! Abstract tests of the catalog interface w/o relying on the actual implementation.
-use std::{any::Any, collections::HashSet, fmt::Display};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    ops::DerefMut,
-    sync::Arc,
-    time::Duration,
-};
-
 use ::test_helpers::assert_error;
 use assert_matches::assert_matches;
 use async_trait::async_trait;
@@ -25,8 +17,16 @@ use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::TimeProvider;
 use metric::{Observation, RawReporter};
 use parking_lot::Mutex;
+use std::{any::Any, collections::HashSet, fmt::Display};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ops::DerefMut,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
+    constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
     interface::{
         CasFailure, Catalog, Error, ParquetFileRepoExt, PartitionRepoExt, RepoCollection,
         SoftDeletedRows,
@@ -52,6 +52,7 @@ where
     test_list_schemas(clean_state().await).await;
     test_list_schemas_soft_deleted_rows(clean_state().await).await;
     test_delete_namespace(clean_state().await).await;
+    test_partition_retention(clean_state().await).await;
 
     let catalog = clean_state().await;
     test_namespace(Arc::clone(&catalog)).await;
@@ -592,7 +593,8 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .tables()
         .create(
             "test_table",
-            TablePartitionTemplateOverride::try_new(None, &namespace.partition_template).unwrap(),
+            TablePartitionTemplateOverride::try_from_existing(None, &namespace.partition_template)
+                .unwrap(),
             namespace.id,
         )
         .await;
@@ -697,7 +699,8 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .tables()
         .create(
             "definitely_unique",
-            TablePartitionTemplateOverride::try_new(None, &latest.partition_template).unwrap(),
+            TablePartitionTemplateOverride::try_from_existing(None, &latest.partition_template)
+                .unwrap(),
             latest.id,
         )
         .await
@@ -705,7 +708,7 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
     assert!(matches!(err, Error::LimitExceeded { .. }));
 
     // Create a table with a partition template other than the default
-    let custom_table_template = TablePartitionTemplateOverride::try_new(
+    let custom_table_template = TablePartitionTemplateOverride::try_from_existing(
         Some(proto::PartitionTemplate {
             parts: vec![
                 proto::TemplatePart {
@@ -781,9 +784,11 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap();
     // Create a table without specifying the partition template
-    let custom_table_template =
-        TablePartitionTemplateOverride::try_new(None, &custom_namespace.partition_template)
-            .unwrap();
+    let custom_table_template = TablePartitionTemplateOverride::try_from_existing(
+        None,
+        &custom_namespace.partition_template,
+    )
+    .unwrap();
     let table_templated_by_namespace = repos
         .tables()
         .create(
@@ -795,7 +800,8 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(
         table_templated_by_namespace.partition_template,
-        TablePartitionTemplateOverride::try_new(None, &custom_namespace_template).unwrap()
+        TablePartitionTemplateOverride::try_from_existing(None, &custom_namespace_template)
+            .unwrap()
     );
 
     // Tag columns should be created for tags used in the template
@@ -2314,6 +2320,53 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         parquet_file_with_source.source,
         Some(ParquetFileSource::BulkIngest)
     );
+
+    // Test that MAX_PARQUET_L0_FILES_PER_PARTITION limit is applied
+    let partition4 = repos
+        .partitions()
+        .create_or_get("four".into(), table.id)
+        .await
+        .unwrap();
+
+    // Create more files than can be returned in a single query, with known (and differing) max_l0_created_at
+    for i in 0..(MAX_PARQUET_L0_FILES_PER_PARTITION + 10) {
+        let f_params = ParquetFileParams {
+            object_store_id: ObjectStoreId::new(),
+            partition_id: partition4.id,
+            max_l0_created_at: Timestamp::new(i),
+            min_time: Timestamp::new(0),
+            max_time: Timestamp::new(10),
+            compaction_level: CompactionLevel::Initial,
+            ..f8_params.clone()
+        };
+        let _ = repos
+            .parquet_files()
+            .create_upgrade_delete(
+                partition4.id,
+                &[],
+                &[],
+                &[f_params],
+                CompactionLevel::Initial,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Make sure we get the right number of files, and the oldest files.
+    let files = repos
+        .parquet_files()
+        .list_by_partition_not_to_delete_batch(vec![partition4.id])
+        .await
+        .unwrap();
+    assert_eq!(files.len(), MAX_PARQUET_L0_FILES_PER_PARTITION as usize);
+    let max_l0_created_ats = files
+        .iter()
+        .map(|f| f.max_l0_created_at.get())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        max_l0_created_ats,
+        (0..MAX_PARQUET_L0_FILES_PER_PARTITION).collect::<Vec<_>>()
+    );
 }
 
 async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
@@ -3101,6 +3154,54 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
         .into_iter()
         .next()
         .unwrap();
+}
+
+async fn test_partition_retention(catalog: Arc<dyn Catalog>) {
+    let now = catalog.time_provider().now().date_time();
+
+    let mut repos = catalog.repositories();
+    let ns_name = NamespaceName::new("test_partition_retention").unwrap();
+    let retention = 1_000_000_000 * 60 * 60 * 24 * 7; // 1 week
+
+    let namespace = repos
+        .namespaces()
+        .create(&ns_name, None, Some(retention), None)
+        .await
+        .unwrap();
+    let table = arbitrary_table(&mut *repos, "test_partition_retention", &namespace).await;
+
+    let part = now - Duration::from_nanos(retention as u64 / 2);
+    let p1 = PartitionKey::from(part.date_naive().to_string());
+    repos
+        .partitions()
+        .create_or_get(p1, table.id)
+        .await
+        .unwrap();
+
+    let part = now - Duration::from_nanos(retention as u64 * 2);
+    let p2 = PartitionKey::from(part.date_naive().to_string());
+    let p2 = repos
+        .partitions()
+        .create_or_get(p2, table.id)
+        .await
+        .unwrap();
+
+    let part = now - Duration::from_nanos(retention as u64 * 3);
+    let p3 = PartitionKey::from(part.date_naive().to_string());
+    let p3 = repos
+        .partitions()
+        .create_or_get(p3, table.id)
+        .await
+        .unwrap();
+
+    repos
+        .parquet_files()
+        .create(arbitrary_parquet_file_params(&namespace, &table, &p3))
+        .await
+        .unwrap();
+
+    let to_delete = repos.partitions().delete_by_retention().await.unwrap();
+    assert_eq!(to_delete, vec![(p2.table_id, p2.id)]);
 }
 
 /// Upsert a namespace called `namespace_name` and write `lines` to it.

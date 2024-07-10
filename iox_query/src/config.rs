@@ -1,6 +1,11 @@
-use std::{str::FromStr, time::Duration};
+use std::{any::Any, str::FromStr, sync::Arc, time::Duration};
 
-use datafusion::{common::extensions_options, config::ConfigExtension};
+use datafusion::{
+    common::{extensions_options, Result},
+    config::{ConfigEntry, ConfigExtension, ExtensionOptions},
+};
+use object_store_mem_cache::MetaIndexCache;
+use tokio::sync::Mutex;
 
 /// IOx-specific config extension prefix.
 pub const IOX_CONFIG_PREFIX: &str = "iox";
@@ -143,4 +148,39 @@ impl std::fmt::Display for MetadataCutoff {
             Self::Absolute(dt) => write!(f, "{}", dt),
         }
     }
+}
+
+pub const IOX_CACHE_PREFIX: &str = "iox_meta_cache";
+
+/// Cache options for IOx Querier
+#[derive(Debug, Clone)]
+pub struct IoxCacheExt {
+    /// metadata cache
+    pub meta_cache: Arc<Mutex<MetaIndexCache>>,
+}
+
+impl ExtensionOptions for IoxCacheExt {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(self.clone())
+    }
+
+    fn set(&mut self, _key: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn entries(&self) -> Vec<ConfigEntry> {
+        vec![]
+    }
+}
+
+impl ConfigExtension for IoxCacheExt {
+    const PREFIX: &'static str = IOX_CACHE_PREFIX;
 }

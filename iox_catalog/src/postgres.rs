@@ -1,10 +1,13 @@
 //! A Postgres backed implementation of the Catalog
 
+use crate::constants::MAX_PARTITION_SELECTED_ONCE_FOR_DELETE;
 use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
 use crate::metrics::CatalogMetrics;
+use crate::util::should_delete_partition;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
+        MAX_PARQUET_L0_FILES_PER_PARTITION,
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
@@ -24,6 +27,7 @@ use data_types::{
     ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
     PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
 };
+use futures::StreamExt;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, Instrument, MetricKind};
 use observability_deps::tracing::{debug, info, warn};
@@ -75,6 +79,9 @@ pub struct PostgresConnectionOptions {
     /// Set a maximum idle duration for individual connections.
     pub idle_timeout: Duration,
 
+    /// Set a maximum duration for individual statements
+    pub statement_timeout: Duration,
+
     /// If the DSN points to a file (i.e. starts with `dsn-file://`), this sets the interval how often the the file
     /// should be polled for updates.
     ///
@@ -95,6 +102,9 @@ impl PostgresConnectionOptions {
     /// Default value for [`idle_timeout`](Self::idle_timeout).
     pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Default value for [`statement_timeout`](Self::statement_timeout).
+    pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
     /// Default value for [`hotswap_poll_interval`](Self::hotswap_poll_interval).
     pub const DEFAULT_HOTSWAP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 }
@@ -108,6 +118,7 @@ impl Default for PostgresConnectionOptions {
             max_conns: Self::DEFAULT_MAX_CONNS,
             connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
             idle_timeout: Self::DEFAULT_IDLE_TIMEOUT,
+            statement_timeout: Self::DEFAULT_STATEMENT_TIMEOUT,
             hotswap_poll_interval: Self::DEFAULT_HOTSWAP_POLL_INTERVAL,
         }
     }
@@ -445,6 +456,7 @@ async fn new_raw_pool(
     let app_name = options.app_name.clone();
     let app_name2 = options.app_name.clone(); // just to log below
     let schema_name = options.schema_name.clone();
+    let statement_timeout = options.statement_timeout.as_millis();
     let pool = PgPoolOptions::new()
         .min_connections(1)
         .max_connections(options.max_conns)
@@ -472,6 +484,8 @@ async fn new_raw_pool(
                 }
                 let search_path_query = format!("SET search_path TO {schema_name},public;");
                 c.execute(sqlx::query(&search_path_query)).await?;
+                let timeout = format!("SET statement_timeout to {statement_timeout}");
+                c.execute(sqlx::query(&timeout)).await?;
 
                 // Ensure explicit timezone selection, instead of deferring to
                 // the server value.
@@ -695,7 +709,7 @@ RETURNING *;
             if is_fk_violation(&e) {
                 Error::NotFound { descr: e.to_string() }
             } else {
-                Error::External { source: Box::new(e) }
+                Error::External { source: Arc::new(e) }
             }
         }})?;
 
@@ -780,7 +794,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 }
             } else {
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             }
         })?;
@@ -884,7 +898,7 @@ WHERE name=$1 AND {v};
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -911,7 +925,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -942,7 +956,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -973,7 +987,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -1072,7 +1086,7 @@ RETURNING *;
                     }
                 } else {
                     Error::External {
-                        source: Box::new(e),
+                        source: Arc::new(e),
                     }
                 }
             }
@@ -1295,7 +1309,7 @@ RETURNING *;
                 }
             } else {
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             }
         })?;
@@ -1355,11 +1369,11 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                     "possible duplicate partition_hash_id?"
                 );
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             } else {
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             }
         })?;
@@ -1477,7 +1491,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             }
             Err(e) => {
                 return Err(CasFailure::QueryError(Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }))
             }
         };
@@ -1681,6 +1695,47 @@ ORDER BY id DESC;"#,
         .map_err(Error::from)
     }
 
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let mut tx = self.inner.pool.begin().await?;
+
+        let mut stream = sqlx::query_as::<_, (PartitionId, PartitionKey, TableId, i64, TablePartitionTemplateOverride)>(
+            r#"
+SELECT partition.id, partition.partition_key, table_name.id, namespace.retention_period_ns, table_name.partition_template
+FROM partition
+JOIN table_name on partition.table_id = table_name.id
+JOIN namespace on table_name.namespace_id = namespace.id
+WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
+    AND retention_period_ns IS NOT NULL;
+        "#,
+        )
+            .fetch(&mut *tx);
+
+        let now = self.time_provider.now();
+        let mut to_remove = Vec::with_capacity(MAX_PARTITION_SELECTED_ONCE_FOR_DELETE);
+
+        while let Some((p_id, key, t_id, retention, template)) = stream.next().await.transpose()? {
+            if should_delete_partition(&key, &template, retention, now) {
+                to_remove.push((t_id, p_id));
+
+                if to_remove.len() == MAX_PARTITION_SELECTED_ONCE_FOR_DELETE {
+                    break;
+                }
+            }
+        }
+        drop(stream);
+
+        let ids: Vec<_> = to_remove.iter().map(|(_, p)| p.get()).collect();
+
+        sqlx::query(r#"DELETE FROM partition WHERE id = ANY($1);"#)
+            .bind(ids) // $1
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(to_remove)
+    }
+
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
         let mut tx = self.inner.pool.begin().await?;
 
@@ -1795,15 +1850,31 @@ RETURNING object_store_id;
     ) -> Result<Vec<ParquetFile>> {
         sqlx::query_as::<_, ParquetFile>(
             r#"
-SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
-       object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
-       compaction_level, created_at, column_set, max_l0_created_at, source
-FROM parquet_file
-WHERE parquet_file.partition_id = ANY($1)
-  AND parquet_file.to_delete IS NULL;
+            (
+                SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+                    object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+                    compaction_level, created_at, column_set, max_l0_created_at, source
+                FROM parquet_file
+                WHERE parquet_file.partition_id = ANY($1)
+                  AND parquet_file.to_delete IS NULL
+                  AND compaction_level != 0
+            )
+            UNION ALL
+            (
+                SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+                    object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+                    compaction_level, created_at, column_set, max_l0_created_at, source
+                FROM parquet_file
+                WHERE parquet_file.partition_id = ANY($1)
+                  AND parquet_file.to_delete IS NULL
+                  AND compaction_level = 0
+                ORDER BY max_l0_created_at
+                LIMIT $2
+            )
         "#,
         )
         .bind(partition_ids) // $1
+        .bind(MAX_PARQUET_L0_FILES_PER_PARTITION) // $2
         .fetch_all(&mut self.inner)
         .await
         .map_err(Error::from)
@@ -1958,7 +2029,7 @@ RETURNING id;
             }
         } else {
             Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             }
         }
     })?;
@@ -2129,6 +2200,16 @@ pub(crate) mod test_utils {
     pub(crate) async fn setup_db_no_migration_with_app_name(
         app_name: &'static str,
     ) -> PostgresCatalog {
+        setup_db_no_migration_with_overrides(|opts| PostgresConnectionOptions {
+            app_name: app_name.to_string(),
+            ..opts
+        })
+        .await
+    }
+
+    pub(crate) async fn setup_db_no_migration_with_overrides(
+        f: impl FnOnce(PostgresConnectionOptions) -> PostgresConnectionOptions + Send,
+    ) -> PostgresCatalog {
         // create a random schema for this particular pool
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
@@ -2149,13 +2230,12 @@ pub(crate) mod test_utils {
 
         create_db(&dsn).await;
 
-        let options = PostgresConnectionOptions {
-            app_name: app_name.to_owned(),
+        let options = f(PostgresConnectionOptions {
             schema_name: schema_name.clone(),
             dsn,
             max_conns: 3,
             ..Default::default()
-        };
+        });
         let pg = PostgresCatalog::connect(options, metrics)
             .await
             .expect("failed to connect catalog");
@@ -2191,6 +2271,7 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::postgres::test_utils::setup_db_no_migration_with_overrides;
     use crate::{
         interface::ParquetFileRepoExt,
         postgres::test_utils::{
@@ -2205,7 +2286,7 @@ mod tests {
     use metric::{Observation, RawReporter};
     use std::{io::Write, ops::Deref, sync::Arc, time::Instant};
     use tempfile::NamedTempFile;
-    use test_helpers::maybe_start_logging;
+    use test_helpers::{assert_contains, maybe_start_logging};
 
     /// Small no-op test just to print out the migrations.
     ///
@@ -2802,7 +2883,7 @@ RETURNING *;
             .tables()
             .create(
                 "pomelo",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     None, // no custom partition template
                     &namespace_custom_template.partition_template,
                 )
@@ -2815,7 +2896,7 @@ RETURNING *;
         // it should have the namespace's template
         assert_eq!(
             table_no_template_with_namespace_template.partition_template,
-            TablePartitionTemplateOverride::try_new(
+            TablePartitionTemplateOverride::try_from_existing(
                 None,
                 &namespace_custom_template.partition_template
             )
@@ -2834,7 +2915,7 @@ RETURNING *;
             record.try_get("partition_template").unwrap();
         assert_eq!(
             partition_template.unwrap(),
-            TablePartitionTemplateOverride::try_new(
+            TablePartitionTemplateOverride::try_from_existing(
                 None,
                 &namespace_custom_template.partition_template
             )
@@ -2854,7 +2935,7 @@ RETURNING *;
             .tables()
             .create(
                 "tangerine",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     Some(custom_table_template), // with custom partition template
                     &namespace_default_template.partition_template,
                 )
@@ -2907,7 +2988,7 @@ RETURNING *;
             .tables()
             .create(
                 "nectarine",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     Some(custom_table_template), // with custom partition template
                     &namespace_custom_template.partition_template,
                 )
@@ -2955,7 +3036,7 @@ RETURNING *;
             .tables()
             .create(
                 "grapefruit",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     None, // no custom partition template
                     &namespace_default_template.partition_template,
                 )
@@ -3132,5 +3213,25 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
         let apps = c1.active_applications().await.unwrap();
         assert!(apps.contains(APP_1));
         assert!(apps.contains(APP_2));
+    }
+
+    #[tokio::test]
+    async fn test_timeout() {
+        maybe_skip_integration!();
+
+        let c = setup_db_no_migration_with_overrides(|opts| PostgresConnectionOptions {
+            statement_timeout: Duration::from_millis(1),
+            ..opts
+        })
+        .await;
+
+        let err = c
+            .pool
+            .execute(sqlx::query("select PG_SLEEP(1)"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_contains!(err, "canceling statement due to statement timeout");
     }
 }

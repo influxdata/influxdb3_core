@@ -39,11 +39,13 @@ pub fn iox_expr_rewrite(expr: Expr) -> Result<Transformed<Expr>> {
 
 fn iox_expr_rewrite_inner(expr: Expr) -> Result<Transformed<Expr>> {
     Ok(match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_case(&left) && is_comparison(op) => {
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if is_case(&left) && is_comparison(op.clone()) =>
+        {
             Transformed::yes(inline_case(true, *left, *right, op))
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right })
-            if is_case(&right) && is_comparison(op) =>
+            if is_case(&right) && is_comparison(op.clone()) =>
         {
             Transformed::yes(inline_case(false, *left, *right, op))
         }
@@ -197,9 +199,9 @@ fn inline_case(case_on_left: bool, left: Expr, right: Expr, op: Operator) -> Exp
         .into_iter()
         .map(|(when, then)| {
             let then = Box::new(if case_on_left {
-                binary_expr(*then, op, other.clone())
+                binary_expr(*then, op.clone(), other.clone())
             } else {
-                binary_expr(other.clone(), op, *then)
+                binary_expr(other.clone(), op.clone(), *then)
             });
             (when, then)
         })
@@ -207,9 +209,9 @@ fn inline_case(case_on_left: bool, left: Expr, right: Expr, op: Operator) -> Exp
 
     let else_expr = else_expr.map(|else_expr| {
         Box::new(if case_on_left {
-            binary_expr(*else_expr, op, other)
+            binary_expr(*else_expr, op.clone(), other)
         } else {
-            binary_expr(other, op, *else_expr)
+            binary_expr(other, op.clone(), *else_expr)
         })
     });
 
@@ -370,7 +372,7 @@ mod tests {
         // CASE WHEN tag IS NULL then '' ELSE tag END = 'bar'
         let expr = binary_expr(
             make_case(col("tag").is_null(), lit1.clone(), col("tag")),
-            op,
+            op.clone(),
             lit2.clone(),
         );
 
@@ -378,7 +380,7 @@ mod tests {
         let expected = if expect_rewrite {
             make_case(
                 col("tag").is_null(),
-                binary_expr(lit1, op, lit2.clone()),
+                binary_expr(lit1, op.clone(), lit2.clone()),
                 binary_expr(col("tag"), op, lit2),
             )
         } else {

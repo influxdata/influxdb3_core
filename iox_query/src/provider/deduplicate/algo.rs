@@ -2,6 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 
+use arrow::compute::SortOptions;
 use arrow::{
     array::{ArrayRef, UInt64Array},
     compute::TakeOptions,
@@ -157,8 +158,10 @@ impl RecordBatchDeduplicator {
                 let last_idx = l.values.len() - 1;
                 if (l.values.is_valid(last_idx), r.values.is_valid(0)) == (true, true) {
                     // Both have values, do the actual comparison
+                    let opts = SortOptions::default();
                     let c =
-                        arrow::array::build_compare(l.values.as_ref(), r.values.as_ref()).unwrap();
+                        arrow::array::make_comparator(l.values.as_ref(), r.values.as_ref(), opts)
+                            .unwrap();
 
                     match c(last_idx, 0) {
                         Ordering::Equal => {}

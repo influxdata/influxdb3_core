@@ -73,6 +73,7 @@ mod tests {
     use chrono::Utc;
     use data_types::{NamespaceId, ObjectStoreId, PartitionId, TableId, TransitionPartitionId};
     use object_store::path::Path;
+    use object_store::PutPayload;
     use parquet_file::ParquetFilePath;
     use std::time::Duration;
 
@@ -135,9 +136,12 @@ mod tests {
                 e_tag: None,
                 version: None,
             };
-            os.put(&object_meta.location, Bytes::from(i.to_string()))
-                .await
-                .unwrap();
+            os.put(
+                &object_meta.location,
+                PutPayload::from(Bytes::from(i.to_string())),
+            )
+            .await
+            .unwrap();
             items.push(object_meta);
         }
         items

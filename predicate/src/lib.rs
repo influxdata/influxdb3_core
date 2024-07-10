@@ -1,8 +1,6 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-pub mod delete_expr;
-pub mod delete_predicate;
 pub mod rpc_predicate;
 
 use data_types::TimestampRange;
@@ -380,7 +378,7 @@ impl ValueExpr {
     /// column replaced with the specified column name
     pub fn replace_col(&self, name: &str) -> Expr {
         if let Expr::BinaryExpr(BinaryExpr { left: _, op, right }) = &self.expr {
-            binary_expr(name.as_expr(), *op, right.as_ref().clone())
+            binary_expr(name.as_expr(), op.clone(), right.as_ref().clone())
         } else {
             unreachable!("Unexpected content in ValueExpr")
         }
@@ -415,7 +413,7 @@ impl Default for RowBasedVisitor {
     }
 }
 
-impl TreeNodeVisitor for RowBasedVisitor {
+impl TreeNodeVisitor<'_> for RowBasedVisitor {
     type Node = Expr;
 
     fn f_down(&mut self, expr: &Expr) -> Result<TreeNodeRecursion, DataFusionError> {
@@ -427,7 +425,6 @@ impl TreeNodeVisitor for RowBasedVisitor {
             | Expr::Cast { .. }
             | Expr::Column(_)
             | Expr::Exists { .. }
-            | Expr::GetIndexedField { .. }
             | Expr::InList { .. }
             | Expr::InSubquery { .. }
             | Expr::IsFalse(_)

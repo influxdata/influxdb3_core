@@ -313,7 +313,7 @@ fn normalize_spans(lines: Vec<String>) -> Vec<String> {
 // tests potentially using multiple threads but there is a single
 // global logger.
 thread_local! {
-    static LOG_LINES: Mutex<Cursor<Vec<u8>>> = Mutex::new(Cursor::new(Vec::new()));
+    static LOG_LINES: Mutex<Cursor<Vec<u8>>> = const { Mutex::new(Cursor::new(Vec::new())) }
 }
 
 // Since we can only setup logging once, we need to have gloabl to

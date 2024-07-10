@@ -145,7 +145,7 @@ fn delta_time(curr: &ScalarValue, prev: &ScalarValue, unit: &ScalarValue) -> Res
         ScalarValue::IntervalMonthDayNano(Some(unit)),
     ) = (curr, prev, unit)
     {
-        Ok((*curr as f64 - *prev as f64) / *unit as f64)
+        Ok((*curr as f64 - *prev as f64) / unit.nanoseconds as f64)
     } else {
         error::internal("derivative attempted on unsupported values")
     }

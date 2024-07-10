@@ -728,7 +728,7 @@ mod tests {
             _object_store_ids: Vec<ObjectStoreId>,
         ) -> iox_catalog::interface::Result<Vec<ObjectStoreId>> {
             Err(iox_catalog::interface::Error::External {
-                source: String::from("test").into(),
+                source: Box::<dyn std::error::Error + Send + Sync>::from("test".to_owned()).into(),
             })
         }
 
@@ -752,45 +752,35 @@ mod tests {
         async fn flag_for_delete_by_retention(
             &mut self,
         ) -> iox_catalog::interface::Result<Vec<(PartitionId, ObjectStoreId)>> {
-            Err(iox_catalog::interface::Error::External {
-                source: String::from("should not have been called").into(),
-            })
+            unimplemented!()
         }
 
         async fn delete_old_ids_only(
             &mut self,
             _older_than: Timestamp,
         ) -> iox_catalog::interface::Result<Vec<ObjectStoreId>> {
-            Err(iox_catalog::interface::Error::External {
-                source: String::from("should not have been called").into(),
-            })
+            unimplemented!()
         }
 
         async fn list_by_partition_not_to_delete_batch(
             &mut self,
             _partition_ids: Vec<PartitionId>,
         ) -> iox_catalog::interface::Result<Vec<ParquetFile>> {
-            Err(iox_catalog::interface::Error::External {
-                source: String::from("should not have been called").into(),
-            })
+            unimplemented!()
         }
 
         async fn get_by_object_store_id(
             &mut self,
             _object_store_id: ObjectStoreId,
         ) -> iox_catalog::interface::Result<Option<ParquetFile>> {
-            Err(iox_catalog::interface::Error::External {
-                source: String::from("should not have been called").into(),
-            })
+            unimplemented!()
         }
 
         async fn exists_by_object_store_id_batch(
             &mut self,
             _object_store_ids: Vec<ObjectStoreId>,
         ) -> iox_catalog::interface::Result<Vec<ObjectStoreId>> {
-            Err(iox_catalog::interface::Error::External {
-                source: String::from("should not have been called").into(),
-            })
+            unimplemented!()
         }
 
         async fn create_upgrade_delete(
@@ -801,9 +791,7 @@ mod tests {
             _create: &[ParquetFileParams],
             _target_level: CompactionLevel,
         ) -> iox_catalog::interface::Result<Vec<ParquetFileId>> {
-            Err(iox_catalog::interface::Error::External {
-                source: String::from("should not have been called").into(),
-            })
+            unimplemented!()
         }
     }
 

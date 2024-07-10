@@ -138,12 +138,12 @@ impl UserDefinedLogicalNodeCore for StreamSplitNode {
         write!(f, "{} split_expr={:?}", self.name(), self.split_exprs)
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "StreamSplitNode: input sizes inconsistent");
-        Self {
+        Ok(Self {
             input: inputs[0].clone(),
             split_exprs: (*exprs).to_vec(),
-        }
+        })
     }
 }
 
@@ -200,6 +200,10 @@ impl Debug for StreamSplitExec {
 }
 
 impl ExecutionPlan for StreamSplitExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
     }
@@ -231,8 +235,8 @@ impl ExecutionPlan for StreamSplitExec {
         vec![requirement]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -546,6 +550,7 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow_util::assert_batches_sorted_eq;
     use datafusion::{
+        execution::context::SessionContext,
         physical_plan::memory::MemoryExec,
         prelude::{col, lit},
     };
@@ -584,7 +589,12 @@ mod tests {
 
         let input = make_input(vec![vec![batch0, batch1]]);
         // int_col < 3
-        let split_expr = df_physical_expr(input.schema(), col("int_col").lt(lit(3))).unwrap();
+        let split_expr = df_physical_expr(
+            &SessionContext::new().state(),
+            input.schema(),
+            col("int_col").lt(lit(3)),
+        )
+        .unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr]));
 
@@ -639,15 +649,16 @@ mod tests {
         ])
         .unwrap();
 
+        let state = SessionContext::new().state();
         let input = make_input(vec![vec![batch0, batch1]]);
         // int_col < 2
         let split_expr1 =
-            df_physical_expr(input.schema(), col("int_col").lt(lit::<i16>(2))).unwrap();
+            df_physical_expr(&state, input.schema(), col("int_col").lt(lit::<i16>(2))).unwrap();
         // 2 <= int_col < 3
         let expr = col("int_col")
             .gt_eq(lit::<i16>(2))
             .and(col("int_col").lt(lit::<i16>(3)));
-        let split_expr2 = df_physical_expr(input.schema(), expr).unwrap();
+        let split_expr2 = df_physical_expr(&state, input.schema(), expr).unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr1, split_expr2]));
 
@@ -696,7 +707,8 @@ mod tests {
 
         let input = make_input(vec![vec![batch0]]);
         // use `false` to send all outputs to second stream
-        let split_expr = df_physical_expr(input.schema(), lit(false)).unwrap();
+        let split_expr =
+            df_physical_expr(&SessionContext::new().state(), input.schema(), lit(false)).unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr]));
 
@@ -728,10 +740,11 @@ mod tests {
         .unwrap();
 
         // Test 1: 3 streams but all data is sent to the second one
+        let state = SessionContext::new().state();
         let input = make_input(vec![vec![batch0.clone()]]);
         // use `false` & `true` to send all outputs to second stream
-        let split_expr1 = df_physical_expr(input.schema(), lit(false)).unwrap();
-        let split_expr2 = df_physical_expr(input.schema(), lit(true)).unwrap();
+        let split_expr1 = df_physical_expr(&state, input.schema(), lit(false)).unwrap();
+        let split_expr2 = df_physical_expr(&state, input.schema(), lit(true)).unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr1, split_expr2]));
 
@@ -760,8 +773,8 @@ mod tests {
         let input = make_input(vec![vec![batch0.clone()]]);
 
         // use `false` & `false` to send all outputs to third stream
-        let split_expr1 = df_physical_expr(input.schema(), lit(false)).unwrap();
-        let split_expr2 = df_physical_expr(input.schema(), lit(false)).unwrap();
+        let split_expr1 = df_physical_expr(&state, input.schema(), lit(false)).unwrap();
+        let split_expr2 = df_physical_expr(&state, input.schema(), lit(false)).unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr1, split_expr2]));
 
@@ -790,8 +803,8 @@ mod tests {
         let input = make_input(vec![vec![batch0]]);
 
         // use `true` & `false` to send all outputs to first stream
-        let split_expr1 = df_physical_expr(input.schema(), lit(true)).unwrap();
-        let split_expr2 = df_physical_expr(input.schema(), lit(false)).unwrap();
+        let split_expr1 = df_physical_expr(&state, input.schema(), lit(true)).unwrap();
+        let split_expr2 = df_physical_expr(&state, input.schema(), lit(false)).unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr1, split_expr2]));
 
@@ -829,7 +842,12 @@ mod tests {
 
         let input = make_input(vec![vec![batch0]]);
         // int_col < 3
-        let split_expr = df_physical_expr(input.schema(), col("int_col").lt(lit(3))).unwrap();
+        let split_expr = df_physical_expr(
+            &SessionContext::new().state(),
+            input.schema(),
+            col("int_col").lt(lit(3)),
+        )
+        .unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr]));
 
@@ -867,15 +885,16 @@ mod tests {
         )])
         .unwrap();
 
+        let state = SessionContext::new().state();
         let input = make_input(vec![vec![batch0]]);
         // int_col < 2
         let split_expr1 =
-            df_physical_expr(input.schema(), col("int_col").lt(lit::<i16>(2))).unwrap();
+            df_physical_expr(&state, input.schema(), col("int_col").lt(lit::<i16>(2))).unwrap();
         // 2 <= int_col < 3
         let expr = col("int_col")
             .gt_eq(lit::<i16>(2))
             .and(col("int_col").lt(lit::<i16>(3)));
-        let split_expr2 = df_physical_expr(input.schema(), expr).unwrap();
+        let split_expr2 = df_physical_expr(&state, input.schema(), expr).unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr1, split_expr2]));
 
@@ -925,7 +944,12 @@ mod tests {
 
         let input = make_input(vec![vec![batch0]]);
         // int_col (not a boolean)
-        let split_expr = df_physical_expr(input.schema(), col("int_col")).unwrap();
+        let split_expr = df_physical_expr(
+            &SessionContext::new().state(),
+            input.schema(),
+            col("int_col"),
+        )
+        .unwrap();
         let split_exec: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSplitExec::new(input, vec![split_expr]));
 

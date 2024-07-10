@@ -194,6 +194,10 @@ impl DeduplicateMetrics {
 }
 
 impl ExecutionPlan for DeduplicateExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -220,8 +224,8 @@ impl ExecutionPlan for DeduplicateExec {
         vec![false]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -1189,6 +1193,10 @@ mod test {
     }
 
     impl ExecutionPlan for DummyExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -1201,7 +1209,7 @@ mod test {
             &self.cache
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 

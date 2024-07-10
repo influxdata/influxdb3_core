@@ -20,8 +20,9 @@ workspace = true
 ### BEGIN HAKARI SECTION
 [dependencies]
 ahash = { version = "0.8" }
-arrow-array = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d", default-features = false, features = ["chrono-tz"] }
-arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d", features = ["lz4"] }
+arrow-array = { version = "52", default-features = false, features = ["chrono-tz"] }
+arrow-cast = { version = "52", default-features = false, features = ["prettyprint"] }
+arrow-ipc = { version = "52", features = ["lz4"] }
 base64 = { version = "0.22" }
 bit-set = { version = "0.5" }
 bit-vec = { version = "0.6" }
@@ -30,13 +31,12 @@ bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env", "string"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "string", "suggestions", "usage"] }
-concurrent-queue = { version = "2" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
 either = { version = "1", features = ["serde"] }
 fixedbitset = { version = "0.4" }
-flatbuffers = { version = "23" }
+flatbuffers = { version = "24" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-executor = { version = "0.3" }
@@ -47,7 +47,7 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom = { version = "0.2", default-features = false, features = ["std"] }
 hashbrown = { version = "0.14", features = ["raw"] }
-hyper = { version = "0.14", features = ["full"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1" }
 indexmap = { version = "2" }
 itertools = { version = "0.12" }
 lalrpop-util = { version = "0.20", features = ["lexer"] }
@@ -60,7 +60,7 @@ nom = { version = "7" }
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
-object_store = { version = "0.9", default-features = false, features = ["aws", "azure", "gcp"] }
+object_store = { version = "0.10", default-features = false, features = ["aws", "azure", "gcp"] }
 once_cell = { version = "1", features = ["parking_lot"] }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 petgraph = { version = "0.6" }
@@ -73,7 +73,8 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "perf", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest = { version = "0.11", default-features = false, features = ["gzip", "json", "multipart", "rustls-tls-native-roots", "stream"] }
+reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls-native-roots", "stream"] }
+reqwest-a6292c17cd707f01 = { package = "reqwest", version = "0.11", default-features = false, features = ["gzip", "json", "multipart", "rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
 rustls-pemfile = { version = "2" }
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -83,8 +84,6 @@ sha2 = { version = "0.10" }
 signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 similar = { version = "2", features = ["inline"] }
 smallvec = { version = "1", default-features = false, features = ["union"] }
-socket2 = { version = "0.5", default-features = false, features = ["all"] }
-sqlparser = { version = "0.45", features = ["visitor"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "sqlite", "uuid"] }
 sqlx-core = { version = "0.7", features = ["_rt-tokio", "_tls-rustls", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.7", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
@@ -176,13 +175,17 @@ zeroize = { version = "1", features = ["derive", "std"] }
 [target.x86_64-unknown-linux-gnu.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 linux-raw-sys = { version = "0.4", default-features = false, features = ["elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
-rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
@@ -191,7 +194,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 linux-raw-sys = { version = "0.4", default-features = false, features = ["elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
@@ -199,12 +202,16 @@ spin = { version = "0.9" }
 [target.x86_64-apple-darwin.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
-rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
@@ -212,7 +219,7 @@ xz2 = { version = "0.1", default-features = false, features = ["static"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
@@ -220,12 +227,16 @@ spin = { version = "0.9" }
 [target.aarch64-apple-darwin.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.28", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "socket"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
-rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
@@ -233,7 +244,7 @@ xz2 = { version = "0.1", default-features = false, features = ["static"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 rustix = { version = "0.38", features = ["event", "fs", "net", "pipe", "process", "time"] }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
@@ -241,10 +252,14 @@ spin = { version = "0.9" }
 [target.x86_64-pc-windows-msvc.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-rustls-3c51e837cfc5589a = { package = "rustls", version = "0.22" }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
 winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "knownfolders", "minwinbase", "minwindef", "ntsecapi", "objbase", "processenv", "profileapi", "shlobj", "winbase", "wincon", "windef", "winerror", "winioctl", "winnt", "ws2ipdef", "ws2tcpip"] }
 windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
@@ -253,7 +268,7 @@ xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-rustls-647d43efb71741da = { package = "rustls", version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }

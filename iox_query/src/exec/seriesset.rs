@@ -87,3 +87,74 @@ pub struct SeriesSet {
     // The underlying record batch data
     pub batch: RecordBatch,
 }
+
+impl SeriesSet {
+    // Amount of memory required to store this series set, in bytes.
+    pub fn memory_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(self.field_indexes.as_slice())
+            + self.batch.get_array_memory_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::super::field::FieldIndex;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    #[test]
+    fn size() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int64, false),
+            Field::new("tag1", DataType::Utf8, false),
+            Field::new("tag2", DataType::Utf8, false),
+            Field::new("field1", DataType::Int64, false),
+            Field::new("field2", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![100, 200, 300])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                ])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    Some("b"),
+                    Some("b"),
+                    Some("b"),
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let batch_size = batch.get_array_memory_size();
+
+        let series_set = SeriesSet {
+            table_name: Arc::from("table_name"),
+            tags: vec![
+                (Arc::from("tag1"), Arc::from("a")),
+                (Arc::from("tag2"), Arc::from("b")),
+            ],
+            field_indexes: FieldIndexes::from_slice(&[(3, 0), (4, 0)]),
+            start_row: 0,
+            num_rows: 3,
+            batch,
+        };
+
+        // The size of the series set should be the size of the struct
+        // plus the size of the field indexes plus the size of the
+        // underlying record batch.
+        let expected_size =
+            std::mem::size_of::<SeriesSet>() + std::mem::size_of::<FieldIndex>() * 2 + batch_size;
+
+        assert_eq!(series_set.memory_size(), expected_size);
+    }
+}

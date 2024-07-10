@@ -113,6 +113,21 @@ pub struct RouterConfig {
     )]
     pub namespace_autocreation_enabled: bool,
 
+    /// The maximum value to accept when setting the column count limits for a
+    /// table. Tables with a current column limit greater than this maximum
+    /// retain their current value but requests for change will respect this
+    /// maximum.
+    ///
+    /// This is a guardrail against clients creating tables which are so wide
+    /// that the overall performance & stability of the whole system is greatly
+    /// reduced.
+    #[clap(
+        long = "table-column-limit-max",
+        env = "INFLUXDB_IOX_TABLE_COLUMN_LIMIT_MAX",
+        default_value = "1000"
+    )]
+    pub table_column_limit_max: NonZeroUsize,
+
     /// Specify the timeout in seconds for a single RPC write request to an
     /// ingester.
     #[clap(

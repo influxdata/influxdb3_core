@@ -61,7 +61,7 @@ impl PartitionEvaluator for ElapsedPartitionEvaluator {
 
         let unit = ScalarValue::try_from_array(&values[1], 0)?;
         let unit = if let ScalarValue::IntervalMonthDayNano(Some(unit)) = unit {
-            unit as i64
+            unit.nanoseconds
         } else {
             1 // default unit is nanoseconds
         };

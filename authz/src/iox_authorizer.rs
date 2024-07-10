@@ -139,7 +139,7 @@ mod test {
     };
 
     use assert_matches::assert_matches;
-    use test_helpers_end_to_end::Authorizer as AuthorizerServer;
+    use test_helpers_authz::Authorizer as AuthorizerServer;
     use tokio::{
         net::TcpListener,
         task::{spawn, JoinHandle},

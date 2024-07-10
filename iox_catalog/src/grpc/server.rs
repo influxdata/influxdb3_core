@@ -19,6 +19,7 @@ use data_types::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::catalog::v2 as proto;
+use generated_types::influxdata::iox::catalog::v2::PartitionDeleteByRetentionRequest;
 use tonic::{Request, Response, Status};
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
@@ -78,6 +79,8 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     type PartitionNeedingColdCompactStream =
         TonicStream<proto::PartitionNeedingColdCompactResponse>;
     type PartitionListOldStyleStream = TonicStream<proto::PartitionListOldStyleResponse>;
+
+    type PartitionDeleteByRetentionStream = TonicStream<proto::PartitionDeleteByRetentionResponse>;
 
     type ParquetFileFlagForDeleteByRetentionStream =
         TonicStream<proto::ParquetFileFlagForDeleteByRetentionResponse>;
@@ -889,6 +892,29 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
                 let partition = serialize_partition(partition);
                 Ok(proto::PartitionListOldStyleResponse {
                     partition: Some(partition),
+                })
+            }))
+            .boxed(),
+        ))
+    }
+
+    async fn partition_delete_by_retention(
+        &self,
+        request: Request<PartitionDeleteByRetentionRequest>,
+    ) -> Result<Response<Self::PartitionDeleteByRetentionStream>, Status> {
+        let (mut repos, _) = self.preprocess_request(request);
+
+        let res = repos
+            .partitions()
+            .delete_by_retention()
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(res.into_iter().map(|(t_id, p_id)| {
+                Ok(proto::PartitionDeleteByRetentionResponse {
+                    table_id: t_id.get(),
+                    partition_id: p_id.get(),
                 })
             }))
             .boxed(),

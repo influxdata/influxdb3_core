@@ -19,7 +19,7 @@ use iox_catalog::{
     },
     util::get_table_columns_by_id,
 };
-use object_store::ObjectStore;
+use object_store::{ObjectStore, PutPayload};
 use observability_deps::tracing::{debug, info, warn};
 use parquet_file::{
     metadata::{DecodedIoxParquetMetaData, IoxMetadata, IoxParquetMetaData},
@@ -530,7 +530,9 @@ impl RemoteImporter {
         );
         let object_store_path = parquet_path.object_store_path();
         debug!(?object_store_path, "copying data to object store");
-        self.object_store.put(&object_store_path, bytes).await?;
+        self.object_store
+            .put(&object_store_path, PutPayload::from_bytes(bytes))
+            .await?;
 
         info!(
             ?file_path,

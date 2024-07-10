@@ -7,7 +7,10 @@ use arrow::{
     array::{cast, Array, ArrayRef},
     datatypes::{DataType, Field},
 };
-use datafusion::logical_expr::{function::AccumulatorArgs, AggregateUDFImpl};
+use datafusion::logical_expr::{
+    function::{AccumulatorArgs, StateFieldsArgs},
+    AggregateUDFImpl,
+};
 use datafusion::{
     common::Result,
     logical_expr::{Accumulator, Signature, Volatility},
@@ -54,13 +57,9 @@ impl AggregateUDFImpl for ModeUDF {
         Ok(Box::new(ModeAccumulator::new(arg.data_type.clone())))
     }
 
-    fn state_fields(
-        &self,
-        name: &str,
-        value_type: DataType,
-        _ordering_fields: Vec<Field>,
-    ) -> Result<Vec<Field>> {
-        let item_list = DataType::List(Arc::new(Field::new("item", value_type.clone(), true)));
+    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<Field>> {
+        let item_list =
+            DataType::List(Arc::new(Field::new("item", args.return_type.clone(), true)));
         let timestamp_list = DataType::List(Arc::new(Field::new(
             "item",
             DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
@@ -68,8 +67,12 @@ impl AggregateUDFImpl for ModeUDF {
         )));
 
         Ok(vec![
-            Field::new(format_state_name(name, "value"), item_list, true),
-            Field::new(format_state_name(name, "timestamp"), timestamp_list, true),
+            Field::new(format_state_name(args.name, "value"), item_list, true),
+            Field::new(
+                format_state_name(args.name, "timestamp"),
+                timestamp_list,
+                true,
+            ),
         ])
     }
 }
@@ -213,8 +216,8 @@ impl Accumulator for ModeAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let v_arr = ScalarValue::new_list(&self.point_values, &self.data_type);
-        let t_arr = ScalarValue::new_list(
+        let v_arr = ScalarValue::new_list_nullable(&self.point_values, &self.data_type);
+        let t_arr = ScalarValue::new_list_nullable(
             &self.point_times,
             &DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
         );

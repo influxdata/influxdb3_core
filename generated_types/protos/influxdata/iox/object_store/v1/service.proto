@@ -2,9 +2,18 @@ syntax = "proto3";
 package influxdata.iox.object_store.v1;
 option go_package = "github.com/influxdata/iox/object_store/v1";
 
+import "influxdata/iox/catalog/v1/partition_identifier.proto";
+
 service ObjectStoreService {
     // Get the parquet file from the object store by its uuid
     rpc GetParquetFileByObjectStoreId(GetParquetFileByObjectStoreIdRequest) returns (stream GetParquetFileByObjectStoreIdResponse);
+
+    // Get the parquet file from the object store by its path
+    rpc GetParquetFileByObjectStorePath(GetParquetFileByObjectStorePathRequest) returns (stream GetParquetFileByObjectStorePathResponse);
+
+    // List the parquet files scoped down to the path prefix (refer to ParquetFilePathFilter).
+    // This will include all versions of the parquet files.
+    rpc ListParquetFilesByPathFilter(ListParquetFilesByPathFilterRequest) returns (stream ListParquetFilesByPathFilterResponse);
 }
 
 message GetParquetFileByObjectStoreIdRequest {
@@ -15,4 +24,48 @@ message GetParquetFileByObjectStoreIdRequest {
 message GetParquetFileByObjectStoreIdResponse {
     // bytes from the parquet file in object store
     bytes data = 1;
+}
+
+message GetParquetFileByObjectStorePathRequest {
+    string path = 1;
+    optional string version = 2;
+}
+
+message GetParquetFileByObjectStorePathResponse {
+    // bytes from the parquet file in object store
+    bytes data = 1;
+}
+
+// filter parquet files based upon path
+message ParquetFilePathFilter {
+    // namespace is always required
+    int64 namespace_id = 1;
+
+    // table is optional
+    optional int64 table_id = 2;
+
+    // partition is optional
+    //
+    // when a partition is provided, the partition_hash_id will be created by either:
+    // (a) PartitionIdentifier(hash_id)
+    // (b) PartitionIdentifier(catalog_id) + partition_key (if exists)
+    optional influxdata.iox.catalog.v1.PartitionIdentifier partition_id = 3;
+    optional string partition_key = 4;
+}
+
+message ListParquetFilesByPathFilterRequest {
+    ParquetFilePathFilter prefix = 1;
+}
+
+message ObjectMetadata {
+    string location = 1;
+    int64 last_modified = 2;
+    int64 size = 3;
+    optional string e_tag = 4;
+    optional string version = 5;
+}
+
+message ListParquetFilesByPathFilterResponse {
+    // metadata from the parquet file in object store, which includes version
+    ObjectMetadata metadata = 1;
 }

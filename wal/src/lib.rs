@@ -17,7 +17,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use snafu::prelude::*;
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -204,6 +204,14 @@ const FILE_TYPE_IDENTIFIER: &FileTypeIdentifier = b"INFLUXV3";
 /// File extension for segment files.
 const SEGMENT_FILE_EXTENSION: &str = "dat";
 
+/// A collection of statistics exposed for a [`Wal`] instance.
+#[derive(Debug)]
+#[allow(missing_copy_implementations)]
+pub struct WalStats {
+    /// The size of the WAL's open segment in bytes.
+    pub open_segment_size_bytes: usize,
+}
+
 /// The main type representing one WAL for one ingester instance.
 ///
 /// # Constraints
@@ -343,11 +351,43 @@ impl Wal {
     /// closed segment details, including the [`SequenceNumberSet`] containing
     /// the sequence numbers of the writes within the closed segment.
     pub fn rotate(&self) -> Result<(ClosedSegment, SequenceNumberSet)> {
+        let mut segments = self.segments.lock();
+        self.rotate_under_lock(&mut segments)
+    }
+
+    /// Behaves as [`Wal::rotate`], but conditional upon `condition_met`
+    /// returning true. If the condition is not met, `Ok(None)` is returned.
+    ///
+    /// # Important
+    ///
+    /// The provided function is performed under exclusive lock and will block
+    /// WAL appends - don't perform expensive logic on it.
+    pub fn rotate_if(
+        &self,
+        condition_met: impl Fn(WalStats) -> bool,
+    ) -> Result<Option<(ClosedSegment, SequenceNumberSet)>> {
+        let mut segments = self.segments.lock();
+
+        let current_stats = WalStats {
+            open_segment_size_bytes: segments.open_segment.bytes_written(),
+        };
+
+        if condition_met(current_stats) {
+            self.rotate_under_lock(&mut segments).map(Option::Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Internal helper to DRY the rotation of the open WAL segment under
+    /// exclusive lock.
+    fn rotate_under_lock(
+        &self,
+        segments: &mut MutexGuard<'_, Segments>,
+    ) -> Result<(ClosedSegment, SequenceNumberSet)> {
         let new_open_segment =
             OpenSegmentFileWriter::new_in_directory(&self.root, Arc::clone(&self.next_id_source))
                 .context(UnableToCreateSegmentFileSnafu)?;
-
-        let mut segments = self.segments.lock();
 
         let closed = std::mem::replace(&mut segments.open_segment, new_open_segment);
         let seqnum_set = std::mem::take(&mut segments.open_segment_ids);
@@ -745,7 +785,16 @@ mod tests {
         wal.write_op(op1.clone());
         wal.write_op(op2.clone());
         wal.write_op(op3.clone());
-        wal.write_op(op4.clone()).changed().await.unwrap();
+        let mut summary = wal.write_op(op4.clone());
+        summary.changed().await.unwrap();
+        // Assert the final write reports same number of total bites as the WAL's
+        // open segment contains.
+        assert_matches!(
+            summary.borrow().as_ref().unwrap(),
+            WriteResult::Ok(summary) => {
+                assert_eq!(summary.total_bytes, wal.segments.lock().open_segment.bytes_written());
+            }
+        );
 
         let (closed, ids) = wal.rotate().unwrap();
 

@@ -16,11 +16,11 @@ chrono-tz = { version = "0.9" }
 iox_query_params = { path = "../iox_query_params/" }
 num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = "0.2"
-thiserror = "1.0.60"
+thiserror = "1.0.61"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
 test_helpers = { path = "../test_helpers" }
 assert_matches = "1"
-insta = { version = "1.38.0", features = ["yaml"] }
+insta = { version = "1.39.0", features = ["yaml"] }
 paste = "1.0.15"

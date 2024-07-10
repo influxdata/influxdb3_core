@@ -538,6 +538,7 @@ pub fn parse_field(input: &str) -> Result<Field, ParseError> {
         return Err(ParseError {
             message: "unexpected eof".into(),
             pos: 0,
+            details: None,
         });
     }
 
@@ -550,6 +551,7 @@ pub fn parse_field(input: &str) -> Result<Field, ParseError> {
             return Err(ParseError {
                 message: message.into(),
                 pos: input.offset(pos),
+                details: None,
             })
         }
         // any other error indicates an invalid expression
@@ -557,6 +559,7 @@ pub fn parse_field(input: &str) -> Result<Field, ParseError> {
             return Err(ParseError {
                 message: "invalid field expression".into(),
                 pos: input.offset(i),
+                details: None,
             })
         }
     };
@@ -568,6 +571,7 @@ pub fn parse_field(input: &str) -> Result<Field, ParseError> {
         return Err(ParseError {
             message: "invalid field expression".into(),
             pos: input.offset(i),
+            details: None,
         });
     }
 

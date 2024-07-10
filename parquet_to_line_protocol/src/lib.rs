@@ -11,7 +11,7 @@ use datafusion::{
         file_format::{parquet::ParquetFormat, FileFormat},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{FileScanConfig, ParquetExec},
+        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
     },
     execution::{
         context::{SessionState, TaskContext},
@@ -247,19 +247,11 @@ impl ParquetFileReader {
         };
 
         // set up enough datafusion context to do the real read session
-        let predicate = None;
-        let metadata_size_hint = None;
-        let exec = ParquetExec::new(
-            base_config,
-            predicate,
-            metadata_size_hint,
-            table_parquet_options(),
-        );
-
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let object_store = Arc::clone(&self.object_store);
         register_iox_object_store(self.session_ctx.runtime_env(), "iox", object_store);
         let task_ctx = Arc::new(TaskContext::from(&self.session_ctx));
 
-        execute_stream(Arc::new(exec), task_ctx).context(ExecutingStreamSnafu)
+        execute_stream(builder.build_arc(), task_ctx).context(ExecutingStreamSnafu)
     }
 }

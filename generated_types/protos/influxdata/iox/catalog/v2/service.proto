@@ -49,6 +49,7 @@ service CatalogService {
   rpc PartitionNeedingColdCompact(PartitionNeedingColdCompactRequest) returns (stream PartitionNeedingColdCompactResponse);
   rpc PartitionUpdateColdCompact(PartitionUpdateColdCompactRequest) returns (PartitionUpdateColdCompactResponse);
   rpc PartitionListOldStyle(PartitionListOldStyleRequest) returns (stream PartitionListOldStyleResponse);
+  rpc PartitionDeleteByRetention(PartitionDeleteByRetentionRequest) returns (stream PartitionDeleteByRetentionResponse);
   rpc PartitionSnapshot(PartitionSnapshotRequest) returns (PartitionSnapshotResponse);
 
   rpc ParquetFileFlagForDeleteByRetention(ParquetFileFlagForDeleteByRetentionRequest) returns (stream ParquetFileFlagForDeleteByRetentionResponse);
@@ -372,6 +373,13 @@ message PartitionListOldStyleResponse {
   Partition partition = 1;
 }
 
+message PartitionDeleteByRetentionRequest {}
+
+message PartitionDeleteByRetentionResponse {
+  int64 table_id = 1;
+  int64 partition_id = 2;
+}
+
 message PartitionSnapshotRequest {
   int64 partition_id = 1;
 }
@@ -506,8 +514,8 @@ message ColumnSet {
 }
 
 enum ParquetFileSource {
-    PARQUET_FILE_SOURCE_UNSPECIFIED = 0;
-    PARQUET_FILE_SOURCE_BULK_INGEST = 1;
+  PARQUET_FILE_SOURCE_UNSPECIFIED = 0;
+  PARQUET_FILE_SOURCE_BULK_INGEST = 1;
 }
 
 message ParquetFileParams {

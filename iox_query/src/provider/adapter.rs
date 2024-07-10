@@ -281,7 +281,7 @@ mod tests {
             input_stream,
             output_schema,
             &Default::default(),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         )
         .unwrap();
 
@@ -315,7 +315,7 @@ mod tests {
             input_stream,
             output_schema,
             &Default::default(),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         )
         .unwrap();
 
@@ -357,7 +357,7 @@ mod tests {
                 ("g", ScalarValue::from(1i32)),
                 ("h", ScalarValue::from(1i32)),
             ]),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         )
         .unwrap();
 
@@ -390,7 +390,7 @@ mod tests {
             input_stream,
             output_schema,
             &Default::default(),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         )
         .unwrap();
 
@@ -424,7 +424,7 @@ mod tests {
             input_stream,
             output_schema,
             &Default::default(),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
         assert_contains!(res.unwrap_err().to_string(), "input field 'c' had type 'Utf8' which is different than output field 'c' which had type 'Float32'");
@@ -445,7 +445,7 @@ mod tests {
             input_stream,
             output_schema,
             &HashMap::from([("d", ScalarValue::from(1u32))]),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
         assert_contains!(res.unwrap_err().to_string(), "creating virtual value of type 'UInt32' which is different than output field 'd' which had type 'UInt8'");
@@ -469,7 +469,7 @@ mod tests {
                 ("a", ScalarValue::from(1i32)),
                 ("d", ScalarValue::from("foo")),
             ]),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
         assert_contains!(res.unwrap_err().to_string(), "the field 'a' is specified within the input and as a virtual column, don't know which one to choose");
@@ -490,7 +490,7 @@ mod tests {
             input_stream,
             output_schema,
             &Default::default(),
-            baseline_metrics(),
+            BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
         assert_contains!(res.unwrap_err().to_string(), "field 'd' had output type 'Utf8' and should be a NULL column but the field is flagged as 'not null'");
@@ -505,10 +505,5 @@ mod tests {
 
         RecordBatch::try_from_iter(vec![("a", col_a as ArrayRef), ("b", col_b), ("c", col_c)])
             .unwrap()
-    }
-
-    /// Create a BaselineMetrics object for testing
-    fn baseline_metrics() -> BaselineMetrics {
-        BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0)
     }
 }

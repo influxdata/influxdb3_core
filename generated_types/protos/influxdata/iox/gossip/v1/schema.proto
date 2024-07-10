@@ -3,6 +3,7 @@ package influxdata.iox.gossip.v1;
 option go_package = "github.com/influxdata/iox/gossip/v1";
 
 import "google/protobuf/timestamp.proto";
+import "influxdata/iox/column_type/v1/type.proto";
 import "influxdata/iox/partition_template/v1/template.proto";
 
 // A message exchanged via the IOx gossip mechanism describing schema changes.
@@ -77,20 +78,5 @@ message TableCreated {
 message Column {
   string name = 1;
   int64 column_id = 2;
-  ColumnType column_type = 5;
-
-  enum ColumnType {
-    // An unknown column data type.
-    //
-    // This is an invalid value and SHOULD never be specified.
-    COLUMN_TYPE_UNSPECIFIED = 0;
-
-    COLUMN_TYPE_I64 = 1;
-    COLUMN_TYPE_U64 = 2;
-    COLUMN_TYPE_F64 = 3;
-    COLUMN_TYPE_BOOL = 4;
-    COLUMN_TYPE_STRING = 5;
-    COLUMN_TYPE_TIME = 6;
-    COLUMN_TYPE_TAG = 7;
-  }
+  influxdata.iox.column_type.v1.ColumnType column_type = 5;
 }

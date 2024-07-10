@@ -1,14 +1,17 @@
 //! Query frontend for InfluxDB Storage gRPC requests
 
+use async_trait::async_trait;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
 use arrow::datatypes::DataType;
 use data_types::ChunkId;
 use datafusion::{
+    catalog::schema::SchemaProvider,
     common::DFSchemaRef,
     error::DataFusionError,
-    logical_expr::{utils::exprlist_to_columns, ExprSchemable, LogicalPlan, LogicalPlanBuilder},
+    functions::core::expr_ext::FieldAccessor,
+    logical_expr::{ExprSchemable, LogicalPlan, LogicalPlanBuilder},
     prelude::{when, Column, Expr},
 };
 use datafusion_util::{
@@ -44,7 +47,7 @@ use query_functions::{
 };
 use schema::{InfluxColumnType, Projection, Schema, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
-use std::collections::{BTreeMap, HashSet as StdHashSet};
+use std::collections::HashSet as StdHashSet;
 use std::{cmp::Reverse, collections::BTreeSet, sync::Arc};
 
 use crate::scan_plan::ScanPlanBuilder;
@@ -225,9 +228,9 @@ pub struct InfluxRpcPlanner {
 
 impl InfluxRpcPlanner {
     /// Create a new instance of the RPC planner
-    pub async fn new(ctx: IOxSessionContext) -> Result<Self> {
-        let meta = Arc::new(NamespaceMeta::new(&ctx).await?);
-        Ok(Self { ctx, meta })
+    pub fn new(ctx: IOxSessionContext) -> Self {
+        let meta = Arc::new(NamespaceMeta::new(&ctx));
+        Self { ctx, meta }
     }
 
     /// Returns a builder that includes
@@ -248,20 +251,17 @@ impl InfluxRpcPlanner {
         let rpc_predicate = rpc_predicate.clear_timestamp_if_max_range();
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
-        let tables: Vec<_> = table_chunk_stream(
-            Arc::clone(&namespace),
-            false,
-            &table_predicates,
-            &ctx,
-            &self.meta,
-        )
-        .try_filter_map(|(table_name, _, table_predicate, chunks)| async move {
-            Ok((!chunks.is_empty()).then_some((table_name, Some((table_predicate, chunks)))))
-        })
-        .try_collect()
-        .await?;
+        let tables: Vec<_> =
+            table_chunk_stream(Arc::clone(&namespace), false, &table_predicates, &ctx)
+                .try_filter_map(|(table_name, schema, table_predicate, chunks)| async move {
+                    Ok((!chunks.is_empty())
+                        .then_some((table_name, Some((schema, table_predicate, chunks)))))
+                })
+                .try_collect()
+                .await?;
 
         // Feed builder
         let mut builder = StringSetPlanBuilder::new();
@@ -270,14 +270,7 @@ impl InfluxRpcPlanner {
                 None => {
                     builder.append_string(table_name.to_string());
                 }
-                Some((predicate, chunks)) => {
-                    let schema = self
-                        .meta
-                        .table_schema(table_name)
-                        .context(TableRemovedSnafu {
-                            table_name: table_name.as_ref(),
-                        })?;
-
+                Some((schema, predicate, chunks)) => {
                     let plan =
                         Self::table_name_plan(Arc::clone(table_name), &schema, &predicate, chunks)?;
                     builder = builder.append_other(plan.into());
@@ -310,28 +303,29 @@ impl InfluxRpcPlanner {
         //    need full plans
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
 
         let mut table_predicates_need_chunks = vec![];
         let mut builder = StringSetPlanBuilder::new();
-        for (table_name, predicate) in table_predicates {
+        for (table_name, schema, predicate) in table_predicates {
             if predicate.is_empty() {
+                let schema = schema.context(TableRemovedSnafu {
+                    table_name: table_name.as_ref(),
+                })?;
+
                 // special case - return the columns from metadata only.
                 // Note that columns with all rows deleted will still show here
                 builder = builder.append_other(
-                    self.meta
-                        .table_schema(&table_name)
-                        .context(TableRemovedSnafu {
-                            table_name: table_name.as_ref(),
-                        })?
+                    schema
                         .tags_iter()
                         .map(|f| f.name().clone())
                         .collect::<BTreeSet<_>>()
                         .into(),
                 );
             } else {
-                table_predicates_need_chunks.push((table_name, predicate));
+                table_predicates_need_chunks.push((table_name, schema, predicate));
             }
         }
 
@@ -340,9 +334,8 @@ impl InfluxRpcPlanner {
             false,
             &table_predicates_need_chunks,
             &ctx,
-            &self.meta,
         )
-        .and_then(|(table_name, _, predicate, chunks)| {
+        .and_then(|(table_name, schema, predicate, chunks)| {
             let mut ctx = ctx.child_ctx("table");
             ctx.set_metadata("table", table_name.to_string());
 
@@ -385,7 +378,7 @@ impl InfluxRpcPlanner {
                     }
                 }
 
-                Ok((table_name, predicate, chunks_full, known_columns))
+                Ok((table_name, schema, predicate, chunks_full, known_columns))
             }
         })
         .try_collect()
@@ -395,20 +388,13 @@ impl InfluxRpcPlanner {
         // in `known_columns`, and potentially some tables in chunks
         // that we need to run a plan to know if they pass the
         // predicate.
-        for (table_name, predicate, chunks_full, known_columns) in tables {
+        for (table_name, schema, predicate, chunks_full, known_columns) in tables {
             builder = builder.append_other(known_columns.into());
 
             if !chunks_full.is_empty() {
                 // TODO an additional optimization here would be to filter
                 // out chunks (and tables) where all columns in that chunk
                 // were already known to have data (based on the contents of known_columns)
-
-                let schema = self
-                    .meta
-                    .table_schema(table_name)
-                    .context(TableRemovedSnafu {
-                        table_name: table_name.as_ref(),
-                    })?;
 
                 let plan = self.tag_keys_plan(table_name, &schema, &predicate, chunks_full)?;
 
@@ -441,26 +427,24 @@ impl InfluxRpcPlanner {
         // which need full plans
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
 
         // filter out tables that do NOT contain `tag_name` early, esp. before performing any chunk
         // scan (which includes ingester RPC)
         let mut table_predicates_filtered = Vec::with_capacity(table_predicates.len());
-        for (table_name, predicate) in table_predicates {
-            let schema = self
-                .meta
-                .table_schema(&table_name)
-                .context(TableRemovedSnafu {
-                    table_name: table_name.as_ref(),
-                })?;
+        for (table_name, schema, predicate) in table_predicates {
+            let schema = schema.context(TableRemovedSnafu {
+                table_name: table_name.as_ref(),
+            })?;
 
             // Skip this table if the tag_name is not a column in this table
             if schema.find_index_of(tag_name).is_none() {
                 continue;
             };
 
-            table_predicates_filtered.push((table_name, predicate));
+            table_predicates_filtered.push((table_name, Some(schema), predicate));
         }
 
         let tables: Vec<_> = table_chunk_stream(
@@ -468,9 +452,8 @@ impl InfluxRpcPlanner {
             false,
             &table_predicates_filtered,
             &ctx,
-            &self.meta,
         )
-        .and_then(|(table_name, _, predicate, chunks)| async move {
+        .and_then(|(table_name, schema, predicate, chunks)| async move {
             let mut chunks_full = vec![];
 
             for chunk in cheap_chunk_first(chunks) {
@@ -511,7 +494,7 @@ impl InfluxRpcPlanner {
                 chunks_full.push(chunk);
             }
 
-            Ok((table_name, predicate, chunks_full))
+            Ok((table_name, schema, predicate, chunks_full))
         })
         .try_collect()
         .await?;
@@ -523,15 +506,8 @@ impl InfluxRpcPlanner {
         // At this point, we have a set of tag_values we know at plan
         // time in `known_columns`, and some tables in chunks that we
         // need to run a plan to find what values pass the predicate.
-        for (table_name, predicate, chunks_full) in tables {
+        for (table_name, schema, predicate, chunks_full) in tables {
             if !chunks_full.is_empty() {
-                let schema = self
-                    .meta
-                    .table_schema(table_name)
-                    .context(TableRemovedSnafu {
-                        table_name: table_name.as_ref(),
-                    })?;
-
                 let scan_and_filter = ScanPlanBuilder::new(Arc::clone(table_name), &schema)
                     .with_chunks(chunks_full)
                     .with_predicate(&predicate)
@@ -586,21 +562,19 @@ impl InfluxRpcPlanner {
         // values and stops the plan executing once it has them
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
 
         // optimization: just get the field columns from metadata.
         // note this both ignores field keys, and sets the timestamp data 'incorrectly'.
         let mut field_list_plan = FieldListPlan::new();
         let mut table_predicates_need_chunks = Vec::with_capacity(table_predicates.len());
-        for (table_name, predicate) in table_predicates {
+        for (table_name, schema, predicate) in table_predicates {
             if predicate.is_empty() {
-                let schema = self
-                    .meta
-                    .table_schema(&table_name)
-                    .context(TableRemovedSnafu {
-                        table_name: table_name.as_ref(),
-                    })?;
+                let schema = schema.context(TableRemovedSnafu {
+                    table_name: table_name.as_ref(),
+                })?;
                 let fields = schema.fields_iter().map(|f| Field {
                     name: f.name().clone(),
                     data_type: f.data_type().clone(),
@@ -610,7 +584,7 @@ impl InfluxRpcPlanner {
                     field_list_plan.append_field(field);
                 }
             } else {
-                table_predicates_need_chunks.push((table_name, predicate));
+                table_predicates_need_chunks.push((table_name, schema, predicate));
             }
         }
 
@@ -619,7 +593,6 @@ impl InfluxRpcPlanner {
             namespace,
             &table_predicates_need_chunks,
             ctx,
-            Arc::clone(&self.meta),
             |table_name, predicate, chunks, schema| {
                 Self::field_columns_plan(Arc::from(table_name), schema, predicate, chunks)
             },
@@ -659,14 +632,14 @@ impl InfluxRpcPlanner {
         debug!(?rpc_predicate, "planning read_filter");
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
 
         let plans = create_plans(
             namespace,
             &table_predicates,
             ctx,
-            Arc::clone(&self.meta),
             |table_name, predicate, chunks, schema| {
                 Self::read_filter_plan(table_name, schema, predicate, chunks)
             },
@@ -707,7 +680,8 @@ impl InfluxRpcPlanner {
         debug!(?rpc_predicate, ?agg, "planning read_group");
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
 
         // Note always group (which will resort the frames)
@@ -734,7 +708,6 @@ impl InfluxRpcPlanner {
             namespace,
             &table_predicates,
             ctx,
-            Arc::clone(&self.meta),
             |table_name, predicate, chunks, schema| {
                 // check group_columns for unknown columns
                 let known_tags_vec = schema
@@ -796,14 +769,14 @@ impl InfluxRpcPlanner {
         );
 
         let table_predicates = rpc_predicate
-            .table_predicates(self.meta.as_ref())
+            .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
+            .await
             .context(CreatingPredicatesSnafu)?;
 
         let plans = create_plans(
             namespace,
             &table_predicates,
             ctx,
-            Arc::clone(&self.meta),
             |table_name, predicate, chunks, schema| {
                 Self::read_window_aggregate_plan(
                     table_name, schema, predicate, agg, every, offset, chunks,
@@ -1259,21 +1232,12 @@ impl InfluxRpcPlanner {
 fn table_chunk_stream<'a>(
     namespace: Arc<dyn QueryNamespace>,
     need_fields: bool,
-    table_predicates: &'a [(Arc<str>, Predicate)],
+    table_predicates: &'a [(Arc<str>, Option<Schema>, Predicate)],
     ctx: &'a IOxSessionContext,
-    meta: &'a NamespaceMeta,
-) -> impl Stream<
-    Item = Result<(
-        &'a Arc<str>,
-        Arc<Schema>,
-        Predicate,
-        Vec<Arc<dyn QueryChunk>>,
-    )>,
-> + 'a {
+) -> impl Stream<Item = Result<(&'a Arc<str>, Schema, Predicate, Vec<Arc<dyn QueryChunk>>)>> + 'a {
     futures::stream::iter(table_predicates)
-        .filter_map(move |(table_name, predicate)| async move {
-            let table_schema = meta.table_schema(table_name)?;
-            let table_schema = Arc::new(table_schema);
+        .filter_map(move |(table_name, table_schema, predicate)| async move {
+            let table_schema = table_schema.as_ref()?.clone();
             Some((table_name, table_schema, predicate))
         })
         .map(move |(table_name, table_schema, predicate)| {
@@ -1317,7 +1281,7 @@ fn table_chunk_stream<'a>(
                     })
                 }
 
-                Ok((table_name, Arc::clone(&table_schema), predicate, chunks))
+                Ok((table_name, table_schema.clone(), predicate, chunks))
             }
         })
         .buffered(CONCURRENT_TABLE_JOBS)
@@ -1338,7 +1302,7 @@ fn columns_in_predicates(
     predicate: &Predicate,
 ) -> Option<Vec<usize>> {
     // columns in field_columns
-    let mut columns = match &predicate.field_columns {
+    let columns: StdHashSet<Column> = match &predicate.field_columns {
         Some(field_columns) => field_columns
             .iter()
             .map(Column::from_name)
@@ -1353,9 +1317,13 @@ fn columns_in_predicates(
         }
     };
 
+    let mut columns: StdHashSet<&Column> = columns.iter().collect::<StdHashSet<_>>();
+
     // columns in exprs
-    let expr_cols_result =
-        exprlist_to_columns(&predicate.exprs, &mut columns).context(ReadColumnsSnafu);
+    predicate
+        .exprs
+        .iter()
+        .for_each(|expr| expr.add_column_refs(&mut columns));
 
     // columns in val_exprs
     let exprs: Vec<Expr> = predicate
@@ -1363,41 +1331,30 @@ fn columns_in_predicates(
         .iter()
         .map(|e| Expr::from((*e).clone()))
         .collect();
-    let val_exprs_cols_result = exprlist_to_columns(&exprs, &mut columns).context(ReadColumnsSnafu);
+    exprs
+        .iter()
+        .for_each(|expr| expr.add_column_refs(&mut columns));
 
-    if expr_cols_result.is_err() || val_exprs_cols_result.is_err() {
-        if expr_cols_result.is_err() {
-            let error_message = expr_cols_result.err().unwrap().to_string();
-            warn!(table_name, ?predicate.exprs, ?error_message, "cannot determine columns in predicate.exprs");
-        }
-        if val_exprs_cols_result.is_err() {
-            let error_message = val_exprs_cols_result.err().unwrap().to_string();
-            warn!(table_name, ?predicate.value_expr, ?error_message, "cannot determine columns in predicate.value_expr");
-        }
+    // convert the column names into their corresponding indexes in the schema
+    if columns.is_empty() {
+        return None;
+    }
 
-        None
-    } else {
-        // convert the column names into their corresponding indexes in the schema
-        if columns.is_empty() {
+    let mut indices = Vec::with_capacity(columns.len());
+    for c in columns {
+        if let Some(idx) = table_schema.find_index_of(&c.name) {
+            indices.push(idx);
+        } else {
+            warn!(
+                table_name,
+                column=c.name.as_str(),
+                table_columns=?table_schema.iter().map(|(_t, f)| f.name()).collect::<Vec<_>>(),
+                "cannot find predicate column (field column, value expr, filter expression) table schema",
+            );
             return None;
         }
-
-        let mut indices = Vec::with_capacity(columns.len());
-        for c in columns {
-            if let Some(idx) = table_schema.find_index_of(&c.name) {
-                indices.push(idx);
-            } else {
-                warn!(
-                    table_name,
-                    column=c.name.as_str(),
-                    table_columns=?table_schema.iter().map(|(_t, f)| f.name()).collect::<Vec<_>>(),
-                    "cannot find predicate column (field column, value expr, filter expression) table schema",
-                );
-                return None;
-            }
-        }
-        Some(indices)
     }
+    Some(indices)
 }
 
 /// Create plans that fetch the data specified in table_predicates.
@@ -1411,9 +1368,8 @@ fn columns_in_predicates(
 ///  invoked on the chunks for each table to produce a plan for each
 async fn create_plans<F, P>(
     namespace: Arc<dyn QueryNamespace>,
-    table_predicates: &[(Arc<str>, Predicate)],
+    table_predicates: &[(Arc<str>, Option<Schema>, Predicate)],
     ctx: IOxSessionContext,
-    meta: Arc<NamespaceMeta>,
     f: F,
 ) -> Result<Vec<P>>
 where
@@ -1423,25 +1379,18 @@ where
         + Sync,
     P: Send,
 {
-    table_chunk_stream(namespace, true, table_predicates, &ctx, &meta)
-        .try_filter_map(|(table_name, _, predicate, chunks)| async move {
-            Ok((!chunks.is_empty()).then_some((table_name, predicate, chunks)))
-                as Result<Option<(&Arc<str>, Predicate, Vec<_>)>>
+    table_chunk_stream(namespace, true, table_predicates, &ctx)
+        .try_filter_map(|(table_name, schema, predicate, chunks)| async move {
+            Ok((!chunks.is_empty()).then_some((table_name, schema, predicate, chunks)))
+                as Result<Option<(&Arc<str>, Schema, Predicate, Vec<_>)>>
         })
-        .and_then(|(table_name, predicate, chunks)| {
+        .and_then(|(table_name, schema, predicate, chunks)| {
             let mut ctx = ctx.child_ctx("table");
             ctx.set_metadata("table", table_name.to_string());
 
-            let meta = Arc::clone(&meta);
             let f = f.clone();
 
-            async move {
-                let schema = meta.table_schema(table_name).context(TableRemovedSnafu {
-                    table_name: table_name.as_ref(),
-                })?;
-
-                f(table_name, &predicate, chunks, &schema)
-            }
+            async move { f(table_name, &predicate, chunks, &schema) }
         })
         .try_collect()
         .await
@@ -1792,13 +1741,12 @@ fn chunk_column_names(
     })
 }
 
-#[derive(Debug)]
 struct NamespaceMeta {
-    tables: BTreeMap<String, Schema>,
+    schema_provider: Arc<dyn SchemaProvider>,
 }
 
 impl NamespaceMeta {
-    async fn new(ctx: &IOxSessionContext) -> Result<Self> {
+    fn new(ctx: &IOxSessionContext) -> Self {
         let schema_provider = ctx
             .inner()
             .catalog(DEFAULT_CATALOG)
@@ -1806,37 +1754,35 @@ impl NamespaceMeta {
             .schema(DEFAULT_SCHEMA)
             .expect("default schema exists");
 
-        let tables = futures::stream::iter(schema_provider.table_names())
-            .map(|table_name| {
-                let schema_provider = Arc::clone(&schema_provider);
-                async move {
-                    let table_provider = schema_provider
-                        .table(&table_name)
-                        .await
-                        .expect("get table provider")?;
-                    let schema: Schema = table_provider
-                        .schema()
-                        .try_into()
-                        .expect("valid IOx schema");
-                    Some((table_name, schema))
-                }
-            })
-            .buffer_unordered(CONCURRENT_TABLE_JOBS)
-            .filter_map(|x| async move { x })
-            .collect()
-            .await;
-
-        Ok(Self { tables })
+        Self { schema_provider }
     }
 }
 
+impl std::fmt::Debug for NamespaceMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamespaceMeta")
+            .field("schema_provider", &"<Provider>")
+            .finish()
+    }
+}
+
+#[async_trait]
 impl QueryNamespaceMeta for NamespaceMeta {
     fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
+        self.schema_provider.table_names()
     }
 
-    fn table_schema(&self, table_name: &str) -> Option<Schema> {
-        self.tables.get(table_name).cloned()
+    async fn table_schema(&self, table_name: &str) -> Option<Schema> {
+        let table_provider = self
+            .schema_provider
+            .table(table_name)
+            .await
+            .expect("get table provider")?;
+        let schema: Schema = table_provider
+            .schema()
+            .try_into()
+            .expect("valid IOx schema");
+        Some(schema)
     }
 }
 
@@ -1956,19 +1902,18 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // predicate has no field_columns
         // predicate on a tag column `foo`
         let expr = col("foo").eq(lit("some_thing"));
         let predicate = Predicate::new().with_expr(expr);
-        let table_predicates = vec![(Arc::from("h2o"), predicate)];
+        let table_predicates = vec![(Arc::from("h2o"), Some(chunk0.schema().clone()), predicate)];
 
         ////////////////////////////
         // Test 1: need_fields --> all columns will be selected
         let need_fields = true;
 
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -1996,7 +1941,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2034,16 +1979,15 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // empty predicate
         let predicate = Predicate::new();
-        let table_predicates = vec![(Arc::from("h2o"), predicate)];
+        let table_predicates = vec![(Arc::from("h2o"), Some(chunk0.schema().clone()), predicate)];
 
         /////////////
         // Test 1: empty predicate with need_fields
         let need_fields = true;
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2070,7 +2014,7 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2102,15 +2046,14 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // predicate on a tag column `foo`
         let expr = col("foo").eq(lit("some_thing"));
         let predicate = Predicate::new().with_expr(expr);
-        let table_predicates = vec![(Arc::from("h2o"), predicate)];
+        let table_predicates = vec![(Arc::from("h2o"), Some(chunk0.schema().clone()), predicate)];
 
         let need_fields = false;
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2149,7 +2092,6 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         let need_fields = false;
 
@@ -2158,9 +2100,9 @@ mod tests {
         // predicate on field column
         let expr = col("i64_field_2").eq(lit(10));
         let predicate = Predicate::new().with_expr(expr);
-        let table_predicates = vec![(Arc::from("h2o"), predicate)];
+        let table_predicates = vec![(Arc::from("h2o"), Some(chunk0.schema().clone()), predicate)];
 
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2188,12 +2130,12 @@ mod tests {
             .with_expr(expr)
             .with_field_columns(vec!["i64_field".to_string()])
             .unwrap();
-        let table_predicates = vec![(Arc::from("h2o"), predicate)];
+        let table_predicates = vec![(Arc::from("h2o"), Some(chunk0.schema().clone()), predicate)];
 
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2232,15 +2174,14 @@ mod tests {
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None, None);
-        let meta = NamespaceMeta::new(&ctx).await.unwrap();
 
         // predicate on unknown column
         let expr = col("unknown_name").eq(lit(10));
         let predicate = Predicate::new().with_expr(expr);
-        let table_predicates = vec![(Arc::from("h2o"), predicate)];
+        let table_predicates = vec![(Arc::from("h2o"), Some(chunk0.schema().clone()), predicate)];
 
         let need_fields = false;
-        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx, &meta)
+        let result = table_chunk_stream(test_db, need_fields, &table_predicates, &ctx)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2267,8 +2208,6 @@ mod tests {
         run_test(|test_db, rpc_predicate| {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .table_names(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2283,8 +2222,6 @@ mod tests {
         run_test(|test_db, rpc_predicate| {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .tag_keys(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2299,8 +2236,6 @@ mod tests {
         run_test(|test_db, rpc_predicate| {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .tag_values(test_db, "foo", rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2315,8 +2250,6 @@ mod tests {
         run_test(|test_db, rpc_predicate| {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .field_columns(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2331,8 +2264,6 @@ mod tests {
         run_test(|test_db, rpc_predicate| {
             async move {
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .read_filter(test_db, rpc_predicate)
                     .await
                     .expect("creating plan");
@@ -2349,8 +2280,6 @@ mod tests {
                 let agg = Aggregate::None;
                 let group_columns = &["foo"];
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .read_group(test_db, rpc_predicate, agg, group_columns)
                     .await
                     .expect("creating plan");
@@ -2390,8 +2319,6 @@ mod tests {
         let agg = Aggregate::None;
         let group_columns = &["foo"];
         let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-            .await
-            .unwrap()
             .read_group(Arc::clone(&test_db) as _, rpc_predicate, agg, group_columns)
             .await
             .expect("creating plan");
@@ -2412,8 +2339,6 @@ mod tests {
                 let every = WindowDuration::from_months(1, false);
                 let offset = WindowDuration::from_months(1, false);
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-                    .await
-                    .unwrap()
                     .read_window_aggregate(test_db, rpc_predicate, agg, every, offset)
                     .await
                     .expect("creating plan");
@@ -2446,8 +2371,6 @@ mod tests {
         let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
 
         let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
-            .await
-            .unwrap()
             .read_filter(Arc::clone(&test_db) as _, rpc_predicate)
             .await
             .expect("creating plan");
