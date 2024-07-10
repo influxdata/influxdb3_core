@@ -378,7 +378,7 @@ impl ValueExpr {
     /// column replaced with the specified column name
     pub fn replace_col(&self, name: &str) -> Expr {
         if let Expr::BinaryExpr(BinaryExpr { left: _, op, right }) = &self.expr {
-            binary_expr(name.as_expr(), *op, right.as_ref().clone())
+            binary_expr(name.as_expr(), op.clone(), right.as_ref().clone())
         } else {
             unreachable!("Unexpected content in ValueExpr")
         }

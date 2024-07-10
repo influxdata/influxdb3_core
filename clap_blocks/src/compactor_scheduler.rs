@@ -334,7 +334,7 @@ pub struct CompactorSchedulerConfig {
     )]
     pub priority_based_selection: bool,
 
-    /// Split file percentage for "leading edge split"
+    /// Fallback split file percentage for "leading edge split"
     ///
     /// To reduce the likelihood of recompacting the same data too many
     /// times, the compactor uses the "leading edge split"
@@ -351,23 +351,19 @@ pub struct CompactorSchedulerConfig {
     /// In the common case, the file containing `older_data` is less
     /// likely to overlap with new data written in.
     ///
-    /// This setting controls what percentage of data is placed into
-    /// the `older_data` portion.
-    ///
-    /// Increasing this value increases the average size of compacted
-    /// files after the first round of compaction. However, doing so
-    /// also increase the likelihood that late arriving data will
-    /// overlap with larger existing files, necessitating additional
-    /// compaction rounds.
+    /// When more than one ingester-created L0 file exists in a partition, the
+    /// compactor derives the amount to split off from that; this flag only
+    /// controls the percentage used when only one such file existed, and
+    /// therefore no overlap could be observed.
     ///
     /// This value must be between (0, 100)
     #[clap(
-        long = "compaction-split-percentage",
-        env = "INFLUXDB_IOX_COMPACTION_SPLIT_PERCENTAGE",
+        long = "compaction-fallback-split-percentage",
+        env = "INFLUXDB_IOX_COMPACTION_FALLBACK_SPLIT_PERCENTAGE",
         default_value = "90",
         action
     )]
-    pub split_percentage: u16,
+    pub fallback_split_percentage: u16,
 
     /// How long since the last new file was written to a partition, in order for it
     /// to be considered cold.
@@ -408,6 +404,16 @@ pub struct CompactorSchedulerConfig {
         action
     )]
     pub partition_timeout_secs: u64,
+
+    /// Temporary variable to allow concurrent compactions on seprate levels of a partition.
+    /// TODO: JRB remove after testing.
+    #[clap(
+        long = "compaction-allow-concurrent-level-compactions",
+        env = "INFLUXDB_IOX_COMPACTION_ALLOW_CONCURRENT_LEVEL_COMPACTIONS",
+        default_value = "false",
+        action
+    )]
+    pub allow_concurrent_level_compactions: bool,
 
     /// Partition source config used by the local scheduler.
     #[clap(flatten)]

@@ -339,6 +339,18 @@ mod tests {
         let r = quorum.get(k2).await.unwrap().unwrap();
         assert_eq!(r, v2);
 
+        // Both replicas should have a value for k2 before proceeding
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if r1.cache().get(k2).is_some() && r2.cache().get(k2).is_some() {
+                break;
+            } else {
+                assert!(attempts < 100);
+                attempts += 1;
+            }
+        }
+
         // Can remove value from one replica and still get quorum
         r2.cache().delete(k2).unwrap();
         let r = quorum.get(k2).await.unwrap().unwrap();

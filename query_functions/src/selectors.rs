@@ -1184,7 +1184,7 @@ mod test {
         pub async fn run_cases_err(selector: AggregateUDF, name: &str) {
             run_case_err(
                 selector.call(vec![]),
-                &format!("Error during planning: Error during planning: [data_types_with_aggregate_udf] Coercion from [] to the signature VariadicAny failed. and No function matches the given name and argument types '{name}()'. You might need to add explicit type casts.\n\tCandidate functions:\n\t{name}(Any, .., Any)"),
+                &format!("Error during planning: Error during planning: {name} does not support zero arguments. No function matches the given name and argument types '{name}()'. You might need to add explicit type casts.\n\tCandidate functions:\n\t{name}(Any, .., Any)"),
             )
             .await;
 

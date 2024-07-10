@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.80"
+async-trait = "0.1.81"
 bytes = "1.6"
 futures = "0.3"
 iox_time = { version = "0.1.0", path = "../iox_time" }

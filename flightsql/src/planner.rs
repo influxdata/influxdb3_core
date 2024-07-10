@@ -433,7 +433,7 @@ async fn plan_get_db_schemas(
     cmd: CommandGetDbSchemas,
 ) -> Result<LogicalPlan> {
     let mut builder = cmd.into_builder();
-    let catalog_list = ctx.inner().state().catalog_list();
+    let catalog_list = Arc::clone(ctx.inner().state().catalog_list());
 
     for catalog_name in catalog_list.catalog_names() {
         // we just got the catalog name from the catalog_list, so it
@@ -485,7 +485,7 @@ async fn plan_get_primary_keys(
 /// Return a list of tables from the DataFusion catalog
 async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Result<LogicalPlan> {
     let mut builder = cmd.into_builder();
-    let catalog_list = ctx.inner().state().catalog_list();
+    let catalog_list = Arc::clone(ctx.inner().state().catalog_list());
 
     for catalog_name in catalog_list.catalog_names() {
         // we just got the catalog name from the catalog_list, so it

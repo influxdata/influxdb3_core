@@ -216,8 +216,8 @@ impl Accumulator for ModeAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let v_arr = ScalarValue::new_list(&self.point_values, &self.data_type);
-        let t_arr = ScalarValue::new_list(
+        let v_arr = ScalarValue::new_list_nullable(&self.point_values, &self.data_type);
+        let t_arr = ScalarValue::new_list_nullable(
             &self.point_times,
             &DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
         );

@@ -3,7 +3,7 @@
 /// The sleep operation passes through its input data and sleeps asynchronously for a duration determined by an
 /// expression. The async sleep is implemented as a special [execution plan](SleepExpr) so we can perform this as part
 /// of the async data stream. In contrast to a UDF, this will NOT block any threads.
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use arrow::{
     array::{Array, Float32Array, Float64Array, Int64Array},
@@ -90,6 +90,69 @@ impl UserDefinedLogicalNodeCore for SleepNode {
     ) -> datafusion::common::Result<Self> {
         Ok(Self::new(inputs[0].clone(), exprs.to_vec()))
     }
+
+    /// Projection pushdown is an optmization that pushes a `Projection` node further down
+    /// into the query plan.
+    ///
+    /// So instead of:
+    ///
+    /// ```text
+    /// Projection: a, b, c
+    ///   SleepNode: ...
+    ///     TableScan: table
+    /// ```
+    ///
+    /// You will get:
+    ///
+    /// ```text
+    /// SleepNode: ...
+    ///   TableScan: table, projection=[a, b, c]
+    /// ```
+    /// By default, DataFusion will not optimize projection pushdown through a user defined node.
+    /// Overriding this trait method allows projection pushdown.
+    ///
+    /// When `ExtractSleep` was an [`OptimizerRule`] this was not needed, because
+    /// the [`SleepNode`] was inserted *after* projection pushdown.
+    ///
+    /// Now that `ExtractSleep` is an [`AnalyzerRule`], it inserts the [`SleepNode`]
+    /// *before* projection pushdown.
+    ///
+    /// [`OptimizerRule`]: datafusion::optimizer::OptimizerRule
+    /// [`AnalyzerRule`]: datafusion::optimizer::AnalyzerRule
+    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        Some(vec![Vec::from(output_columns)])
+    }
+
+    /// Filter pushdown (or predicate pushdown) is an optmization that pushes a `Filter` node further down
+    /// into the query plan.
+    ///
+    /// So instead of:
+    ///
+    /// ```text
+    /// Filter: predicate
+    ///   SleepNode: ...
+    ///     TableScan: table
+    /// ```
+    /// You will get:
+    ///
+    /// ```text
+    /// SleepNode: ...
+    ///   TableScan: table, filters=[predicate]
+    /// ```
+    /// By default, DataFusion will not optimize filter pushdown through a user defined node.
+    /// Overriding this trait method allows filter pushdown.
+    ///
+    /// When `ExtractSleep` was an [`OptimizerRule`] this was not needed, because
+    /// the [`SleepNode`] was inserted *after* filter pushdown.
+    ///
+    /// Now that `ExtractSleep` is an [`AnalyzerRule`], it inserts the [`SleepNode`]
+    /// *before* filter pushdown.
+    ///
+    /// [`OptimizerRule`]: datafusion::optimizer::OptimizerRule
+    /// [`AnalyzerRule`]: datafusion::optimizer::AnalyzerRule
+    fn prevent_predicate_push_down_columns(&self) -> std::collections::HashSet<String> {
+        HashSet::new()
+    }
 }
 
 /// Physical node that implements a "sleep" operation.
@@ -144,6 +207,10 @@ impl DisplayAs for SleepExpr {
 }
 
 impl ExecutionPlan for SleepExpr {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

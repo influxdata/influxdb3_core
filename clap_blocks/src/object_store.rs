@@ -542,7 +542,7 @@ impl LocalUploadSigner {
 impl object_store::signer::Signer for LocalUploadSigner {
     async fn signed_url(
         &self,
-        _method: reqwest::Method,
+        _method: http_1::Method,
         path: &Path,
         _expires_in: Duration,
     ) -> Result<Url, object_store::Error> {
@@ -860,7 +860,7 @@ mod tests {
         let object_store_parquet_file_path = Path::parse(parquet_file_path).unwrap();
         let upload_url = signer
             .signed_url(
-                reqwest::Method::PUT,
+                http_1::Method::PUT,
                 &object_store_parquet_file_path,
                 Duration::from_secs(100),
             )

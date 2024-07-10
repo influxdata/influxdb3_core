@@ -26,7 +26,7 @@ use datafusion::{
 use datafusion_util::config::{
     iox_session_config, register_iox_object_store, table_parquet_options,
 };
-use object_store::{DynObjectStore, ObjectMeta};
+use object_store::{DynObjectStore, ObjectMeta, PutPayload};
 use observability_deps::tracing::*;
 use schema::Projection;
 use std::{
@@ -343,6 +343,7 @@ impl ParquetStorage {
 
         let file_size = data.len();
         let data = Bytes::from(data);
+        let playload = PutPayload::from_bytes(data);
 
         debug!(
             file_size,
@@ -358,7 +359,7 @@ impl ParquetStorage {
         //
         // Cloning `data` is a ref count inc, rather than a data copy.
         let mut retried = false;
-        while let Err(e) = self.object_store.put(&path, data.clone()).await {
+        while let Err(e) = self.object_store.put(&path, playload.clone()).await {
             warn!(error=%e, ?meta, "failed to upload parquet file to object storage, retrying");
             tokio::time::sleep(Duration::from_secs(1)).await;
             retried = true;
@@ -470,11 +471,11 @@ pub enum ProjectionError {
 mod tests {
     use super::*;
     use arrow::{
-        array::{ArrayRef, Int64Array, IntervalMonthDayNanoArray, StringArray},
+        array::{ArrayRef, Int64Array, StringArray},
         record_batch::RecordBatch,
     };
     use data_types::{CompactionLevel, NamespaceId, ObjectStoreId, PartitionId, TableId};
-    use datafusion::common::DataFusionError;
+    use datafusion::common::{DataFusionError, ScalarValue};
     use datafusion_util::{unbounded_memory_pool, MemoryStream};
     use iox_time::Time;
     use std::collections::HashMap;
@@ -985,9 +986,10 @@ mod tests {
         Arc::new(array)
     }
 
-    fn to_interval_array(vals: &[i128]) -> ArrayRef {
-        let array: IntervalMonthDayNanoArray = vals.iter().map(|v| Some(*v)).collect();
-        Arc::new(array)
+    /// Returns an IntervalMonthDayNano array with the given nanosecond values
+    fn to_interval_array(vals: &[i64]) -> ArrayRef {
+        ScalarValue::iter_to_array(vals.iter().map(|v| ScalarValue::new_interval_mdn(0, 0, *v)))
+            .unwrap()
     }
 
     fn to_int_array(vals: &[i64]) -> ArrayRef {

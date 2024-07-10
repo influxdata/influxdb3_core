@@ -10,7 +10,6 @@ use workspace_hack as _;
 use crate::{
     objectstore::{checker as os_checker, deleter as os_deleter, lister as os_lister},
     parquetfile::deleter as pf_deleter,
-    retention::flagger as retention_flagger,
 };
 
 use clap_blocks::garbage_collector::GarbageCollectorConfig;
@@ -44,7 +43,8 @@ pub struct GarbageCollector {
     os_checker: tokio::task::JoinHandle<Result<(), os_checker::Error>>,
     os_deleter: tokio::task::JoinHandle<Result<(), os_deleter::Error>>,
     pf_deleter: tokio::task::JoinHandle<Result<(), pf_deleter::Error>>,
-    retention_flagger: tokio::task::JoinHandle<Result<(), retention_flagger::Error>>,
+    partition_retention: Option<tokio::task::JoinHandle<Result<(), retention::partition::Error>>>,
+    parquet_retention: tokio::task::JoinHandle<Result<(), retention::parquet::Error>>,
 }
 
 impl Debug for GarbageCollector {
@@ -70,6 +70,7 @@ impl GarbageCollector {
             parquetfile_sleep_interval = %format_duration(sub_config.parquetfile_sleep_interval()),
             objectstore_sleep_interval_minutes = %sub_config.objectstore_sleep_interval_minutes,
             retention_sleep_interval_minutes = %sub_config.retention_sleep_interval_minutes,
+            partition_retention = %sub_config.partition_retention,
             "GarbageCollector starting"
         );
 
@@ -156,12 +157,20 @@ impl GarbageCollector {
 
         // Initialise the retention code, which is just one thread that calls
         // flag_for_delete_by_retention() on the catalog then sleeps.
-        let retention_flagger = tokio::spawn(retention_flagger::perform(
+        let parquet_retention = tokio::spawn(retention::parquet::perform(
             shutdown.clone(),
-            catalog,
+            Arc::clone(&catalog),
             sub_config.retention_sleep_interval_minutes,
             sub_config.dry_run,
         ));
+
+        let partition_retention = sub_config.partition_retention.then(|| {
+            tokio::spawn(retention::partition::perform(
+                shutdown.clone(),
+                catalog,
+                sub_config.retention_sleep_interval_minutes,
+            ))
+        });
 
         Ok(Self {
             shutdown,
@@ -169,7 +178,8 @@ impl GarbageCollector {
             os_checker,
             os_deleter,
             pf_deleter,
-            retention_flagger,
+            partition_retention,
+            parquet_retention,
         })
     }
 
@@ -188,19 +198,24 @@ impl GarbageCollector {
             os_checker,
             os_deleter,
             pf_deleter,
-            retention_flagger,
+            partition_retention,
+            parquet_retention,
             shutdown: _,
         } = self;
 
-        let (os_lister, os_checker, os_deleter, pf_deleter, retention_flagger) = futures::join!(
+        let (os_lister, os_checker, os_deleter, pf_deleter, parquet_retention) = futures::join!(
             os_lister,
             os_checker,
             os_deleter,
             pf_deleter,
-            retention_flagger
+            parquet_retention
         );
 
-        retention_flagger.context(ParquetFileDeleterPanicSnafu)??;
+        if let Some(p) = partition_retention {
+            p.await.context(PartitionRetentionFlaggerPanicSnafu)??;
+        }
+
+        parquet_retention.context(ParquetFileDeleterPanicSnafu)??;
         pf_deleter.context(ParquetFileDeleterPanicSnafu)??;
         os_deleter.context(ObjectStoreDeleterPanicSnafu)??;
         os_checker.context(ObjectStoreCheckerPanicSnafu)??;
@@ -263,7 +278,15 @@ pub enum Error {
 
     #[snafu(display("The parquet file retention flagger task failed"))]
     #[snafu(context(false))]
-    ParquetFileRetentionFlagger { source: retention_flagger::Error },
+    ParquetFileRetentionFlagger { source: retention::parquet::Error },
+
+    #[snafu(display("The partition retention task failed"))]
+    #[snafu(context(false))]
+    PartitionRetention { source: retention::partition::Error },
+
+    #[snafu(display("The partition retention task panicked"))]
+    PartitionRetentionFlaggerPanic { source: tokio::task::JoinError },
+
     #[snafu(display("The parquet file retention flagger task panicked"))]
     ParquetFileRetentionFlaggerPanic { source: tokio::task::JoinError },
 }

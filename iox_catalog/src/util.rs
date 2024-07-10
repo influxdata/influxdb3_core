@@ -1,26 +1,27 @@
 //! Helper methods to simplify catalog work.
 //!
-//! They all use the public [`Catalog`] interface and have no special access to internals, so in theory they can be
-//! implement downstream as well.
-
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
-
-use data_types::{
-    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
-    ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, SortKeyIds,
-    TableId, TableSchema,
-};
-use mutable_batch::MutableBatch;
-use thiserror::Error;
+//! They all use the public [`Catalog`] interface and have no special access to internals,
+//! so in theory they can be implemented downstream as well.
 
 use crate::{
     constants::TIME_COLUMN,
     interface::{CasFailure, Catalog, Error, RepoCollection, SoftDeletedRows},
 };
+use data_types::partition_template::{build_column_values, ColumnValue};
+use data_types::{
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
+    ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, PartitionKey,
+    SortKeyIds, TableId, TableSchema,
+};
+use iox_time::Time;
+use mutable_batch::MutableBatch;
+use std::time::Duration;
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
+use thiserror::Error;
 
 /// Gets the namespace schema including all tables and columns.
 pub async fn get_schema_by_id<R>(
@@ -605,6 +606,25 @@ where
     table.add_column(time_col);
 
     Ok(table)
+}
+
+/// Returns true if `key` is more than a day outside the retention period
+pub fn should_delete_partition(
+    key: &PartitionKey,
+    template: &TablePartitionTemplateOverride,
+    retention_period: i64,
+    now: Time,
+) -> bool {
+    for (_, c) in build_column_values(template, key.inner()) {
+        if let Some(ColumnValue::Datetime { end, .. }) = c {
+            let expiry = end
+                + Duration::from_nanos(retention_period as _)
+                + Duration::from_secs(24 * 60 * 60);
+
+            return now.date_time() > expiry;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -200,6 +200,10 @@ impl Debug for StreamSplitExec {
 }
 
 impl ExecutionPlan for StreamSplitExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
     }

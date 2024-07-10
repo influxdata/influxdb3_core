@@ -2,6 +2,7 @@
 //! used for testing or for an IOx designed to run without catalog persistence.
 
 use crate::interface::namespace_snapshot_by_name;
+use crate::util::should_delete_partition;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
@@ -901,6 +902,41 @@ impl PartitionRepo for MemTxn {
             .collect();
 
         Ok(old_style)
+    }
+
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let stage = self.collections.lock();
+
+        let now = self.time_provider.now();
+        let retention: HashMap<_, _> = stage
+            .namespaces
+            .iter()
+            .filter_map(|x| Some((x.id, x.retention_period_ns?)))
+            .collect();
+
+        let tables: HashMap<_, _> = stage
+            .tables
+            .iter()
+            .map(|x| (x.id, (x.namespace_id, x.partition_template.clone())))
+            .collect();
+
+        let mut candidates: HashMap<_, _> = stage
+            .partitions
+            .iter()
+            .filter_map(|x| {
+                let (ns_id, template) = tables.get(&x.table_id)?;
+                let retention = *retention.get(ns_id)?;
+
+                should_delete_partition(&x.partition_key, template, retention, now)
+                    .then_some((x.id, x.table_id))
+            })
+            .collect();
+
+        for p in &stage.parquet_files {
+            candidates.remove(&p.partition_id);
+        }
+
+        Ok(candidates.into_iter().map(|(p, t)| (t, p)).collect())
     }
 
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {

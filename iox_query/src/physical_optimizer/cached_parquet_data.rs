@@ -3,13 +3,11 @@ use std::{ops::Range, sync::Arc};
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion::{
-    common::{
-        tree_node::{Transformed, TreeNode},
-        Statistics,
-    },
+    common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{
-        FileMeta, ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory,
+    datasource::{
+        file_format::parquet::statistics_from_parquet_meta,
+        physical_plan::{FileMeta, ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory},
     },
     error::DataFusionError,
     parquet::{
@@ -23,9 +21,15 @@ use datafusion::{
 use executor::spawn_io;
 use futures::{future::Shared, prelude::future::BoxFuture, FutureExt};
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
+use object_store_mem_cache::MetaIndexCache;
 use observability_deps::tracing::warn;
+use parquet_file::ParquetFilePath;
+use tokio::sync::Mutex;
 
-use crate::{config::IoxConfigExt, provider::PartitionedFileExt};
+use crate::{
+    config::{IoxCacheExt, IoxConfigExt},
+    provider::PartitionedFileExt,
+};
 
 #[derive(Debug, Default)]
 pub struct CachedParquetData;
@@ -67,11 +71,19 @@ impl PhysicalOptimizerRule for CachedParquetData {
                 return Err(DataFusionError::Plan("lost PartitionFileExt".to_owned()));
             };
 
+            // Only querier has cache ext. The compactor does not have it.
+            // It is useful for querier to cache the file metadat cache for furture file pruning
+            // based on query predicates. The compactor reads file without predicates
+            // and hence won't benefit from caching the file metadata.
+            let iox_cache_ext = config.extensions.get::<IoxCacheExt>();
+            let meta_cache = iox_cache_ext.map(|e| Arc::clone(&e.meta_cache));
+
             let parquet_exec = parquet_exec
                 .clone()
                 .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
                     Arc::clone(&ext.object_store),
-                    ext.table_schema.clone(),
+                    Arc::clone(&ext.table_schema),
+                    meta_cache,
                 )));
             Ok(Transformed::yes(Arc::new(parquet_exec)))
         })
@@ -95,15 +107,21 @@ impl PhysicalOptimizerRule for CachedParquetData {
 #[derive(Debug)]
 struct CachedParquetFileReaderFactory {
     object_store: Arc<DynObjectStore>,
-    table_schema: Option<SchemaRef>,
+    table_schema: SchemaRef,
+    meta_cache: Option<Arc<Mutex<MetaIndexCache>>>,
 }
 
 impl CachedParquetFileReaderFactory {
     /// Create new factory based on the given object store.
-    pub(crate) fn new(object_store: Arc<DynObjectStore>, table_schema: Option<SchemaRef>) -> Self {
+    pub(crate) fn new(
+        object_store: Arc<DynObjectStore>,
+        table_schema: SchemaRef,
+        meta_cache: Option<Arc<Mutex<MetaIndexCache>>>,
+    ) -> Self {
         Self {
             object_store,
             table_schema,
+            meta_cache,
         }
     }
 }
@@ -128,12 +146,14 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         .boxed()
         .shared();
 
+        let meta_cache = self.meta_cache.as_ref().map(Arc::clone);
         Ok(Box::new(CachedFileReader {
             meta: Arc::new(file_meta.object_meta),
             file_metrics: Some(file_metrics),
             metadata_size_hint,
             data,
-            table_schema: self.table_schema.clone(),
+            table_schema: Arc::clone(&self.table_schema),
+            meta_cache,
         }))
     }
 }
@@ -148,8 +168,14 @@ struct CachedFileReader {
     file_metrics: Option<ParquetFileMetrics>,
     metadata_size_hint: Option<usize>,
     data: Shared<BoxFuture<'static, Result<Bytes, Arc<ObjectStoreError>>>>,
-    // todo: will remove the option when we also pass metadata index here
-    table_schema: Option<SchemaRef>,
+    table_schema: SchemaRef, // todo: may want to replace this with tableCache
+    meta_cache: Option<Arc<Mutex<MetaIndexCache>>>,
+}
+
+impl CachedFileReader {
+    fn get_meta_cache(&self) -> Option<Arc<Mutex<MetaIndexCache>>> {
+        self.meta_cache.as_ref().map(Arc::clone)
+    }
 }
 
 impl AsyncFileReader for CachedFileReader {
@@ -209,7 +235,8 @@ impl AsyncFileReader for CachedFileReader {
                 file_metrics: None,
                 metadata_size_hint: self.metadata_size_hint,
                 data: self.data.clone(),
-                table_schema: self.table_schema.clone(),
+                table_schema: Arc::clone(&self.table_schema),
+                meta_cache: self.meta_cache.as_ref().map(Arc::clone),
             };
 
             let mut loader = MetadataLoader::load(&mut this, file_size, prefetch).await?;
@@ -219,22 +246,32 @@ impl AsyncFileReader for CachedFileReader {
 
             let metadata = loader.finish();
 
-            if let Some(_table_schema) = &self.table_schema {
-                let file_statistics: Option<Statistics> = None;
-                // todo: turn this on after upgrading DF with https://github.com/apache/datafusion/pull/10880/files
-                // file_statitics = statistics_from_parquet_meta(metadata, table_schema);
+            // No meta cache available when this is executed by the compactor, stop here
+            let Some(meta_cache) = this.get_meta_cache() else {
+                return Ok(Arc::new(metadata));
+            };
 
-                // Note for self: while working on https://github.com/influxdata/influxdb_iox/pull/11282, I think
-                // we can easily see if this file meta is already available in the index, if so, we do not need to cache
-                // it again here because all files are inmmutable
+            // Collect statistics and add to meta cache
+            let mut collected = false;
 
-                if let Some(_file_statistics) = file_statistics {
-                    // todo: add the file statistics to the metadata index in next PR
-                    // https://github.com/influxdata/influxdb_iox/issues/11232
-                } else {
-                    // log a warning that we cannot collect statitics for this file
-                    warn!(file_path = %self.meta.location, "Cannot collect statistics for file")
+            if let Some(file_uuid) = ParquetFilePath::uuid_from_path(&this.meta.location) {
+                // get statistics from metadata
+                let file_statistics =
+                    statistics_from_parquet_meta(&metadata, this.table_schema).await;
+
+                if let Ok(file_statistics) = file_statistics {
+                    let mut handle = meta_cache.lock().await;
+                    handle.add_file_with_stats(file_uuid, file_statistics).await;
+
+                    collected = true;
                 }
+            }
+
+            if !collected {
+                warn!(
+                    "Failed to collect statistics for file: {:?}",
+                    this.meta.location
+                );
             }
 
             Ok(Arc::new(metadata))

@@ -116,6 +116,10 @@ impl Debug for SchemaExec {
 }
 
 impl ExecutionPlan for SchemaExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

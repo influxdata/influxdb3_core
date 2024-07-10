@@ -132,8 +132,8 @@ pub struct IngesterMetrics {
 
 impl std::fmt::Display for IngesterMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IngesterMetrics {{ latency_to_plan = {}ms, latency_to_full_data = {}ms, response_rows = {}, partition_count = {}, response_size = {} }}",
-            self.latency_to_plan.as_millis(), self.latency_to_full_data.as_millis(), self.response_rows, self.partition_count, self.response_size
+        write!(f, "IngesterMetrics {{ latency_to_plan = {:?}, latency_to_full_data = {:?}, response_rows = {}, partition_count = {}, response_size = {} }}",
+            self.latency_to_plan, self.latency_to_full_data, self.response_rows, self.partition_count, self.response_size
         )
     }
 }
@@ -857,7 +857,7 @@ mod test_super {
                 r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ms, latency_to_full_data = 0ms, response_rows = 0, partition_count = 0, response_size = 0 }; success = true; running = false; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = true; running = false; cancelled = false;"#,
             ],
         );
     }
@@ -932,7 +932,7 @@ mod test_super {
                 r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ms, latency_to_full_data = 0ms, response_rows = 0, partition_count = 0, response_size = 0 }; success = true; running = false; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = true; running = false; cancelled = false;"#,
             ],
         );
     }
@@ -1010,7 +1010,7 @@ mod test_super {
                 r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ms, latency_to_full_data = 0ms, response_rows = 0, partition_count = 0, response_size = 0 }; success = false; running = false; cancelled = false;"#,
+                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = false; running = false; cancelled = false;"#,
             ],
         );
     }
@@ -1125,7 +1125,7 @@ mod test_super {
                 r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
                 r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; ingester_metrics = None; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ms, latency_to_full_data = 0ms, response_rows = 0, partition_count = 0, response_size = 0 }; success = false; running = false; cancelled = true;"#,
+                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = false; running = false; cancelled = true;"#,
             ],
         );
     }
@@ -1229,6 +1229,10 @@ mod test_super {
     }
 
     impl ExecutionPlan for TestExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }

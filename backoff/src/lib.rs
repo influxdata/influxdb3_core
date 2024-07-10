@@ -27,7 +27,7 @@ pub struct BackoffConfig {
     /// Multiplier for each backoff round.
     pub base: f64,
 
-    /// Timeout until we try to retry.
+    /// Timeout after which retrying stops.
     pub deadline: Option<Duration>,
 }
 

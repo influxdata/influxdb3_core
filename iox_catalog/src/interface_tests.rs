@@ -1,12 +1,4 @@
 //! Abstract tests of the catalog interface w/o relying on the actual implementation.
-use std::{any::Any, collections::HashSet, fmt::Display};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    ops::DerefMut,
-    sync::Arc,
-    time::Duration,
-};
-
 use ::test_helpers::assert_error;
 use assert_matches::assert_matches;
 use async_trait::async_trait;
@@ -25,6 +17,13 @@ use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::TimeProvider;
 use metric::{Observation, RawReporter};
 use parking_lot::Mutex;
+use std::{any::Any, collections::HashSet, fmt::Display};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ops::DerefMut,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
     constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
@@ -53,6 +52,7 @@ where
     test_list_schemas(clean_state().await).await;
     test_list_schemas_soft_deleted_rows(clean_state().await).await;
     test_delete_namespace(clean_state().await).await;
+    test_partition_retention(clean_state().await).await;
 
     let catalog = clean_state().await;
     test_namespace(Arc::clone(&catalog)).await;
@@ -3154,6 +3154,54 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
         .into_iter()
         .next()
         .unwrap();
+}
+
+async fn test_partition_retention(catalog: Arc<dyn Catalog>) {
+    let now = catalog.time_provider().now().date_time();
+
+    let mut repos = catalog.repositories();
+    let ns_name = NamespaceName::new("test_partition_retention").unwrap();
+    let retention = 1_000_000_000 * 60 * 60 * 24 * 7; // 1 week
+
+    let namespace = repos
+        .namespaces()
+        .create(&ns_name, None, Some(retention), None)
+        .await
+        .unwrap();
+    let table = arbitrary_table(&mut *repos, "test_partition_retention", &namespace).await;
+
+    let part = now - Duration::from_nanos(retention as u64 / 2);
+    let p1 = PartitionKey::from(part.date_naive().to_string());
+    repos
+        .partitions()
+        .create_or_get(p1, table.id)
+        .await
+        .unwrap();
+
+    let part = now - Duration::from_nanos(retention as u64 * 2);
+    let p2 = PartitionKey::from(part.date_naive().to_string());
+    let p2 = repos
+        .partitions()
+        .create_or_get(p2, table.id)
+        .await
+        .unwrap();
+
+    let part = now - Duration::from_nanos(retention as u64 * 3);
+    let p3 = PartitionKey::from(part.date_naive().to_string());
+    let p3 = repos
+        .partitions()
+        .create_or_get(p3, table.id)
+        .await
+        .unwrap();
+
+    repos
+        .parquet_files()
+        .create(arbitrary_parquet_file_params(&namespace, &table, &p3))
+        .await
+        .unwrap();
+
+    let to_delete = repos.partitions().delete_by_retention().await.unwrap();
+    assert_eq!(to_delete, vec![(p2.table_id, p2.id)]);
 }
 
 /// Upsert a namespace called `namespace_name` and write `lines` to it.

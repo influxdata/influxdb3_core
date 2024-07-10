@@ -335,6 +335,17 @@ pub enum TemplatePart<'a> {
     Bucket(&'a str, u32),
 }
 
+impl<'a> TemplatePart<'a> {
+    /// Column name.
+    pub fn column_name(&self) -> &'a str {
+        match self {
+            TemplatePart::TagValue(c) => c,
+            TemplatePart::TimeFormat(_) => TIME_COLUMN_NAME,
+            TemplatePart::Bucket(c, _) => c,
+        }
+    }
+}
+
 /// The default partitioning scheme is by each day according to the "time" column.
 pub static PARTITION_BY_DAY_PROTO: Lazy<Arc<proto::PartitionTemplate>> = Lazy::new(|| {
     Arc::new(proto::PartitionTemplate {
@@ -936,11 +947,7 @@ pub fn build_column_values<'a>(
 
     // Produce an iterator of (template_part, template_value)
     template_parts.zip(key_parts).map(|(template, value)| {
-        let name = match template {
-            TemplatePart::TagValue(col_name) => col_name,
-            TemplatePart::TimeFormat(_) => TIME_COLUMN_NAME,
-            TemplatePart::Bucket(col_name, _) => col_name,
-        };
+        let name = template.column_name();
         let value = (value != PARTITION_KEY_VALUE_NULL_STR)
             .then(|| match template {
                 TemplatePart::TagValue(_) => parse_part_tag_value(value),

@@ -1,7 +1,9 @@
 //! A SQLite backed implementation of the Catalog
 
+use crate::constants::MAX_PARTITION_SELECTED_ONCE_FOR_DELETE;
 use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
 use crate::metrics::CatalogMetrics;
+use crate::util::should_delete_partition;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
@@ -27,6 +29,7 @@ use data_types::{
     ParquetFileSource, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
     SortKeyIds, Table, TableId, Timestamp,
 };
+use futures::StreamExt;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::Registry;
 use observability_deps::tracing::debug;
@@ -1278,6 +1281,48 @@ ORDER BY id DESC;
         .into_iter()
         .map(Into::into)
         .collect())
+    }
+
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let mut tx = self.inner.get_mut().pool.begin().await?;
+
+        let mut stream = sqlx::query_as::<_, (PartitionId, PartitionKey, TableId, i64, TablePartitionTemplateOverride)>(
+            r#"
+SELECT partition.id, partition.partition_key, table_name.id, namespace.retention_period_ns, table_name.partition_template
+FROM partition
+JOIN table_name on partition.table_id = table_name.id
+JOIN namespace on table_name.namespace_id = namespace.id
+WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
+    AND retention_period_ns IS NOT NULL;
+        "#,
+        )
+            .fetch(&mut *tx);
+
+        let now = self.time_provider.now();
+        let mut to_remove = Vec::with_capacity(MAX_PARTITION_SELECTED_ONCE_FOR_DELETE);
+
+        while let Some((p_id, key, t_id, retention, template)) = stream.next().await.transpose()? {
+            if should_delete_partition(&key, &template, retention, now) {
+                to_remove.push((t_id, p_id));
+
+                if to_remove.len() == MAX_PARTITION_SELECTED_ONCE_FOR_DELETE {
+                    break;
+                }
+            }
+        }
+        drop(stream);
+
+        // We use a JSON-based "IS IN" check.
+        let ids: Vec<_> = to_remove.iter().map(|(p, _)| p.get()).collect();
+
+        sqlx::query(r#"DELETE FROM partition WHERE id IN (SELECT value FROM json_each($1));"#)
+            .bind(Json(&ids[..])) // $1
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(to_remove)
     }
 
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {

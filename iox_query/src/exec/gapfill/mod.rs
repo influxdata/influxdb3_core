@@ -248,6 +248,40 @@ impl UserDefinedLogicalNodeCore for GapFill {
         let params = self.params.from_template(&param_expr, &aggr_expr);
         Self::try_new(Arc::new(inputs[0].clone()), group_expr, aggr_expr, params)
     }
+
+    /// Projection pushdown is an optmization that pushes a `Projection` node further down
+    /// into the query plan.
+    ///
+    /// So instead of:
+    ///
+    /// ```text
+    /// Projection: a, b, c
+    ///   GapFill: ...
+    ///     Aggregate: ...
+    ///       TableScan: table
+    /// ```
+    ///
+    /// You will get:
+    ///
+    /// ```text
+    /// GapFill: ...
+    ///   Aggregate: ...
+    ///     TableScan: table, projection=[a, b, c]
+    /// ```
+    /// By default, DataFusion will not optimize projection pushdown through a user defined node.
+    /// Overriding this trait method allows projection pushdown.
+    ///
+    /// When `HandleGapfill` was an [`OptimizerRule`] this was not needed, because
+    /// the [`GapFill`] node was inserted *after* projection pushdown.
+    ///
+    /// Now that `HandleGapFill` is an [`AnalyzerRule`], it inserts the [`GapFill`] node
+    /// *before* projection pushdown.
+    ///
+    /// [`OptimizerRule`]: datafusion::optimizer::OptimizerRule
+    /// [`AnalyzerRule`]: datafusion::optimizer::AnalyzerRule
+    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        Some(vec![Vec::from(output_columns)])
+    }
 }
 
 /// Called by the extension planner to plan a [GapFill] node.
@@ -475,6 +509,10 @@ impl Debug for GapFillExec {
 }
 
 impl ExecutionPlan for GapFillExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -600,12 +638,13 @@ mod test {
 
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::prelude::lit;
+    use datafusion::scalar::ScalarValue;
     use datafusion::{
         datasource::empty::EmptyTable,
         error::Result,
         logical_expr::{logical_plan, Extension, UserDefinedLogicalNode},
-        prelude::{col, lit},
-        scalar::ScalarValue,
+        prelude::col,
     };
     use datafusion_util::lit_timestamptz_nano;
 
@@ -640,7 +679,7 @@ mod test {
             vec![col("loc"), col("time")],
             vec![col("temp")],
             GapFillParams {
-                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                stride: lit(ScalarValue::new_interval_dt(0, 60_000)),
                 time_column: col("time"),
                 origin: None,
                 time_range: Range {
@@ -682,7 +721,7 @@ mod test {
         for params in vec![
             // no origin, no start bound
             GapFillParams {
-                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                stride: lit(ScalarValue::new_interval_dt(0, 60_000)),
                 time_column: col("time"),
                 origin: None,
                 time_range: Range {
@@ -693,7 +732,7 @@ mod test {
             },
             // no origin, yes start bound
             GapFillParams {
-                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                stride: lit(ScalarValue::new_interval_dt(0, 60_000)),
                 time_column: col("time"),
                 origin: None,
                 time_range: Range {
@@ -704,7 +743,7 @@ mod test {
             },
             // yes origin, no start bound
             GapFillParams {
-                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                stride: lit(ScalarValue::new_interval_dt(0, 60_000)),
                 time_column: col("time"),
                 origin: Some(lit_timestamptz_nano(1_000_000_000)),
                 time_range: Range {
@@ -715,7 +754,7 @@ mod test {
             },
             // yes origin, yes start bound
             GapFillParams {
-                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                stride: lit(ScalarValue::new_interval_dt(0, 60_000)),
                 time_column: col("time"),
                 origin: Some(lit_timestamptz_nano(1_000_000_000)),
                 time_range: Range {
@@ -748,7 +787,7 @@ mod test {
             vec![col("loc"), col("time")],
             vec![col("temp")],
             GapFillParams {
-                stride: lit(ScalarValue::IntervalDayTime(Some(60_000))),
+                stride: lit(ScalarValue::new_interval_dt(0, 60_000)),
                 time_column: col("time"),
                 origin: None,
                 time_range: Range {
@@ -766,7 +805,7 @@ mod test {
             format_logical_plan(&plan),
             @r###"
         ---
-        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
         - "   TableScan: temps"
         "###
         );
@@ -797,12 +836,11 @@ mod test {
             explain,
             @r###"
         ---
-        - " ProjectionExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as minute, AVG(temps.temp)@1 as AVG(temps.temp)]"
-        - "   GapFillExec: group_expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0], aggr_expr=[AVG(temps.temp)@1], stride=60000000000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
-        - "     SortExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 ASC], preserve_partitioning=[false]"
-        - "       AggregateExec: mode=Final, gby=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
-        - "         AggregateExec: mode=Partial, gby=[date_bin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
-        - "           EmptyExec"
+        - " ProjectionExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as minute, avg(temps.temp)@1 as avg(temps.temp)]"
+        - "   GapFillExec: group_expr=[date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0], aggr_expr=[avg(temps.temp)@1], stride=IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
+        - "     SortExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 ASC], preserve_partitioning=[false]"
+        - "       AggregateExec: mode=Single, gby=[date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[avg(temps.temp)]"
+        - "         EmptyExec"
         "###
         );
         Ok(())
@@ -827,12 +865,11 @@ mod test {
             explain,
             @r###"
         ---
-        - " ProjectionExec: expr=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as minute, concat(Utf8(\"zz\"),temps.loc)@2 as loczz, AVG(temps.temp)@3 as AVG(temps.temp)]"
-        - "   GapFillExec: group_expr=[loc@0, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1, concat(Utf8(\"zz\"),temps.loc)@2], aggr_expr=[AVG(temps.temp)@3], stride=60000000000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
-        - "     SortExec: expr=[loc@0 ASC,concat(Utf8(\"zz\"),temps.loc)@2 ASC,date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC], preserve_partitioning=[false]"
-        - "       AggregateExec: mode=Final, gby=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(Utf8(\"zz\"),temps.loc)@2 as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
-        - "         AggregateExec: mode=Partial, gby=[loc@1 as loc, date_bin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
-        - "           EmptyExec"
+        - " ProjectionExec: expr=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as minute, concat(Utf8(\"zz\"),temps.loc)@2 as loczz, avg(temps.temp)@3 as avg(temps.temp)]"
+        - "   GapFillExec: group_expr=[loc@0, date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1, concat(Utf8(\"zz\"),temps.loc)@2], aggr_expr=[avg(temps.temp)@3], stride=IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
+        - "     SortExec: expr=[loc@0 ASC,concat(Utf8(\"zz\"),temps.loc)@2 ASC,date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC], preserve_partitioning=[false]"
+        - "       AggregateExec: mode=Single, gby=[loc@1 as loc, date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[avg(temps.temp)]"
+        - "         EmptyExec"
         "###
         );
         Ok(())

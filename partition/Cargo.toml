@@ -28,7 +28,7 @@ criterion = { version = "0.5", default-features = false, features = [
 generated_types = { path = "../generated_types" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 paste = "1.0.15"
-proptest = { version = "1.4.0", default-features = false }
+proptest = { workspace = true }
 rand = "0.8"
 test_helpers = { path = "../test_helpers" }
 

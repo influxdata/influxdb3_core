@@ -3,6 +3,8 @@
 #![warn(missing_docs)]
 #![allow(clippy::missing_docs_in_private_items)]
 
+use std::str::FromStr;
+
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -86,6 +88,16 @@ impl ParquetFilePath {
             object_store_id,
             ..self
         }
+    }
+
+    /// extract file uuid from file path: "database_id/table_id/parition_hash_id/file_uuid.parquet"
+    pub fn uuid_from_path(file_path: &Path) -> Option<ObjectStoreId> {
+        file_path.parts().nth(3).and_then(|file_uuid| {
+            let file_uuid = file_uuid.as_ref();
+            // check if ".parquet" is at the end, if so, remove it
+            let file_uuid = file_uuid.strip_suffix(".parquet").unwrap_or(file_uuid);
+            ObjectStoreId::from_str(file_uuid).ok()
+        })
     }
 }
 

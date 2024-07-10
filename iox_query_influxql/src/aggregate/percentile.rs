@@ -149,7 +149,7 @@ impl Accumulator for PercentileAccumulator {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         // TODO could be more efficient by storing values using native Vec
         // rather than ScalarValue and avoid the copy here
-        let arr = ScalarValue::new_list(&self.data, &self.data_type);
+        let arr = ScalarValue::new_list_nullable(&self.data, &self.data_type);
         Ok(vec![
             ScalarValue::List(arr),
             ScalarValue::Float64(self.percentile),

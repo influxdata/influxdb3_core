@@ -253,6 +253,7 @@ pub async fn to_parquet_upload(
         output_schema: batches.schema(),
         table_partition_cols: vec![], // should be empty, since we want sink to be a single parquet
         overwrite: false,
+        keep_partition_by_columns: false,
     };
     let sink = ParquetSink::new(sink_config, parquet_options);
 
@@ -286,7 +287,11 @@ fn writer_props(meta: Vec<KeyValue>) -> Result<WriterProperties, prost::EncodeEr
     let builder = WriterProperties::builder()
         .set_key_value_metadata(Some(meta))
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(ROW_GROUP_WRITE_SIZE);
+        .set_max_row_group_size(ROW_GROUP_WRITE_SIZE)
+        // Change default to match new default in arrow-rs
+        // https://github.com/apache/arrow-rs/pull/5957
+        // can remove this override once we have upgraded to a parquet version after `52.0.0`
+        .set_data_page_row_count_limit(20_000);
 
     Ok(builder.build())
 }

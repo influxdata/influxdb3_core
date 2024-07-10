@@ -61,7 +61,8 @@ pub struct IngesterConfig {
     )]
     pub concurrent_query_limit: usize,
 
-    /// The maximum number of persist tasks that can run simultaneously.
+    /// The maximum number of persist tasks that can run simultaneously during
+    /// standard operation.
     #[clap(
         long = "persist-max-parallelism",
         env = "INFLUXDB_IOX_PERSIST_MAX_PARALLELISM",
@@ -69,6 +70,20 @@ pub struct IngesterConfig {
         action
     )]
     pub persist_max_parallelism: NonZeroUsize,
+
+    /// The factor by which the value of "persist max parallelism" is to be
+    /// scaled when the ingester is operating in a high throughput persist
+    /// workload.
+    ///
+    /// A high throughput persist workload only occurs in scenarios where the
+    /// ingester is not accepting writes.
+    #[clap(
+        long = "persist-high-throughput-scale-factor",
+        env = "INFLUXDB_IOX_PERSIST_HIGH_THROUGHPUT_SCALE_FACTOR",
+        default_value = "2",
+        action
+    )]
+    pub persist_high_throughput_scale_factor: NonZeroUsize,
 
     /// The maximum number of persist tasks that can be queued at any one time.
     ///
@@ -134,7 +149,7 @@ pub struct IngesterConfig {
     )]
     pub max_partitions_per_namespace: Option<NonZeroUsize>,
 
-    /// Limit the memory usage of the ingester by applying a soft usage limit,
+    /// Limit the memory usage of the ingester by applying a usage limit,
     /// specified in bytes or as a percentage (expressed as 'N%').
     ///
     /// Once this limit is reached, this ingester stops accepting write requests
@@ -147,10 +162,10 @@ pub struct IngesterConfig {
     /// This limit is applied to the resident set size of the process.
     #[cfg(feature = "jemalloc")]
     #[clap(
-        long = "ram-soft-limit-bytes",
-        env = "INFLUXDB_IOX_RAM_SOFT_LIMIT_BYTES"
+        long = "ram-hard-limit-bytes",
+        env = "INFLUXDB_IOX_RAM_HARD_LIMIT_BYTES"
     )]
-    pub ram_soft_limit_bytes: Option<MemorySize>,
+    pub ram_hard_limit_bytes: Option<MemorySize>,
 }
 
 /// Returns exactly half the number of logical cores, or 1 if on a single core

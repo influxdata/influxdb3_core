@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-async-trait = "0.1.80"
+async-trait = "0.1.81"
 backoff = { path = "../backoff" }
 futures = "0.3"
 iox_time = { path = "../iox_time" }
@@ -27,7 +27,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["rayon"]}
-proptest = { version = "1", default-features = false, features = ["std"] }
+proptest = { workspace = true }
 test_helpers = { path = "../test_helpers" }
 
 [lib]

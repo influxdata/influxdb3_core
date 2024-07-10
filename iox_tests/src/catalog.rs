@@ -901,6 +901,11 @@ impl TestParquetFile {
         let table_schema: Schema = table_columns.clone().try_into().unwrap();
         table_schema.select_by_names(&selection[..]).unwrap()
     }
+
+    /// Get object store id.
+    pub fn object_store_id(&self) -> ObjectStoreId {
+        self.parquet_file.object_store_id
+    }
 }
 
 /// Return the current time

@@ -1,16 +1,16 @@
 // Workaround for "unused crate" lint false positives.
+use bytes as _;
+use tokio as _;
 use workspace_hack as _;
 
 use std::{io::Read, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::{future::ready, stream::BoxStream, TryStreamExt};
 use object_store::{
     local::LocalFileSystem, path::Path, GetOptions, GetResult, GetResultPayload, ListResult,
-    MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
-use tokio::io::AsyncWrite;
 
 /// Provides a versioning alternative of [`LocalFileSystem`].
 /// The versioning is intended to be analogous to S3.
@@ -64,6 +64,7 @@ impl ObjectStore for VersionedFileSystemStore {
             payload,
             meta: ObjectMeta { size, .. },
             range: _,
+            ..
         } = self.inner.get(location).await?;
         let mut buf = Vec::with_capacity(size);
         let size_versioned = match payload {
@@ -181,7 +182,7 @@ impl ObjectStore for VersionedFileSystemStore {
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.inner.put_opts(location, bytes, opts).await
@@ -189,16 +190,18 @@ impl ObjectStore for VersionedFileSystemStore {
     async fn put_multipart(
         &self,
         location: &Path,
-    ) -> object_store::Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart(location).await
     }
-    async fn abort_multipart(
+
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-        multipart_id: &MultipartId,
-    ) -> object_store::Result<()> {
-        self.inner.abort_multipart(location, multipart_id).await
+        opts: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
     }
+
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         self.inner.copy(from, to).await
     }
@@ -242,6 +245,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn test_versioned_file_system_store() {
@@ -255,7 +259,10 @@ mod tests {
         let data = Bytes::from("all these important words");
 
         // can put
-        let put = store.put(&path, data.clone()).await.unwrap();
+        let put = store
+            .put(&path, PutPayload::from(data.clone()))
+            .await
+            .unwrap();
         assert!(
             put.version.is_none(),
             "current objects should have no version"
@@ -387,7 +394,10 @@ mod tests {
         let data = Bytes::from("all these important words");
 
         // put
-        let put = store.put(&path, data.clone()).await.unwrap();
+        let put = store
+            .put(&path, PutPayload::from_bytes(data))
+            .await
+            .unwrap();
         assert!(
             put.version.is_none(),
             "current objects should have no version"
@@ -443,7 +453,10 @@ mod tests {
         let data = Bytes::from("all these important words");
 
         // put #1
-        let put = store.put(&path, data.clone()).await.unwrap();
+        let put = store
+            .put(&path, PutPayload::from(data.clone()))
+            .await
+            .unwrap();
         assert!(
             put.version.is_none(),
             "current objects should have no version"
@@ -456,7 +469,10 @@ mod tests {
             .expect("should not error on delete");
 
         // put #2
-        let put = store.put(&path, data.clone()).await.unwrap();
+        let put = store
+            .put(&path, PutPayload::from(data.clone()))
+            .await
+            .unwrap();
         assert!(
             put.version.is_none(),
             "current objects should have no version"
@@ -469,7 +485,7 @@ mod tests {
             .expect("should not error on delete");
 
         // put #3
-        let put = store.put(&path, data.clone()).await.unwrap();
+        let put = store.put(&path, PutPayload::from(data)).await.unwrap();
         assert!(
             put.version.is_none(),
             "current objects should have no version"

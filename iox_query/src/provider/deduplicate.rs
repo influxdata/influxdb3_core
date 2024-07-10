@@ -194,6 +194,10 @@ impl DeduplicateMetrics {
 }
 
 impl ExecutionPlan for DeduplicateExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1189,6 +1193,10 @@ mod test {
     }
 
     impl ExecutionPlan for DummyExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }

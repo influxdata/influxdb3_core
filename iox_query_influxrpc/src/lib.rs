@@ -11,7 +11,7 @@ use datafusion::{
     common::DFSchemaRef,
     error::DataFusionError,
     functions::core::expr_ext::FieldAccessor,
-    logical_expr::{utils::exprlist_to_columns, ExprSchemable, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{ExprSchemable, LogicalPlan, LogicalPlanBuilder},
     prelude::{when, Column, Expr},
 };
 use datafusion_util::{
@@ -1302,7 +1302,7 @@ fn columns_in_predicates(
     predicate: &Predicate,
 ) -> Option<Vec<usize>> {
     // columns in field_columns
-    let mut columns = match &predicate.field_columns {
+    let columns: StdHashSet<Column> = match &predicate.field_columns {
         Some(field_columns) => field_columns
             .iter()
             .map(Column::from_name)
@@ -1317,9 +1317,13 @@ fn columns_in_predicates(
         }
     };
 
+    let mut columns: StdHashSet<&Column> = columns.iter().collect::<StdHashSet<_>>();
+
     // columns in exprs
-    let expr_cols_result =
-        exprlist_to_columns(&predicate.exprs, &mut columns).context(ReadColumnsSnafu);
+    predicate
+        .exprs
+        .iter()
+        .for_each(|expr| expr.add_column_refs(&mut columns));
 
     // columns in val_exprs
     let exprs: Vec<Expr> = predicate
@@ -1327,41 +1331,30 @@ fn columns_in_predicates(
         .iter()
         .map(|e| Expr::from((*e).clone()))
         .collect();
-    let val_exprs_cols_result = exprlist_to_columns(&exprs, &mut columns).context(ReadColumnsSnafu);
+    exprs
+        .iter()
+        .for_each(|expr| expr.add_column_refs(&mut columns));
 
-    if expr_cols_result.is_err() || val_exprs_cols_result.is_err() {
-        if expr_cols_result.is_err() {
-            let error_message = expr_cols_result.err().unwrap().to_string();
-            warn!(table_name, ?predicate.exprs, ?error_message, "cannot determine columns in predicate.exprs");
-        }
-        if val_exprs_cols_result.is_err() {
-            let error_message = val_exprs_cols_result.err().unwrap().to_string();
-            warn!(table_name, ?predicate.value_expr, ?error_message, "cannot determine columns in predicate.value_expr");
-        }
+    // convert the column names into their corresponding indexes in the schema
+    if columns.is_empty() {
+        return None;
+    }
 
-        None
-    } else {
-        // convert the column names into their corresponding indexes in the schema
-        if columns.is_empty() {
+    let mut indices = Vec::with_capacity(columns.len());
+    for c in columns {
+        if let Some(idx) = table_schema.find_index_of(&c.name) {
+            indices.push(idx);
+        } else {
+            warn!(
+                table_name,
+                column=c.name.as_str(),
+                table_columns=?table_schema.iter().map(|(_t, f)| f.name()).collect::<Vec<_>>(),
+                "cannot find predicate column (field column, value expr, filter expression) table schema",
+            );
             return None;
         }
-
-        let mut indices = Vec::with_capacity(columns.len());
-        for c in columns {
-            if let Some(idx) = table_schema.find_index_of(&c.name) {
-                indices.push(idx);
-            } else {
-                warn!(
-                    table_name,
-                    column=c.name.as_str(),
-                    table_columns=?table_schema.iter().map(|(_t, f)| f.name()).collect::<Vec<_>>(),
-                    "cannot find predicate column (field column, value expr, filter expression) table schema",
-                );
-                return None;
-            }
-        }
-        Some(indices)
     }
+    Some(indices)
 }
 
 /// Create plans that fetch the data specified in table_predicates.

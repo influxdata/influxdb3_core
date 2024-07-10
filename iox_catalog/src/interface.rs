@@ -512,6 +512,12 @@ pub trait PartitionRepo: Send + Sync {
     /// longer needed.
     async fn list_old_style(&mut self) -> Result<Vec<Partition>>;
 
+    /// Delete empty partitions more than a day outside the retention interval
+    ///
+    /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
+    /// changes. The caller MAY call this method again if the result was NOT empty.
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>>;
+
     /// Obtain a partition snapshot
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
 }

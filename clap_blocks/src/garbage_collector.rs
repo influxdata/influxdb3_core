@@ -116,6 +116,15 @@ pub struct GarbageCollectorConfig {
         env = "INFLUXDB_IOX_GC_RETENTION_SLEEP_INTERVAL_MINUTES"
     )]
     pub retention_sleep_interval_minutes: u64,
+
+    /// Enable partition retention
+    #[clap(
+        long,
+        default_value = "false",
+        action,
+        env = "INFLUXDB_IOX_GC_PARTITION_RETENTION"
+    )]
+    pub partition_retention: bool,
 }
 
 #[derive(Debug, Snafu)]

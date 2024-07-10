@@ -13,7 +13,9 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["pem"] }
 futures = "0.3"
-http = "0.2.12"
+http = "0.2"
+# object store crate uses new version of http crate
+http_1 = { version = "1.1", package = "http" }
 humantime = "2.1.0"
 iox_catalog = { path = "../iox_catalog" }
 iox_time = { path = "../iox_time" }
@@ -23,9 +25,8 @@ non-empty-string = "0.2.4"
 object_store = { workspace = true }
 observability_deps = { path = "../observability_deps" }
 paste = "1.0.15"
-reqwest = { version = "0.11", default-features = false }
 snafu = "0.8"
-sysinfo = "0.30.12"
+sysinfo = "0.30.13"
 tokio = { version = "1.38", features = ["rt-multi-thread"] }
 trace_exporters = { path = "../trace_exporters" }
 trogging = { path = "../trogging", default-features = false, features = ["clap"] }

@@ -840,6 +840,27 @@ impl PartitionRepo for Repos {
         self.backing.partitions().list_old_style().await
     }
 
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let res = self.backing.partitions().delete_by_retention().await?;
+
+        let affected_tables: HashSet<_> = res.iter().map(|(t, _)| *t).collect();
+
+        // Refresh all impacted tables to avoid lost updates
+        futures::stream::iter(affected_tables)
+            .map(|t_id| {
+                let this = &self;
+                async move {
+                    this.tables.refresh(t_id).await?;
+                    Ok::<(), Error>(())
+                }
+            })
+            .buffer_unordered(self.quorum_fanout)
+            .try_collect::<()>()
+            .await?;
+
+        Ok(res)
+    }
+
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
         self.partitions.get(partition_id).await
     }

@@ -227,8 +227,8 @@ fn no(expr: Expr) -> Result<Transformed<Expr>> {
 /// Rewrite and coerce the expression tree to model the behavior
 /// of an InfluxQL query.
 fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>> {
-    expr.transform(&|expr| {
-        match expr {
+    expr.transform(&|expr: Expr| {
+        match expr.clone() {
             Expr::BinaryExpr(BinaryExpr {
                 ref left,
                 op,
@@ -237,7 +237,7 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
                 let lhs_type = left.get_type(&schema.df_schema)?;
                 let rhs_type = right.get_type(&schema.df_schema)?;
 
-                match (lhs_type, op, rhs_type) {
+                match (lhs_type, &op, rhs_type) {
                     //
                     // NULL types
                     //
@@ -469,7 +469,7 @@ fn rewrite_any_binary_expr(op: Operator) -> Expr {
 /// > InfluxQL allows bitwise operations on boolean data types, which must be cast to
 /// > an integer to perform the bitwise operation and back to a boolean.
 fn rewrite_boolean(lhs: Expr, op: Operator, rhs: Expr) -> Expr {
-    match op {
+    match &op {
         Operator::And | Operator::Or | Operator::Eq | Operator::NotEq => binary_expr(lhs, op, rhs),
         // DataFusion doesn't support arithmetic operators for boolean types,
         // so cast both sides to an i64 and then the result back to a boolean
@@ -675,20 +675,20 @@ mod test {
 
         // duration expressions
         let expr = binary_expr(
-            lit(ScalarValue::IntervalMonthDayNano(Some(1))),
+            lit(ScalarValue::new_interval_mdn(0, 0, 1)),
             Operator::Lt,
-            lit(ScalarValue::IntervalMonthDayNano(Some(1000000000))),
+            lit(ScalarValue::new_interval_mdn(0, 0, 1000000000)),
         );
         assert_eq!(
             rewrite(expr),
-            r#"IntervalMonthDayNano("1") < IntervalMonthDayNano("1000000000")"#
+            "IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 1 }\") < IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 1000000000 }\")",
         );
 
-        let expr = lit(ScalarValue::IntervalMonthDayNano(Some(1)))
-            + lit(ScalarValue::IntervalMonthDayNano(Some(1000000000)));
+        let expr = lit(ScalarValue::new_interval_mdn(0, 0, 1))
+            + lit(ScalarValue::new_interval_mdn(0, 0, 1000000000));
         assert_eq!(
             rewrite(expr),
-            r#"IntervalMonthDayNano("1") + IntervalMonthDayNano("1000000000")"#
+            "IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 1 }\") + IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 1000000000 }\")",
         );
     }
 
@@ -707,7 +707,7 @@ mod test {
         let expr = binary_expr(
             lit("1"),
             Operator::Eq,
-            lit(ScalarValue::IntervalMonthDayNano(Some(1000000000))),
+            lit(ScalarValue::new_interval_mdn(0, 0, 1000000000)),
         );
         assert_eq!(rewrite(expr), "Boolean(false)");
     }

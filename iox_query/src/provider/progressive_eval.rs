@@ -128,6 +128,10 @@ impl DisplayAs for ProgressiveEvalExec {
 }
 
 impl ExecutionPlan for ProgressiveEvalExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
@@ -1749,6 +1753,10 @@ mod tests {
     }
 
     impl ExecutionPlan for BlockingExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }

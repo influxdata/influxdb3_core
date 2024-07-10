@@ -10,6 +10,7 @@ use super::{
     split::StreamSplitNode,
 };
 use crate::{
+    analyzer::register_iox_analyzers,
     config::IoxConfigExt,
     exec::{
         fieldlist::{FieldList, IntoFieldList},
@@ -36,6 +37,7 @@ use async_trait::async_trait;
 use datafusion::{
     catalog::CatalogProvider,
     common::ParamValues,
+    config::ConfigExtension,
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
         memory_pool::MemoryPool,
@@ -196,6 +198,12 @@ impl IOxSessionConfig {
         }
     }
 
+    /// add a new extension to the session config
+    pub fn with_extension(mut self, ext: impl ConfigExtension) -> Self {
+        self.session_config.options_mut().extensions.insert(ext);
+        self
+    }
+
     /// Set execution concurrency
     pub fn with_target_partitions(mut self, target_partitions: NonZeroUsize) -> Self {
         self.session_config = self
@@ -278,6 +286,7 @@ impl IOxSessionConfig {
             .with_query_planner(Arc::new(IOxQueryPlanner {}));
         let state = register_iox_physical_optimizers(state);
         let state = register_iox_logical_optimizers(state);
+        let state = register_iox_analyzers(state);
 
         let inner = SessionContext::new_with_state(state);
         register_selector_aggregates(&inner);
@@ -555,6 +564,7 @@ impl IOxSessionContext {
         // Run the plans in parallel
         let ctx = self.child_ctx("to_series_set");
         let exec = self.exec.clone();
+
         let data = futures::stream::iter(plans)
             .then(move |plan| {
                 let ctx = ctx.child_ctx("for plan");
@@ -576,7 +586,13 @@ impl IOxSessionContext {
                         let it = ctx.execute_stream(physical_plan).await?;
 
                         SeriesSetConverter::default()
-                            .convert(table_name, tag_columns, field_columns, it)
+                            .convert(
+                                table_name,
+                                tag_columns,
+                                field_columns,
+                                it,
+                                Arc::clone(&ctx.inner().runtime_env().memory_pool),
+                            )
                             .await
                     })
                     .await?;

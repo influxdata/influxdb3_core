@@ -84,11 +84,20 @@ impl TryFrom<i32> for CompactionLevel {
 impl CompactionLevel {
     /// When compacting files of this level, provide the level that the resulting file should be.
     /// Does not exceed the maximum available level.
-    pub fn next(&self) -> Self {
+    pub fn target_level(&self) -> Self {
         match self {
             Self::Initial => Self::FileNonOverlapped,
             Self::FileNonOverlapped => Self::Final,
             Self::Final => Self::Final,
+        }
+    }
+
+    /// Return next level, if there is one.  This is used for iterating a range, not determining the target level.
+    pub fn next(&self) -> Option<Self> {
+        match self {
+            Self::Initial => Some(Self::FileNonOverlapped),
+            Self::FileNonOverlapped => Some(Self::Final),
+            Self::Final => None,
         }
     }
 

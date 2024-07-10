@@ -654,6 +654,10 @@ mod tests {
     }
 
     impl ExecutionPlan for TestExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
