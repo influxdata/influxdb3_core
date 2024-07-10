@@ -107,12 +107,24 @@ pub struct GarbageCollectorConfig {
     /// Number of minutes to sleep between iterations of the retention code.
     /// Defaults to 35 minutes to reduce incidence of it running at the same time as the parquet
     /// file deleter.
+    ///
+    /// If the Garbage Collecter cannot keep up with retention at this call frequency, it
+    /// will reduce the interval (potentially down to 1m) until it can keep up.
     #[clap(
         long,
         default_value_t = 35,
         env = "INFLUXDB_IOX_GC_RETENTION_SLEEP_INTERVAL_MINUTES"
     )]
     pub retention_sleep_interval_minutes: u64,
+
+    /// Enable partition retention
+    #[clap(
+        long,
+        default_value = "false",
+        action,
+        env = "INFLUXDB_IOX_GC_PARTITION_RETENTION"
+    )]
+    pub partition_retention: bool,
 }
 
 #[derive(Debug, Snafu)]

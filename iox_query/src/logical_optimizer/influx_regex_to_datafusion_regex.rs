@@ -1,10 +1,10 @@
 use datafusion::common::tree_node::Transformed;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::{
-    common::{tree_node::TreeNodeRewriter, DFSchema},
+    common::tree_node::TreeNodeRewriter,
     error::DataFusionError,
     logical_expr::{expr_rewriter::rewrite_preserving_name, LogicalPlan, Operator},
-    optimizer::{OptimizerConfig, OptimizerRule},
+    optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
     prelude::{binary_expr, lit, Expr},
     scalar::ScalarValue,
 };
@@ -33,39 +33,41 @@ impl OptimizerRule for InfluxRegexToDataFusionRegex {
 
     fn try_optimize(
         &self,
-        plan: &LogicalPlan,
+        _plan: &LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> datafusion::error::Result<Option<LogicalPlan>> {
-        optimize(plan).map(Some)
+        Err(DataFusionError::Internal(
+            "Should have called InfluxRegexToDataFusionRegex::rewrite".into(),
+        ))
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> datafusion::error::Result<Transformed<LogicalPlan>, DataFusionError> {
+        optimize(plan)
     }
 }
 
-fn optimize(plan: &LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
-    let new_inputs = plan
-        .inputs()
-        .iter()
-        .map(|input| optimize(input))
-        .collect::<Result<Vec<_>, DataFusionError>>()?;
-
-    let mut schema =
-        new_inputs
-            .iter()
-            .map(|input| input.schema())
-            .fold(DFSchema::empty(), |mut lhs, rhs| {
-                lhs.merge(rhs);
-                lhs
-            });
-
-    schema.merge(plan.schema());
+fn optimize(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    // Inputs have already been rewritten (due to bottom-up traversal handled by Optimizer)
+    // Just need to rewrite our own expressions
 
     let mut expr_rewriter = InfluxRegexToDataFusionRegex {};
 
-    let new_exprs = plan
-        .expressions()
-        .into_iter()
-        .map(|expr| rewrite_preserving_name(expr, &mut expr_rewriter))
-        .collect::<Result<Vec<_>, DataFusionError>>()?;
-    plan.with_new_exprs(new_exprs, new_inputs)
+    plan.map_expressions(|expr| {
+        let new_expr = rewrite_preserving_name(expr, &mut expr_rewriter)?;
+        Ok(Transformed::yes(new_expr))
+    })
 }
 
 impl TreeNodeRewriter for InfluxRegexToDataFusionRegex {

@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-async-trait = "0.1.80"
+async-trait = "0.1.81"
 backoff = { path = "../backoff" }
 futures = "0.3"
 iox_time = { path = "../iox_time" }
@@ -18,8 +18,8 @@ observability_deps = { path = "../observability_deps" }
 ouroboros = "0.18"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 pdatastructs = { version = "0.7", default-features = false, features = ["fixedbitset"] }
-rand = "0.8.3"
-tokio = { version = "1.37", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+rand = "0.8.5"
+tokio = { version = "1.38", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.11" }
 trace = { path = "../trace"}
 tracker = { path = "../tracker"}
@@ -27,7 +27,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["rayon"]}
-proptest = { version = "1", default_features = false, features = ["std"] }
+proptest = { workspace = true }
 test_helpers = { path = "../test_helpers" }
 
 [lib]

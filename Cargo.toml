@@ -32,8 +32,6 @@ members = [
     "iox_system_tables",
     "iox_tests",
     "iox_time",
-    "ioxd_common",
-    "ioxd_test",
     "logfmt",
     "metric_exporters",
     "metric",
@@ -41,6 +39,7 @@ members = [
     "mutable_batch_pb",
     "mutable_batch_tests",
     "mutable_batch",
+    "object_store_mem_cache",
     "object_store_metrics",
     "observability_deps",
     "panic_logging",
@@ -54,8 +53,8 @@ members = [
     "service_grpc_testing",
     "sharder",
     "sqlx-hotswap-pool",
-    "test_helpers_end_to_end",
     "tokio_metrics_bridge",
+    "test_helpers_authz",
     "trace_exporters",
     "trace_http",
     "trace",
@@ -64,6 +63,7 @@ members = [
     "wal_inspect",
     "wal",
     "workspace-hack",
+    "versioned_file_store",
 ]
 
 resolver = "2"
@@ -86,22 +86,23 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "51.0.0", features = ["prettyprint", "chrono-tz"] }
-arrow-buffer = { version = "51.0.0" }
-arrow-flight = { version = "51.0.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "5fac581efbaffd0e6a9edf931182517524526afd" }
-datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "5fac581efbaffd0e6a9edf931182517524526afd" }
+arrow = { version = "52.1.0", features = ["prettyprint", "chrono-tz"] }
+arrow-buffer = { version = "52.1.0" }
+arrow-flight = { version = "52.1.0", features = ["flight-sql-experimental"] }
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
+datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
 hashbrown = { version = "0.14.5" }
-object_store = { version = "0.9.1" }
-parquet = { version = "51.0.0", features = ["object_store"] }
+object_store = { version = "0.10.1" }
+parquet = { version = "52.1.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
 pbjson-types = { version = "0.6.0" }
-prost = { version = "0.12.4" }
-prost-build = { version = "0.12.4" }
-prost-types = { version = "0.12.4" }
+proptest = { version = "1", default-features = false, features = ["std"] }
+prost = { version = "0.12.6" }
+prost-build = { version = "0.12.6" }
+prost-types = { version = "0.12.6" }
 smallvec = { version = "1.13.2", features = ["union"] }
-sqlparser = { version = "0.45.0" }
+sqlparser = { version = "0.48.0" }
 tonic = { version = "0.11.0", features = ["tls", "tls-roots"] }
 tonic-build = { version = "0.11.0" }
 tonic-health = { version = "0.11.0" }
@@ -156,13 +157,21 @@ opt-level = 3
 [profile.dev.package.similar]
 opt-level = 3
 
-# patch arrow-flight crate to allow for prepared statement parameters
-# see related arrow-rs PR https://github.com/apache/arrow-rs/pull/5433
-[patch.crates-io]
-arrow-array = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
-arrow-schema = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
-arrow-data = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
-arrow-buffer = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
-arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
-arrow-flight = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
-parquet = { git = "https://github.com/influxdata/arrow-rs.git", rev = "ea454d74707357731535d4bf20e9508e838f5f5d" }
+# Patching Arrow
+#
+# Assuming you have a local checkout of Arrow in a directory alongside your local checkout of influxdb3_core,
+# and you have changes to Arrow in your local checkout that you want to test out with influxdb3_core,
+# uncomment this `[patch.crates-io]` section to tell Cargo to use your local arrow versions for all
+# transitive dependencies. The entries for the `arrow-*` crates are needed because `datafusion` has
+# a direct dependency on them.
+#
+# WARNING: Do not merge in a PR uncommenting this change! This is for local testing only!
+#
+# [patch.crates-io]
+# arrow = { path = "../arrow-rs/arrow" }
+# parquet = { path = "../arrow-rs/parquet" }
+# arrow-array = { path = "../arrow-rs/arrow-array" }
+# arrow-schema = { path = "../arrow-rs/arrow-schema" }
+# arrow-data = { path = "../arrow-rs/arrow-data" }
+# arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+# arrow-ipc = { path = "../arrow-rs/arrow-ipc" }

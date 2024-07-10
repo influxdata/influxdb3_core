@@ -10,7 +10,7 @@ use datafusion::{
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{FileScanConfig, ParquetExec},
+        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
     },
     physical_expr::PhysicalSortExpr,
     physical_plan::{empty::EmptyExec, expressions::Column, union::UnionExec, ExecutionPlan},
@@ -18,6 +18,7 @@ use datafusion::{
 };
 use datafusion_util::config::table_parquet_options;
 use object_store::{DynObjectStore, ObjectMeta, ObjectStore};
+use parquet_file::storage::ParquetExecInput;
 use schema::{sort::SortKey, Schema};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -29,6 +30,7 @@ pub struct PartitionedFileExt {
     pub chunk: Arc<dyn QueryChunk>,
     pub output_sort_key_memo: Option<SortKey>,
     pub object_store: Arc<DynObjectStore>,
+    pub table_schema: SchemaRef,
 }
 
 /// Holds a list of chunks that all have the same "URL" and
@@ -38,7 +40,6 @@ pub struct PartitionedFileExt {
 /// plans
 #[derive(Debug)]
 struct ParquetChunkList {
-    object_store_url: ObjectStoreUrl,
     object_store: Arc<dyn ObjectStore>,
     chunks: Vec<(ObjectMeta, Arc<dyn QueryChunk>)>,
     /// Sort key to place on the ParquetExec, validated to be
@@ -52,7 +53,6 @@ impl ParquetChunkList {
     /// (e.g. the partition sort key) also computes compatibility with
     /// the chunk order.
     fn new(
-        object_store_url: ObjectStoreUrl,
         object_store: Arc<dyn ObjectStore>,
         chunk: &Arc<dyn QueryChunk>,
         meta: ObjectMeta,
@@ -61,7 +61,6 @@ impl ParquetChunkList {
         let sort_key = combine_sort_key(output_sort_key.cloned(), chunk.sort_key(), chunk.schema());
 
         Self {
-            object_store_url,
             object_store,
             chunks: vec![(meta, Arc::clone(chunk))],
             sort_key,
@@ -125,7 +124,7 @@ fn combine_sort_key(
 ///
 /// Record batch chunks will be turned into a single [`RecordBatchesExec`].
 ///
-/// Parquet chunks will be turned into a [`ParquetExec`] per store, each of them with
+/// Parquet chunks will be turned into a [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) per store, each of them with
 /// [`target_partitions`](datafusion::execution::context::SessionConfig::target_partitions) file groups.
 ///
 /// If this function creates more than one physical node, they will be combined using an [`UnionExec`]. Otherwise, a
@@ -138,10 +137,11 @@ fn combine_sort_key(
 /// For empty inputs (i.e. no chunks), this will create a single [`EmptyExec`] node with appropriate schema.
 ///
 /// # Predicates
-/// The give `predicate` will only be applied to [`ParquetExec`] nodes since they are the only node type benifiting from
+/// The give `predicate` will only be applied to [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) nodes since they are the only node type benifiting from
 /// pushdown ([`RecordBatchesExec`] has NO builtin filter function). Delete predicates are NOT applied at all. The
 /// caller is responsible for wrapping the output node into appropriate filter nodes.
 pub fn chunks_to_physical_nodes(
+    // schema that includes all columns of all given chunks. This schema may just cover a subset of columns of the Table
     schema: &SchemaRef,
     output_sort_key: Option<&SortKey>,
     chunks: Vec<Arc<dyn QueryChunk>>,
@@ -152,28 +152,30 @@ pub fn chunks_to_physical_nodes(
     }
 
     let mut record_batch_chunks: Vec<Arc<dyn QueryChunk>> = vec![];
-    let mut parquet_chunks: HashMap<String, ParquetChunkList> = HashMap::new();
+    let mut parquet_chunks: HashMap<ObjectStoreUrl, ParquetChunkList> = HashMap::new();
 
     for chunk in &chunks {
         match chunk.data() {
             QueryChunkData::RecordBatches(_) => {
                 record_batch_chunks.push(Arc::clone(chunk));
             }
-            QueryChunkData::Parquet(parquet_input) => {
-                let url_str = parquet_input.object_store_url.as_str().to_owned();
-                match parquet_chunks.entry(url_str) {
+            QueryChunkData::Parquet(ParquetExecInput {
+                object_store_url,
+                object_store,
+                object_meta,
+            }) => {
+                match parquet_chunks.entry(object_store_url) {
                     Entry::Occupied(mut o) => {
-                        o.get_mut()
-                            .add_parquet_file(chunk, parquet_input.object_meta);
+                        o.get_mut().add_parquet_file(chunk, object_meta);
                     }
                     Entry::Vacant(v) => {
                         // better have some instead of no sort information at all
                         let output_sort_key = output_sort_key.or_else(|| chunk.sort_key());
+
                         v.insert(ParquetChunkList::new(
-                            parquet_input.object_store_url,
-                            parquet_input.object_store,
+                            object_store,
                             chunk,
-                            parquet_input.object_meta,
+                            object_meta,
                             output_sort_key,
                         ));
                     }
@@ -193,9 +195,8 @@ pub fn chunks_to_physical_nodes(
     let mut parquet_chunks: Vec<_> = parquet_chunks.into_iter().collect();
     parquet_chunks.sort_by_key(|(url_str, _)| url_str.clone());
     let has_chunk_order_col = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).is_ok();
-    for (_url_str, chunk_list) in parquet_chunks {
+    for (object_store_url, chunk_list) in parquet_chunks {
         let ParquetChunkList {
-            object_store_url,
             object_store,
             mut chunks,
             sort_key,
@@ -210,28 +211,6 @@ pub fn chunks_to_physical_nodes(
             .map(|(_meta, chunk)| Arc::clone(chunk))
             .collect::<Vec<_>>();
         let statistics = build_statistics_for_chunks(&query_chunks, Arc::clone(schema));
-
-        let file_groups = distribute(
-            chunks.into_iter().map(|(object_meta, chunk)| {
-                let partition_values = if has_chunk_order_col {
-                    vec![ScalarValue::from(chunk.order().get())]
-                } else {
-                    vec![]
-                };
-                PartitionedFile {
-                    object_meta,
-                    partition_values,
-                    range: None,
-                    extensions: Some(Arc::new(PartitionedFileExt {
-                        chunk,
-                        output_sort_key_memo: output_sort_key.cloned(),
-                        object_store: Arc::clone(&object_store),
-                    })),
-                    statistics: None,
-                }
-            }),
-            target_partitions,
-        );
 
         // Tell datafusion about the sort key, if any
         let output_ordering = sort_key.map(|sort_key| arrow_sort_key_exprs(&sort_key, schema));
@@ -267,6 +246,29 @@ pub fn chunks_to_physical_nodes(
             (vec![], Arc::clone(schema), output_ordering)
         };
 
+        let file_groups = distribute(
+            chunks.into_iter().map(|(object_meta, chunk)| {
+                let partition_values = if has_chunk_order_col {
+                    vec![ScalarValue::from(chunk.order().get())]
+                } else {
+                    vec![]
+                };
+                PartitionedFile {
+                    object_meta,
+                    partition_values,
+                    range: None,
+                    extensions: Some(Arc::new(PartitionedFileExt {
+                        chunk,
+                        output_sort_key_memo: output_sort_key.cloned(),
+                        object_store: Arc::clone(&object_store),
+                        table_schema: Arc::clone(&file_schema), // todo: rename file_schema to table_schema
+                    })),
+                    statistics: None,
+                }
+            }),
+            target_partitions,
+        );
+
         // No sort order is represented by an empty Vec
         let output_ordering = vec![output_ordering.unwrap_or_default()];
 
@@ -280,12 +282,9 @@ pub fn chunks_to_physical_nodes(
             table_partition_cols,
             output_ordering,
         };
-        let meta_size_hint = None;
 
-        let parquet_exec =
-            ParquetExec::new(base_config, None, meta_size_hint, table_parquet_options());
-
-        output_nodes.push(Arc::new(parquet_exec));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        output_nodes.push(builder.build_arc());
     }
 
     assert!(!output_nodes.is_empty());
@@ -317,6 +316,7 @@ where
 mod tests {
     use datafusion::{
         common::stats::Precision,
+        datasource::physical_plan::ParquetExec,
         physical_plan::{ColumnStatistics, Statistics},
     };
     use schema::{sort::SortKeyBuilder, InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME};

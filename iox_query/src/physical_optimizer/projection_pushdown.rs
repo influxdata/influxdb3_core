@@ -7,7 +7,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{FileScanConfig, ParquetExec},
+    datasource::physical_plan::{parquet::ParquetExecBuilder, FileScanConfig, ParquetExec},
     error::{DataFusionError, Result},
     physical_expr::{
         utils::{collect_columns, reassign_predicate_columns},
@@ -114,13 +114,12 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                         output_ordering,
                         ..child_parquet.base_config().clone()
                     };
-                    let new_child = ParquetExec::new(
-                        base_config,
-                        child_parquet.predicate().cloned(),
-                        None,
-                        table_parquet_options(),
-                    );
-                    return Ok(Transformed::yes(Arc::new(new_child)));
+                    let mut builder =
+                        ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+                    if let Some(predicate) = child_parquet.predicate() {
+                        builder = builder.with_predicate(Arc::clone(predicate));
+                    }
+                    return Ok(Transformed::yes(builder.build_arc()));
                 } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
                     let filter_required_cols = collect_columns(child_filter.predicate());
                     let filter_required_cols = filter_required_cols
@@ -225,7 +224,7 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                     let plan = wrap_user_into_projections(
                         &dedup_required_cols,
                         &column_names,
-                        input,
+                        Arc::clone(input),
                         |plan| {
                             let sort_keys = reassign_sort_exprs_columns(
                                 child_dedup.sort_keys(),
@@ -757,12 +756,9 @@ mod tests {
                 },
             ]],
         };
-        let inner = ParquetExec::new(
-            base_config,
-            Some(expr_string_cmp("tag1", &schema)),
-            None,
-            table_parquet_options(),
-        );
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
+            .with_predicate(expr_string_cmp("tag1", &schema));
+        let inner = builder.build();
         let plan = Arc::new(
             ProjectionExec::try_new(
                 vec![
@@ -1356,12 +1352,8 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        let plan = Arc::new(ParquetExec::new(
-            base_config,
-            None,
-            None,
-            table_parquet_options(),
-        ));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        let plan = builder.build_arc();
         let plan = Arc::new(UnionExec::new(vec![plan]));
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(
@@ -1699,6 +1691,10 @@ mod tests {
     }
 
     impl ExecutionPlan for TestExec {
+        fn name(&self) -> &str {
+            Self::static_name()
+        }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -1711,7 +1707,7 @@ mod tests {
             &self.cache
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 

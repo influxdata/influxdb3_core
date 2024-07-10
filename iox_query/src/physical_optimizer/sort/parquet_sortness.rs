@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
-    datasource::physical_plan::{FileScanConfig, ParquetExec},
+    datasource::physical_plan::{parquet::ParquetExecBuilder, FileScanConfig, ParquetExec},
     error::Result,
     physical_expr::{PhysicalSortExpr, PhysicalSortRequirement},
     physical_optimizer::PhysicalOptimizerRule,
@@ -98,6 +98,7 @@ fn detect_children_with_desired_ordering(
                     .map(|requirement| requirement.expect("just checked"))
                     .map(PhysicalSortRequirement::to_sort_exprs),
             )
+            .map(|(arc, sort_exprs)| (Arc::clone(arc), sort_exprs))
             .collect(),
     )
 }
@@ -163,12 +164,12 @@ impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
                 .collect(),
             ..base_config.clone()
         };
-        let new_parquet_exec = ParquetExec::new(
-            base_config,
-            parquet_exec.predicate().cloned(),
-            None,
-            table_parquet_options(),
-        );
+        let mut builder =
+            ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        if let Some(predicate) = parquet_exec.predicate() {
+            builder = builder.with_predicate(Arc::clone(predicate));
+        }
+        let new_parquet_exec = builder.build();
 
         // did this help?
         if new_parquet_exec.properties().output_ordering() == Some(self.desired_ordering) {
@@ -214,9 +215,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
+            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
                 .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
@@ -248,9 +249,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(DeduplicateExec::new(
-            Arc::new(inner),
+            builder.build_arc(),
             ordering(["col2", "col1"], &schema),
             true,
         ));
@@ -283,9 +284,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
+            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
                 .with_preserve_partitioning(true)
                 .with_fetch(Some(42)),
         );
@@ -331,9 +332,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
+            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
                 .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
@@ -365,9 +366,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col1", "col2"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
+            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
                 .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
@@ -399,9 +400,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
+            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
                 .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
@@ -433,9 +434,9 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let inner = ParquetExec::new(base_config, None, None, table_parquet_options());
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
+            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
                 .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
@@ -496,12 +497,8 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1"], &schema)],
         };
-        let plan = Arc::new(ParquetExec::new(
-            base_config,
-            None,
-            None,
-            table_parquet_options(),
-        ));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        let plan = builder.build_arc();
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
@@ -529,12 +526,8 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col1", "col2"], &schema)],
         };
-        let plan = Arc::new(ParquetExec::new(
-            base_config,
-            None,
-            None,
-            table_parquet_options(),
-        ));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        let plan = builder.build_arc();
         let plan =
             Arc::new(SortExec::new(ordering(["col2", "col1"], &schema), plan).with_fetch(Some(42)));
         let plan =
@@ -570,12 +563,8 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col1", "col2"], &schema)],
         };
-        let plan = Arc::new(ParquetExec::new(
-            base_config,
-            None,
-            None,
-            table_parquet_options(),
-        ));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        let plan = builder.build_arc();
         let plan =
             Arc::new(SortExec::new(ordering(["col1", "col2"], &schema), plan).with_fetch(Some(42)));
         let plan =
@@ -612,12 +601,8 @@ mod tests {
             table_partition_cols: vec![],
             output_ordering: vec![ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)],
         };
-        let plan_parquet = Arc::new(ParquetExec::new(
-            base_config,
-            None,
-            None,
-            table_parquet_options(),
-        ));
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        let plan_parquet = builder.build_arc();
         let plan_batches = Arc::new(RecordBatchesExec::new(vec![], Arc::clone(&schema), None));
 
         let plan = Arc::new(UnionExec::new(vec![plan_batches, plan_parquet]));

@@ -980,7 +980,7 @@ mod tests {
                         .into_iter()
                         .collect();
 
-                    let got = reversed.collect::<Vec<_>>();
+                    let got = reversed.filter_map(|(name, val)| val.map(|val| (name, val))).collect::<Vec<_>>();
                     assert_eq!(got, want, "reversed key differs");
                 }
             }
@@ -1518,7 +1518,7 @@ mod tests {
             let reversed: Vec<(&str, ColumnValue<'_>)> = build_column_values(
                 &template,
                 &keys[0]
-            ).collect();
+            ).filter_map(|(name, val)| val.map(|val| (name, val))).collect();
 
             // Build the expected set of reversed tags by filtering out any
             // NULL tags (preserving empty string values).

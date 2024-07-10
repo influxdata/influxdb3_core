@@ -154,6 +154,47 @@ impl TryFrom<generated_types::influxdata::iox::catalog::v1::PartitionIdentifier>
     }
 }
 
+/// Deserialize a [`TransitionPartitionId`] from a protobuf representation,
+/// with an optional partition_key to enable deterministic ids.
+impl
+    TryFrom<(
+        generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
+        TableId,
+        Option<PartitionKey>,
+    )> for TransitionPartitionId
+{
+    type Error = PartitionIdProtoError;
+
+    fn try_from(
+        value: (
+            generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
+            TableId,
+            Option<PartitionKey>,
+        ),
+    ) -> Result<Self, Self::Error> {
+        use generated_types::influxdata::iox::catalog::v1 as proto;
+
+        let id = value.0.id.ok_or(PartitionIdProtoError::NoId)?;
+        let table_id = value.1;
+        let partition_key = value.2;
+
+        Ok(match (id, partition_key) {
+            (proto::partition_identifier::Id::CatalogId(v), None) => {
+                Self::Deprecated(PartitionId::new(v))
+            }
+            (proto::partition_identifier::Id::CatalogId(v), Some(partition_key)) => {
+                Self::from_parts(
+                    PartitionId::new(v),
+                    Some(PartitionHashId::new(table_id, &partition_key)),
+                )
+            }
+            (proto::partition_identifier::Id::HashId(hash), _) => {
+                Self::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
+            }
+        })
+    }
+}
+
 /// Unique ID for a `Partition`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type, sqlx::FromRow)]
 #[sqlx(transparent)]

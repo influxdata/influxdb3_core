@@ -33,7 +33,8 @@ use std::{
     fmt::{Display, Write},
     mem::{self, size_of_val},
     num::{FpCategory, NonZeroU64},
-    ops::{Add, Deref, Sub},
+    ops::{Add, AddAssign, Deref, Sub},
+    str::FromStr,
     sync::Arc,
 };
 use uuid::Uuid;
@@ -83,11 +84,20 @@ impl TryFrom<i32> for CompactionLevel {
 impl CompactionLevel {
     /// When compacting files of this level, provide the level that the resulting file should be.
     /// Does not exceed the maximum available level.
-    pub fn next(&self) -> Self {
+    pub fn target_level(&self) -> Self {
         match self {
             Self::Initial => Self::FileNonOverlapped,
             Self::FileNonOverlapped => Self::Final,
             Self::Final => Self::Final,
+        }
+    }
+
+    /// Return next level, if there is one.  This is used for iterating a range, not determining the target level.
+    pub fn next(&self) -> Option<Self> {
+        match self {
+            Self::Initial => Some(Self::FileNonOverlapped),
+            Self::FileNonOverlapped => Some(Self::Final),
+            Self::Final => None,
         }
     }
 
@@ -181,6 +191,12 @@ impl Add<u64> for SequenceNumber {
 
     fn add(self, other: u64) -> Self {
         Self(self.0 + other)
+    }
+}
+
+impl AddAssign<u64> for SequenceNumber {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs;
     }
 }
 
@@ -855,6 +871,52 @@ impl From<ParquetFile> for generated_types::influxdata::iox::catalog::v1::Parque
             max_l0_created_at: v.max_l0_created_at.get(),
             source: ParquetFileSource::to_proto(v.source),
         }
+    }
+}
+
+/// Errors converting from a catalog proto v1 ParquetFile to [`ParquetFile`].
+#[derive(Debug, Error)]
+pub enum ProtoV1ParquetFileError {
+    /// invalid partition hash id
+    #[error("Error converting partition_hash_id: {0}")]
+    PartitionHashId(#[from] PartitionHashIdError),
+
+    /// invalid object store it
+    #[error("Error converting object_store_id: {0}")]
+    ObjectStoreId(#[from] uuid::Error),
+
+    /// invalid compaction level
+    #[error("Error converting compaction level")]
+    CompactionLevel,
+}
+
+impl TryFrom<generated_types::influxdata::iox::catalog::v1::ParquetFile> for ParquetFile {
+    type Error = ProtoV1ParquetFileError;
+
+    fn try_from(
+        v: generated_types::influxdata::iox::catalog::v1::ParquetFile,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: ParquetFileId::new(v.id),
+            namespace_id: NamespaceId::new(v.namespace_id),
+            table_id: TableId::new(v.table_id),
+            partition_id: PartitionId::new(v.partition_id),
+            partition_hash_id: Some(v.partition_hash_id[..].try_into()?),
+            object_store_id: ObjectStoreId::from_str(&v.object_store_id)?,
+            min_time: Timestamp::new(v.min_time),
+            max_time: Timestamp::new(v.max_time),
+            to_delete: v.to_delete.map(Timestamp::new),
+            file_size_bytes: v.file_size_bytes,
+            row_count: v.row_count,
+            compaction_level: v
+                .compaction_level
+                .try_into()
+                .map_err(|_| ProtoV1ParquetFileError::CompactionLevel)?,
+            created_at: Timestamp::new(v.created_at),
+            column_set: ColumnSet::new(v.column_set.into_iter().map(ColumnId::new)),
+            max_l0_created_at: Timestamp::new(v.max_l0_created_at),
+            source: ParquetFileSource::from_proto(v.source),
+        })
     }
 }
 

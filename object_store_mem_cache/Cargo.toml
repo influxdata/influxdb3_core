@@ -1,0 +1,29 @@
+[package]
+name = "object_store_mem_cache"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { version = "0.1.81", default-features = false }
+bytes = { version = "1.6.0", default-features = false }
+dashmap = "6.0.1"
+data_types = { path = "../data_types" }
+datafusion = { workspace = true }
+futures = { version = "0.3.30" }
+metric = { path = "../metric" }
+object_store.workspace = true
+observability_deps = { path = "../observability_deps" }
+snafu = "0.8"
+tokio = { version = "1.38.0", default-features = false }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+arrow_util = { path = "../arrow_util" }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
+

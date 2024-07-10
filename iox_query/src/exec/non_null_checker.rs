@@ -152,14 +152,14 @@ impl UserDefinedLogicalNodeCore for NonNullCheckerNode {
         )
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "NonNullChecker: input sizes inconsistent");
         assert_eq!(
             exprs.len(),
             self.exprs.len(),
             "NonNullChecker: expression sizes inconsistent"
         );
-        Self::new(self.value.as_ref(), inputs[0].clone())
+        Ok(Self::new(self.value.as_ref(), inputs[0].clone()))
     }
 }
 
@@ -227,6 +227,10 @@ impl Debug for NonNullCheckerExec {
 }
 
 impl ExecutionPlan for NonNullCheckerExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
     }
@@ -243,8 +247,8 @@ impl ExecutionPlan for NonNullCheckerExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(

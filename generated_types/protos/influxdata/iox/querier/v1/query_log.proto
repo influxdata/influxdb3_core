@@ -71,6 +71,8 @@ message LogEntry {
   // Maximum memory allocated when executing the query.
   int64 max_memory = 20;
 
+  IngesterMetrics ingester_metrics = 22;
+
   // If the query completed successfully.
   bool success = 9;
 
@@ -79,6 +81,23 @@ message LogEntry {
 
   // If the query was cancelled.
   bool cancelled = 17;
+}
+
+message IngesterMetrics {
+  // Total time spent waiting on ingester before planning 
+  google.protobuf.Duration latency_to_plan = 1;
+
+  // Total time spent waiting on all data from ingester(s)
+  google.protobuf.Duration latency_to_data = 2;
+
+  // Total response size from ingester(s) in bytes
+  uint64 response_size_bytes = 3;
+
+  // Total number of rows from ingester(s)
+  uint64 response_row_count = 4;
+
+  // Total number of partitions from ingester(s)
+  uint64 partition_count = 5;
 }
 
 // Metadata for the entire response.

@@ -64,7 +64,7 @@ impl<W: Write + Send> TrackedMemoryArrowWriter<W> {
         let result = self.inner.write(&batch);
 
         // In progress memory, in bytes
-        let in_progress_size = self.inner.in_progress_size();
+        let in_progress_size = self.inner.memory_size();
 
         // update the allocation with the pool.
         let reservation_result = self
@@ -129,7 +129,7 @@ mod test {
         // first batch exceeds page limit, so wrote to a page
         writer.write(data_gen.batch(10)).unwrap();
         assert!(writer.reservation.size() > 0);
-        assert_eq!(writer.reservation.size(), writer.inner.in_progress_size());
+        assert_eq!(writer.reservation.size(), writer.inner.memory_size());
         let previous_reservation = writer.reservation.size();
 
         // Feed in more data to force more data to be written
@@ -144,12 +144,12 @@ mod test {
         // continues to match (may not grow as pages are flushed)
         for _ in 0..50 {
             writer.write(data_gen.batch(5)).unwrap();
-            assert_eq!(writer.reservation.size(), writer.inner.in_progress_size())
+            assert_eq!(writer.reservation.size(), writer.inner.memory_size())
         }
 
         println!("Final reservation is {}", pool.reserved());
         assert_ne!(pool.reserved(), 0);
-        assert_eq!(pool.reserved(), writer.inner.in_progress_size());
+        assert_eq!(pool.reserved(), writer.inner.memory_size());
 
         // drop the writer and verify the memory is returned to the pool
         std::mem::drop(writer);
@@ -212,17 +212,17 @@ mod test {
 
         writer.write(data_gen.batch(10)).unwrap();
         assert_ne!(writer.reservation.size(), 0);
-        assert_eq!(writer.reservation.size(), writer.inner.in_progress_size());
+        assert_eq!(writer.reservation.size(), writer.inner.memory_size());
 
         // write a bad batch and accounting should still add up
         writer.write(data_gen.bad_batch(3)).unwrap();
-        assert_eq!(writer.reservation.size(), writer.inner.in_progress_size());
+        assert_eq!(writer.reservation.size(), writer.inner.memory_size());
 
         // feed more good batches and allocation should still match
         for _ in 0..15 {
             writer.write(data_gen.batch(13)).unwrap();
             assert_ne!(writer.reservation.size(), 0);
-            assert_eq!(writer.reservation.size(), writer.inner.in_progress_size());
+            assert_eq!(writer.reservation.size(), writer.inner.memory_size());
         }
     }
 
