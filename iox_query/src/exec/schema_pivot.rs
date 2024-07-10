@@ -115,14 +115,14 @@ impl UserDefinedLogicalNodeCore for SchemaPivotNode {
         write!(f, "{}", self.name())
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "SchemaPivot: input sizes inconistent");
         assert_eq!(
             exprs.len(),
             self.exprs.len(),
             "SchemaPivot: expression sizes inconistent"
         );
-        Self::new(inputs[0].clone())
+        Ok(Self::new(inputs[0].clone()))
     }
 }
 
@@ -187,6 +187,10 @@ impl Debug for SchemaPivotExec {
 }
 
 impl ExecutionPlan for SchemaPivotExec {
+    fn name(&self) -> &str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
     }
@@ -203,8 +207,8 @@ impl ExecutionPlan for SchemaPivotExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![Arc::clone(&self.input)]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(

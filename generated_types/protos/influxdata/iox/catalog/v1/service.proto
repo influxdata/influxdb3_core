@@ -13,6 +13,9 @@ service CatalogService {
     // Get the partition catalog records by the table id
     rpc GetPartitionsByTableId(GetPartitionsByTableIdRequest) returns (GetPartitionsByTableIdResponse);
 
+    // Get the partition catalog record by the id
+    rpc GetPartitionById(GetPartitionByIdRequest) returns (GetPartitionByIdResponse);
+
     // Get the column catalog records by the table id
     rpc GetColumnsByTableId(GetColumnsByTableIdRequest) returns (GetColumnsByTableIdResponse);
 
@@ -72,6 +75,14 @@ message GetPartitionsByTableIdRequest {
 
 message GetPartitionsByTableIdResponse {
     repeated Partition partitions = 1;
+}
+
+message GetPartitionByIdRequest {
+    int64 id = 1;
+}
+
+message GetPartitionByIdResponse {
+    Partition partition = 1;
 }
 
 message Column {

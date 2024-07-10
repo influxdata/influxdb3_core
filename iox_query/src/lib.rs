@@ -28,10 +28,12 @@ use parquet_file::storage::ParquetExecInput;
 use schema::{sort::SortKey, Projection, Schema};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
+pub mod analyzer;
 pub mod chunk_statistics;
 pub mod config;
 pub mod exec;
 pub mod frontend;
+pub mod ingester;
 pub mod logical_optimizer;
 pub mod physical_optimizer;
 pub mod plan;

@@ -4,7 +4,7 @@ use crate::pruning_oracle::BucketPartitionPruningOracle;
 use crate::QueryChunk;
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, UInt64Array},
+    array::{new_empty_array, ArrayRef, BooleanArray, UInt64Array},
     datatypes::{DataType, SchemaRef},
 };
 use datafusion::{
@@ -255,6 +255,12 @@ fn collect_pruning_stats<'a>(
     statistics: impl Iterator<Item = Option<&'a ColumnStatistics>>,
     aggregate: Aggregate,
 ) -> Option<ArrayRef> {
+    let mut statistics = statistics.peekable();
+    if statistics.peek().is_none() {
+        // empty
+        return Some(new_empty_array(data_type));
+    }
+
     let null = ScalarValue::try_from(data_type).ok()?;
 
     let stats = ScalarValue::iter_to_array(statistics.map(|stats| {
@@ -294,6 +300,7 @@ mod test {
     use datafusion::prelude::{col, lit};
     use datafusion_util::lit_dict;
     use schema::merge::SchemaMerger;
+    use test_helpers::{assert_not_contains, tracing::TracingCapture};
 
     use crate::{
         pruning_oracle::{BucketInfo, BucketPartitionPruningOracleBuilder},
@@ -304,13 +311,34 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_empty() {
+    fn test_empty_schema() {
         test_helpers::maybe_start_logging();
+        let capture = TracingCapture::new();
         let c1 = Arc::new(TestChunk::new("chunk1"));
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &[]);
-
+        let result = prune_chunks(&c1.schema().clone(), &[Arc::clone(&c1) as _], &[]);
         assert_eq!(result, Err(NotPrunedReason::NoExpressionOnPredicate));
+
+        let result = prune_chunks(
+            &c1.schema().clone(),
+            &[Arc::clone(&c1) as _],
+            &[lit(1).eq(lit(1))],
+        );
+        assert_eq!(result.expect("pruning succeeds"), vec![true]);
+
+        assert_not_contains!(capture.to_string().to_lowercase(), "warn");
+    }
+
+    #[test]
+    fn test_empty_chunks() {
+        test_helpers::maybe_start_logging();
+        let capture = TracingCapture::new();
+        let c1 = Arc::new(TestChunk::new("chunk1").with_f64_field_column("column1"));
+
+        let result = prune_chunks(&c1.schema().clone(), &[], &[col("column1").gt(lit(1.0f64))]);
+        assert_eq!(result.expect("pruning succeeds"), Vec::<bool>::new());
+
+        assert_not_contains!(capture.to_string().to_lowercase(), "warn");
     }
 
     #[test]

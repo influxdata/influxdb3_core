@@ -1,10 +1,13 @@
 //! A SQLite backed implementation of the Catalog
 
+use crate::constants::MAX_PARTITION_SELECTED_ONCE_FOR_DELETE;
 use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
 use crate::metrics::CatalogMetrics;
+use crate::util::should_delete_partition;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
+        MAX_PARQUET_L0_FILES_PER_PARTITION,
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
@@ -26,6 +29,7 @@ use data_types::{
     ParquetFileSource, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
     SortKeyIds, Table, TableId, Timestamp,
 };
+use futures::StreamExt;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::Registry;
 use observability_deps::tracing::debug;
@@ -287,7 +291,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 }
             } else {
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             }
         })?;
@@ -391,7 +395,7 @@ WHERE name=$1 AND {v};
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -418,7 +422,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -449,7 +453,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -480,7 +484,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                 descr: name.to_string(),
             },
             _ => Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             },
         })?;
 
@@ -570,7 +574,7 @@ RETURNING *;
             if is_fk_violation(&e) {
                 Error::NotFound { descr: e.to_string() }
             } else {
-                Error::External { source: Box::new(e) }
+                Error::External { source: Arc::new(e) }
             }
         }})?;
 
@@ -641,7 +645,7 @@ RETURNING *;
                     }
                 } else {
                     Error::External {
-                        source: Box::new(e),
+                        source: Arc::new(e),
                     }
                 }
             }
@@ -873,7 +877,7 @@ RETURNING *;
                 }
             } else {
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             }
         })?;
@@ -959,7 +963,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                 }
             } else {
                 Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }
             }
         })?;
@@ -1082,7 +1086,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             }
             Err(e) => {
                 return Err(CasFailure::QueryError(Error::External {
-                    source: Box::new(e),
+                    source: Arc::new(e),
                 }))
             }
         };
@@ -1279,6 +1283,48 @@ ORDER BY id DESC;
         .collect())
     }
 
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let mut tx = self.inner.get_mut().pool.begin().await?;
+
+        let mut stream = sqlx::query_as::<_, (PartitionId, PartitionKey, TableId, i64, TablePartitionTemplateOverride)>(
+            r#"
+SELECT partition.id, partition.partition_key, table_name.id, namespace.retention_period_ns, table_name.partition_template
+FROM partition
+JOIN table_name on partition.table_id = table_name.id
+JOIN namespace on table_name.namespace_id = namespace.id
+WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
+    AND retention_period_ns IS NOT NULL;
+        "#,
+        )
+            .fetch(&mut *tx);
+
+        let now = self.time_provider.now();
+        let mut to_remove = Vec::with_capacity(MAX_PARTITION_SELECTED_ONCE_FOR_DELETE);
+
+        while let Some((p_id, key, t_id, retention, template)) = stream.next().await.transpose()? {
+            if should_delete_partition(&key, &template, retention, now) {
+                to_remove.push((t_id, p_id));
+
+                if to_remove.len() == MAX_PARTITION_SELECTED_ONCE_FOR_DELETE {
+                    break;
+                }
+            }
+        }
+        drop(stream);
+
+        // We use a JSON-based "IS IN" check.
+        let ids: Vec<_> = to_remove.iter().map(|(p, _)| p.get()).collect();
+
+        sqlx::query(r#"DELETE FROM partition WHERE id IN (SELECT value FROM json_each($1));"#)
+            .bind(Json(&ids[..])) // $1
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(to_remove)
+    }
+
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
         let mut tx = self.inner.get_mut().pool.begin().await?;
 
@@ -1451,15 +1497,29 @@ RETURNING object_store_id;
 
         let query = sqlx::query_as::<_, ParquetFilePod>(
             r#"
-SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
-       object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
-       compaction_level, created_at, column_set, max_l0_created_at, source
-FROM parquet_file
-WHERE parquet_file.partition_id IN (SELECT value FROM json_each($1))
-  AND parquet_file.to_delete IS NULL;
+    SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+        object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+        compaction_level, created_at, column_set, max_l0_created_at, source
+    FROM parquet_file
+    WHERE parquet_file.partition_id IN (SELECT value FROM json_each($1))
+        AND parquet_file.to_delete IS NULL
+        AND compaction_level != 0
+UNION ALL
+SELECT * FROM (
+    SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+        object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+        compaction_level, created_at, column_set, max_l0_created_at, source
+    FROM parquet_file
+    WHERE parquet_file.partition_id IN (SELECT value FROM json_each($1))
+        AND parquet_file.to_delete IS NULL
+        AND compaction_level = 0
+    ORDER BY max_l0_created_at
+    LIMIT $2
+)
         "#,
         )
-        .bind(Json(&ids[..])); // $1
+        .bind(Json(&ids[..])) // $1
+        .bind(MAX_PARQUET_L0_FILES_PER_PARTITION); // $2
 
         Ok(query
             .fetch_all(self.inner.get_mut())
@@ -1628,7 +1688,7 @@ RETURNING
             }
         } else {
             Error::External {
-                source: Box::new(e),
+                source: Arc::new(e),
             }
         }
     })?;
@@ -2159,7 +2219,7 @@ RETURNING *;
             .tables()
             .create(
                 "pomelo",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     None, // no custom partition template
                     &namespace_custom_template.partition_template,
                 )
@@ -2172,7 +2232,7 @@ RETURNING *;
         // it should have the namespace's template
         assert_eq!(
             table_no_template_with_namespace_template.partition_template,
-            TablePartitionTemplateOverride::try_new(
+            TablePartitionTemplateOverride::try_from_existing(
                 None,
                 &namespace_custom_template.partition_template
             )
@@ -2191,7 +2251,7 @@ RETURNING *;
             record.try_get("partition_template").unwrap();
         assert_eq!(
             partition_template.unwrap(),
-            TablePartitionTemplateOverride::try_new(
+            TablePartitionTemplateOverride::try_from_existing(
                 None,
                 &namespace_custom_template.partition_template
             )
@@ -2211,7 +2271,7 @@ RETURNING *;
             .tables()
             .create(
                 "tangerine",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     Some(custom_table_template), // with custom partition template
                     &namespace_default_template.partition_template,
                 )
@@ -2264,7 +2324,7 @@ RETURNING *;
             .tables()
             .create(
                 "nectarine",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     Some(custom_table_template), // with custom partition template
                     &namespace_custom_template.partition_template,
                 )
@@ -2312,7 +2372,7 @@ RETURNING *;
             .tables()
             .create(
                 "grapefruit",
-                TablePartitionTemplateOverride::try_new(
+                TablePartitionTemplateOverride::try_from_existing(
                     None, // no custom partition template
                     &namespace_default_template.partition_template,
                 )

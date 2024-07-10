@@ -48,7 +48,8 @@ pub async fn arbitrary_table<R: RepoCollection + ?Sized>(
         .tables()
         .create(
             name,
-            TablePartitionTemplateOverride::try_new(None, &namespace.partition_template).unwrap(),
+            TablePartitionTemplateOverride::try_from_existing(None, &namespace.partition_template)
+                .unwrap(),
             namespace.id,
         )
         .await

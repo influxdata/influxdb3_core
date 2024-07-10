@@ -2,9 +2,11 @@
 //! used for testing or for an IOx designed to run without catalog persistence.
 
 use crate::interface::namespace_snapshot_by_name;
+use crate::util::should_delete_partition;
 use crate::{
     constants::{
         MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
+        MAX_PARQUET_L0_FILES_PER_PARTITION,
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
@@ -902,6 +904,41 @@ impl PartitionRepo for MemTxn {
         Ok(old_style)
     }
 
+    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+        let stage = self.collections.lock();
+
+        let now = self.time_provider.now();
+        let retention: HashMap<_, _> = stage
+            .namespaces
+            .iter()
+            .filter_map(|x| Some((x.id, x.retention_period_ns?)))
+            .collect();
+
+        let tables: HashMap<_, _> = stage
+            .tables
+            .iter()
+            .map(|x| (x.id, (x.namespace_id, x.partition_template.clone())))
+            .collect();
+
+        let mut candidates: HashMap<_, _> = stage
+            .partitions
+            .iter()
+            .filter_map(|x| {
+                let (ns_id, template) = tables.get(&x.table_id)?;
+                let retention = *retention.get(ns_id)?;
+
+                should_delete_partition(&x.partition_key, template, retention, now)
+                    .then_some((x.id, x.table_id))
+            })
+            .collect();
+
+        for p in &stage.parquet_files {
+            candidates.remove(&p.partition_id);
+        }
+
+        Ok(candidates.into_iter().map(|(p, t)| (t, p)).collect())
+    }
+
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
         let mut guard = self.collections.lock();
         let (partition, generation) = {
@@ -1001,12 +1038,20 @@ impl ParquetFileRepo for MemTxn {
         let partition_ids = partition_ids.into_iter().collect::<HashSet<_>>();
         let stage = self.collections.lock();
 
-        Ok(stage
+        let (mut l0s, others): (Vec<ParquetFile>, Vec<ParquetFile>) = stage
             .parquet_files
             .iter()
             .filter(|f| partition_ids.contains(&f.partition_id) && f.to_delete.is_none())
             .cloned()
-            .collect())
+            .partition(|f| f.compaction_level == CompactionLevel::Initial);
+
+        l0s.sort_by(|a, b| a.max_l0_created_at.cmp(&b.max_l0_created_at));
+        let l0s: Vec<ParquetFile> = l0s
+            .into_iter()
+            .take(MAX_PARQUET_L0_FILES_PER_PARTITION as usize)
+            .collect();
+
+        Ok(l0s.into_iter().chain(others.into_iter()).collect())
     }
 
     async fn get_by_object_store_id(

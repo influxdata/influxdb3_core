@@ -1,4 +1,6 @@
 //! Common config for all `run` commands.
+use std::path::PathBuf;
+
 use trace_exporters::TracingConfig;
 use trogging::cli::LoggingConfig;
 
@@ -95,6 +97,15 @@ pub struct RunConfig {
         action,
     )]
     pub max_http_request_size: usize,
+
+    /// Path to file containing license JWT.
+    #[clap(
+        long = "license-path",
+        env = "INFLUXDB_IOX_LICENSE_PATH",
+        default_value = "/etc/influxdb3/license.jwt",
+        action
+    )]
+    pub license_path: PathBuf,
 }
 
 impl RunConfig {
@@ -132,6 +143,7 @@ impl RunConfig {
         http_bind_address: SocketAddr,
         grpc_bind_address: SocketAddr,
         max_http_request_size: usize,
+        license_path: PathBuf,
     ) -> Self {
         Self {
             logging_config,
@@ -144,6 +156,7 @@ impl RunConfig {
             grpc_server_tcp_kernel_receive_buffer_size: None,
             http_server_tcp_kernel_send_buffer_size: None,
             http_server_tcp_kernel_receive_buffer_size: None,
+            license_path,
         }
     }
 }

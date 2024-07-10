@@ -247,10 +247,7 @@ impl TableProvider for ChunkTableProvider {
                     split_conjunction(&expr)
                         .into_iter()
                         .filter(|expr| {
-                            let Ok(expr_cols) = expr.to_columns() else {
-                                return false;
-                            };
-                            expr_cols
+                            expr.column_refs()
                                 .into_iter()
                                 .all(|c| dedup_cols.contains(c.name.as_str()))
                         })
@@ -262,7 +259,7 @@ impl TableProvider for ChunkTableProvider {
 
             if let Some(expr) = maybe_expr {
                 Arc::new(FilterExec::try_new(
-                    df_physical_expr(plan.schema(), expr)?,
+                    df_physical_expr(ctx, plan.schema(), expr)?,
                     plan,
                 )?)
             } else {

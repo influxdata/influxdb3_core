@@ -29,6 +29,7 @@ use datafusion::{
 pub struct NestedUnion;
 
 impl PhysicalOptimizerRule for NestedUnion {
+    #[allow(clippy::map_clone)]
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -40,14 +41,20 @@ impl PhysicalOptimizerRule for NestedUnion {
             if let Some(union_exec) = plan_any.downcast_ref::<UnionExec>() {
                 let children = union_exec.children();
 
-                let mut children_new = Vec::with_capacity(children.len());
+                let mut children_new: Vec<Arc<dyn ExecutionPlan>> =
+                    Vec::with_capacity(children.len());
                 let mut found_union = false;
                 for child in children {
                     if let Some(union_child) = child.as_any().downcast_ref::<UnionExec>() {
                         found_union = true;
-                        children_new.append(&mut union_child.children());
+                        let mut union_children = union_child
+                            .children()
+                            .iter()
+                            .map(|c| Arc::clone(c))
+                            .collect::<Vec<Arc<dyn ExecutionPlan>>>();
+                        children_new.append(&mut union_children);
                     } else {
-                        children_new.push(child)
+                        children_new.push(Arc::clone(child))
                     }
                 }
 

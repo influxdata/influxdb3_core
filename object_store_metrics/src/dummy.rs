@@ -8,10 +8,9 @@ use snafu::Snafu;
 use std::ops::Range;
 
 use object_store::{
-    path::Path, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartId,
-    ObjectMeta, ObjectStore, PutOptions, PutResult, Result,
+    path::Path, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
 };
-use tokio::io::AsyncWrite;
 
 /// A specialized `Error` for Azure object store-related errors
 #[derive(Debug, Snafu, Clone)]
@@ -60,20 +59,21 @@ impl ObjectStore for DummyObjectStore {
     async fn put_opts(
         &self,
         _location: &Path,
-        _bytes: Bytes,
+        _payload: PutPayload,
         _opts: PutOptions,
     ) -> Result<PutResult> {
         Ok(NotSupportedSnafu { name: self.name }.fail()?)
     }
 
-    async fn put_multipart(
-        &self,
-        _location: &Path,
-    ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+    async fn put_multipart(&self, _location: &Path) -> Result<Box<dyn MultipartUpload>> {
         Ok(NotSupportedSnafu { name: self.name }.fail()?)
     }
 
-    async fn abort_multipart(&self, _location: &Path, _multipart_id: &MultipartId) -> Result<()> {
+    async fn put_multipart_opts(
+        &self,
+        _location: &Path,
+        _opts: PutMultipartOpts,
+    ) -> Result<Box<dyn MultipartUpload>> {
         Ok(NotSupportedSnafu { name: self.name }.fail()?)
     }
 

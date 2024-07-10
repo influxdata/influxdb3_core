@@ -170,12 +170,14 @@ pub struct NamespaceServiceProtectionLimitsOverride {
     pub max_columns_per_table: Option<MaxColumnsPerTable>,
 }
 
-impl TryFrom<namespace_proto::ServiceProtectionLimits>
-    for NamespaceServiceProtectionLimitsOverride
-{
-    type Error = ServiceLimitError;
-
-    fn try_from(value: namespace_proto::ServiceProtectionLimits) -> Result<Self, Self::Error> {
+impl NamespaceServiceProtectionLimitsOverride {
+    /// Constructs a [`NamespaceServiceProtectionLimitsOverride`] from the
+    /// provided `value`, performing validation and applying
+    /// `column_limit_upper_bound` to the per-table column limit.
+    pub fn bounded_try_from(
+        value: namespace_proto::ServiceProtectionLimits,
+        column_limit_upper_bound: MaxColumnsPerTable,
+    ) -> Result<Self, ServiceLimitError> {
         let namespace_proto::ServiceProtectionLimits {
             max_tables,
             max_columns_per_table,
@@ -184,7 +186,17 @@ impl TryFrom<namespace_proto::ServiceProtectionLimits>
         Ok(Self {
             max_tables: max_tables.map(MaxTables::try_from).transpose()?,
             max_columns_per_table: max_columns_per_table
-                .map(MaxColumnsPerTable::try_from)
+                .map(|n| {
+                    MaxColumnsPerTable::try_from(n).map(|l| {
+                        if l <= column_limit_upper_bound {
+                            Ok(l)
+                        } else {
+                            Err(ServiceLimitError::ColumnLimitTooLarge(
+                                column_limit_upper_bound,
+                            ))
+                        }
+                    })?
+                })
                 .transpose()?,
         })
     }
@@ -216,17 +228,33 @@ pub enum ServiceLimitError {
     /// though they are stored as `usize` in Rust, the `usize` value must be less than `i32::MAX`.
     #[error("service limit values must fit in a 32-bit signed integer (`i32`)")]
     MustFitInI32,
+
+    /// Per-table column limits are restricted
+    #[error("per-table column limits are restricted to a maximum value of {0} for system performance purposes")]
+    ColumnLimitTooLarge(MaxColumnsPerTable),
 }
 
-impl TryFrom<Option<LimitUpdate>> for ServiceLimitUpdate {
-    type Error = ServiceLimitError;
-
-    fn try_from(limit_update: Option<LimitUpdate>) -> Result<Self, Self::Error> {
+impl ServiceLimitUpdate {
+    /// Constructs a [`ServiceLimitUpdate`] from the provided `limit_update`,
+    /// performing validation and applying `column_limit_upper_bound` to the
+    /// per-table column limit.
+    pub fn bounded_try_from(
+        limit_update: Option<LimitUpdate>,
+        column_limit_upper_bound: MaxColumnsPerTable,
+    ) -> Result<Self, ServiceLimitError> {
         match limit_update {
             Some(LimitUpdate::MaxTables(n)) => Ok(Self::MaxTables(MaxTables::try_from(n)?)),
-            Some(LimitUpdate::MaxColumnsPerTable(n)) => {
-                Ok(Self::MaxColumnsPerTable(MaxColumnsPerTable::try_from(n)?))
-            }
+            Some(LimitUpdate::MaxColumnsPerTable(n)) => Ok(Self::MaxColumnsPerTable(
+                MaxColumnsPerTable::try_from(n).map(|l| {
+                    if l <= column_limit_upper_bound {
+                        Ok(l)
+                    } else {
+                        Err(ServiceLimitError::ColumnLimitTooLarge(
+                            column_limit_upper_bound,
+                        ))
+                    }
+                })??,
+            )),
             None => Err(ServiceLimitError::NoValueSpecified),
         }
     }

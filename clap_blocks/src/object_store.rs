@@ -4,16 +4,18 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use non_empty_string::NonEmptyString;
 use object_store::{
+    local::LocalFileSystem,
     memory::InMemory,
     path::Path,
     throttle::{ThrottleConfig, ThrottledStore},
-    DynObjectStore,
+    DynObjectStore, ObjectStore,
 };
 use observability_deps::tracing::{info, warn};
 use snafu::{ResultExt, Snafu};
 use std::{convert::Infallible, fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 use url::Url;
 use uuid::Uuid;
+use versioned_file_store::VersionedFileSystemStore;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
@@ -265,6 +267,10 @@ pub enum ObjectStoreType {
     /// Filesystem.
     File,
 
+    /// Local file based object store that implements S3 style versioning for deleted objects
+    /// used for testing.
+    VersionedFile,
+
     /// AWS S3.
     S3,
 
@@ -273,6 +279,21 @@ pub enum ObjectStoreType {
 
     /// Azure object store.
     Azure,
+}
+
+impl ObjectStoreType {
+    /// Map enum variant to static string, followed inverse of clap parsing rules.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Memory => "memory",
+            Self::MemoryThrottled => "memory-throttled",
+            Self::File => "file",
+            Self::VersionedFile => "versioned-file",
+            Self::S3 => "s3",
+            Self::Google => "google",
+            Self::Azure => "azure",
+        }
+    }
 }
 
 #[cfg(feature = "gcp")]
@@ -386,9 +407,12 @@ fn new_azure(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
 /// Create config-dependant object store.
 pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     if let Some(data_dir) = &config.database_directory {
-        if !matches!(&config.object_store, Some(ObjectStoreType::File)) {
+        if !matches!(
+            &config.object_store,
+            Some(ObjectStoreType::File) | Some(ObjectStoreType::VersionedFile)
+        ) {
             warn!(?data_dir, object_store_type=?config.object_store,
-                  "--data-dir / `INFLUXDB_IOX_DB_DIR` ignored. It only affects 'file' object stores");
+                  "--data-dir / `INFLUXDB_IOX_DB_DIR` ignored. It only affects 'file' and 'versioned-file' object stores");
         }
     }
 
@@ -423,20 +447,19 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
         Some(ObjectStoreType::S3) => new_s3(config)?,
         Some(ObjectStoreType::Azure) => new_azure(config)?,
         Some(ObjectStoreType::File) => new_local_file_system(config)?,
+        Some(ObjectStoreType::VersionedFile) => new_versioned_local_file_system(config)?,
     };
 
     Ok(remote_store)
 }
 
-fn new_local_file_system(
-    config: &ObjectStoreConfig,
-) -> Result<Arc<object_store::local::LocalFileSystem>, ParseError> {
+fn new_local_file_system(config: &ObjectStoreConfig) -> Result<Arc<LocalFileSystem>, ParseError> {
     match config.database_directory.as_ref() {
         Some(db_dir) => {
             info!(?db_dir, object_store_type = "Directory", "Object Store");
             fs::create_dir_all(db_dir).context(CreatingDatabaseDirectorySnafu { path: db_dir })?;
 
-            let store = object_store::local::LocalFileSystem::new_with_prefix(db_dir)
+            let store = LocalFileSystem::new_with_prefix(db_dir)
                 .context(CreateLocalFileSystemSnafu { path: db_dir })?;
             Ok(Arc::new(store))
         }
@@ -446,6 +469,27 @@ fn new_local_file_system(
         }
         .fail()?,
     }
+}
+
+fn new_versioned_local_file_system(
+    config: &ObjectStoreConfig,
+) -> Result<Arc<dyn ObjectStore>, ParseError> {
+    let inner = new_local_file_system(config)?;
+
+    // use the same path as provided in the config.
+    // During testing, all the server fixtures will access the same versioning store.
+    let dir = config
+        .database_directory
+        .clone()
+        .expect("new_versioned_local_file_system requires a declared config.database_directory");
+
+    Ok(Arc::new(
+        VersionedFileSystemStore::try_new(inner, dir.clone()).context(
+            CreateLocalFileSystemSnafu {
+                path: dir.clone().as_path(),
+            },
+        )?,
+    ))
 }
 
 /// The `object_store::signer::Signer` trait is implemented for AWS and local file systems, so when
@@ -483,7 +527,7 @@ pub fn make_presigned_url_signer(
 /// Again, will not work and not intended to work in production, but is useful in local testing.
 #[derive(Debug)]
 pub struct LocalUploadSigner {
-    inner: Arc<object_store::local::LocalFileSystem>,
+    inner: Arc<LocalFileSystem>,
 }
 
 impl LocalUploadSigner {
@@ -498,7 +542,7 @@ impl LocalUploadSigner {
 impl object_store::signer::Signer for LocalUploadSigner {
     async fn signed_url(
         &self,
-        _method: reqwest::Method,
+        _method: http_1::Method,
         path: &Path,
         _expires_in: Duration,
     ) -> Result<Url, object_store::Error> {
@@ -776,6 +820,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_versioned_file_system_store() {
+        let root = TempDir::new().unwrap();
+        let root_path = root.path().to_str().unwrap();
+
+        let config = ObjectStoreConfig::try_parse_from([
+            "server",
+            "--object-store",
+            "versioned-file",
+            "--data-dir",
+            root_path,
+        ])
+        .unwrap();
+
+        let store = make_object_store(&config).unwrap();
+        assert!(store.to_string().starts_with("VersionedFileSystemStore"));
+    }
+
     #[tokio::test]
     async fn local_url_signer() {
         let root = TempDir::new().unwrap();
@@ -798,7 +860,7 @@ mod tests {
         let object_store_parquet_file_path = Path::parse(parquet_file_path).unwrap();
         let upload_url = signer
             .signed_url(
-                reqwest::Method::PUT,
+                http_1::Method::PUT,
                 &object_store_parquet_file_path,
                 Duration::from_secs(100),
             )
