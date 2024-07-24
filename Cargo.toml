@@ -92,7 +92,7 @@ arrow-flight = { version = "52.1.0", features = ["flight-sql-experimental"] }
 datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
 datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
 hashbrown = { version = "0.14.5" }
-object_store = { version = "0.10.1" }
+object_store = { version = "0.10.2" }
 parquet = { version = "52.1.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
