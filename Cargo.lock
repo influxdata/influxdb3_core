@@ -776,7 +776,7 @@ name = "catalog_cache"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "dashmap 6.0.1",
+ "dashmap",
  "futures",
  "generated_types",
  "hyper 0.14.30",
@@ -1229,19 +1229,6 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "5.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
-dependencies = [
- "cfg-if",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
-]
-
-[[package]]
-name = "dashmap"
 version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "804c8821570c3f8b70230c2ba75ffa5c0f9a4189b9a432b6656c536712acae28"
@@ -1291,8 +1278,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1304,17 +1291,18 @@ dependencies = [
  "bytes",
  "bzip2",
  "chrono",
- "dashmap 5.5.3",
+ "dashmap",
  "datafusion-common",
  "datafusion-common-runtime",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
  "datafusion-functions-aggregate",
- "datafusion-functions-array",
+ "datafusion-functions-nested",
  "datafusion-optimizer",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
+ "datafusion-physical-optimizer",
  "datafusion-physical-plan",
  "datafusion-sql",
  "flate2",
@@ -1332,7 +1320,7 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "rand",
- "sqlparser 0.47.0",
+ "sqlparser",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1344,8 +1332,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1360,25 +1348,25 @@ dependencies = [
  "num_cpus",
  "object_store",
  "parquet",
- "sqlparser 0.47.0",
+ "sqlparser",
 ]
 
 [[package]]
 name = "datafusion-common-runtime"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "datafusion-execution"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "arrow",
  "chrono",
- "dashmap 5.5.3",
+ "dashmap",
  "datafusion-common",
  "datafusion-expr",
  "futures",
@@ -1393,8 +1381,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1404,17 +1392,18 @@ dependencies = [
  "datafusion-common",
  "paste",
  "serde_json",
- "sqlparser 0.47.0",
+ "sqlparser",
  "strum",
  "strum_macros",
 ]
 
 [[package]]
 name = "datafusion-functions"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "base64 0.22.1",
  "blake2",
  "blake3",
@@ -1436,8 +1425,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1448,13 +1437,13 @@ dependencies = [
  "datafusion-physical-expr-common",
  "log",
  "paste",
- "sqlparser 0.47.0",
+ "sqlparser",
 ]
 
 [[package]]
-name = "datafusion-functions-array"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+name = "datafusion-functions-nested"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1465,15 +1454,17 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
+ "datafusion-functions-aggregate",
  "itertools 0.12.1",
  "log",
  "paste",
+ "rand",
 ]
 
 [[package]]
 name = "datafusion-optimizer"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1491,8 +1482,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1520,8 +1511,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr-common"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1532,9 +1523,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-physical-optimizer"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
+dependencies = [
+ "datafusion-common",
+ "datafusion-execution",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
+]
+
+[[package]]
 name = "datafusion-physical-plan"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "ahash",
  "arrow",
@@ -1566,8 +1568,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sql"
-version = "39.0.0"
-source = "git+https://github.com/apache/datafusion.git?rev=a64df83502821f18067fb4ff65dd217815b305c9#a64df83502821f18067fb4ff65dd217815b305c9"
+version = "40.0.0"
+source = "git+https://github.com/apache/datafusion.git?rev=fab7e238e8559bdb2e4e0449354f7efeccbc07a7#fab7e238e8559bdb2e4e0449354f7efeccbc07a7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1576,7 +1578,7 @@ dependencies = [
  "datafusion-expr",
  "log",
  "regex",
- "sqlparser 0.47.0",
+ "sqlparser",
  "strum",
 ]
 
@@ -2554,7 +2556,7 @@ version = "0.1.0"
 dependencies = [
  "generated_types",
  "snafu 0.8.4",
- "sqlparser 0.48.0",
+ "sqlparser",
  "workspace-hack",
 ]
 
@@ -2605,7 +2607,7 @@ dependencies = [
  "base64 0.22.1",
  "catalog_cache",
  "client_util",
- "dashmap 6.0.1",
+ "dashmap",
  "data_types",
  "dotenvy",
  "futures",
@@ -3496,7 +3498,7 @@ dependencies = [
  "arrow_util",
  "async-trait",
  "bytes",
- "dashmap 6.0.1",
+ "dashmap",
  "data_types",
  "datafusion",
  "futures",
@@ -5020,21 +5022,12 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "295e9930cd7a97e58ca2a070541a3ca502b17f5d1fa7157376d0fabd85324f25"
-dependencies = [
- "log",
- "sqlparser_derive",
-]
-
-[[package]]
-name = "sqlparser"
 version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "749780d15ad1ee15fd74f5f84b0665560b6abb913de744c2b69155770f9601da"
 dependencies = [
  "log",
+ "sqlparser_derive",
 ]
 
 [[package]]
