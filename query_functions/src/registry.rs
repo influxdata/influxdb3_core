@@ -84,6 +84,10 @@ impl FunctionRegistry for IOxFunctionRegistry {
             "IOx FunctionRegistry does not contain user defined window function '{name}'"
         )))
     }
+
+    fn expr_planners(&self) -> Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>> {
+        vec![]
+    }
 }
 
 /// Return a reference to the global iox function registry
