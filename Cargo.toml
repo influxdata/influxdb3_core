@@ -36,6 +36,7 @@ members = [
     "metric_exporters",
     "metric",
     "mutable_batch_lp",
+    "mutable_batch_lp/fuzz",
     "mutable_batch_pb",
     "mutable_batch_tests",
     "mutable_batch",
@@ -111,7 +112,8 @@ tonic-reflection = { version = "0.11.0" }
 [workspace.lints.rust]
 missing_copy_implementations = "deny"
 missing_debug_implementations = "deny"
-rust_2018_idioms = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 unreachable_pub = "deny"
 unused_crate_dependencies = "deny"
 
