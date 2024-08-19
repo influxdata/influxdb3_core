@@ -3,7 +3,6 @@
 members = [
     "arrow_util",
     "backoff",
-    "cache_system",
     "clap_blocks",
     "client_util",
     "data_types",
@@ -36,6 +35,7 @@ members = [
     "metric_exporters",
     "metric",
     "mutable_batch_lp",
+    "mutable_batch_lp/fuzz",
     "mutable_batch_pb",
     "mutable_batch_tests",
     "mutable_batch",
@@ -92,7 +92,7 @@ arrow-flight = { version = "52.1.0", features = ["flight-sql-experimental"] }
 datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
 datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
 hashbrown = { version = "0.14.5" }
-object_store = { version = "0.10.1" }
+object_store = { version = "0.10.2" }
 parquet = { version = "52.1.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
@@ -111,7 +111,8 @@ tonic-reflection = { version = "0.11.0" }
 [workspace.lints.rust]
 missing_copy_implementations = "deny"
 missing_debug_implementations = "deny"
-rust_2018_idioms = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 unreachable_pub = "deny"
 unused_crate_dependencies = "deny"
 
