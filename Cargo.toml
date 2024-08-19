@@ -3,7 +3,6 @@
 members = [
     "arrow_util",
     "backoff",
-    "cache_system",
     "clap_blocks",
     "client_util",
     "data_types",
