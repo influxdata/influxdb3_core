@@ -101,15 +101,15 @@ macro_rules! setup_builder {
     ($input:ident, $server_type:ident) => {
         $crate::setup_builder_impl!($input, $server_type, None)
     };
-    ($input:ident, $server_type:ident, $server_timeout:expr) => {
-        $crate::setup_builder_impl!($input, $server_type, Some($server_timeout))
+    ($input:ident, $server_type:ident, $server_opts:expr) => {
+        $crate::setup_builder_impl!($input, $server_type, Some($server_opts))
     };
 }
 
 #[macro_export]
 #[doc(hidden)]
 macro_rules! setup_builder_impl {
-    ($input:ident, $server_type:ident, $server_timeout:expr) => {{
+    ($input:ident, $server_type:ident, $server_opts:expr) => {{
         #[allow(unused_imports)]
         use std::collections::HashSet;
         #[allow(unused_imports)]
@@ -123,10 +123,21 @@ macro_rules! setup_builder_impl {
             shutdown,
         } = $input;
 
+        type OptFn<T> = fn(T) -> T;
+        let server_opts_fn: Option<OptFn<$crate::reexport::tonic::transport::Server>> = $server_opts;
+
         let (health_reporter, health_service) =
             $crate::reexport::tonic_health::server::health_reporter();
 
         let builder = $crate::reexport::tonic::transport::Server::builder();
+
+        let builder = match server_opts_fn {
+            Some(opts) => {
+                opts(builder)
+            }
+            None => builder,
+        };
+
         let builder = builder
             .layer($crate::reexport::trace_http::tower::TraceLayer::new(
                 trace_header_parser,
@@ -143,11 +154,6 @@ macro_rules! setup_builder_impl {
                 ),
             )
             .layer($crate::reexport::tower_trailer::TrailerLayer::default());
-
-        let builder = match $server_timeout {
-            Some(t) => builder.timeout(t),
-            None => builder,
-        };
 
         // all services being registered should have a FileDescriptorProto available execept for
         // these
