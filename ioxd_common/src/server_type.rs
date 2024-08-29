@@ -22,6 +22,9 @@ pub enum RpcError {
         details: String,
     },
 
+    #[snafu(display("Tls setup failure"))]
+    Tls,
+
     #[snafu(display("gRPC endpoint is not implemented"))]
     UnImplemented,
 }
