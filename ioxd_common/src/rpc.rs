@@ -99,10 +99,10 @@ macro_rules! add_service {
 #[macro_export]
 macro_rules! setup_builder {
     ($input:ident, $server_type:ident) => {
-        $crate::setup_builder_impl!($input, $server_type, None)
+        $crate::setup_builder_impl!($input, $server_type, |b| b)
     };
     ($input:ident, $server_type:ident, $server_opts:expr) => {
-        $crate::setup_builder_impl!($input, $server_type, Some($server_opts))
+        $crate::setup_builder_impl!($input, $server_type, $server_opts)
     };
 }
 
@@ -123,20 +123,20 @@ macro_rules! setup_builder_impl {
             shutdown,
         } = $input;
 
-        type OptFn<T> = fn(T) -> T;
-        let server_opts_fn: Option<OptFn<$crate::reexport::tonic::transport::Server>> = $server_opts;
-
         let (health_reporter, health_service) =
             $crate::reexport::tonic_health::server::health_reporter();
 
         let builder = $crate::reexport::tonic::transport::Server::builder();
 
-        let builder = match server_opts_fn {
-            Some(opts) => {
-                opts(builder)
-            }
-            None => builder,
-        };
+        // to force type inference on the macro expr
+        fn handle_opts(
+            b: $crate::reexport::tonic::transport::Server,
+            f: impl FnOnce($crate::reexport::tonic::transport::Server) -> $crate::reexport::tonic::transport::Server,
+        ) -> $crate::reexport::tonic::transport::Server {
+            f(b)
+        }
+
+        let builder = handle_opts(builder, $server_opts);
 
         let builder = builder
             .layer($crate::reexport::trace_http::tower::TraceLayer::new(
