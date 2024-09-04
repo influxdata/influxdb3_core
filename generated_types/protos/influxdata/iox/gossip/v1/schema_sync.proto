@@ -19,7 +19,7 @@ service AntiEntropyService {
 
   // Fetch all schemas in the peer cache within the specified inclusive key
   // range bounds.
-  rpc GetRange(GetRangeRequest) returns (GetRangeResponse);
+  rpc GetRange(GetRangeRequest) returns (stream GetRangeResponse);
 }
 
 // Request the receiver perform a Merkle Search Tree diff against the provided
@@ -50,7 +50,7 @@ message PageRange {
 // An inclusive range of namespace names which contains at least one
 // inconsistent schema.
 message DiffRange {
-  // Lexicographically minimum inconsistent namespace name in this diff range 
+  // Lexicographically minimum inconsistent namespace name in this diff range
   // (inclusive).
   string min = 1;
 
@@ -62,7 +62,7 @@ message DiffRange {
 // Fetch the namespace schemas with namespace names falling within the specified
 // inclusive range.
 message GetRangeRequest {
-  // Lexicographically minimum namespace name in this range to be fetched 
+  // Lexicographically minimum namespace name in this range to be fetched
   // (inclusive).
   string min = 1;
 

@@ -13,8 +13,7 @@ use arrow::{
     },
 };
 use arrow_flight::sql::SqlSupportsConvert;
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 pub(crate) const SQL_INFO_SQL_KEYWORDS: &[&str] = &[
     // SQL-92 Reserved Words
@@ -314,8 +313,8 @@ pub(crate) const SQL_INFO_DATE_TIME_FUNCTIONS: &[&str] = &[
 
 pub(crate) const SQL_INFO_SYSTEM_FUNCTIONS: &[&str] = &["array", "arrow_typeof", "struct"];
 
-static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: Lazy<HashMap<SqlSupportsConvert, DataType>> =
-    Lazy::new(|| {
+static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: LazyLock<HashMap<SqlSupportsConvert, DataType>> =
+    LazyLock::new(|| {
         [
             // Referenced from DataFusion data types
             // https://arrow.apache.org/datafusion/user-guide/sql/data_types.html
@@ -373,18 +372,21 @@ static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: Lazy<HashMap<SqlSupportsConvert, DataTy
         .collect()
     });
 
-pub(crate) static SQL_INFO_SUPPORTS_CONVERT: Lazy<HashMap<i32, Vec<i32>>> = Lazy::new(|| {
-    let mut convert: HashMap<i32, Vec<i32>> = HashMap::new();
-    for (from_type_sql, from_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone().into_iter() {
-        let mut can_convert_to: Vec<i32> = vec![];
-        for (to_type_sql, to_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone().into_iter() {
-            if can_cast_types(&from_type_arrow, &to_type_arrow) {
-                can_convert_to.push(to_type_sql as i32)
+pub(crate) static SQL_INFO_SUPPORTS_CONVERT: LazyLock<HashMap<i32, Vec<i32>>> =
+    LazyLock::new(|| {
+        let mut convert: HashMap<i32, Vec<i32>> = HashMap::new();
+        for (from_type_sql, from_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone().into_iter()
+        {
+            let mut can_convert_to: Vec<i32> = vec![];
+            for (to_type_sql, to_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone().into_iter()
+            {
+                if can_cast_types(&from_type_arrow, &to_type_arrow) {
+                    can_convert_to.push(to_type_sql as i32)
+                }
+            }
+            if !can_convert_to.is_empty() {
+                convert.insert(from_type_sql as i32, can_convert_to);
             }
         }
-        if !can_convert_to.is_empty() {
-            convert.insert(from_type_sql as i32, can_convert_to);
-        }
-    }
-    convert
-});
+        convert
+    });

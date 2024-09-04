@@ -47,7 +47,7 @@
 //! encoded.
 //!
 //! Because this serialisation format can be unambiguously reversed, the
-//! [`build_column_values()`] function can be used to obtain the set of
+//! [`TablePartitionTemplateOverride::column_values()`] function can be used to obtain the set of
 //! [`TemplatePart::TagValue`] and/or [`TemplatePart::Bucket`] the key
 //! was constructed from.
 //!
@@ -58,7 +58,7 @@
 //! this length limit, it is truncated and the truncation marker `#`
 //! ([`PARTITION_KEY_PART_TRUNCATED`]) is appended.
 //!
-//! When rebuilding column values using [`build_column_values()`], a truncated
+//! When rebuilding column values using [`TablePartitionTemplateOverride::column_values`], a truncated
 //! key part yields [`ColumnValue::Prefix`], which can only be used for prefix
 //! matching - equality matching against a string always returns false.
 //!
@@ -177,21 +177,20 @@
 //! [percent encoded]: https://url.spec.whatwg.org/#percent-encoded-bytes
 use std::{
     borrow::Cow,
+    cmp::min,
     fmt::{Display, Formatter},
-    ops::Range,
-    sync::Arc,
+    ops::{Add, Range},
+    sync::{Arc, LazyLock},
 };
 
-use chrono::{
-    format::{Numeric, StrftimeItems},
-    DateTime, Days, Months, Utc,
-};
+use chrono::{format::StrftimeItems, DateTime, Days, Months, Utc};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use murmur3::murmur3_32;
-use once_cell::sync::Lazy;
 use percent_encoding::{percent_decode_str, AsciiSet, CONTROLS};
 use schema::TIME_COLUMN_NAME;
 use thiserror::Error;
+
+use crate::{MismatchedNumPartsError, PartitionKey, PartitionKeyBuilder};
 
 /// Reasons a user-specified partition template isn't valid.
 #[derive(Debug, Error)]
@@ -285,7 +284,7 @@ pub const PARTITION_KEY_MAX_PART_LEN: usize = 200;
 /// key as having been truncated.
 ///
 /// Truncated partition key parts can only be used for prefix matching, and
-/// yield a [`ColumnValue::Prefix`] from [`build_column_values()`].
+/// yield a [`ColumnValue::Prefix`] from [`TablePartitionTemplateOverride::column_values`].
 pub const PARTITION_KEY_PART_TRUNCATED: char = '#';
 
 /// The reserved tag value key for the `time` column, which is reserved as
@@ -305,7 +304,7 @@ pub const ALLOWED_BUCKET_QUANTITIES: Range<u32> = Range {
 /// generation when they form part of a partition key part, in order to be
 /// unambiguously reversible.
 ///
-/// See module-level documentation & [`build_column_values()`].
+/// See module-level documentation & [`TablePartitionTemplateOverride::column_values`].
 pub const ENCODED_PARTITION_KEY_CHARS: AsciiSet = CONTROLS
     .add(PARTITION_KEY_DELIMITER as u8)
     .add(PARTITION_KEY_VALUE_NULL as u8)
@@ -315,7 +314,7 @@ pub const ENCODED_PARTITION_KEY_CHARS: AsciiSet = CONTROLS
 
 /// Allocationless and protobufless access to the parts of a template needed to
 /// actually do partitioning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum TemplatePart<'a> {
     /// A tag-value partition part.
     ///
@@ -347,7 +346,7 @@ impl<'a> TemplatePart<'a> {
 }
 
 /// The default partitioning scheme is by each day according to the "time" column.
-pub static PARTITION_BY_DAY_PROTO: Lazy<Arc<proto::PartitionTemplate>> = Lazy::new(|| {
+pub static PARTITION_BY_DAY_PROTO: LazyLock<Arc<proto::PartitionTemplate>> = LazyLock::new(|| {
     Arc::new(proto::PartitionTemplate {
         parts: vec![proto::TemplatePart {
             part: Some(proto::template_part::Part::TimeFormat(
@@ -386,6 +385,14 @@ pub fn bucket_for_tag_value(tag_value: &str, num_buckets: u32) -> u32 {
     // 32 bit murmur hash and modulo by the number of buckets to assign
     // across.
     (hash & i32::MAX as u32) % num_buckets
+}
+
+/// Returns exploded parts of the given partition key on the "|" character ([`PARTITION_KEY_DELIMITER`]).
+///
+/// Any uses of the "|" character within the partition key's user-provided
+/// values are url encoded, so this is an unambiguous field separator.
+fn split_partition_key(key: &str) -> impl Iterator<Item = &str> {
+    key.split(PARTITION_KEY_DELIMITER)
 }
 
 /// A partition template specified by a namespace record.
@@ -450,6 +457,25 @@ impl NamespacePartitionTemplateOverride {
     /// [`serialization::Wrapper::parts()`].
     pub fn parts(&self) -> impl Iterator<Item = TemplatePart<'_>> {
         serialization::Wrapper::parts(self.0.as_ref())
+    }
+}
+
+impl NamespacePartitionTemplateOverride {
+    /// Create a [`PartitionKey`] intended to be used with this
+    /// [`NamespacePartitionTemplateOverride`], where the caller provides a slice of items to
+    /// construct the key with. This just calls methods on [`PartitionKeyBuilder`] internally, and
+    /// is provided only as a convenience method.
+    pub fn part_key<T: Display>(
+        &self,
+        parts: &[T],
+    ) -> Result<PartitionKey, MismatchedNumPartsError> {
+        let mut builder = PartitionKeyBuilder::new(self);
+
+        for part in parts {
+            builder = builder.push(part);
+        }
+
+        builder.build()
     }
 }
 
@@ -606,6 +632,39 @@ impl TablePartitionTemplateOverride {
     /// Return the protobuf representation of this template.
     pub fn as_proto(&self) -> Option<&proto::PartitionTemplate> {
         self.0.as_ref().map(|v| v.inner())
+    }
+
+    /// Reverse a `partition_key` generated from the given `template`, reconstructing the set of
+    /// tag values and bucket IDs the `partition_key` was generated from, in the form of `(column
+    /// name, column value)` tuples.
+    ///
+    /// The `partition_key` MUST have been generated by the same `template`.
+    ///
+    /// If you need to process many partition keys against the same template, consider using the
+    /// more efficient [`Self::column_values_builder`] API instead.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if a column value is not valid UTF8 after decoding, or
+    /// when a bucket ID is not valid (not a u32 or within the expected number of
+    /// buckets).
+    pub fn column_values<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> impl Iterator<Item = (&'a str, Option<ColumnValue<'a>>)> {
+        self.column_values_builder()
+            .into_column_values_from_key(key)
+    }
+
+    /// Creates a [`ColumnValuesBuilder`] that can be used to reverse partition keys generated from
+    /// this template by calling the method [`ColumnValuesBuilder::build_from_key`].
+    ///
+    /// Some prepared state is stored in this builder to avoid redundant work when processing
+    /// many partition keys against the same template. If you only need to process a single partition
+    /// key for a single template, consider using the simpler [`Self::column_values`] API
+    /// instead.
+    pub fn column_values_builder(&self) -> ColumnValuesBuilder<'_> {
+        ColumnValuesBuilder::new(self.parts())
     }
 }
 
@@ -839,7 +898,7 @@ mod serialization {
 
 /// The value of a column, reversed from a partition key.
 ///
-/// See [`build_column_values()`].
+/// See [`TablePartitionTemplateOverride::column_values`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnValue<'a> {
     /// The inner value is the exact, unmodified input column value.
@@ -909,55 +968,141 @@ where
     }
 }
 
-/// Reverse a `partition_key` generated from the given partition key `template`,
-/// reconstructing the set of tag values and bucket IDs the `partition_key` was
-/// generated from, in the form of `(column name, column value)` tuples.
+#[derive(Debug)]
+/// Reverses partition keys into [`ColumnValue`]s using the `template` passed to
+/// [`ColumnValuesBuilder::new`].
 ///
-/// The `partition_key` MUST have been generated by `template`.
-///
-/// Tag values are returned as a [`Cow`], avoiding the need for value copying if
-/// they do not need decoding, while buckets are returned as a tuple of
-/// `(bucket id, number of buckets)`. See module docs for encoding/decoding
-/// details.
-///
-/// # Panics
-///
-/// This method panics if a column value is not valid UTF8 after decoding, or
-/// when a bucket ID is not valid (not a u32 or within the expected number of
-/// buckets).
-pub fn build_column_values<'a>(
-    template: &'a TablePartitionTemplateOverride,
-    partition_key: &'a str,
-) -> impl Iterator<Item = (&'a str, Option<ColumnValue<'a>>)> {
-    // Exploded parts of the generated key on the "|" character.
-    //
-    // Any uses of the "|" character within the partition key's user-provided
-    // values are url encoded, so this is an unambiguous field separator.
-    let key_parts = partition_key.split(PARTITION_KEY_DELIMITER);
+/// This builder stores some "prepared" state from the template string parts, so that redundant work
+/// can be avoided when the builder is used to process multiple partition keys. For example, time
+/// format strings are parsed and processed in advance.
+pub struct ColumnValuesBuilder<'t> {
+    parts: Vec<ColumnValueBuilder<'t>>,
+}
 
-    // Obtain an iterator of template parts, from which the meaning of the key
-    // parts can be inferred.
-    let template_parts = template.parts();
+impl<'t> ColumnValuesBuilder<'t> {
+    /// Constructs a [`ColumnValuesBuilder`] from an iterator of [`TemplatePart`]s.
+    ///
+    /// The returned builder contains prepared state that can be used to reverse multiple
+    /// partition keys generated from the same source template by calling the
+    /// [`ColumnValuesBuilder::build_from_key`] method on each partition key.
+    pub fn new(template: impl IntoIterator<Item = TemplatePart<'t>>) -> Self {
+        Self {
+            parts: template.into_iter().map(ColumnValueBuilder::new).collect(),
+        }
+    }
 
-    // Invariant: the number of key parts generated from a given template always
-    // matches the number of template parts.
-    //
-    // The key_parts iterator is not an ExactSizeIterator, so an assert can't be
-    // placed here to validate this property.
-
-    // Produce an iterator of (template_part, template_value)
-    template_parts.zip(key_parts).map(|(template, value)| {
-        let name = template.column_name();
-        let value = (value != PARTITION_KEY_VALUE_NULL_STR)
-            .then(|| match template {
-                TemplatePart::TagValue(_) => parse_part_tag_value(value),
-                TemplatePart::TimeFormat(format) => parse_part_time_format(value, format),
-                TemplatePart::Bucket(_, num_buckets) => parse_part_bucket(value, num_buckets),
+    /// Reverse a `partition_key` generated from the `template` used to create this builder,
+    /// reconstructing the set of tag values and bucket IDs the `partition_key` was generated from,
+    /// in the form of `(column name, column value)` tuples.
+    ///
+    /// The `partition_key` MUST have been generated by the same `template`.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if a column value is not valid UTF8 after decoding, or
+    /// when a bucket ID is not valid (not a u32 or within the expected number of
+    /// buckets).
+    pub fn build_from_key<'a>(
+        &'a self,
+        partition_key: &'t str,
+    ) -> impl Iterator<Item = (&'t str, Option<ColumnValue<'t>>)> + 'a {
+        // Invariant: the number of key parts generated from a given template
+        // always matches the number of template parts, and the partition key
+        // must be produced from the same template used to construct this builder
+        //
+        // The split_partition_key iterator is not an ExactSizeIterator, so an assert can't be
+        // placed here to validate this property.
+        self.parts
+            .iter()
+            .zip(split_partition_key(partition_key))
+            .map(move |(builder, value)| {
+                let name = builder.column_name();
+                let value = builder.build_from_key_part(value);
+                (name, value)
             })
-            .flatten();
+    }
 
-        (name, value)
-    })
+    /// A private variant of [`Self::build_from_key`] that consumes the builder. This is used by
+    /// the public [`TablePartitionTemplateOverride::column_values`] method as an easier API for
+    /// when only one partition key is needed.
+    fn into_column_values_from_key(
+        self,
+        partition_key: &'t str,
+    ) -> impl Iterator<Item = (&'t str, Option<ColumnValue<'t>>)> {
+        self.parts
+            .into_iter()
+            .zip(split_partition_key(partition_key))
+            .map(move |(builder, value)| {
+                let name = builder.column_name();
+                let value = builder.build_from_key_part(value);
+                (name, value)
+            })
+    }
+
+    /// Get the number of [`TemplatePart`]s used to create this builder.
+    #[allow(clippy::len_without_is_empty)] // there must always be >0 parts.
+    pub fn len(&self) -> usize {
+        self.parts.len()
+    }
+}
+
+#[derive(Debug)]
+/// Prepared state for decoding a single partition key part into a [`ColumnValue`]
+///
+/// The enum variants are analogous to the [`TemplatePart`] variants of the same name.
+enum ColumnValueBuilder<'t> {
+    /// Stores prepared state needed to convert a[`TemplatePart::TagValue`] into a [ColumnValue]
+    ///
+    /// No extra state is needed here so we just store the name of the tag column.
+    TagValue(&'t str),
+
+    /// Stores prepared state needed to convert a [`TemplatePart::TimeFormat`] into a [`ColumnValue`]
+    ///
+    /// See [`TimeFormatColumnValueState`] for detailed explanation of the state values.
+    /// A value of [`None`] indicates the time format of this template is not supported or not implemented.
+    TimeFormat(Option<TimeFormatColumnValueState<'t>>),
+
+    /// Stores prepared state needed to convert a [`TemplatePart::Bucket`] into a [ColumnValue]
+    ///
+    /// No extra state is needed here so we just store the name of the tag column and the bucket ID
+    Bucket(&'t str, u32),
+}
+
+impl<'t> ColumnValueBuilder<'t> {
+    /// Create prepared state from a given [`TemplatePart`]
+    fn new(part: TemplatePart<'t>) -> Self {
+        match part {
+            TemplatePart::TagValue(tag) => Self::TagValue(tag),
+            TemplatePart::TimeFormat(format) => {
+                Self::TimeFormat(TimeFormatColumnValueState::try_new(format))
+            }
+            TemplatePart::Bucket(tag, bucket) => Self::Bucket(tag, bucket),
+        }
+    }
+
+    /// Convert part of a partition key into a [`ColumnValue`].
+    ///
+    /// The partition key part MUST have been generated from the same [`TemplatePart`] used to
+    /// construct this builder.
+    fn build_from_key_part(&self, value: &'t str) -> Option<ColumnValue<'t>> {
+        (value != PARTITION_KEY_VALUE_NULL_STR)
+            .then(|| match self {
+                Self::TagValue(_) => parse_part_tag_value(value),
+                Self::TimeFormat(None) => None,
+                Self::TimeFormat(Some(time_builder)) => time_builder.parse_part_time_format(value),
+                Self::Bucket(_, num_buckets) => parse_part_bucket(value, *num_buckets),
+            })
+            .flatten()
+    }
+
+    /// Get the column name. Same as [`TemplatePart::column_name`].
+    fn column_name(&self) -> &'t str {
+        match self {
+            Self::TagValue(c) => c,
+            Self::TimeFormat(_) => TIME_COLUMN_NAME,
+            Self::Bucket(c, _) => c,
+        }
+    }
 }
 
 fn parse_part_tag_value(value: &str) -> Option<ColumnValue<'_>> {
@@ -996,62 +1141,6 @@ fn parse_part_tag_value(value: &str) -> Option<ColumnValue<'_>> {
     } else {
         Some(ColumnValue::Identity(decoded))
     }
-}
-
-fn parse_part_time_format(value: &str, format: &str) -> Option<ColumnValue<'static>> {
-    use chrono::format::{parse, Item, Parsed};
-
-    let items = StrftimeItems::new(format);
-
-    let mut parsed = Parsed::new();
-    parse(&mut parsed, value, items.clone()).ok()?;
-
-    // fill in defaults
-    let parsed = parsed_implicit_defaults(parsed)?;
-
-    let begin = parsed.to_datetime_with_timezone(&Utc).ok()?;
-
-    let mut end: Option<DateTime<Utc>> = None;
-    for item in items {
-        let item_end = match item {
-            Item::Literal(_) | Item::OwnedLiteral(_) | Item::Space(_) | Item::OwnedSpace(_) => None,
-            Item::Error => {
-                return None;
-            }
-            Item::Numeric(numeric, _pad) => {
-                match numeric {
-                    Numeric::Year => Some(begin + Months::new(12)),
-                    Numeric::Month => Some(begin + Months::new(1)),
-                    Numeric::Day => Some(begin + Days::new(1)),
-                    _ => {
-                        // not supported
-                        return None;
-                    }
-                }
-            }
-            Item::Fixed(_) => {
-                // not implemented
-                return None;
-            }
-        };
-
-        end = match (end, item_end) {
-            (Some(a), Some(b)) => {
-                let a_d = a - begin;
-                let b_d = b - begin;
-                if a_d < b_d {
-                    Some(a)
-                } else {
-                    Some(b)
-                }
-            }
-            (None, Some(dt)) => Some(dt),
-            (Some(dt), None) => Some(dt),
-            (None, None) => None,
-        };
-    }
-
-    end.map(|end| ColumnValue::Datetime { begin, end })
 }
 
 fn parse_part_bucket(value: &str, num_buckets: u32) -> Option<ColumnValue<'_>> {
@@ -1113,6 +1202,118 @@ fn parsed_implicit_defaults(mut parsed: chrono::format::Parsed) -> Option<chrono
     }
 
     Some(parsed)
+}
+
+/// Prepared state for decoding a partition key timestamp into the time range of its column values
+#[derive(Debug)]
+pub struct TimeFormatColumnValueState<'t> {
+    /// The parsed time format string. This is used to construct a DateTime from the partition key
+    /// timestamp
+    parsed_format: Vec<chrono::format::Item<'t>>,
+    /// Computed time duration to add to a partition key timestamp (representing the lower bound of
+    /// the partition time interval) to get the upper bound of the partition time interval
+    partition_duration: PartitionDuration,
+}
+
+impl<'t> TimeFormatColumnValueState<'t> {
+    fn try_new(format: &'t str) -> Option<Self> {
+        let parsed_format = StrftimeItems::new(format).collect::<Vec<_>>();
+        let partition_duration = PartitionDuration::from_format_items(parsed_format.iter())?;
+        Some(Self {
+            parsed_format,
+            partition_duration,
+        })
+    }
+
+    fn parse_part_time_format(&self, value: &'t str) -> Option<ColumnValue<'t>> {
+        use chrono::format::{parse, Parsed};
+        let Self {
+            parsed_format,
+            partition_duration,
+        } = self;
+
+        let mut parsed = Parsed::new();
+        parse(&mut parsed, value, parsed_format.iter()).ok()?;
+
+        // fill in defaults
+        let parsed = parsed_implicit_defaults(parsed)?;
+
+        let begin = parsed.to_datetime_with_timezone(&Utc).ok()?;
+        let end: DateTime<Utc> = begin + *partition_duration;
+        Some(ColumnValue::Datetime { begin, end })
+    }
+}
+
+/// Logically represents the duration of time that a [`ColumnValue::Datetime`] created from a
+/// [`TemplatePart::TimeFormat`] represents.
+///
+/// Currently this is constrained to the set of durations that we support for partition pruning. As
+/// such, not all possible time formats can be represented with this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PartitionDuration {
+    /// A daily partition time duration. Example time format: %Y-%m-%d
+    Daily,
+    /// A monthly partition time duration. Example time format: %Y-%m
+    Monthly,
+    /// A yearly partition time duration. Example time format: %Y
+    Yearly,
+}
+
+impl PartitionDuration {
+    /// Convert from a numeric time specifier. For example [`chrono::format::Numeric::Year`] is converted to
+    /// [`PartitionDuration::Yearly`]. A value of [`None`] indicates that the time format is not supported by
+    /// partition pruning.
+    fn from_numeric_format_part(value: chrono::format::Numeric) -> Option<Self> {
+        use chrono::format::Numeric;
+        Some(match value {
+            Numeric::Year => PartitionDuration::Yearly,
+            Numeric::Month => PartitionDuration::Monthly,
+            Numeric::Day => PartitionDuration::Daily,
+            _ => return None,
+        })
+    }
+
+    /// Convert from an iterator of chrono time format items, obtained by parsing a
+    /// [`TemplatePart::TimeFormat`] string.
+    fn from_format_items<'a>(
+        items: impl IntoIterator<Item = &'a chrono::format::Item<'a>>,
+    ) -> Option<Self> {
+        use chrono::format::Item;
+        let mut min_duration = None;
+        for item in items {
+            match item {
+                // ignore these
+                Item::Literal(_) | Item::OwnedLiteral(_) | Item::Space(_) | Item::OwnedSpace(_) => {
+                    continue
+                }
+                // break out on error
+                Item::Error => return None,
+                // not implemented. break out
+                Item::Fixed(_) => return None,
+                Item::Numeric(numeric, _pad) => {
+                    let duration = PartitionDuration::from_numeric_format_part(numeric.clone())?;
+                    // find smaller of current minimum and new duration
+                    min_duration = Some(match min_duration {
+                        Some(current_min) => min(current_min, duration),
+                        None => duration,
+                    })
+                }
+            }
+        }
+        min_duration
+    }
+}
+
+impl<Tz: chrono::TimeZone> Add<PartitionDuration> for chrono::DateTime<Tz> {
+    type Output = Self;
+    /// Add a [`PartitionDuration`] to a [`chrono::DateTime`].
+    fn add(self, rhs: PartitionDuration) -> Self::Output {
+        match rhs {
+            PartitionDuration::Yearly => self + Months::new(12),
+            PartitionDuration::Monthly => self + Months::new(1),
+            PartitionDuration::Daily => self + Days::new(1),
+        }
+    }
 }
 
 /// In production code, the template should come from protobuf that is either from the database or
@@ -1653,7 +1854,7 @@ mod tests {
                         .collect::<Vec<_>>();
 
                     let input = String::from($partition_key);
-                    let got = build_column_values(&template, input.as_str())
+                    let got = template.column_values(input.as_str())
                         .collect::<Vec<_>>();
 
                     assert_eq!(got, want);
@@ -1934,6 +2135,20 @@ mod tests {
     );
 
     test_build_column_values!(
+        datetime_unsupported_numeric,
+        template = [TemplatePart::TimeFormat("%d-%m-%Y-%H"),],
+        partition_key = "01-09-2023",
+        want = [(TIME_COLUMN_NAME, None,)]
+    );
+
+    test_build_column_values!(
+        datetime_unsupported_fixed,
+        template = [TemplatePart::TimeFormat("%d-%m-%Y-%b"),],
+        partition_key = "01-09-2023",
+        want = [(TIME_COLUMN_NAME, None,)]
+    );
+
+    test_build_column_values!(
         bucket_part_fixture,
         template = [
             TemplatePart::Bucket("a", 41),
@@ -1962,7 +2177,7 @@ mod tests {
 
         // normalise the values into a (str, ColumnValue) for the comparison
         let input = String::from("1|1|43");
-        let _ = build_column_values(&template, input.as_str()).collect::<Vec<_>>();
+        let _ = template.column_values(input.as_str()).collect::<Vec<_>>();
     }
 
     #[test]
@@ -1979,7 +2194,7 @@ mod tests {
 
         // normalise the values into a (str, ColumnValue) for the comparison
         let input = String::from("1|1|bananas");
-        let _ = build_column_values(&template, input.as_str()).collect::<Vec<_>>();
+        let _ = template.column_values(input.as_str()).collect::<Vec<_>>();
     }
 
     test_build_column_values!(

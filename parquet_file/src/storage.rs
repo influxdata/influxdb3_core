@@ -150,11 +150,10 @@ impl ParquetExecInput {
         let exec_schema = exec.schema();
         datafusion::physical_plan::collect(Arc::new(exec), session_ctx.task_ctx())
             .await
-            .map(|batches| {
-                for batch in &batches {
+            .inspect(|batches| {
+                for batch in batches {
                     assert_eq!(batch.schema(), exec_schema);
                 }
-                batches
             })
     }
 }
@@ -472,17 +471,24 @@ mod tests {
     use super::*;
     use arrow::{
         array::{ArrayRef, Int64Array, StringArray},
+        datatypes::{DataType, Schema},
         record_batch::RecordBatch,
     };
     use data_types::{CompactionLevel, NamespaceId, ObjectStoreId, PartitionId, TableId};
     use datafusion::common::{DataFusionError, ScalarValue};
-    use datafusion_util::{unbounded_memory_pool, MemoryStream};
+    use datafusion_util::{config::BATCH_SIZE, unbounded_memory_pool, MemoryStream};
     use iox_time::Time;
-    use std::collections::HashMap;
+    use schema::{Error::InvalidInfluxColumnType, Schema as IoxSchema, SchemaBuilder};
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     async fn test_upload_metadata(store: ParquetStorage) {
-        let (partition_id, meta) = meta();
-        let batch = RecordBatch::try_from_iter([
+        let (transition_partition_id, meta) = meta();
+        let mut batch = RecordBatch::try_from_iter([
             ("a", to_string_array(&["value"; 8192 * 2])),
             ("b", to_int_array(&[1; 8192 * 2])),
             ("c", to_string_array(&["foo"; 8192 * 2])),
@@ -492,11 +498,34 @@ mod tests {
         assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 8192 * 2);
 
+        // schema on batch is not valid iox schema
+        let iox_schema = IoxSchema::try_from(batch.schema());
+        assert!(
+            matches!(iox_schema, Err(InvalidInfluxColumnType { .. })),
+            "should not have iox schema, yet"
+        );
+
+        // build & use iox_schema
+        let iox_schema = SchemaBuilder::new()
+            .influx_field("a", schema::InfluxFieldType::String)
+            .influx_field("b", schema::InfluxFieldType::Integer)
+            .influx_field("c", schema::InfluxFieldType::String)
+            .influx_field("d", schema::InfluxFieldType::Integer)
+            .build()
+            .expect("valid iox schema");
+        batch = batch
+            .with_schema(iox_schema.clone().into())
+            .expect("should update batch with iox schema");
+
         // Serialize & upload the record batches.
-        let (file_meta, _file_size) = upload(&store, &partition_id, &meta, batch.clone()).await;
+        let (encoded_file_meta, _file_size) =
+            upload(&store, &transition_partition_id, &meta, batch.clone()).await;
 
         // Extract the various bits of metadata.
-        let file_meta = file_meta.decode().expect("should decode parquet metadata");
+        let file_meta = encoded_file_meta
+            .decode()
+            .expect("should decode parquet metadata");
+
         let got_iox_meta = file_meta
             .read_iox_metadata_new()
             .expect("should read IOx metadata from parquet meta");
@@ -504,6 +533,12 @@ mod tests {
         // Ensure the metadata in the file decodes to the same IOx metadata we
         // provided when uploading.
         assert_eq!(got_iox_meta, meta);
+
+        // Ensure gets the IOx Schema from the parquet metadata
+        assert!(
+            matches!(file_meta.read_schema(), Ok(encoded_schema) if encoded_schema == iox_schema),
+            "should have the parquet encoded schema match the schema provided to upload"
+        );
     }
 
     #[tokio::test]
@@ -543,11 +578,43 @@ mod tests {
         test_upload_metadata(store).await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-    #[cfg(tokio_unstable)]
-    async fn test_default_upload_is_single_threaded() {
-        use tokio::runtime::{Handle, RuntimeFlavor};
+    /// Perform parquet encoding and upload, while monitoring
+    /// the currently active tokio task count.
+    async fn run_upload_and_count_max_active_tasks(
+        store: ParquetStorage,
+        batch: RecordBatch,
+    ) -> Arc<AtomicUsize> {
+        // prepare schema
+        let schema = batch.schema();
 
+        // background watcher, counting the num of active tasks
+        // this uses a tokio stable API in RuntimeMetrics
+        let counter = Arc::new(AtomicUsize::new(0));
+        let captured_counter = Arc::clone(&counter);
+        let counter_handle = Handle::current().spawn(async move {
+            loop {
+                let num_active = Handle::current().metrics().num_alive_tasks(); // tokio stable api
+                captured_counter.fetch_max(num_active, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_nanos(1)).await;
+            }
+        });
+
+        // Test: start upload on current thread
+        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
+        counter_handle.abort();
+
+        // provide counter for test assertions
+        counter
+    }
+
+    /// Verify that using the ArrowWriter (our non-parallel writing
+    /// implementation) uses a single thread, even when multiple threads
+    /// are available in the tokio threadpool.
+    ///
+    /// The number of tasks is a proxy for the number of threads,
+    /// since tokio distributes tasks across its threadpool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+    async fn test_default_upload_is_single_threaded() {
         // confirm test runtime is multi-threaded
         assert_eq!(
             RuntimeFlavor::MultiThread,
@@ -558,36 +625,33 @@ mod tests {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-        // start upload on current thread
-        let mut batch = Vec::with_capacity(10_000);
-        for field in 0..100 {
-            batch.push((field.to_string(), to_string_array(&["value"])));
-        }
-        let batch = RecordBatch::try_from_iter(batch).unwrap();
-        let schema = batch.schema();
-        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
-
-        // examine rt metrics
-        let rt_metrics = Handle::current().metrics();
-        let mut additional_workers_utilized = 0;
-        for worker_id in 0..rt_metrics.num_workers()
-            + rt_metrics.num_blocking_threads()
-            + rt_metrics.num_idle_blocking_threads()
-        {
-            if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
-                additional_workers_utilized += 1;
-            }
-        }
-
+        // Test: single task, even when many columns
+        let counter =
+            run_upload_and_count_max_active_tasks(store.clone(), batch_with_many_cols_and_1_row())
+                .await;
         assert_eq!(
-            additional_workers_utilized, 0,
-            "should be single threaded upload"
+            counter.load(Ordering::SeqCst),
+            1,
+            "should be only 1 tasks, instead found {:?}",
+            counter.load(Ordering::SeqCst)
+        );
+
+        // Test: single task, even when many rows
+        let counter =
+            run_upload_and_count_max_active_tasks(store, batch_with_many_rows_and_1_col()).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "should be only 1 tasks, instead found {:?}",
+            counter.load(Ordering::SeqCst)
         );
     }
 
+    /// Verify using datafusion writer is using more than a single task to
+    /// encode parquet files. The number of tasks is used as a proxy for
+    /// the speed of writing parquet files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-    #[cfg(tokio_unstable)]
-    async fn test_parallel_columns_upload_uses_multiple_threads() {
+    async fn test_parallel_parquet_sink_uses_multiple_tasks() {
         use tokio::runtime::{Handle, RuntimeFlavor};
 
         // confirm test runtime is multi-threaded
@@ -600,101 +664,19 @@ mod tests {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
         let store = ParquetStorage::new(object_store, StorageId::from("iox"))
             .with_enabled_parallel_writes(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(6).unwrap(), // parallelized only column writing
+                NonZeroUsize::new(1).unwrap(), // only 1
+                NonZeroUsize::new(1).unwrap(), // only 1
             );
 
-        // start upload on current thread
-        let mut batch = Vec::with_capacity(100);
-        for field in 0..100 {
-            batch.push((field.to_string(), to_string_array(&["value"])));
-        }
-        let batch = RecordBatch::try_from_iter(batch).unwrap();
-        assert_eq!(batch.num_columns(), 100);
-        assert_eq!(batch.num_rows(), 1);
-        let schema = batch.schema();
-        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
-
-        // examine rt metrics
-        let rt_metrics = Handle::current().metrics();
-        let mut additional_workers_utilized = 0;
-        for worker_id in 0..rt_metrics.num_workers()
-            + rt_metrics.num_blocking_threads()
-            + rt_metrics.num_idle_blocking_threads()
-        {
-            if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
-                additional_workers_utilized += 1;
-            }
-        }
-
-        // note: tokio rt model schedules spawned tasks onto any of it's threads.
-        // therefore the 6 column writers will be spawned on any of the 10 threads.
-        //
-        // The configuration is a maximum of how many threads to be used, and the min being at least 1
-        // additional thread spawned (for a column writer not on the main thread).
+        // Test: we should be using multiple tasks
+        // w/ the many-cols-in-1-row
+        let counter =
+            run_upload_and_count_max_active_tasks(store.clone(), batch_with_many_cols_and_1_row())
+                .await;
         assert!(
-            additional_workers_utilized > 1,
-            "should have distributed work to additional threads (>1 thread total), when using parallelized column writers; but found {additional_workers_utilized} threads",
-        );
-        assert!(
-            additional_workers_utilized <= 10,
-            "{} additional worker threads;cannot use more than the 10 threads available",
-            additional_workers_utilized,
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-    #[cfg(tokio_unstable)]
-    async fn test_parallel_row_groups_upload_uses_multiple_threads() {
-        use arrow::datatypes::{DataType, Schema};
-        use tokio::runtime::{Handle, RuntimeFlavor};
-
-        // confirm test runtime is multi-threaded
-        assert_eq!(
-            RuntimeFlavor::MultiThread,
-            Handle::current().runtime_flavor()
-        );
-
-        // store with multi-threaded upload
-        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
-        let max_parallel_rowgroups_possible = 6;
-        let store = ParquetStorage::new(object_store, StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(max_parallel_rowgroups_possible).unwrap(), // parallelized only rowgroup writing
-                NonZeroUsize::new(1).unwrap(),
-            );
-
-        // start upload on current thread
-        let num_batches = max_parallel_rowgroups_possible;
-        let col_1 = to_int_array(&[2; 8192 / 8 * 6]);
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(schema, vec![col_1]).expect("created new record batch");
-        assert_eq!(batch.num_columns(), 1);
-        assert_eq!(batch.num_rows(), 8192 / 8 * num_batches);
-        let schema = batch.schema();
-        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
-
-        // examine rt metrics
-        let rt_metrics = Handle::current().metrics();
-        let mut additional_workers_utilized = 0;
-        for worker_id in 0..rt_metrics.num_workers()
-            + rt_metrics.num_blocking_threads()
-            + rt_metrics.num_idle_blocking_threads()
-        {
-            if rt_metrics.worker_total_busy_duration(worker_id) > Duration::new(0, 0) {
-                additional_workers_utilized += 1;
-            }
-        }
-
-        // Since the record batches are streaming we may not utilize all rowgroup writers,
-        // but we should have utilized some additional threads.
-        assert!(
-            additional_workers_utilized > 1,
-            "should have distributed work to additional threads (>1 thread total), when using parallelized rowgroup writers; but found {additional_workers_utilized} threads"
-        );
-        assert!(
-            additional_workers_utilized <= 10,
-            "cannot use more than the 10 threads available"
+            counter.load(Ordering::SeqCst) > 1,
+            "should have >1 task, instead found {:?}",
+            counter.load(Ordering::SeqCst)
         );
     }
 
@@ -979,6 +961,30 @@ mod tests {
         let expected_batch =
             RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
         assert_roundtrip(file_batch, Projection::Some(&["a"]), schema, expected_batch).await;
+    }
+
+    fn batch_with_many_cols_and_1_row() -> RecordBatch {
+        let mut batch = Vec::with_capacity(10_000);
+        for field in 0..10_000 {
+            batch.push((field.to_string(), to_string_array(&["value"])));
+        }
+        let batch = RecordBatch::try_from_iter(batch).unwrap();
+
+        assert_eq!(batch.num_columns(), 10_000);
+        assert_eq!(batch.num_rows(), 1);
+        batch
+    }
+
+    fn batch_with_many_rows_and_1_col() -> RecordBatch {
+        let iox_session_batch_size = BATCH_SIZE;
+
+        let col_1 = to_int_array(&[2; 1024 * 8]);
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![col_1]).expect("created new record batch");
+
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), iox_session_batch_size);
+        batch
     }
 
     fn to_string_array(strs: &[&str]) -> ArrayRef {

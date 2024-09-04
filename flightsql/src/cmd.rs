@@ -61,7 +61,7 @@ impl PreparedStatementHandle {
         let map = match &self.params {
             Some(params) => params
                 .schema()
-                .all_fields()
+                .flattened_fields()
                 .into_iter()
                 .zip(params.columns())
                 .map(|(field, col)| {

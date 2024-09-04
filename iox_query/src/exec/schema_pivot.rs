@@ -360,12 +360,12 @@ async fn schema_pivot(
 
 #[cfg(test)]
 mod tests {
-    use crate::exec::stringset::{IntoStringSet, StringSetRef};
+    use std::collections::BTreeSet;
 
     use super::*;
     use arrow::{
-        array::{Int64Array, StringArray},
-        datatypes::{Field, Schema, SchemaRef},
+        array::{as_dictionary_array, as_string_array, Int64Array, StringArray},
+        datatypes::{Field, Int32Type, Schema, SchemaRef},
     };
     use datafusion::physical_plan::memory::MemoryExec;
     use datafusion_util::test_execute_partition;
@@ -473,22 +473,38 @@ mod tests {
     }
 
     /// Return a StringSet extracted from the record batch
-    async fn reader_to_stringset(mut reader: SendableRecordBatchStream) -> StringSetRef {
-        let mut batches = Vec::new();
+    async fn reader_to_stringset(mut reader: SendableRecordBatchStream) -> BTreeSet<String> {
+        let mut strings = BTreeSet::default();
+
         // process the record batches one by one
         while let Some(record_batch) = reader.next().await.transpose().expect("reading next batch")
         {
-            batches.push(record_batch)
+            assert_eq!(record_batch.num_columns(), 1);
+            let arr = record_batch.column(0);
+            match arr.data_type() {
+                DataType::Utf8 => {
+                    let arr = as_string_array(arr);
+                    strings.extend(arr.iter().filter_map(|s| s.map(|s| s.to_string())));
+                }
+                DataType::Dictionary(key, value)
+                    if key == &Box::new(DataType::Int32) && value == &Box::new(DataType::Utf8) =>
+                {
+                    let arr = as_dictionary_array::<Int32Type>(arr);
+                    let values = as_string_array(arr.values());
+                    strings.extend(
+                        arr.keys_iter()
+                            .filter_map(|idx| idx.map(|idx| values.value(idx).to_string())),
+                    )
+                }
+                _ => panic!("Expected string"),
+            }
         }
-        batches
-            .into_stringset()
-            .expect("Converted record batch reader into stringset")
+        strings
     }
 
     /// return a set for testing
-    fn to_stringset(strs: &[&str]) -> StringSetRef {
-        let stringset = strs.iter().map(|s| s.to_string()).collect();
-        StringSetRef::new(stringset)
+    fn to_stringset(strs: &[&str]) -> BTreeSet<String> {
+        strs.iter().map(|s| s.to_string()).collect()
     }
 
     /// Create a schema pivot node with a single input
@@ -541,13 +557,13 @@ mod tests {
         }
 
         /// return expected output, as StringSet
-        fn expected_output(&self) -> StringSetRef {
+        fn expected_output(&self) -> BTreeSet<String> {
             to_stringset(self.expected_output)
         }
 
         /// run the input batches through a schema pivot and return the results
-        /// as a StringSetRef
-        async fn pivot(&self) -> StringSetRef {
+        /// as a BTreeSet
+        async fn pivot(&self) -> BTreeSet<String> {
             let schema = Self::input_schema();
 
             // prepare input

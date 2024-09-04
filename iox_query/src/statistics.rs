@@ -1418,7 +1418,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Internal(\"Empty iterator passed to ScalarValue::iter_to_array\")")]
+    #[should_panic(expected = "Execution(\"Empty iterator passed to ScalarValue::iter_to_array\")")]
     fn test_overlap_empty() {
         let _overlap = overlap_all(&[]);
     }

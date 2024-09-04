@@ -2,11 +2,12 @@
 #![warn(missing_docs)]
 #![allow(clippy::missing_docs_in_private_items)]
 
+use measurement_fields_response::MessageField;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
 use client_util::connection::GrpcConnection;
-use futures_util::TryStreamExt;
+use futures_util::{TryStream, TryStreamExt};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -349,6 +350,41 @@ pub fn tag_key_bytes_to_strings(bytes: Vec<u8>) -> String {
         [255] => "_f(0xff)".into(),
         _ => String::from_utf8(bytes).expect("string value response was not utf8"),
     }
+}
+
+/// Collect all of the strings generated from a stream of
+/// [`StringValuesResponse`]s into a collection.
+pub async fn try_collect_string_values<S, C, T>(mut stream: S) -> Result<C, <S as TryStream>::Error>
+where
+    S: TryStream<Ok = StringValuesResponse> + Sized + Send + Unpin,
+    C: Default + Extend<T> + Send,
+    T: From<String>,
+{
+    let mut collection = C::default();
+    while let Some(svr) = stream.try_next().await? {
+        collection.extend(
+            svr.values
+                .into_iter()
+                .map(tag_key_bytes_to_strings)
+                .map(<T as From<String>>::from),
+        );
+    }
+    Ok(collection)
+}
+
+/// Collect all of the fields generated from a stream of
+/// [`MeasurementFieldsResponse`]s into a collection.
+pub async fn try_collect_measurement_fields<S, C, T>(mut stream: S) -> Result<C, S::Error>
+where
+    S: TryStream<Ok = MeasurementFieldsResponse> + Sized + Send + Unpin,
+    C: Default + Extend<T> + Send,
+    T: From<MessageField>,
+{
+    let mut collection = C::default();
+    while let Some(mfr) = stream.try_next().await? {
+        collection.extend(mfr.fields.into_iter().map(<T as From<MessageField>>::from));
+    }
+    Ok(collection)
 }
 
 /// Logs the specific item

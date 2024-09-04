@@ -12,6 +12,8 @@ use url::Url;
 pub const DEFAULT_CATALOG: &str = "public";
 // The default schema name - this impacts what SQL queries use if not specified
 pub const DEFAULT_SCHEMA: &str = "iox";
+// The system table schema name
+pub const SYSTEM_SCHEMA: &str = "system";
 
 /// The maximum number of rows that DataFusion should create in each RecordBatch
 pub const BATCH_SIZE: usize = 8 * 1024;

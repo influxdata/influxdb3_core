@@ -2,14 +2,12 @@
 //!
 //! [Functions]: https://docs.influxdata.com/influxdb/v1.8/query_language/functions/
 
-use std::collections::HashSet;
-
-use once_cell::sync::Lazy;
+use std::{collections::HashSet, sync::LazyLock};
 
 /// Returns `true` if `name` is a mathematical scalar function
 /// supported by InfluxQL.
 pub fn is_scalar_math_function(name: &str) -> bool {
-    static FUNCTIONS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    static FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         HashSet::from([
             "abs", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "ln",
             "log2", "log10", "sqrt", "pow", "floor", "ceil", "round",
@@ -22,7 +20,7 @@ pub fn is_scalar_math_function(name: &str) -> bool {
 /// Returns `true` if `name` is an aggregate or aggregate function
 /// supported by InfluxQL.
 pub fn is_aggregate_function(name: &str) -> bool {
-    static FUNCTIONS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    static FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         HashSet::from([
             // Scalar-like functions
             "cumulative_sum",

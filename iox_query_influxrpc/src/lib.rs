@@ -1,19 +1,25 @@
 //! Query frontend for InfluxDB Storage gRPC requests
 
-use async_trait::async_trait;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use arrow::datatypes::DataType;
+use crate::schema::SeriesSchema;
+use ::schema::{InfluxColumnType, InfluxFieldType, Projection, Schema, TIME_COLUMN_NAME};
+use arrow::datatypes::{DataType, Field};
+use async_trait::async_trait;
 use data_types::ChunkId;
 use datafusion::{
-    catalog::schema::SchemaProvider,
-    common::DFSchemaRef,
+    catalog::SchemaProvider,
     error::DataFusionError,
-    functions::core::expr_ext::FieldAccessor,
-    logical_expr::{ExprSchemable, LogicalPlan, LogicalPlanBuilder},
+    functions::core::get_field,
+    functions_aggregate::{
+        average::avg_udaf, count::count_udaf, expr_fn::max, min_max::max_udaf, sum::sum_udaf,
+    },
+    logical_expr::{col, expr::ScalarFunction, lit, LogicalPlan, LogicalPlanBuilder},
     prelude::{when, Column, Expr},
 };
+use plan::{string_value_schema, FieldAggregator, LogicalPlanBuilderExt};
+
 use datafusion_util::{
     config::{DEFAULT_CATALOG, DEFAULT_SCHEMA},
     AsExpr,
@@ -21,15 +27,8 @@ use datafusion_util::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use hashbrown::HashSet;
 use iox_query::{
-    exec::{
-        field::FieldColumns, fieldlist::Field, make_non_null_checker, make_schema_pivot,
-        stringset::StringSet, IOxSessionContext,
-    },
-    plan::{
-        fieldlist::FieldListPlan,
-        seriesset::{SeriesSetPlan, SeriesSetPlans},
-        stringset::{Error as StringSetError, StringSetPlan, StringSetPlanBuilder},
-    },
+    exec::{build_schema_pivot, IOxSessionContext},
+    provider::{ChunkTableProvider, ProviderBuilder},
     QueryChunk, QueryNamespace,
 };
 use observability_deps::tracing::{debug, warn};
@@ -45,17 +44,27 @@ use query_functions::{
     make_window_bound_expr,
     selectors::{selector_first, selector_last, selector_max, selector_min},
 };
-use schema::{InfluxColumnType, Projection, Schema, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
-use std::collections::HashSet as StdHashSet;
-use std::{cmp::Reverse, collections::BTreeSet, sync::Arc};
+use std::collections::{BTreeMap, BTreeSet, HashSet as StdHashSet};
+use std::iter::repeat;
+use std::sync::Arc;
 
-use crate::scan_plan::ScanPlanBuilder;
+use crate::plan::fields_pivot_schema;
 
-mod missing_columns;
-mod scan_plan;
+mod exec;
+mod extension;
+mod extension_planner;
+mod physical_optimizer;
+mod plan;
+pub mod schema;
+
+pub use extension::InfluxRpcExtension;
 
 const CONCURRENT_TABLE_JOBS: usize = 10;
+
+/// Name of the single column that is produced by queries
+/// that form a set of string values.
+const STRING_VALUE_COLUMN_NAME: &str = "string_value";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,14 +88,14 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("gRPC planner got error creating string set plan: {}", source))]
-    CreatingStringSet { source: StringSetError },
-
     #[snafu(display("gRPC planner got error creating predicates: {}", source))]
     CreatingPredicates { source: DataFusionError },
 
     #[snafu(display("gRPC planner got error building plan: {}", source))]
     BuildingPlan { source: DataFusionError },
+
+    #[snafu(display("gRPC planner got error building table provider: {}", source))]
+    BuildingTableProvider { source: iox_query::provider::Error },
 
     #[snafu(display("gRPC planner got error reading columns from expression: {}", source))]
     ReadColumns {
@@ -131,9 +140,6 @@ pub enum Error {
         source: query_functions::group_by::Error,
     },
 
-    #[snafu(display("Error creating scan:  {}", source))]
-    CreatingScan { source: crate::scan_plan::Error },
-
     #[snafu(display(
         "gRPC planner got error casting aggregate {:?} for {}: {}",
         agg,
@@ -154,6 +160,9 @@ pub enum Error {
 
     #[snafu(display("Table was removed while planning query: {}", table_name))]
     TableRemoved { table_name: String },
+
+    #[snafu(display("Internal error: invalid schema for series"))]
+    InternalInvalidArrowSchema {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -174,20 +183,14 @@ impl Error {
             Self::TableRemoved { .. }
             | Self::InvalidTagColumn { .. }
             | Self::DuplicateGroupColumn { .. }
+            | Self::BuildingTableProvider { .. }
             | Self::GroupColumnNotFound { .. } => DataFusionError::Plan(msg),
-            e @ (Self::CreatingStringSet { .. }
-            | Self::InternalInvalidTagType { .. }
+            e @ (Self::InternalInvalidTagType { .. }
             | Self::CreatingAggregates { .. }
-            | Self::CreatingScan { .. }
             | Self::InternalUnexpectedNoneAggregate {}
-            | Self::InternalAggregateNotSelector { .. }) => DataFusionError::External(Box::new(e)),
+            | Self::InternalAggregateNotSelector { .. }
+            | Self::InternalInvalidArrowSchema {}) => DataFusionError::External(Box::new(e)),
         }
-    }
-}
-
-impl From<crate::scan_plan::Error> for Error {
-    fn from(source: crate::scan_plan::Error) -> Self {
-        Self::CreatingScan { source }
     }
 }
 
@@ -243,7 +246,7 @@ impl InfluxRpcPlanner {
         &self,
         namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
-    ) -> Result<StringSetPlan> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("table_names planning");
         debug!(?rpc_predicate, "planning table_names");
 
@@ -264,21 +267,29 @@ impl InfluxRpcPlanner {
                 .await?;
 
         // Feed builder
-        let mut builder = StringSetPlanBuilder::new();
+        let mut names: Vec<Vec<Expr>> = vec![];
+        let mut plans: Vec<LogicalPlan> = vec![];
         for (table_name, maybe_full_plan) in tables {
             match maybe_full_plan {
                 None => {
-                    builder.append_string(table_name.to_string());
+                    names.push(vec![lit(table_name.to_string())]);
                 }
                 Some((schema, predicate, chunks)) => {
-                    let plan =
-                        Self::table_name_plan(Arc::clone(table_name), &schema, &predicate, chunks)?;
-                    builder = builder.append_other(plan.into());
+                    let provider = table_provider(Arc::clone(table_name), schema, chunks)?;
+                    plans.push(Self::table_name_plan(Arc::new(provider), &predicate)?);
                 }
             }
         }
 
-        builder.build().context(CreatingStringSetSnafu)
+        let mut builder = LogicalPlanBuilder::known_values(names, string_value_schema())?;
+        for p in plans {
+            builder = builder.union(p).context(BuildingPlanSnafu)?;
+        }
+        builder = builder
+            .sort(vec![col(STRING_VALUE_COLUMN_NAME).sort(true, false)])
+            .context(BuildingPlanSnafu)?;
+
+        builder.build().context(BuildingPlanSnafu)
     }
 
     /// Returns a set of plans that produces the names of "tag" columns (as defined in the InfluxDB
@@ -288,7 +299,7 @@ impl InfluxRpcPlanner {
         &self,
         namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
-    ) -> Result<StringSetPlan> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("tag_keys planning");
         debug!(?rpc_predicate, "planning tag_keys");
 
@@ -308,7 +319,7 @@ impl InfluxRpcPlanner {
             .context(CreatingPredicatesSnafu)?;
 
         let mut table_predicates_need_chunks = vec![];
-        let mut builder = StringSetPlanBuilder::new();
+        let mut keys = BTreeSet::new();
         for (table_name, schema, predicate) in table_predicates {
             if predicate.is_empty() {
                 let schema = schema.context(TableRemovedSnafu {
@@ -317,13 +328,7 @@ impl InfluxRpcPlanner {
 
                 // special case - return the columns from metadata only.
                 // Note that columns with all rows deleted will still show here
-                builder = builder.append_other(
-                    schema
-                        .tags_iter()
-                        .map(|f| f.name().clone())
-                        .collect::<BTreeSet<_>>()
-                        .into(),
-                );
+                keys.extend(schema.tags_iter().map(|f| f.name().clone()));
             } else {
                 table_predicates_need_chunks.push((table_name, schema, predicate));
             }
@@ -343,7 +348,7 @@ impl InfluxRpcPlanner {
                 let mut chunks_full = vec![];
                 let mut known_columns = BTreeSet::new();
 
-                for chunk in cheap_chunk_first(chunks) {
+                for chunk in chunks {
                     // get only tag columns from metadata
                     let schema = chunk.schema();
 
@@ -384,27 +389,38 @@ impl InfluxRpcPlanner {
         .try_collect()
         .await?;
 
+        let mut plans = vec![];
         // At this point, we have a set of column names we know pass
         // in `known_columns`, and potentially some tables in chunks
         // that we need to run a plan to know if they pass the
         // predicate.
-        for (table_name, schema, predicate, chunks_full, known_columns) in tables {
-            builder = builder.append_other(known_columns.into());
+        for (table_name, schema, predicate, chunks_full, mut known_columns) in tables {
+            keys.append(&mut known_columns);
 
             if !chunks_full.is_empty() {
                 // TODO an additional optimization here would be to filter
                 // out chunks (and tables) where all columns in that chunk
                 // were already known to have data (based on the contents of known_columns)
 
-                let plan = self.tag_keys_plan(table_name, &schema, &predicate, chunks_full)?;
-
-                if let Some(plan) = plan {
-                    builder = builder.append_other(plan)
+                let provider = table_provider(Arc::clone(table_name), schema.clone(), chunks_full)?;
+                if let Some(plan) = Self::tag_keys_plan(Arc::new(provider), &predicate)? {
+                    plans.push(plan);
                 }
             }
         }
 
-        builder.build().context(CreatingStringSetSnafu)
+        let mut builder = LogicalPlanBuilder::known_values(
+            keys.into_iter().map(|v| vec![lit(v)]).collect(),
+            string_value_schema(),
+        )?;
+        for p in plans {
+            builder = builder.union_distinct(p).context(BuildingPlanSnafu)?;
+        }
+        builder = builder
+            .sort(vec![col(STRING_VALUE_COLUMN_NAME).sort(true, false)])
+            .context(BuildingPlanSnafu)?;
+
+        builder.build().context(BuildingPlanSnafu)
     }
 
     /// Returns a plan which finds the distinct, non-null tag values in the specified `tag_name`
@@ -414,7 +430,7 @@ impl InfluxRpcPlanner {
         namespace: Arc<dyn QueryNamespace>,
         tag_name: &str,
         rpc_predicate: InfluxRpcPredicate,
-    ) -> Result<StringSetPlan> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("tag_values planning");
         debug!(?rpc_predicate, tag_name, "planning tag_values");
 
@@ -456,7 +472,7 @@ impl InfluxRpcPlanner {
         .and_then(|(table_name, schema, predicate, chunks)| async move {
             let mut chunks_full = vec![];
 
-            for chunk in cheap_chunk_first(chunks) {
+            for chunk in chunks {
                 // use schema to validate column type
                 let schema = chunk.schema();
 
@@ -499,46 +515,24 @@ impl InfluxRpcPlanner {
         .try_collect()
         .await?;
 
-        let mut builder = StringSetPlanBuilder::new();
-
-        let select_exprs = vec![tag_name.as_expr()];
-
-        // At this point, we have a set of tag_values we know at plan
-        // time in `known_columns`, and some tables in chunks that we
+        // At this point, we have a set of tables in chunks that we
         // need to run a plan to find what values pass the predicate.
-        for (table_name, schema, predicate, chunks_full) in tables {
-            if !chunks_full.is_empty() {
-                let scan_and_filter = ScanPlanBuilder::new(Arc::clone(table_name), &schema)
-                    .with_chunks(chunks_full)
-                    .with_predicate(&predicate)
-                    .build()?;
+        let plans = tables
+            .into_iter()
+            .filter(|(_, _, _, chunks)| !chunks.is_empty())
+            .map(|(table_name, schema, predicate, chunks)| {
+                let provider = table_provider(Arc::clone(table_name), schema.clone(), chunks)?;
+                Self::tag_values_plan(Arc::new(provider), &predicate, tag_name)
+                    .context(BuildingPlanSnafu)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-                let tag_name_is_not_null = tag_name.as_expr().is_not_null();
-
-                // TODO: optimize this to use "DISINCT" or do
-                // something more intelligent that simply fetching all
-                // the values and reducing them in the query Executor
-                //
-                // Until then, simply use a plan which looks like:
-                //
-                //    Projection
-                //      Filter(is not null)
-                //        Filter(predicate)
-                //          Scan
-                let plan = scan_and_filter
-                    .plan_builder
-                    .project(select_exprs.clone())
-                    .context(BuildingPlanSnafu)?
-                    .filter(tag_name_is_not_null)
-                    .context(BuildingPlanSnafu)?
-                    .build()
-                    .context(BuildingPlanSnafu)?;
-
-                builder = builder.append_other(plan.into());
-            }
+        let mut builder = LogicalPlanBuilder::known_values(vec![], string_value_schema())?;
+        for p in plans {
+            builder = builder.union_distinct(p).context(BuildingPlanSnafu)?;
         }
-
-        builder.build().context(CreatingStringSetSnafu)
+        builder = builder.sort(vec![STRING_VALUE_COLUMN_NAME.as_expr().sort(true, false)])?;
+        builder.build().context(BuildingPlanSnafu)
     }
 
     /// Returns a plan that produces a list of columns and their datatypes (as defined in the data
@@ -548,7 +542,7 @@ impl InfluxRpcPlanner {
         &self,
         namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
-    ) -> Result<FieldListPlan> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("field_columns planning");
         debug!(?rpc_predicate, "planning field_columns");
 
@@ -568,20 +562,17 @@ impl InfluxRpcPlanner {
 
         // optimization: just get the field columns from metadata.
         // note this both ignores field keys, and sets the timestamp data 'incorrectly'.
-        let mut field_list_plan = FieldListPlan::new();
+        let mut fields: BTreeMap<String, InfluxFieldType> = BTreeMap::new();
         let mut table_predicates_need_chunks = Vec::with_capacity(table_predicates.len());
         for (table_name, schema, predicate) in table_predicates {
             if predicate.is_empty() {
                 let schema = schema.context(TableRemovedSnafu {
                     table_name: table_name.as_ref(),
                 })?;
-                let fields = schema.fields_iter().map(|f| Field {
-                    name: f.name().clone(),
-                    data_type: f.data_type().clone(),
-                    last_timestamp: 0,
-                });
-                for field in fields {
-                    field_list_plan.append_field(field);
+                for (r#type, field) in schema.iter() {
+                    if let InfluxColumnType::Field(r#type) = r#type {
+                        fields.insert(field.name().into(), r#type);
+                    }
                 }
             } else {
                 table_predicates_need_chunks.push((table_name, schema, predicate));
@@ -594,15 +585,33 @@ impl InfluxRpcPlanner {
             &table_predicates_need_chunks,
             ctx,
             |table_name, predicate, chunks, schema| {
-                Self::field_columns_plan(Arc::from(table_name), schema, predicate, chunks)
+                let provider = table_provider(table_name, schema.clone(), chunks)?;
+                Self::field_columns_plan(Arc::new(provider), predicate).context(BuildingPlanSnafu)
             },
         )
         .await?;
-        for plan in plans {
-            field_list_plan = field_list_plan.append_other(plan.into());
-        }
 
-        Ok(field_list_plan)
+        let mut builder = LogicalPlanBuilder::known_values(
+            fields
+                .into_iter()
+                .map(|(name, r#type)| vec![lit(name), lit(r#type as i32), lit(0_i64)])
+                .collect::<Vec<_>>(),
+            fields_pivot_schema(),
+        )
+        .context(BuildingPlanSnafu)?;
+        for plan in plans {
+            builder = builder.union(plan).context(BuildingPlanSnafu)?
+        }
+        builder = builder
+            .aggregate(
+                vec![col("key"), col("type")],
+                vec![max(col("timestamp")).alias("timestamp")],
+            )
+            .context(BuildingPlanSnafu)?
+            .sort(vec![col("key").sort(true, false)])
+            .context(BuildingPlanSnafu)?;
+
+        builder.build().context(BuildingPlanSnafu)
     }
 
     /// Returns a plan that finds all rows which pass the
@@ -627,26 +636,36 @@ impl InfluxRpcPlanner {
         &self,
         namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
-    ) -> Result<SeriesSetPlans> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("planning_read_filter");
         debug!(?rpc_predicate, "planning read_filter");
 
-        let table_predicates = rpc_predicate
+        let mut table_predicates = rpc_predicate
             .table_predicates(ctx.inner(), self.meta.as_ref(), CONCURRENT_TABLE_JOBS)
             .await
             .context(CreatingPredicatesSnafu)?;
+
+        // The measurement (table) name is the first element of the sort key.
+        // Let's generate them in the correct order to avoid needing a sort later.
+        table_predicates
+            .as_mut_slice()
+            .sort_unstable_by(|(name1, _, _), (name2, _, _)| name1.cmp(name2));
 
         let plans = create_plans(
             namespace,
             &table_predicates,
             ctx,
             |table_name, predicate, chunks, schema| {
-                Self::read_filter_plan(table_name, schema, predicate, chunks)
+                let provider = table_provider(table_name, schema.clone(), chunks)?;
+                Self::read_filter_plan(Arc::new(provider), predicate)
             },
         )
         .await?;
 
-        Ok(SeriesSetPlans::new(plans))
+        let mut builder = LogicalPlanBuilder::union_series(plans).context(BuildingPlanSnafu)?;
+        let schema = SeriesSchema::try_from(builder.schema())?;
+        builder = builder.sort(schema.sort(&[])).context(BuildingPlanSnafu)?;
+        builder.build().context(BuildingPlanSnafu)
     }
 
     /// Creates one or more GroupedSeriesSet plans that produces an
@@ -661,8 +680,8 @@ impl InfluxRpcPlanner {
     ///   1. The group_columns are a prefix of the sort key
     ///
     ///   2. All remaining tags appear in the sort key, in order,
-    ///   after the prefix (as the tag key may also appear as a group
-    ///   key)
+    ///      after the prefix (as the tag key may also appear as a
+    ///      group key)
     ///
     /// Schematically, the plan looks like:
     ///
@@ -675,7 +694,7 @@ impl InfluxRpcPlanner {
         rpc_predicate: InfluxRpcPredicate,
         agg: Aggregate,
         group_columns: &[impl AsRef<str> + Send + Sync],
-    ) -> Result<SeriesSetPlans> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("read_group planning");
         debug!(?rpc_predicate, ?agg, "planning read_group");
 
@@ -735,18 +754,16 @@ impl InfluxRpcPlanner {
                         }
                     );
                 }
-
-                match agg {
-                    Aggregate::None => {
-                        Self::read_filter_plan(table_name, schema, predicate, chunks)
-                    }
-                    _ => Self::read_group_plan(table_name, schema, predicate, agg, chunks),
-                }
+                let provider = table_provider(table_name, schema.clone(), chunks)?;
+                Self::read_group_plan(Arc::new(provider), predicate, agg)
             },
         )
         .await?;
+        let mut builder = LogicalPlanBuilder::union_series(plans)?;
+        let schema = SeriesSchema::try_from(builder.schema())?;
+        builder = builder.sort(schema.sort(&group_columns))?;
 
-        Ok(SeriesSetPlans::new(plans).grouped_by(group_columns))
+        Ok(builder.build()?)
     }
 
     /// Creates a GroupedSeriesSet plan that produces an output table with rows
@@ -758,7 +775,7 @@ impl InfluxRpcPlanner {
         agg: Aggregate,
         every: WindowDuration,
         offset: WindowDuration,
-    ) -> Result<SeriesSetPlans> {
+    ) -> Result<LogicalPlan> {
         let ctx = self.ctx.child_ctx("read_window_aggregate planning");
         debug!(
             ?rpc_predicate,
@@ -778,14 +795,16 @@ impl InfluxRpcPlanner {
             &table_predicates,
             ctx,
             |table_name, predicate, chunks, schema| {
-                Self::read_window_aggregate_plan(
-                    table_name, schema, predicate, agg, every, offset, chunks,
-                )
+                let provider = table_provider(table_name, schema.clone(), chunks)?;
+                Self::read_window_aggregate_plan(Arc::new(provider), predicate, agg, every, offset)
             },
         )
         .await?;
+        let mut builder = LogicalPlanBuilder::union_series(plans)?;
+        let schema = SeriesSchema::try_from(builder.schema())?;
+        builder = builder.sort(schema.sort(&[]))?;
 
-        Ok(SeriesSetPlans::new(plans))
+        Ok(builder.build()?)
     }
 
     /// Creates a DataFusion LogicalPlan that returns column *names* as a
@@ -799,20 +818,12 @@ impl InfluxRpcPlanner {
     ///      TableScan (of chunks)
     /// ```
     fn tag_keys_plan(
-        &self,
-        table_name: &str,
-        schema: &Schema,
+        provider: Arc<ChunkTableProvider>,
         predicate: &Predicate,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<StringSetPlan>> {
-        let scan_and_filter = ScanPlanBuilder::new(Arc::from(table_name), schema)
-            .with_predicate(predicate)
-            .with_chunks(chunks)
-            .build()?;
-
-        // now, select only the tag columns
-        let select_exprs = scan_and_filter
-            .schema()
+    ) -> Result<Option<LogicalPlan>, DataFusionError> {
+        // select only the tag columns
+        let select_exprs = provider
+            .iox_schema()
             .iter()
             .filter_map(|(influx_column_type, field)| {
                 if influx_column_type == InfluxColumnType::Tag {
@@ -828,19 +839,37 @@ impl InfluxRpcPlanner {
             return Ok(None);
         }
 
-        let plan = scan_and_filter
-            .plan_builder
-            .project(select_exprs)
-            .context(BuildingPlanSnafu)?
-            .build()
-            .context(BuildingPlanSnafu)?;
-
+        let mut builder = Arc::clone(&provider).into_logical_plan_builder()?;
+        if let Some(predicate) = predicate.filter_expr() {
+            builder = builder.filter(predicate.clone())?;
+        }
+        builder = builder.project(select_exprs)?;
         // And finally pivot the plan
-        let plan = make_schema_pivot(plan);
-        debug!(table_name=table_name, plan=%plan.display_indent_schema(),
+        let plan = build_schema_pivot(builder)?
+            .project(vec![col("non_null_column").alias(STRING_VALUE_COLUMN_NAME)])?
+            .build()?;
+
+        debug!(table_name=provider.table_name(), plan=%plan.display_indent_schema(),
                "created column_name plan for table");
 
-        Ok(Some(plan.into()))
+        Ok(Some(plan))
+    }
+
+    /// Creates a DataFusion LogicalPlan that returns the distinct values
+    /// for a specific tag column in a table.
+    fn tag_values_plan(
+        provider: Arc<ChunkTableProvider>,
+        predicate: &Predicate,
+        key: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let mut builder = provider.into_logical_plan_builder()?;
+        if let Some(predicate) = predicate.filter_expr() {
+            builder = builder.filter(predicate)?;
+        }
+        builder = builder.project(vec![key.as_expr().alias(STRING_VALUE_COLUMN_NAME)])?;
+        builder = builder.filter(STRING_VALUE_COLUMN_NAME.as_expr().is_not_null())?;
+        builder = builder.distinct()?;
+        builder.build()
     }
 
     /// Creates a DataFusion LogicalPlan that returns the timestamp
@@ -861,35 +890,28 @@ impl InfluxRpcPlanner {
     ///        Scan
     /// ```
     fn field_columns_plan(
-        table_name: Arc<str>,
-        schema: &Schema,
+        provider: Arc<ChunkTableProvider>,
         predicate: &Predicate,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<LogicalPlan> {
-        let scan_and_filter = ScanPlanBuilder::new(table_name, schema)
-            .with_predicate(predicate)
-            .with_chunks(chunks)
-            .build()?;
-
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let mut builder = Arc::clone(&provider).into_logical_plan_builder()?;
+        if let Some(predicate) = predicate.filter_expr() {
+            builder = builder.filter(predicate.clone())?;
+        }
         // Selection of only fields and time
-        let select_exprs = scan_and_filter
-            .schema()
-            .iter()
-            .filter_map(|(influx_column_type, field)| match influx_column_type {
-                InfluxColumnType::Field(_) => Some(field.name().as_expr()),
-                InfluxColumnType::Timestamp => Some(field.name().as_expr()),
-                InfluxColumnType::Tag => None,
-            })
-            .collect::<Vec<_>>();
-
-        let plan = scan_and_filter
-            .plan_builder
-            .project(select_exprs)
-            .context(BuildingPlanSnafu)?
+        let select_exprs =
+            provider
+                .iox_schema()
+                .iter()
+                .filter_map(|(influx_column_type, field)| match influx_column_type {
+                    InfluxColumnType::Field(_) => Some(field.name().as_expr()),
+                    InfluxColumnType::Timestamp => Some(field.name().as_expr()),
+                    InfluxColumnType::Tag => None,
+                });
+        builder = builder.project(select_exprs)?;
+        builder
+            .sort([col(TIME_COLUMN_NAME).sort(false, false)])?
+            .fields_pivot()?
             .build()
-            .context(BuildingPlanSnafu)?;
-
-        Ok(plan)
     }
 
     /// Creates a DataFusion LogicalPlan that returns the values in
@@ -912,310 +934,303 @@ impl InfluxRpcPlanner {
     ///        Scan
     /// ```
     fn table_name_plan(
-        table_name: Arc<str>,
-        schema: &Schema,
+        provider: Arc<ChunkTableProvider>,
         predicate: &Predicate,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<LogicalPlan> {
-        debug!(%table_name, "Creating table_name full plan");
-        let scan_and_filter = ScanPlanBuilder::new(Arc::clone(&table_name), schema)
-            .with_predicate(predicate)
-            .with_chunks(chunks)
-            .build()?;
+    ) -> Result<LogicalPlan, DataFusionError> {
+        debug!(
+            table_name = provider.table_name(),
+            "Creating table_name full plan"
+        );
 
-        // Select only fields requested
-        let select_exprs: Vec<_> = filtered_fields_iter(scan_and_filter.schema(), predicate)
-            .map(|field| field.name.as_expr())
-            .collect();
-
-        let plan = scan_and_filter
-            .plan_builder
-            .project(select_exprs)
-            .context(BuildingPlanSnafu)?
-            .build()
-            .context(BuildingPlanSnafu)?;
-
-        // Add the final node that outputs the table name or not, depending
-        let plan = make_non_null_checker(&table_name, plan);
-
-        Ok(plan)
+        let mut builder = Arc::clone(&provider).into_logical_plan_builder()?;
+        if let Some(predicate) = predicate.filter_expr() {
+            builder = builder.filter(predicate.clone())?;
+        }
+        if let Some(field_exprs) = filtered_fields_iter(provider.iox_schema(), predicate)
+            .map(|fe| fe.expr.is_not_null())
+            .reduce(|left, right| left.or(right))
+        {
+            builder = builder.filter(field_exprs)?;
+        }
+        builder = builder.sort([col(TIME_COLUMN_NAME).sort(false, false)])?;
+        builder = builder.limit(0, Some(1))?;
+        builder = builder.project(vec![
+            lit(String::from(provider.table_name())).alias(STRING_VALUE_COLUMN_NAME)
+        ])?;
+        builder.build()
     }
 
-    /// Creates a plan for computing series sets for a given table,
-    /// returning None if the predicate rules out matching any rows in
-    /// the table
-    //
-    /// The created plan looks like:
+    /// Creates a DataFusion LogicalPlan that produces the pivoted data
+    /// from the table provider.
     ///
-    ///    Projection (select the columns needed)
-    ///      Order by (tag_columns, timestamp_column)
-    ///        Filter(predicate)
-    ///          Scan
+    /// The plan has the schema like:
+    ///
+    /// - _measurement: Dictionary(Int32, Utf8)
+    /// - ...tags: Dictionary(Int32, Utf8)
+    /// - _field: Dictionary(Int32, Utf8)
+    /// - _time: Timestamp(Nanosecond, None)
+    /// - _value: Union
+    ///
     fn read_filter_plan(
-        table_name: &str,
-        schema: &Schema,
+        provider: Arc<ChunkTableProvider>,
         predicate: &Predicate,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<SeriesSetPlan> {
-        let scan_and_filter = ScanPlanBuilder::new(Arc::from(table_name), schema)
-            .with_predicate(predicate)
-            .with_chunks(chunks)
-            .build()?;
-
-        let schema = scan_and_filter.provider.iox_schema();
-
-        let tags_and_timestamp: Vec<_> = scan_and_filter
-            .schema()
-            .tags_iter()
-            .chain(scan_and_filter.schema().time_iter())
-            .map(|f| f.name() as &str)
-            // Convert to SortExprs to pass to the plan builder
-            .map(|n| n.as_sort_expr())
-            .collect();
-
-        // Order by
-        let plan_builder = scan_and_filter
-            .plan_builder
-            .sort(tags_and_timestamp)
-            .context(BuildingPlanSnafu)?;
-
-        // Select away anything that isn't in the influx data model
-        let tags_fields_and_timestamps: Vec<Expr> = schema
-            .tags_iter()
-            .map(|field| field.name().as_expr())
-            .chain(filtered_fields_iter(schema, predicate).map(|f| f.expr))
-            .chain(schema.time_iter().map(|field| field.name().as_expr()))
-            .collect();
-
-        let plan_builder = plan_builder
-            .project(tags_fields_and_timestamps)
-            .context(BuildingPlanSnafu)?;
-
-        let plan = plan_builder.build().context(BuildingPlanSnafu)?;
-
-        let tag_columns = schema
-            .tags_iter()
-            .map(|field| Arc::from(field.name().as_str()))
-            .collect();
-
-        let field_columns = filtered_fields_iter(schema, predicate)
-            .map(|field| Arc::from(field.name))
-            .collect();
-
-        // TODO: remove the use of tag_columns and field_column names
-        // and instead use the schema directly)
-        let ss_plan = SeriesSetPlan::new_from_shared_timestamp(
-            Arc::from(table_name),
-            plan,
-            tag_columns,
-            field_columns,
-        );
-
-        Ok(ss_plan)
+    ) -> Result<LogicalPlan> {
+        Self::read_group_plan(provider, predicate, Aggregate::None)
     }
 
-    /// Creates a GroupedSeriesSet plan that produces an output table
-    /// with one row per tagset and the values aggregated using a
-    /// specific function.
+    /// Creates a DataFusion LogicalPlan that produces the pivoted data
+    /// from the table provider. If an aggregate is specified it will be
+    /// applied to the data before pivoting.
     ///
-    /// Equivalent to this SQL query for 'aggregates': sum, count, mean
-    /// SELECT
-    ///   tag1...tagN
-    ///   agg_function(_val1) as _value1
-    ///   ...
-    ///   agg_function(_valN) as _valueN
-    ///   agg_function(time) as time
-    /// GROUP BY
-    ///   tags,
-    /// ORDER BY
-    ///   tags
+    /// The plan has the schema like:
     ///
-    /// Note the columns are the same but in a different order
-    /// for GROUP BY / ORDER BY
+    /// - _measurement: Dictionary(Int32, Utf8)
+    /// - ...tags: Dictionary(Int32, Utf8)
+    /// - _field: Dictionary(Int32, Utf8)
+    /// - _time: Timestamp(Nanosecond, None)
+    /// - _value: Union
     ///
-    /// Equivalent to this SQL query for 'selector' functions: first, last, min,
-    /// max as they can have different values of the timestamp column
-    ///
-    /// SELECT
-    ///   tag1...tagN
-    ///   agg_function(_val1) as _value1
-    ///   agg_function(time) as time1
-    ///   ..
-    ///   agg_function(_valN) as _valueN
-    ///   agg_function(time) as timeN
-    /// GROUP BY
-    ///   tags
-    /// ORDER BY
-    ///   tags
-    ///
-    /// The created plan looks like:
-    ///
-    ///  OrderBy(gby cols; agg)
-    ///     GroupBy(gby cols, aggs, time cols)
-    ///       Filter(predicate)
-    ///          Scan
     fn read_group_plan(
-        table_name: &str,
-        schema: &Schema,
+        provider: Arc<ChunkTableProvider>,
         predicate: &Predicate,
-        agg: Aggregate,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<SeriesSetPlan> {
-        let scan_and_filter = ScanPlanBuilder::new(Arc::from(table_name), schema)
-            .with_predicate(predicate)
-            .with_chunks(chunks)
-            .build()?;
+        aggregate: Aggregate,
+    ) -> Result<LogicalPlan> {
+        let schema = provider.iox_schema();
 
-        // order the tag columns so that the group keys come first (we
-        // will group and
-        // order in the same order)
-        let schema = scan_and_filter.provider.iox_schema();
-        let tag_columns: Vec<_> = schema.tags_iter().map(|f| f.name() as &str).collect();
+        let measurement_expr = lit(provider.table_name());
+        let mut tag_names = schema
+            .tags_iter()
+            .map(|tag| tag.name().clone())
+            .collect::<Vec<String>>();
+        tag_names.sort_unstable();
+        let tag_exprs: Vec<_> = tag_names
+            .into_iter()
+            .map(|s| {
+                Expr::Column(Column {
+                    relation: None,
+                    name: s,
+                })
+            })
+            .collect();
+        let time_expr = schema.time_iter().map(field_col).next().unwrap();
+        let (field_exprs, field_columns) = filtered_fields_iter(schema, predicate)
+            .map(|fe| {
+                (
+                    fe.expr,
+                    Expr::Column(Column {
+                        relation: None,
+                        name: fe.name.to_string(),
+                    }),
+                )
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
 
-        // Group by all tag columns
-        let group_exprs = tag_columns
-            .iter()
-            .map(|tag_name| tag_name.as_expr())
-            .collect::<Vec<_>>();
+        let mut builder = Arc::clone(&provider).into_logical_plan_builder()?;
+        if let Some(expr) = predicate.filter_expr() {
+            builder = builder.filter(expr)?;
+        }
 
-        let AggExprs {
-            agg_exprs,
-            field_columns,
-        } = AggExprs::try_new_for_read_group(agg, schema, predicate)?;
-
-        let plan_builder = scan_and_filter
-            .plan_builder
-            .aggregate(group_exprs, agg_exprs)
-            .context(BuildingPlanSnafu)?;
-
-        // Reorganize the output so it is ordered and sorted on tag columns
-
-        // no columns if there are no tags in the input and no group columns in the query
-        let plan_builder = if !tag_columns.is_empty() {
-            // reorder columns
-            let reorder_exprs = tag_columns
-                .iter()
-                .map(|tag_name| tag_name.as_expr())
-                .collect::<Vec<_>>();
-
-            let sort_exprs = reorder_exprs
-                .iter()
-                .map(|expr| expr.as_sort_expr())
-                .collect::<Vec<_>>();
-
-            let project_exprs = project_exprs_in_schema(&tag_columns, plan_builder.schema());
-
-            plan_builder
-                .project(project_exprs)
-                .context(BuildingPlanSnafu)?
-                .sort(sort_exprs)
-                .context(BuildingPlanSnafu)?
-        } else {
-            plan_builder
+        let (mut builder, time_exprs, field_exprs) = match aggregate {
+            agg @ (Aggregate::Sum | Aggregate::Count | Aggregate::Mean) => {
+                let agg = match agg {
+                    Aggregate::Sum => FieldAggregator::Aggregator(sum_udaf()),
+                    Aggregate::Count => FieldAggregator::Aggregator(count_udaf()),
+                    Aggregate::Mean => FieldAggregator::Aggregator(avg_udaf()),
+                    _ => unreachable!(),
+                };
+                (
+                    builder.aggregate_fields(
+                        tag_exprs.clone(),
+                        time_expr.clone(),
+                        Some(max_udaf()),
+                        field_exprs.clone(),
+                        agg,
+                    )?,
+                    repeat(&time_expr)
+                        .take(field_columns.len())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    field_columns,
+                )
+            }
+            agg @ (Aggregate::Min | Aggregate::Max | Aggregate::First | Aggregate::Last) => {
+                let agg = match agg {
+                    Aggregate::Min => FieldAggregator::Selector(Arc::new(selector_min())),
+                    Aggregate::Max => FieldAggregator::Selector(Arc::new(selector_max())),
+                    Aggregate::First => FieldAggregator::Selector(Arc::new(selector_first())),
+                    Aggregate::Last => FieldAggregator::Selector(Arc::new(selector_last())),
+                    _ => unreachable!(),
+                };
+                (
+                    builder.aggregate_fields(
+                        tag_exprs.clone(),
+                        time_expr.clone(),
+                        None,
+                        field_exprs.clone(),
+                        agg,
+                    )?,
+                    field_columns
+                        .iter()
+                        .map(|expr| {
+                            Expr::ScalarFunction(ScalarFunction {
+                                func: get_field(),
+                                args: vec![expr.clone(), lit("time")],
+                            })
+                        })
+                        .collect(),
+                    field_columns
+                        .iter()
+                        .map(|expr| {
+                            expr.name_for_alias().map(|alias| {
+                                Expr::ScalarFunction(ScalarFunction {
+                                    func: get_field(),
+                                    args: vec![expr.clone(), lit("value")],
+                                })
+                                .alias(alias)
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            Aggregate::None => (
+                builder,
+                repeat(&time_expr)
+                    .take(field_columns.len())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                field_exprs,
+            ),
         };
-
-        let plan_builder = cast_aggregates(plan_builder, agg, &field_columns)?;
-
-        let plan = plan_builder.build().context(BuildingPlanSnafu)?;
-
-        let tag_columns = tag_columns.iter().map(|s| Arc::from(*s)).collect();
-        let ss_plan = SeriesSetPlan::new(
-            Arc::from(table_name.to_string()),
-            plan,
-            tag_columns,
-            field_columns,
-        );
-
-        Ok(ss_plan)
+        builder = builder.series_pivot(measurement_expr, tag_exprs, time_exprs, field_exprs)?;
+        Ok(builder.build()?)
     }
 
-    /// Creates a SeriesSetPlan that produces an output table with rows
-    /// that are grouped by window definitions
+    /// Creates a DataFusion LogicalPlan that produces the pivoted data
+    /// from the table provider. The data is aggregated into time windows
+    /// using the requested aggregate function.
     ///
-    /// The order of the tag_columns
+    /// The plan has the schema like:
     ///
-    /// The data is sorted on tag_col1, tag_col2, ...) so that all
-    /// rows for a particular series (groups where all tags are the
-    /// same) occur together in the plan
+    /// - _measurement: Dictionary(Int32, Utf8)
+    /// - ...tags: Dictionary(Int32, Utf8)
+    /// - _field: Dictionary(Int32, Utf8)
+    /// - _time: Timestamp(Nanosecond, None)
+    /// - _value: Union
     ///
-    /// Equivalent to this SQL query
-    ///
-    /// SELECT tag1, ... tagN,
-    ///   window_bound(time, every, offset) as time,
-    ///   agg_function1(field), as field_name
-    /// FROM measurement
-    /// GROUP BY
-    ///   tag1, ... tagN,
-    ///   window_bound(time, every, offset) as time,
-    /// ORDER BY
-    ///   tag1, ... tagN,
-    ///   window_bound(time, every, offset) as time
-    ///
-    /// The created plan looks like:
-    ///
-    ///  OrderBy(gby: tag columns, window_function; agg: aggregate(field))
-    ///      GroupBy(gby: tag columns, window_function; agg: aggregate(field))
-    ///        Filter(predicate)
-    ///          Scan
     #[allow(clippy::too_many_arguments)]
     fn read_window_aggregate_plan(
-        table_name: &str,
-        schema: &Schema,
+        provider: Arc<ChunkTableProvider>,
         predicate: &Predicate,
-        agg: Aggregate,
+        aggregate: Aggregate,
         every: WindowDuration,
         offset: WindowDuration,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<SeriesSetPlan> {
-        let scan_and_filter = ScanPlanBuilder::new(Arc::from(table_name), schema)
-            .with_predicate(predicate)
-            .with_chunks(chunks)
-            .build()?;
+    ) -> Result<LogicalPlan> {
+        let schema = provider.iox_schema();
 
-        let schema = scan_and_filter.provider.iox_schema();
-
+        let measurement_expr = lit(provider.table_name());
+        let mut tag_names = schema
+            .tags_iter()
+            .map(|tag| tag.name().clone())
+            .collect::<Vec<String>>();
+        tag_names.sort_unstable();
+        let tag_exprs: Vec<_> = tag_names
+            .into_iter()
+            .map(|s| {
+                Expr::Column(Column {
+                    relation: None,
+                    name: s,
+                })
+            })
+            .collect();
+        let time_expr = schema.time_iter().map(field_col).next().unwrap();
+        let (field_exprs, field_columns) = filtered_fields_iter(schema, predicate)
+            .map(|fe| {
+                (
+                    fe.expr,
+                    Expr::Column(Column {
+                        relation: None,
+                        name: fe.name.to_string(),
+                    }),
+                )
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
         // Group by all tag columns and the window bounds
         let window_bound = make_window_bound_expr(TIME_COLUMN_NAME.as_expr(), every, offset)
             .alias(TIME_COLUMN_NAME);
 
-        let group_exprs = schema
-            .tags_iter()
-            .map(|field| field.name().as_expr())
-            .chain(std::iter::once(window_bound))
-            .collect::<Vec<_>>();
+        let mut builder = Arc::clone(&provider).into_logical_plan_builder()?;
+        if let Some(expr) = predicate.filter_expr() {
+            builder = builder.filter(expr)?;
+        }
+        let mut group_expr = tag_exprs.clone();
+        group_expr.push(window_bound);
 
-        let AggExprs {
-            agg_exprs,
-            field_columns,
-        } = AggExprs::try_new_for_read_window_aggregate(agg, schema, predicate)?;
-
-        // sort by the group by expressions as well
-        let sort_exprs = group_exprs
-            .iter()
-            .map(|expr| expr.as_sort_expr())
-            .collect::<Vec<_>>();
-
-        let plan_builder = scan_and_filter
-            .plan_builder
-            .aggregate(group_exprs, agg_exprs)?
-            .sort(sort_exprs)?;
-
-        let plan_builder = cast_aggregates(plan_builder, agg, &field_columns)?;
-
-        // and finally create the plan
-        let plan = plan_builder.build()?;
-
-        let tag_columns = schema
-            .tags_iter()
-            .map(|field| Arc::from(field.name().as_str()))
-            .collect();
-
-        Ok(SeriesSetPlan::new(
-            Arc::from(table_name),
-            plan,
-            tag_columns,
-            field_columns,
-        ))
+        let (mut builder, time_exprs, field_exprs) = match aggregate {
+            agg @ (Aggregate::Sum | Aggregate::Count | Aggregate::Mean) => {
+                let agg = match agg {
+                    Aggregate::Sum => FieldAggregator::Aggregator(sum_udaf()),
+                    Aggregate::Count => FieldAggregator::Aggregator(count_udaf()),
+                    Aggregate::Mean => FieldAggregator::Aggregator(avg_udaf()),
+                    _ => unreachable!(),
+                };
+                (
+                    builder.aggregate_fields(
+                        group_expr,
+                        time_expr.clone(),
+                        None,
+                        field_exprs.clone(),
+                        agg,
+                    )?,
+                    repeat(&time_expr)
+                        .take(field_columns.len())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    field_columns,
+                )
+            }
+            agg @ (Aggregate::Min | Aggregate::Max | Aggregate::First | Aggregate::Last) => {
+                let agg = match agg {
+                    Aggregate::Min => FieldAggregator::Selector(Arc::new(selector_min())),
+                    Aggregate::Max => FieldAggregator::Selector(Arc::new(selector_max())),
+                    Aggregate::First => FieldAggregator::Selector(Arc::new(selector_first())),
+                    Aggregate::Last => FieldAggregator::Selector(Arc::new(selector_last())),
+                    _ => unreachable!(),
+                };
+                (
+                    builder.aggregate_fields(
+                        group_expr,
+                        time_expr.clone(),
+                        None,
+                        field_exprs.clone(),
+                        agg,
+                    )?,
+                    field_columns
+                        .iter()
+                        .map(|expr| {
+                            Expr::ScalarFunction(ScalarFunction {
+                                func: get_field(),
+                                args: vec![expr.clone(), lit("time")],
+                            })
+                        })
+                        .collect(),
+                    field_columns
+                        .iter()
+                        .map(|expr| {
+                            expr.name_for_alias().map(|alias| {
+                                Expr::ScalarFunction(ScalarFunction {
+                                    func: get_field(),
+                                    args: vec![expr.clone(), lit("value")],
+                                })
+                                .alias(alias)
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            Aggregate::None => InternalUnexpectedNoneAggregateSnafu.fail()?,
+        };
+        builder = builder.series_pivot(measurement_expr, tag_exprs, time_exprs, field_exprs)?;
+        Ok(builder.build()?)
     }
 }
 
@@ -1396,79 +1411,6 @@ where
         .await
 }
 
-/// Return a `Vec` of `Exprs` such that it starts with `prefix` cols and
-/// then has all columns in `schema` that are not already in the prefix.
-fn project_exprs_in_schema(prefix: &[&str], schema: &DFSchemaRef) -> Vec<Expr> {
-    let seen: HashSet<_> = prefix.iter().cloned().collect();
-
-    let prefix_exprs = prefix.iter().map(|name| name.as_expr());
-    let new_exprs = schema.fields().iter().filter_map(|f| {
-        let name = f.name().as_str();
-        if !seen.contains(name) {
-            Some(name.as_expr())
-        } else {
-            None
-        }
-    });
-
-    prefix_exprs.chain(new_exprs).collect()
-}
-
-/// casts aggregates (fields named in field_columns) to the types
-/// expected by Flux. Currently this means converting count aggregates
-/// into Int64
-fn cast_aggregates(
-    plan_builder: LogicalPlanBuilder,
-    agg: Aggregate,
-    field_columns: &FieldColumns,
-) -> Result<LogicalPlanBuilder> {
-    if !matches!(agg, Aggregate::Count) {
-        return Ok(plan_builder);
-    }
-
-    let schema = plan_builder.schema();
-
-    // in read_group and read_window_aggregate, aggregates are only
-    // applied to fields, so all fields are also aggregates.
-    let field_names: HashSet<&str> = match field_columns {
-        FieldColumns::SharedTimestamp(field_names) => {
-            field_names.iter().map(|s| s.as_ref()).collect()
-        }
-        FieldColumns::DifferentTimestamp(fields_and_timestamps) => fields_and_timestamps
-            .iter()
-            .map(|(field, _timestamp)| field.as_ref())
-            .collect(),
-    };
-
-    // Build expressions for each select list
-    let cast_exprs = schema
-        .fields()
-        .iter()
-        .map(|df_field| {
-            let field_name = df_field.name();
-            let expr = if field_names.contains(field_name.as_str()) {
-                // CAST(field_name as Int64) as field_name
-                field_name
-                    .as_expr()
-                    .cast_to(&DataType::Int64, schema)
-                    .context(CastingAggregatesSnafu { agg, field_name })?
-                    .alias(field_name)
-            } else {
-                field_name.as_expr()
-            };
-            Ok(expr)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    plan_builder.project(cast_exprs).context(BuildingPlanSnafu)
-}
-
-/// Helper for creating aggregates
-pub(crate) struct AggExprs {
-    agg_exprs: Vec<Expr>,
-    field_columns: FieldColumns,
-}
-
 // Encapsulates a field column projection as an expression. In the simplest case
 // the expression is a `Column` expression. In more complex cases it might be
 // a predicate that filters rows for the projection.
@@ -1517,209 +1459,11 @@ fn filtered_fields_iter<'a>(
     })
 }
 
-/// Creates aggregate expressions and tracks field output according to
-/// the rules explained on `read_group_plan`
-impl AggExprs {
-    /// Create the appropriate aggregate expressions, based on the type of the
-    /// field for a `read_group` plan.
-    pub(crate) fn try_new_for_read_group(
-        agg: Aggregate,
-        schema: &Schema,
-        predicate: &Predicate,
-    ) -> Result<Self> {
-        match agg {
-            Aggregate::Sum | Aggregate::Count | Aggregate::Mean => {
-                Self::agg_for_read_group(agg, schema, predicate)
-            }
-            Aggregate::First | Aggregate::Last | Aggregate::Min | Aggregate::Max => {
-                Self::selector_aggregates(agg, schema, predicate)
-            }
-            Aggregate::None => InternalUnexpectedNoneAggregateSnafu.fail(),
-        }
-    }
-
-    /// Create the appropriate aggregate expressions, based on the type of the
-    /// field for a `read_window_aggregate` plan.
-    pub(crate) fn try_new_for_read_window_aggregate(
-        agg: Aggregate,
-        schema: &Schema,
-        predicate: &Predicate,
-    ) -> Result<Self> {
-        match agg {
-            Aggregate::Sum | Aggregate::Count | Aggregate::Mean => {
-                Self::agg_for_read_window_aggregate(agg, schema, predicate)
-            }
-            Aggregate::First | Aggregate::Last | Aggregate::Min | Aggregate::Max => {
-                Self::selector_aggregates(agg, schema, predicate)
-            }
-            Aggregate::None => InternalUnexpectedNoneAggregateSnafu.fail(),
-        }
-    }
-
-    // Creates special aggregate "selector" expressions for the fields in the
-    // provided schema. Selectors ensure that the relevant aggregate functions
-    // are also provided to a distinct time column for each field column.
-    //
-    // Equivalent SQL would look like:
-    //
-    //   agg_function(_val1) as _value1
-    //   agg_function(time) as time1
-    //   ..
-    //   agg_function(_valN) as _valueN
-    //   agg_function(time) as timeN
-    fn selector_aggregates(agg: Aggregate, schema: &Schema, predicate: &Predicate) -> Result<Self> {
-        // might be nice to use a more functional style here
-        let mut agg_exprs = Vec::new();
-        let mut field_list = Vec::new();
-
-        for field in filtered_fields_iter(schema, predicate) {
-            let selector = make_selector_expr(agg, field.clone())?;
-
-            let field_name = field.name;
-            agg_exprs.push(selector.clone().field("value").alias(field_name));
-
-            let time_column_name = format!("{TIME_COLUMN_NAME}_{field_name}");
-            agg_exprs.push(selector.field("time").alias(&time_column_name));
-
-            field_list.push((
-                Arc::from(field_name), // value name
-                Arc::from(time_column_name.as_str()),
-            ));
-        }
-
-        let field_columns = field_list.into();
-        Ok(Self {
-            agg_exprs,
-            field_columns,
-        })
-    }
-
-    // Creates aggregate expressions for use in a read_group plan, which
-    // includes the time column.
-    //
-    // Equivalent SQL would look like this:
-    //
-    //  agg_function(_val1) as _value1
-    //  ...
-    //  agg_function(_valN) as _valueN
-    //  agg_function(time) as time
-    fn agg_for_read_group(agg: Aggregate, schema: &Schema, predicate: &Predicate) -> Result<Self> {
-        let agg_exprs = filtered_fields_iter(schema, predicate)
-            .map(|field| make_agg_expr(agg, field))
-            .chain(schema.time_iter().map(|field| {
-                make_agg_expr(
-                    agg,
-                    FieldExpr {
-                        expr: field.name().as_expr(),
-                        name: field.name(),
-                    },
-                )
-            }))
-            .collect::<Result<Vec<_>>>()?;
-
-        let field_columns = filtered_fields_iter(schema, predicate)
-            .map(|field| Arc::from(field.name))
-            .collect::<Vec<_>>()
-            .into();
-
-        Ok(Self {
-            agg_exprs,
-            field_columns,
-        })
-    }
-
-    // Creates aggregate expressions for use in a read_window_aggregate plan. No
-    // aggregates are created for the time column because the
-    // `read_window_aggregate` uses a time column calculated using window
-    // bounds.
-    //
-    // Equivalent SQL would look like this:
-    //
-    //  agg_function(_val1) as _value1
-    //  ...
-    //  agg_function(_valN) as _valueN
-    fn agg_for_read_window_aggregate(
-        agg: Aggregate,
-        schema: &Schema,
-        predicate: &Predicate,
-    ) -> Result<Self> {
-        let agg_exprs = filtered_fields_iter(schema, predicate)
-            .map(|field| make_agg_expr(agg, field))
-            .collect::<Result<Vec<_>>>()?;
-
-        let field_columns = filtered_fields_iter(schema, predicate)
-            .map(|field| Arc::from(field.name))
-            .collect::<Vec<_>>()
-            .into();
-
-        Ok(Self {
-            agg_exprs,
-            field_columns,
-        })
-    }
-}
-
-/// Creates a DataFusion expression suitable for calculating an aggregate:
-///
-/// equivalent to `CAST agg(field) as field`
-fn make_agg_expr(agg: Aggregate, field_expr: FieldExpr<'_>) -> Result<Expr> {
-    // For timestamps, use `MAX` which corresponds to the last
-    // timestamp in the group, unless `MIN` was specifically requested
-    // to be consistent with the Go implementation which takes the
-    // timestamp at the end of the window
-    let agg = if field_expr.name == TIME_COLUMN_NAME && agg != Aggregate::Min {
-        Aggregate::Max
-    } else {
-        agg
-    };
-
-    let field_name = field_expr.name;
-    agg.to_datafusion_expr(field_expr.expr)
-        .context(CreatingAggregatesSnafu)
-        .map(|agg| agg.alias(field_name))
-}
-
-/// Creates a DataFusion expression suitable for calculating the time part of a
-/// selector:
-///
-/// The output expression is equivalent to `CAST selector_time(field_expression)
-/// as col_name`.
-///
-/// In the simplest scenarios the field expressions are `Column` expressions.
-/// In some cases the field expressions are `CASE` statements such as for
-/// example:
-///
-/// CAST selector_time(
-///     CASE WHEN field = 1.87 OR field = 1.99 THEN field
-///     ELSE NULL
-/// END) as col_name
-///
-fn make_selector_expr(agg: Aggregate, field: FieldExpr<'_>) -> Result<Expr> {
-    let uda = match agg {
-        Aggregate::First => selector_first(),
-        Aggregate::Last => selector_last(),
-        Aggregate::Min => selector_min(),
-        Aggregate::Max => selector_max(),
-        _ => return InternalAggregateNotSelectorSnafu { agg }.fail(),
-    };
-
-    Ok(uda.call(vec![field.expr, TIME_COLUMN_NAME.as_expr()]))
-}
-
-/// Orders chunks so it is likely that the ones that already have cached data are pulled first.
-///
-/// We use the inverse chunk order as a heuristic here. See <https://github.com/influxdata/influxdb_iox/issues/5037> for
-/// a more advanced variant.
-fn cheap_chunk_first(mut chunks: Vec<Arc<dyn QueryChunk>>) -> Vec<Arc<dyn QueryChunk>> {
-    chunks.sort_by_key(|chunk| Reverse(chunk.order()));
-    chunks
-}
-
 fn chunk_column_names(
     chunk: &Arc<dyn QueryChunk>,
     predicate: &Predicate,
     columns: Projection<'_>,
-) -> Option<StringSet> {
+) -> Option<BTreeSet<String>> {
     if !predicate.is_empty() {
         // if there is anything in the predicate, bail for now and force a full plan
         return None;
@@ -1766,6 +1510,19 @@ impl std::fmt::Debug for NamespaceMeta {
     }
 }
 
+/// Create a table provider for the specified table name, schema, and chunks.
+fn table_provider(
+    table_name: impl Into<Arc<str>>,
+    schema: Schema,
+    chunks: impl IntoIterator<Item = Arc<dyn QueryChunk>>,
+) -> Result<ChunkTableProvider> {
+    let mut builder = ProviderBuilder::new(table_name.into(), schema);
+    for chunk in chunks {
+        builder = builder.add_chunk(chunk);
+    }
+    builder.build().context(BuildingTableProviderSnafu)
+}
+
 #[async_trait]
 impl QueryNamespaceMeta for NamespaceMeta {
     fn table_names(&self) -> Vec<String> {
@@ -1784,6 +1541,14 @@ impl QueryNamespaceMeta for NamespaceMeta {
             .expect("valid IOx schema");
         Some(schema)
     }
+}
+
+/// Create an expression that references a field in a table.
+fn field_col(field: &Field) -> Expr {
+    Expr::Column(Column {
+        relation: None,
+        name: field.name().clone(),
+    })
 }
 
 #[cfg(test)]
@@ -2278,7 +2043,7 @@ mod tests {
         run_test(|test_db, rpc_predicate| {
             async move {
                 let agg = Aggregate::None;
-                let group_columns = &["foo"];
+                let group_columns = &[String::from("foo")];
                 InfluxRpcPlanner::new(test_db.new_query_context(None, None))
                     .read_group(test_db, rpc_predicate, agg, group_columns)
                     .await
@@ -2317,16 +2082,14 @@ mod tests {
         let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
 
         let agg = Aggregate::None;
-        let group_columns = &["foo"];
+        let group_columns = &[String::from("foo")];
         let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
             .read_group(Arc::clone(&test_db) as _, rpc_predicate, agg, group_columns)
             .await
             .expect("creating plan");
-        assert_eq!(res.plans.len(), 1);
-        let ssplan = res.plans.first().unwrap();
-        insta::assert_snapshot!(ssplan.plan.display_indent_schema().to_string(), @r###"
-        Projection: h2o.foo, CASE WHEN h2o.foo.bar = Float64(1.2) THEN h2o.foo.bar END AS foo.bar, h2o.time [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
-          Sort: h2o.foo ASC NULLS FIRST, h2o.time ASC NULLS FIRST [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
+        insta::assert_snapshot!(res.display_indent_schema().to_string(), @r###"
+        Sort: foo ASC NULLS LAST, _measurement ASC NULLS LAST, _field ASC NULLS LAST, _time ASC NULLS LAST [_measurement:Dictionary(Int32, Utf8), foo:Dictionary(Int32, Utf8);N, _field:Dictionary(Int32, Utf8), _time:Timestamp(Nanosecond, Some("UTC")), _value:Union([(0, Field { name: "float", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (1, Field { name: "integer", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (2, Field { name: "unsigned", data_type: UInt64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (3, Field { name: "boolean", data_type: Boolean, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (4, Field { name: "string", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })], Sparse)]
+          SeriesPivot: measurement_expr=Utf8("h2o"), tag_exprs=(foo), time_exprs=(time), field_exprs=(CASE WHEN foo.bar = Float64(1.2) THEN foo.bar END AS foo.bar) [_measurement:Dictionary(Int32, Utf8), foo:Dictionary(Int32, Utf8);N, _field:Dictionary(Int32, Utf8), _time:Timestamp(Nanosecond, Some("UTC")), _value:Union([(0, Field { name: "float", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (1, Field { name: "integer", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (2, Field { name: "unsigned", data_type: UInt64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (3, Field { name: "boolean", data_type: Boolean, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (4, Field { name: "string", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })], Sparse)]
             TableScan: h2o [foo:Dictionary(Int32, Utf8);N, foo.bar:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
         "###);
     }
@@ -2370,21 +2133,247 @@ mod tests {
 
         let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
 
-        let res = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
+        let plan = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
             .read_filter(Arc::clone(&test_db) as _, rpc_predicate)
             .await
             .expect("creating plan");
-        assert_eq!(res.plans.len(), 1);
 
         // Note: The retention policy (i.e. a time predicate) does NOT occur within the logical plan because it is an
         //       implementation detail of the table itself and will only be manifested when the `TableScan` is converted
         //       into a physical plan (which uses the IOx table provider code).
-        let ssplan = res.plans.first().unwrap();
-        insta::assert_snapshot!(ssplan.plan.display_indent_schema().to_string(), @r###"
-        Projection: table.tag, table.field AS field, table.time [tag:Dictionary(Int32, Utf8);N, field:Float64;N, time:Timestamp(Nanosecond, Some("UTC"))]
-          Sort: table.tag ASC NULLS FIRST, table.time ASC NULLS FIRST [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+        insta::assert_snapshot!(plan.display_indent_schema().to_string(), @r###"
+        Sort: _measurement ASC NULLS LAST, tag ASC NULLS LAST, _field ASC NULLS LAST, _time ASC NULLS LAST [_measurement:Dictionary(Int32, Utf8), tag:Dictionary(Int32, Utf8);N, _field:Dictionary(Int32, Utf8), _time:Timestamp(Nanosecond, Some("UTC")), _value:Union([(0, Field { name: "float", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (1, Field { name: "integer", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (2, Field { name: "unsigned", data_type: UInt64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (3, Field { name: "boolean", data_type: Boolean, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (4, Field { name: "string", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })], Sparse)]
+          SeriesPivot: measurement_expr=Utf8("table"), tag_exprs=(tag), time_exprs=(time), field_exprs=(field AS field) [_measurement:Dictionary(Int32, Utf8), tag:Dictionary(Int32, Utf8);N, _field:Dictionary(Int32, Utf8), _time:Timestamp(Nanosecond, Some("UTC")), _value:Union([(0, Field { name: "float", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (1, Field { name: "integer", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (2, Field { name: "unsigned", data_type: UInt64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (3, Field { name: "boolean", data_type: Boolean, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), (4, Field { name: "string", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })], Sparse)]
             Filter: table.tag = Dictionary(Int32, Utf8("MA")) AND table.time > TimestampNanosecond(1, Some("UTC")) [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
               TableScan: table [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+        "###);
+    }
+
+    #[tokio::test]
+    async fn test_table_names_plan_empty() {
+        maybe_start_logging();
+
+        let executor = Arc::new(Executor::new_testing());
+        let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
+        let predicate = Predicate::new();
+        let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
+
+        let plan = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
+            .table_names(Arc::clone(&test_db) as _, rpc_predicate)
+            .await
+            .expect("creating plan");
+
+        insta::assert_snapshot!(plan.display_indent_schema().to_string(), @r###"
+        Sort: string_value ASC NULLS LAST [string_value:Utf8]
+          EmptyRelation [string_value:Utf8]
+        "###);
+
+        let physical_plan = executor
+            .new_context()
+            .create_physical_plan(&plan)
+            .await
+            .expect("physical plan");
+        let physical_plan = datafusion::physical_plan::displayable(physical_plan.as_ref());
+        insta::assert_snapshot!(physical_plan.indent(true), @r###"
+        EmptyExec
+        "###);
+    }
+
+    #[tokio::test]
+    async fn test_table_names_plan_one_table() {
+        maybe_start_logging();
+
+        let executor = Arc::new(Executor::new_testing());
+        let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
+
+        let chunk = Arc::new(
+            TestChunk::new("table")
+                .with_id(0)
+                .with_tag_column("tag")
+                .with_f64_field_column("field")
+                .with_time_column()
+                .with_one_row_of_data(),
+        );
+        test_db.add_chunk("my_partition_key", Arc::clone(&chunk));
+
+        let predicate = Predicate::new();
+        let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
+
+        let plan = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
+            .table_names(Arc::clone(&test_db) as _, rpc_predicate)
+            .await
+            .expect("creating plan");
+
+        insta::assert_snapshot!(plan.display_indent_schema().to_string(), @r###"
+        Sort: string_value ASC NULLS LAST [string_value:Utf8]
+          Union [string_value:Utf8]
+            EmptyRelation [string_value:Utf8]
+            Projection: Utf8("table") AS string_value [string_value:Utf8]
+              Limit: skip=0, fetch=1 [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                Sort: table.time DESC NULLS LAST [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: table.field IS NOT NULL [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: table [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+        "###);
+
+        let physical_plan = executor
+            .new_context()
+            .create_physical_plan(&plan)
+            .await
+            .expect("physical plan");
+        let physical_plan = datafusion::physical_plan::displayable(physical_plan.as_ref());
+        insta::assert_snapshot!(physical_plan.indent(true), @r###"
+        ProjectionExec: expr=[table as string_value]
+          SortExec: TopK(fetch=1), expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]
+            ProjectionExec: expr=[time@1 as time]
+              CoalesceBatchesExec: target_batch_size=8192
+                FilterExec: field@0 IS NOT NULL
+                  RecordBatchesExec: chunks=1, projection=[field, time]
+        "###);
+    }
+
+    #[tokio::test]
+    async fn test_table_names_plan_two_tables() {
+        maybe_start_logging();
+
+        let executor = Arc::new(Executor::new_testing());
+        let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
+
+        let chunk = Arc::new(
+            TestChunk::new("table")
+                .with_id(0)
+                .with_tag_column("tag")
+                .with_f64_field_column("field")
+                .with_time_column()
+                .with_one_row_of_data(),
+        );
+        test_db.add_chunk("my_partition_key_1", Arc::clone(&chunk));
+
+        let chunk = Arc::new(
+            TestChunk::new("other_table")
+                .with_id(0)
+                .with_tag_column("tag")
+                .with_f64_field_column("other_field")
+                .with_time_column()
+                .with_one_row_of_data(),
+        );
+        test_db.add_chunk("my_partition_key_2", Arc::clone(&chunk));
+
+        let predicate = Predicate::new();
+        let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
+
+        let plan = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
+            .table_names(Arc::clone(&test_db) as _, rpc_predicate)
+            .await
+            .expect("creating plan");
+
+        insta::assert_snapshot!(plan.display_indent_schema().to_string(), @r###"
+        Sort: string_value ASC NULLS LAST [string_value:Utf8]
+          Union [string_value:Utf8]
+            Union [string_value:Utf8]
+              EmptyRelation [string_value:Utf8]
+              Projection: Utf8("table") AS string_value [string_value:Utf8]
+                Limit: skip=0, fetch=1 [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Sort: table.time DESC NULLS LAST [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    Filter: table.field IS NOT NULL [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                      TableScan: table [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+            Projection: Utf8("other_table") AS string_value [string_value:Utf8]
+              Limit: skip=0, fetch=1 [other_field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                Sort: other_table.time DESC NULLS LAST [other_field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: other_table.other_field IS NOT NULL [other_field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    TableScan: other_table [other_field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+        "###);
+
+        let physical_plan = executor
+            .new_context()
+            .create_physical_plan(&plan)
+            .await
+            .expect("physical plan");
+        let physical_plan = datafusion::physical_plan::displayable(physical_plan.as_ref());
+        insta::assert_snapshot!(physical_plan.indent(true), @r###"
+        SortPreservingMergeExec: [string_value@0 ASC NULLS LAST]
+          UnionExec
+            ProjectionExec: expr=[table as string_value]
+              SortExec: TopK(fetch=1), expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]
+                ProjectionExec: expr=[time@1 as time]
+                  CoalesceBatchesExec: target_batch_size=8192
+                    FilterExec: field@0 IS NOT NULL
+                      RecordBatchesExec: chunks=1, projection=[field, time]
+            ProjectionExec: expr=[other_table as string_value]
+              SortExec: TopK(fetch=1), expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]
+                ProjectionExec: expr=[time@1 as time]
+                  CoalesceBatchesExec: target_batch_size=8192
+                    FilterExec: other_field@0 IS NOT NULL
+                      RecordBatchesExec: chunks=1, projection=[other_field, time]
+        "###);
+    }
+
+    #[tokio::test]
+    async fn test_table_names_plan_two_tables_with_predicate() {
+        maybe_start_logging();
+
+        let executor = Arc::new(Executor::new_testing());
+        let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
+
+        let chunk = Arc::new(
+            TestChunk::new("table")
+                .with_id(0)
+                .with_tag_column("tag")
+                .with_f64_field_column("field")
+                .with_time_column()
+                .with_one_row_of_data(),
+        );
+        test_db.add_chunk("my_partition_key_1", Arc::clone(&chunk));
+
+        let chunk = Arc::new(
+            TestChunk::new("other_table")
+                .with_id(0)
+                .with_tag_column("other_tag")
+                .with_f64_field_column("other_field")
+                .with_time_column()
+                .with_one_row_of_data(),
+        );
+        test_db.add_chunk("my_partition_key_2", Arc::clone(&chunk));
+
+        let predicate = Predicate::new().with_expr("tag".as_expr().eq(lit("MA")));
+        let rpc_predicate = InfluxRpcPredicate::new(None, predicate);
+
+        let plan = InfluxRpcPlanner::new(test_db.new_query_context(None, None))
+            .table_names(Arc::clone(&test_db) as _, rpc_predicate)
+            .await
+            .expect("creating plan");
+
+        insta::assert_snapshot!(plan.display_indent_schema().to_string(), @r###"
+        Sort: string_value ASC NULLS LAST [string_value:Utf8]
+          Union [string_value:Utf8]
+            Union [string_value:Utf8]
+              EmptyRelation [string_value:Utf8]
+              Projection: Utf8("table") AS string_value [string_value:Utf8]
+                Limit: skip=0, fetch=1 [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Sort: table.time DESC NULLS LAST [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    Filter: table.field IS NOT NULL [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                      Filter: table.tag = Dictionary(Int32, Utf8("MA")) [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                        TableScan: table [field:Float64;N, tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+            Projection: Utf8("other_table") AS string_value [string_value:Utf8]
+              Limit: skip=0, fetch=1 [other_field:Float64;N, other_tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                Sort: other_table.time DESC NULLS LAST [other_field:Float64;N, other_tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                  Filter: other_table.other_field IS NOT NULL [other_field:Float64;N, other_tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                    Filter: Boolean(NULL) [other_field:Float64;N, other_tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+                      TableScan: other_table [other_field:Float64;N, other_tag:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, Some("UTC"))]
+        "###);
+
+        let physical_plan = executor
+            .new_context()
+            .create_physical_plan(&plan)
+            .await
+            .expect("physical plan");
+        let physical_plan = datafusion::physical_plan::displayable(physical_plan.as_ref());
+        insta::assert_snapshot!(physical_plan.indent(true), @r###"
+        ProjectionExec: expr=[table as string_value]
+          SortExec: TopK(fetch=1), expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]
+            ProjectionExec: expr=[time@2 as time]
+              CoalesceBatchesExec: target_batch_size=8192
+                FilterExec: field@0 IS NOT NULL AND tag@1 = MA
+                  RecordBatchesExec: chunks=1, projection=[field, tag, time]
         "###);
     }
 

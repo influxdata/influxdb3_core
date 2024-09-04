@@ -15,9 +15,8 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
-use once_cell::sync::Lazy;
 use prost::Message;
 use prost_types::FileDescriptorProto;
 // Re-export prost for users of proto types.
@@ -386,37 +385,38 @@ pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("prot
 /// A map of [`tonic::server::NamedService::NAME`] strings to
 /// [`prost_types::FileDescriptorProto`]s. This is intended to be used to selectively populating
 /// the gRPC reflection service only with service protos being registered in a given IOx component.
-pub static FILE_DESCRIPTOR_MAP: Lazy<HashMap<String, FileDescriptorProto>> = Lazy::new(|| {
-    FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
-        .expect("decoding FILE_DESCRIPTOR_SET")
-        .file
-        .into_iter()
-        .flat_map(|proto| {
-            proto
-                .service
-                .iter()
-                .map(|svc| {
-                    // Figure out the fully-qualified name of this service.
-                    //
-                    // This string will be in the form of "<package>.<service>"
-                    // where "package" may itself contain multiple parts
-                    // delimited by "."
-                    //
-                    // If no package exists, use the service name only.
-                    let qualified_name = proto
-                        .package
-                        .iter()
-                        .chain(svc.name.iter())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(".");
+pub static FILE_DESCRIPTOR_MAP: LazyLock<HashMap<String, FileDescriptorProto>> =
+    LazyLock::new(|| {
+        FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+            .expect("decoding FILE_DESCRIPTOR_SET")
+            .file
+            .into_iter()
+            .flat_map(|proto| {
+                proto
+                    .service
+                    .iter()
+                    .map(|svc| {
+                        // Figure out the fully-qualified name of this service.
+                        //
+                        // This string will be in the form of "<package>.<service>"
+                        // where "package" may itself contain multiple parts
+                        // delimited by "."
+                        //
+                        // If no package exists, use the service name only.
+                        let qualified_name = proto
+                            .package
+                            .iter()
+                            .chain(svc.name.iter())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(".");
 
-                    (qualified_name, proto.clone())
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
-});
+                        (qualified_name, proto.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    });
 
 /// Compares the protobuf type URL found within a google.protobuf.Any
 /// message to an expected Protobuf package and message name

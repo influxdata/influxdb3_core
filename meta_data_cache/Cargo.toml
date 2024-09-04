@@ -1,0 +1,30 @@
+[package]
+name = "meta_data_cache"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace dependencies, in alphabetical order
+data_types = { path = "../data_types" }
+iox_time = { path = "../iox_time" }
+metric = { path = "../metric" }
+object_store_mem_cache = { path = "../object_store_mem_cache" }
+observability_deps = { path = "../observability_deps" }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# Crates.io dependencies, in alphabetical order
+arrow = { workspace = true }
+datafusion = { workspace = true }
+datafusion_util = { path = "../datafusion_util" }
+futures = { version = "0.3.30" }
+tokio = { version = "1.40.0", default-features = false }
+
+[dev-dependencies]
+arrow_util = { path = "../arrow_util" }
+uuid = { version = "1", features = ["v4"] }
+bytes = "1.7"
+
+[lints]
+workspace = true

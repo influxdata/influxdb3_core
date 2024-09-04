@@ -18,8 +18,7 @@ use data_types::{
 };
 use iox_time::TimeProvider;
 use metric::{DurationHistogram, Metric};
-use std::time::Duration;
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 use trace::{
     ctx::SpanContext,
     span::{SpanExt, SpanRecorder},
@@ -321,8 +320,9 @@ decorate! {
         repo = parquet_files,
         methods = [
             parquet_flag_for_delete_by_retention = flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
-            parquet_delete_old_ids_only = delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
+            parquet_delete_old_ids_only = delete_old_ids_only(&mut self, older_than: Timestamp, cutoff: Duration) -> Result<Vec<ObjectStoreId>>;
             parquet_list_by_partition_not_to_delete_batch = list_by_partition_not_to_delete_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<ParquetFile>>;
+            parquet_active_as_of = active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
             parquet_get_by_object_store_id = get_by_object_store_id(&mut self, object_store_id: ObjectStoreId) -> Result<Option<ParquetFile>>;
             parquet_exists_by_object_store_id_batch = exists_by_object_store_id_batch(&mut self, object_store_ids: Vec<ObjectStoreId>) -> Result<Vec<ObjectStoreId>>;
             parquet_create_upgrade_delete = create_upgrade_delete(&mut self, partition_id: PartitionId, delete: &[ObjectStoreId], upgrade: &[ObjectStoreId], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFileId>>;

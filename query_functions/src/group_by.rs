@@ -81,8 +81,7 @@ pub enum WindowDuration {
 impl Aggregate {
     /// Create the appropriate DataFusion expression for this aggregate
     pub fn to_datafusion_expr(self, input: Expr) -> Result<Expr> {
-        use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
-        use datafusion::prelude::{max, min};
+        use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
         match self {
             Self::Sum => Ok(sum(input)),
             Self::Count => Ok(count(input)),

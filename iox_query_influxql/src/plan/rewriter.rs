@@ -1662,10 +1662,10 @@ struct SelectStatementInfo {
 ///
 /// For selector queries, which are those that use selector functions like `last` or `max`:
 ///
-/// * Projecting **multiple** selector functions, such as `last` or `first` will not be
-/// combined with non-aggregate columns
-/// * Projecting a **single** selector function, such as `last` or `first` may be combined
-/// with non-aggregate columns
+/// * Projecting **multiple** selector functions, such as `last` or `first` will not be combined
+///   with non-aggregate columns
+/// * Projecting a **single** selector function, such as `last` or `first` may be combined with
+///   non-aggregate columns
 ///
 /// Finally, the `top` and `bottom` function have the following additional restrictions:
 ///

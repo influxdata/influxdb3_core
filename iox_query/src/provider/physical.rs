@@ -261,7 +261,7 @@ pub fn chunks_to_physical_nodes(
                         chunk,
                         output_sort_key_memo: output_sort_key.cloned(),
                         object_store: Arc::clone(&object_store),
-                        table_schema: Arc::clone(&file_schema), // todo: rename file_schema to table_schema
+                        table_schema: Arc::clone(&file_schema),
                     })),
                     statistics: None,
                 }

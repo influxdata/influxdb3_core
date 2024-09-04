@@ -2,17 +2,12 @@
 //! plans. This is currently implemented using DataFusion, and this
 //! interface abstracts away many of the details
 pub(crate) mod context;
-pub mod field;
-pub mod fieldlist;
 pub mod gapfill;
 mod metrics;
-mod non_null_checker;
 pub mod query_tracing;
 mod schema_pivot;
-pub mod seriesset;
 pub mod sleep;
 pub(crate) mod split;
-pub mod stringset;
 use datafusion_util::config::register_iox_object_store;
 pub use executor::DedicatedExecutor;
 use metric::Registry;
@@ -24,21 +19,25 @@ use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 
 use datafusion::{
     self,
+    error::DataFusionError,
     execution::{
         disk_manager::DiskManagerConfig,
         memory_pool::MemoryPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
-    logical_expr::{expr_rewriter::normalize_col, Extension},
-    logical_expr::{Expr, LogicalPlan},
+    logical_expr::{
+        expr_rewriter::normalize_col, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
+    },
 };
 
-pub use context::{IOxSessionConfig, IOxSessionContext, QueryConfig, SessionContextIOxExt};
+pub use context::{
+    IOxSessionConfig, IOxSessionContext, QueryConfig, QueryLanguage, SessionContextIOxExt,
+};
 use schema_pivot::SchemaPivotNode;
 
 use crate::exec::metrics::DataFusionMemoryPoolMetricsBridge;
 
-use self::{non_null_checker::NonNullCheckerNode, split::StreamSplitNode};
+use self::split::StreamSplitNode;
 
 const TESTING_MEM_POOL_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
@@ -206,7 +205,7 @@ impl Executor {
 
 // No need to implement `Drop` because this is done by DedicatedExecutor already
 
-/// Create a SchemaPivot node which  an arbitrary input like
+/// Create a SchemaPivot node which takes an arbitrary input like
 ///  ColA | ColB | ColC
 /// ------+------+------
 ///   1   | NULL | NULL
@@ -226,42 +225,26 @@ pub fn make_schema_pivot(input: LogicalPlan) -> LogicalPlan {
     LogicalPlan::Extension(Extension { node })
 }
 
-/// Make a NonNullChecker node takes an arbitrary input array and
-/// produces a single string output column that contains
-///
-/// 1. the single `table_name` string if any of the input columns are non-null
-/// 2. zero rows if all of the input columns are null
-///
-/// For this input:
-///
+/// Attach a SchemaPivot node to a builder. A SchemaPivot
+/// node takes an arbitrary input like
 ///  ColA | ColB | ColC
 /// ------+------+------
 ///   1   | NULL | NULL
 ///   2   | 2    | NULL
 ///   3   | 2    | NULL
 ///
-/// The output would be (given 'the_table_name' was the table name)
+/// And pivots it to a table with a single string column for any
+/// columns that had non null values.
 ///
 ///   non_null_column
 ///  -----------------
-///   the_table_name
-///
-/// However, for this input (All NULL)
-///
-///  ColA | ColB | ColC
-/// ------+------+------
-///  NULL | NULL | NULL
-///  NULL | NULL | NULL
-///  NULL | NULL | NULL
-///
-/// There would be no output rows
-///
-///   non_null_column
-///  -----------------
-pub fn make_non_null_checker(table_name: &str, input: LogicalPlan) -> LogicalPlan {
-    let node = Arc::new(NonNullCheckerNode::new(table_name, input));
-
-    LogicalPlan::Extension(Extension { node })
+///   "ColA"
+///   "ColB"
+pub fn build_schema_pivot(
+    builder: LogicalPlanBuilder,
+) -> Result<LogicalPlanBuilder, DataFusionError> {
+    let input = builder.build()?;
+    Ok(LogicalPlanBuilder::from(make_schema_pivot(input)))
 }
 
 /// Create a StreamSplit node which takes an input stream of record
@@ -312,9 +295,11 @@ pub fn make_stream_split(input: LogicalPlan, split_exprs: Vec<Expr>) -> LogicalP
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use arrow::{
         array::{ArrayRef, Int64Array, StringArray},
-        datatypes::{DataType, Field, Schema, SchemaRef},
+        datatypes::{DataType, Field, SchemaRef},
     };
     use datafusion::{
         datasource::{provider_as_source, MemTable},
@@ -326,152 +311,13 @@ mod tests {
             PlanProperties, RecordBatchStream,
         },
     };
-    use futures::{stream::BoxStream, Stream, StreamExt};
+    use futures::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
     use metric::{Observation, RawReporter};
-    use stringset::StringSet;
+
     use tokio::sync::Barrier;
 
     use super::*;
-    use crate::exec::stringset::StringSetRef;
-    use crate::plan::stringset::StringSetPlan;
     use arrow::record_batch::RecordBatch;
-
-    #[tokio::test]
-    async fn executor_known_string_set_plan_ok() {
-        let expected_strings = to_set(&["Foo", "Bar"]);
-        let plan = StringSetPlan::Known(Arc::clone(&expected_strings));
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let result_strings = ctx.to_string_set(plan).await.unwrap();
-        assert_eq!(result_strings, expected_strings);
-    }
-
-    #[tokio::test]
-    async fn executor_datafusion_string_set_single_plan_no_batches() {
-        // Test with a single plan that produces no batches
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
-        let scan = make_plan(schema, vec![]);
-        let plan: StringSetPlan = vec![scan].into();
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await.unwrap();
-
-        assert_eq!(results, StringSetRef::new(StringSet::new()));
-    }
-
-    #[tokio::test]
-    async fn executor_datafusion_string_set_single_plan_one_batch() {
-        // Test with a single plan that produces one record batch
-        let data = to_string_array(&["foo", "bar", "baz", "foo"]);
-        let batch = RecordBatch::try_from_iter_with_nullable(vec![("a", data, true)])
-            .expect("created new record batch");
-        let scan = make_plan(batch.schema(), vec![batch]);
-        let plan: StringSetPlan = vec![scan].into();
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await.unwrap();
-
-        assert_eq!(results, to_set(&["foo", "bar", "baz"]));
-    }
-
-    #[tokio::test]
-    async fn executor_datafusion_string_set_single_plan_two_batch() {
-        // Test with a single plan that produces multiple record batches
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
-        let data1 = to_string_array(&["foo", "bar"]);
-        let batch1 = RecordBatch::try_new(Arc::clone(&schema), vec![data1])
-            .expect("created new record batch");
-        let data2 = to_string_array(&["baz", "foo"]);
-        let batch2 = RecordBatch::try_new(Arc::clone(&schema), vec![data2])
-            .expect("created new record batch");
-        let scan = make_plan(schema, vec![batch1, batch2]);
-        let plan: StringSetPlan = vec![scan].into();
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await.unwrap();
-
-        assert_eq!(results, to_set(&["foo", "bar", "baz"]));
-    }
-
-    #[tokio::test]
-    async fn executor_datafusion_string_set_multi_plan() {
-        // Test with multiple datafusion logical plans
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
-
-        let data1 = to_string_array(&["foo", "bar"]);
-        let batch1 = RecordBatch::try_new(Arc::clone(&schema), vec![data1])
-            .expect("created new record batch");
-        let scan1 = make_plan(Arc::clone(&schema), vec![batch1]);
-
-        let data2 = to_string_array(&["baz", "foo"]);
-        let batch2 = RecordBatch::try_new(Arc::clone(&schema), vec![data2])
-            .expect("created new record batch");
-        let scan2 = make_plan(schema, vec![batch2]);
-
-        let plan: StringSetPlan = vec![scan1, scan2].into();
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await.unwrap();
-
-        assert_eq!(results, to_set(&["foo", "bar", "baz"]));
-    }
-
-    #[tokio::test]
-    async fn executor_datafusion_string_set_nulls() {
-        // Ensure that nulls in the output set are handled reasonably
-        // (error, rather than silently ignored)
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
-        let array = StringArray::from_iter(vec![Some("foo"), None]);
-        let data = Arc::new(array);
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![data])
-            .expect("created new record batch");
-        let scan = make_plan(schema, vec![batch]);
-        let plan: StringSetPlan = vec![scan].into();
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await;
-
-        let actual_error = match results {
-            Ok(_) => "Unexpected Ok".into(),
-            Err(e) => format!("{e}"),
-        };
-        let expected_error = "unexpected null value";
-        assert!(
-            actual_error.contains(expected_error),
-            "expected error '{expected_error}' not found in '{actual_error:?}'",
-        );
-    }
-
-    #[tokio::test]
-    async fn executor_datafusion_string_set_bad_schema() {
-        // Ensure that an incorect schema (an int) gives a reasonable error
-        let data: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-        let batch =
-            RecordBatch::try_from_iter(vec![("a", data)]).expect("created new record batch");
-        let scan = make_plan(batch.schema(), vec![batch]);
-        let plan: StringSetPlan = vec![scan].into();
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await;
-
-        let actual_error = match results {
-            Ok(_) => "Unexpected Ok".into(),
-            Err(e) => format!("{e}"),
-        };
-
-        let expected_error = "schema not a single Utf8";
-        assert!(
-            actual_error.contains(expected_error),
-            "expected error '{expected_error}' not found in '{actual_error:?}'"
-        );
-    }
 
     #[tokio::test]
     async fn make_schema_pivot_is_planned() {
@@ -485,11 +331,27 @@ mod tests {
 
         let scan = make_plan(batch.schema(), vec![batch]);
         let pivot = make_schema_pivot(scan);
-        let plan = vec![pivot].into();
 
         let exec = Executor::new_testing();
         let ctx = exec.new_context();
-        let results = ctx.to_string_set(plan).await.expect("Executed plan");
+        let physical_plan = ctx
+            .create_physical_plan(&pivot)
+            .await
+            .expect("Created physical plan");
+        let mut stream = ctx
+            .execute_stream(physical_plan)
+            .await
+            .expect("Executed plan");
+
+        let mut results = BTreeSet::<String>::default();
+        while let Some(batch) = stream.try_next().await.expect("Got next batch") {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Cast to string array");
+            results.extend(arr.into_iter().map(|x| String::from(x.expect("No nulls"))));
+        }
 
         assert_eq!(results, to_set(&["f1", "f2"]));
     }
@@ -543,8 +405,8 @@ mod tests {
     }
 
     /// return a set for testing
-    fn to_set(strs: &[&str]) -> StringSetRef {
-        StringSetRef::new(strs.iter().map(|s| s.to_string()).collect::<StringSet>())
+    fn to_set(strs: &[&str]) -> BTreeSet<String> {
+        strs.iter().map(|s| s.to_string()).collect()
     }
 
     fn to_string_array(strs: &[&str]) -> ArrayRef {

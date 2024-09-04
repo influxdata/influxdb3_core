@@ -6,6 +6,7 @@ pub mod dictionary;
 pub mod display;
 pub mod flight;
 pub mod optimize;
+pub mod parquet_meta;
 pub mod string;
 pub mod util;
 

@@ -10,7 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-bytes = "1.6"
+bytes = "1.7"
 trace = { path = "../trace" }
 futures = "0.3"
 hashbrown = { workspace = true }

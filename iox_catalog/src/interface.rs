@@ -14,8 +14,12 @@ use data_types::{
 };
 use iox_time::TimeProvider;
 use snafu::Snafu;
-use std::collections::HashSet;
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::Arc,
+    time::Duration,
+};
 use trace::ctx::SpanContext;
 
 /// An error wrapper detailing the reason for a compare-and-swap failure.
@@ -594,13 +598,18 @@ pub trait ParquetFileRepo: Send + Sync {
     /// Flag all parquet files for deletion that are older than their namespace's retention period.
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
 
-    /// Delete parquet files that were marked to be deleted earlier than the specified time.
+    /// Delete parquet files that were marked to be deleted longer ago than the specified duration
+    /// from the current time according to the catalog.
     ///
     /// Returns the deleted IDs only.
     ///
     /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
     /// changes. The caller MAY call this method again if the result was NOT empty.
-    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
+    async fn delete_old_ids_only(
+        &mut self,
+        older_than: Timestamp,
+        cutoff: Duration,
+    ) -> Result<Vec<ObjectStoreId>>;
 
     /// List parquet files for given partitions that are NOT marked as
     /// [`to_delete`](ParquetFile::to_delete).
@@ -613,6 +622,10 @@ pub trait ParquetFileRepo: Send + Sync {
         &mut self,
         partition_ids: Vec<PartitionId>,
     ) -> Result<Vec<ParquetFile>>;
+
+    /// List Parquet files that are active as of the specified timestamp. Active means the file was
+    /// created before the specified time, and was not deleted before the specified time.
+    async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
 
     /// Return the parquet file with the given object store id
     // used heavily in tests for verification of catalog state.

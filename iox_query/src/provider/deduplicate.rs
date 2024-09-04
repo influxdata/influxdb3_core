@@ -292,7 +292,7 @@ impl ExecutionPlan for DeduplicateExec {
 
     fn statistics(&self) -> Result<Statistics> {
         // use a guess from our input but they are NOT exact
-        Ok(self.input.statistics()?.into_inexact())
+        Ok(self.input.statistics()?.to_inexact())
     }
 }
 

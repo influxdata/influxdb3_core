@@ -7,7 +7,7 @@ use crate::{
     memory_size::MemorySize,
     single_tenant::{CONFIG_AUTHZ_ENV_NAME, CONFIG_AUTHZ_FLAG},
 };
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf};
 
 /// CLI config for querier configuration
 #[derive(Debug, Clone, PartialEq, Eq, clap::Parser)]
@@ -113,6 +113,44 @@ pub struct QuerierConfig {
     )]
     pub ram_pool_data_bytes: MemorySize,
 
+    /// Size of the parquet in-mem data cache in bytes.
+    ///
+    /// If NOT set, this will default to `--ram-pool-data-bytes`/`INFLUXDB_IOX_RAM_POOL_DATA_BYTES`.
+    ///
+    /// Set to zero to disable.
+    ///
+    /// Can be given as absolute value or in percentage of the total available memory (e.g. `10%`).
+    #[clap(
+        long = "parquet-data-mem-cache-bytes",
+        env = "INFLUXDB_IOX_PARQUET_DATA_MEM_CACHE_BYTES",
+        action
+    )]
+    pub parquet_data_mem_cache_bytes: Option<MemorySize>,
+
+    /// Storage location for parquet disk data cache.
+    ///
+    /// Cache is NOT used if this value is not provided.
+    #[clap(
+        long = "parquet-data-disk-cache-location",
+        env = "INFLUXDB_IOX_PARQUET_DATA_DISK_CACHE_LOCATION",
+        action
+    )]
+    pub parquet_data_disk_cache_location: Option<PathBuf>,
+
+    /// Size of the parquet in-mem metadata cache in bytes.
+    ///
+    /// If NOT set, this will default to `--ram-pool-data-bytes`/`INFLUXDB_IOX_RAM_POOL_DATA_BYTES`.
+    ///
+    /// Set to zero to disable.
+    ///
+    /// Can be given as absolute value or in percentage of the total available memory (e.g. `10%`).
+    #[clap(
+        long = "parquet-metadata-mem-cache-bytes",
+        env = "INFLUXDB_IOX_PARQUET_METADATA_MEM_CACHE_BYTES",
+        action
+    )]
+    pub parquet_metadata_mem_cache_bytes: Option<MemorySize>,
+
     /// Limit the number of concurrent queries.
     #[clap(
         long = "max-concurrent-queries",
@@ -182,6 +220,24 @@ pub struct QuerierConfig {
         action
     )]
     pub optimize_for_data_cache: bool,
+
+    /// Enable meta cache
+    #[clap(
+        long = "optimize-for-meta-cache",
+        env = "INFLUXDB_IOX_OPTIMIZE_FOR_META_CACHE",
+        default_value = "false",
+        action
+    )]
+    pub optimize_for_meta_cache: bool,
+
+    /// Enable meta cache & compute column statistics for file pruning
+    #[clap(
+        long = "optimize-for-meta-cache-and-file-pruning",
+        env = "INFLUXDB_IOX_OPTIMIZE_FOR_META_CACHE_AND_FILE_PRUNING",
+        default_value = "false",
+        action
+    )]
+    pub optimize_for_meta_cache_and_file_pruning: bool,
 
     /// Enable object store caching by specifying one or more cache endpoints as
     /// a comma delimited string.

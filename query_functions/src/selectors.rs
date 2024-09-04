@@ -265,7 +265,7 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
     }
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> DataFusionResult<Box<dyn Accumulator>> {
-        let agg_type = AggType::try_from_return_type(arg.data_type)?;
+        let agg_type = AggType::try_from_return_type(arg.return_type)?;
         let value_type = agg_type.value_type;
         let timezone = match agg_type.time_type {
             DataType::Timestamp(_, tz) => tz.clone(),

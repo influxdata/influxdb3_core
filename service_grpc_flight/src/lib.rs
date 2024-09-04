@@ -43,6 +43,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
     fmt::Debug,
     pin::Pin,
+    str::FromStr,
     sync::{Arc, Mutex},
     task::Poll,
     time::Duration,
@@ -52,7 +53,10 @@ use tonic::{
     Request, Response, Streaming,
 };
 use trace::{ctx::SpanContext, span::SpanExt};
-use trace_http::ctx::{RequestLogContext, RequestLogContextExt};
+use trace_http::{
+    ctx::{RequestLogContext, RequestLogContextExt},
+    query_variant::QueryVariantExt,
+};
 use tracker::InstrumentedAsyncOwnedSemaphorePermit;
 
 /// The supported names of the grpc header that contain the target database
@@ -72,6 +76,10 @@ const IOX_FLIGHT_PARTITION_LIMIT_HEADER: &str = "x-influxdata-partition-limit";
 
 /// Header that contains a query-specific parquet file limit.
 const IOX_FLIGHT_PARQUET_FILE_LIMIT_HEADER: &str = "x-influxdata-parquet-file-limit";
+
+/// Header that specifies the language which the provided query string should be interpreted as;
+/// optionally sent as part of the GetFlightInfo request
+const IOX_FLIGHT_QUERY_LANGUAGE: &str = "x-influxdata-query-language";
 
 /// Trailer that describes the duration (in seconds) for which a query was queued due to concurrency limits.
 const IOX_FLIGHT_QUEUE_DURATION_RESPONSE_TRAILER: &str = "x-influxdata-queue-duration-seconds";
@@ -436,14 +444,12 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 ///
 /// To run an ad-hoc query, via FlightSQL, the client needs to
 ///
-/// 1. Encode the query in a `CommandStatementQuery` FlightSQL
-/// structure in a [`FlightDescriptor`]
+/// 1. Encode the query in a `CommandStatementQuery` FlightSQL structure in a [`FlightDescriptor`]
 ///
 /// 2. Call the `GetFlightInfo` method with the the [`FlightDescriptor`]
 ///
-/// 3. Receive a `Ticket` in the returned [`FlightInfo`]. The Ticket is
-/// opaque (uninterpreted) by the client. It contains an
-/// [`IoxGetRequest`] with the `CommandStatementQuery` request.
+/// 3. Receive a `Ticket` in the returned [`FlightInfo`]. The Ticket is opaque (uninterpreted) by
+///    the client. It contains an [`IoxGetRequest`] with the `CommandStatementQuery` request.
 ///
 /// 4. Calls the `DoGet` method with the `Ticket` from the previous step.
 ///
@@ -482,17 +488,15 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 /// To run a prepared query, via FlightSQL, the client undertakes a
 /// few more steps:
 ///
-/// 1. Encode the query in a `ActionCreatePreparedStatementRequest`
-/// request structure
+/// 1. Encode the query in a `ActionCreatePreparedStatementRequest` request structure
 ///
 /// 2. Call `DoAction` method with the the request
 ///
-/// 3. Receive a `ActionCreatePreparedStatementResponse`, which contains
-/// a prepared statement "handle".
+/// 3. Receive a `ActionCreatePreparedStatementResponse`, which contains a prepared statement
+///    "handle".
 ///
-/// 4. Encode the handle in a `CommandPreparedStatementQuery`
-/// FlightSQL structure in a [`FlightDescriptor`] and call the
-/// `GetFlightInfo` method with the the [`FlightDescriptor`]
+/// 4. Encode the handle in a `CommandPreparedStatementQuery` FlightSQL structure in a
+///    [`FlightDescriptor`] and call the `GetFlightInfo` method with the the [`FlightDescriptor`]
 ///
 /// 5. Steps 5,6,7 proceed the same as for a FlightSQL ad-hoc query
 ///
@@ -531,24 +535,22 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 /// running a prepared query without bind parameters, but there is an additional
 /// step to bind the parameter values to the prepared statement handle.
 ///
-/// 1. Encode the query in a `ActionCreatePreparedStatementRequest`
-/// request structure
+/// 1. Encode the query in a `ActionCreatePreparedStatementRequest` request structure
 ///
 /// 2. Call `DoAction` method with the the request
 ///
-/// 3. Receive a `ActionCreatePreparedStatementResponse`, which contains
-/// a prepared statement "handle".
+/// 3. Receive a `ActionCreatePreparedStatementResponse`, which contains a prepared statement
+///    "handle".
 ///
 /// 4. Call `DoPut method with `CommandPreparedStatementQuery`
 ///
 /// 5. Send a stream of [`FlightData`] containing the parameters
 ///
-/// 6. Receive a `DoPutPreparedStatementResult` which contains an updated prepared
-///    statement handle to use with the subsequent steps.
+/// 6. Receive a `DoPutPreparedStatementResult` which contains an updated prepared statement handle
+///    to use with the subsequent steps.
 ///
-/// 7. Encode the updated handle in a `CommandPreparedStatementQuery`
-/// FlightSQL structure in a [`FlightDescriptor`] and call the
-/// `GetFlightInfo` method with the the [`FlightDescriptor`]
+/// 7. Encode the updated handle in a `CommandPreparedStatementQuery` FlightSQL structure in a
+///    [`FlightDescriptor`] and call the `GetFlightInfo` method with the the [`FlightDescriptor`]
 ///
 /// 8. Steps 8,9,10 proceed the same as for a FlightSQL ad-hoc query
 ///
@@ -636,7 +638,7 @@ impl FlightService {
 
         let query_completed_token = db.record_query(
             external_span_ctx.as_ref().map(RequestLogContext::ctx),
-            query.variant(),
+            query.variant().str(),
             Box::new(query.to_string()),
             params.clone(),
         );
@@ -648,7 +650,7 @@ impl FlightService {
             %namespace_name,
             %query,
             trace=external_span_ctx.format_jaeger().as_str(),
-            variant=query.variant(),
+            variant=query.variant().str(),
             "DoGet request",
         );
 
@@ -658,15 +660,16 @@ impl FlightService {
 
         let q = Arc::clone(&query);
         let ns = Arc::clone(&namespace);
+
         // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
         let physical_plan_res = ctx
             .run(async move {
                 match q.as_ref() {
-                    RunQuery::Sql(sql_query) => planner.sql(sql_query, params).await,
-                    RunQuery::InfluxQL(sql_query) => planner.influxql(sql_query, params).await,
                     RunQuery::FlightSQL(msg) => {
                         planner.flight_sql_do_get(&ns, db, msg.clone()).await
                     }
+                    RunQuery::Sql(sql_query) => planner.sql(sql_query, params).await,
+                    RunQuery::InfluxQL(sql_query) => planner.influxql(sql_query, params).await,
                 }
             })
             .await
@@ -739,24 +742,31 @@ impl Flight for FlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, tonic::Status> {
-        let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
+        let extensions = request.extensions();
+
+        let external_span_ctx: Option<RequestLogContext> = extensions.get().cloned();
         // technically the trailers layer should always be installed but for testing this isn't always the case, so lets
         // make this optional
-        let trailers: Option<Trailers> = request.extensions().get().cloned();
-        let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
-        let authz_token = get_flight_authz(request.metadata());
-        let debug_header = has_debug_header(request.metadata());
-        let query_config = get_query_config(request.metadata());
+        let trailers: Option<Trailers> = extensions.get().cloned();
+        let span_ctx: Option<SpanContext> = extensions.get().cloned();
+        let query_variant_ext: Option<QueryVariantExt> = extensions.get().cloned();
+
+        let metadata = request.metadata();
+        let authz_token = get_flight_authz(metadata);
+        let debug_header = has_debug_header(metadata);
+        let query_config = get_query_config(metadata);
         let ticket = request.into_inner();
 
         // attempt to decode ticket
-        let request = IoxGetRequest::try_decode(ticket).context(InvalidTicketSnafu);
+        let request = IoxGetRequest::try_decode(ticket)
+            .context(InvalidTicketSnafu)
+            .inspect_err(|e| info!(%e, "Error decoding Flight API ticket"))?
+            .add_debug_header(debug_header);
 
-        if let Err(e) = &request {
-            info!(%e, "Error decoding Flight API ticket");
-        };
-
-        let request = request?.add_debug_header(debug_header);
+        // register query variant
+        if let Some(ext) = query_variant_ext {
+            ext.set(request.query().variant())
+        }
 
         let perms = match request.query() {
             RunQuery::FlightSQL(cmd) => flightsql_permissions(request.database(), cmd),
@@ -770,6 +780,10 @@ impl Flight for FlightService {
             .await
             .map_err(Error::from)?;
 
+        let database = request.database.clone();
+        let query = request.query.clone();
+        let jaeger_trace = external_span_ctx.format_jaeger();
+
         // `run_do_get` may wait for the semaphore. In this case, we shall send empty "keep alive" messages already. So
         // wrap the whole implementation into the keep alive stream.
         //
@@ -781,8 +795,8 @@ impl Flight for FlightService {
         let response = Self::run_do_get(
             server,
             span_ctx,
-            external_span_ctx.clone(),
-            request.clone(),
+            external_span_ctx,
+            request,
             &mut log_entry,
             query_config.as_ref(),
         )
@@ -790,17 +804,17 @@ impl Flight for FlightService {
 
         if let Err(e) = &response {
             info!(
-                %request.database,
-                %request.query,
-                trace=external_span_ctx.format_jaeger().as_str(),
+                %database,
+                %query,
+                trace=jaeger_trace.as_str(),
                 %e,
                 "Error running DoGet",
             );
         } else {
             debug!(
-                %request.database,
-                %request.query,
-                trace=external_span_ctx.format_jaeger().as_str(),
+                %database,
+                %query,
+                trace=jaeger_trace.as_str(),
                 "Planned DoGet request",
             );
         }
@@ -877,10 +891,13 @@ impl Flight for FlightService {
         let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let trace = external_span_ctx.format_jaeger();
-        let is_debug = has_debug_header(request.metadata());
+        let metadata = request.metadata();
 
-        let namespace_name = get_flightsql_namespace(request.metadata())?;
-        let authz_token = get_flight_authz(request.metadata());
+        let is_debug = has_debug_header(metadata);
+
+        let namespace_name = get_flightsql_namespace(metadata)?;
+        let authz_token = get_flight_authz(metadata);
+        let query_lang = parse_header_str(metadata, IOX_FLIGHT_QUERY_LANGUAGE);
         let flight_descriptor = request.into_inner();
 
         // extract the FlightSQL message
@@ -910,28 +927,34 @@ impl Flight for FlightService {
         let ns_name = namespace_name.clone();
         let planner = Planner::new(&ctx);
         let cmd_captured = cmd.clone();
-        // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
-        let schema = ctx
+
+        // invariant: schema and run_query must both correspond to the same language. This is not
+        // really something that we can encode in the type system, as that would 1. require
+        // changing the wire format that these tickets and such as encoded/decoded as, and 2. mess
+        // with the concept of having unified types for processing something that is either an
+        // InfluxQL query plan or a SQL query plan. So we just process them at the same place and
+        // hope we don't mess that up in the future
+        let (schema, run_query) = ctx
+            // Run planner on a separate threadpool, rather than the IO pool that is servicing this request
             .run(async move {
                 planner
-                    .flight_sql_get_flight_info_schema(&ns_name, cmd_captured)
+                    .flight_sql_get_flight_info_schema(&ns_name, cmd_captured, query_lang)
                     .await
             })
             .await
             .context(PlanningSnafu {
                 namespace_name: &namespace_name,
                 query: format!("{cmd:?}"),
-            });
-
-        if let Err(e) = &schema {
-            info!(%namespace_name, %cmd, %trace, %e, "Error running GetFlightInfo");
-        } else {
-            debug!(%namespace_name, %cmd, %trace, "Completed GetFlightInfo request");
-        };
-        let schema = schema?;
+            })
+            .inspect_err(
+                |e| info!(%namespace_name, %cmd, %trace, %e, "Error running GetFlightInfo"),
+            )
+            .inspect(
+                |_| debug!(%namespace_name, %cmd, %trace, "Completed GetFlightInfo request"),
+            )?;
 
         // Form the response ticket (that the client will pass back to DoGet)
-        let ticket = IoxGetRequest::new(&namespace_name, RunQuery::FlightSQL(cmd), is_debug)
+        let ticket = IoxGetRequest::new(&namespace_name, run_query, is_debug)
             .try_encode()
             .context(InternalCreatingTicketSnafu)?;
 
@@ -1196,25 +1219,28 @@ fn has_debug_header(metadata: &MetadataMap) -> bool {
         .unwrap_or_default()
 }
 
+fn parse_header_str<C: FromStr>(metadata: &MetadataMap, header_str: &'static str) -> Option<C> {
+    metadata
+        .get(header_str)
+        .and_then(|s| s.to_str().ok())
+        .and_then(|s| s.parse().ok())
+}
+
 /// Extract the desired per-query configuration from the request metadata.
 fn get_query_config(metadata: &MetadataMap) -> Option<QueryConfig> {
-    let mut config: Option<QueryConfig> = None;
-    if let Some(partition_limit) = metadata
-        .get(IOX_FLIGHT_PARTITION_LIMIT_HEADER)
-        .and_then(|s| s.to_str().ok())
-        .and_then(|s| s.parse().ok())
-    {
+    let mut config = None;
+
+    if let Some(partition_limit) = parse_header_str(metadata, IOX_FLIGHT_PARTITION_LIMIT_HEADER) {
         config.get_or_insert(QueryConfig::default()).partition_limit = Some(partition_limit);
-    };
-    if let Some(parquet_file_limit) = metadata
-        .get(IOX_FLIGHT_PARQUET_FILE_LIMIT_HEADER)
-        .and_then(|s| s.to_str().ok())
-        .and_then(|s| s.parse().ok())
+    }
+
+    if let Some(parquet_file_limit) =
+        parse_header_str(metadata, IOX_FLIGHT_PARQUET_FILE_LIMIT_HEADER)
     {
         config
             .get_or_insert(QueryConfig::default())
             .parquet_file_limit = Some(parquet_file_limit);
-    };
+    }
     config
 }
 
@@ -1346,7 +1372,7 @@ struct QueryResponseMetadata {
 }
 
 impl QueryResponseMetadata {
-    fn write_trailer_count(md: &mut HeaderMap, key: &'static str, count: Option<i64>) {
+    fn write_trailer_count<N: ToString>(md: &mut HeaderMap, key: &'static str, count: Option<N>) {
         let Some(count) = count else { return };
         md.insert(key, count.to_string().parse().expect("always valid"));
     }
@@ -1387,6 +1413,8 @@ impl QueryResponseMetadata {
             running: _,
             phase: _,
             ingester_metrics,
+            deduplicated_parquet_files: _,
+            deduplicated_partitions: _,
         } = state.as_ref();
 
         Self::write_trailer_duration(

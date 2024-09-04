@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::{
     array::{as_string_array, ArrayRef, BooleanArray},
@@ -11,7 +11,6 @@ use datafusion::{
     prelude::create_udf,
     scalar::ScalarValue,
 };
-use once_cell::sync::Lazy;
 
 /// The name of the regex_match UDF given to DataFusion.
 pub const REGEX_MATCH_UDF_NAME: &str = "influx_regex_match";
@@ -20,7 +19,7 @@ pub const REGEX_MATCH_UDF_NAME: &str = "influx_regex_match";
 pub const REGEX_NOT_MATCH_UDF_NAME: &str = "influx_regex_not_match";
 
 /// Implementation of regexp_match
-pub(crate) static REGEX_MATCH_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static REGEX_MATCH_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(create_udf(
         REGEX_MATCH_UDF_NAME,
         // takes two arguments: regex, pattern
@@ -32,7 +31,7 @@ pub(crate) static REGEX_MATCH_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
 });
 
 /// Implementation of regexp_not_match
-pub(crate) static REGEX_NOT_MATCH_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static REGEX_NOT_MATCH_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(create_udf(
         REGEX_NOT_MATCH_UDF_NAME,
         // takes two arguments: regex, pattern

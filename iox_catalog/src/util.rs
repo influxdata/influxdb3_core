@@ -7,7 +7,7 @@ use crate::{
     constants::TIME_COLUMN,
     interface::{CasFailure, Catalog, Error, RepoCollection, SoftDeletedRows},
 };
-use data_types::partition_template::{build_column_values, ColumnValue};
+use data_types::partition_template::ColumnValue;
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, PartitionKey,
@@ -615,7 +615,7 @@ pub fn should_delete_partition(
     retention_period: i64,
     now: Time,
 ) -> bool {
-    for (_, c) in build_column_values(template, key.inner()) {
+    for (_, c) in template.column_values(key.inner()) {
         if let Some(ColumnValue::Datetime { end, .. }) = c {
             let expiry = end
                 + Duration::from_nanos(retention_period as _)

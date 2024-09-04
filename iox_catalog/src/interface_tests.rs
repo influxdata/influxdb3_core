@@ -17,9 +17,10 @@ use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::TimeProvider;
 use metric::{Observation, RawReporter};
 use parking_lot::Mutex;
-use std::{any::Any, collections::HashSet, fmt::Display};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    any::Any,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt::Display,
     ops::DerefMut,
     sync::Arc,
     time::Duration,
@@ -46,6 +47,7 @@ where
     test_column(clean_state().await).await;
     test_partition(clean_state().await).await;
     test_parquet_file(clean_state().await).await;
+    test_parquet_file_active_as_of(clean_state().await).await;
     test_parquet_file_delete_broken(clean_state().await).await;
     test_update_to_compaction_level_1(clean_state().await).await;
     test_list_by_partiton_not_to_delete(clean_state().await).await;
@@ -1685,12 +1687,11 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
 
     // verify that to_delete is initially set to null and the file does not get deleted
     assert!(parquet_file.to_delete.is_none());
-    let older_than = Timestamp::new(
-        (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
-    );
+    let older_than = Timestamp::new(catalog.time_provider().now().timestamp_nanos());
+    let no_time_ago = Duration::from_secs(0);
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(older_than)
+        .delete_old_ids_only(older_than, no_time_ago)
         .await
         .unwrap();
     assert!(deleted.is_empty());
@@ -1729,12 +1730,12 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .unwrap();
 
     // File is not deleted if it was marked to be deleted after the specified time
-    let before_deleted = Timestamp::new(
-        (catalog.time_provider().now() - Duration::from_secs(100)).timestamp_nanos(),
-    );
+    let before_deleted_ago = Duration::from_secs(100);
+    let before_deleted =
+        Timestamp::new((catalog.time_provider().now() - before_deleted_ago).timestamp_nanos());
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(before_deleted)
+        .delete_old_ids_only(before_deleted, before_deleted_ago)
         .await
         .unwrap();
     assert!(deleted.is_empty());
@@ -1750,7 +1751,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     // File is deleted if it was marked to be deleted before the specified time
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(older_than)
+        .delete_old_ids_only(older_than, no_time_ago)
         .await
         .unwrap();
     assert_eq!(deleted.len(), 1);
@@ -1931,12 +1932,11 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     assert!(files.is_empty());
 
     // test delete_old_ids_only
-    let older_than = Timestamp::new(
-        (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
-    );
+    let older_than = Timestamp::new(catalog.time_provider().now().timestamp_nanos());
+    let no_time_ago = Duration::from_secs(0);
     let ids = repos
         .parquet_files()
-        .delete_old_ids_only(older_than)
+        .delete_old_ids_only(older_than, no_time_ago)
         .await
         .unwrap();
     assert_eq!(ids.len(), 1);
@@ -2083,7 +2083,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(ids.len(), 0); // none left
 
-    // test create_update_delete
+    // test create_upgrade_delete
     let f6_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
         ..f5_params
@@ -2140,7 +2140,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
 
     let f7_uuid = f7.object_store_id;
 
-    // test create_update_delete transaction (rollback because f7 already exists)
+    // test create_upgrade_delete transaction (rollback because f7 already exists)
     let cud = repos
         .parquet_files()
         .create_upgrade_delete(
@@ -2367,6 +2367,191 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         max_l0_created_ats,
         (0..MAX_PARQUET_L0_FILES_PER_PARTITION).collect::<Vec<_>>()
     );
+}
+
+async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
+    let mut repos = catalog.repositories();
+
+    let namespace = arbitrary_namespace(&mut *repos, "namespace_parquet_file_active_as_of").await;
+
+    let table = arbitrary_table(&mut *repos, "test_table", &namespace).await;
+    // Two partitions in the same table
+    let partition1 = repos
+        .partitions()
+        .create_or_get("one".into(), table.id)
+        .await
+        .unwrap();
+    let partition2 = repos
+        .partitions()
+        .create_or_get("two".into(), table.id)
+        .await
+        .unwrap();
+
+    // Another table and partition in the same namespace
+    let other_table = arbitrary_table(&mut *repos, "other", &namespace).await;
+    let other_partition = repos
+        .partitions()
+        .create_or_get("one".into(), other_table.id)
+        .await
+        .unwrap();
+
+    // An entirely different namespace
+    let another_namespace = arbitrary_namespace(&mut *repos, "another_active_as_of").await;
+    let another_table = arbitrary_table(&mut *repos, "another_table", &another_namespace).await;
+    let another_partition = repos
+        .partitions()
+        .create_or_get("one".into(), another_table.id)
+        .await
+        .unwrap();
+
+    // Setup of this test, where N is the start time of the test and the additional time added
+    // isn't the real value, just some amount after the initial time:
+    //
+    // | Time | N       | N+1     | N+2     | N+3     | N+4     | N+5     | N+6     | N+7     |
+    // |------|---------|---------|---------|---------|---------|---------|---------|---------|
+    // | PF A | Created | Deleted |         |         |         |         |         |         |
+    // | PF B |         |         | Created |         |         |         |         |         |
+    // | PF C |         |         |         | Created |         |         | Deleted |         |
+    // | PF D |         |         |         |         | Created | Deleted |         |         |
+    // | PF E |         |         |         |         |         |         |         | Created |
+    //
+    // After all of the Parquet file records are created, calling `active_as_of` with the
+    // `as_of` parameter set to between N+3 and N+4 should cover all possibilities:
+    //
+    // - PF A was created and deleted before `as_of` and should NOT be returned.
+    // - PF B was created before `as_of` and never deleted and SHOULD be returned.
+    // - PF C was created before `as_of` and deleted after `as_of` and SHOULD be returned.
+    // - PF D was created and deleted after `as_of` and should NOT be returned.
+    // - PF E was created after `as_of` and never deleted and should NOT be returned.
+
+    let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition1);
+
+    let pf_a = repos
+        .parquet_files()
+        .create(ParquetFileParams {
+            created_at: catalog.time_provider().now().into(),
+            ..parquet_file_params.clone()
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    repos
+        .parquet_files()
+        .create_upgrade_delete(
+            partition1.id,
+            &[pf_a.object_store_id],
+            &[],
+            &[],
+            CompactionLevel::Initial,
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let pf_b = repos
+        .parquet_files()
+        .create(ParquetFileParams {
+            created_at: catalog.time_provider().now().into(),
+            object_store_id: ObjectStoreId::new(),
+            partition_id: partition2.id,
+            ..parquet_file_params.clone()
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let pf_c = repos
+        .parquet_files()
+        .create(ParquetFileParams {
+            created_at: catalog.time_provider().now().into(),
+            object_store_id: ObjectStoreId::new(),
+            namespace_id: another_namespace.id,
+            table_id: another_table.id,
+            partition_id: another_partition.id,
+            ..parquet_file_params.clone()
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let as_of = catalog.time_provider().now();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let pf_d = repos
+        .parquet_files()
+        .create(ParquetFileParams {
+            created_at: catalog.time_provider().now().into(),
+            object_store_id: ObjectStoreId::new(),
+            table_id: other_table.id,
+            partition_id: other_partition.id,
+            ..parquet_file_params.clone()
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    repos
+        .parquet_files()
+        .create_upgrade_delete(
+            other_partition.id,
+            &[pf_d.object_store_id],
+            &[],
+            &[],
+            CompactionLevel::Initial,
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    repos
+        .parquet_files()
+        .create_upgrade_delete(
+            another_partition.id,
+            &[pf_c.object_store_id],
+            &[],
+            &[],
+            CompactionLevel::Initial,
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let _pf_e = repos
+        .parquet_files()
+        .create(ParquetFileParams {
+            created_at: catalog.time_provider().now().into(),
+            object_store_id: ObjectStoreId::new(),
+            ..parquet_file_params.clone()
+        })
+        .await
+        .unwrap();
+
+    let active_as_of = repos
+        .parquet_files()
+        .active_as_of(as_of.into())
+        .await
+        .unwrap();
+    assert_eq!(
+        active_as_of.len(),
+        2,
+        "{active_as_of:#?}\n{}, {}\nas_of = {}",
+        pf_b.object_store_id,
+        pf_c.object_store_id,
+        Timestamp::from(as_of).get()
+    );
+
+    let active_as_of_ids: Vec<_> = active_as_of.iter().map(|a| a.object_store_id).collect();
+    assert!(active_as_of_ids.contains(&pf_b.object_store_id));
+    assert!(active_as_of_ids.contains(&pf_c.object_store_id));
 }
 
 async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {

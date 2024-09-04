@@ -58,13 +58,6 @@ impl std::fmt::Debug for ScanPlan {
     }
 }
 
-impl ScanPlan {
-    /// Return the schema of the source (the merged schema across all tables)
-    pub(crate) fn schema(&self) -> &Schema {
-        self.provider.iox_schema()
-    }
-}
-
 /// Builder for [`ScanPlan`]s which scan the data  1 or more [`QueryChunk`] for
 /// IOx's custom query frontends (InfluxRPC and Reorg at the time of
 /// writing).

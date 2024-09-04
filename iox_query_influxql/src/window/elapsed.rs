@@ -50,6 +50,7 @@ struct ElapsedPartitionEvaluator {}
 impl PartitionEvaluator for ElapsedPartitionEvaluator {
     fn evaluate_all(&mut self, values: &[ArrayRef], _num_rows: usize) -> Result<Arc<dyn Array>> {
         assert_eq!(values.len(), 3);
+        // Nanoseconds are all in UTC, therefore the tz is irrelevant.
         assert!(matches!(
             values[2].data_type(),
             &DataType::Timestamp(Nanosecond, _)

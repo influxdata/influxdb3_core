@@ -10,6 +10,7 @@ use datafusion::{
     physical_expr::PhysicalSortExpr,
     physical_plan::{
         expressions::{Column, Literal},
+        limit::LocalLimitExec,
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
@@ -336,4 +337,36 @@ pub(crate) fn add_union_and_progressive_eval(
     let progressive_eval = ProgressiveEvalExec::new(union_exec, Some(value_ranges), fetch_number);
 
     Arc::new(progressive_eval) as Arc<dyn ExecutionPlan>
+}
+
+/// Find the [`UnionExec`] located as input to the [`SortPreservingMergeExec`].
+///
+/// This accepts specific locations for the union, in relation to the sort merge input.
+pub(crate) fn accepted_union_exec(merge_node: &SortPreservingMergeExec) -> Option<&UnionExec> {
+    if let Some(union_exec) = merge_node.input().as_any().downcast_ref::<UnionExec>() {
+        return Some(union_exec);
+    }
+
+    // LIMITs may be applied locally, by pushing down closer to the data source.
+    //
+    // When a limit is pushed down, it will return a subset of the source rows.
+    // However, it will not broaden the range of the data used (in crate::ValueRangeAndColValue)
+    // to determine non-overlapping streams for ordering.
+    //
+    // The limit may narrow the range, but this is acceptable since the non-overlapping property
+    // will still be retained.
+    if let Some(union_exec) = merge_node
+        .input()
+        .as_any()
+        .downcast_ref::<LocalLimitExec>()
+        .and_then(|local_limit_exec| {
+            local_limit_exec
+                .input()
+                .as_any()
+                .downcast_ref::<UnionExec>()
+        })
+    {
+        return Some(union_exec);
+    }
+    None
 }

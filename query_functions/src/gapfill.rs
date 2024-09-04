@@ -18,7 +18,7 @@
 //! in that they don't have normal implementations, but instead
 //! are transformed by logical optimizer rule `HandleGapFill` to
 //! produce a plan that fills gaps.
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::{
@@ -26,7 +26,6 @@ use datafusion::{
     logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
     physical_plan::ColumnarValue,
 };
-use once_cell::sync::Lazy;
 use schema::InfluxFieldType;
 
 /// The name of the date_bin_gapfill UDF given to DataFusion.
@@ -74,7 +73,7 @@ impl ScalarUDFImpl for DateBinGapFillUDF {
 /// This function takes arguments identical to `date_bin()` but
 /// works in conjunction with the logical optimizer rule
 /// `HandleGapFill` to fill gaps in time series data.
-pub(crate) static DATE_BIN_GAPFILL: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static DATE_BIN_GAPFILL: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     // DATE_BIN_GAPFILL should have the same signature as DATE_BIN,
     // so that just adding _GAPFILL can turn a query into a gap-filling query.
     let mut signatures = datafusion::functions::datetime::functions()
@@ -135,7 +134,7 @@ impl ScalarUDFImpl for LocfUDF {
 /// "last observation carried forward." It does not have
 /// an implementation since it will be consumed by the logical optimizer rule
 /// `HandleGapFill`.
-pub(crate) static LOCF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static LOCF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(LocfUDF {
         signature: Signature::any(1, Volatility::Volatile),
     }))
@@ -185,7 +184,7 @@ impl ScalarUDFImpl for InterpolateUDF {
 /// columns that should be inmterpolated. It does not have
 /// an implementation since it will be consumed by the logical optimizer rule
 /// `HandleGapFill`.
-pub(crate) static INTERPOLATE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static INTERPOLATE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     let signatures = [
         InfluxFieldType::Float,
         InfluxFieldType::Integer,

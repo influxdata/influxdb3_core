@@ -3,14 +3,18 @@
 //! [keywords]: https://docs.influxdata.com/influxdb/v1.8/query_language/spec/#keywords
 
 use crate::internal::ParseResult;
-use nom::bytes::complete::tag_no_case;
-use nom::character::complete::alpha1;
-use nom::combinator::{fail, verify};
-use nom::sequence::terminated;
-use nom::FindToken;
-use once_cell::sync::Lazy;
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use nom::{
+    bytes::complete::tag_no_case,
+    character::complete::alpha1,
+    combinator::{fail, verify},
+    sequence::terminated,
+    FindToken,
+};
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    sync::LazyLock,
+};
 
 /// Verifies the next character of `i` is valid following a keyword.
 ///
@@ -54,7 +58,7 @@ impl<'a> Hash for Token<'a> {
     }
 }
 
-static KEYWORDS: Lazy<HashSet<Token<'static>>> = Lazy::new(|| {
+static KEYWORDS: LazyLock<HashSet<Token<'static>>> = LazyLock::new(|| {
     HashSet::from([
         Token("ALL"),
         Token("ALTER"),

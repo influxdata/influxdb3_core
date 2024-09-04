@@ -17,7 +17,7 @@ use workspace_hack as _;
 
 use crate::column::{Column, ColumnData};
 use arrow::record_batch::RecordBatch;
-use data_types::StatValues;
+use data_types::{StatValues, Statistics};
 use hashbrown::HashMap;
 use iox_time::Time;
 use schema::Projection;
@@ -26,6 +26,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use std::{collections::BTreeSet, ops::Range};
 
 pub mod column;
+mod noop_validator;
 pub mod payload;
 pub mod writer;
 
@@ -157,6 +158,29 @@ impl MutableBatch {
         }
 
         Some(summary)
+    }
+
+    /// Read the minimum timestamp (in nanoseconds) for `self` from the column
+    /// statistics.
+    ///
+    /// This is an O(1) operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no "time" column in this batch or no statistics are
+    /// present.
+    pub fn timestamp_min(&self) -> i64 {
+        let idx = self
+            .column_names
+            .get(TIME_COLUMN_NAME)
+            .expect("no time column in batch");
+
+        let col = self.columns.get(*idx).unwrap();
+
+        match col.stats() {
+            Statistics::I64(v) => v.min.unwrap(),
+            _ => unreachable!("time column is i64"),
+        }
     }
 
     /// Extend this [`MutableBatch`] with the contents of `other`
@@ -313,15 +337,17 @@ mod tests {
 
         assert_eq!(batch.size_data(), 128);
         assert_eq!(batch.columns().len(), 5);
+        assert_eq!(batch.timestamp_min(), 1234);
 
         let batches = lines_to_batches(
-            "cpu,t1=hellomore,t2=world f1=1.1,f2=1i 1234\ncpu,t1=h,t2=w f1=2.2,f2=2i 1234",
+            "cpu,t1=hellomore,t2=world f1=1.1,f2=1i 1234\ncpu,t1=h,t2=w f1=2.2,f2=2i 42",
             0,
         )
         .unwrap();
         let batch = batches.get("cpu").unwrap();
         assert_eq!(batch.size_data(), 138);
         assert_eq!(batch.columns().len(), 5);
+        assert_eq!(batch.timestamp_min(), 42);
     }
 
     #[test]

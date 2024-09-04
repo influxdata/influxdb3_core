@@ -5,16 +5,17 @@
 //! call information as the InfluxQL AST. These expressions are then
 //! rewritten at a later stage of planning, with more context available.
 
-use crate::plan::util::find_exprs_in_exprs;
-use crate::{error, NUMERICS};
+use crate::{error, plan::util::find_exprs_in_exprs, NUMERICS};
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
     logical_expr::{Expr, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
     physical_plan::ColumnarValue,
 };
-use once_cell::sync::Lazy;
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, LazyLock},
+};
 
 pub(super) enum WindowFunction {
     MovingAverage,
@@ -90,7 +91,7 @@ pub(crate) fn moving_average(args: Vec<Expr>) -> Expr {
 }
 
 /// Definition of the `MOVING_AVERAGE` function.
-static MOVING_AVERAGE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static MOVING_AVERAGE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(MovingAverageUDF {
         signature: Signature::one_of(
             NUMERICS
@@ -144,7 +145,7 @@ pub(crate) fn difference(args: Vec<Expr>) -> Expr {
 }
 
 /// Definition of the `DIFFERENCE` function.
-static DIFFERENCE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static DIFFERENCE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(DifferenceUDF {
         signature: Signature::one_of(
             NUMERICS
@@ -193,7 +194,7 @@ pub(crate) fn elapsed(args: Vec<Expr>) -> Expr {
 }
 
 /// Definition of the `ELAPSED` function.
-static ELAPSED: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static ELAPSED: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(ElapsedUDF {
         signature: Signature::any(3, Volatility::Immutable),
     }))
@@ -241,7 +242,7 @@ pub(crate) fn non_negative_difference(args: Vec<Expr>) -> Expr {
 }
 
 /// Definition of the `NON_NEGATIVE_DIFFERENCE` function.
-static NON_NEGATIVE_DIFFERENCE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static NON_NEGATIVE_DIFFERENCE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(NonNegativeDifferenceUDF {
         signature: Signature::one_of(
             NUMERICS
@@ -290,7 +291,7 @@ pub(crate) fn derivative(args: Vec<Expr>) -> Expr {
 }
 
 /// Definition of the `DERIVATIVE` function.
-static DERIVATIVE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static DERIVATIVE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(DerivativeUDF {
         signature: Signature::one_of(
             NUMERICS
@@ -350,13 +351,13 @@ pub(crate) fn non_negative_derivative(args: Vec<Expr>) -> Expr {
 }
 
 /// Definition of the `NON_NEGATIVE_DERIVATIVE` function.
-static NON_NEGATIVE_DERIVATIVE: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static NON_NEGATIVE_DERIVATIVE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(NonNegativeDerivativeUDF {
         signature: Signature::one_of(
             NUMERICS
                 .iter()
                 .flat_map(|dt| {
-                    vec![
+                    [
                         TypeSignature::Exact(vec![dt.clone()]),
                         TypeSignature::Exact(vec![
                             dt.clone(),
@@ -415,7 +416,7 @@ pub(crate) fn cumulative_sum(args: Vec<Expr>) -> Expr {
     CUMULATIVE_SUM.call(args)
 }
 /// Definition of the `CUMULATIVE_SUM` function.
-static CUMULATIVE_SUM: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+static CUMULATIVE_SUM: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(CumulativeSumUDF {
         signature: Signature::one_of(
             NUMERICS

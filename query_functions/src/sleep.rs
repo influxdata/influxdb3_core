@@ -1,4 +1,7 @@
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, LazyLock},
+};
 
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::{
@@ -6,7 +9,6 @@ use datafusion::{
     logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     physical_plan::ColumnarValue,
 };
-use once_cell::sync::Lazy;
 
 /// The name of the "sleep" UDF given to DataFusion.
 pub const SLEEP_UDF_NAME: &str = "sleep";
@@ -42,7 +44,7 @@ impl ScalarUDFImpl for SleepUDF {
 }
 
 /// Implementation of "sleep"
-pub(crate) static SLEEP_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static SLEEP_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(SleepUDF {
         signature: Signature::uniform(
             1,

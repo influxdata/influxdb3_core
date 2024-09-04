@@ -1,18 +1,15 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode, TreeNodeRewriter},
+    common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
-    error::{DataFusionError, Result},
+    error::Result,
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        empty::EmptyExec,
-        expressions::{BinaryExpr, Column},
-        filter::FilterExec,
-        union::UnionExec,
+        empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec, union::UnionExec,
         ExecutionPlan, PhysicalExpr,
     },
 };
@@ -125,30 +122,6 @@ impl PhysicalOptimizerRule for PredicatePushdown {
 
     fn schema_check(&self) -> bool {
         true
-    }
-}
-
-#[derive(Debug, Default)]
-struct ColumnCollector {
-    cols: HashSet<Column>,
-}
-
-impl TreeNodeRewriter for ColumnCollector {
-    type Node = Arc<dyn PhysicalExpr>;
-
-    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>, DataFusionError> {
-        if let Some(column) = node.as_any().downcast_ref::<Column>() {
-            self.cols.insert(column.clone());
-            return Ok(Transformed::yes(node));
-        }
-        Ok(Transformed::no(node))
-    }
-
-    fn f_up(
-        &mut self,
-        expr: Arc<dyn PhysicalExpr>,
-    ) -> Result<Transformed<Self::Node>, DataFusionError> {
-        Ok(Transformed::no(expr))
     }
 }
 

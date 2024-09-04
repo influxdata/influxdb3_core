@@ -271,8 +271,8 @@ impl TryFrom<&gossip::v1::Column> for ColumnSchema {
 
 /// The column data type
 #[allow(missing_docs)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, sqlx::Type)]
-#[repr(i16)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[repr(i8)]
 pub enum ColumnType {
     I64 = 1,
     U64 = 2,
@@ -323,6 +323,57 @@ impl ColumnType {
 
             _ => false,
         }
+    }
+}
+
+/// Serialise the [`ColumnType`] enum as a 2-byte signed integer when stored in
+/// the catalog, but use a single byte representation in IOx (as 2 bytes is
+/// unnecessarily large and IOx deals with a lot of columns).
+impl<DB: ::sqlx::Database> ::sqlx::Type<DB> for ColumnType
+where
+    i16: ::sqlx::Type<DB>,
+{
+    fn type_info() -> DB::TypeInfo {
+        <i16 as ::sqlx::Type<DB>>::type_info()
+    }
+    fn compatible(ty: &DB::TypeInfo) -> bool {
+        <i16 as ::sqlx::Type<DB>>::compatible(ty)
+    }
+}
+
+impl<'q, DB> sqlx::Encode<'q, DB> for ColumnType
+where
+    DB: sqlx::Database,
+    i16: sqlx::Encode<'q, DB>,
+{
+    fn encode_by_ref(
+        &self,
+        buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer,
+    ) -> sqlx::encode::IsNull {
+        <i16>::encode(*self as i16, buf)
+    }
+}
+
+impl<'q, DB> sqlx::Decode<'q, DB> for ColumnType
+where
+    DB: sqlx::Database,
+    i16: sqlx::Decode<'q, DB>,
+{
+    fn decode(
+        value: <DB as sqlx::database::HasValueRef<'q>>::ValueRef,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let discriminant = <i16>::decode(value)?;
+
+        Ok(match discriminant {
+            v if v == ColumnType::I64 as i16 => ColumnType::I64,
+            v if v == ColumnType::U64 as i16 => ColumnType::U64,
+            v if v == ColumnType::F64 as i16 => ColumnType::F64,
+            v if v == ColumnType::Bool as i16 => ColumnType::Bool,
+            v if v == ColumnType::String as i16 => ColumnType::String,
+            v if v == ColumnType::Time as i16 => ColumnType::Time,
+            v if v == ColumnType::Tag as i16 => ColumnType::Tag,
+            _ => return Err("invalid column type discriminant".into()),
+        })
     }
 }
 
@@ -1066,6 +1117,14 @@ mod tests {
 
         let decoded: SortKeyIds = encoded.array_sort_key_ids.into();
         assert_eq!(decoded, original);
+    }
+
+    /// Assert a sensibly sized data type is used to represent a [`ColumnType`]
+    /// in IOx, even though the catalog uses an overly large type.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_column_type_size() {
+        assert_eq!(std::mem::size_of::<ColumnType>(), 1);
     }
 
     macro_rules! test_is_monotonic_update {

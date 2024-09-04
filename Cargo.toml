@@ -19,7 +19,6 @@ members = [
     "influxdb_iox_client",
     "influxdb_line_protocol",
     "influxdb_storage_client",
-    "influxdb_tsm",
     "influxdb2_client",
     "influxrpc_parser",
     "iox_catalog",
@@ -32,6 +31,7 @@ members = [
     "iox_tests",
     "iox_time",
     "logfmt",
+    "meta_data_cache",
     "metric_exporters",
     "metric",
     "mutable_batch_lp",
@@ -86,14 +86,14 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "52.1.0", features = ["prettyprint", "chrono-tz"] }
-arrow-buffer = { version = "52.1.0" }
-arrow-flight = { version = "52.1.0", features = ["flight-sql-experimental"] }
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
-datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "a64df83502821f18067fb4ff65dd217815b305c9" }
+arrow = { version = "52.2.0", features = ["prettyprint", "chrono-tz"] }
+arrow-buffer = { version = "52.2.0" }
+arrow-flight = { version = "52.2.0", features = ["flight-sql-experimental"] }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5de0c3577fd30dcf9213f428222a29efae789807" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5de0c3577fd30dcf9213f428222a29efae789807" }
 hashbrown = { version = "0.14.5" }
 object_store = { version = "0.10.2" }
-parquet = { version = "52.1.0", features = ["object_store"] }
+parquet = { version = "52.2.0", features = ["object_store"] }
 pbjson = { version = "0.6.0" }
 pbjson-build = { version = "0.6.2" }
 pbjson-types = { version = "0.6.0" }
@@ -102,7 +102,7 @@ prost = { version = "0.12.6" }
 prost-build = { version = "0.12.6" }
 prost-types = { version = "0.12.6" }
 smallvec = { version = "1.13.2", features = ["union"] }
-sqlparser = { version = "0.48.0" }
+sqlparser = { version = "0.50.0" }
 tonic = { version = "0.11.0", features = ["tls", "tls-roots"] }
 tonic-build = { version = "0.11.0" }
 tonic-health = { version = "0.11.0" }

@@ -13,21 +13,17 @@ use arrow::{
 };
 
 use data_types::TimestampMinMax;
+use datafusion::common::DFSchema;
 use datafusion::physical_expr::{analyze, AnalysisContext, ExprBoundaries};
 use datafusion::{
     self,
-    common::ToDFSchema,
     datasource::{provider_as_source, MemTable},
     error::DataFusionError,
     logical_expr::{interval_arithmetic::Interval, LogicalPlan, LogicalPlanBuilder},
-    physical_plan::{
-        expressions::{col as physical_col, PhysicalSortExpr},
-        PhysicalExpr,
-    },
+    physical_plan::expressions::{col as physical_col, PhysicalSortExpr},
     prelude::{Column, Expr},
 };
 use datafusion::{common::stats::Precision, execution::context::SessionState};
-
 use itertools::Itertools;
 use schema::{sort::SortKey, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
@@ -95,16 +91,6 @@ pub fn arrow_sort_key_exprs(
             })
         })
         .collect()
-}
-
-/// Build a datafusion physical expression from a logical one
-pub fn df_physical_expr(
-    session_state: &SessionState,
-    schema: ArrowSchemaRef,
-    expr: Expr,
-) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-    let df_schema = Arc::clone(&schema).to_dfschema_ref()?;
-    session_state.create_physical_expr(expr, df_schema.as_ref())
 }
 
 /// Return min and max for column `time` of the given set of record batches by
@@ -186,8 +172,9 @@ pub fn calculate_field_intervals(
         .collect::<Result<Vec<_>, DataFusionError>>()?;
 
     let context = AnalysisContext::new(boundaries);
+    let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let analysis_result = analyze(
-        &df_physical_expr(session_state, Arc::clone(&schema), expr)?,
+        &session_state.create_physical_expr(expr, &df_schema)?,
         context,
         &schema,
     )?;

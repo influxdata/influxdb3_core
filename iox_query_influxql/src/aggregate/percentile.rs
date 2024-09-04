@@ -54,7 +54,9 @@ impl AggregateUDFImpl for PercentileUDF {
     }
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(PercentileAccumulator::new(arg.data_type.clone())))
+        Ok(Box::new(PercentileAccumulator::new(
+            arg.return_type.clone(),
+        )))
     }
 
     fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<arrow::datatypes::Field>> {

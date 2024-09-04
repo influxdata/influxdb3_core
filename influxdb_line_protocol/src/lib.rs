@@ -1,11 +1,9 @@
 //! This crate contains pure Rust implementations of
 //!
 //! 1. A [parser](crate::parse_lines) for [InfluxDB Line Protocol] developed as part of the
-//! [InfluxDB IOx] project.  This implementation is intended to be
-//! compatible with the [Go implementation], however, this
-//! implementation uses a [nom] combinator-based parser rather than
-//! attempting to port the imperative Go logic so there are likely
-//! some small differences.
+//!    [InfluxDB IOx] project. This implementation is intended to be compatible with the [Go
+//!    implementation], however, this implementation uses a [nom] combinator-based parser rather
+//!    than attempting to port the imperative Go logic so there are likely some small differences.
 //!
 //! 2. A [builder](crate::builder::LineProtocolBuilder) to construct valid [InfluxDB Line Protocol]
 //!
@@ -75,6 +73,8 @@
 
 pub mod builder;
 pub use builder::LineProtocolBuilder;
+#[cfg(feature = "v3")]
+pub mod v3;
 
 use fmt::Display;
 use log::debug;
@@ -153,6 +153,10 @@ pub enum Error {
 
     #[snafu(display(r#"Tag Set Malformed"#))]
     TagSetMalformed,
+
+    #[cfg(feature = "v3")]
+    #[snafu(display(r#"Series Key Malformed"#))]
+    SeriesKeyMalformed,
 
     // TODO: Replace this with specific failures.
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]

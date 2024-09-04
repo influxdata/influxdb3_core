@@ -14,7 +14,7 @@ metric = { path = "../metric" }
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 snafu = "0.8"
-tokio = { version = "1.38" }
+tokio = { version = "1.40" }
 tokio_metrics_bridge = { path = "../tokio_metrics_bridge" }
 tokio_watchdog = { path = "../tokio_watchdog" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

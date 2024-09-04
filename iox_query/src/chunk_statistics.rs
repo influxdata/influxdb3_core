@@ -133,7 +133,7 @@ where
     for (t, field) in schema.iter() {
         let stats = match t {
             InfluxColumnType::Timestamp => {
-                // prefer explicitely given time range but fall back to column ranges
+                // prefer explicitly given time range but fall back to column ranges
                 let (min_value, max_value) = match ts_min_max {
                     Some(ts_min_max) => (
                         Precision::Exact(timestamptz_nano(ts_min_max.min)),
@@ -188,7 +188,7 @@ where
                             null_count = Precision::Exact(row_count);
                         }
                         None => {
-                            num_rows = NULL_COLUMN_INDICATOR.clone();
+                            num_rows = NULL_COLUMN_INDICATOR;
                         }
                     }
                 }

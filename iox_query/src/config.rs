@@ -4,8 +4,7 @@ use datafusion::{
     common::{extensions_options, Result},
     config::{ConfigEntry, ConfigExtension, ExtensionOptions},
 };
-use object_store_mem_cache::MetaIndexCache;
-use tokio::sync::Mutex;
+use meta_data_cache::MetaIndexCache;
 
 /// IOx-specific config extension prefix.
 pub const IOX_CONFIG_PREFIX: &str = "iox";
@@ -156,7 +155,7 @@ pub const IOX_CACHE_PREFIX: &str = "iox_meta_cache";
 #[derive(Debug, Clone)]
 pub struct IoxCacheExt {
     /// metadata cache
-    pub meta_cache: Arc<Mutex<MetaIndexCache>>,
+    pub meta_cache: Arc<MetaIndexCache>,
 }
 
 impl ExtensionOptions for IoxCacheExt {

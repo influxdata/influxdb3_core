@@ -2,12 +2,14 @@
 
 use crate::{
     column::{Column, ColumnData, NULL_DID},
+    noop_validator::NoopValidator,
     MutableBatch,
 };
 use arrow_util::bitset::{iter_set_positions, iter_set_positions_with_offset, BitSet};
 use data_types::{IsNan, StatValues, Statistics};
+use hashbrown::hash_map::RawEntryMut;
 use schema::{InfluxColumnType, InfluxFieldType};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use std::{num::NonZeroU64, ops::Range};
 
 #[allow(missing_docs, missing_copy_implementations)]
@@ -27,17 +29,77 @@ pub enum Error {
 
     #[snafu(display("Key not found in dictionary: {}", key))]
     KeyNotFound { key: usize },
+
+    #[snafu(display("Could not insert column: {source}"))]
+    ColumnInsertionRejected { source: InvalidInsertionError },
 }
 
 /// A specialized `Error` for [`Writer`] errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[allow(missing_docs)]
+#[derive(Debug, Snafu)]
+pub enum InvalidInsertionError {
+    #[snafu(display(
+        "Existing table schema specifies column {column} is type {table_type}, but type {given} was given"
+    ))]
+    TableSchemaConflict {
+        column: String,
+        table_type: InfluxColumnType,
+        given: InfluxColumnType,
+    },
+}
+
+/// A type capable of checking the validity of a column insertion into a
+/// [`MutableBatch`] using information external to the writer.
+pub trait ColumnInsertValidator {
+    /// Validates whether a new column with `col_name` and `col_type` can be
+    /// added to the writer's [`MutableBatch`]
+    fn validate_insertion(
+        &self,
+        col_name: &str,
+        col_type: InfluxColumnType,
+    ) -> std::result::Result<(), InvalidInsertionError>;
+}
+
+impl<T> ColumnInsertValidator for &T
+where
+    T: ColumnInsertValidator,
+{
+    fn validate_insertion(
+        &self,
+        col_name: &str,
+        col_type: InfluxColumnType,
+    ) -> std::result::Result<(), InvalidInsertionError> {
+        T::validate_insertion(self, col_name, col_type)
+    }
+}
+
+/// A no-op [`ColumnInsertValidator`] implementation that always allows an
+/// insert to proceed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopColumnInsertValidator;
+
+impl ColumnInsertValidator for NoopColumnInsertValidator {
+    fn validate_insertion(
+        &self,
+        _col_name: &str,
+        _col_type: schema::InfluxColumnType,
+    ) -> Result<(), InvalidInsertionError> {
+        Ok(())
+    }
+}
 
 /// [`Writer`] provides a panic-safe abstraction to append a number of rows to a [`MutableBatch`]
 ///
 /// If a [`Writer`] is dropped without calling [`Writer::commit`], the [`MutableBatch`] will be
 /// truncated to the original number of rows, and the statistics not updated
 #[derive(Debug)]
-pub struct Writer<'a> {
+pub struct Writer<'a, T> {
+    /// A check is delegated to this validator before a new, unseen column is
+    /// added to `batch`, in order to allow consumers of the writer to impose
+    /// additional constraints outside of the writer's knowledge.
+    column_insert_validator: T,
     /// The mutable batch that is being mutated
     batch: &'a mut MutableBatch,
     /// A list of column index paired with Statistics
@@ -53,15 +115,33 @@ pub struct Writer<'a> {
     /// If this Writer committed successfully
     success: bool,
 }
-
-impl<'a> Writer<'a> {
+impl<'a> Writer<'a, NoopValidator> {
     /// Create a [`Writer`] for inserting `to_insert` rows to the provided `batch`
     ///
     /// If the writer is dropped without calling commit all changes will be rolled back
     pub fn new(batch: &'a mut MutableBatch, to_insert: usize) -> Self {
+        Self::new_with_column_validator(batch, to_insert, Default::default())
+    }
+}
+
+impl<'a, T> Writer<'a, T>
+where
+    T: ColumnInsertValidator,
+{
+    /// Create a [`Writer`] for inserting `to_insert` rows into the provided
+    /// `batch`, accepting new columns only on passing checks from the
+    /// [`ColumnInsertValidator`].
+    ///
+    /// If the writer is dropped without calling commit all changes will be rolled back
+    pub fn new_with_column_validator(
+        batch: &'a mut MutableBatch,
+        to_insert: usize,
+        column_insert_validator: T,
+    ) -> Self {
         let initial_rows = batch.rows();
         let initial_cols = batch.columns.len();
         Self {
+            column_insert_validator,
             batch,
             statistics: vec![],
             initial_rows,
@@ -616,13 +696,18 @@ impl<'a> Writer<'a> {
     ) -> Result<(usize, &mut Column)> {
         let columns_len = self.batch.columns.len();
 
-        let column_idx = *self
-            .batch
-            .column_names
-            .raw_entry_mut()
-            .from_key(name)
-            .or_insert_with(|| (name.to_string(), columns_len))
-            .1;
+        // Fetch the index of the column with `name`, inserting a new column
+        // into the writer's batch if none exists and the column insert
+        // validator allows.
+        let column_idx = *match self.batch.column_names.raw_entry_mut().from_key(name) {
+            RawEntryMut::Occupied(ref v) => v.get(),
+            RawEntryMut::Vacant(v) => {
+                self.column_insert_validator
+                    .validate_insertion(name, influx_type)
+                    .context(ColumnInsertionRejectedSnafu)?;
+                v.insert(name.to_string(), columns_len).1
+            }
+        };
 
         if columns_len == column_idx {
             self.batch
@@ -805,7 +890,7 @@ fn compute_stats<'a, T, U, F>(
     stats.update_for_nulls(to_insert as u64 - non_null_count);
 }
 
-impl<'a> Drop for Writer<'a> {
+impl<'a, T> Drop for Writer<'a, T> {
     fn drop(&mut self) {
         if !self.success {
             let initial_rows = self.initial_rows;
@@ -834,5 +919,98 @@ impl<'a> Drop for Writer<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+
+    use super::*;
+
+    struct AlwaysRejectingValidator<F> {
+        return_err: F,
+    }
+
+    impl<F> ColumnInsertValidator for AlwaysRejectingValidator<F>
+    where
+        F: Fn() -> InvalidInsertionError,
+    {
+        fn validate_insertion(
+            &self,
+            _col_name: &str,
+            _col_type: InfluxColumnType,
+        ) -> std::result::Result<(), InvalidInsertionError> {
+            Err((self.return_err)())
+        }
+    }
+
+    /// A basic test to assert that each write method results in the
+    /// [`ColumnInsertValidator`] being invoked.
+    #[test]
+    fn writer_delegates_to_column_validator() {
+        const COLUMN: &str = "anything";
+
+        let mut b = MutableBatch::new();
+        // Provide the writer with a validator that always returns a well know error.
+        let mut w = Writer::new_with_column_validator(
+            &mut b,
+            7,
+            AlwaysRejectingValidator {
+                return_err: || InvalidInsertionError::TableSchemaConflict {
+                    column: COLUMN.to_string(),
+                    table_type: InfluxColumnType::Timestamp,
+                    given: InfluxColumnType::Tag,
+                },
+            },
+        );
+
+        assert_matches!(
+            w.write_tag("bread", None, std::iter::once("fluffy")),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+        assert_matches!(
+            w.write_tag_dict(
+                "bread",
+                None,
+                vec![1, 0, 0, 1].into_iter(),
+                vec!["fluffy", "stale"].into_iter(),
+            ),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+        assert_matches!(
+            w.write_f64("foo", None, std::iter::once(4.2)),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+        assert_matches!(
+            w.write_i64("bar", None, std::iter::once(-42)),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+        assert_matches!(
+            w.write_u64("baz", None, std::iter::once(42)),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+        assert_matches!(
+            w.write_string("bananas", None, std::iter::once("great")),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+        assert_matches!(
+            w.write_bool("answer", None, std::iter::once(true)),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
     }
 }

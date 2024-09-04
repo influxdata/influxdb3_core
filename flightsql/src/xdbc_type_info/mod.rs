@@ -50,7 +50,7 @@
 //!    interval_precision: int32 (If the data type is an interval data type, then this column contains the value
 //!                               of the interval leading precision. Otherwise, this column is NULL. This fields
 //!                               is only relevant to be used by ODBC).
-//! >
+//! \>
 //! The returned data should be ordered by data_type and then by type_name.
 //!
 //!
@@ -58,7 +58,7 @@
 
 use arrow_flight::sql::metadata::{XdbcTypeInfo, XdbcTypeInfoData, XdbcTypeInfoDataBuilder};
 use arrow_flight::sql::{Nullable, Searchable, XdbcDataType, XdbcDatetimeSubcode};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
 pub(crate) fn xdbc_type_info_data() -> &'static XdbcTypeInfoData {
     &XDBC_TYPE_INFO_DATA
@@ -66,7 +66,7 @@ pub(crate) fn xdbc_type_info_data() -> &'static XdbcTypeInfoData {
 
 /// Data Types supported by DataFusion
 /// <https://arrow.apache.org/datafusion/user-guide/sql/data_types.html>
-static XDBC_TYPE_INFO_DATA: Lazy<XdbcTypeInfoData> = Lazy::new(|| {
+static XDBC_TYPE_INFO_DATA: LazyLock<XdbcTypeInfoData> = LazyLock::new(|| {
     let mut builder = XdbcTypeInfoDataBuilder::new();
     builder.append(XdbcTypeInfo {
         type_name: "VARCHAR".to_string(),

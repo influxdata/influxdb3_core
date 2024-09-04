@@ -55,6 +55,7 @@ service CatalogService {
   rpc ParquetFileFlagForDeleteByRetention(ParquetFileFlagForDeleteByRetentionRequest) returns (stream ParquetFileFlagForDeleteByRetentionResponse);
   rpc ParquetFileDeleteOldIdsOnly(ParquetFileDeleteOldIdsOnlyRequest) returns (stream ParquetFileDeleteOldIdsOnlyResponse);
   rpc ParquetFileListByPartitionNotToDeleteBatch(ParquetFileListByPartitionNotToDeleteBatchRequest) returns (stream ParquetFileListByPartitionNotToDeleteBatchResponse);
+  rpc ParquetFileActiveAsOf(ParquetFileActiveAsOfRequest) returns (stream ParquetFileActiveAsOfResponse);
   rpc ParquetFileGetByObjectStoreId(ParquetFileGetByObjectStoreIdRequest) returns (ParquetFileGetByObjectStoreIdResponse);
   rpc ParquetFileExistsByObjectStoreIdBatch(stream ParquetFileExistsByObjectStoreIdBatchRequest) returns (stream ParquetFileExistsByObjectStoreIdBatchResponse);
   rpc ParquetFileCreateUpgradeDelete(ParquetFileCreateUpgradeDeleteRequest) returns (ParquetFileCreateUpgradeDeleteResponse);
@@ -398,17 +399,26 @@ message ParquetFileFlagForDeleteByRetentionResponse {
 
 message ParquetFileDeleteOldIdsOnlyRequest {
   int64 older_than = 1;
+  int64 cutoff = 2;
 }
 
 message ParquetFileDeleteOldIdsOnlyResponse {
   ObjectStoreId object_store_id = 1;
 }
 
-message ParquetFileListByPartitionNotToDeleteBatchRequest  {
+message ParquetFileListByPartitionNotToDeleteBatchRequest {
   repeated int64 partition_ids = 1;
 }
 
 message ParquetFileListByPartitionNotToDeleteBatchResponse {
+  ParquetFile parquet_file = 1;
+}
+
+message ParquetFileActiveAsOfRequest {
+  int64 as_of = 1;
+}
+
+message ParquetFileActiveAsOfResponse {
   ParquetFile parquet_file = 1;
 }
 

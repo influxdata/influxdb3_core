@@ -15,13 +15,8 @@ use std::{fmt::Debug, time::Duration};
 const MINIMUM_CUTOFF_PERIOD: Duration = Duration::from_secs(3600 * 3);
 
 /// Configuration specific to the object store garbage collector
-#[derive(Debug, Clone, Parser, Copy)]
+#[derive(Debug, Clone, Parser)]
 pub struct GarbageCollectorConfig {
-    /// If this flag is specified, don't delete the files in object storage. Only print the files
-    /// that would be deleted if this flag wasn't specified.
-    #[clap(long, env = "INFLUXDB_IOX_GC_DRY_RUN")]
-    pub dry_run: bool,
-
     /// Items in the object store that are older than this duration that are not referenced in the
     /// catalog will be deleted.
     /// Parsed with <https://docs.rs/humantime/latest/humantime/fn.parse_duration.html>
@@ -117,14 +112,30 @@ pub struct GarbageCollectorConfig {
     )]
     pub retention_sleep_interval_minutes: u64,
 
-    /// Enable partition retention
+    /// Read replica catalog connection string to be used for querying for catalog backup lists of
+    /// Parquet files, to avoid adding load to the primary read/write catalog.
+    ///
+    /// If not specified, defaults to the value specified for
+    /// `--catalog-dsn`/`INFLUXDB_IOX_CATALOG_DSN`, which is usually the primary catalog.
+    ///
+    /// The dsn determines the type of catalog used.
+    ///
+    /// PostgreSQL: `postgresql://postgres@localhost:5432/postgres`
+    ///
+    /// Sqlite (a local filename /tmp/foo.sqlite): `sqlite:///tmp/foo.sqlite` -
+    /// note sqlite is for development/testing only and should not be used for
+    /// production workloads.
+    ///
+    /// Memory (ephemeral, only useful for testing): `memory`
+    ///
+    /// Catalog service: `http://catalog-service-0:8080; http://catalog-service-1:8080`
+    ///
     #[clap(
-        long,
-        default_value = "false",
-        action,
-        env = "INFLUXDB_IOX_GC_PARTITION_RETENTION"
+        long = "catalog-replica-dsn",
+        env = "INFLUXDB_IOX_CATALOG_REPLICA_DSN",
+        action
     )]
-    pub partition_retention: bool,
+    pub replica_dsn: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
@@ -159,7 +170,7 @@ impl GarbageCollectorConfig {
         let duration = parse_duration(d).context(InvalidDurationSnafu {
             given: d.to_string(),
         })?;
-        if duration.as_secs() <= MINIMUM_CUTOFF_PERIOD.as_secs() {
+        if duration.as_secs() < MINIMUM_CUTOFF_PERIOD.as_secs() {
             return CutoffTooShortSnafu { duration }.fail();
         }
         Ok(duration)

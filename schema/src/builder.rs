@@ -3,6 +3,9 @@ use std::convert::TryInto;
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use snafu::{ResultExt, Snafu};
 
+#[cfg(feature = "v3")]
+use crate::{MissingSeriesKeyColumnSnafu, TagsNotInSeriesKeySnafu};
+
 use super::{InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME};
 
 /// Namespace schema creation / validation errors.
@@ -25,6 +28,10 @@ pub struct SchemaBuilder {
 
     /// If the builder has been consumed
     finished: bool,
+
+    /// The series key, if defined
+    #[cfg(feature = "v3")]
+    series_key: Option<Vec<String>>,
 }
 
 impl SchemaBuilder {
@@ -37,7 +44,29 @@ impl SchemaBuilder {
             measurement: Default::default(),
             fields: Vec::with_capacity(n),
             finished: Default::default(),
+            #[cfg(feature = "v3")]
+            series_key: None,
         }
+    }
+
+    #[cfg(feature = "v3")]
+    pub fn series_key(&self) -> Option<&[String]> {
+        self.series_key.as_deref()
+    }
+
+    #[cfg(feature = "v3")]
+    pub fn with_series_key<I>(&mut self, columns: I) -> &mut Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        self.series_key = Some(
+            columns
+                .into_iter()
+                .map(|c| c.as_ref().to_string())
+                .collect(),
+        );
+        self
     }
 
     /// Add a new tag column to this schema. By default tags are
@@ -132,8 +161,49 @@ impl SchemaBuilder {
         assert!(!self.finished, "build called multiple times");
         self.finished = true;
 
-        Schema::new_from_parts(self.measurement.take(), self.fields.drain(..), false)
-            .context(ValidatingSchemaSnafu)
+        // enforce non-nullable based on series key membership
+        #[cfg(feature = "v3")]
+        if let Some(sk) = self.series_key.as_ref() {
+            self.fields = self
+                .fields
+                .drain(..)
+                .map(|(f, t)| {
+                    if sk.contains(f.name()) {
+                        (f.with_nullable(false), t)
+                    } else {
+                        (f, t)
+                    }
+                })
+                .collect();
+
+            if sk
+                .iter()
+                .any(|k| self.fields.iter().all(|(f, _)| f.name() != k))
+            {
+                return MissingSeriesKeyColumnSnafu
+                    .fail()
+                    .context(ValidatingSchemaSnafu);
+            }
+
+            if self
+                .fields
+                .iter()
+                .any(|(f, t)| matches!(t, InfluxColumnType::Tag) && !sk.contains(f.name()))
+            {
+                return TagsNotInSeriesKeySnafu
+                    .fail()
+                    .context(ValidatingSchemaSnafu);
+            }
+        }
+
+        Schema::new_from_parts(
+            self.measurement.take(),
+            self.fields.drain(..),
+            false,
+            #[cfg(feature = "v3")]
+            self.series_key.take(),
+        )
+        .context(ValidatingSchemaSnafu)
     }
 
     /// Internal helper method to add a column definition
@@ -302,5 +372,34 @@ mod test {
             res.unwrap_err().to_string(),
             "Error validating schema: Internal Error: Duplicate column name found in schema: 'time'"
         );
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_builder_mismatch_series_key_and_tags() {
+        SchemaBuilder::new()
+            .with_series_key(["a", "b"])
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .expect_err("no tag columns, but specified series key, should not be able to build");
+        SchemaBuilder::new()
+            .with_series_key(["a", "b"])
+            .tag("a")
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .expect_err("missing tag 'b' from the series key, should not be able to build");
+        SchemaBuilder::new()
+            .with_series_key(["a"])
+            .tag("a")
+            .tag("b")
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .expect_err("extra tag 'b' that is not in the series key, should not be able to build");
     }
 }

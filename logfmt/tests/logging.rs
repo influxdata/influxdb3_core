@@ -7,13 +7,13 @@
 
 use logfmt::LogFmtLayer;
 use observability_deps::tracing::{debug, error, info, span, trace, warn, Level};
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::{
     error::Error,
     fmt,
     io::{self, Cursor},
+    sync::LazyLock,
 };
 use tracing_subscriber::{self, fmt::MakeWriter, prelude::*};
 
@@ -318,7 +318,7 @@ thread_local! {
 
 // Since we can only setup logging once, we need to have gloabl to
 // use it among test cases
-static GLOBAL_WRITER: Lazy<Mutex<CapturedWriter>> = Lazy::new(|| {
+static GLOBAL_WRITER: LazyLock<Mutex<CapturedWriter>> = LazyLock::new(|| {
     let capture = CapturedWriter::default();
     tracing_subscriber::registry()
         .with(LogFmtLayer::new(capture.clone()))

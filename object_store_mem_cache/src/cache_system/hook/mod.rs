@@ -1,9 +1,9 @@
-pub(crate) mod chain;
-pub(crate) mod limit;
-pub(crate) mod observer;
-
-#[cfg(test)]
-pub(crate) mod test_utils;
+pub mod chain;
+pub mod level_trigger;
+pub mod limit;
+mod notify;
+pub mod observer;
+pub mod test_utils;
 
 use crate::cache_system::interfaces::DynError;
 
@@ -22,26 +22,56 @@ use crate::cache_system::interfaces::DynError;
 /// To simplify accounting and prevent large-scale locking, [`evict`](Self::evict) will only be called after the
 /// fetching future is finished. This means that a key may be observed concurrently, one version that is dropped from
 /// the cache but that still has a polling future and a new version. Use the generation number to distinguish them.
-pub(crate) trait Hook: std::fmt::Debug + Send + Sync {
-    type K;
-
+pub trait Hook<K>: std::fmt::Debug + Send + Sync {
     /// Called before a value is potentially inserted.
-    fn insert(&self, _gen: u64, _k: &Self::K) {}
+    fn insert(&self, _gen: u64, _k: &K) {}
 
     /// A value was fetched.
     ///
     /// The hook can reject a value using an error.
-    fn fetched(
-        &self,
-        _gen: u64,
-        _k: &Self::K,
-        _res: &Result<usize, DynError>,
-    ) -> Result<(), DynError> {
-        Ok(())
+    fn fetched(&self, _gen: u64, _k: &K, _res: Result<usize, &DynError>) -> HookDecision {
+        HookDecision::default()
     }
 
     /// A key removed.
-    ///
-    /// The value is set if it was fetched.
-    fn evict(&self, _gen: u64, _k: &Self::K, _res: &Option<Result<usize, ()>>) {}
+    fn evict(&self, _gen: u64, _k: &K, _res: EvictResult) {}
+}
+
+/// Decision made by [`Hook::fetched`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookDecision {
+    /// The the entry.
+    #[default]
+    Keep,
+
+    /// Evict the entry immediately.
+    Evict,
+}
+
+impl HookDecision {
+    /// Combine two decisions but favor [eviction](Self::Evict).
+    pub fn favor_evict(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Keep, Self::Keep) => Self::Keep,
+            (Self::Keep, Self::Evict) => Self::Evict,
+            (Self::Evict, Self::Keep) => Self::Evict,
+            (Self::Evict, Self::Evict) => Self::Evict,
+        }
+    }
+}
+
+/// Status that is report to [`Hook::evict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvictResult {
+    /// Evict element that was never fetched.
+    Unfetched,
+
+    /// Evict element that was fetched.
+    Fetched {
+        /// Size in bytes.
+        size: usize,
+    },
+
+    /// Evict element that could not be fetched due to error.
+    Failed,
 }

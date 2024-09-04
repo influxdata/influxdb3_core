@@ -54,7 +54,7 @@ impl AggregateUDFImpl for ModeUDF {
     }
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(ModeAccumulator::new(arg.data_type.clone())))
+        Ok(Box::new(ModeAccumulator::new(arg.return_type.clone())))
     }
 
     fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<Field>> {
@@ -238,9 +238,13 @@ impl Accumulator for ModeAccumulator {
     }
 }
 
+/// Take a scalar timestamptz, and return a UTC nanoseconds.
+///
+/// Nanoseconds provided should always be in UTC, even if TZ differs. The offset
+/// information is not retained.
 fn from_timestamp(time: &ScalarValue) -> Result<i64> {
     match time {
-        ScalarValue::TimestampNanosecond(nano, _) => Ok(nano.unwrap_or(0)),
+        ScalarValue::TimestampNanosecond(nano, _tz) => Ok(nano.unwrap_or(0)),
         sv => error::internal(format!(
             "expected TimestampNanosecond for mode timestamp, got {}",
             sv.data_type()

@@ -918,11 +918,15 @@ impl ParquetFileRepo for Repos {
         Ok(res)
     }
 
-    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
+    async fn delete_old_ids_only(
+        &mut self,
+        older_than: Timestamp,
+        cutoff: Duration,
+    ) -> Result<Vec<ObjectStoreId>> {
         // deleted files are NOT part of the snapshot, so this bypasses the cache
         self.backing
             .parquet_files()
-            .delete_old_ids_only(older_than)
+            .delete_old_ids_only(older_than, cutoff)
             .await
     }
 
@@ -968,6 +972,11 @@ impl ParquetFileRepo for Repos {
         initial_level.truncate(MAX_PARQUET_L0_FILES_PER_PARTITION as usize);
         files.append(&mut initial_level);
         Ok(files)
+    }
+
+    async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>> {
+        // read-through: this is used by the GC, so this is not overall latency-critical
+        self.backing.parquet_files().active_as_of(as_of).await
     }
 
     async fn get_by_object_store_id(

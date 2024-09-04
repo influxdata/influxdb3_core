@@ -105,8 +105,8 @@ impl Instrument for TokioInstrumentDispatcher {
         rt_metric!(
             this = guard,
             reporter = reporter,
-            metric = active_tasks_count,
-            descr = "The number of active tasks in the runtime.",
+            metric = num_alive_tasks,
+            descr = "The current number of alive tasks in the runtime.",
             t = U64Gauge,
         );
         rt_metric!(

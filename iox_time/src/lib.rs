@@ -1,7 +1,7 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use chrono::{DateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, DurationRound, TimeDelta, TimeZone, Timelike, Utc};
 use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
 use std::{
     fmt::{Debug, Display},
@@ -75,7 +75,7 @@ impl Time {
     }
 
     /// Makes a new `Time` from the provided [`DateTime<Utc>`]
-    pub fn from_date_time(time: chrono::DateTime<Utc>) -> Self {
+    pub const fn from_date_time(time: chrono::DateTime<Utc>) -> Self {
         Self(time)
     }
 
@@ -156,6 +156,20 @@ impl Time {
     /// Returns `Time` as a [`DateTime<Utc>`]
     pub fn date_time(&self) -> DateTime<Utc> {
         self.0
+    }
+
+    /// Returns a new instance truncated to the most recently passed hour.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let time = iox_time::Time::from_timestamp_nanos(1723129005000000000);
+    /// assert_eq!(time.to_rfc3339(), "2024-08-08T14:56:45+00:00");
+    /// let truncated = time.truncate_to_hour().unwrap();
+    /// assert_eq!(truncated.to_rfc3339(), "2024-08-08T14:00:00+00:00");
+    /// ```
+    pub fn truncate_to_hour(&self) -> Result<Self, chrono::RoundingError> {
+        self.0.duration_trunc(TimeDelta::hours(1)).map(Self)
     }
 }
 

@@ -34,47 +34,47 @@
 //! ## Proof
 //!
 //! 1. pending_registrations starts at 1, and is incremented on
-//! TrackerRegistration::clone. A TrackerRegistration cannot be created from an
-//! existing TrackerState, only another TrackerRegistration
+//!    TrackerRegistration::clone. A TrackerRegistration cannot be created from an
+//!    existing TrackerState, only another TrackerRegistration
 //!
 //! 2. pending_registrations is decremented with release semantics on
-//! TrackerRegistration::drop
+//!    TrackerRegistration::drop
 //!
 //! 3. pending_futures is only incremented with a TrackerRegistration in scope
 //!
-//! 4. 2. + 3. -> A thread that increments pending_futures, decrements
-//! pending_registrations with release semantics afterwards. By definition of
-//! release semantics these writes to pending_futures cannot be reordered to
-//! come after the atomic decrement of pending_registrations
+//! 4. 2 + 3 -> A thread that increments pending_futures, decrements
+//!    pending_registrations with release semantics afterwards. By definition of
+//!    release semantics these writes to pending_futures cannot be reordered to
+//!    come after the atomic decrement of pending_registrations
 //!
-//! 5. 1. + 2. + drop cannot be called multiple times on the same object -> once
-//! pending_registrations is decremented to 0 it can never be incremented again
+//! 5. 1 + 2 + drop cannot be called multiple times on the same object -> once
+//!    pending_registrations is decremented to 0 it can never be incremented again
 //!
-//! 6. 4. + 5. -> the decrement to 0 of pending_registrations must commit after
-//! the last increment of pending_futures
+//! 6. 4 + 5 -> the decrement to 0 of pending_registrations must commit after
+//!    the last increment of pending_futures
 //!
 //! 7. pending_registrations is loaded with acquire semantics
 //!
 //! 8. By definition of acquire semantics, any thread that reads
-//! pending_registrations is guaranteed to see any increments to pending_futures
-//! performed before the most recent decrement of pending_registrations
+//!    pending_registrations is guaranteed to see any increments to pending_futures
+//!    performed before the most recent decrement of pending_registrations
 //!
-//! 9. 6. + 8. -> A thread that observes a pending_registrations of 0 cannot
-//! subsequently observe pending_futures to increase
+//! 9. 6 + 8 -> A thread that observes a pending_registrations of 0 cannot
+//!    subsequently observe pending_futures to increase
 //!
 //! 10. Tracker::get_status returns Complete if it observes
-//! pending_registrations to be 0 and then pending_futures to be 0
+//!     pending_registrations to be 0 and then pending_futures to be 0
 //!
 //! 11. 9 + 10 -> A thread can only observe a tracker to be complete
-//! after all futures have been dropped and no more can be created
+//!     after all futures have been dropped and no more can be created
 //!
 //! 12. pending_futures is decremented with Release semantics on
-//! TrackedFuture::drop after any associated metrics have been incremented
+//!     TrackedFuture::drop after any associated metrics have been incremented
 //!
 //! 13. pending_futures is loaded with acquire semantics
 //!
-//! 14. 12. + 13. -> A thread that observes a pending_futures of 0 is guaranteed
-//! to see any metrics from any dropped TrackedFuture
+//! 14. 12 + 13 -> A thread that observes a pending_futures of 0 is guaranteed
+//!     to see any metrics from any dropped TrackedFuture
 //!
 //! Note: this proof ignores the complexity of moving Trackers, TrackedFutures,
 //! etc... between threads as any such functionality must perform the necessary
