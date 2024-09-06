@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use snafu::{ResultExt, Snafu};
 use std::fmt::{Debug, Display, Formatter};
+use trace_http::query_variant::QueryVariant;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -60,8 +61,8 @@ enum AnyError {
 ///
 /// Tickets are encoded in one of two formats:
 ///
-/// 1. Protobuf: as a [ReadInfo](proto::ReadInfo) wrapped as a "Any"
-/// message and encoded using binary encoding
+/// 1. Protobuf: as a [ReadInfo](proto::ReadInfo) wrapped as a "Any" message and encoded using
+///    binary encoding
 ///
 /// 2. JSON: formatted as below.
 ///
@@ -139,11 +140,11 @@ pub(crate) enum RunQuery {
 }
 
 impl RunQuery {
-    pub(crate) fn variant(&self) -> &'static str {
+    pub(crate) fn variant(&self) -> QueryVariant {
         match self {
-            Self::Sql(_) => "sql",
-            Self::InfluxQL(_) => "influxql",
-            Self::FlightSQL(_) => "flightsql",
+            Self::Sql(_) => QueryVariant::Sql,
+            Self::InfluxQL(_) => QueryVariant::InfluxQl,
+            Self::FlightSQL(_) => QueryVariant::FlightSql,
         }
     }
 }

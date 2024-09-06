@@ -1,6 +1,6 @@
 //! gRPC server implementation.
 
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use crate::{
     grpc::serialization::{
@@ -88,6 +88,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         TonicStream<proto::ParquetFileDeleteOldIdsOnlyResponse>;
     type ParquetFileListByPartitionNotToDeleteBatchStream =
         TonicStream<proto::ParquetFileListByPartitionNotToDeleteBatchResponse>;
+    type ParquetFileActiveAsOfStream = TonicStream<proto::ParquetFileActiveAsOfResponse>;
     type ParquetFileExistsByObjectStoreIdBatchStream =
         TonicStream<proto::ParquetFileExistsByObjectStoreIdBatchResponse>;
 
@@ -971,7 +972,10 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
         let id_list = repos
             .parquet_files()
-            .delete_old_ids_only(Timestamp::new(req.older_than))
+            .delete_old_ids_only(
+                Timestamp::new(req.older_than),
+                Duration::from_nanos(req.cutoff as u64),
+            )
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -1009,6 +1013,31 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             futures::stream::iter(file_list.into_iter().map(|file| {
                 let file = serialize_parquet_file(file);
                 Ok(proto::ParquetFileListByPartitionNotToDeleteBatchResponse {
+                    parquet_file: Some(file),
+                })
+            }))
+            .boxed(),
+        ))
+    }
+
+    async fn parquet_file_active_as_of(
+        &self,
+        request: Request<proto::ParquetFileActiveAsOfRequest>,
+    ) -> Result<Response<Self::ParquetFileActiveAsOfStream>, tonic::Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let as_of = Timestamp::new(req.as_of);
+
+        let file_list = repos
+            .parquet_files()
+            .active_as_of(as_of)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(file_list.into_iter().map(|file| {
+                let file = serialize_parquet_file(file);
+                Ok(proto::ParquetFileActiveAsOfResponse {
                     parquet_file: Some(file),
                 })
             }))

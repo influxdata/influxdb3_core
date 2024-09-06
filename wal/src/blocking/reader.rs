@@ -142,7 +142,7 @@ where
 
     /// Returns the cumulative count of encoded bytes successfully read from
     /// the underlying reader.
-    pub(crate) fn bytes_read(&self) -> u64 {
+    pub(crate) fn bytes_read_total(&self) -> u64 {
         self.cumulative_bytes_read
     }
 
@@ -278,7 +278,7 @@ mod tests {
 
         let entry = reader.one_entry().unwrap();
         assert!(entry.is_none());
-        assert_eq!(reader.bytes_read(), segment_file.size_bytes());
+        assert_eq!(reader.bytes_read_total(), segment_file.size_bytes());
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
 
         let entry = reader.one_entry().unwrap();
         assert!(entry.is_none());
-        assert_eq!(reader.bytes_read(), segment_file.size_bytes());
+        assert_eq!(reader.bytes_read_total(), segment_file.size_bytes());
     }
 
     #[test]
@@ -335,12 +335,12 @@ mod tests {
         assert_matches!(read_fail, Err(Error::UnableToReadData { source: e }) => {
             assert_matches!(e.kind(), std::io::ErrorKind::UnexpectedEof);
         });
-        assert_eq!(reader.bytes_read(), want_bytes_read);
+        assert_eq!(reader.bytes_read_total(), want_bytes_read);
         // Trying to continue reading will fail as well, see:
         // <https://github.com/influxdata/influxdb_iox/issues/6222>
         assert_error!(reader.one_entry(), Error::UnableToReadData { .. });
         // Ensure no magical bean counting occurs when stuck unable to read data.
-        assert_eq!(reader.bytes_read(), want_bytes_read);
+        assert_eq!(reader.bytes_read_total(), want_bytes_read);
     }
 
     #[test]
@@ -369,12 +369,12 @@ mod tests {
         assert_matches!(read_fail, Err(Error::UnableToReadData { source: e }) => {
             assert_matches!(e.kind(), std::io::ErrorKind::UnexpectedEof);
         });
-        assert_eq!(reader.bytes_read(), want_bytes_read);
+        assert_eq!(reader.bytes_read_total(), want_bytes_read);
         // Trying to continue reading will fail as well, see:
         // <https://github.com/influxdata/influxdb_iox/issues/6222>
         assert_error!(reader.one_entry(), Error::UnableToReadData { .. });
         // Also no magical bean counting when cannot read more.
-        assert_eq!(reader.bytes_read(), want_bytes_read);
+        assert_eq!(reader.bytes_read_total(), want_bytes_read);
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
 
         let entry = reader.one_entry().unwrap();
         assert!(entry.is_none());
-        assert_eq!(reader.bytes_read(), segment_file.size_bytes());
+        assert_eq!(reader.bytes_read_total(), segment_file.size_bytes());
     }
 
     #[derive(Debug)]

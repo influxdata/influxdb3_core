@@ -15,10 +15,8 @@ use arrow::{
 };
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
-    physical_plan::{
-        expressions::{MaxAccumulator, MinAccumulator},
-        Accumulator,
-    },
+    functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
+    physical_plan::Accumulator,
     scalar::ScalarValue,
 };
 

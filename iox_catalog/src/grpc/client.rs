@@ -56,6 +56,7 @@ pub struct GrpcCatalogClientBuilder {
     timeout: Duration,
     connect_timeout: Duration,
     trace_header_name: HeaderName,
+    max_decoded_message_size: usize,
 }
 
 impl GrpcCatalogClientBuilder {
@@ -68,6 +69,7 @@ impl GrpcCatalogClientBuilder {
             timeout,
             connect_timeout,
             trace_header_name,
+            max_decoded_message_size,
         } = self;
 
         let channel = match uri.len() {
@@ -100,6 +102,7 @@ impl GrpcCatalogClientBuilder {
             ),
             time_provider,
             trace_header_name,
+            max_decoded_message_size,
         }
     }
 
@@ -123,6 +126,16 @@ impl GrpcCatalogClientBuilder {
             ..self
         }
     }
+
+    /// Set max decoded message size.
+    ///
+    /// Default: 4MB
+    pub fn max_decoded_message_size(self, max_decoded_message_size: usize) -> Self {
+        Self {
+            max_decoded_message_size,
+            ..self
+        }
+    }
 }
 
 /// Catalog that goes through a gRPC interface.
@@ -132,6 +145,7 @@ pub struct GrpcCatalogClient {
     metrics: CatalogMetrics,
     time_provider: Arc<dyn TimeProvider>,
     trace_header_name: HeaderName,
+    max_decoded_message_size: usize,
 }
 
 impl GrpcCatalogClient {
@@ -150,6 +164,8 @@ impl GrpcCatalogClient {
             timeout: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(2),
             trace_header_name: HeaderName::from_static("uber-trace-id"),
+            // default from tonic: 4MB
+            max_decoded_message_size: 4194304,
         }
     }
 }
@@ -165,6 +181,7 @@ impl Catalog for GrpcCatalogClient {
             channel: self.channel.clone(),
             span_ctx: None,
             trace_header_name: self.trace_header_name.clone(),
+            max_decoded_message_size: self.max_decoded_message_size,
         })))
     }
 
@@ -193,6 +210,7 @@ struct GrpcCatalogClientRepos {
     channel: InstrumentedChannel,
     span_ctx: Option<SpanContext>,
     trace_header_name: HeaderName,
+    max_decoded_message_size: usize,
 }
 
 type ServiceClient = proto::catalog_service_client::CatalogServiceClient<
@@ -236,6 +254,7 @@ impl GrpcCatalogClientRepos {
             self.channel.clone(),
             headers,
         ))
+        .max_decoding_message_size(self.max_decoded_message_size)
     }
 
     async fn retry<U, FunIo, Fut, D>(
@@ -1122,9 +1141,17 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
-    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
+    async fn delete_old_ids_only(
+        &mut self,
+        older_than: Timestamp,
+        cutoff: Duration,
+    ) -> Result<Vec<ObjectStoreId>> {
         let p = proto::ParquetFileDeleteOldIdsOnlyRequest {
             older_than: older_than.get(),
+            cutoff: cutoff
+                .as_nanos()
+                .try_into()
+                .expect("deletion cutoff duration nanos should fit in an i64"),
         };
 
         self.retry(
@@ -1162,6 +1189,26 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
                         .await,
                 )
                 .await
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|res| {
+            Ok(deserialize_parquet_file(
+                res.parquet_file.required().ctx("parquet_file")?,
+            )?)
+        })
+        .collect()
+    }
+
+    async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>> {
+        let p = proto::ParquetFileActiveAsOfRequest { as_of: as_of.get() };
+
+        self.retry(
+            "parquet_file_active_as_of",
+            p,
+            |data, mut client| async move {
+                buffer_stream_response(client.parquet_file_active_as_of(data).await).await
             },
         )
         .await?

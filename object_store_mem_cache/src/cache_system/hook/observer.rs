@@ -1,16 +1,12 @@
-use std::marker::PhantomData;
-
 use metric::{U64Counter, U64Gauge};
 use observability_deps::tracing::debug;
 
 use crate::cache_system::{hook::Hook, interfaces::DynError};
 
+use super::{EvictResult, HookDecision};
+
 #[derive(Debug)]
-pub(crate) struct ObserverHook<K>
-where
-    K: std::fmt::Debug,
-{
-    _k: PhantomData<dyn Fn() -> K + Send + Sync + 'static>,
+pub struct ObserverHook {
     inserted_elements: U64Counter,
     fetched_ok_elements: U64Counter,
     fetched_ok_bytes: U64Counter,
@@ -23,15 +19,8 @@ where
     limit_bytes: Option<U64Gauge>,
 }
 
-impl<K> ObserverHook<K>
-where
-    K: std::fmt::Debug,
-{
-    pub(crate) fn new(
-        cache: &'static str,
-        metrics: &metric::Registry,
-        limit_bytes: Option<u64>,
-    ) -> Self {
+impl ObserverHook {
+    pub fn new(cache: &'static str, metrics: &metric::Registry, limit_bytes: Option<u64>) -> Self {
         let metric_elements = metrics.register_metric::<U64Counter>(
             "mem_cache_change_elements",
             "Change of in-mem cache accounted by elements",
@@ -42,7 +31,6 @@ where
         );
 
         Self {
-            _k: Default::default(),
             inserted_elements: metric_elements
                 .recorder(&[("cache", cache), ("transition", "inserted")]),
             fetched_ok_elements: metric_elements.recorder(&[
@@ -94,29 +82,21 @@ where
     }
 }
 
-impl<K> Hook for ObserverHook<K>
+impl<K> Hook<K> for ObserverHook
 where
     K: std::fmt::Debug,
 {
-    type K = K;
-
-    fn insert(&self, gen: u64, k: &Self::K) {
+    fn insert(&self, gen: u64, k: &K) {
         debug!(gen, ?k, "insert");
         self.inserted_elements.inc(1);
     }
 
-    fn fetched(
-        &self,
-        gen: u64,
-        k: &Self::K,
-        res: &Result<usize, DynError>,
-    ) -> Result<(), DynError> {
-        match res.as_ref() {
-            Ok(bytes) => {
-                let bytes = *bytes;
-                debug!(gen, ?k, size_bytes = bytes, "fetched successfully");
+    fn fetched(&self, gen: u64, k: &K, res: Result<usize, &DynError>) -> HookDecision {
+        match res {
+            Ok(size_bytes) => {
+                debug!(gen, ?k, size_bytes, "fetched successfully");
                 self.fetched_ok_elements.inc(1);
-                self.fetched_ok_bytes.inc(bytes as u64);
+                self.fetched_ok_bytes.inc(size_bytes as u64);
             }
             Err(e) => {
                 debug!(gen, ?k, %e, "failed to fetch");
@@ -124,27 +104,21 @@ where
             }
         }
 
-        Ok(())
+        HookDecision::default()
     }
 
-    fn evict(&self, gen: u64, k: &Self::K, res: &Option<Result<usize, ()>>) {
-        match res.as_ref() {
-            None => {
+    fn evict(&self, gen: u64, k: &K, res: EvictResult) {
+        match res {
+            EvictResult::Unfetched => {
                 debug!(gen, ?k, "evict element that was never fetched");
                 self.evict_unfetched_elements.inc(1);
             }
-            Some(Ok(bytes)) => {
-                let bytes = *bytes;
-                debug!(
-                    gen,
-                    ?k,
-                    size_bytes = bytes,
-                    "evict element that was fetched"
-                );
+            EvictResult::Fetched { size } => {
+                debug!(gen, ?k, size_bytes = size, "evict element that was fetched");
                 self.evict_fetched_elements.inc(1);
-                self.evict_fetched_bytes.inc(bytes as u64);
+                self.evict_fetched_bytes.inc(size as u64);
             }
-            Some(Err(())) => {
+            EvictResult::Failed => {
                 debug!(
                     gen,
                     ?k,
@@ -158,14 +132,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::cache_system::test_utils::str_err;
+    use crate::cache_system::utils::str_err;
 
     use super::*;
 
     #[test]
     fn test_new_limit() {
         let registry = metric::Registry::new();
-        let hook = ObserverHook::<&'static str>::new("my_cache", &registry, Some(42));
+        let hook = ObserverHook::new("my_cache", &registry, Some(42));
 
         assert_eq!(
             Metrics::read(&hook),
@@ -186,7 +160,7 @@ mod tests {
     #[test]
     fn test_new_no_limit() {
         let registry = metric::Registry::new();
-        let hook = ObserverHook::<&'static str>::new("my_cache", &registry, None);
+        let hook = ObserverHook::new("my_cache", &registry, None);
 
         assert_eq!(
             Metrics::read(&hook),
@@ -207,7 +181,7 @@ mod tests {
     #[test]
     fn test_insert() {
         let registry = metric::Registry::new();
-        let hook = ObserverHook::<&'static str>::new("my_cache", &registry, None);
+        let hook = ObserverHook::new("my_cache", &registry, None);
 
         hook.insert(1, &"foo");
         hook.insert(2, &"bar");
@@ -230,11 +204,17 @@ mod tests {
     #[test]
     fn test_fetch() {
         let registry = metric::Registry::new();
-        let hook = ObserverHook::<&'static str>::new("my_cache", &registry, None);
+        let hook = ObserverHook::new("my_cache", &registry, None);
 
-        hook.fetched(1, &"foo", &Ok(42)).unwrap();
-        hook.fetched(2, &"bar1", &Err(str_err("e1"))).unwrap();
-        hook.fetched(3, &"bar2", &Err(str_err("e2"))).unwrap();
+        assert_eq!(hook.fetched(1, &"foo", Ok(42)), HookDecision::default());
+        assert_eq!(
+            hook.fetched(2, &"bar1", Err(&str_err("e1"))),
+            HookDecision::default()
+        );
+        assert_eq!(
+            hook.fetched(3, &"bar2", Err(&str_err("e2"))),
+            HookDecision::default()
+        );
         assert_eq!(
             Metrics::read(&hook),
             Metrics {
@@ -254,14 +234,14 @@ mod tests {
     #[test]
     fn test_evict() {
         let registry = metric::Registry::new();
-        let hook = ObserverHook::<&'static str>::new("my_cache", &registry, None);
+        let hook = ObserverHook::new("my_cache", &registry, None);
 
-        hook.evict(1, &"foo", &None);
-        hook.evict(2, &"bar1", &Some(Ok(42)));
-        hook.evict(3, &"bar2", &Some(Ok(43)));
-        hook.evict(4, &"baz1", &Some(Err(())));
-        hook.evict(5, &"baz2", &Some(Err(())));
-        hook.evict(6, &"baz3", &Some(Err(())));
+        hook.evict(1, &"foo", EvictResult::Unfetched);
+        hook.evict(2, &"bar1", EvictResult::Fetched { size: 42 });
+        hook.evict(3, &"bar2", EvictResult::Fetched { size: 43 });
+        hook.evict(4, &"baz1", EvictResult::Failed);
+        hook.evict(5, &"baz2", EvictResult::Failed);
+        hook.evict(6, &"baz3", EvictResult::Failed);
         assert_eq!(
             Metrics::read(&hook),
             Metrics {
@@ -292,12 +272,8 @@ mod tests {
     }
 
     impl Metrics {
-        fn read<K>(hook: &ObserverHook<K>) -> Self
-        where
-            K: std::fmt::Debug,
-        {
+        fn read(hook: &ObserverHook) -> Self {
             let ObserverHook {
-                _k,
                 inserted_elements,
                 fetched_ok_elements,
                 fetched_ok_bytes,

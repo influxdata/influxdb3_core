@@ -14,8 +14,7 @@ use datafusion::{
         physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
     },
     execution::{
-        context::{SessionState, TaskContext},
-        runtime_env::RuntimeEnv,
+        context::TaskContext, runtime_env::RuntimeEnv, session_state::SessionStateBuilder,
     },
     physical_plan::{execute_stream, SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
@@ -150,7 +149,11 @@ where
             })
         })
         // run some number of futures in parallel
-        .buffered(num_cpus::get())
+        .buffered(
+            std::thread::available_parallelism()
+                .map(|t| t.get())
+                .unwrap_or(1),
+        )
         // unwrap task result (check for panics)
         .map(|result| match result {
             Ok(res) => res,
@@ -197,7 +200,11 @@ impl ParquetFileReader {
     ) -> Result<Self, Error> {
         let runtime = Arc::new(RuntimeEnv::default());
         let session_config = iox_session_config();
-        let session_state = SessionState::new_with_config_rt(session_config, runtime);
+        let session_state = SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .build();
 
         // Keep metadata so we can find the measurement name
         let format = ParquetFormat::new().with_skip_metadata(false);

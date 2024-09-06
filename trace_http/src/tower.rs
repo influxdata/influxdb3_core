@@ -32,6 +32,7 @@ use trace::{span::SpanRecorder, TraceCollector};
 use crate::classify::{classify_headers, classify_response, Classification};
 use crate::ctx::{RequestLogContext, RequestLogContextExt, TraceHeaderParser};
 use crate::metrics::{MetricsRecorder, RequestMetrics};
+use crate::query_variant::QueryVariantExt;
 
 /// `TraceLayer` implements `tower::Layer` and can be used to decorate a
 /// `tower::Service` to collect information about requests flowing through it
@@ -123,7 +124,9 @@ where
     }
 
     fn call(&mut self, mut request: Request<ReqBody>) -> Self::Future {
-        let metrics_recorder = Some(self.metrics.recorder(&request));
+        let query_variant = QueryVariantExt::default();
+        let metrics_recorder = Some(self.metrics.recorder(&request, query_variant.clone()));
+        request.extensions_mut().insert(query_variant);
 
         let request_ctx = self.trace_header_parser.as_ref().and_then(|parser| {
             match parser.parse(self.collector.as_ref(), request.headers()) {

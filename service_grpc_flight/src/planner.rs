@@ -8,12 +8,18 @@ use datafusion::{
 };
 use flightsql::{FlightSQLCommand, FlightSQLPlanner};
 use futures::stream::Peekable;
-use iox_query::{exec::IOxSessionContext, frontend::sql::SqlQueryPlanner, QueryNamespace};
+use iox_query::{
+    exec::{IOxSessionContext, QueryLanguage},
+    frontend::sql::SqlQueryPlanner,
+    QueryNamespace,
+};
 
 pub(crate) use datafusion::error::{DataFusionError as Error, Result};
 use iox_query_influxql::frontend::planner::InfluxQLQueryPlanner;
 use iox_query_params::StatementParams;
 use tonic::Streaming;
+
+use crate::request::RunQuery;
 
 /// Query planner that plans queries on a separate threadpool.
 ///
@@ -55,11 +61,10 @@ impl Planner {
         query: impl AsRef<str> + Send,
         params: impl Into<StatementParams> + Send,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let planner = InfluxQLQueryPlanner::new();
         let query = query.as_ref();
         let ctx = self.ctx.child_ctx("planner_influxql");
 
-        planner.query(query, params, &ctx).await
+        InfluxQLQueryPlanner::query(query, params, &ctx).await
     }
 
     /// Creates a plan for a `DoGet` FlightSQL message, as described on
@@ -118,12 +123,48 @@ impl Planner {
         &self,
         namespace_name: impl Into<String> + Send,
         cmd: FlightSQLCommand,
-    ) -> Result<SchemaRef> {
+        query_lang: Option<QueryLanguage>,
+    ) -> Result<(SchemaRef, RunQuery)> {
         let namespace_name = namespace_name.into();
         let ctx = self.ctx.child_ctx("planner_flight_sql_get_flight_info");
 
-        FlightSQLPlanner::get_schema(namespace_name, cmd, &ctx)
-            .await
-            .map_err(DataFusionError::from)
+        match (cmd, query_lang) {
+            // We only want to handle queries with an InfluxQL header like they're actually
+            // InfluxQL if they come with a CommandStatementQuery cmd, because that's the only
+            // variant that could reasonably be processed as InfluxQL and we're not certain that
+            // flightsql clients have the capability to switch this header on and off per-request,
+            // so instead of just failing on influxql commands that aren't of this variant, we want
+            // to let commands kinda do what you'd expect.
+            (FlightSQLCommand::CommandStatementQuery(cmd), Some(QueryLanguage::InfluxQL)) => self
+                .influxql_query_to_schema(&cmd.query)
+                .await
+                .map(|schema| (schema, RunQuery::InfluxQL(cmd.query))),
+
+            // this seems kinda unnecessary (as it's basically a wildcard but verbose) but we want
+            // to make sure nobody misses this in the future if another language is added to this
+            // variant - exhaustive patterns are nice and useful
+            // but we're matching on all patterns here not because we want the FlightSQLPlanner to
+            // handle InfluxQL and all other languages, but rather because (at moment of writing)
+            // we've already verified that, up above, we matched the special case(s) where we want to
+            // actually process InfluxQL, and here we just want to fallback to normal sql
+            // processing.
+            (cmd, Some(QueryLanguage::Sql | QueryLanguage::InfluxQL) | None) => {
+                FlightSQLPlanner::get_schema(namespace_name, &cmd, &ctx)
+                    .await
+                    .map_err(DataFusionError::from)
+                    .map(|schema| (schema, RunQuery::FlightSQL(cmd)))
+            }
+        }
+    }
+
+    async fn influxql_query_to_schema(&self, query: &str) -> Result<SchemaRef> {
+        let ctx = self.ctx.child_ctx("planner_influxql_query_to_schema");
+
+        let statement = InfluxQLQueryPlanner::query_to_statement(query)?;
+        let logical_plan =
+            InfluxQLQueryPlanner::statement_to_plan(statement, StatementParams::new(), &ctx)
+                .await?;
+
+        Ok(FlightSQLPlanner::get_schema_for_plan(&logical_plan))
     }
 }

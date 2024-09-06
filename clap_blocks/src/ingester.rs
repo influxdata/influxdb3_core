@@ -2,9 +2,7 @@
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
-use crate::{
-    gossip::GossipConfig, memory_size::MemorySize, parquet_write_hint::ParquetWriteHintConfig,
-};
+use crate::{gossip::GossipConfig, memory_size::MemorySize};
 
 /// CLI config for the ingester using the RPC write path
 #[derive(Debug, Clone, clap::Parser)]
@@ -13,10 +11,6 @@ pub struct IngesterConfig {
     /// Gossip config.
     #[clap(flatten)]
     pub gossip_config: GossipConfig,
-
-    /// Parquet write hint config.
-    #[clap(flatten)]
-    pub parquet_write_hint_config: ParquetWriteHintConfig,
 
     /// Where this ingester instance should store its write-ahead log files. Each ingester instance
     /// must have its own directory.
@@ -153,7 +147,8 @@ pub struct IngesterConfig {
     /// specified in bytes or as a percentage (expressed as 'N%').
     ///
     /// Once this limit is reached, this ingester stops accepting write requests
-    /// until the memory usage drops below 2/3rds of this value.
+    /// until the memory usage drops below 2/3rds of this value, or 2/3rds of
+    /// the soft limit if specified.
     ///
     /// This limit is inexact, and recovery requires allocating additional
     /// memory to reduce the overall memory pressure. Provide at least 10%
@@ -166,6 +161,30 @@ pub struct IngesterConfig {
         env = "INFLUXDB_IOX_RAM_HARD_LIMIT_BYTES"
     )]
     pub ram_hard_limit_bytes: Option<MemorySize>,
+
+    /// The amount of memory an ingester is allowed to utilise before data is
+    /// pre-emptively marked for early persistence to shed load in an attempt to
+    /// reduce saturation. Full write availability is maintained.
+    ///
+    /// This value MUST be less than than `INFLUXDB_IOX_RAM_HARD_LIMIT_BYTES` or
+    /// the ingester will not run.
+    ///
+    /// Specified in bytes or as a percentage (expressed as 'N%').
+    ///
+    /// Once this limit is reached, this ingester attempts to shed load to below
+    /// 2/3rds of this value.
+    ///
+    /// This limit is inexact, and recovery requires allocating additional
+    /// memory to reduce the overall memory pressure. Provide at least 10%
+    /// headroom between this limit and any hard limit imposed on this process.
+    ///
+    /// This limit is applied to the resident set size of the process.
+    #[cfg(feature = "jemalloc")]
+    #[clap(
+        long = "ram-soft-limit-bytes",
+        env = "INFLUXDB_IOX_RAM_SOFT_LIMIT_BYTES"
+    )]
+    pub ram_soft_limit_bytes: Option<MemorySize>,
 }
 
 /// Returns exactly half the number of logical cores, or 1 if on a single core

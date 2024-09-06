@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use data_types::TableId;
 use datafusion::{logical_expr::LogicalPlan, prelude::col};
 use datafusion_util::lit_timestamptz_nano;
 use observability_deps::tracing::debug;
@@ -23,12 +24,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Reorg planner got error adding creating scan for {}: {}",
+        "Reorg planner got error adding creating scan for table {} (id {}): {}",
         table_name,
+        table_id,
         source
     ))]
     CreatingScan {
         table_name: String,
+        table_id: TableId,
         source: crate::provider::Error,
     },
 }
@@ -64,6 +67,7 @@ impl ReorgPlanner {
     /// ```
     pub fn compact_plan<I>(
         &self,
+        table_id: TableId,
         table_name: Arc<str>,
         schema: &Schema,
         chunks: I,
@@ -81,6 +85,7 @@ impl ReorgPlanner {
 
         let provider = builder.build().context(CreatingScanSnafu {
             table_name: table_name.as_ref(),
+            table_id,
         })?;
         let plan_builder = Arc::new(provider)
             .into_logical_plan_builder()
@@ -92,7 +97,7 @@ impl ReorgPlanner {
             .build()
             .context(BuildingPlanSnafu)?;
 
-        debug!(table_name=table_name.as_ref(), plan=%plan.display_indent_schema(),
+        debug!(table_name=table_name.as_ref(), table_id=%table_id, plan=%plan.display_indent_schema(),
                "created compact plan for table");
 
         Ok(plan)
@@ -165,6 +170,7 @@ impl ReorgPlanner {
     /// ```
     pub fn split_plan<I>(
         &self,
+        table_id: TableId,
         table_name: Arc<str>,
         schema: &Schema,
         chunks: I,
@@ -188,6 +194,7 @@ impl ReorgPlanner {
 
         let provider = builder.build().context(CreatingScanSnafu {
             table_name: table_name.as_ref(),
+            table_id,
         })?;
         let plan_builder = Arc::new(provider)
             .into_logical_plan_builder()
@@ -221,7 +228,7 @@ impl ReorgPlanner {
         }
         let plan = make_stream_split(plan, split_exprs);
 
-        debug!(table_name=table_name.as_ref(), plan=%plan.display_indent_schema(),
+        debug!(table_name=table_name.as_ref(), table_id=%table_id, plan=%plan.display_indent_schema(),
                "created split plan for table");
 
         Ok(plan)
@@ -241,6 +248,8 @@ mod test {
     };
 
     use super::*;
+
+    const ARBITRARY_TABLE_ID: TableId = TableId::new(42);
 
     async fn get_test_chunks() -> (Schema, Vec<Arc<dyn QueryChunk>>) {
         // Chunk 1 with 5 rows of data on 2 tags
@@ -361,7 +370,13 @@ mod test {
                 .build();
 
             let compact_plan = ReorgPlanner::new()
-                .compact_plan(Arc::from("t"), &schema, chunks, sort_key)
+                .compact_plan(
+                    ARBITRARY_TABLE_ID,
+                    Arc::from("t"),
+                    &schema,
+                    chunks,
+                    sort_key,
+                )
                 .expect("created compact plan");
 
             let physical_plan = executor
@@ -398,7 +413,13 @@ mod test {
             .build();
 
         let compact_plan = ReorgPlanner::new()
-            .compact_plan(Arc::from("t"), &schema, chunks, sort_key)
+            .compact_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+            )
             .expect("created compact plan");
 
         let executor = Executor::new_testing();
@@ -468,7 +489,13 @@ mod test {
             .build();
 
         let compact_plan = ReorgPlanner::new()
-            .compact_plan(Arc::from("t"), &schema, chunks, sort_key)
+            .compact_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+            )
             .expect("created compact plan");
 
         let executor = Executor::new_testing();
@@ -539,7 +566,14 @@ mod test {
 
         // split on 1000 should have timestamps 1000, 5000, and 7000
         let split_plan = ReorgPlanner::new()
-            .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000])
+            .split_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+                vec![1000],
+            )
             .expect("created compact plan");
 
         let executor = Executor::new_testing();
@@ -623,7 +657,14 @@ mod test {
 
         // split on 1000 and 7000
         let split_plan = ReorgPlanner::new()
-            .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000, 7000])
+            .split_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+                vec![1000, 7000],
+            )
             .expect("created compact plan");
 
         let executor = Executor::new_testing();
@@ -719,7 +760,14 @@ mod test {
 
         // split on 1000 and 7000
         let _split_plan = ReorgPlanner::new()
-            .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![]) // reason of panic: empty split_times
+            .split_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+                vec![],
+            ) // reason of panic: empty split_times
             .expect("created compact plan");
     }
 
@@ -738,7 +786,14 @@ mod test {
 
         // split on 1000 and 7000
         let _split_plan = ReorgPlanner::new()
-            .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000, 500]) // reason of panic: split_times not in ascending order
+            .split_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+                vec![1000, 500],
+            ) // reason of panic: split_times not in ascending order
             .expect("created compact plan");
     }
 }

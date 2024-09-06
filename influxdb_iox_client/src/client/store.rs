@@ -63,6 +63,8 @@ impl Client {
 
     /// List the parquet files located with the path prefix.
     /// Search is recursive (e.g. searching `prefix/` includes `prefix/<other/paths>/uuid.parquet`.
+    ///
+    /// Returns only the current version of a file, not any other (e.g. deleted) versions
     pub async fn list_parquet_files_by_path_filter(
         &mut self,
         prefix: ParquetFilePathFilter,

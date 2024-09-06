@@ -44,10 +44,16 @@ message LogEntry {
   google.protobuf.Timestamp issue_time = 7;
 
   // Number of partitions the query was executed on.
-  int64 partitions = 18;
+  uint64 partitions = 18;
 
   // Number of parquet files the query was executed on.
-  int64 parquet_files = 19;
+  uint64 parquet_files = 19;
+
+  // Number of partitions under a `DeduplicateExec` in this query
+  uint64 deduplicated_partitions = 23;
+
+  // Number of files under a `DeduplicateExec` in this query
+  uint64 deduplicated_parquet_files = 24;
 
   reserved 8;
   reserved 'query_completed_duration';
@@ -84,7 +90,7 @@ message LogEntry {
 }
 
 message IngesterMetrics {
-  // Total time spent waiting on ingester before planning 
+  // Total time spent waiting on ingester before planning
   google.protobuf.Duration latency_to_plan = 1;
 
   // Total time spent waiting on all data from ingester(s)

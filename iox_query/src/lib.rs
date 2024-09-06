@@ -1,16 +1,6 @@
 //! Contains the IOx query engine
 #![allow(unreachable_pub)]
 
-use datafusion_util::MemoryStream;
-use futures::TryStreamExt;
-use iox_query_params::StatementParams;
-use query_log::{QueryCompletedToken, QueryText, StateReceived};
-use trace::{ctx::SpanContext, span::Span};
-
-use tracker::InstrumentedAsyncOwnedSemaphorePermit;
-// Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
-
 use arrow::{
     datatypes::{DataType, Field, SchemaRef},
     record_batch::RecordBatch,
@@ -22,21 +12,34 @@ use datafusion::{
     physical_plan::{SendableRecordBatchStream, Statistics},
     prelude::{Expr, SessionContext},
 };
+use datafusion_util::MemoryStream;
 use exec::IOxSessionContext;
-use once_cell::sync::Lazy;
+use extension::EmptyExtension;
+use futures::TryStreamExt;
+use iox_query_params::StatementParams;
 use parquet_file::storage::ParquetExecInput;
+use query_log::{QueryCompletedToken, QueryText, StateReceived};
 use schema::{sort::SortKey, Projection, Schema};
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{
+    any::Any,
+    fmt::Debug,
+    sync::{Arc, LazyLock},
+};
+use trace::{ctx::SpanContext, span::Span};
+use tracker::InstrumentedAsyncOwnedSemaphorePermit;
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 pub mod analyzer;
 pub mod chunk_statistics;
 pub mod config;
 pub mod exec;
+pub mod extension;
 pub mod frontend;
 pub mod ingester;
 pub mod logical_optimizer;
 pub mod physical_optimizer;
-pub mod plan;
 pub mod provider;
 pub mod pruning;
 pub mod pruning_oracle;
@@ -46,13 +49,14 @@ pub mod util;
 
 use crate::exec::QueryConfig;
 use crate::query_log::QueryLogEntries;
+pub use extension::Extension;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 /// The name of the virtual column that represents the chunk order.
 pub const CHUNK_ORDER_COLUMN_NAME: &str = "__chunk_order";
 
-static CHUNK_ORDER_FIELD: Lazy<Arc<Field>> =
-    Lazy::new(|| Arc::new(Field::new(CHUNK_ORDER_COLUMN_NAME, DataType::Int64, false)));
+static CHUNK_ORDER_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(CHUNK_ORDER_COLUMN_NAME, DataType::Int64, false)));
 
 /// Generate [`Field`] for [chunk order column](CHUNK_ORDER_COLUMN_NAME).
 pub fn chunk_order_field() -> Arc<Field> {
@@ -142,6 +146,17 @@ pub trait QueryNamespace: Debug + Send + Sync {
     /// Returns a new execution context suitable for running queries
     fn new_query_context(
         &self,
+        span_ctx: Option<SpanContext>,
+        query_config: Option<&QueryConfig>,
+    ) -> IOxSessionContext {
+        self.new_extended_query_context(Arc::new(EmptyExtension {}), span_ctx, query_config)
+    }
+
+    /// Returns a new execution context suitable for running queries
+    /// with a particular extension.
+    fn new_extended_query_context(
+        &self,
+        extension: Arc<dyn Extension>,
         span_ctx: Option<SpanContext>,
         query_config: Option<&QueryConfig>,
     ) -> IOxSessionContext;

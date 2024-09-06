@@ -22,18 +22,25 @@ use std::{fmt::Debug, sync::Arc};
 use tokio::{select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
+/// Logic for managing catalog backup file lists
+mod catalog_backups;
 /// Logic for listing, checking and deleting files in object storage
 mod objectstore;
 /// Logic for deleting parquet files from the catalog
 mod parquetfile;
 /// Logic for flagging parquet files for deletion based on retention settings
 mod retention;
+// Helpers for unit tests
+#[cfg(test)]
+mod test_utils;
 
 const BUFFER_SIZE: usize = 1000;
 
 /// Run the tasks that clean up old object store files that don't appear in the catalog.
-pub async fn main(config: Config) -> Result<()> {
-    GarbageCollector::start(config)?.join().await
+pub async fn main(config: Config, metric_registry: Arc<metric::Registry>) -> Result<()> {
+    GarbageCollector::start(config, metric_registry)?
+        .join()
+        .await
 }
 
 /// The tasks that clean up old object store files that don't appear in the catalog.
@@ -41,10 +48,10 @@ pub struct GarbageCollector {
     shutdown: CancellationToken,
     os_lister: tokio::task::JoinHandle<Result<(), os_lister::Error>>,
     os_checker: tokio::task::JoinHandle<Result<(), os_checker::Error>>,
-    os_deleter: tokio::task::JoinHandle<Result<(), os_deleter::Error>>,
-    pf_deleter: tokio::task::JoinHandle<Result<(), pf_deleter::Error>>,
-    partition_retention: Option<tokio::task::JoinHandle<Result<(), retention::partition::Error>>>,
-    parquet_retention: tokio::task::JoinHandle<Result<(), retention::parquet::Error>>,
+    os_deleter: tokio::task::JoinHandle<()>,
+    pf_deleter: tokio::task::JoinHandle<()>,
+    partition_retention: tokio::task::JoinHandle<()>,
+    parquet_retention: tokio::task::JoinHandle<()>,
 }
 
 impl Debug for GarbageCollector {
@@ -55,14 +62,14 @@ impl Debug for GarbageCollector {
 
 impl GarbageCollector {
     /// Construct the garbage collector and start it
-    pub fn start(config: Config) -> Result<Self> {
+    pub fn start(config: Config, metric_registry: Arc<metric::Registry>) -> Result<Self> {
         let Config {
             object_store,
             sub_config,
             catalog,
+            replica_catalog: _, // Will be used for catalog backup file lists; see below
         } = config;
 
-        let dry_run = sub_config.dry_run;
         info!(
             objectstore_cutoff = %format_duration(sub_config.objectstore_cutoff),
             bulk_ingest_objectstore_cutoff = %format_duration(sub_config.bulk_ingest_objectstore_cutoff),
@@ -70,12 +77,20 @@ impl GarbageCollector {
             parquetfile_sleep_interval = %format_duration(sub_config.parquetfile_sleep_interval()),
             objectstore_sleep_interval_minutes = %sub_config.objectstore_sleep_interval_minutes,
             retention_sleep_interval_minutes = %sub_config.retention_sleep_interval_minutes,
-            partition_retention = %sub_config.partition_retention,
             "GarbageCollector starting"
         );
 
         // Shutdown handler channel to notify children
         let shutdown = CancellationToken::new();
+
+        // Soon there will be a thread that manages catalog backup file lists on a schedule. It
+        // will be called something like this:
+        //
+        // let catalog_backup_file_lists = tokio::spawn(catalog_backup_file_lists::perform(
+        //     shutdown.clone(),
+        //     replica_catalog.unwrap_or_else(Arc::clone(&catalog)),
+        //     Arc::clone(&object_store),
+        // ));
 
         // Initialise the object store garbage collector, which works as three communicating threads:
         // - lister lists objects in the object store and sends them on a channel. the lister will
@@ -91,9 +106,11 @@ impl GarbageCollector {
         let sdt = shutdown.clone();
         let osa = Arc::clone(&object_store);
 
+        let lister_metric_registry = Arc::clone(&metric_registry);
         let os_lister = tokio::spawn(async move {
             select! {
                 ret = os_lister::perform(
+                    lister_metric_registry,
                     osa,
                     tx1,
                     sub_config.objectstore_sleep_interval_minutes,
@@ -122,9 +139,11 @@ impl GarbageCollector {
                 }
             })?;
 
+        let checker_metric_registry = Arc::clone(&metric_registry);
         let os_checker = tokio::spawn(async move {
             select! {
                 ret = os_checker::perform(
+                    checker_metric_registry,
                     cat,
                     cutoff,
                     bulk_ingest_cutoff,
@@ -139,16 +158,17 @@ impl GarbageCollector {
             }
         });
 
-        let os_deleter = tokio::spawn(os_deleter::perform(
-            shutdown.clone(),
-            object_store,
-            dry_run,
-            rx2,
-        ));
+        let os_deleter = tokio::spawn({
+            os_deleter::perform(
+                Arc::clone(&metric_registry),
+                shutdown.clone(),
+                object_store,
+                rx2,
+            )
+        });
 
-        // Initialise the parquet file deleter, which is just one thread that calls delete_old()
-        // on the catalog then sleeps.
         let pf_deleter = tokio::spawn(pf_deleter::perform(
+            Arc::clone(&metric_registry),
             shutdown.clone(),
             Arc::clone(&catalog),
             sub_config.parquetfile_cutoff,
@@ -158,19 +178,18 @@ impl GarbageCollector {
         // Initialise the retention code, which is just one thread that calls
         // flag_for_delete_by_retention() on the catalog then sleeps.
         let parquet_retention = tokio::spawn(retention::parquet::perform(
+            Arc::clone(&metric_registry),
             shutdown.clone(),
             Arc::clone(&catalog),
             sub_config.retention_sleep_interval_minutes,
-            sub_config.dry_run,
         ));
 
-        let partition_retention = sub_config.partition_retention.then(|| {
-            tokio::spawn(retention::partition::perform(
-                shutdown.clone(),
-                catalog,
-                sub_config.retention_sleep_interval_minutes,
-            ))
-        });
+        let partition_retention = tokio::spawn(retention::partition::perform(
+            Arc::clone(&metric_registry),
+            shutdown.clone(),
+            catalog,
+            sub_config.retention_sleep_interval_minutes,
+        ));
 
         Ok(Self {
             shutdown,
@@ -203,21 +222,19 @@ impl GarbageCollector {
             shutdown: _,
         } = self;
 
-        let (os_lister, os_checker, os_deleter, pf_deleter, parquet_retention) = futures::join!(
+        let (os_lister, os_checker, os_deleter, pf_deleter, partition_retention, parquet_retention) = futures::join!(
             os_lister,
             os_checker,
             os_deleter,
             pf_deleter,
-            parquet_retention
+            partition_retention,
+            parquet_retention,
         );
 
-        if let Some(p) = partition_retention {
-            p.await.context(PartitionRetentionFlaggerPanicSnafu)??;
-        }
-
-        parquet_retention.context(ParquetFileDeleterPanicSnafu)??;
-        pf_deleter.context(ParquetFileDeleterPanicSnafu)??;
-        os_deleter.context(ObjectStoreDeleterPanicSnafu)??;
+        parquet_retention.context(ParquetFileDeleterPanicSnafu)?;
+        partition_retention.context(PartitionRetentionFlaggerPanicSnafu)?;
+        pf_deleter.context(ParquetFileDeleterPanicSnafu)?;
+        os_deleter.context(ObjectStoreDeleterPanicSnafu)?;
         os_checker.context(ObjectStoreCheckerPanicSnafu)??;
         os_lister.context(ObjectStoreListerPanicSnafu)??;
 
@@ -233,6 +250,10 @@ pub struct Config {
 
     /// The catalog to check if an object is garbage
     pub catalog: Arc<dyn Catalog>,
+
+    /// The read replica catalog to query for active Parquet files to put in catalog file backup
+    /// lists. If not specified, use `catalog`.
+    pub replica_catalog: Option<Arc<dyn Catalog>>,
 
     /// The garbage collector specific configuration
     pub sub_config: GarbageCollectorConfig,
@@ -264,25 +285,11 @@ pub enum Error {
     #[snafu(display("The object store checker task panicked"))]
     ObjectStoreCheckerPanic { source: tokio::task::JoinError },
 
-    #[snafu(display("The object store deleter task failed"))]
-    #[snafu(context(false))]
-    ObjectStoreDeleter { source: os_deleter::Error },
     #[snafu(display("The object store deleter task panicked"))]
     ObjectStoreDeleterPanic { source: tokio::task::JoinError },
 
-    #[snafu(display("The parquet file deleter task failed"))]
-    #[snafu(context(false))]
-    ParquetFileDeleter { source: pf_deleter::Error },
     #[snafu(display("The parquet file deleter task panicked"))]
     ParquetFileDeleterPanic { source: tokio::task::JoinError },
-
-    #[snafu(display("The parquet file retention flagger task failed"))]
-    #[snafu(context(false))]
-    ParquetFileRetentionFlagger { source: retention::parquet::Error },
-
-    #[snafu(display("The partition retention task failed"))]
-    #[snafu(context(false))]
-    PartitionRetention { source: retention::partition::Error },
 
     #[snafu(display("The partition retention task panicked"))]
     PartitionRetentionFlaggerPanic { source: tokio::task::JoinError },
@@ -312,6 +319,7 @@ mod tests {
     #[tokio::test]
     async fn deletes_untracked_files_older_than_the_cutoff() {
         let setup = OldFileSetup::new();
+        let metric_registry = Arc::new(metric::Registry::new());
 
         let config = build_config(
             setup.data_dir_arg(),
@@ -319,7 +327,7 @@ mod tests {
         )
         .await;
         tokio::spawn(async {
-            main(config).await.unwrap();
+            main(config, metric_registry).await.unwrap();
         });
 
         // file-based objectstore only has one file, it can't take long
@@ -335,13 +343,14 @@ mod tests {
     #[tokio::test]
     async fn preserves_untracked_files_newer_than_the_cutoff() {
         let setup = OldFileSetup::new();
+        let metric_registry = Arc::new(metric::Registry::new());
 
         #[rustfmt::skip]
         let config = build_config(setup.data_dir_arg(), [
             "--objectstore-cutoff", "10y",
         ]).await;
         tokio::spawn(async {
-            main(config).await.unwrap();
+            main(config, metric_registry).await.unwrap();
         });
 
         // file-based objectstore only has one file, it can't take long
@@ -363,6 +372,7 @@ mod tests {
         Config {
             object_store,
             catalog,
+            replica_catalog: None,
             sub_config,
         }
     }

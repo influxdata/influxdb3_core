@@ -1,34 +1,37 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, LazyLock},
+};
 
 use datafusion::{
     common::{DataFusionError, Result as DataFusionResult},
     execution::{registry::MemoryFunctionRegistry, FunctionRegistry},
-    logical_expr::{AggregateUDF, ScalarUDF, WindowUDF},
+    logical_expr::{planner::ExprPlanner, AggregateUDF, ScalarUDF, WindowUDF},
 };
-use once_cell::sync::Lazy;
 
 use crate::{gapfill, regex, sleep, to_timestamp, window};
 
 /// Contains IOx UDFs
-static IOX_REGISTRY: Lazy<IOxFunctionRegistry> = Lazy::new(IOxFunctionRegistry::new);
+static IOX_REGISTRY: LazyLock<IOxFunctionRegistry> = LazyLock::new(IOxFunctionRegistry::new);
 
 /// Contains IOx & Datafusion UDFs
-static ALL_REGISTRY: Lazy<Box<dyn FunctionRegistry + 'static + Send + Sync>> = Lazy::new(|| {
-    let mut registry = MemoryFunctionRegistry::new();
-    datafusion::functions::register_all(&mut registry).expect("should register datafusion UDF");
+static ALL_REGISTRY: LazyLock<Box<dyn FunctionRegistry + 'static + Send + Sync>> =
+    LazyLock::new(|| {
+        let mut registry = MemoryFunctionRegistry::new();
+        datafusion::functions::register_all(&mut registry).expect("should register datafusion UDF");
 
-    let iox_registry = IOxFunctionRegistry::new();
-    for fn_name in iox_registry.udfs() {
-        registry
-            .register_udf(
-                iox_registry
-                    .udf(&fn_name)
-                    .expect("iox registry is missing udf"),
-            )
-            .expect("should register iox UDF");
-    }
-    Box::new(registry)
-});
+        let iox_registry = IOxFunctionRegistry::new();
+        for fn_name in iox_registry.udfs() {
+            registry
+                .register_udf(
+                    iox_registry
+                        .udf(&fn_name)
+                        .expect("iox registry is missing udf"),
+                )
+                .expect("should register iox UDF");
+        }
+        Box::new(registry)
+    });
 
 /// Lookup for all DataFusion User Defined Functions used by IOx
 #[derive(Debug)]
@@ -83,6 +86,10 @@ impl FunctionRegistry for IOxFunctionRegistry {
         Err(DataFusionError::Plan(format!(
             "IOx FunctionRegistry does not contain user defined window function '{name}'"
         )))
+    }
+
+    fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {
+        vec![]
     }
 }
 

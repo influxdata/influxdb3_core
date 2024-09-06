@@ -4,9 +4,9 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -60,7 +60,7 @@ where
 
     async fn scan(
         &self,
-        _ctx: &SessionState,
+        _ctx: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -213,6 +213,7 @@ impl<T> DisplayAs for SystemTableExecutionPlan<T> {
             DisplayFormatType::Default | DisplayFormatType::Verbose => f
                 .debug_struct("SystemTableExecutionPlan")
                 .field("projection", &self.projection)
+                .field("filters", &self.filters)
                 .finish(),
         }
     }

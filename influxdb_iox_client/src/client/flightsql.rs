@@ -108,7 +108,7 @@ impl FlightSqlClient {
     }
 
     /// Send `cmd`, encoded as protobuf, to the FlightSQL server
-    async fn get_flight_info_for_command(
+    pub async fn get_flight_info_for_command(
         &mut self,
         cmd: arrow_flight::sql::Any,
     ) -> Result<FlightInfo> {
@@ -390,8 +390,8 @@ impl FlightSqlClient {
 
     /// Implements the canonical interaction for most FlightSQL messages:
     ///
-    /// 1. Call `GetFlightInfo` with the provided message, and get a
-    /// [`FlightInfo`] and embedded ticket.
+    /// 1. Call `GetFlightInfo` with the provided message, and get a [`FlightInfo`] and embedded
+    ///    ticket.
     ///
     /// 2. Call `DoGet` with the provided ticket.
     ///
@@ -400,11 +400,16 @@ impl FlightSqlClient {
         &mut self,
         cmd: arrow_flight::sql::Any,
     ) -> Result<FlightRecordBatchStream> {
-        let FlightInfo {
-            flight_descriptor: _,
-            mut endpoint,
-            ..
-        } = self.get_flight_info_for_command(cmd).await?;
+        let info = self.get_flight_info_for_command(cmd).await?;
+        self.do_get_with_info(info).await
+    }
+
+    /// Calls `DoGet` with the provded FlightInfo, which is normally retrieved by calling
+    /// [`Self::get_flight_info_for_command`]. This method allows one to provide a ticket (as
+    /// opposed to allowing the client to get one with the default options) and then provide that
+    /// to be used with a do_get.
+    pub async fn do_get_with_info(&mut self, info: FlightInfo) -> Result<FlightRecordBatchStream> {
+        let FlightInfo { mut endpoint, .. } = info;
 
         let flight_endpoint = endpoint.pop().ok_or_else(|| {
             FlightError::protocol("No endpoint specifed in CommandStatementQuery response")

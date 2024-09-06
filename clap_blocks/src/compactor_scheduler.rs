@@ -65,7 +65,9 @@ pub struct PartitionSourceConfigForLocalScheduler {
 
     /// Filter partitions to the given set of IDs.
     ///
-    /// This is mostly useful for debugging.
+    /// Don't expect to find this referenced in test files.
+    /// We use this for reproducing compactor DataFusion queries from prod, among other things.
+    /// See issue #12055 for an example.
     #[clap(
         long = "compaction-partition-filter",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_FILTER",
@@ -82,16 +84,6 @@ pub struct PartitionSourceConfigForLocalScheduler {
         action
     )]
     pub process_all_partitions: bool,
-
-    /// Ignores "partition marked w/ error and shall be skipped" entries in the catalog.
-    ///
-    /// This is mostly useful for debugging.
-    #[clap(
-        long = "compaction-ignore-partition-skip-marker",
-        env = "INFLUXDB_IOX_COMPACTION_IGNORE_PARTITION_SKIP_MARKER",
-        action
-    )]
-    pub ignore_partition_skip_marker: bool,
 }
 
 /// CLI config for scheduler's gossip.
@@ -225,10 +217,23 @@ pub struct CompactorSchedulerConfig {
     #[clap(
         long = "compaction-min-num-l1-files-to-compact",
         env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_FILES_TO_COMPACT",
-        default_value = "4",
+        default_value = "6",
         action
     )]
     pub min_num_l1_files_to_compact: std::num::NonZeroU32,
+
+    /// Whether to adjust [Self::min_num_l1_files_to_compact] dynamically; ON by default.
+    ///
+    /// TODO(epg): Delete this flag after rolling out, as it's just a safety rapid-off switch.
+    /// If this works, we delete the dynamic code.
+    /// If this doesn't work, we re-enable it and delete this flag.
+    #[clap(
+        long = "compaction-min-num-l1-files-to-compact-dynamic",
+        env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_FILES_TO_COMPACT_DYNAMIC",
+        default_value = "true",
+        action
+    )]
+    pub min_num_l1_files_to_compact_dynamic: bool,
 
     /// Minimum number of bytes in L0 files before considering for compaction to L1.
     ///
@@ -365,6 +370,17 @@ pub struct CompactorSchedulerConfig {
     )]
     pub fallback_split_percentage: u16,
 
+    /// Pad the leading-edge split this additional percentage.  Setting to 0
+    /// means no padding, i.e. use the computed leading-edge split as is,
+    /// which is unlikely to be useful.
+    #[clap(
+        long = "compaction-leading_edge_split_pad_percentage",
+        env = "INFLUXDB_IOX_COMPACTION_LEADING_EDGE_SPLIT_PAD_PERCENTAGE",
+        default_value = "20",
+        action
+    )]
+    pub leading_edge_split_pad_percentage: u16,
+
     /// How long since the last new file was written to a partition, in order for it
     /// to be considered cold.
     ///
@@ -414,6 +430,26 @@ pub struct CompactorSchedulerConfig {
         action
     )]
     pub allow_concurrent_level_compactions: bool,
+
+    /// Allow multiple L0 compactions to run concurrently on the same partition.
+    #[clap(
+        long = "compaction-allow-concurrent-l0-compactions",
+        env = "INFLUXDB_IOX_COMPACTION_ALLOW_CONCURRENT_L0_COMPACTIONS",
+        default_value = "false",
+        action
+    )]
+    pub allow_concurrent_l0_compactions: bool,
+
+    /// Number of L0s per hour per partition, that is manageable by the compactor.
+    /// This is just a threshold for reporting overly hot partitions. It does not affect
+    /// the compactor's behavior.
+    #[clap(
+        long = "compaction-overly_hot_l0s-per-hour-threshold",
+        env = "INFLUXDB_IOX_COMPACTION_OVERLY_HOT_L0S_PER_HOUR_THRESHOLD",
+        default_value = "120",
+        action
+    )]
+    pub overly_hot_l0s_per_hour_threshold: usize,
 
     /// Partition source config used by the local scheduler.
     #[clap(flatten)]

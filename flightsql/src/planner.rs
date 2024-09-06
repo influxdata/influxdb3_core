@@ -1,5 +1,5 @@
 //! FlightSQL handling
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::{
     array::{ArrayRef, StringArray},
@@ -30,7 +30,6 @@ use futures::{stream::Peekable, TryStreamExt};
 use iox_query::{exec::IOxSessionContext, QueryNamespace};
 
 use observability_deps::tracing::debug;
-use once_cell::sync::Lazy;
 use prost::Message;
 use snafu::OptionExt;
 use tonic::Streaming;
@@ -50,7 +49,12 @@ impl FlightSQLPlanner {
     /// Returns the schema for the request in msg.
     pub async fn get_schema(
         namespace_name: impl Into<String> + Send,
-        cmd: FlightSQLCommand,
+        // We can take this by-ref cause it (mostly) doesn't actually need to consume any of the data in it.
+        // There are some `clone`s in the body of this function, but the function 2/3 end up
+        // resolving to and calling doesn't actually use the `self` reference, so a Sufficiently
+        // Smart Compiler (tm) should optimize away those clones. Ideally. So no consuming except
+        // for one instance, and imo cloning preemptively is not worth it.
+        cmd: &FlightSQLCommand,
         ctx: &IOxSessionContext,
     ) -> Result<SchemaRef> {
         let namespace_name = namespace_name.into();
@@ -58,7 +62,7 @@ impl FlightSQLPlanner {
 
         match cmd {
             FlightSQLCommand::CommandStatementQuery(CommandStatementQuery { query, .. }) => {
-                get_schema_for_query(&query, ctx).await
+                get_schema_for_query(query, ctx).await
             }
             FlightSQLCommand::CommandPreparedStatementQuery(handle) => {
                 get_schema_for_query(handle.query(), ctx).await
@@ -66,11 +70,11 @@ impl FlightSQLPlanner {
             FlightSQLCommand::CommandGetSqlInfo(CommandGetSqlInfo { .. }) => {
                 Ok(iox_sql_info_data().schema())
             }
-            FlightSQLCommand::CommandGetCatalogs(req) => Ok(req.into_builder().schema()),
+            FlightSQLCommand::CommandGetCatalogs(req) => Ok(req.clone().into_builder().schema()),
             FlightSQLCommand::CommandGetCrossReference(CommandGetCrossReference { .. }) => {
                 Ok(Arc::clone(&GET_CROSS_REFERENCE_SCHEMA))
             }
-            FlightSQLCommand::CommandGetDbSchemas(req) => Ok(req.into_builder().schema()),
+            FlightSQLCommand::CommandGetDbSchemas(req) => Ok(req.clone().into_builder().schema()),
             FlightSQLCommand::CommandGetExportedKeys(CommandGetExportedKeys { .. }) => {
                 Ok(Arc::clone(&GET_EXPORTED_KEYS_SCHEMA))
             }
@@ -80,7 +84,7 @@ impl FlightSQLPlanner {
             FlightSQLCommand::CommandGetPrimaryKeys(CommandGetPrimaryKeys { .. }) => {
                 Ok(Arc::clone(&GET_PRIMARY_KEYS_SCHEMA))
             }
-            FlightSQLCommand::CommandGetTables(req) => Ok(req.into_builder().schema()),
+            FlightSQLCommand::CommandGetTables(req) => Ok(req.clone().into_builder().schema()),
             FlightSQLCommand::CommandGetTableTypes(CommandGetTableTypes { .. }) => {
                 Ok(Arc::clone(&GET_TABLE_TYPE_SCHEMA))
             }
@@ -329,6 +333,13 @@ impl FlightSQLPlanner {
             .fail(),
         }
     }
+
+    /// Return the schema for the specified logical plan
+    pub fn get_schema_for_plan(logical_plan: &LogicalPlan) -> SchemaRef {
+        // gather real schema, but only
+        let schema = logical_plan.schema().as_ref();
+        prepare_schema_for_flight(schema.as_arrow())
+    }
 }
 
 /// Return the IPC encoded dataset and parameter schema for the specified query
@@ -337,7 +348,7 @@ async fn get_encoded_schemas_for_prepared_statement(
     ctx: &IOxSessionContext,
 ) -> Result<(Bytes, Bytes)> {
     let plan = ctx.sql_to_logical_plan(query).await?;
-    let dataset_schema = get_schema_for_plan(&plan);
+    let dataset_schema = FlightSQLPlanner::get_schema_for_plan(&plan);
     let parameter_schema = get_parameter_schema_for_plan(&plan)?;
     Ok((
         encode_schema(&dataset_schema)?,
@@ -348,28 +359,21 @@ async fn get_encoded_schemas_for_prepared_statement(
 /// Return the schema for the specified query
 async fn get_schema_for_query(query: &str, ctx: &IOxSessionContext) -> Result<SchemaRef> {
     let plan = ctx.sql_to_logical_plan(query).await?;
-    Ok(get_schema_for_plan(&plan))
-}
-
-/// Return the schema for the specified logical plan
-fn get_schema_for_plan(logical_plan: &LogicalPlan) -> SchemaRef {
-    // gather real schema, but only
-    let schema = Arc::new(Schema::from(logical_plan.schema().as_ref()));
-    prepare_schema_for_flight(schema)
+    Ok(FlightSQLPlanner::get_schema_for_plan(&plan))
 }
 
 /// Return the schema for any bind parameters within the specified logical plan
 fn get_parameter_schema_for_plan(logical_plan: &LogicalPlan) -> Result<SchemaRef> {
     let parameter_schema = parameter_types_to_schema(logical_plan.get_parameter_types()?)?;
-    Ok(prepare_schema_for_flight(parameter_schema))
+    Ok(prepare_schema_for_flight(&parameter_schema))
 }
 
 /// Return the parameter schema for the specified map of parameters.
 /// Map can be produced from [LogicalPlan::get_parameter_types]
 fn parameter_types_to_schema(
     parameter_types: impl IntoIterator<Item = (String, Option<DataType>)>,
-) -> Result<SchemaRef> {
-    let parameters_schema = Schema::new(
+) -> Result<Schema> {
+    Ok(Schema::new(
         parameter_types
             .into_iter()
             .map(|(id, data_type)| {
@@ -379,8 +383,7 @@ fn parameter_types_to_schema(
                 Ok(Field::new(id, data_type, true))
             })
             .collect::<Result<Vec<_>>>()?,
-    );
-    Ok(Arc::new(parameters_schema))
+    ))
 }
 
 /// Encodes the schema IPC encoded (schema_bytes)
@@ -564,7 +567,7 @@ async fn plan_get_xdbc_type_info(
 }
 
 /// The schema for GetTableTypes
-static GET_TABLE_TYPE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+static GET_TABLE_TYPE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![Field::new(
         "table_type",
         DataType::Utf8,
@@ -572,7 +575,7 @@ static GET_TABLE_TYPE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     )]))
 });
 
-static TABLE_TYPES_RECORD_BATCH: Lazy<RecordBatch> = Lazy::new(|| {
+static TABLE_TYPES_RECORD_BATCH: LazyLock<RecordBatch> = LazyLock::new(|| {
     // https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L285-L287
     // IOx doesn't support LOCAL TEMPORARY yet
     let table_type = Arc::new(StringArray::from_iter_values(["BASE TABLE", "VIEW"])) as ArrayRef;
@@ -587,7 +590,7 @@ static TABLE_TYPES_RECORD_BATCH: Lazy<RecordBatch> = Lazy::new(|| {
 ///    - 2 = SET NULL
 ///    - 3 = NO ACTION
 ///    - 4 = SET DEFAULT
-static GET_CROSS_REFERENCE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+static GET_CROSS_REFERENCE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("pk_catalog_name", DataType::Utf8, false),
         Field::new("pk_db_schema_name", DataType::Utf8, false),
@@ -605,7 +608,7 @@ static GET_CROSS_REFERENCE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     ]))
 });
 
-static GET_EXPORTED_KEYS_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+static GET_EXPORTED_KEYS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("pk_catalog_name", DataType::Utf8, false),
         Field::new("pk_db_schema_name", DataType::Utf8, false),
@@ -623,7 +626,7 @@ static GET_EXPORTED_KEYS_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     ]))
 });
 
-static GET_IMPORTED_KEYS_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+static GET_IMPORTED_KEYS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("pk_catalog_name", DataType::Utf8, false),
         Field::new("pk_db_schema_name", DataType::Utf8, false),
@@ -641,7 +644,7 @@ static GET_IMPORTED_KEYS_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     ]))
 });
 
-static GET_PRIMARY_KEYS_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+static GET_PRIMARY_KEYS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("catalog_name", DataType::Utf8, false),
         Field::new("db_schema_name", DataType::Utf8, false),
@@ -654,7 +657,7 @@ static GET_PRIMARY_KEYS_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
 
 /// The schema for GetXdbcTypeInfo
 // From https://github.com/apache/arrow/blob/9588da967c756b2923e213ccc067378ba6c90a86/format/FlightSql.proto#L1064-L1113
-static GET_XDBC_TYPE_INFO_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+static GET_XDBC_TYPE_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("type_name", DataType::Utf8, false),
         Field::new("data_type", DataType::Int32, false),
@@ -704,7 +707,7 @@ mod test {
         ];
         let schema = parameter_types_to_schema(types).unwrap();
         assert_eq!(
-            *schema,
+            schema,
             Schema::new(vec![
                 Field::new("param1", DataType::Null, true),
                 Field::new("param2", DataType::Utf8, true),

@@ -558,7 +558,10 @@ mod tests {
         let predicate = Predicate {
             field_columns: Some(BTreeSet::from([String::from("foo"), String::from("bar")])),
             range: Some(TimestampRange::new(13, 42)),
-            exprs: vec![Expr::Wildcard { qualifier: None }],
+            exprs: vec![Expr::Wildcard {
+                qualifier: None,
+                options: Default::default(),
+            }],
             value_expr: vec![col("_value").eq(lit("bar")).try_into().unwrap()],
         };
         let predicate: proto::Predicate = predicate.try_into().unwrap();

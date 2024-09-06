@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 
-use arrow::compute::SortOptions;
+use arrow::compute::{concat_batches, SortOptions};
 use arrow::{
     array::{ArrayRef, UInt64Array},
     compute::TakeOptions,
@@ -10,11 +10,8 @@ use arrow::{
     error::Result as ArrowResult,
     record_batch::RecordBatch,
 };
-
 use arrow_util::optimize::optimize_dictionaries;
-use datafusion::physical_plan::{
-    coalesce_batches::concat_batches, expressions::PhysicalSortExpr, metrics, PhysicalExpr,
-};
+use datafusion::physical_plan::{expressions::PhysicalSortExpr, metrics, PhysicalExpr};
 use observability_deps::tracing::{debug, trace};
 
 // Handles the deduplication across potentially multiple
@@ -63,7 +60,7 @@ impl RecordBatchDeduplicator {
             let schema = last_batch.schema();
             let row_count = last_batch.num_rows() + batch.num_rows();
             debug!(row_count, "Before concat_batches");
-            let result = concat_batches(&schema, &[last_batch, batch], row_count)?;
+            let result = concat_batches(&schema, &[last_batch, batch])?;
             debug!(row_count, "After concat_batches");
             result
         } else {

@@ -8,14 +8,13 @@ use object_store::{
     memory::InMemory,
     path::Path,
     throttle::{ThrottleConfig, ThrottledStore},
-    DynObjectStore, ObjectStore,
+    DynObjectStore,
 };
 use observability_deps::tracing::{info, warn};
 use snafu::{ResultExt, Snafu};
 use std::{convert::Infallible, fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 use url::Url;
 use uuid::Uuid;
-use versioned_file_store::VersionedFileSystemStore;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
@@ -183,6 +182,13 @@ pub struct ObjectStoreConfig {
     #[clap(long = "aws-allow-http", env = "AWS_ALLOW_HTTP", action)]
     pub aws_allow_http: bool,
 
+    /// If enabled, S3 stores will not fetch credentials and will not sign requests.
+    ///
+    /// This can be useful when interacting with public S3 buckets that deny authorized requests or for when working
+    /// with in-cluster proxies that handle the credentials already.
+    #[clap(long = "aws-skip-signature", env = "AWS_SKIP_SIGNATURE", action)]
+    pub aws_skip_signature: bool,
+
     /// When using Google Cloud Storage as the object store, set this to the
     /// path to the JSON file that contains the Google credentials.
     ///
@@ -225,6 +231,16 @@ pub struct ObjectStoreConfig {
         action
     )]
     pub object_store_connection_limit: NonZeroUsize,
+
+    /// Force HTTP/2 connection to network-based object stores.
+    ///
+    /// This implies "prior knowledge" as per RFC7540 section 3.4.
+    #[clap(
+        long = "object-store-http2-only",
+        env = "OBJECT_STORE_HTTP2_ONLY",
+        action
+    )]
+    pub http2_only: bool,
 }
 
 impl ObjectStoreConfig {
@@ -244,6 +260,7 @@ impl ObjectStoreConfig {
             aws_endpoint: Default::default(),
             aws_secret_access_key: Default::default(),
             aws_session_token: Default::default(),
+            aws_skip_signature: Default::default(),
             azure_storage_access_key: Default::default(),
             azure_storage_account: Default::default(),
             bucket: Default::default(),
@@ -251,7 +268,19 @@ impl ObjectStoreConfig {
             google_service_account: Default::default(),
             object_store,
             object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
+            http2_only: Default::default(),
         }
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn client_options(&self) -> object_store::ClientOptions {
+        let mut options = object_store::ClientOptions::new();
+
+        if self.http2_only {
+            options = options.with_http2_only();
+        }
+
+        options
     }
 }
 
@@ -266,10 +295,6 @@ pub enum ObjectStoreType {
 
     /// Filesystem.
     File,
-
-    /// Local file based object store that implements S3 style versioning for deleted objects
-    /// used for testing.
-    VersionedFile,
 
     /// AWS S3.
     S3,
@@ -288,7 +313,6 @@ impl ObjectStoreType {
             Self::Memory => "memory",
             Self::MemoryThrottled => "memory-throttled",
             Self::File => "file",
-            Self::VersionedFile => "versioned-file",
             Self::S3 => "s3",
             Self::Google => "google",
             Self::Azure => "azure",
@@ -303,7 +327,7 @@ fn new_gcs(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError
 
     info!(bucket=?config.bucket, object_store_type="GCS", "Object Store");
 
-    let mut builder = GoogleCloudStorageBuilder::new();
+    let mut builder = GoogleCloudStorageBuilder::new().with_client_options(config.client_options());
 
     if let Some(bucket) = &config.bucket {
         builder = builder.with_bucket_name(bucket);
@@ -340,13 +364,18 @@ fn new_s3(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError>
     )))
 }
 
+/// If further configuration of S3 is needed beyond what this module provides, use this function
+/// to create an [`object_store::aws::AmazonS3Builder`] and further customize, then call `.build()`
+/// directly.
 #[cfg(feature = "aws")]
-fn build_s3(config: &ObjectStoreConfig) -> Result<object_store::aws::AmazonS3, ParseError> {
+pub fn s3_builder(config: &ObjectStoreConfig) -> object_store::aws::AmazonS3Builder {
     use object_store::aws::AmazonS3Builder;
 
     let mut builder = AmazonS3Builder::new()
+        .with_client_options(config.client_options())
         .with_allow_http(config.aws_allow_http)
         .with_region(&config.aws_default_region)
+        .with_skip_signature(config.aws_skip_signature)
         .with_imdsv1_fallback();
 
     if let Some(bucket) = &config.bucket {
@@ -365,6 +394,13 @@ fn build_s3(config: &ObjectStoreConfig) -> Result<object_store::aws::AmazonS3, P
         builder = builder.with_endpoint(endpoint);
     }
 
+    builder
+}
+
+#[cfg(feature = "aws")]
+fn build_s3(config: &ObjectStoreConfig) -> Result<object_store::aws::AmazonS3, ParseError> {
+    let builder = s3_builder(config);
+
     builder.build().context(InvalidS3ConfigSnafu)
 }
 
@@ -381,7 +417,7 @@ fn new_azure(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseErr
     info!(bucket=?config.bucket, account=?config.azure_storage_account,
           object_store_type="Azure", "Object Store");
 
-    let mut builder = MicrosoftAzureBuilder::new();
+    let mut builder = MicrosoftAzureBuilder::new().with_client_options(config.client_options());
 
     if let Some(bucket) = &config.bucket {
         builder = builder.with_container_name(bucket);
@@ -407,12 +443,9 @@ fn new_azure(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
 /// Create config-dependant object store.
 pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     if let Some(data_dir) = &config.database_directory {
-        if !matches!(
-            &config.object_store,
-            Some(ObjectStoreType::File) | Some(ObjectStoreType::VersionedFile)
-        ) {
+        if !matches!(&config.object_store, Some(ObjectStoreType::File)) {
             warn!(?data_dir, object_store_type=?config.object_store,
-                  "--data-dir / `INFLUXDB_IOX_DB_DIR` ignored. It only affects 'file' and 'versioned-file' object stores");
+                  "--data-dir / `INFLUXDB_IOX_DB_DIR` ignored. It only affects 'file' object stores");
         }
     }
 
@@ -447,7 +480,6 @@ pub fn make_object_store(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStor
         Some(ObjectStoreType::S3) => new_s3(config)?,
         Some(ObjectStoreType::Azure) => new_azure(config)?,
         Some(ObjectStoreType::File) => new_local_file_system(config)?,
-        Some(ObjectStoreType::VersionedFile) => new_versioned_local_file_system(config)?,
     };
 
     Ok(remote_store)
@@ -469,27 +501,6 @@ fn new_local_file_system(config: &ObjectStoreConfig) -> Result<Arc<LocalFileSyst
         }
         .fail()?,
     }
-}
-
-fn new_versioned_local_file_system(
-    config: &ObjectStoreConfig,
-) -> Result<Arc<dyn ObjectStore>, ParseError> {
-    let inner = new_local_file_system(config)?;
-
-    // use the same path as provided in the config.
-    // During testing, all the server fixtures will access the same versioning store.
-    let dir = config
-        .database_directory
-        .clone()
-        .expect("new_versioned_local_file_system requires a declared config.database_directory");
-
-    Ok(Arc::new(
-        VersionedFileSystemStore::try_new(inner, dir.clone()).context(
-            CreateLocalFileSystemSnafu {
-                path: dir.clone().as_path(),
-            },
-        )?,
-    ))
 }
 
 /// The `object_store::signer::Signer` trait is implemented for AWS and local file systems, so when
@@ -818,24 +829,6 @@ mod tests {
             "Specified File for the object store, required configuration missing for \
             data-dir"
         );
-    }
-
-    #[test]
-    fn test_versioned_file_system_store() {
-        let root = TempDir::new().unwrap();
-        let root_path = root.path().to_str().unwrap();
-
-        let config = ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "versioned-file",
-            "--data-dir",
-            root_path,
-        ])
-        .unwrap();
-
-        let store = make_object_store(&config).unwrap();
-        assert!(store.to_string().starts_with("VersionedFileSystemStore"));
     }
 
     #[tokio::test]

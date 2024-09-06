@@ -21,7 +21,8 @@ use crate::{
 };
 
 use super::util::{
-    add_sort_preserving_merge, all_physical_sort_exprs_on_column, ValueRangeAndColValues,
+    accepted_union_exec, add_sort_preserving_merge, all_physical_sort_exprs_on_column,
+    ValueRangeAndColValues,
 };
 
 /// IOx specific optimization rule to replace SortPreservingMerge with ProgressiveEval if
@@ -93,11 +94,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputsForConstants {
             let sort_options = sort_expr[0].options;
 
             // Check if under the SortPreservingMergeExec is UnionnExec
-            let Some(union_exec) = sort_preserving_merge_exec
-                .input()
-                .as_any()
-                .downcast_ref::<UnionExec>()
-            else {
+            let Some(union_exec) = accepted_union_exec(sort_preserving_merge_exec) else {
                 return Ok(Transformed::no(plan));
             };
 
@@ -770,9 +767,9 @@ mod test {
         );
     }
 
-    // No projection under sort
+    // bad projection under sort
     #[test]
-    fn test_negative_no_projection_under_sort() {
+    fn test_negative_bad_projection_under_sort() {
         test_helpers::maybe_start_logging();
 
         let schema = schema();
@@ -791,7 +788,15 @@ mod test {
 
         // Second sort on record batch
         let plan_batches = record_batches_exec_with_value_range(1, 2001, 3000);
-        let plan_sort2 = Arc::new(SortExec::new(sort_order.clone(), plan_batches));
+        // swap order of projection expressions
+        let plan_projection_1 = Arc::new(
+            ProjectionExec::try_new(
+                projection_expr_with_2_constants("tag0", "tag1", &schema),
+                plan_batches,
+            )
+            .unwrap(),
+        );
+        let plan_sort2 = Arc::new(SortExec::new(sort_order_two_cols(), plan_projection_1));
 
         // union the 2 sorts
         let plan_union = Arc::new(UnionExec::new(vec![plan_sort1, plan_sort2]));
@@ -814,8 +819,9 @@ mod test {
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-          - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "       RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
+          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "       ProjectionExec: expr=[tag0 as iox::measurement, tag1 as key, tag1@2 as value]"
+          - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
             - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
@@ -823,8 +829,9 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-            - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "       RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
+            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "       ProjectionExec: expr=[tag0 as iox::measurement, tag1 as key, tag1@2 as value]"
+            - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         "###
         );
     }

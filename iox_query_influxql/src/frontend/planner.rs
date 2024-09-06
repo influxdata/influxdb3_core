@@ -169,18 +169,13 @@ impl DisplayAs for SchemaExec {
 }
 
 /// Create plans for running InfluxQL queries against databases
-#[derive(Debug, Default, Copy, Clone)]
-pub struct InfluxQLQueryPlanner {}
+#[derive(Debug, Copy, Clone)]
+pub struct InfluxQLQueryPlanner;
 
 impl InfluxQLQueryPlanner {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Plan an InfluxQL query against the catalogs registered with `ctx`, and return a
     /// DataFusion physical execution plan that runs on the query executor.
     pub async fn query(
-        &self,
         query: &str,
         params: impl Into<StatementParams> + Send,
         ctx: &IOxSessionContext,
@@ -188,8 +183,8 @@ impl InfluxQLQueryPlanner {
         let ctx = ctx.child_ctx("InfluxQLQueryPlanner::query");
         debug!(text=%query, "planning InfluxQL query");
 
-        let statement = self.query_to_statement(query)?;
-        let logical_plan = self.statement_to_plan(statement, params, &ctx).await?;
+        let statement = Self::query_to_statement(query)?;
+        let logical_plan = Self::statement_to_plan(statement, params, &ctx).await?;
         // add params to plan only when they're non-empty
         let input = ctx.create_physical_plan(&logical_plan).await?;
 
@@ -207,8 +202,8 @@ impl InfluxQLQueryPlanner {
         Ok(Arc::new(SchemaExec::new(input, schema)))
     }
 
-    async fn statement_to_plan(
-        &self,
+    /// Process a [`Statement`] and its associated params into a [`LogicalPlan`] fallibly
+    pub async fn statement_to_plan(
         statement: Statement,
         params: impl Into<StatementParams> + Send,
         ctx: &IOxSessionContext,
@@ -269,7 +264,7 @@ impl InfluxQLQueryPlanner {
         Ok(logical_plan)
     }
 
-    fn query_to_statement(&self, query: &str) -> Result<Statement> {
+    pub fn query_to_statement(query: &str) -> Result<Statement> {
         let mut statements =
             parse_statements(query).map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
@@ -374,15 +369,12 @@ mod test {
 
     #[test]
     fn test_query_to_statement() {
-        let p = InfluxQLQueryPlanner::new();
-
         // succeeds for a single statement
-        let _ = p.query_to_statement("SELECT foo FROM bar").unwrap();
+        let _ = InfluxQLQueryPlanner::query_to_statement("SELECT foo FROM bar").unwrap();
 
         // Fallible
-
         assert_error!(
-            p.query_to_statement("SELECT foo FROM bar; SELECT bar FROM foo"),
+            InfluxQLQueryPlanner::query_to_statement("SELECT foo FROM bar; SELECT bar FROM foo"),
             DataFusionError::NotImplemented(ref s) if s == "The context currently only supports a single InfluxQL statement"
         );
     }
@@ -390,8 +382,7 @@ mod test {
     #[test]
     fn test_find_all_measurements() {
         fn find(q: &str) -> Vec<String> {
-            let p = InfluxQLQueryPlanner::new();
-            let s = p.query_to_statement(q).unwrap();
+            let s = InfluxQLQueryPlanner::query_to_statement(q).unwrap();
             let tables = vec!["foo".into(), "bar".into(), "foobar".into()];
             let res = find_all_measurements(&s, &tables).unwrap();
             res.into_iter().sorted().collect()

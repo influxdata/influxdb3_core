@@ -5,6 +5,7 @@ pub mod sql;
 mod test {
     use std::sync::Arc;
 
+    use data_types::TableId;
     use datafusion::physical_plan::{
         metrics::{self, MetricValue},
         ExecutionPlan, ExecutionPlanVisitor,
@@ -20,6 +21,8 @@ mod test {
         test::TestChunk,
         QueryChunk,
     };
+
+    const ARBITRARY_TABLE_ID: TableId = TableId::new(42);
 
     /// A macro to asserts the contents of the extracted metrics is reasonable
     ///
@@ -65,7 +68,14 @@ mod test {
 
         // Use a split plan as it has StreamSplitExec, DeduplicateExec and IOxReadFilternode
         let split_plan = ReorgPlanner::new()
-            .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000])
+            .split_plan(
+                ARBITRARY_TABLE_ID,
+                Arc::from("t"),
+                &schema,
+                chunks,
+                sort_key,
+                vec![1000],
+            )
             .expect("created compact plan");
 
         let executor = Executor::new_testing();

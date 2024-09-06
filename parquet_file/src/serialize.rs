@@ -2,7 +2,11 @@
 //!
 //! [`RecordBatch`]: arrow::record_batch::RecordBatch
 
-use std::{collections::HashMap, io::Write, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::Arc,
+};
 
 use datafusion::{
     config::{ParquetOptions, TableParquetOptions},
@@ -17,13 +21,18 @@ use datafusion_util::config::{table_parquet_options, BATCH_SIZE};
 use futures::{pin_mut, TryStreamExt};
 use observability_deps::tracing::{debug, trace, warn};
 use parquet::{
+    arrow::ARROW_SCHEMA_META_KEY,
     basic::Compression,
     errors::ParquetError,
     file::{metadata::KeyValue, properties::WriterProperties},
 };
 use thiserror::Error;
 
-use crate::{metadata::IoxMetadata, storage::ParquetUploadInput, writer::TrackedMemoryArrowWriter};
+use crate::{
+    metadata::{IoxMetadata, METADATA_KEY},
+    storage::ParquetUploadInput,
+    writer::TrackedMemoryArrowWriter,
+};
 
 /// Parquet row group write size
 pub const ROW_GROUP_WRITE_SIZE: usize = 1024 * 1024;
@@ -222,28 +231,28 @@ pub async fn to_parquet_upload(
         .map_err(CodecError::DataFusion)?;
     let object_store_url = upload_input.object_store_url();
 
+    // TODO: add fix upstream in the ParquetSink code.
+    // Refer to <https://github.com/apache/datafusion/issues/11770>.
+    let mut meta: Vec<KeyValue> = meta.try_into()?;
+    arrow_util::parquet_meta::add_encoded_arrow_schema_to_metadata(batches.schema(), &mut meta);
+
     // parquet options
-    let default_options = table_parquet_options();
-    let meta: Vec<KeyValue> = meta.try_into()?;
+    let metadata_keys: HashSet<String> =
+        HashSet::from_iter(meta.iter().map(|KeyValue { key, .. }| key.clone()));
     assert_eq!(
-        meta.len(),
-        1,
-        "expected IoxMetadata to convert into a single KeyValue"
+        metadata_keys.len(),
+        2,
+        "expected IoxMetadata to contain two KeyValues (iox meta and arrow meta)"
     );
-    let ParallelParquetWriterOptions {
-        maximum_parallel_row_group_writers,
-        maximum_buffered_record_batches_per_stream,
-    } = parallel_writer_options;
-    let parquet_options = TableParquetOptions {
-        global: ParquetOptions {
-            allow_single_file_parallelism: true,
-            maximum_parallel_row_group_writers,
-            maximum_buffered_record_batches_per_stream,
-            ..default_options.global
-        },
-        key_value_metadata: HashMap::from([(meta[0].key.clone(), meta[0].value.clone())]),
-        ..default_options
-    };
+    assert!(
+        metadata_keys.contains(ARROW_SCHEMA_META_KEY),
+        "expected to contain the arrow metadata key"
+    );
+    assert!(
+        metadata_keys.contains(METADATA_KEY),
+        "expected to contain the iox metadata key"
+    );
+    let parquet_options = parallel_parquet_options(parallel_writer_options, meta);
 
     // make sink
     let sink_config = FileSinkConfig {
@@ -282,16 +291,57 @@ pub async fn to_parquet_upload(
     Ok(writer_meta)
 }
 
-/// Helper to construct [`WriterProperties`] for a list of given [`KeyValue`] metadata values
+/// Helper to contruct [`TableParquetOptions`] for parallelized writes.
+///
+/// The configuration used here should be the same as in [`writer_props`].
+fn parallel_parquet_options(
+    parallel_writer_options: ParallelParquetWriterOptions,
+    meta: Vec<KeyValue>,
+) -> TableParquetOptions {
+    let default_options = table_parquet_options();
+
+    let ParallelParquetWriterOptions {
+        maximum_parallel_row_group_writers,
+        maximum_buffered_record_batches_per_stream,
+    } = parallel_writer_options;
+
+    TableParquetOptions {
+        global: ParquetOptions {
+            // parallel options
+            allow_single_file_parallelism: true,
+            maximum_parallel_row_group_writers,
+            maximum_buffered_record_batches_per_stream,
+
+            // iox specific options (in line with `writer_props`)
+            max_row_group_size: ROW_GROUP_WRITE_SIZE,
+            compression: Some("zstd(1)".into()),
+
+            // TODO: datafusion's ParquetOptions defaults need to be update
+            // Refer to <https://github.com/apache/datafusion/issues/11367>
+            data_page_row_count_limit: 20_000,
+            column_index_truncate_length: Some(64),
+
+            ..default_options.global
+        },
+        key_value_metadata: meta.into_iter().fold(
+            HashMap::new(),
+            |mut acc, KeyValue { key, value }| {
+                acc.insert(key, value);
+                acc
+            },
+        ),
+        ..default_options
+    }
+}
+
+/// Helper to construct [`WriterProperties`] for a list of given [`KeyValue`] metadata values.
+///
+/// The configuration used here should be the same as in [`parallel_parquet_options`].
 fn writer_props(meta: Vec<KeyValue>) -> Result<WriterProperties, prost::EncodeError> {
     let builder = WriterProperties::builder()
         .set_key_value_metadata(Some(meta))
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(ROW_GROUP_WRITE_SIZE)
-        // Change default to match new default in arrow-rs
-        // https://github.com/apache/arrow-rs/pull/5957
-        // can remove this override once we have upgraded to a parquet version after `52.0.0`
-        .set_data_page_row_count_limit(20_000);
+        .set_max_row_group_size(ROW_GROUP_WRITE_SIZE);
 
     Ok(builder.build())
 }
@@ -306,9 +356,13 @@ mod tests {
     };
     use bytes::Bytes;
     use data_types::{CompactionLevel, NamespaceId, ObjectStoreId, TableId};
-    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use datafusion::{
+        common::file_options::parquet_writer::ParquetWriterOptions,
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+    };
     use datafusion_util::{unbounded_memory_pool, MemoryStream};
     use iox_time::Time;
+    use parquet::schema::types::ColumnPath;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -365,5 +419,127 @@ mod tests {
     fn to_string_array(strs: &[&str]) -> ArrayRef {
         let array: StringArray = strs.iter().map(|s| Some(*s)).collect();
         Arc::new(array)
+    }
+
+    fn assert_writer_properties_are_eq(a: WriterProperties, b: WriterProperties) {
+        let column_path = ColumnPath::new(vec!["foo".into()]);
+
+        assert_eq!(
+            a.data_page_size_limit(),
+            b.data_page_size_limit(),
+            "should have same data_page_size_limit"
+        );
+        assert_eq!(
+            a.dictionary_page_size_limit(),
+            b.dictionary_page_size_limit(),
+            "should have same dictionary_page_size_limit"
+        );
+        assert_eq!(
+            a.data_page_row_count_limit(),
+            b.data_page_row_count_limit(),
+            "should have same data_page_row_count_limit"
+        );
+        assert_eq!(
+            a.write_batch_size(),
+            b.write_batch_size(),
+            "should have same write_batch_size"
+        );
+        assert_eq!(
+            a.max_row_group_size(),
+            b.max_row_group_size(),
+            "should have same max_row_group_size"
+        );
+        assert_eq!(
+            a.writer_version(),
+            b.writer_version(),
+            "should have same writer_version"
+        );
+        assert_eq!(
+            a.key_value_metadata(),
+            b.key_value_metadata(),
+            "should have same key_value_metadata"
+        );
+        assert_eq!(
+            a.sorting_columns(),
+            b.sorting_columns(),
+            "should have same sorting_columns"
+        );
+        assert_eq!(
+            a.column_index_truncate_length(),
+            b.column_index_truncate_length(),
+            "should have same column_index_truncate_length"
+        );
+        assert_eq!(
+            a.statistics_truncate_length(),
+            b.statistics_truncate_length(),
+            "should have same statistics_truncate_length"
+        );
+        assert_eq!(
+            a.dictionary_data_page_encoding(),
+            b.dictionary_data_page_encoding(),
+            "should have same dictionary_data_page_encoding"
+        );
+        assert_eq!(
+            a.dictionary_page_encoding(),
+            b.dictionary_page_encoding(),
+            "should have same dictionary_page_encoding"
+        );
+        assert_eq!(
+            a.compression(&column_path),
+            b.compression(&column_path),
+            "should have same compression"
+        );
+        assert_eq!(
+            a.dictionary_enabled(&column_path),
+            b.dictionary_enabled(&column_path),
+            "should have same dictionary_enabled"
+        );
+        assert_eq!(
+            a.statistics_enabled(&column_path),
+            b.statistics_enabled(&column_path),
+            "should have same statistics_enabled"
+        );
+        assert_eq!(
+            a.max_statistics_size(&column_path),
+            b.max_statistics_size(&column_path),
+            "should have same max_statistics_size"
+        );
+        assert_eq!(
+            a.bloom_filter_properties(&column_path),
+            b.bloom_filter_properties(&column_path),
+            "should have same bloom_filter_properties"
+        );
+    }
+
+    #[test]
+    fn test_writer_properties_are_identical() {
+        let kv_meta = vec![KeyValue {
+            key: "iox-metadata-key".into(),
+            value: None,
+        }];
+
+        // use writer_props() for writer props
+        let single_threaded_props = writer_props(kv_meta.clone()).unwrap();
+
+        // use parallel_parquet_options() for writer props
+        let set_for_single_threaded = ParallelParquetWriterOptions {
+            maximum_parallel_row_group_writers: 1,
+            maximum_buffered_record_batches_per_stream: 1,
+        };
+        let parallel_table_parquet_opts =
+            parallel_parquet_options(set_for_single_threaded, kv_meta);
+        let ParquetWriterOptions {
+            writer_options: parallel_props,
+        } = ParquetWriterOptions::try_from(&parallel_table_parquet_opts).unwrap();
+
+        // will have different created_by (parquet-rs vs datafusion)
+        assert_eq!(
+            single_threaded_props.created_by(),
+            "parquet-rs version 52.2.0"
+        );
+        assert_eq!(parallel_props.created_by(), "datafusion version 41.0.0");
+
+        // assert they are the same
+        assert_writer_properties_are_eq(single_threaded_props, parallel_props);
     }
 }

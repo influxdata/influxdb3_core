@@ -9,9 +9,8 @@ use arrow::{
     error::ArrowError,
     record_batch::RecordBatch,
 };
-use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
 use uuid::Uuid;
 
 /// Compares the formatted output with the pretty formatted results of
@@ -170,8 +169,8 @@ pub fn equalize_batch_schemas(batches: Vec<RecordBatch>) -> Result<Vec<RecordBat
         batches.iter().map(|batch| batch.schema().as_ref().clone()),
     )?);
 
-    // Sort the feilds to keep the schema order deterministic
-    let mut fields = common_schema.all_fields().clone();
+    // Sort the fields to keep the schema order deterministic
+    let mut fields = common_schema.flattened_fields();
     fields.sort_by_key(|field| field.name().to_string());
     let common_schema = Arc::new(Schema::new(fields.into_iter().cloned().collect::<Vec<_>>()));
 
@@ -198,7 +197,7 @@ pub fn equalize_batch_schemas(batches: Vec<RecordBatch>) -> Result<Vec<RecordBat
 /// `32/51/216/13452/1d325760-2b20-48de-ab48-2267b034133d.parquet`
 ///
 /// matches `1d325760-2b20-48de-ab48-2267b034133d`
-pub static REGEX_UUID: Lazy<Regex> = Lazy::new(|| {
+pub static REGEX_UUID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").expect("UUID regex")
 });
 
@@ -207,8 +206,8 @@ pub static REGEX_UUID: Lazy<Regex> = Lazy::new(|| {
 /// `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502/1d325760-2b20-48de-ab48-2267b034133d.parquet`
 ///
 /// matches `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502`
-static REGEX_DIRS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"[0-9]+/[0-9]+/[0-9a-f]+/"#).expect("directory regex"));
+static REGEX_DIRS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[0-9]+/[0-9]+/[0-9a-f]+/"#).expect("directory regex"));
 
 /// Replace table row separators of flexible width with fixed with. This is required
 /// because the original timing values may differ in "printed width", so the table
@@ -218,7 +217,8 @@ static REGEX_DIRS: Lazy<Regex> =
 ///   `+--+------+` -> `----------`
 ///
 /// Note that we're kinda inexact with our regex here, but it gets the job done.
-static REGEX_LINESEP: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[+-]{6,}"#).expect("linesep regex"));
+static REGEX_LINESEP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[+-]{6,}"#).expect("linesep regex"));
 
 /// Similar to the row separator issue above, the table columns are right-padded
 /// with spaces. Due to the different "printed width" of the timing values, we need
@@ -226,25 +226,25 @@ static REGEX_LINESEP: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[+-]{6,}"#).expec
 ///
 ///   `        |`  -> `    |`
 ///   `         |` -> `    |`
-static REGEX_COL: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+\|").expect("col regex"));
+static REGEX_COL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+\|").expect("col regex"));
 
 /// Matches line like `metrics=[foo=1, bar=2]`
-static REGEX_METRICS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"metrics=\[([^\]]*)\]").expect("metrics regex"));
+static REGEX_METRICS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"metrics=\[([^\]]*)\]").expect("metrics regex"));
 
 /// Matches things like  `1s`, `1.2ms` and `10.2μs`
-static REGEX_TIMING: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[0-9]+(\.[0-9]+)?.s").expect("timing regex"));
+static REGEX_TIMING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[0-9]+(\.[0-9]+)?.s").expect("timing regex"));
 
 /// Matches things like `FilterExec: .*` and `ParquetExec: .*`
 ///
 /// Should be used in combination w/ [`REGEX_TIME_OP`].
-static REGEX_FILTER: Lazy<Regex> = Lazy::new(|| {
+static REGEX_FILTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("(?P<prefix>(FilterExec)|(ParquetExec): )(?P<expr>.*)").expect("filter regex")
 });
 
 /// Matches things like `time@3 < -9223372036854775808` and `time_min@2 > 1641031200399937022`
-static REGEX_TIME_OP: Lazy<Regex> = Lazy::new(|| {
+static REGEX_TIME_OP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("(?P<prefix>time((_min)|(_max))?@[0-9]+ [<>=]=? (CAST\\()?)(?P<value>-?[0-9]+)(?P<suffix> AS Timestamp\\(Nanosecond, \"[^\"]\"\\)\\))?")
         .expect("time opt regex")
 });

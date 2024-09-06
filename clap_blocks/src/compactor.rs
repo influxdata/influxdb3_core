@@ -2,9 +2,7 @@
 
 use std::num::NonZeroUsize;
 
-use crate::{
-    gossip::GossipConfig, memory_size::MemorySize, parquet_write_hint::ParquetWriteHintConfig,
-};
+use crate::{gossip::GossipConfig, memory_size::MemorySize};
 
 use super::compactor_scheduler::CompactorSchedulerConfig;
 
@@ -44,10 +42,6 @@ pub struct CompactorConfig {
     /// Gossip config.
     #[clap(flatten)]
     pub gossip_config: GossipConfig,
-
-    /// Parquet write hint config.
-    #[clap(flatten)]
-    pub parquet_write_hint_config: ParquetWriteHintConfig,
 
     /// Enable writing parquet files in parallel. If enabled, the compactor
     /// will use multiple cores and multi-part uploads when creating parquet files.

@@ -11,7 +11,7 @@
 //!               int32_bitmask: int32,
 //!               string_list: list<string_data: utf8>
 //!               int32_to_int32_list_map: map<key: int32, value: list<$data$: int32>>
-//!  >
+//!  \>
 //!
 //! where there is one row per requested piece of metadata information.
 //!
@@ -25,15 +25,14 @@ use arrow_flight::sql::{
     SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity, SqlSupportedTransactions,
     SupportedSqlGrammar,
 };
-use once_cell::sync::Lazy;
-
 use meta::{
     SQL_INFO_DATE_TIME_FUNCTIONS, SQL_INFO_NUMERIC_FUNCTIONS, SQL_INFO_SQL_KEYWORDS,
     SQL_INFO_STRING_FUNCTIONS, SQL_INFO_SUPPORTS_CONVERT, SQL_INFO_SYSTEM_FUNCTIONS,
 };
+use std::sync::LazyLock;
 
 #[allow(non_snake_case)]
-static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
+static INSTANCE: LazyLock<SqlInfoData> = LazyLock::new(|| {
     // The following are not defined in the [`SqlInfo`], but are
     // documented at
     // https://arrow.apache.org/docs/format/FlightSql.html#protocol-buffer-definitions.
@@ -96,7 +95,7 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
     builder.append(SqlInfo::SqlNullPlusNullIsNull, true);
     builder.append(
         SqlInfo::SqlSupportsConvert,
-        &SQL_INFO_SUPPORTS_CONVERT.clone(),
+        SQL_INFO_SUPPORTS_CONVERT.clone(),
     );
     builder.append(SqlInfo::SqlSupportsTableCorrelationNames, false);
     builder.append(SqlInfo::SqlSupportsDifferentTableCorrelationNames, false);

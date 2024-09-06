@@ -292,7 +292,7 @@ fn project_output_ordering(
 ) -> Result<Vec<PhysicalSortExpr>> {
     // filter out sort exprs columns that got projected away
     let known_columns = projected_schema
-        .all_fields()
+        .flattened_fields()
         .iter()
         .map(|f| f.name().as_str())
         .collect::<HashSet<_>>();

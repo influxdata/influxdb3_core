@@ -1,9 +1,8 @@
 mod internal;
 
 pub use internal::Duration;
-use schema::{TIME_DATA_TIMEZONE, TIME_DATA_TYPE};
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::{
     array::{Array, ArrayRef, TimestampNanosecondArray},
@@ -15,7 +14,7 @@ use datafusion::{
     prelude::*,
     scalar::ScalarValue,
 };
-use once_cell::sync::Lazy;
+use schema::{TIME_DATA_TIMEZONE, TIME_DATA_TYPE};
 
 use crate::group_by::WindowDuration;
 
@@ -26,7 +25,7 @@ pub use datafusion::error::{DataFusionError, Result as DataFusionResult};
 pub(crate) const WINDOW_BOUNDS_UDF_NAME: &str = "influx_window_bounds";
 
 /// Implementation of window_bounds
-pub(crate) static WINDOW_BOUNDS_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub(crate) static WINDOW_BOUNDS_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(create_udf(
         WINDOW_BOUNDS_UDF_NAME,
         // takes 7 arguments (see [`window_bounds_udf`] for details)

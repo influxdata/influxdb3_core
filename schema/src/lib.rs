@@ -11,7 +11,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt,
     mem::{size_of, size_of_val},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use arrow::datatypes::{
@@ -21,7 +21,6 @@ use arrow::datatypes::{
 use hashbrown::HashSet;
 
 use crate::sort::SortKey;
-use once_cell::sync::OnceCell;
 use snafu::{OptionExt, Snafu};
 
 /// The name of the timestamp column in the InfluxDB datamodel
@@ -37,16 +36,13 @@ pub const INFLUXQL_METADATA_KEY: &str = "iox::influxql::group_key::metadata";
 // https://github.com/influxdata/idpe/issues/18154
 #[allow(non_snake_case)]
 pub fn TIME_DATA_TIMEZONE() -> Option<Arc<str>> {
-    _TIME_DATA_TIMEZONE
-        .get_or_init(|| {
-            std::env::var("INFLUXDB_IOX_TIME_DATA_TIMEZONE")
-                .map_or_else(|_| None, |v| Some(v.into()))
-        })
-        .clone()
+    _TIME_DATA_TIMEZONE.clone()
 }
 
-// TODO: refactor TIME_DATA_TIMEZONE() into a lazy static
-static _TIME_DATA_TIMEZONE: OnceCell<Option<Arc<str>>> = OnceCell::new();
+/// This enables setting the default timezone. This is currently only tested for UTC and other timezone may cause issues.
+static _TIME_DATA_TIMEZONE: LazyLock<Option<Arc<str>>> = LazyLock::new(|| {
+    std::env::var("INFLUXDB_IOX_TIME_DATA_TIMEZONE").map_or_else(|_| None, |v| Some(v.into()))
+});
 
 /// the [`ArrowDataType`] to use for InfluxDB timestamps
 #[allow(non_snake_case)]
@@ -116,6 +112,16 @@ pub enum Error {
         column_name
     ))]
     WrongTimeColumnName { column_name: String },
+
+    #[cfg(feature = "v3")]
+    #[snafu(display(
+        "The series key contains a column that was not present in fields when building"
+    ))]
+    MissingSeriesKeyColumn,
+
+    #[cfg(feature = "v3")]
+    #[snafu(display("The series key does not contain all tag columns present in the schema"))]
+    TagsNotInSeriesKey,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -170,6 +176,10 @@ impl TryFrom<ArrowSchemaRef> for Schema {
 
 const MEASUREMENT_METADATA_KEY: &str = "iox::measurement::name";
 const COLUMN_METADATA_KEY: &str = "iox::column::type";
+#[cfg(feature = "v3")]
+const SERIES_KEY_METADATA_KEY: &str = "iox::series::key";
+#[cfg(feature = "v3")]
+const SERIES_KEY_METADATA_SEPARATOR: &str = "/";
 
 impl Schema {
     /// Create a new Schema wrapper over the schema
@@ -181,6 +191,11 @@ impl Schema {
         {
             // All column names must be unique
             let mut field_names = HashSet::with_capacity(inner.fields().len());
+            #[cfg(feature = "v3")]
+            let series_key = inner.metadata.get(SERIES_KEY_METADATA_KEY).map(|s| {
+                s.split(SERIES_KEY_METADATA_SEPARATOR)
+                    .collect::<Vec<&str>>()
+            });
 
             for field in inner.fields() {
                 let column_name = field.name();
@@ -206,6 +221,19 @@ impl Schema {
                     });
                 }
 
+                #[cfg(feature = "v3")]
+                let expected_nullable = match (
+                    series_key
+                        .as_ref()
+                        .is_some_and(|sk| sk.contains(&column_name.as_str())),
+                    influxdb_column_type,
+                ) {
+                    (true, _) => false,
+                    (false, InfluxColumnType::Tag) => true,
+                    (false, InfluxColumnType::Field(_)) => true,
+                    (false, InfluxColumnType::Timestamp) => false,
+                };
+                #[cfg(not(feature = "v3"))]
                 let expected_nullable = match influxdb_column_type {
                     InfluxColumnType::Tag => true,
                     InfluxColumnType::Field(_) => true,
@@ -244,11 +272,23 @@ impl Schema {
         measurement: Option<String>,
         fields: impl Iterator<Item = (ArrowField, InfluxColumnType)>,
         sort_columns: bool,
+        #[cfg(feature = "v3")] series_key: Option<impl IntoIterator<Item: AsRef<str>>>,
     ) -> Result<Self> {
         let mut metadata = HashMap::new();
 
         if let Some(measurement) = measurement {
             metadata.insert(MEASUREMENT_METADATA_KEY.to_string(), measurement);
+        }
+
+        #[cfg(feature = "v3")]
+        if let Some(sk) = series_key {
+            metadata.insert(
+                SERIES_KEY_METADATA_KEY.to_string(),
+                sk.into_iter()
+                    .map(|k| k.as_ref().to_string())
+                    .collect::<Vec<_>>()
+                    .join(SERIES_KEY_METADATA_SEPARATOR),
+            );
         }
 
         let mut fields: Vec<ArrowField> = fields
@@ -268,6 +308,14 @@ impl Schema {
             ArrowSchemaRef::new(ArrowSchema::new_with_metadata(fields, metadata)).try_into()?;
 
         Ok(record)
+    }
+
+    #[cfg(feature = "v3")]
+    pub fn series_key(&self) -> Option<Vec<&str>> {
+        self.inner
+            .metadata
+            .get(SERIES_KEY_METADATA_KEY)
+            .map(|v| v.split(SERIES_KEY_METADATA_SEPARATOR).collect())
     }
 
     /// Returns true if the sort_key includes all primary key cols
@@ -417,7 +465,7 @@ impl Schema {
                     .map(|i| self.field(*i).1.name().to_string())
                     .collect::<HashSet<_>>();
 
-                // Add missing PK columnns (tags and time) as they are needed for deduplication
+                // Add missing PK columnns as they are needed for deduplication
                 let pk = self.primary_key();
                 for col in pk {
                     columns.insert(col.to_string());
@@ -479,8 +527,57 @@ impl Schema {
 
     /// Return columns used for the "primary key" in this table.
     ///
-    /// Currently this relies on the InfluxDB data model annotations
-    /// for what columns to include in the key columns
+    /// This will use the series key if present in the schema, otherwise will revert to
+    /// the InfluxDB data model annotations for what columns to include
+    #[cfg(feature = "v3")]
+    pub fn primary_key(&self) -> Vec<&str> {
+        use InfluxColumnType::*;
+        self.inner
+            .metadata
+            .get(SERIES_KEY_METADATA_KEY)
+            .map_or_else(
+                // use tags in lexicographical order
+                || {
+                    let mut primary_keys: Vec<_> = self
+                        .iter()
+                        .filter_map(|(column_type, field)| match column_type {
+                            Tag => Some((Tag, field)),
+                            Field(_) => None,
+                            Timestamp => Some((Timestamp, field)),
+                        })
+                        .collect();
+
+                    // Now, sort lexographically (but put timestamp last)
+                    primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
+                        match (a_column_type, b_column_type) {
+                            (Tag, Tag) => a.name().cmp(b.name()),
+                            (Timestamp, Tag) => Ordering::Greater,
+                            (Tag, Timestamp) => Ordering::Less,
+                            (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
+                            _ => panic!("Unexpected types in key summary"),
+                        }
+                    });
+
+                    // Take just the names
+                    primary_keys
+                        .into_iter()
+                        .map(|(_column_type, field)| field.name().as_str())
+                        .collect()
+                },
+                // use the series key
+                |v| {
+                    v.split(SERIES_KEY_METADATA_SEPARATOR)
+                        .chain(self.time_iter().map(|f| f.name().as_str()))
+                        .collect()
+                },
+            )
+    }
+
+    /// Return columns used for the "primary key" in this table.
+    ///
+    /// This will use the series key if present in the schema, otherwise will revert to
+    /// the InfluxDB data model annotations for what columns to include
+    #[cfg(not(feature = "v3"))]
     pub fn primary_key(&self) -> Vec<&str> {
         use InfluxColumnType::*;
         let mut primary_keys: Vec<_> = self
@@ -1390,5 +1487,20 @@ mod test {
 
         // this is mostly a smoke test
         assert_eq!(schema.estimate_size(), 1246);
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_series_key_as_pk() {
+        let schema = SchemaBuilder::new()
+            .with_series_key(["a", "b"])
+            .tag("a")
+            .tag("b")
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .unwrap();
+        assert_eq!(vec!["a", "b", "time"], schema.primary_key());
     }
 }

@@ -29,10 +29,11 @@
 //! [`Hook`]: self::hook::Hook
 //! [`Reactor`]: self::reactor::Reactor
 //! [shared futures]: futures::future::Shared
-pub(crate) mod cache;
-pub(crate) mod hook;
-pub(crate) mod interfaces;
-pub(crate) mod reactor;
+pub mod cache;
+pub mod hook;
+pub mod interfaces;
+pub mod reactor;
+pub mod utils;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

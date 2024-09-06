@@ -184,12 +184,12 @@ pub trait QueryNamespaceMeta: Send + Sync {
 /// Predicate that has been "specialized" / normalized for a
 /// particular table. Specifically:
 ///
-/// * all references to the [MEASUREMENT_COLUMN_NAME] column in any
-/// `Exprs` are rewritten with the actual table name
-/// * any expression on the [VALUE_COLUMN_NAME] column is rewritten to be
-/// applied across all field columns.
-/// * any expression on the [FIELD_COLUMN_NAME] is rewritten to be
-/// applied as a projection to specific columns.
+/// * all references to the [MEASUREMENT_COLUMN_NAME] column in any `Exprs` are rewritten with the
+///   actual table name
+/// * any expression on the [VALUE_COLUMN_NAME] column is rewritten to be applied across all field
+///   columns.
+/// * any expression on the [FIELD_COLUMN_NAME] is rewritten to be applied as a projection to
+///   specific columns.
 ///
 /// For example if the original predicate was
 /// ```text

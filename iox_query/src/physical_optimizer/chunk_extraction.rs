@@ -165,9 +165,10 @@ impl ExecutionPlanVisitor for ExtractChunksVisitor {
 
 #[cfg(test)]
 mod tests {
-    use crate::{provider::chunks_to_physical_nodes, test::TestChunk, util::df_physical_expr};
+    use crate::{provider::chunks_to_physical_nodes, test::TestChunk};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use data_types::ChunkId;
+    use datafusion::common::DFSchema;
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
         config::TableParquetOptions,
@@ -223,14 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn test_different_schemas() {
+    fn test_union_different_schemas() {
         let some_chunk = chunk(1);
         let iox_schema = some_chunk.schema();
-        let schema1 = iox_schema.as_arrow();
-        let schema2 = iox_schema.select_by_indices(&[]).as_arrow();
+        let schema_with_col1 = iox_schema.select_by_indices(&[1]).as_arrow();
+        let schema_with_col2 = iox_schema.select_by_indices(&[2]).as_arrow();
+
         let plan = UnionExec::new(vec![
-            Arc::new(EmptyExec::new(schema1)),
-            Arc::new(EmptyExec::new(schema2)),
+            Arc::new(EmptyExec::new(schema_with_col1)),
+            Arc::new(EmptyExec::new(schema_with_col2)),
         ]);
         assert!(extract_chunks(&plan).is_none());
     }
@@ -275,13 +277,11 @@ mod tests {
         let schema = chunk1.schema().as_arrow();
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk1)], 2);
 
+        let df_schema = DFSchema::try_from(plan.schema()).unwrap();
         let plan = FilterExec::try_new(
-            df_physical_expr(
-                &SessionContext::new().state(),
-                plan.schema(),
-                col("tag1").eq(lit("foo")),
-            )
-            .unwrap(),
+            SessionContext::new()
+                .create_physical_expr(col("tag1").eq(lit("foo")), &df_schema)
+                .unwrap(),
             plan,
         )
         .unwrap();

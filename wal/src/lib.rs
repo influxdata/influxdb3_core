@@ -609,7 +609,7 @@ impl Iterator for ClosedSegmentFileReader {
             e @ Err(_) => e.context(UnableToReadNextOpsSnafu),
         }
         .transpose()
-        .map(|result| result.map(|batch| (batch, self.bytes_read())))
+        .map(|result| result.map(|batch| (batch, self.bytes_read_total())))
     }
 }
 
@@ -619,10 +619,10 @@ impl ClosedSegmentFileReader {
         self.id
     }
 
-    /// Returns the total number of bytes successfully read by the underlying file reader
-    /// from disk.
-    pub fn bytes_read(&self) -> u64 {
-        self.file.bytes_read()
+    /// Returns the cumulative total number of bytes successfully read by the
+    /// underlying file reader from disk across.
+    pub fn bytes_read_total(&self) -> u64 {
+        self.file.bytes_read_total()
     }
 
     /// Open the segment file and read its header, ensuring it is a segment file and reading its id.

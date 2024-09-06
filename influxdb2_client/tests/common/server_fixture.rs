@@ -1,10 +1,9 @@
-use once_cell::sync::OnceCell;
 use std::{
     fs::File,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering::SeqCst},
-        Arc, Weak,
+        Arc, LazyLock, Weak,
     },
     time::Duration,
 };
@@ -68,12 +67,11 @@ impl ServerFixture {
     pub async fn create_shared() -> Self {
         // Try and reuse the same shared server, if there is already
         // one present
-        static SHARED_SERVER: OnceCell<parking_lot::Mutex<Weak<TestServer>>> = OnceCell::new();
-
-        let shared_server = SHARED_SERVER.get_or_init(|| parking_lot::Mutex::new(Weak::new()));
+        static SHARED_SERVER: LazyLock<parking_lot::Mutex<Weak<TestServer>>> =
+            LazyLock::new(|| parking_lot::Mutex::new(Weak::new()));
 
         let shared_upgraded = {
-            let locked = shared_server.lock();
+            let locked = SHARED_SERVER.lock();
             locked.upgrade()
         };
 
@@ -90,7 +88,7 @@ impl ServerFixture {
                 // save a reference for other threads that may want to
                 // use this server, but don't prevent it from being
                 // destroyed when going out of scope
-                let mut shared_server = shared_server.lock();
+                let mut shared_server = SHARED_SERVER.lock();
                 *shared_server = Arc::downgrade(&server);
                 server
             }

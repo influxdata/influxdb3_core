@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use datafusion::{execution::context::SessionState, physical_optimizer::PhysicalOptimizerRule};
+use datafusion::{
+    execution::session_state::SessionStateBuilder, physical_optimizer::PhysicalOptimizerRule,
+};
 
 pub(crate) use self::limits::ParquetFileMetrics;
 use self::{
@@ -35,7 +37,7 @@ mod test_util;
 mod tests;
 
 /// Register IOx-specific [`PhysicalOptimizerRule`]s with the SessionContext
-pub fn register_iox_physical_optimizers(state: SessionState) -> SessionState {
+pub fn register_iox_physical_optimizers(mut state: SessionStateBuilder) -> SessionStateBuilder {
     // prepend IOx-specific rules to DataFusion builtins
     // The optimizer rules have to be done in this order
     let mut optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Sync + Send>> = vec![
@@ -50,7 +52,13 @@ pub fn register_iox_physical_optimizers(state: SessionState) -> SessionState {
     ];
 
     // Append DataFusion physical rules to the IOx-specific rules
-    optimizers.append(&mut state.physical_optimizers().to_vec());
+    optimizers.append(
+        &mut state
+            .physical_optimizers()
+            .clone()
+            .unwrap_or_default()
+            .rules,
+    );
 
     // install cached parquet readers AFTER DataFusion (re-)creates ParquetExec's
     optimizers.push(Arc::new(CachedParquetData));

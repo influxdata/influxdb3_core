@@ -10,8 +10,9 @@ workspace = true
 
 [dependencies] # In alphabetical order
 arrow = { workspace = true }
+arrow_util = { path = "../arrow_util" }
 base64 = "0.22"
-bytes = "1.6"
+bytes = "1.7"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
@@ -25,9 +26,9 @@ pbjson-types = { workspace = true }
 prost = { workspace = true }
 schema = { path = "../schema" }
 snafu = "0.8"
-thiserror = "1.0.61"
+thiserror = "1.0.63"
 thrift = "0.17"
-tokio = { version = "1.38", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1.40", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = { version = "0.13", default-features = false }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

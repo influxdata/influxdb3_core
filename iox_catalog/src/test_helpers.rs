@@ -29,6 +29,29 @@ pub async fn arbitrary_namespace<R: RepoCollection + ?Sized>(
         .unwrap()
 }
 
+/// When the details of the namespace don't matter; the test just needs *a* catalog namespace
+/// with a particular name and a specific retention policy.
+///
+/// Use [`NamespaceRepo::create`] directly if:
+///
+/// - The values of the parameters to `create` need to be different than what's here
+/// - The values of the parameters to `create` are relevant to the behavior under test
+/// - You expect namespace creation to fail in the test
+///
+/// [`NamespaceRepo::create`]: crate::interface::NamespaceRepo::create
+pub async fn arbitrary_namespace_with_retention_policy<R: RepoCollection + ?Sized>(
+    repos: &mut R,
+    name: &str,
+    retention_period_ns: i64,
+) -> Namespace {
+    let namespace_name = NamespaceName::new(name).unwrap();
+    repos
+        .namespaces()
+        .create(&namespace_name, None, Some(retention_period_ns), None)
+        .await
+        .unwrap()
+}
+
 /// When the details of the table don't matter; the test just needs *a* catalog table
 /// with a particular name in a particular namespace.
 ///

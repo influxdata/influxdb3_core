@@ -126,13 +126,12 @@ use std::sync::Arc;
 use crate::plan::util::IQLSchema;
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
-use datafusion::common::{Result, ScalarValue};
+use datafusion::common::{not_impl_err, Result, ScalarValue};
 use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
 use datafusion::logical_expr::{binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, Operator};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::prelude::{when, Column};
-use datafusion_util::coalesce;
 use observability_deps::tracing::trace;
 use predicate::rpc_predicate::{iox_expr_rewrite, simplify_predicate};
 
@@ -323,7 +322,7 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
                         // implementations, however, InfluxQL coalesces the result to `0`.
 
                         // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4268-L4270
-                        Operator::Divide => yes(coalesce(vec![expr, lit(0_f64)])),
+                        Operator::Divide => yes(divide_carefully(left.as_ref().clone(), right.as_ref().clone(), DataType::Float64)?),
                         _ => no(expr),
                     },
                     //
@@ -331,7 +330,7 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
                     //
                     (DataType::UInt64, ..) |
                     (.., DataType::UInt64) => match op {
-                        Operator::Divide => yes(coalesce(vec![expr, lit(0_u64)])),
+                        Operator::Divide => yes(divide_carefully(left.as_ref().clone(), right.as_ref().clone(), DataType::UInt64)?),
                         _ => no(expr),
                     }
                     //
@@ -346,7 +345,7 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
                         // the expression should be promoted to Float64, so cast both sides.
                         //
                         // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4331-L4336
-                        Operator::Divide => yes(coalesce(vec![binary_expr(cast((**left).clone(), DataType::Float64), Operator::Divide, cast((**right).clone(), DataType::Float64)), lit(0_f64)])),
+                        Operator::Divide => yes(divide_carefully(cast((**left).clone(), DataType::Float64), cast((**right).clone(), DataType::Float64), DataType::Float64)?),
                         _ => no(expr),
                     },
 
@@ -481,6 +480,27 @@ fn rewrite_boolean(lhs: Expr, op: Operator, rhs: Expr) -> Expr {
     }
 }
 
+/// Emits `lhs / rhs` but will result in `0` (instead of NULL) for devision by zero.
+///
+/// The result is NULL if either operant is NULL.
+fn divide_carefully(lhs: Expr, rhs: Expr, output_dtype: DataType) -> Result<Expr> {
+    let zero = match output_dtype {
+        DataType::Float64 => lit(0_f64),
+        DataType::UInt64 => lit(0_u64),
+        // in theory we could map more types, but they are not required for our planner
+        other => {
+            return not_impl_err!("unsupported data type for `divide_carefully`: {other}");
+        }
+    };
+
+    let zero_condition = rhs
+        .clone()
+        .eq(zero.clone())
+        .and(Expr::IsNotNull(Box::new(lhs.clone())));
+    let division = binary_expr(lhs, Operator::Divide, rhs);
+    when(zero_condition, zero).otherwise(division)
+}
+
 /// Rewrite regex conditional expressions to match InfluxQL behaviour.
 struct FixRegularExpressions<'a> {
     schema: &'a IQLSchema<'a>,
@@ -552,6 +572,7 @@ mod test {
 
     use chrono::{DateTime, NaiveDate, Utc};
     use datafusion::common::{DFSchemaRef, ToDFSchema};
+    use insta::assert_snapshot;
     use schema::{InfluxFieldType, SchemaBuilder};
     use std::sync::Arc;
 
@@ -590,55 +611,27 @@ mod test {
 
         // Float64
         let expr = lit(5.0) / "float_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(Float64(5) / float_field, Float64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN float_field = Float64(0) AND Float64(5) IS NOT NULL THEN Float64(0) ELSE Float64(5) / float_field END");
         let expr = lit(5_u64) / "float_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(UInt64(5) / float_field, Float64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN float_field = Float64(0) AND UInt64(5) IS NOT NULL THEN Float64(0) ELSE UInt64(5) / float_field END");
         let expr = lit(5_i64) / "float_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(Int64(5) / float_field, Float64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN float_field = Float64(0) AND Int64(5) IS NOT NULL THEN Float64(0) ELSE Int64(5) / float_field END");
         let expr = lit(5.0) / "unsigned_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(Float64(5) / unsigned_field, Float64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN unsigned_field = Float64(0) AND Float64(5) IS NOT NULL THEN Float64(0) ELSE Float64(5) / unsigned_field END");
         let expr = lit(5.0) / "integer_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(Float64(5) / integer_field, Float64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN integer_field = Float64(0) AND Float64(5) IS NOT NULL THEN Float64(0) ELSE Float64(5) / integer_field END");
 
         // UInt64
         let expr = lit(5_u64) / "unsigned_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(UInt64(5) / unsigned_field, UInt64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN unsigned_field = UInt64(0) AND UInt64(5) IS NOT NULL THEN UInt64(0) ELSE UInt64(5) / unsigned_field END");
         let expr = lit(5_i64) / "unsigned_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(Int64(5) / unsigned_field, UInt64(0))"
-        );
-        // integer field combined with an unsigned is coalesced to a Uint64
+        assert_snapshot!(rewrite(expr), @"CASE WHEN unsigned_field = UInt64(0) AND Int64(5) IS NOT NULL THEN UInt64(0) ELSE Int64(5) / unsigned_field END");
         let expr = lit(5_u64) / "integer_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(UInt64(5) / integer_field, UInt64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN integer_field = UInt64(0) AND UInt64(5) IS NOT NULL THEN UInt64(0) ELSE UInt64(5) / integer_field END");
 
         // Int64 values are cast to Float64 to be consistent with InfluxQL
         let expr = lit(5_i64) / "integer_field".as_expr();
-        assert_eq!(
-            rewrite(expr),
-            "coalesce(CAST(Int64(5) AS Float64) / CAST(integer_field AS Float64), Float64(0))"
-        );
+        assert_snapshot!(rewrite(expr), @"CASE WHEN CAST(integer_field AS Float64) = Float64(0) AND CAST(Int64(5) AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(Int64(5) AS Float64) / CAST(integer_field AS Float64) END");
     }
 
     /// Verifies expressions pass through, with the expectation that

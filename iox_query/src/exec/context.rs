@@ -4,8 +4,6 @@
 use super::{
     cross_rt_stream::CrossRtStream,
     gapfill::{plan_gap_fill, GapFill},
-    non_null_checker::NonNullCheckerNode,
-    seriesset::{series::Either, SeriesSet},
     sleep::SleepNode,
     split::StreamSplitNode,
 };
@@ -13,37 +11,28 @@ use crate::{
     analyzer::register_iox_analyzers,
     config::IoxConfigExt,
     exec::{
-        fieldlist::{FieldList, IntoFieldList},
-        non_null_checker::NonNullCheckerExec,
         query_tracing::TracedStream,
         schema_pivot::{SchemaPivotExec, SchemaPivotNode},
-        seriesset::{
-            converter::{GroupGenerator, SeriesSetConverter},
-            series::Series,
-        },
         split::StreamSplitExec,
-        stringset::{IntoStringSet, StringSetRef},
     },
     logical_optimizer::register_iox_logical_optimizers,
     physical_optimizer::register_iox_physical_optimizers,
-    plan::{
-        fieldlist::FieldListPlan,
-        seriesset::{SeriesSetPlan, SeriesSetPlans},
-        stringset::StringSetPlan,
-    },
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::{
     catalog::CatalogProvider,
     common::ParamValues,
     config::ConfigExtension,
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
-        memory_pool::MemoryPool,
         runtime_env::RuntimeEnv,
+        session_state::SessionStateBuilder,
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
+    optimizer::{AnalyzerRule, OptimizerRule},
+    physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
         EmptyRecordBatchStream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
@@ -53,10 +42,10 @@ use datafusion::{
 };
 use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
 use executor::DedicatedExecutor;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use observability_deps::tracing::debug;
 use query_functions::{register_iox_scalar_functions, selectors::register_selector_aggregates};
-use std::{fmt, num::NonZeroUsize, sync::Arc};
+use std::{fmt, num::NonZeroUsize, str::FromStr, sync::Arc};
 use trace::{
     ctx::SpanContext,
     span::{MetaValue, Span, SpanEvent, SpanExt, SpanRecorder},
@@ -68,7 +57,9 @@ pub use datafusion::error::{DataFusionError, Result};
 
 /// This structure implements the DataFusion notion of "query planner"
 /// and is needed to create plans with the IOx extension nodes.
-struct IOxQueryPlanner {}
+struct IOxQueryPlanner {
+    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+}
 
 #[async_trait]
 impl QueryPlanner for IOxQueryPlanner {
@@ -82,7 +73,7 @@ impl QueryPlanner for IOxQueryPlanner {
         // Teach the default physical planner how to plan SchemaPivot
         // and StreamSplit nodes.
         let physical_planner =
-            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(IOxExtensionPlanner {})]);
+            DefaultPhysicalPlanner::with_extension_planners(self.extension_planners.clone());
         // Delegate most work of physical planning to the default physical planner
         physical_planner
             .create_physical_plan(logical_plan, session_state)
@@ -110,13 +101,6 @@ impl ExtensionPlanner for IOxExtensionPlanner {
             Some(Arc::new(SchemaPivotExec::new(
                 Arc::clone(&physical_inputs[0]),
                 schema_pivot.schema().as_ref().clone().into(),
-            )) as Arc<dyn ExecutionPlan>)
-        } else if let Some(non_null_checker) = any.downcast_ref::<NonNullCheckerNode>() {
-            assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
-            Some(Arc::new(NonNullCheckerExec::new(
-                Arc::clone(&physical_inputs[0]),
-                non_null_checker.schema().as_ref().clone().into(),
-                non_null_checker.value(),
             )) as Arc<dyn ExecutionPlan>)
         } else if let Some(stream_split) = any.downcast_ref::<StreamSplitNode>() {
             assert_eq!(
@@ -173,6 +157,18 @@ pub struct IOxSessionConfig {
 
     /// Span context from which to create spans for this query
     span_ctx: Option<SpanContext>,
+
+    /// Planners for extensions that are provided by the consumer.
+    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+
+    /// Analyzer rules for extensions that are provided by the consumer.
+    analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+
+    /// Optimizer rules for extensions that are provided by the consumer.
+    optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+
+    /// Physical optimizer rules for extensions that are provided by the consumer.
+    physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
 }
 
 impl fmt::Debug for IOxSessionConfig {
@@ -195,6 +191,10 @@ impl IOxSessionConfig {
             runtime,
             default_catalog: None,
             span_ctx: None,
+            extension_planners: vec![],
+            analyzer_rules: vec![],
+            optimizer_rules: vec![],
+            physical_optimizer_rules: vec![],
         }
     }
 
@@ -262,6 +262,44 @@ impl IOxSessionConfig {
         self
     }
 
+    /// Add an [`ExtensionPlanner`] to the  context. `ExtensionPlanner`s
+    /// take precedence in the order they are added, and take precedence
+    /// over the `iox_query` and datafusion planners.
+    pub fn with_extension_planner(
+        mut self,
+        extension_planner: Arc<dyn ExtensionPlanner + Send + Sync>,
+    ) -> Self {
+        self.extension_planners.push(extension_planner);
+        self
+    }
+
+    /// Add an [`AnalyzerRule`] to the context.
+    pub fn with_analyzer_rule(
+        mut self,
+        analyzer_rule: Arc<dyn AnalyzerRule + Send + Sync>,
+    ) -> Self {
+        self.analyzer_rules.push(analyzer_rule);
+        self
+    }
+
+    /// Add an [`OptimizerRule`] to the context.
+    pub fn with_optimizer_rule(
+        mut self,
+        optimizer_rule: Arc<dyn OptimizerRule + Send + Sync>,
+    ) -> Self {
+        self.optimizer_rules.push(optimizer_rule);
+        self
+    }
+
+    /// Add an [`PhysicalOptimizerRule`] to the context.
+    pub fn with_physical_optimizer_rule(
+        mut self,
+        physical_optimizer_rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+    ) -> Self {
+        self.physical_optimizer_rules.push(physical_optimizer_rule);
+        self
+    }
+
     /// Create an ExecutionContext suitable for executing DataFusion plans
     pub fn build(self) -> IOxSessionContext {
         let maybe_span = self.span_ctx.child_span("query_planning");
@@ -282,12 +320,30 @@ impl IOxSessionConfig {
             cache_manager: Arc::clone(&self.runtime.cache_manager),
             object_store_registry: Arc::clone(&self.runtime.object_store_registry),
         };
-        let state = SessionState::new_with_config_rt(session_config, Arc::new(runtime))
-            .with_query_planner(Arc::new(IOxQueryPlanner {}));
+        let mut extension_planners = self.extension_planners;
+        extension_planners.push(Arc::new(IOxExtensionPlanner {}));
+
+        let state = SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_runtime_env(Arc::new(runtime))
+            .with_default_features()
+            .with_query_planner(Arc::new(IOxQueryPlanner { extension_planners }));
+
         let state = register_iox_physical_optimizers(state);
         let state = register_iox_logical_optimizers(state);
-        let state = register_iox_analyzers(state);
+        let mut state = register_iox_analyzers(state);
 
+        for analyzer_rule in self.analyzer_rules {
+            state = state.with_analyzer_rule(analyzer_rule);
+        }
+        for optimizer_rule in self.optimizer_rules {
+            state = state.with_optimizer_rule(optimizer_rule);
+        }
+        for physical_optimizer_rule in self.physical_optimizer_rules {
+            state = state.with_physical_optimizer_rule(physical_optimizer_rule);
+        }
+
+        let state = state.build();
         let inner = SessionContext::new_with_state(state);
         register_selector_aggregates(&inner);
         register_iox_scalar_functions(&inner);
@@ -296,6 +352,39 @@ impl IOxSessionConfig {
         }
 
         IOxSessionContext::new(inner, self.exec, recorder, memory_monitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum QueryLanguage {
+    Sql,
+    InfluxQL,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoSuchQueryLanguage;
+
+impl std::fmt::Display for NoSuchQueryLanguage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "The provided string did not match any known query languages"
+        )
+    }
+}
+
+impl std::error::Error for NoSuchQueryLanguage {}
+
+impl FromStr for QueryLanguage {
+    type Err = NoSuchQueryLanguage;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("sql") {
+            Ok(Self::Sql)
+        } else if s.eq_ignore_ascii_case("influxql") {
+            Ok(Self::InfluxQL)
+        } else {
+            Err(NoSuchQueryLanguage)
+        }
     }
 }
 
@@ -541,194 +630,6 @@ impl IOxSessionContext {
         Ok(Box::pin(stream))
     }
 
-    /// Executes the SeriesSetPlans on the query executor, in
-    /// parallel, producing series or groups
-    pub async fn to_series_and_groups(
-        &self,
-        series_set_plans: SeriesSetPlans,
-        memory_pool: Arc<dyn MemoryPool>,
-        points_per_batch: usize,
-    ) -> Result<impl Stream<Item = Result<Either>>> {
-        let SeriesSetPlans {
-            mut plans,
-            group_columns,
-        } = series_set_plans;
-
-        if plans.is_empty() {
-            return Ok(futures::stream::empty().boxed());
-        }
-
-        // sort plans by table (measurement) name
-        plans.sort_by(|a, b| a.table_name.cmp(&b.table_name));
-
-        // Run the plans in parallel
-        let ctx = self.child_ctx("to_series_set");
-        let exec = self.exec.clone();
-
-        let data = futures::stream::iter(plans)
-            .then(move |plan| {
-                let ctx = ctx.child_ctx("for plan");
-                let exec = exec.clone();
-
-                async move {
-                    let stream = Self::run_inner(exec.clone(), async move {
-                        let SeriesSetPlan {
-                            table_name,
-                            plan,
-                            tag_columns,
-                            field_columns,
-                        } = plan;
-
-                        let tag_columns = Arc::new(tag_columns);
-
-                        let physical_plan = ctx.create_physical_plan(&plan).await?;
-
-                        let it = ctx.execute_stream(physical_plan).await?;
-
-                        SeriesSetConverter::default()
-                            .convert(
-                                table_name,
-                                tag_columns,
-                                field_columns,
-                                it,
-                                Arc::clone(&ctx.inner().runtime_env().memory_pool),
-                            )
-                            .await
-                    })
-                    .await?;
-
-                    Ok::<_, DataFusionError>(CrossRtStream::new_with_df_error_stream(stream, exec))
-                }
-            })
-            .try_flatten()
-            .try_filter_map(move |series_set: SeriesSet| async move {
-                // If all timestamps of returned columns are nulls,
-                // there must be no data. We need to check this because
-                // aggregate (e.g. count, min, max) returns one row that are
-                // all null (even the values of aggregate) for min, max and 0 for count.
-                // For influx read_group's series and group, we do not want to return 0
-                // for count either.
-                if series_set.is_timestamp_all_null() {
-                    return Ok(None);
-                }
-
-                let series: Vec<Series> =
-                    series_set.try_into_series(points_per_batch).map_err(|e| {
-                        DataFusionError::Execution(format!("Error converting to series: {e}"))
-                    })?;
-                Ok(Some(futures::stream::iter(series).map(Ok)))
-            })
-            .try_flatten();
-
-        // If we have group columns, sort the results, and create the
-        // appropriate groups
-        if let Some(group_columns) = group_columns {
-            let grouper = GroupGenerator::new(group_columns, memory_pool);
-            Ok(grouper.group(data).await?.boxed())
-        } else {
-            Ok(data.map_ok(|series| series.into()).boxed())
-        }
-    }
-
-    /// Executes `plan` and return the resulting FieldList on the query executor
-    pub async fn to_field_list(&self, plan: FieldListPlan) -> Result<FieldList> {
-        let FieldListPlan {
-            known_values,
-            extra_plans,
-        } = plan;
-
-        // Run the plans in parallel
-        let handles = extra_plans
-            .into_iter()
-            .map(|plan| {
-                let ctx = self.child_ctx("to_field_list");
-                self.run(async move {
-                    let physical_plan = ctx.create_physical_plan(&plan).await?;
-
-                    // TODO: avoid this buffering
-                    let field_list =
-                        ctx.collect(physical_plan)
-                            .await?
-                            .into_fieldlist()
-                            .map_err(|e| {
-                                DataFusionError::Context(
-                                    "Error converting to field list".to_string(),
-                                    Box::new(DataFusionError::External(Box::new(e))),
-                                )
-                            })?;
-
-                    Ok(field_list)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // collect them all up and combine them
-        let mut results = Vec::new();
-
-        if !known_values.is_empty() {
-            let list = known_values.into_iter().map(|f| f.1).collect();
-            results.push(FieldList { fields: list })
-        }
-
-        for join_handle in handles {
-            let fieldlist = join_handle.await?;
-
-            results.push(fieldlist);
-        }
-
-        // TODO: Stream this
-        results.into_fieldlist().map_err(|e| {
-            DataFusionError::Context(
-                "Error converting to field list".to_string(),
-                Box::new(DataFusionError::External(Box::new(e))),
-            )
-        })
-    }
-
-    /// Executes this plan on the query pool, and returns the
-    /// resulting set of strings
-    pub async fn to_string_set(&self, plan: StringSetPlan) -> Result<StringSetRef> {
-        let ctx = self.child_ctx("to_string_set");
-        match plan {
-            StringSetPlan::Known(ss) => Ok(ss),
-            StringSetPlan::Plan(plans) => ctx
-                .run_logical_plans(plans)
-                .await?
-                .into_stringset()
-                .map_err(|e| {
-                    DataFusionError::Context(
-                        "Error converting to stringset".to_string(),
-                        Box::new(DataFusionError::External(Box::new(e))),
-                    )
-                }),
-        }
-    }
-
-    /// plans and runs the plans in parallel and collects the results
-    /// run each plan in parallel and collect the results
-    async fn run_logical_plans(&self, plans: Vec<LogicalPlan>) -> Result<Vec<RecordBatch>> {
-        let value_futures = plans
-            .into_iter()
-            .map(|plan| {
-                let ctx = self.child_ctx("run_logical_plans");
-                self.run(async move {
-                    let physical_plan = ctx.create_physical_plan(&plan).await?;
-
-                    // TODO: avoid this buffering
-                    ctx.collect(physical_plan).await
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // now, wait for all the values to resolve and collect them together
-        let mut results = Vec::new();
-        for join_handle in value_futures {
-            let mut plan_result = join_handle.await?;
-            results.append(&mut plan_result);
-        }
-        Ok(results)
-    }
-
     /// Runs the provided future using this execution context
     pub async fn run<Fut, T>(&self, fut: Fut) -> Result<T>
     where
@@ -796,7 +697,7 @@ pub trait SessionContextIOxExt {
     fn span_ctx(&self) -> Option<SpanContext>;
 }
 
-impl SessionContextIOxExt for SessionState {
+impl SessionContextIOxExt for &dyn Session {
     fn child_span(&self, name: &'static str) -> Option<Span> {
         self.config()
             .get_extension::<Option<Span>>()

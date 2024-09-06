@@ -9,10 +9,11 @@ use workspace_hack as _;
 
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 use influxdb_line_protocol::{parse_lines, FieldValue, ParsedLine};
-use mutable_batch::writer::Writer;
+use mutable_batch::writer::{ColumnInsertValidator, Writer};
 use mutable_batch::MutableBatch;
 use snafu::{ResultExt, Snafu};
 
+/// A limit on the number of errors to return from a partial LP write.
 const MAXIMUM_RETURNED_ERRORS: usize = 100;
 
 /// Error type for a conversion attempt on a set of line protocol lines
@@ -107,7 +108,8 @@ impl LinesConverter {
     ///     [`mutable_batch::writer::Error::TypeMismatch`]
     ///
     pub fn write_lp(&mut self, lines: &str) -> Result<()> {
-        let errors = parse_lines(lines)
+        let mut errors = Vec::new();
+        for line_err in parse_lines(lines)
             .enumerate()
             .filter_map(|(line_idx, maybe_line)| {
                 maybe_line
@@ -116,8 +118,11 @@ impl LinesConverter {
                     .and_then(|line| self.add_line_to_batch(line, line_idx))
                     .err()
             })
-            .take(MAXIMUM_RETURNED_ERRORS)
-            .collect::<Vec<_>>();
+        {
+            if errors.len() < MAXIMUM_RETURNED_ERRORS {
+                errors.push(line_err);
+            }
+        }
 
         if !errors.is_empty() {
             return Err(Error::PerLine { lines: errors });
@@ -234,11 +239,14 @@ pub enum LineWriteError {
 
 /// Writes the [`ParsedLine`] to the [`MutableBatch`], respecting the edge case
 /// semantics described in [`LinesConverter::write_lp()`].
-pub fn write_line(
-    writer: &mut Writer<'_>,
+pub fn write_line<T>(
+    writer: &mut Writer<'_, T>,
     line: &ParsedLine<'_>,
     default_time: i64,
-) -> Result<(), LineWriteError> {
+) -> Result<(), LineWriteError>
+where
+    T: ColumnInsertValidator,
+{
     // Only allocate the seen tags hashset if there are tags.
     if let Some(tags) = &line.series.tag_set {
         let mut seen = HashSet::with_capacity(tags.len());
@@ -709,5 +717,36 @@ cpu val=4u";
     fn duplicate_field_names_when_one_contains_optional_escaping_doesnt_panic() {
         let lp = "table ,field=33,\\,field=333";
         lines_to_batches(lp, 5).unwrap();
+    }
+
+    #[test]
+    fn batch_creation_continues_after_line_error_limit() {
+        const WANT_GOOD_ROWS: usize = 5;
+
+        // Create a LP payload that exceeds the error limit for "bad lines",
+        // but then contains a few good lines.
+        //
+        // Converting it should result in errors returned up to, but not over
+        // the limit. All good lines following the limit must still be
+        // converted.
+        let lp = (0..=MAXIMUM_RETURNED_ERRORS)
+            .map(|i| format!("bananas,foo=bar foo=42i {i}"))
+            .chain(
+                (1..=WANT_GOOD_ROWS)
+                    .map(|i| format!("bananas,baz=qux life=42i {}", i + MAXIMUM_RETURNED_ERRORS)),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut converter = LinesConverter::new(0);
+        assert_matches!(converter.write_lp(&lp), Err(Error::PerLine { lines }) => {
+            assert_eq!(lines.len(), MAXIMUM_RETURNED_ERRORS);
+        });
+        let (batches, _) = converter.finish().unwrap();
+
+        // 1 table, with 5 rows.
+        assert_eq!(batches.len(), 1);
+        let total_rows: usize = batches.iter().map(|(_table, batch)| batch.rows()).sum();
+        assert_eq!(total_rows, WANT_GOOD_ROWS);
     }
 }

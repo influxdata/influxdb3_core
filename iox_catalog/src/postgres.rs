@@ -31,7 +31,6 @@ use futures::StreamExt;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, Instrument, MetricKind};
 use observability_deps::tracing::{debug, info, warn};
-use once_cell::sync::Lazy;
 use parking_lot::{RwLock, RwLockWriteGuard};
 use snafu::prelude::*;
 use sqlx::{
@@ -46,15 +45,18 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     time::Duration,
 };
 use tokio::task::JoinSet;
 use trace::ctx::SpanContext;
 
-static MIGRATOR: Lazy<IOxMigrator> =
-    Lazy::new(|| IOxMigrator::try_from(&sqlx::migrate!()).expect("valid migration"));
+static MIGRATOR: LazyLock<IOxMigrator> =
+    LazyLock::new(|| IOxMigrator::try_from(&sqlx::migrate!()).expect("valid migration"));
+
+/// Environment variable feature flag for switching to always using the catalog's view of `NOW`.
+static CATALOG_NOW: LazyLock<bool> = LazyLock::new(|| std::env::var("CATALOG_NOW").is_ok());
 
 /// Postgres connection options.
 #[derive(Debug, Clone)]
@@ -1786,10 +1788,32 @@ WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
 #[async_trait]
 impl ParquetFileRepo for PostgresTxn {
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
-        let flagged_at = Timestamp::from(self.time_provider.now());
         // TODO - include check of table retention period once implemented
-        let flagged = sqlx::query(
-            r#"
+        let flagged = if *CATALOG_NOW {
+            sqlx::query(
+                r#"
+    WITH parquet_file_ids as (
+        SELECT parquet_file.object_store_id
+        FROM namespace, parquet_file
+        WHERE namespace.retention_period_ns IS NOT NULL
+        AND parquet_file.to_delete IS NULL
+        AND parquet_file.max_time < EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000 - namespace.retention_period_ns
+        AND namespace.id = parquet_file.namespace_id
+        LIMIT $1
+    )
+    UPDATE parquet_file
+    SET to_delete = EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000
+    WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
+    RETURNING partition_id, object_store_id;
+                "#,
+            )
+            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $1
+            .fetch_all(&mut self.inner)
+            .await?
+        } else {
+            let flagged_at = Timestamp::from(self.time_provider.now());
+            sqlx::query(
+                r#"
 WITH parquet_file_ids as (
     SELECT parquet_file.object_store_id
     FROM namespace, parquet_file
@@ -1804,11 +1828,12 @@ SET to_delete = $1
 WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
 RETURNING partition_id, object_store_id;
             "#,
-        )
-        .bind(flagged_at) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $2
-        .fetch_all(&mut self.inner)
-        .await?;
+            )
+            .bind(flagged_at) // $1
+            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $2
+            .fetch_all(&mut self.inner)
+            .await?
+        };
 
         let flagged = flagged
             .into_iter()
@@ -1817,25 +1842,55 @@ RETURNING partition_id, object_store_id;
         Ok(flagged)
     }
 
-    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
-        // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
-        let deleted = sqlx::query(
-            r#"
-WITH parquet_file_ids as (
-    SELECT object_store_id
-    FROM parquet_file
-    WHERE to_delete < $1
-    LIMIT $2
-)
-DELETE FROM parquet_file
-WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
-RETURNING object_store_id;
-             "#,
+    async fn delete_old_ids_only(
+        &mut self,
+        older_than: Timestamp,
+        cutoff: Duration,
+    ) -> Result<Vec<ObjectStoreId>> {
+        let deleted = if *CATALOG_NOW {
+            let cutoff_nanos: i64 = cutoff
+                .as_nanos()
+                .try_into()
+                .expect("deletion cutoff duration nanos should fit in an i64");
+
+            // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
+            sqlx::query(
+                r#"
+    WITH parquet_file_ids as (
+        SELECT object_store_id
+        FROM parquet_file
+        WHERE to_delete < EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000 - $1
+        LIMIT $2
+    )
+    DELETE FROM parquet_file
+    WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
+    RETURNING object_store_id;
+                 "#,
+            )
+            .bind(cutoff_nanos) // $1
+            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
+            .fetch_all(&mut self.inner)
+            .await?
+        } else {
+            // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
+            sqlx::query(
+                r#"
+        WITH parquet_file_ids as (
+            SELECT object_store_id
+            FROM parquet_file
+            WHERE to_delete < $1
+            LIMIT $2
         )
-        .bind(older_than) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
-        .fetch_all(&mut self.inner)
-        .await?;
+        DELETE FROM parquet_file
+        WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
+        RETURNING object_store_id;
+                     "#,
+            )
+            .bind(older_than) // $1
+            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
+            .fetch_all(&mut self.inner)
+            .await?
+        };
 
         let deleted = deleted
             .into_iter()
@@ -1875,6 +1930,23 @@ RETURNING object_store_id;
         )
         .bind(partition_ids) // $1
         .bind(MAX_PARQUET_L0_FILES_PER_PARTITION) // $2
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(Error::from)
+    }
+
+    async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>> {
+        sqlx::query_as::<_, ParquetFile>(
+            r#"
+SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id, min_time,
+       max_time, to_delete, file_size_bytes, row_count, compaction_level, created_at, column_set,
+       max_l0_created_at, source
+FROM parquet_file
+WHERE created_at <= $1
+AND (to_delete IS NULL OR to_delete > $1);
+            "#,
+        )
+        .bind(as_of) // $1
         .fetch_all(&mut self.inner)
         .await
         .map_err(Error::from)
@@ -1950,14 +2022,36 @@ WHERE object_store_id = ANY($1);
         update_compaction_level(&mut *tx, partition_id, upgrade, target_level).await?;
 
         let mut ids = Vec::with_capacity(create.len());
+        let mut created_at_max = None;
         for file in create {
             if file.partition_id != partition_id {
                 return Err(Error::Malformed {
                     descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
                 });
             }
+            if file.compaction_level == CompactionLevel::Initial {
+                created_at_max = match created_at_max {
+                    None => Some(file.created_at),
+                    Some(current) => Some(current.max(file.created_at)),
+                };
+            }
             let id = create_parquet_file(&mut *tx, partition_id, file).await?;
             ids.push(id);
+        }
+
+        // update partition
+        if let Some(created_at_max) = created_at_max {
+            // there's also `greatest(a, b)`, but we want to try to avoid the partition update at all if we can to
+            // reduce server IO
+            sqlx::query(
+                r#"
+                UPDATE partition SET new_file_at = $2 WHERE id = $1 AND ($2 > new_file_at OR new_file_at IS NULL);
+                "#,
+            )
+            .bind(partition_id) // $1
+            .bind(created_at_max) // $2
+            .fetch_all(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -2046,13 +2140,28 @@ async fn flag_for_delete<'q, E>(
 where
     E: Executor<'q, Database = Postgres>,
 {
-    let updated =
+    let updated = if *CATALOG_NOW {
+        sqlx::query_as::<_, (i64,)>(
+            r#"
+UPDATE parquet_file
+SET to_delete = EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000
+WHERE object_store_id = ANY($1)
+AND partition_id = $2
+AND to_delete is NULL
+RETURNING id;"#,
+        )
+        .bind(ids) // $1
+        .bind(partition_id) // $2
+        .fetch_all(executor)
+        .await?
+    } else {
         sqlx::query_as::<_, (i64,)>(r#"UPDATE parquet_file SET to_delete = $1 WHERE object_store_id = ANY($2) AND partition_id = $3 AND to_delete is NULL RETURNING id;"#)
-            .bind(marked_at) // $1
-            .bind(ids) // $2
-            .bind(partition_id) // $3
-            .fetch_all(executor)
-            .await?;
+                    .bind(marked_at) // $1
+                    .bind(ids) // $2
+                    .bind(partition_id) // $3
+                    .fetch_all(executor)
+                    .await?
+    };
 
     if updated.len() != ids.len() {
         return Err(Error::NotFound {
@@ -2210,6 +2319,9 @@ pub(crate) mod test_utils {
     pub(crate) async fn setup_db_no_migration_with_overrides(
         f: impl FnOnce(PostgresConnectionOptions) -> PostgresConnectionOptions + Send,
     ) -> PostgresCatalog {
+        unsafe {
+            std::env::set_var("CATALOG_NOW", "1");
+        }
         // create a random schema for this particular pool
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
@@ -2559,81 +2671,6 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
 
         // give query some time to get started
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    #[tokio::test]
-    async fn test_billing_summary_on_parqet_file_creation() {
-        maybe_skip_integration!();
-
-        let postgres = setup_db().await;
-        let pool = postgres.pool.clone();
-        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
-        let mut repos = postgres.repositories();
-        let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
-        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
-        let key = "bananas";
-        let partition = repos
-            .partitions()
-            .create_or_get(key.into(), table.id)
-            .await
-            .unwrap();
-
-        // parquet file to create- all we care about here is the size
-        let mut p1 = arbitrary_parquet_file_params(&namespace, &table, &partition);
-        p1.file_size_bytes = 1337;
-        let f1 = repos.parquet_files().create(p1.clone()).await.unwrap();
-        // insert the same again with a different size; we should then have 3x1337 as total file
-        // size
-        p1.object_store_id = ObjectStoreId::new();
-        p1.file_size_bytes *= 2;
-        let _f2 = repos
-            .parquet_files()
-            .create(p1.clone())
-            .await
-            .expect("create parquet file should succeed");
-
-        // after adding two files we should have 3x1337 in the summary
-        let total_file_size_bytes: i64 =
-            sqlx::query_scalar("SELECT total_file_size_bytes FROM billing_summary;")
-                .fetch_one(&pool)
-                .await
-                .expect("fetch total file size failed");
-        assert_eq!(total_file_size_bytes, 1337 * 3);
-
-        // flag f1 for deletion and assert that the total file size is reduced accordingly.
-        repos
-            .parquet_files()
-            .create_upgrade_delete(
-                partition.id,
-                &[f1.object_store_id],
-                &[],
-                &[],
-                CompactionLevel::Initial,
-            )
-            .await
-            .expect("flag parquet file for deletion should succeed");
-        let total_file_size_bytes: i64 =
-            sqlx::query_scalar("SELECT total_file_size_bytes FROM billing_summary;")
-                .fetch_one(&pool)
-                .await
-                .expect("fetch total file size failed");
-        // we marked the first file of size 1337 for deletion leaving only the second that was 2x
-        // that
-        assert_eq!(total_file_size_bytes, 1337 * 2);
-
-        // actually deleting shouldn't change the total
-        let older_than = p1.created_at + 1;
-        repos
-            .parquet_files()
-            .delete_old_ids_only(older_than)
-            .await
-            .expect("parquet file deletion should succeed");
-        let total_file_size_bytes: i64 =
-            sqlx::query_scalar("SELECT total_file_size_bytes FROM billing_summary;")
-                .fetch_one(&pool)
-                .await
-                .expect("fetch total file size failed");
-        assert_eq!(total_file_size_bytes, 1337 * 2);
     }
 
     #[tokio::test]

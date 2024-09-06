@@ -2,15 +2,17 @@ use std::sync::Arc;
 
 use crate::cache_system::{hook::Hook, interfaces::DynError};
 
+use super::{EvictResult, HookDecision};
+
 /// Chains multiple [hooks](Hook).
 ///
 /// For [fetched](Hook::fetched) this will combine errors.
-pub(crate) struct HookChain<K> {
-    hooks: Box<[Arc<dyn Hook<K = K>>]>,
+pub struct HookChain<K> {
+    hooks: Box<[Arc<dyn Hook<K>>]>,
 }
 
 impl<K> HookChain<K> {
-    pub(crate) fn new(hooks: impl IntoIterator<Item = Arc<dyn Hook<K = K>>>) -> Self {
+    pub fn new(hooks: impl IntoIterator<Item = Arc<dyn Hook<K>>>) -> Self {
         Self {
             hooks: hooks.into_iter().collect(),
         }
@@ -25,79 +27,27 @@ impl<K> std::fmt::Debug for HookChain<K> {
     }
 }
 
-impl<K> Hook for HookChain<K> {
-    type K = K;
-
-    fn insert(&self, gen: u64, k: &Self::K) {
-        for hook in self.hooks.iter() {
+impl<K> Hook<K> for HookChain<K> {
+    fn insert(&self, gen: u64, k: &K) {
+        for hook in &self.hooks {
             hook.insert(gen, k);
         }
     }
 
-    fn fetched(
-        &self,
-        gen: u64,
-        k: &Self::K,
-        res: &Result<usize, DynError>,
-    ) -> Result<(), DynError> {
-        let mut e = None;
-
-        for hook in self.hooks.iter() {
-            let res = match (&e, res) {
-                (Some(e), _) => Err(Arc::clone(e)),
-                (None, res) => res.clone(),
-            };
-
-            match hook.fetched(gen, k, &res) {
-                Ok(()) => (),
-                Err(new_e) => match (e, res.as_ref()) {
-                    (Some(existing_e), _) => {
-                        e = Some(Arc::new(ErrorChain {
-                            error: new_e,
-                            cause: existing_e,
-                        }));
-                    }
-                    (None, Err(existing_e)) => {
-                        e = Some(Arc::new(ErrorChain {
-                            error: new_e,
-                            cause: Arc::clone(existing_e),
-                        }));
-                    }
-                    (None, Ok(_)) => {
-                        e = Some(new_e);
-                    }
-                },
-            }
-        }
-
-        match e {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+    fn fetched(&self, gen: u64, k: &K, res: Result<usize, &DynError>) -> HookDecision {
+        self.hooks
+            .iter()
+            .map(|hook| hook.fetched(gen, k, res))
+            .fold::<Option<HookDecision>, _>(None, |a, b| {
+                Some(a.map(|a| a.favor_evict(b)).unwrap_or(b))
+            })
+            .unwrap_or_default()
     }
 
-    fn evict(&self, gen: u64, k: &Self::K, res: &Option<Result<usize, ()>>) {
-        for hook in self.hooks.iter() {
+    fn evict(&self, gen: u64, k: &K, res: EvictResult) {
+        for hook in &self.hooks {
             hook.evict(gen, k, res);
         }
-    }
-}
-
-#[derive(Debug)]
-struct ErrorChain {
-    error: DynError,
-    cause: DynError,
-}
-
-impl std::fmt::Display for ErrorChain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.error, self.cause)
-    }
-}
-
-impl std::error::Error for ErrorChain {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.cause)
     }
 }
 
@@ -105,7 +55,7 @@ impl std::error::Error for ErrorChain {
 mod tests {
     use crate::cache_system::{
         hook::test_utils::{TestHook, TestHookRecord},
-        test_utils::str_err,
+        utils::str_err,
     };
 
     use super::*;
@@ -115,11 +65,14 @@ mod tests {
         let chain = HookChain::<()>::new([]);
 
         chain.insert(1, &());
-        chain.fetched(2, &(), &Ok(1)).unwrap();
-        chain.fetched(3, &(), &Err(str_err("foo"))).unwrap();
-        chain.evict(4, &(), &None);
-        chain.evict(5, &(), &Some(Ok(1)));
-        chain.evict(6, &(), &Some(Err(())));
+        assert_eq!(chain.fetched(2, &(), Ok(1)), HookDecision::default(),);
+        assert_eq!(
+            chain.fetched(3, &(), Err(&str_err("foo"))),
+            HookDecision::default(),
+        );
+        chain.evict(4, &(), EvictResult::Unfetched);
+        chain.evict(5, &(), EvictResult::Fetched { size: 1 });
+        chain.evict(6, &(), EvictResult::Failed);
     }
 
     #[test]
@@ -128,95 +81,71 @@ mod tests {
         let h2 = Arc::new(TestHook::<u8>::default());
         let chain = HookChain::<u8>::new([Arc::clone(&h1) as _, Arc::clone(&h2) as _]);
 
-        chain.insert(1, &1);
+        chain.insert(0, &0);
 
-        chain.fetched(2, &2, &Ok(1000)).unwrap();
-        chain.fetched(3, &3, &Err(str_err("e1"))).unwrap();
+        h1.mock_next_fetch(HookDecision::Keep);
+        h2.mock_next_fetch(HookDecision::Keep);
+        assert_eq!(chain.fetched(1, &1, Ok(1000)), HookDecision::Keep);
 
-        h1.mock_next_fetch(Err("e2"));
+        h1.mock_next_fetch(HookDecision::Keep);
+        h2.mock_next_fetch(HookDecision::Keep);
         assert_eq!(
-            chain.fetched(4, &4, &Ok(2000)).unwrap_err().to_string(),
-            "e2",
+            chain.fetched(2, &2, Err(&str_err("e1"))),
+            HookDecision::Keep
         );
 
-        h1.mock_next_fetch(Err("e3"));
+        h1.mock_next_fetch(HookDecision::Evict);
+        h2.mock_next_fetch(HookDecision::Keep);
+        assert_eq!(chain.fetched(3, &3, Ok(2000)), HookDecision::Evict,);
+
+        h1.mock_next_fetch(HookDecision::Evict);
+        h2.mock_next_fetch(HookDecision::Keep);
         assert_eq!(
-            chain
-                .fetched(5, &5, &Err(str_err("e4")))
-                .unwrap_err()
-                .to_string(),
-            "e3: e4",
+            chain.fetched(4, &4, Err(&str_err("e2"))),
+            HookDecision::Evict,
         );
 
-        h2.mock_next_fetch(Err("e5"));
+        h1.mock_next_fetch(HookDecision::Keep);
+        h2.mock_next_fetch(HookDecision::Evict);
+        assert_eq!(chain.fetched(5, &5, Ok(3000)), HookDecision::Evict,);
+
+        h1.mock_next_fetch(HookDecision::Keep);
+        h2.mock_next_fetch(HookDecision::Evict);
         assert_eq!(
-            chain.fetched(6, &6, &Ok(3000)).unwrap_err().to_string(),
-            "e5",
+            chain.fetched(6, &6, Err(&str_err("e3"))),
+            HookDecision::Evict,
         );
 
-        h2.mock_next_fetch(Err("e6"));
+        h1.mock_next_fetch(HookDecision::Evict);
+        h2.mock_next_fetch(HookDecision::Evict);
+        assert_eq!(chain.fetched(7, &7, Ok(4000)), HookDecision::Evict,);
+
+        h1.mock_next_fetch(HookDecision::Evict);
+        h2.mock_next_fetch(HookDecision::Evict);
         assert_eq!(
-            chain
-                .fetched(7, &7, &Err(str_err("e7")))
-                .unwrap_err()
-                .to_string(),
-            "e6: e7",
+            chain.fetched(8, &8, Err(&str_err("e4"))),
+            HookDecision::Evict,
         );
 
-        h1.mock_next_fetch(Err("e9"));
-        h2.mock_next_fetch(Err("e10"));
-        assert_eq!(
-            chain.fetched(8, &8, &Ok(4000)).unwrap_err().to_string(),
-            "e10: e9",
-        );
+        chain.evict(9, &9, EvictResult::Unfetched);
+        chain.evict(10, &10, EvictResult::Fetched { size: 5000 });
+        chain.evict(11, &11, EvictResult::Failed);
 
-        h1.mock_next_fetch(Err("e11"));
-        h2.mock_next_fetch(Err("e12"));
-        assert_eq!(
-            chain
-                .fetched(9, &9, &Err(str_err("e13")))
-                .unwrap_err()
-                .to_string(),
-            "e12: e11: e13",
-        );
-
-        chain.evict(10, &10, &None);
-        chain.evict(11, &11, &Some(Ok(5000)));
-        chain.evict(12, &12, &Some(Err(())));
-
-        assert_eq!(
-            h1.records(),
-            vec![
-                TestHookRecord::Insert(1, 1),
-                TestHookRecord::Fetched(2, 2, Ok(1000)),
-                TestHookRecord::Fetched(3, 3, Err("e1".to_owned())),
-                TestHookRecord::Fetched(4, 4, Ok(2000)),
-                TestHookRecord::Fetched(5, 5, Err("e4".to_owned())),
-                TestHookRecord::Fetched(6, 6, Ok(3000)),
-                TestHookRecord::Fetched(7, 7, Err("e7".to_owned())),
-                TestHookRecord::Fetched(8, 8, Ok(4000)),
-                TestHookRecord::Fetched(9, 9, Err("e13".to_owned())),
-                TestHookRecord::Evict(10, 10, None),
-                TestHookRecord::Evict(11, 11, Some(Ok(5000))),
-                TestHookRecord::Evict(12, 12, Some(Err(()))),
-            ],
-        );
-        assert_eq!(
-            h2.records(),
-            vec![
-                TestHookRecord::Insert(1, 1),
-                TestHookRecord::Fetched(2, 2, Ok(1000)),
-                TestHookRecord::Fetched(3, 3, Err("e1".to_owned())),
-                TestHookRecord::Fetched(4, 4, Err("e2".to_owned())),
-                TestHookRecord::Fetched(5, 5, Err("e3: e4".to_owned())),
-                TestHookRecord::Fetched(6, 6, Ok(3000)),
-                TestHookRecord::Fetched(7, 7, Err("e7".to_owned())),
-                TestHookRecord::Fetched(8, 8, Err("e9".to_owned())),
-                TestHookRecord::Fetched(9, 9, Err("e11: e13".to_owned())),
-                TestHookRecord::Evict(10, 10, None),
-                TestHookRecord::Evict(11, 11, Some(Ok(5000))),
-                TestHookRecord::Evict(12, 12, Some(Err(()))),
-            ],
-        );
+        let records = vec![
+            TestHookRecord::Insert(0, 0),
+            TestHookRecord::Fetched(1, 1, Ok(1000)),
+            TestHookRecord::Fetched(2, 2, Err("e1".to_owned())),
+            TestHookRecord::Fetched(3, 3, Ok(2000)),
+            TestHookRecord::Fetched(4, 4, Err("e2".to_owned())),
+            TestHookRecord::Fetched(5, 5, Ok(3000)),
+            TestHookRecord::Fetched(6, 6, Err("e3".to_owned())),
+            TestHookRecord::Fetched(7, 7, Ok(4000)),
+            TestHookRecord::Fetched(8, 8, Err("e4".to_owned())),
+            TestHookRecord::Evict(9, 9, EvictResult::Unfetched),
+            TestHookRecord::Evict(10, 10, EvictResult::Fetched { size: 5000 }),
+            TestHookRecord::Evict(11, 11, EvictResult::Failed),
+        ];
+        assert_eq!(h1.records(), records,);
+        assert_eq!(h2.records(), records,);
     }
 }

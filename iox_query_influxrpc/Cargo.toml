@@ -10,11 +10,12 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-async-trait = "0.1.81"
+async-trait = "0.1.82"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
 futures = "0.3"
+generated_types = { path = "../generated_types" }
 hashbrown = { workspace = true }
 iox_query = { path = "../iox_query" }
 observability_deps = { path = "../observability_deps" }
@@ -28,4 +29,4 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 arrow_util = { path = "../arrow_util" }
 test_helpers = { path = "../test_helpers" }
 insta = { version = "1", features = ["yaml"] }
-tokio = { version = "1.38", features = ["macros", "parking_lot"] }
+tokio = { version = "1.40", features = ["macros", "parking_lot"] }

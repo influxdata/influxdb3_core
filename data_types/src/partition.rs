@@ -1,5 +1,7 @@
 //! Types having to do with partitions.
 
+use crate::{NamespacePartitionTemplateOverride, PARTITION_KEY_DELIMITER};
+
 use super::{ColumnsByName, SortKeyIds, TableId, Timestamp};
 
 use schema::sort::SortKey;
@@ -310,6 +312,80 @@ impl sqlx::Decode<'_, sqlx::Sqlite> for PartitionKey {
         Ok(Self(
             <String as sqlx::Decode<sqlx::Sqlite>>::decode(value)?.into(),
         ))
+    }
+}
+
+/// An error struct that could be returned from [`NamespacePartitionTemplateOverride::part_key()`]
+/// if validation fails. [`Self::expected`] will be equal to the number of parts which the template had,
+/// and [`Self::found`] will be equal to the number of fields passed in as the argument `parts`
+#[derive(Debug, Copy, Clone, Error)]
+#[error("Expected {expected} parts in key due to template passed in, found {found}. (Note: this may be due to a provided `part` containing the delimiter, `|`, resulting in the key containing more parts than necessary)")]
+pub struct MismatchedNumPartsError {
+    /// The number of parts that the tmpl passed into [`NamespacePartitionTemplateOverride::part_key()`] had
+    pub expected: usize,
+    /// The number of parts that were passed into [`NamespacePartitionTemplateOverride::part_key()`]
+    pub found: usize,
+}
+
+/// A utility struct to create a [`PartitionKey`] for a specific
+/// [`NamespacePartitionTemplateOverride`] and verify that this key has the correct amount of
+/// `parts` in it to be used with the provided template.
+#[derive(Debug)]
+pub struct PartitionKeyBuilder {
+    /// The incremental string that is built as [`Self::push()`] is called multiple times, and what
+    /// will be turned into the [`PartitionKey`] if validation succeeds.
+    key: String,
+    /// The number of expected `parts` that this key should have, based on the template provided in
+    /// [`Self::new()`]
+    expected_parts: usize,
+}
+
+impl PartitionKeyBuilder {
+    /// Create a new [`PartitionKeyBuilder`] with a preallocated string that expects
+    /// [`tmpl.parts()`](`NamespacePartitionTemplateOverride::parts()`)[`.count()`] calls to
+    /// [`Self::push()`].
+    ///
+    /// [`.count()`]: ::std::iter::Iterator::count
+    pub fn new(tmpl: &NamespacePartitionTemplateOverride) -> Self {
+        let expected_parts = tmpl.parts().count();
+        Self {
+            key: String::with_capacity((expected_parts * 2) - 1),
+            expected_parts,
+        }
+    }
+
+    /// Push a `T` that implements [`std::fmt::Display`] to the internally-stored string. This
+    /// method will automatically add the `|` to separate the `T` from the rest of the string with
+    /// necessary, and returns `&mut Self` to facilitate chaining.
+    pub fn push<T: Display>(mut self, part: T) -> Self {
+        use std::fmt::Write as _;
+
+        if self.key.is_empty() {
+            write!(self.key, "{part}").unwrap();
+        } else {
+            write!(self.key, "{PARTITION_KEY_DELIMITER}{part}").unwrap();
+        }
+        self
+    }
+
+    /// Attempt to build [`self`], returning a [`MismatchedNumPartsError`] if validation fails.
+    /// Validation fails only if the number of parts (which are delimited by a `|` character) in
+    /// [`self.key`] does not equal [`self.expected_parts`] (which is equal to the number of parts
+    /// in the template passed into [`Self::new()`]. If validation does not fail, [`self.key`] will
+    /// be turned into a [`PartitionKey`] and returned.
+    ///
+    /// [`self`]: Self
+    /// [`self.key`]: Self::key
+    /// [`self.expected_parts`]: Self::expected_parts
+    pub fn build(self) -> Result<PartitionKey, MismatchedNumPartsError> {
+        let found = self.key.chars().filter(|c| *c == '|').count() + 1;
+
+        (found == self.expected_parts)
+            .then(|| self.key.into())
+            .ok_or(MismatchedNumPartsError {
+                found,
+                expected: self.expected_parts,
+            })
     }
 }
 

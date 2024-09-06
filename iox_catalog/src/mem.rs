@@ -37,6 +37,7 @@ use std::{
     fmt::Formatter,
     ops::{Deref, DerefMut},
     sync::Arc,
+    time::Duration,
 };
 use trace::ctx::SpanContext;
 
@@ -1014,8 +1015,14 @@ impl ParquetFileRepo for MemTxn {
             .collect())
     }
 
-    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
+    async fn delete_old_ids_only(
+        &mut self,
+        _older_than: Timestamp,
+        cutoff: Duration,
+    ) -> Result<Vec<ObjectStoreId>> {
         let mut stage = self.collections.lock();
+
+        let older_than = Timestamp::from(self.time_provider.now() - cutoff);
 
         let (delete, keep): (Vec<_>, Vec<_>) = stage.parquet_files.iter().cloned().partition(
             |f| matches!(f.to_delete, Some(marked_deleted) if marked_deleted < older_than),
@@ -1052,6 +1059,17 @@ impl ParquetFileRepo for MemTxn {
             .collect();
 
         Ok(l0s.into_iter().chain(others.into_iter()).collect())
+    }
+
+    async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>> {
+        let stage = self.collections.lock();
+
+        Ok(stage
+            .parquet_files
+            .iter()
+            .filter(|f| f.created_at <= as_of && f.to_delete.map(|del| del > as_of).unwrap_or(true))
+            .cloned()
+            .collect())
     }
 
     async fn get_by_object_store_id(

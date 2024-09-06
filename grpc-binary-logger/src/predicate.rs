@@ -9,18 +9,6 @@ pub trait Predicate: Clone {
         B: Body;
 }
 
-#[derive(Default, Clone, Debug)]
-pub(crate) struct LogAll;
-
-impl Predicate for LogAll {
-    fn should_log<B>(&self, _req: &hyper::Request<B>) -> bool
-    where
-        B: Body,
-    {
-        true
-    }
-}
-
 /// A [`Predicate`] that filters out all [gRPC server reflection](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md)
 #[derive(Default, Clone, Debug, Copy)]
 pub struct NoReflection;

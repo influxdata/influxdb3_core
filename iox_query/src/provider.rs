@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use datafusion::common::DFSchema;
 use datafusion::{
+    catalog::Session,
     datasource::{provider_as_source, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::context::SessionState,
     logical_expr::{
         utils::{conjunction, split_conjunction},
         LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
@@ -22,11 +23,7 @@ use datafusion::{
 use observability_deps::tracing::trace;
 use schema::{sort::SortKey, Schema};
 
-use crate::{
-    chunk_order_field,
-    util::{arrow_sort_key_exprs, df_physical_expr},
-    QueryChunk, CHUNK_ORDER_COLUMN_NAME,
-};
+use crate::{chunk_order_field, util::arrow_sort_key_exprs, QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
 use snafu::{ResultExt, Snafu};
 
@@ -203,7 +200,7 @@ impl TableProvider for ChunkTableProvider {
     /// ```
     async fn scan(
         &self,
-        ctx: &SessionState,
+        ctx: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
@@ -258,10 +255,9 @@ impl TableProvider for ChunkTableProvider {
             };
 
             if let Some(expr) = maybe_expr {
-                Arc::new(FilterExec::try_new(
-                    df_physical_expr(ctx, plan.schema(), expr)?,
-                    plan,
-                )?)
+                let df_schema = DFSchema::try_from(plan.schema())?;
+                let filter_expr = ctx.create_physical_expr(expr, &df_schema)?;
+                Arc::new(FilterExec::try_new(filter_expr, plan)?)
             } else {
                 plan
             }

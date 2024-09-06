@@ -3,9 +3,9 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-mod cache_system;
-mod meta_store;
-mod store;
+pub mod cache_system;
+pub mod object_store_cache_tests;
+pub mod object_store_helpers;
+pub mod store;
 
-pub use meta_store::{MetaIndexCache, MetaIndexCacheParams};
 pub use store::{MemCacheObjectStore, MemCacheObjectStoreParams};

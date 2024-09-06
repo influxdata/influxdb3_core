@@ -141,6 +141,16 @@ pub struct CatalogDsnConfig {
         value_parser = humantime::parse_duration,
     )]
     pub hotswap_poll_interval: Duration,
+
+    /// For gRPC-driven catalog connections, set the max decoded message size.
+    ///
+    /// Defaults to 100MB.
+    #[clap(
+        long = "catalog-grpc-max-decoded-message-size",
+        env = "INFLUXDB_IOX_CATALOG_GRPC_MAX_DECODED_MESSAGE_SIZE",
+        default_value = "104857600",  // 100 MB
+    )]
+    pub grpc_max_decoded_message_size: usize,
 }
 
 impl CatalogDsnConfig {
@@ -156,13 +166,33 @@ impl CatalogDsnConfig {
             return Err(Error::DsnNotSpecified {});
         };
 
+        self.get_catalog_with_dsn(
+            dsn,
+            app_name,
+            metrics,
+            time_provider,
+            traces_jaeger_trace_context_header_name,
+        )
+        .await
+    }
+
+    /// Get config-dependent catalog with the specified `dsn` rather than the value in the `dsn`
+    /// field; use all the other relevant fields from `self`
+    pub async fn get_catalog_with_dsn(
+        &self,
+        dsn: &str,
+        app_name: &'static str,
+        metrics: Arc<metric::Registry>,
+        time_provider: Arc<dyn TimeProvider>,
+        traces_jaeger_trace_context_header_name: String,
+    ) -> Result<Arc<dyn Catalog>, Error> {
         if dsn.starts_with("postgres") || dsn.starts_with("dsn-file://") {
             // do not log entire postgres dsn as it may contain credentials
             info!(postgres_schema_name=%self.postgres_schema_name, "Catalog: Postgres");
             let options = PostgresConnectionOptions {
                 app_name: app_name.to_string(),
                 schema_name: self.postgres_schema_name.clone(),
-                dsn: dsn.clone(),
+                dsn: dsn.to_string(),
                 max_conns: self.max_catalog_connections,
                 connect_timeout: self.connect_timeout,
                 idle_timeout: self.idle_timeout,
@@ -204,6 +234,7 @@ impl CatalogDsnConfig {
                         .try_into()
                         .context(InvalidTraceHeaderSnafu)?,
                 )
+                .max_decoded_message_size(self.grpc_max_decoded_message_size)
                 .build();
             Ok(Arc::new(grpc))
         } else {

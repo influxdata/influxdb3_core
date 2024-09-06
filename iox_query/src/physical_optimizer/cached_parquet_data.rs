@@ -5,9 +5,8 @@ use bytes::Bytes;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::{
-        file_format::parquet::statistics_from_parquet_meta,
-        physical_plan::{FileMeta, ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory},
+    datasource::physical_plan::{
+        FileMeta, ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory,
     },
     error::DataFusionError,
     parquet::{
@@ -20,11 +19,10 @@ use datafusion::{
 };
 use executor::spawn_io;
 use futures::{future::Shared, prelude::future::BoxFuture, FutureExt};
+use meta_data_cache::MetaIndexCache;
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
-use object_store_mem_cache::MetaIndexCache;
 use observability_deps::tracing::warn;
 use parquet_file::ParquetFilePath;
-use tokio::sync::Mutex;
 
 use crate::{
     config::{IoxCacheExt, IoxConfigExt},
@@ -108,7 +106,7 @@ impl PhysicalOptimizerRule for CachedParquetData {
 struct CachedParquetFileReaderFactory {
     object_store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
-    meta_cache: Option<Arc<Mutex<MetaIndexCache>>>,
+    meta_cache: Option<Arc<MetaIndexCache>>,
 }
 
 impl CachedParquetFileReaderFactory {
@@ -116,7 +114,7 @@ impl CachedParquetFileReaderFactory {
     pub(crate) fn new(
         object_store: Arc<DynObjectStore>,
         table_schema: SchemaRef,
-        meta_cache: Option<Arc<Mutex<MetaIndexCache>>>,
+        meta_cache: Option<Arc<MetaIndexCache>>,
     ) -> Self {
         Self {
             object_store,
@@ -146,15 +144,24 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         .boxed()
         .shared();
 
-        let meta_cache = self.meta_cache.as_ref().map(Arc::clone);
-        Ok(Box::new(CachedFileReader {
-            meta: Arc::new(file_meta.object_meta),
+        let meta = Arc::new(file_meta.object_meta);
+        let file_reader = ParquetFileReader {
+            meta: Arc::clone(&meta),
             file_metrics: Some(file_metrics),
             metadata_size_hint,
             data,
-            table_schema: Arc::clone(&self.table_schema),
-            meta_cache,
-        }))
+        };
+
+        // no meta cache available when this is executed by the compactor
+        if let Some(ref meta_cache) = self.meta_cache {
+            Ok(Box::new(CachedParquetFileReader {
+                inner: file_reader,
+                table_schema: Arc::clone(&self.table_schema),
+                meta_cache: Arc::clone(meta_cache),
+            }))
+        } else {
+            Ok(Box::new(file_reader))
+        }
     }
 }
 
@@ -163,22 +170,102 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 /// This does NOT support file parts / sub-ranges, we will always fetch the entire file!
 ///
 /// This is an implementation detail of [`CachedParquetFileReaderFactory`]
-struct CachedFileReader {
+#[derive(Debug)]
+struct CachedParquetFileReader {
+    inner: ParquetFileReader,
+    table_schema: SchemaRef, // todo(nga): may want to replace this with tableCache
+    meta_cache: Arc<MetaIndexCache>,
+}
+
+impl AsyncFileReader for CachedParquetFileReader {
+    #[inline]
+    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
+        self.inner.get_bytes(range)
+    }
+
+    #[inline]
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<usize>>,
+    ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
+        self.inner.get_byte_ranges(ranges)
+    }
+
+    fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>, ParquetError>> {
+        Box::pin(async move {
+            if let Some(file_uuid) = ParquetFilePath::uuid_from_path(&self.inner.meta.location) {
+                let file_reader = self.inner.clone_with_no_metrics();
+                let file_metas = self
+                    .meta_cache
+                    .add_metadata_for_file(&file_uuid, Arc::clone(&self.table_schema), file_reader)
+                    .await
+                    // unfortunately there doesn't seem to be a way to downcast the Arc<DynError> into the
+                    // `ParquetError` that DataFusion accepts, so just wrap it as an external error
+                    .map_err(|e| ParquetError::External(Box::new(e)))?;
+                if file_metas.col_metas.is_none() {
+                    warn!(
+                        "Failed to collect statistics for file: {:?}",
+                        self.inner.meta.location
+                    );
+                }
+                Ok(Arc::clone(&file_metas.parquet_metadata))
+            } else {
+                warn!(
+                    "Unable to cache parquet metadata: Failed to find UUID from path: {:?}",
+                    self.inner.meta.location
+                );
+                // no available UUID, try to fetch metadata without caching
+                // NOTE(adam): does this make sense? maybe should throw an error instead?
+                self.inner.get_metadata().await
+            }
+        })
+    }
+}
+
+/// A [`AsyncFileReader`] that fetches file data each time it is invoked (no cache).
+///
+/// This does NOT support file parts / sub-ranges, we will always fetch the entire file!
+///
+/// This is used as the inner implementation of [`CachedParquetFileReader`]
+#[derive(Debug)]
+struct ParquetFileReader {
     meta: Arc<ObjectMeta>,
     file_metrics: Option<ParquetFileMetrics>,
     metadata_size_hint: Option<usize>,
     data: Shared<BoxFuture<'static, Result<Bytes, Arc<ObjectStoreError>>>>,
-    table_schema: SchemaRef, // todo: may want to replace this with tableCache
-    meta_cache: Option<Arc<Mutex<MetaIndexCache>>>,
 }
 
-impl CachedFileReader {
-    fn get_meta_cache(&self) -> Option<Arc<Mutex<MetaIndexCache>>> {
-        self.meta_cache.as_ref().map(Arc::clone)
+impl ParquetFileReader {
+    /// Creates a new [`ParquetFileReader`] for loading metadata.
+    ///
+    /// This is a "partial" clone, but omits `file_metrics` because Datafusion excludes metadata
+    /// loads from the "bytes scanned" metrics
+    #[inline]
+    fn clone_with_no_metrics(&self) -> Self {
+        Self {
+            meta: Arc::clone(&self.meta),
+            file_metrics: None,
+            metadata_size_hint: self.metadata_size_hint,
+            data: self.data.clone(),
+        }
+    }
+    /// Loads [`ParquetMetaData`] from file.
+    #[inline]
+    async fn load_metadata(&mut self) -> Result<ParquetMetaData, ParquetError> {
+        let preload_column_index = true;
+        let preload_offset_index = true;
+
+        let file_size = self.meta.size;
+        let prefetch = self.metadata_size_hint;
+        let mut loader = MetadataLoader::load(self, file_size, prefetch).await?;
+        loader
+            .load_page_index(preload_column_index, preload_offset_index)
+            .await?;
+        Ok(loader.finish())
     }
 }
 
-impl AsyncFileReader for CachedFileReader {
+impl AsyncFileReader for ParquetFileReader {
     fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
         Box::pin(async move {
             Ok(self
@@ -221,60 +308,9 @@ impl AsyncFileReader for CachedFileReader {
 
     fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>, ParquetError>> {
         Box::pin(async move {
-            // TODO(marco): preload metadata aggressively to make actual data loads cheaper
-            //              DataFusion currently sets both to `false`
-            let preload_column_index = false;
-            let preload_offset_index = false;
-
-            let file_size = self.meta.size;
-            let prefetch = self.metadata_size_hint;
-
-            // DataFusion excludes metadata loads from "bytes scanned"
-            let mut this = Self {
-                meta: Arc::clone(&self.meta),
-                file_metrics: None,
-                metadata_size_hint: self.metadata_size_hint,
-                data: self.data.clone(),
-                table_schema: Arc::clone(&self.table_schema),
-                meta_cache: self.meta_cache.as_ref().map(Arc::clone),
-            };
-
-            let mut loader = MetadataLoader::load(&mut this, file_size, prefetch).await?;
-            loader
-                .load_page_index(preload_column_index, preload_offset_index)
-                .await?;
-
-            let metadata = loader.finish();
-
-            // No meta cache available when this is executed by the compactor, stop here
-            let Some(meta_cache) = this.get_meta_cache() else {
-                return Ok(Arc::new(metadata));
-            };
-
-            // Collect statistics and add to meta cache
-            let mut collected = false;
-
-            if let Some(file_uuid) = ParquetFilePath::uuid_from_path(&this.meta.location) {
-                // get statistics from metadata
-                let file_statistics =
-                    statistics_from_parquet_meta(&metadata, this.table_schema).await;
-
-                if let Ok(file_statistics) = file_statistics {
-                    let mut handle = meta_cache.lock().await;
-                    handle.add_file_with_stats(file_uuid, file_statistics).await;
-
-                    collected = true;
-                }
-            }
-
-            if !collected {
-                warn!(
-                    "Failed to collect statistics for file: {:?}",
-                    this.meta.location
-                );
-            }
-
-            Ok(Arc::new(metadata))
+            Ok(Arc::new(
+                self.clone_with_no_metrics().load_metadata().await?,
+            ))
         })
     }
 }

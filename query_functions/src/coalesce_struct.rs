@@ -71,24 +71,24 @@
 //!   d: {a: 2, b: 3},
 //! }
 //! ```
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, LazyLock},
+};
 
-use arrow::array::ArrayRef;
 use arrow::{
-    array::{Array, StructArray},
+    array::{Array, ArrayRef, StructArray},
     compute::{is_null, kernels::zip::zip},
     datatypes::DataType,
 };
-use datafusion::common::internal_err;
 use datafusion::{
-    common::cast::as_struct_array,
+    common::{cast::as_struct_array, internal_err},
     error::{DataFusionError, Result},
     logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     physical_plan::ColumnarValue,
     prelude::Expr,
     scalar::ScalarValue,
 };
-use once_cell::sync::Lazy;
 
 /// The name of the `coalesce_struct` UDF given to DataFusion.
 pub const COALESCE_STRUCT_UDF_NAME: &str = "coalesce_struct";
@@ -181,7 +181,7 @@ impl ScalarUDFImpl for CoalesceStructUDF {
 /// Implementation of `coalesce_struct`.
 ///
 /// See [module-level docs](self) for more information.
-pub static COALESCE_STRUCT_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| {
+pub static COALESCE_STRUCT_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     Arc::new(ScalarUDF::from(CoalesceStructUDF {
         signature: Signature::variadic_any(Volatility::Immutable),
     }))

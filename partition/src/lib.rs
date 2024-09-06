@@ -427,9 +427,7 @@ mod tests {
 
     use assert_matches::assert_matches;
     use chrono::{format::StrftimeItems, DateTime, Datelike, Days, TimeZone, Utc};
-    use data_types::partition_template::{
-        build_column_values, test_table_partition_override, ColumnValue,
-    };
+    use data_types::partition_template::{test_table_partition_override, ColumnValue};
     use mutable_batch::{writer::Writer, MutableBatch};
     use proptest::{prelude::*, prop_compose, proptest, strategy::Strategy};
     use rand::prelude::*;
@@ -624,7 +622,7 @@ mod tests {
 
         writer.commit();
 
-        let keys: Vec<_> = partition_keys(&batch, template_parts.clone().into_iter())
+        let keys: Vec<_> = partition_keys(&batch, template_parts.into_iter())
             .map(|v| v.expect("non-identical consecutive keys"))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -972,7 +970,7 @@ mod tests {
                     assert_eq!(keys, vec![$want_key.to_string()], "generated key differs");
 
                     // Reverse the encoding.
-                    let reversed = build_column_values(&template, &keys[0]);
+                    let reversed = template.column_values(&keys[0]);
 
                     // Expect the tags to be (str, ColumnValue) for the
                     // comparison
@@ -1515,10 +1513,11 @@ mod tests {
             assert_eq!(keys.len(), 1);
 
             // Reverse the encoding.
-            let reversed: Vec<(&str, ColumnValue<'_>)> = build_column_values(
-                &template,
-                &keys[0]
-            ).filter_map(|(name, val)| val.map(|val| (name, val))).collect();
+            let reversed: Vec<(&str, ColumnValue<'_>)> =
+                template
+                    .column_values(&keys[0])
+                    .filter_map(|(name, val)| val.map(|val| (name, val)))
+                    .collect();
 
             // Build the expected set of reversed tags by filtering out any
             // NULL tags (preserving empty string values).

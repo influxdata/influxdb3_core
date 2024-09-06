@@ -21,18 +21,22 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream::BoxStream, Stream, StreamExt};
-use iox_time::{SystemProvider, Time, TimeProvider};
+use iox_time::{Time, TimeProvider};
 use metric::{DurationHistogram, Metric, U64Counter};
 use pin_project::{pin_project, pinned_drop};
 
 use object_store::{path::Path, GetResult, ListResult, ObjectMeta, ObjectStore, Result};
 use tokio::{sync::Mutex, task::JoinSet};
 
-/// A typed name of a instance scope / shard to report the metrics under.
-#[derive(Debug, Clone)]
-pub struct ShardName(Cow<'static, str>);
+#[cfg(test)]
+mod dummy;
+mod multipart_upload_metrics;
 
-impl<T> From<T> for ShardName
+/// A typed name of a scope / type to report the metrics under.
+#[derive(Debug, Clone)]
+pub struct StoreType(Cow<'static, str>);
+
+impl<T> From<T> for StoreType
 where
     T: Into<Cow<'static, str>>,
 {
@@ -41,10 +45,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod dummy;
-mod multipart_upload_metrics;
-
 #[derive(Debug, Clone)]
 struct Metrics {
     success_duration: DurationHistogram,
@@ -52,7 +52,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(registry: &metric::Registry, shard: &ShardName, op: &'static str) -> Self {
+    fn new(registry: &metric::Registry, store_type: &StoreType, op: &'static str) -> Self {
         // Call durations broken down by op & result
         let duration: Metric<DurationHistogram> = registry.register_metric(
             "object_store_op_duration",
@@ -61,12 +61,12 @@ impl Metrics {
 
         Self {
             success_duration: duration.recorder([
-                ("shard", shard.0.clone()),
+                ("store_type", store_type.0.clone()),
                 ("op", Cow::Borrowed(op)),
                 ("result", Cow::Borrowed("success")),
             ]),
             error_duration: duration.recorder([
-                ("shard", shard.0.clone()),
+                ("store_type", store_type.0.clone()),
                 ("op", Cow::Borrowed(op)),
                 ("result", Cow::Borrowed("error")),
             ]),
@@ -96,7 +96,7 @@ struct MetricsWithBytes {
 }
 
 impl MetricsWithBytes {
-    fn new(registry: &metric::Registry, shard: &ShardName, op: &'static str) -> Self {
+    fn new(registry: &metric::Registry, store_type: &StoreType, op: &'static str) -> Self {
         // Byte counts up/down
         let bytes = registry.register_metric::<U64Counter>(
             "object_store_transfer_bytes",
@@ -104,14 +104,14 @@ impl MetricsWithBytes {
         );
 
         Self {
-            inner: Metrics::new(registry, shard, op),
+            inner: Metrics::new(registry, store_type, op),
             success_bytes: bytes.recorder([
-                ("shard", shard.0.clone()),
+                ("store_type", store_type.0.clone()),
                 ("op", Cow::Borrowed(op)),
                 ("result", Cow::Borrowed("success")),
             ]),
             error_bytes: bytes.recorder([
-                ("shard", shard.0.clone()),
+                ("store_type", store_type.0.clone()),
                 ("op", Cow::Borrowed(op)),
                 ("result", Cow::Borrowed("error")),
             ]),
@@ -136,6 +136,60 @@ impl MetricsWithBytes {
 }
 
 #[derive(Debug, Clone)]
+struct MetricsWithBytesAndTtfb {
+    inner: MetricsWithBytes,
+    success_duration: DurationHistogram,
+    error_duration: DurationHistogram,
+}
+
+impl MetricsWithBytesAndTtfb {
+    fn new(registry: &metric::Registry, store_type: &StoreType, op: &'static str) -> Self {
+        // Call durations broken down by op & result
+        let duration: Metric<DurationHistogram> = registry.register_metric(
+            "object_store_op_ttfb",
+            "Time to first byte for object store operation",
+        );
+
+        Self {
+            inner: MetricsWithBytes::new(registry, store_type, op),
+            success_duration: duration.recorder([
+                ("store_type", store_type.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("success")),
+            ]),
+            error_duration: duration.recorder([
+                ("store_type", store_type.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed("error")),
+            ]),
+        }
+    }
+
+    fn record_bytes_only(&self, success: bool, bytes: u64) {
+        self.inner.record_bytes_only(success, bytes);
+    }
+
+    fn record(
+        &self,
+        t_begin: Time,
+        t_first_byte: Time,
+        t_end: Time,
+        success: bool,
+        bytes: Option<u64>,
+    ) {
+        if let Some(delta) = t_first_byte.checked_duration_since(t_begin) {
+            if success {
+                self.success_duration.record(delta);
+            } else {
+                self.error_duration.record(delta);
+            }
+        }
+
+        self.inner.record(t_begin, t_end, success, bytes);
+    }
+}
+
+#[derive(Debug, Clone)]
 struct MetricsWithCount {
     inner: Metrics,
     success_count: U64Counter,
@@ -143,21 +197,21 @@ struct MetricsWithCount {
 }
 
 impl MetricsWithCount {
-    fn new(registry: &metric::Registry, shard: &ShardName, op: &'static str) -> Self {
+    fn new(registry: &metric::Registry, store_type: &StoreType, op: &'static str) -> Self {
         let count = registry.register_metric::<U64Counter>(
             "object_store_transfer_objects",
             "cumulative count of objects transferred to/from the object store",
         );
 
         Self {
-            inner: Metrics::new(registry, shard, op),
+            inner: Metrics::new(registry, store_type, op),
             success_count: count.recorder([
-                ("shard", shard.0.clone()),
+                ("store_type", store_type.0.clone()),
                 ("op", Cow::Borrowed(op)),
                 ("result", Cow::Borrowed("success")),
             ]),
             error_count: count.recorder([
-                ("shard", shard.0.clone()),
+                ("store_type", store_type.0.clone()),
                 ("op", Cow::Borrowed(op)),
                 ("result", Cow::Borrowed("error")),
             ]),
@@ -235,7 +289,7 @@ pub struct ObjectStoreMetrics {
     put: MetricsWithBytes,
     put_multipart: Arc<MetricsWithBytes>,
     inprogress_multipart: Mutex<JoinSet<()>>,
-    get: MetricsWithBytes,
+    get: MetricsWithBytesAndTtfb,
     get_range: MetricsWithBytes,
     get_ranges: MetricsWithBytes,
     head: Metrics,
@@ -255,31 +309,39 @@ impl ObjectStoreMetrics {
     pub fn new(
         inner: Arc<dyn ObjectStore>,
         time_provider: Arc<dyn TimeProvider>,
-        shard: impl Into<ShardName>,
+        store_type: impl Into<StoreType>,
         registry: &metric::Registry,
     ) -> Self {
-        let shard = shard.into();
+        let store_type = store_type.into();
 
         Self {
             inner,
             time_provider,
 
-            put: MetricsWithBytes::new(registry, &shard, "put"),
-            put_multipart: Arc::new(MetricsWithBytes::new(registry, &shard, "put_multipart")),
+            put: MetricsWithBytes::new(registry, &store_type, "put"),
+            put_multipart: Arc::new(MetricsWithBytes::new(
+                registry,
+                &store_type,
+                "put_multipart",
+            )),
             inprogress_multipart: Default::default(),
-            get: MetricsWithBytes::new(registry, &shard, "get"),
-            get_range: MetricsWithBytes::new(registry, &shard, "get_range"),
-            get_ranges: MetricsWithBytes::new(registry, &shard, "get_ranges"),
-            head: Metrics::new(registry, &shard, "head"),
-            delete: Metrics::new(registry, &shard, "delete"),
-            delete_stream: MetricsWithCount::new(registry, &shard, "delete_stream"),
-            list: MetricsWithCount::new(registry, &shard, "list"),
-            list_with_offset: MetricsWithCount::new(registry, &shard, "list_with_offset"),
-            list_with_delimiter: MetricsWithCount::new(registry, &shard, "list_with_delimiter"),
-            copy: Metrics::new(registry, &shard, "copy"),
-            rename: Metrics::new(registry, &shard, "rename"),
-            copy_if_not_exists: Metrics::new(registry, &shard, "copy_if_not_exists"),
-            rename_if_not_exists: Metrics::new(registry, &shard, "rename_if_not_exists"),
+            get: MetricsWithBytesAndTtfb::new(registry, &store_type, "get"),
+            get_range: MetricsWithBytes::new(registry, &store_type, "get_range"),
+            get_ranges: MetricsWithBytes::new(registry, &store_type, "get_ranges"),
+            head: Metrics::new(registry, &store_type, "head"),
+            delete: Metrics::new(registry, &store_type, "delete"),
+            delete_stream: MetricsWithCount::new(registry, &store_type, "delete_stream"),
+            list: MetricsWithCount::new(registry, &store_type, "list"),
+            list_with_offset: MetricsWithCount::new(registry, &store_type, "list_with_offset"),
+            list_with_delimiter: MetricsWithCount::new(
+                registry,
+                &store_type,
+                "list_with_delimiter",
+            ),
+            copy: Metrics::new(registry, &store_type, "copy"),
+            rename: Metrics::new(registry, &store_type, "rename"),
+            copy_if_not_exists: Metrics::new(registry, &store_type, "copy_if_not_exists"),
+            rename_if_not_exists: Metrics::new(registry, &store_type, "rename_if_not_exists"),
         }
     }
 
@@ -345,8 +407,12 @@ impl ObjectStore for ObjectStoreMetrics {
                         let size = file.metadata().await.ok().map(|m| m.len());
                         let file = file.into_std().await;
 
-                        self.get
-                            .record(started_at, self.time_provider.now(), true, size);
+                        let end = self.time_provider.now();
+                        self.get.record(
+                            started_at,
+                            // first byte wasn't really measured, so take "end" instead
+                            end, end, true, size,
+                        );
                         GetResultPayload::File(file, path)
                     }
                     GetResultPayload::Stream(s) => {
@@ -357,6 +423,7 @@ impl ObjectStore for ObjectStoreMetrics {
                                 s,
                                 started_at,
                                 BytesStreamDelegate::new(self.get.clone()),
+                                Arc::clone(&self.time_provider),
                             )
                             .fuse(),
                         )))
@@ -365,8 +432,8 @@ impl ObjectStore for ObjectStoreMetrics {
                 Ok(res)
             }
             Err(e) => {
-                self.get
-                    .record(started_at, self.time_provider.now(), false, None);
+                let end = self.time_provider.now();
+                self.get.record(started_at, end, end, false, None);
                 Err(e)
             }
         }
@@ -426,6 +493,7 @@ impl ObjectStore for ObjectStoreMetrics {
             s,
             started_at,
             CountStreamDelegate::new(self.delete_stream.clone()),
+            Arc::clone(&self.time_provider),
         )
         .fuse()
         .boxed()
@@ -438,9 +506,14 @@ impl ObjectStore for ObjectStoreMetrics {
 
         // Wrap the object store data stream in a decorator to track the
         // yielded data / wall clock, inclusive of the inner call above.
-        StreamMetricRecorder::new(s, started_at, CountStreamDelegate::new(self.list.clone()))
-            .fuse()
-            .boxed()
+        StreamMetricRecorder::new(
+            s,
+            started_at,
+            CountStreamDelegate::new(self.list.clone()),
+            Arc::clone(&self.time_provider),
+        )
+        .fuse()
+        .boxed()
     }
 
     fn list_with_offset(
@@ -458,6 +531,7 @@ impl ObjectStore for ObjectStoreMetrics {
             s,
             started_at,
             CountStreamDelegate::new(self.list_with_offset.clone()),
+            Arc::clone(&self.time_provider),
         )
         .fuse()
         .boxed()
@@ -513,10 +587,10 @@ trait MetricDelegate {
     type Item;
 
     /// Invoked when the stream yields an `Ok(Item)`.
-    fn observe_ok(&self, value: &Self::Item);
+    fn observe_ok(&mut self, value: &Self::Item, t: Time);
 
     /// Finish stream.
-    fn finish(&self, t_begin: Time, t_end: Time, success: bool);
+    fn finish(&mut self, t_begin: Time, t_end: Time, success: bool);
 }
 
 /// A [`MetricDelegate`] for instrumented streams of [`Bytes`].
@@ -524,23 +598,39 @@ trait MetricDelegate {
 /// This impl is used to record the number of bytes yielded for
 /// [`ObjectStore::get()`] calls.
 #[derive(Debug)]
-struct BytesStreamDelegate(MetricsWithBytes);
+struct BytesStreamDelegate {
+    metrics: MetricsWithBytesAndTtfb,
+    first_byte: Option<Time>,
+}
 
 impl BytesStreamDelegate {
-    fn new(metrics: MetricsWithBytes) -> Self {
-        Self(metrics)
+    fn new(metrics: MetricsWithBytesAndTtfb) -> Self {
+        Self {
+            metrics,
+            first_byte: None,
+        }
     }
 }
 
 impl MetricDelegate for BytesStreamDelegate {
     type Item = Bytes;
 
-    fn observe_ok(&self, bytes: &Self::Item) {
-        self.0.record_bytes_only(true, bytes.len() as _);
+    fn observe_ok(&mut self, bytes: &Self::Item, t: Time) {
+        if self.first_byte.is_none() {
+            self.first_byte = Some(t);
+        }
+
+        self.metrics.record_bytes_only(true, bytes.len() as _);
     }
 
-    fn finish(&self, t_begin: Time, t_end: Time, success: bool) {
-        self.0.record(t_begin, t_end, success, None);
+    fn finish(&mut self, t_begin: Time, t_end: Time, success: bool) {
+        self.metrics.record(
+            t_begin,
+            self.first_byte.unwrap_or(t_end),
+            t_end,
+            success,
+            None,
+        );
     }
 }
 
@@ -556,11 +646,11 @@ impl<T> CountStreamDelegate<T> {
 impl<T> MetricDelegate for CountStreamDelegate<T> {
     type Item = T;
 
-    fn observe_ok(&self, _value: &Self::Item) {
+    fn observe_ok(&mut self, _value: &Self::Item, _t: Time) {
         self.0.record_count_only(true, 1);
     }
 
-    fn finish(&self, t_begin: Time, t_end: Time, success: bool) {
+    fn finish(&mut self, t_begin: Time, t_end: Time, success: bool) {
         self.0.record(t_begin, t_end, success, None);
     }
 }
@@ -581,15 +671,14 @@ impl<T> MetricDelegate for CountStreamDelegate<T> {
 /// error only if the last poll performed by the caller returned an error.
 #[derive(Debug)]
 #[pin_project(PinnedDrop)]
-struct StreamMetricRecorder<S, D, P = SystemProvider>
+struct StreamMetricRecorder<S, D>
 where
-    P: TimeProvider,
     D: MetricDelegate,
 {
     #[pin]
     inner: S,
 
-    time_provider: P,
+    time_provider: Arc<dyn TimeProvider>,
 
     // The timestamp at which the read request began, inclusive of the work
     // required to acquire the inner stream (which may involve fetching all the
@@ -622,8 +711,12 @@ where
     S: Stream,
     D: MetricDelegate,
 {
-    fn new(stream: S, started_at: Time, metric_delegate: D) -> Self {
-        let time_provider = SystemProvider::default();
+    fn new(
+        stream: S,
+        started_at: Time,
+        metric_delegate: D,
+        time_provider: Arc<dyn TimeProvider>,
+    ) -> Self {
         Self {
             inner: stream,
 
@@ -643,10 +736,9 @@ where
     }
 }
 
-impl<S, T, D, P, E> Stream for StreamMetricRecorder<S, D, P>
+impl<S, T, D, E> Stream for StreamMetricRecorder<S, D>
 where
     S: Stream<Item = Result<T, E>>,
-    P: TimeProvider,
     D: MetricDelegate<Item = T>,
 {
     type Item = S::Item;
@@ -658,11 +750,13 @@ where
 
         match res {
             Poll::Ready(Some(Ok(value))) => {
+                let now = this.time_provider.now();
+
                 *this.last_call_ok = true;
-                *this.last_yielded_at.as_mut().unwrap() = this.time_provider.now();
+                *this.last_yielded_at.as_mut().unwrap() = now;
 
                 // Allow the pluggable metric delegate to record the value of T
-                this.metric_delegate.observe_ok(&value);
+                this.metric_delegate.observe_ok(&value, now);
 
                 Poll::Ready(Some(Ok(value)))
             }
@@ -696,17 +790,18 @@ where
 }
 
 #[pinned_drop]
-impl<S, D, P> PinnedDrop for StreamMetricRecorder<S, D, P>
+impl<S, D> PinnedDrop for StreamMetricRecorder<S, D>
 where
-    P: TimeProvider,
     D: MetricDelegate,
 {
     fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+
         // Only emit metrics if the end of the stream was not observed (and
         // therefore last_yielded_at is still Some).
-        if let Some(last) = self.last_yielded_at {
-            self.metric_delegate
-                .finish(self.started_at, last, self.last_call_ok);
+        if let Some(last) = this.last_yielded_at {
+            this.metric_delegate
+                .finish(*this.started_at, *last, *this.last_call_ok);
         }
     }
 }
@@ -721,6 +816,7 @@ mod tests {
     };
 
     use futures::{stream, FutureExt, TryStreamExt};
+    use iox_time::{MockProvider, SystemProvider};
     use metric::Attributes;
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -798,13 +894,21 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "put"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "put"),
+                ("result", "success"),
+            ],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "put"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "put"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -826,13 +930,21 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "put"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "put"),
+                ("result", "error"),
+            ],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "put"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "put"),
+                ("result", "error"),
+            ],
         );
     }
 
@@ -863,7 +975,7 @@ mod tests {
             &metrics,
             "object_store_transfer_bytes",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "success"),
             ],
@@ -873,7 +985,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "success"),
             ],
@@ -978,7 +1090,7 @@ mod tests {
             &metrics,
             "object_store_transfer_bytes",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "error"),
             ],
@@ -988,7 +1100,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "error"),
             ],
@@ -1109,7 +1221,7 @@ mod tests {
             &metrics,
             "object_store_transfer_bytes",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "error"),
             ],
@@ -1119,7 +1231,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "error"),
             ],
@@ -1153,7 +1265,7 @@ mod tests {
             &metrics,
             "object_store_transfer_bytes",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "error"),
             ],
@@ -1163,7 +1275,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "put_multipart"),
                 ("result", "error"),
             ],
@@ -1190,13 +1302,21 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_objects",
-            [("shard", "bananas"), ("op", "list"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "list"),
+                ("result", "success"),
+            ],
             2,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "list"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "list"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1229,7 +1349,7 @@ mod tests {
             &metrics,
             "object_store_transfer_objects",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "list_with_offset"),
                 ("result", "success"),
             ],
@@ -1239,7 +1359,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "list_with_offset"),
                 ("result", "success"),
             ],
@@ -1249,7 +1369,11 @@ mod tests {
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "list"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "list"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1268,7 +1392,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "list"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "list"),
+                ("result", "error"),
+            ],
         );
     }
 
@@ -1288,7 +1416,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "list_with_delimiter"),
                 ("result", "success"),
             ],
@@ -1314,7 +1442,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "list_with_delimiter"),
                 ("result", "error"),
             ],
@@ -1336,7 +1464,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "head"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "head"),
+                ("result", "error"),
+            ],
         );
     }
 
@@ -1355,7 +1487,20 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "get"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "error"),
+            ],
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_ttfb",
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "error"),
+            ],
         );
     }
 
@@ -1375,7 +1520,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "get_range"),
                 ("result", "error"),
             ],
@@ -1402,7 +1547,7 @@ mod tests {
             &metrics,
             "object_store_transfer_bytes",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "get_ranges"),
                 ("result", "success"),
             ],
@@ -1412,7 +1557,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "get_ranges"),
                 ("result", "success"),
             ],
@@ -1423,7 +1568,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "get_range"),
                 ("result", "success"),
             ],
@@ -1449,7 +1594,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "copy"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "copy"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1473,7 +1622,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "copy_if_not_exists"),
                 ("result", "success"),
             ],
@@ -1500,7 +1649,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "rename"),
                 ("result", "success"),
             ],
@@ -1510,13 +1659,17 @@ mod tests {
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "copy"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "copy"),
+                ("result", "success"),
+            ],
         );
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "delete"),
                 ("result", "success"),
             ],
@@ -1543,7 +1696,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "rename_if_not_exists"),
                 ("result", "success"),
             ],
@@ -1553,13 +1706,17 @@ mod tests {
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "copy"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "copy"),
+                ("result", "success"),
+            ],
         );
         assert_histogram_not_hit(
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "copy_if_not_exists"),
                 ("result", "success"),
             ],
@@ -1568,7 +1725,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "delete"),
                 ("result", "success"),
             ],
@@ -1608,7 +1765,7 @@ mod tests {
             &metrics,
             "object_store_transfer_objects",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "delete_stream"),
                 ("result", "success"),
             ],
@@ -1618,7 +1775,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "delete_stream"),
                 ("result", "success"),
             ],
@@ -1629,7 +1786,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "delete"),
                 ("result", "success"),
             ],
@@ -1666,13 +1823,21 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "get"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "success"),
+            ],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "get"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "success"),
+            ],
         );
 
         store
@@ -1683,7 +1848,7 @@ mod tests {
             &metrics,
             "object_store_transfer_bytes",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "get_range"),
                 ("result", "success"),
             ],
@@ -1693,7 +1858,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "get_range"),
                 ("result", "success"),
             ],
@@ -1703,7 +1868,11 @@ mod tests {
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "head"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "head"),
+                ("result", "success"),
+            ],
         );
 
         store
@@ -1714,7 +1883,7 @@ mod tests {
             &metrics,
             "object_store_op_duration",
             [
-                ("shard", "bananas"),
+                ("store_type", "bananas"),
                 ("op", "delete"),
                 ("result", "success"),
             ],
@@ -1744,13 +1913,30 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "get"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "success"),
+            ],
             5,
         );
         assert_histogram_hit(
             &metrics,
             "object_store_op_duration",
-            [("shard", "bananas"), ("op", "get"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "success"),
+            ],
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_ttfb",
+            [
+                ("store_type", "bananas"),
+                ("op", "get"),
+                ("result", "success"),
+            ],
         );
     }
 
@@ -1768,16 +1954,22 @@ mod tests {
             .collect::<Vec<Result<_, std::io::Error>>>(),
         );
 
-        let time_provider = SystemProvider::default();
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_millis(0).unwrap()));
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
+        let m = MetricsWithBytesAndTtfb::new(&metrics, &StoreType("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
             time_provider.now(),
             BytesStreamDelegate::new(m.clone()),
+            Arc::clone(&time_provider) as _,
         );
+
+        // Sleep at least 10ms to assert the recorder to captures the wall clock
+        // time.
+        const SLEEP: Duration = Duration::from_millis(20);
+        time_provider.inc(SLEEP);
 
         let got = stream
             .next()
@@ -1788,14 +1980,17 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             1,
         );
 
         // Sleep at least 10ms to assert the recorder to captures the wall clock
         // time.
-        const SLEEP: Duration = Duration::from_millis(20);
-        tokio::time::sleep(SLEEP).await;
+        time_provider.inc(SLEEP);
 
         let got = stream
             .next()
@@ -1806,15 +2001,21 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             4,
         );
 
-        let success_hist = &m.inner.success_duration;
+        let success_hist = &m.inner.inner.success_duration;
+        let ttfb_hist = &m.success_duration;
 
         // Until the stream is fully consumed, there should be no wall clock
         // metrics emitted.
         assert!(!success_hist.fetch().buckets.iter().any(|b| b.count > 0));
+        assert!(!ttfb_hist.fetch().buckets.iter().any(|b| b.count > 0));
 
         // The stream should complete and cause metrics to be emitted.
         assert!(stream.next().await.is_none());
@@ -1826,31 +2027,43 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             4,
         );
 
-        // And it must be in a SLEEP or higher bucket.
-        let hit_count: u64 = success_hist
-            .fetch()
-            .buckets
-            .iter()
-            .skip_while(|b| b.le < SLEEP) // Skip buckets less than the sleep duration
-            .map(|v| v.count)
-            .sum();
+        // Wall clock duration it must be in a total SLEEP.
+        let hit_count = success_hist.fetch().sample_count();
+        assert_eq!(hit_count, 1, "wall clock duration not recorded correctly");
+        let d = success_hist.fetch().total;
+        assert_eq!(d, SLEEP * 2, "wall clock duration not recorded correctly");
+
+        // TTFB after first sleep
+        let hit_count = ttfb_hist.fetch().sample_count();
         assert_eq!(
             hit_count, 1,
-            "wall clock duration not recorded in correct bucket"
+            "ttfb wall clock duration not recorded correctly"
         );
+        let d = ttfb_hist.fetch().total;
+        assert_eq!(d, SLEEP, "ttfb wall clock duration not recorded correctly");
 
         // Metrics must not be duplicated when the decorator is dropped
         drop(stream);
         let hit_count = success_hist.fetch().sample_count();
         assert_eq!(hit_count, 1, "wall clock duration duplicated");
+        let hit_count = ttfb_hist.fetch().sample_count();
+        assert_eq!(hit_count, 1, "ttfb duration duplicated");
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             4,
         );
     }
@@ -1869,15 +2082,16 @@ mod tests {
             .collect::<Vec<Result<_, std::io::Error>>>(),
         );
 
-        let time_provider = SystemProvider::default();
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_millis(0).unwrap()));
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
+        let m = MetricsWithBytesAndTtfb::new(&metrics, &StoreType("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
             time_provider.now(),
             BytesStreamDelegate::new(m.clone()),
+            Arc::clone(&time_provider) as _,
         );
 
         let got = stream
@@ -1889,28 +2103,36 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             1,
         );
 
         // Sleep at least 10ms to assert the recorder to captures the wall clock
         // time.
         const SLEEP: Duration = Duration::from_millis(20);
-        tokio::time::sleep(SLEEP).await;
+        time_provider.inc(SLEEP);
 
         // Drop the stream without consuming the rest of the data.
         drop(stream);
 
         // Now the stream is complete, the wall clock duration must have been
         // recorded.
-        let hit_count = m.inner.success_duration.fetch().sample_count();
+        let hit_count = m.inner.inner.success_duration.fetch().sample_count();
         assert_eq!(hit_count, 1, "wall clock duration recorded incorrectly");
 
         // And the number of bytes read must match the pre-drop value.
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             1,
         );
     }
@@ -1929,15 +2151,16 @@ mod tests {
             .collect::<Vec<Result<_, std::io::Error>>>(),
         );
 
-        let time_provider = SystemProvider::default();
+        let time_provider = Arc::new(SystemProvider::default());
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
+        let m = MetricsWithBytesAndTtfb::new(&metrics, &StoreType("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
             time_provider.now(),
             BytesStreamDelegate::new(m.clone()),
+            Arc::clone(&time_provider) as _,
         );
 
         let got = stream
@@ -1949,13 +2172,21 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             1,
         );
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "error"),
+            ],
             0,
         );
 
@@ -1969,20 +2200,28 @@ mod tests {
         drop(stream);
 
         // Ensure the wall clock was added to the "error" histogram.
-        let hit_count = m.inner.error_duration.fetch().sample_count();
+        let hit_count = m.inner.inner.error_duration.fetch().sample_count();
         assert_eq!(hit_count, 1, "wall clock duration recorded incorrectly");
 
         // And the number of bytes read must match
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             1,
         );
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "error")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "error"),
+            ],
             0,
         );
     }
@@ -2001,15 +2240,16 @@ mod tests {
             .collect::<Vec<Result<_, std::io::Error>>>(),
         );
 
-        let time_provider = SystemProvider::default();
+        let time_provider = Arc::new(SystemProvider::default());
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
+        let m = MetricsWithBytesAndTtfb::new(&metrics, &StoreType("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
             time_provider.now(),
             BytesStreamDelegate::new(m.clone()),
+            Arc::clone(&time_provider) as _,
         );
 
         let got = stream
@@ -2021,7 +2261,11 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             1,
         );
 
@@ -2040,7 +2284,11 @@ mod tests {
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             4,
         );
 
@@ -2049,14 +2297,23 @@ mod tests {
 
         // Ensure the wall clock was added to the "success" histogram after
         // progressing past the transient error.
-        let hit_count = m.inner.success_duration.fetch().sample_count();
+        let hit_count = m.inner.inner.success_duration.fetch().sample_count();
         assert_eq!(hit_count, 1, "wall clock duration recorded incorrectly");
+        let hit_count = m.success_duration.fetch().sample_count();
+        assert_eq!(
+            hit_count, 1,
+            "ttfb wall clock duration recorded incorrectly"
+        );
 
         // And the number of bytes read must match
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             4,
         );
     }
@@ -2071,29 +2328,39 @@ mod tests {
                 .collect::<Vec<Result<Bytes, std::io::Error>>>(),
         );
 
-        let time_provider = SystemProvider::default();
+        let time_provider = Arc::new(SystemProvider::default());
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
+        let m = MetricsWithBytesAndTtfb::new(&metrics, &StoreType("bananas".into()), "test");
 
         let stream = StreamMetricRecorder::new(
             inner,
             time_provider.now(),
             BytesStreamDelegate::new(m.clone()),
+            Arc::clone(&time_provider) as _,
         );
 
         // Drop immediately
         drop(stream);
 
         // Ensure the wall clock was added to the "success" histogram
-        let hit_count = m.inner.success_duration.fetch().sample_count();
+        let hit_count = m.inner.inner.success_duration.fetch().sample_count();
         assert_eq!(hit_count, 1, "wall clock duration recorded incorrectly");
+        let hit_count = m.success_duration.fetch().sample_count();
+        assert_eq!(
+            hit_count, 1,
+            "ttfb wall clock duration recorded incorrectly"
+        );
 
         // And the number of bytes read must match
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             0,
         );
     }
@@ -2107,29 +2374,39 @@ mod tests {
                 .collect::<Vec<Result<Bytes, std::io::Error>>>(),
         );
 
-        let time_provider = SystemProvider::default();
+        let time_provider = Arc::new(SystemProvider::default());
 
         let metrics = Arc::new(metric::Registry::default());
-        let m = MetricsWithBytes::new(&metrics, &ShardName("bananas".into()), "test");
+        let m = MetricsWithBytesAndTtfb::new(&metrics, &StoreType("bananas".into()), "test");
 
         let mut stream = StreamMetricRecorder::new(
             inner,
             time_provider.now(),
             BytesStreamDelegate::new(m.clone()),
+            Arc::clone(&time_provider) as _,
         );
 
         assert!(stream.next().await.is_none());
 
         // Ensure the wall clock was added to the "success" histogram even
         // though it yielded no data.
-        let hit_count = m.inner.success_duration.fetch().sample_count();
+        let hit_count = m.inner.inner.success_duration.fetch().sample_count();
         assert_eq!(hit_count, 1, "wall clock duration recorded incorrectly");
+        let hit_count = m.success_duration.fetch().sample_count();
+        assert_eq!(
+            hit_count, 1,
+            "ttfb wall clock duration recorded incorrectly"
+        );
 
         // And the number of bytes read must match
         assert_counter_value(
             &metrics,
             "object_store_transfer_bytes",
-            [("shard", "bananas"), ("op", "test"), ("result", "success")],
+            [
+                ("store_type", "bananas"),
+                ("op", "test"),
+                ("result", "success"),
+            ],
             0,
         );
     }

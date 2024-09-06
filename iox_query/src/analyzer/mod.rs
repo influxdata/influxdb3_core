@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use datafusion::execution::context::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 
 use self::{extract_sleep::ExtractSleep, handle_gapfill::HandleGapFill};
 
@@ -11,10 +11,8 @@ pub use handle_gapfill::range_predicate;
 /// Register IOx-specific [`AnalyzerRule`]s with the SessionContext
 ///
 /// [`AnalyzerRule`]: datafusion::optimizer::AnalyzerRule
-pub fn register_iox_analyzers(mut state: SessionState) -> SessionState {
-    state.add_analyzer_rule(Arc::new(ExtractSleep::new()));
-
+pub fn register_iox_analyzers(state: SessionStateBuilder) -> SessionStateBuilder {
     state
-        .add_analyzer_rule(Arc::new(HandleGapFill::new()))
-        .clone()
+        .with_analyzer_rule(Arc::new(ExtractSleep::new()))
+        .with_analyzer_rule(Arc::new(HandleGapFill::new()))
 }

@@ -2,15 +2,12 @@
 //!
 //! AKA it is a Mock
 
-use crate::query_log::QueryLogEntries;
 use crate::{
-    exec::{
-        stringset::{StringSet, StringSetRef},
-        Executor, IOxSessionContext, QueryConfig,
-    },
+    exec::{Executor, IOxSessionContext, QueryConfig},
     pruning::prune_chunks,
-    query_log::{QueryLog, StateReceived},
-    QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace, QueryText,
+    query_log::{QueryLog, QueryLogEntries, StateReceived},
+    Extension, QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace,
+    QueryText,
 };
 use arrow::array::{BooleanArray, Float64Array};
 use arrow::datatypes::SchemaRef;
@@ -25,11 +22,13 @@ use async_trait::async_trait;
 use data_types::{ChunkId, ChunkOrder, NamespaceId, PartitionKey, TableId, TransitionPartitionId};
 use datafusion::common::stats::Precision;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::{catalog::schema::SchemaProvider, logical_expr::LogicalPlan};
 use datafusion::{catalog::CatalogProvider, physical_plan::displayable};
+use datafusion::{
+    catalog::{SchemaProvider, Session},
+    logical_expr::LogicalPlan,
+};
 use datafusion::{
     datasource::{object_store::ObjectStoreUrl, TableProvider, TableType},
     physical_plan::{ColumnStatistics, Statistics as DataFusionStatistics},
@@ -47,7 +46,7 @@ use schema::{
 };
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     num::NonZeroU64,
     sync::Arc,
@@ -136,7 +135,7 @@ pub struct TestDatabase {
     partitions: Mutex<BTreeMap<String, BTreeMap<ChunkId, Arc<TestChunk>>>>,
 
     /// `column_names` to return upon next request
-    column_names: Arc<Mutex<Option<StringSetRef>>>,
+    column_names: Arc<Mutex<Option<BTreeSet<String>>>>,
 
     /// The predicate passed to the most recent call to `chunks()`
     chunks_predicate: Mutex<Vec<Expr>>,
@@ -186,8 +185,7 @@ impl TestDatabase {
     /// Set the list of column names that will be returned on a call to
     /// column_names
     pub fn set_column_names(&self, column_names: Vec<String>) {
-        let column_names = column_names.into_iter().collect::<StringSet>();
-        let column_names = Arc::new(column_names);
+        let column_names = column_names.into_iter().collect::<BTreeSet<String>>();
 
         *Arc::clone(&self.column_names).lock() = Some(column_names)
     }
@@ -253,8 +251,9 @@ impl QueryNamespace for TestDatabase {
         )
     }
 
-    fn new_query_context(
+    fn new_extended_query_context(
         &self,
+        extension: Arc<dyn Extension>,
         span_ctx: Option<SpanContext>,
         query_config: Option<&QueryConfig>,
     ) -> IOxSessionContext {
@@ -266,6 +265,18 @@ impl QueryNamespace for TestDatabase {
                 self,
             )))
             .with_span_context(span_ctx);
+        if let Some(planner) = extension.planner() {
+            cmd = cmd.with_extension_planner(planner);
+        }
+        for analyzer_rule in extension.analyzer_rules() {
+            cmd = cmd.with_analyzer_rule(analyzer_rule);
+        }
+        for optimizer_rule in extension.optimizer_rules() {
+            cmd = cmd.with_optimizer_rule(optimizer_rule);
+        }
+        for physical_optimizer_rule in extension.physical_optimizer_rules() {
+            cmd = cmd.with_physical_optimizer_rule(physical_optimizer_rule);
+        }
         if let Some(query_config) = query_config {
             cmd = cmd.with_query_config(query_config);
         }
@@ -365,7 +376,7 @@ impl TableProvider for TestDatabaseTableProvider {
 
     async fn scan(
         &self,
-        _ctx: &SessionState,
+        _ctx: &dyn Session,
         _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,

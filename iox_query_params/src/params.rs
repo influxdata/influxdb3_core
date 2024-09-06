@@ -254,7 +254,7 @@ impl TryFrom<RecordBatch> for StatementParams {
     fn try_from(batch: RecordBatch) -> Result<Self, Self::Error> {
         let mut params = HashMap::with_capacity(batch.num_columns());
         let schema = batch.schema();
-        for field in schema.all_fields() {
+        for field in schema.flattened_fields() {
             params.insert(
                 field.name().clone(),
                 StatementParam::try_from(Arc::clone(&batch[field.name()]))?,

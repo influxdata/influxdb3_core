@@ -1,4 +1,6 @@
-use data_types::{NamespaceId, PartitionHashId, PartitionId, TableId, TransitionPartitionId};
+use data_types::{
+    NamespaceId, PartitionHashId, PartitionHashIdError, PartitionId, TableId, TransitionPartitionId,
+};
 use futures_util::TryStreamExt;
 use influxdb_iox_client::{
     catalog::{
@@ -55,10 +57,14 @@ pub enum ExportError {
 type Result<T, E = ExportError> = std::result::Result<T, E>;
 
 enum DesiredFiles {
+    /// Export files which are current
     AllCurrent,
+    /// Export a subset of current files
     SubsetCurrent(Vec<ParquetFile>),
-    AllVersions,
-    SubsetVersions(HashSet<String /* object_store uuid */>),
+    /// Export files, including both current and soft deleted
+    AllExisting,
+    /// Export a subset of files, including both current and soft deleted
+    SubsetExisting(HashSet<String /* object_store uuid */>),
 }
 
 /// Exports data from a remote IOx instance to local files.
@@ -114,7 +120,7 @@ impl RemoteExporter {
         // Determine which files are sought.
         let desired_files = match (file_uuids, include_deleted) {
             (None, false) => DesiredFiles::AllCurrent,
-            (None, true) => DesiredFiles::AllVersions,
+            (None, true) => DesiredFiles::AllExisting,
             (Some(file_uuids), false) => {
                 let len = file_uuids.len();
                 let (in_catalog, _) = self
@@ -149,7 +155,7 @@ impl RemoteExporter {
                     // do the less expensive retrieval
                     DesiredFiles::SubsetCurrent(in_catalog)
                 } else {
-                    DesiredFiles::SubsetVersions(HashSet::from_iter(
+                    DesiredFiles::SubsetExisting(HashSet::from_iter(
                         file_uuids.into_iter().map(|uuid| format!("{uuid}.parquet")),
                     ))
                 }
@@ -175,11 +181,11 @@ impl RemoteExporter {
     /// table. Overwrites existing files, if any, to ensure it has the
     /// latest catalog information.
     ///
-    /// 1. `<output_directory>/table.<partition_id>.json`: pbjson
-    /// encoded data about the table (minimal now)
+    /// 1. `<output_directory>/table.<partition_id>.json`: pbjson encoded data about the table
+    ///    (minimal now)
     ///
-    /// 2. `<output_directory>/partition.<partition_id>.json`: pbjson
-    /// encoded data for each partition
+    /// 2. `<output_directory>/partition.<partition_id>.json`: pbjson encoded data for each
+    ///    partition
     async fn export_table_metadata(
         &mut self,
         output_directory: &Path,
@@ -250,8 +256,8 @@ impl RemoteExporter {
     /// whether or not exists in the catalog for a given table
     /// (or partition if narrowed to partition scope).
     ///
-    /// If the files do NOT exist in the catalog, they will be presumed as existing
-    /// as versioned within the table or partition [`object_store::path::Path`].
+    /// If the files do NOT exist in the iox_catalog (e.g. mya be soft deleted),
+    /// they will be presumed as existing within the store.
     async fn determine_source_of_file_uuids(
         &mut self,
         namespace_name: &String,
@@ -327,10 +333,10 @@ impl RemoteExporter {
                     .await?;
                 }
             }
-            DesiredFiles::AllVersions => {
-                println!("exporting all versioned Parquet files (total count unknown)...");
+            DesiredFiles::AllExisting => {
+                println!("exporting all existing Parquet files (total count unknown)...");
 
-                self.export_versioned_objects_at_path(
+                self.export_existing_objects_at_path(
                     &output_directory,
                     None,
                     namespace_id,
@@ -339,11 +345,11 @@ impl RemoteExporter {
                 )
                 .await?;
             }
-            DesiredFiles::SubsetVersions(files) => {
+            DesiredFiles::SubsetExisting(files) => {
                 let total_num_files = files.len();
                 println!("found {total_num_files} Parquet files, exporting...");
 
-                self.export_versioned_objects_at_path(
+                self.export_existing_objects_at_path(
                     &output_directory,
                     Some(files),
                     namespace_id,
@@ -361,6 +367,8 @@ impl RemoteExporter {
     /// 1. `<output_directory>/<uuid>.parquet`: The parquet bytes
     ///
     /// 2. `<output_directory>/<uuid>.parquet.json`: pbjson encoded `ParquetFile` metadata
+    ///
+    /// Performs a catalog request (within the object store grpc service), per file.
     async fn export_parquet_file(
         &mut self,
         output_directory: &Path,
@@ -398,9 +406,11 @@ impl RemoteExporter {
                     "downloading file {} of {num_parquet_files} ({filename})...",
                     index + 1
                 );
+
+                let store_location = to_store_path(parquet_file)?;
                 let mut response = self
                     .store_client
-                    .get_parquet_file_by_object_store_id(uuid.clone())
+                    .get_parquet_file_by_object_store_path(store_location.to_string(), None)
                     .await?
                     .map_ok(|res| res.data)
                     .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
@@ -414,10 +424,12 @@ impl RemoteExporter {
         Ok(())
     }
 
-    /// From a given [`Partition`], export a given set of filenames (`{uuid}.parquet`) to:
+    /// From a given table, or [`Partition`], export a given set of filenames (`{uuid}.parquet`) to:
     ///
     /// 1. `<output_directory>/<uuid>.parquet`: The parquet bytes
-    async fn export_versioned_objects_at_path(
+    ///
+    /// Exports if existing in the object store path, which catalog requests.
+    async fn export_existing_objects_at_path(
         &mut self,
         output_directory: &Path,
         filenames: Option<HashSet<String>>,
@@ -459,12 +471,12 @@ impl RemoteExporter {
             }
         };
 
-        let mut versioned_objects_exporter =
-            ExportVersionedObjects::try_new(filenames, path_filter, self.store_client.clone())
+        let mut existing_objects_exporter =
+            ExportExistingObjects::try_new(filenames, path_filter, self.store_client.clone())
                 .await?;
 
         let mut index = 1;
-        while let Ok(Some(filename)) = versioned_objects_exporter
+        while let Ok(Some(filename)) = existing_objects_exporter
             .export_next(output_directory)
             .await
         {
@@ -472,7 +484,7 @@ impl RemoteExporter {
             index += 1;
         }
 
-        let not_found = versioned_objects_exporter.objects_wanted();
+        let not_found = existing_objects_exporter.objects_wanted();
         if !not_found.is_empty() {
             return Err(ExportError::InvalidArg(format!(
                 "requested uuids which do not exist in remote store: {:?}",
@@ -499,6 +511,29 @@ fn to_partition_id(partition_identifier: Option<&PartitionIdentifier>) -> Transi
     }
 }
 
+fn to_store_path(file: &ParquetFile) -> Result<object_store::path::Path> {
+    let ParquetFile {
+        namespace_id,
+        table_id,
+        partition_hash_id,
+        partition_id,
+        object_store_id,
+        ..
+    } = file;
+    let partition_hash_id: PartitionHashId = partition_hash_id[..]
+        .try_into()
+        .map_err(|e: PartitionHashIdError| ExportError::Internal(e.to_string()))?;
+
+    Ok(object_store::path::Path::from_iter([
+        &format!("{}", namespace_id),
+        &format!("{}", table_id),
+        TransitionPartitionId::from_parts(PartitionId::new(*partition_id), Some(partition_hash_id))
+            .to_string()
+            .as_str(),
+        &format!("{}.parquet", object_store_id),
+    ]))
+}
+
 /// writes the contents of a string to a file, overwriting the previous contents, if any
 async fn write_string_to_file(contents: &str, path: &Path) -> Result<()> {
     let mut file = OpenOptions::new()
@@ -513,14 +548,17 @@ async fn write_string_to_file(contents: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Export versioned objects from a given store prefix.
+/// Export existing objects from a given store prefix.
 ///
-/// This exporter collects all the versions once (scoped down to a given
+/// This exporter collects all the existing objects once (scoped down to a given
 /// prefix path), and determines if any are within the desired set.
-struct ExportVersionedObjects {
+///
+/// Does not explicitly support versioned objects. Instead, it supports whichever
+/// objects exist within the [`object_store::ObjectStore::list()`] request.
+struct ExportExistingObjects {
     /// Given objects to export, if located at path_prefix.
     ///
-    /// If none, then export all versioned objects at path.
+    /// If none, then export all exisitng objects at path.
     objects_wanted: Option<HashSet<String /* filename = `uuid.parquet` */>>,
 
     /// objects available at path_prefix
@@ -530,7 +568,7 @@ struct ExportVersionedObjects {
     store_client: store::Client,
 }
 
-impl ExportVersionedObjects {
+impl ExportExistingObjects {
     async fn try_new(
         objects_wanted: Option<HashSet<String /* filename = `uuid.parquet` */>>,
         path_prefix: ParquetFilePathFilter,

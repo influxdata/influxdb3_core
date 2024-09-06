@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use std::{
-    num::{NonZeroUsize, ParseIntError},
+    num::{NonZeroU64, NonZeroUsize, ParseIntError},
     time::Duration,
 };
 
@@ -92,16 +92,16 @@ pub struct RouterConfig {
     )]
     pub ingester_addresses: Vec<IngesterAddress>,
 
-    /// Retention period to use when auto-creating namespaces.
-    /// For infinite retention, leave this unset and it will default to `None`.
-    /// Setting it to zero will not make it infinite.
-    /// Ignored if namespace-autocreation-enabled is set to false.
+    /// Retention period to use for implicitly created namespaces.
+    ///
+    /// For infinite retention do not specify this option.
     #[clap(
         long = "new-namespace-retention-hours",
         env = "INFLUXDB_IOX_NEW_NAMESPACE_RETENTION_HOURS",
+        requires = "namespace_autocreation_enabled",
         action
     )]
-    pub new_namespace_retention_hours: Option<u64>,
+    pub new_namespace_retention_hours: Option<NonZeroU64>,
 
     /// When writing data to a non-existent namespace, should the router auto-create the namespace
     /// or reject the write? Set to false to disable namespace autocreation.

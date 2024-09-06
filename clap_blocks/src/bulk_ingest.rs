@@ -4,8 +4,9 @@ use ed25519_dalek::{
     pkcs8::{DecodePrivateKey, DecodePublicKey},
     SigningKey, VerifyingKey,
 };
+use humantime::parse_duration;
 use snafu::{ResultExt, Snafu};
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, path::PathBuf, time::Duration};
 
 /// CLI config for bulk ingest.
 #[derive(Debug, Clone, Default, clap::Parser)]
@@ -64,21 +65,15 @@ pub struct BulkIngestConfig {
         env = "INFLUXDB_IOX_BULK_INGEST_USE_MOCK_PRESIGNED_URL_SIGNER"
     )]
     pub use_mock_presigned_url_signer: Option<String>,
-}
 
-impl BulkIngestConfig {
-    /// Constructor for bulk ingest configuration.
-    pub fn new(
-        metadata_signing_key_file: Option<PathBuf>,
-        additional_verification_key_files: Vec<PathBuf>,
-        use_mock_presigned_url_signer: Option<String>,
-    ) -> Self {
-        Self {
-            metadata_signing_key_file,
-            additional_verification_key_files,
-            use_mock_presigned_url_signer,
-        }
-    }
+    /// Specify how long signed upload URLs are valid for after creation.
+    #[clap(
+        long = "bulk-ingest-upload-url-validity",
+        env = "INFLUXDB_IOX_BULK_INGEST_UPLOAD_URL_VALIDITY",
+        default_value = "1h",
+        value_parser = parse_duration
+    )]
+    pub signed_upload_url_validity: Duration,
 }
 
 impl TryFrom<&BulkIngestConfig> for Option<BulkIngestKeys> {

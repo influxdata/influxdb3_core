@@ -18,7 +18,7 @@ repository = "https://github.com/influxdata/influxdb_iox/tree/main/influxdb_line
 # History: https://github.com/influxdata/influxdb_iox/issues/7051
 
 [dependencies] # In alphabetical order
-bytes = "1.6"
+bytes = "1.7"
 log = "0.4.22"
 nom = { version = "7", default-features = false, features = ["std"] }
 smallvec = { workspace = true }
@@ -27,3 +27,10 @@ snafu = "0.8"
 # `path` `[dev-dependencies]` are fine
 [dev-dependencies] # In alphabetical order
 test_helpers = { path = "../test_helpers" }
+
+[features]
+# Support for the v3 Line Protocol Parser, see:
+# https://github.com/influxdata/influxdb/issues/24979
+# 
+# This feature is experimental, and is not enabled by default.
+v3 = []

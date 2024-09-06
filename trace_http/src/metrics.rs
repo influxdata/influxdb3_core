@@ -1,4 +1,5 @@
 use crate::classify::Classification;
+use crate::query_variant::{QueryVariant, QueryVariantExt};
 use hashbrown::HashMap;
 use http::Method;
 use metric::{
@@ -25,6 +26,9 @@ struct MetricsKey {
 
     /// method or None for invalid methods
     method: Option<Method>,
+
+    /// query variant
+    query_variant: Option<QueryVariant>,
 }
 
 /// Metrics collected for HTTP/gRPC requests
@@ -60,7 +64,11 @@ impl RequestMetrics {
     }
 
     /// Gets the `MetricsRecorder` for a given http request
-    pub(crate) fn recorder<B>(self: &Arc<Self>, request: &http::Request<B>) -> MetricsRecorder {
+    pub(crate) fn recorder<B>(
+        self: &Arc<Self>,
+        request: &http::Request<B>,
+        query_variant: QueryVariantExt,
+    ) -> MetricsRecorder {
         MetricsRecorder {
             metrics: Arc::clone(self),
             start_instant: Instant::now(),
@@ -68,6 +76,7 @@ impl RequestMetrics {
             method: Some(request.method().clone()),
             classification: None,
             response_body_size: 0,
+            query_variant,
         }
     }
 
@@ -75,6 +84,7 @@ impl RequestMetrics {
         &self,
         path: Option<String>,
         method: Option<Method>,
+        query_variant: Option<QueryVariant>,
     ) -> MappedMutexGuard<'_, Metrics> {
         // method is only important for HTTP / non-gRPC
         let method = match self.family {
@@ -83,7 +93,11 @@ impl RequestMetrics {
         };
 
         MutexGuard::map(self.metrics.lock(), |metrics| {
-            let key = MetricsKey { path, method };
+            let key = MetricsKey {
+                path,
+                method,
+                query_variant,
+            };
             let (_, request_metrics) =
                 metrics.raw_entry_mut().from_key(&key).or_insert_with(|| {
                     let mut attributes = Attributes::from([]);
@@ -92,6 +106,9 @@ impl RequestMetrics {
                     }
                     if let Some(method) = &key.method {
                         attributes.insert("method", method.to_string());
+                    }
+                    if let Some(query_variant) = &key.query_variant {
+                        attributes.insert("query_variant", query_variant.str());
                     }
                     if let (Some(path), Some(method)) = (&key.path, &key.method) {
                         // help Grafana because you can only repeat a single variable, not a cross-product of the two
@@ -220,6 +237,7 @@ pub(crate) struct MetricsRecorder {
     method: Option<Method>,
     classification: Option<Classification>,
     response_body_size: u64,
+    query_variant: QueryVariantExt,
 }
 
 impl MetricsRecorder {
@@ -248,9 +266,11 @@ impl MetricsRecorder {
 
 impl Drop for MetricsRecorder {
     fn drop(&mut self) {
-        let metrics = self
-            .metrics
-            .request_metrics(self.path.take(), self.method.take());
+        let metrics = self.metrics.request_metrics(
+            self.path.take(),
+            self.method.take(),
+            self.query_variant.get(),
+        );
 
         let duration = self.start_instant.elapsed();
         match self.classification {
