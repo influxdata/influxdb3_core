@@ -11,6 +11,8 @@ mod service;
 pub mod reexport {
     pub use generated_types;
     pub use service_grpc_testing;
+    pub use clap_blocks;
+    pub use tokio;
     pub use tokio_stream;
     pub use tonic;
     pub use tonic_health;
@@ -29,6 +31,7 @@ use observability_deps::tracing::{error, info};
 use snafu::{ResultExt, Snafu};
 use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::CancellationToken;
+use clap_blocks::socket_addr::SocketAddrOrUDS;
 use trace_http::ctx::TraceHeaderParser;
 
 #[derive(Debug, Snafu)]
@@ -107,7 +110,9 @@ pub async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-pub async fn grpc_listener(
+/// grpc_tcp_listener takes a socket address and returns a tcp listener on that
+/// socket with the provided configuration.
+pub async fn grpc_tcp_listener(
     addr: SocketAddr,
     tcp_kernel_send_buffer_size: Option<usize>,
     tcp_kernel_receive_buffer_size: Option<usize>,
@@ -256,16 +261,17 @@ fn set_tcp_kernel_receive_buffer_size(
     )
 }
 
-/// Instantiates the gRPC and optional HTTP listeners and returns a `Future` that completes when
+/// Instantiates gRPC and HTTP listeners and returns a `Future` that completes when
 /// the listeners have all exited or the `frontend_shutdown` token is called.
+/// Instantiates gRPC or HTTP or both for the provided server type.
 pub async fn serve(
     common_state: CommonServerState,
     frontend_shutdown: CancellationToken,
-    grpc_listener: Option<tokio::net::TcpListener>,
+    grpc_address: Option<SocketAddrOrUDS>,
     http_listener: Option<AddrIncoming>,
     server_type: Arc<dyn ServerType>,
 ) -> Result<()> {
-    if grpc_listener.is_none() && http_listener.is_none() {
+    if grpc_address.is_none() && http_listener.is_none() {
         return Err(Error::MissingListener);
     }
 
@@ -288,7 +294,7 @@ pub async fn serve(
     let captured_shutdown = frontend_shutdown.clone();
     let captured_trace_header_parser = trace_header_parser.clone();
     let grpc_server = async move {
-        if let Some(grpc_listener) = grpc_listener {
+        if let Some(grpc_listener) = grpc_address {
             info!(?captured_server_type, "gRPC server listening");
             rpc::serve(
                 grpc_listener,

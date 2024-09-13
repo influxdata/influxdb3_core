@@ -2,7 +2,7 @@
 use trace_exporters::TracingConfig;
 use trogging::cli::LoggingConfig;
 
-use crate::socket_addr::SocketAddr;
+use crate::socket_addr::SocketAddrOrUDS;
 
 /// The default bind address for the HTTP API.
 pub const DEFAULT_API_BIND_ADDR: &str = "127.0.0.1:8080";
@@ -28,7 +28,7 @@ pub struct RunConfig {
         default_value = DEFAULT_API_BIND_ADDR,
         action,
     )]
-    pub http_bind_address: SocketAddr,
+    pub http_bind_address: SocketAddrOrUDS,
 
     /// Maximum number of pending RST_STREAM before a GOAWAY will be sent
     /// by the service bound to `http_bind_address`
@@ -45,7 +45,7 @@ pub struct RunConfig {
         default_value = DEFAULT_GRPC_BIND_ADDR,
         action,
     )]
-    pub grpc_bind_address: SocketAddr,
+    pub grpc_bind_address: SocketAddrOrUDS,
 
     /// Kernel-side TCP send buffer size for the gRPC server, in bytes.
     ///
@@ -114,13 +114,13 @@ impl RunConfig {
     }
 
     /// set the http bind address
-    pub fn with_http_bind_address(mut self, http_bind_address: SocketAddr) -> Self {
+    pub fn with_http_bind_address(mut self, http_bind_address: SocketAddrOrUDS) -> Self {
         self.http_bind_address = http_bind_address;
         self
     }
 
     /// set the grpc bind address
-    pub fn with_grpc_bind_address(mut self, grpc_bind_address: SocketAddr) -> Self {
+    pub fn with_grpc_bind_address(mut self, grpc_bind_address: SocketAddrOrUDS) -> Self {
         self.grpc_bind_address = grpc_bind_address;
         self
     }
@@ -129,8 +129,8 @@ impl RunConfig {
     pub fn new(
         logging_config: LoggingConfig,
         tracing_config: TracingConfig,
-        http_bind_address: SocketAddr,
-        grpc_bind_address: SocketAddr,
+        http_bind_address: SocketAddrOrUDS,
+        grpc_bind_address: SocketAddrOrUDS,
         max_http_request_size: usize,
     ) -> Self {
         Self {

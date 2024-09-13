@@ -6,7 +6,9 @@ pub use generated_types::FileDescriptorSet;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::{body::BoxBody, server::NamedService, Code};
+use tonic::transport::server::TcpIncoming;
 use tonic_health::server::HealthReporter;
+use clap_blocks::socket_addr::SocketAddrOrUDS;
 use trace_http::ctx::TraceHeaderParser;
 
 use crate::server_type::{RpcError, ServerType};
@@ -18,7 +20,7 @@ pub fn service_name<S: NamedService>(_: &S) -> &'static str {
 
 #[derive(Debug)]
 pub struct RpcBuilderInput {
-    pub socket: TcpListener,
+    pub address: SocketAddrOrUDS,
     pub trace_header_parser: TraceHeaderParser,
     pub shutdown: CancellationToken,
 }
@@ -30,7 +32,7 @@ pub struct RpcBuilder<T> {
     pub expected_missing_fds: HashSet<&'static str>,
     pub health_reporter: HealthReporter,
     pub shutdown: CancellationToken,
-    pub socket: TcpListener,
+    pub address: SocketAddrOrUDS,
 }
 
 /// Adds a gRPC service to the builder, and registers it with the
@@ -55,7 +57,7 @@ macro_rules! add_service {
                     mut reflection_fd_set,
                     expected_missing_fds,
                     shutdown,
-                    socket,
+                    address,
                 } = $builder;
                 let service = $svc;
 
@@ -85,7 +87,7 @@ macro_rules! add_service {
                     expected_missing_fds,
                     health_reporter,
                     shutdown,
-                    socket,
+                    address,
                 }
             }
         };
@@ -118,7 +120,7 @@ macro_rules! setup_builder_impl {
         use $crate::{add_service, rpc::RpcBuilder, server_type::ServerType};
 
         let RpcBuilderInput {
-            socket,
+            address,
             trace_header_parser,
             shutdown,
         } = $input;
@@ -174,7 +176,7 @@ macro_rules! setup_builder_impl {
             expected_missing_fds,
             health_reporter,
             shutdown,
-            socket,
+            address,
         };
 
         add_service!(builder, health_service);
@@ -202,17 +204,26 @@ macro_rules! serve_builder {
         let RpcBuilder {
             inner,
             shutdown,
-            socket,
+            address,
             ..
         } = $builder;
 
-        let stream = $crate::reexport::tonic::transport::server::TcpIncoming::from_listener(
-            socket, true, None,
-        )
-        .expect("failed to initialise tcp socket");
-        inner
-            .serve_with_incoming_shutdown(stream, shutdown.cancelled())
-            .await?;
+        match address {
+            $crate::reexport::clap_blocks::socket_addr::SocketAddrOrUDS::UDS(path) => {
+                let listener = $crate::reexport::tokio::net::UnixListener::bind(path).expect("couldn't bind unix path");
+                let stream = $crate::reexport::tokio_stream::wrappers::UnixListenerStream::new(listener);
+                inner
+                    .serve_with_incoming_shutdown(stream, shutdown.cancelled())
+                    .await?;
+            }
+            $crate::reexport::clap_blocks::socket_addr::SocketAddrOrUDS::SocketAddr(socket) => {
+                let stream =  ioxd_common::rpc::tcp_listener_from_socket(ioxd_common::grpc_tcp_listener(socket.into(), None, None).await.expect
+                ("tcp listener failed"));
+                inner
+                    .serve_with_incoming_shutdown(stream, shutdown.cancelled())
+                    .await?;
+            }
+        }
     }};
 }
 
@@ -234,18 +245,23 @@ pub fn handle_panic(err: Box<dyn Any + Send + 'static>) -> http::Response<BoxBod
         .unwrap()
 }
 
-/// Instantiate a server listening on the specified address
-/// implementing the IOx, Storage, and Flight gRPC interfaces, the
-/// underlying hyper server instance. Resolves when the server has
-/// shutdown.
+pub fn tcp_listener_from_socket(socket: TcpListener) -> TcpIncoming {
+    TcpIncoming::from_listener(
+        socket, true, None,
+    ).expect("failed to initialise tcp socket")
+}
+
+/// Instantiate a server listening on the specified stream
+/// implementing gRPC interfaces, the underlying hyper server instance.
+/// Resolves when the server has shutdown.
 pub async fn serve(
-    socket: TcpListener,
+    address: SocketAddrOrUDS,
     server_type: Arc<dyn ServerType>,
     trace_header_parser: TraceHeaderParser,
     shutdown: CancellationToken,
 ) -> Result<(), RpcError> {
     let builder_input = RpcBuilderInput {
-        socket,
+        address,
         trace_header_parser,
         shutdown,
     };
