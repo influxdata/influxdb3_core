@@ -22,7 +22,6 @@ members = [
     "influxdb2_client",
     "influxrpc_parser",
     "iox_catalog",
-    "iox_data_generator",
     "iox_http",
     "iox_query_influxql",
     "iox_query_influxrpc",
@@ -60,8 +59,6 @@ members = [
     "trace",
     "tracker",
     "trogging",
-    "wal_inspect",
-    "wal",
     "workspace-hack",
     "versioned_file_store",
 ]
