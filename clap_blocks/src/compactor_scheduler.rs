@@ -120,6 +120,15 @@ pub struct CompactorSchedulerGossipConfig {
         action
     )]
     pub scheduler_gossip_bind_address: SocketAddr,
+
+    /// Number of "partiions queried" gossip messages to allow in the receive queue.
+    #[clap(
+        env = "INFLUXDB_IOX_COMPACTOR_SCHEDULER_GOSSIP_PARTITION_QUERIED_BUFFER_SIZE",
+        default_value = "256",
+        required = false,
+        action
+    )]
+    pub partition_queried_buffer_size: usize,
 }
 
 impl Default for CompactorSchedulerGossipConfig {
@@ -127,6 +136,7 @@ impl Default for CompactorSchedulerGossipConfig {
         Self {
             scheduler_seed_list: vec![],
             scheduler_gossip_bind_address: SocketAddr::from_str("0.0.0.0:4324").unwrap(),
+            partition_queried_buffer_size: 256,
         }
     }
 }
@@ -138,6 +148,7 @@ impl CompactorSchedulerGossipConfig {
         Self {
             scheduler_seed_list: seed_list,
             scheduler_gossip_bind_address: SocketAddr::from_str(bind_address).unwrap(),
+            ..Default::default()
         }
     }
 }
@@ -222,11 +233,11 @@ pub struct CompactorSchedulerConfig {
     )]
     pub min_num_l1_files_to_compact: std::num::NonZeroU32,
 
+    // Added this as a safety OFF switch for issue #11746 but in issue #12383
+    // we discover scenarios where this doesn't work a we'd like.
+    // Further tuning is necessary before calling this complete, and in the
+    // mean-time, they will use this flag to disable it.
     /// Whether to adjust [Self::min_num_l1_files_to_compact] dynamically; ON by default.
-    ///
-    /// TODO(epg): Delete this flag after rolling out, as it's just a safety rapid-off switch.
-    /// If this works, we delete the dynamic code.
-    /// If this doesn't work, we re-enable it and delete this flag.
     #[clap(
         long = "compaction-min-num-l1-files-to-compact-dynamic",
         env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_FILES_TO_COMPACT_DYNAMIC",
@@ -405,6 +416,13 @@ pub struct CompactorSchedulerConfig {
     )]
     pub cold_concurrency: usize,
 
+    /// Force cold compaction, only for end-to-end tests.
+    #[clap(
+        // intentionally omitting env to make it even harder to use outside end-to-end tests
+        long = "compaction-force-cold-for-end-to-end-tests-not-for-prod",
+    )]
+    pub testing_cold: bool,
+
     /// Default soft stop timeout for compaction jobs.
     /// After this much time as passed, the compaction job won't start more work,
     /// as a courtesy to the other partitions.  The intent of the soft stop is to
@@ -420,25 +438,6 @@ pub struct CompactorSchedulerConfig {
         action
     )]
     pub partition_timeout_secs: u64,
-
-    /// Temporary variable to allow concurrent compactions on seprate levels of a partition.
-    /// TODO: JRB remove after testing.
-    #[clap(
-        long = "compaction-allow-concurrent-level-compactions",
-        env = "INFLUXDB_IOX_COMPACTION_ALLOW_CONCURRENT_LEVEL_COMPACTIONS",
-        default_value = "false",
-        action
-    )]
-    pub allow_concurrent_level_compactions: bool,
-
-    /// Allow multiple L0 compactions to run concurrently on the same partition.
-    #[clap(
-        long = "compaction-allow-concurrent-l0-compactions",
-        env = "INFLUXDB_IOX_COMPACTION_ALLOW_CONCURRENT_L0_COMPACTIONS",
-        default_value = "false",
-        action
-    )]
-    pub allow_concurrent_l0_compactions: bool,
 
     /// Number of L0s per hour per partition, that is manageable by the compactor.
     /// This is just a threshold for reporting overly hot partitions. It does not affect

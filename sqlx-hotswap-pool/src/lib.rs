@@ -10,8 +10,7 @@ use std::sync::{Arc, RwLock};
 use either::Either;
 use futures::{future::BoxFuture, prelude::stream::BoxStream};
 use sqlx::{
-    database::HasStatement, pool::PoolConnection, Acquire, Database, Describe, Error, Execute,
-    Executor, Pool, Transaction,
+    pool::PoolConnection, Acquire, Database, Describe, Error, Execute, Executor, Pool, Transaction,
 };
 
 /// A `HotSwapPool` is a Pool that wraps another Pool and it allows the pool to
@@ -114,7 +113,7 @@ where
         self,
         sql: &'q str,
         parameters: &'e [<Self::Database as Database>::TypeInfo],
-    ) -> BoxFuture<'e, Result<<Self::Database as HasStatement<'q>>::Statement, Error>> {
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, Error>> {
         let pool = self.pool.read().expect("poisoned");
         pool.prepare_with(sql, parameters)
     }

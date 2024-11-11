@@ -1,7 +1,6 @@
 //! CLI handling for object store config (via CLI arguments and environment variables).
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use non_empty_string::NonEmptyString;
 use object_store::{
     local::LocalFileSystem,
@@ -14,7 +13,6 @@ use observability_deps::tracing::{info, warn};
 use snafu::{ResultExt, Snafu};
 use std::{convert::Infallible, fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 use url::Url;
-use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
@@ -65,6 +63,38 @@ pub const FALLBACK_AWS_REGION: &str = "us-east-1";
 /// `Some(NonEmptyString)` otherwise.
 fn parse_optional_string(s: &str) -> Result<Option<NonEmptyString>, Infallible> {
     Ok(NonEmptyString::new(s.to_string()).ok())
+}
+
+/// Endpoint for S3 & Co.
+///
+/// This is a [`Url`] without a trailing slash.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Endpoint(String);
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Endpoint> for String {
+    fn from(value: Endpoint) -> Self {
+        value.0
+    }
+}
+
+impl std::str::FromStr for Endpoint {
+    type Err = Box<dyn std::error::Error + Send + Sync>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // try to parse it
+        Url::parse(s)?;
+
+        // strip trailing slash
+        let s = s.strip_suffix("/").unwrap_or(s);
+
+        Ok(Self(s.to_owned()))
+    }
 }
 
 /// CLI config for object stores.
@@ -166,7 +196,7 @@ pub struct ObjectStoreConfig {
     /// Prefer the environment variable over the command line flag in shared
     /// environments.
     #[clap(long = "aws-endpoint", env = "AWS_ENDPOINT", action)]
-    pub aws_endpoint: Option<String>,
+    pub aws_endpoint: Option<Endpoint>,
 
     /// When using Amazon S3 as an object store, set this to the session token. This is handy when using a federated
     /// login / SSO and you fetch credentials via the UI.
@@ -241,6 +271,20 @@ pub struct ObjectStoreConfig {
         action
     )]
     pub http2_only: bool,
+
+    /// Set max frame size (in bytes/octets) for HTTP/2 connection.
+    ///
+    /// If not set, this uses the `object_store`/`reqwest` default.
+    ///
+    /// Usually you want to set this as high as possible -- the maximum allowed by the standard is `2^24-1 = 16,777,215`.
+    /// However under some circumstances (like buggy middleware or upstream providers getting unhappy), you may be
+    /// required to pick something else.
+    #[clap(
+        long = "object-store-http2-max-frame-size",
+        env = "OBJECT_STORE_HTTP2_MAX_FRAME_SIZE",
+        action
+    )]
+    pub http2_max_frame_size: Option<u32>,
 }
 
 impl ObjectStoreConfig {
@@ -269,6 +313,7 @@ impl ObjectStoreConfig {
             object_store,
             object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
             http2_only: Default::default(),
+            http2_max_frame_size: Default::default(),
         }
     }
 
@@ -278,6 +323,9 @@ impl ObjectStoreConfig {
 
         if self.http2_only {
             options = options.with_http2_only();
+        }
+        if let Some(sz) = self.http2_max_frame_size {
+            options = options.with_http2_max_frame_size(sz);
         }
 
         options
@@ -391,7 +439,7 @@ pub fn s3_builder(config: &ObjectStoreConfig) -> object_store::aws::AmazonS3Buil
         builder = builder.with_secret_access_key(secret.get());
     }
     if let Some(endpoint) = &config.aws_endpoint {
-        builder = builder.with_endpoint(endpoint);
+        builder = builder.with_endpoint(endpoint.clone());
     }
 
     builder
@@ -572,32 +620,11 @@ pub enum CheckError {
     CannotReadObjectStore { source: object_store::Error },
 }
 
-/// Check if object store is properly configured and accepts writes and reads.
-///
-/// Note: This does NOT test if the object store is writable!
-pub async fn check_object_store(object_store: &DynObjectStore) -> Result<(), CheckError> {
-    // Use some prefix that will very likely end in an empty result, so we don't pull too much actual data here.
-    let uuid = Uuid::new_v4().to_string();
-    let prefix = Path::from_iter([uuid]);
-
-    // create stream (this might fail if the store is not readable)
-    let mut stream = object_store.list(Some(&prefix));
-
-    // ... but sometimes it fails only if we use the resulting stream, so try that once
-    stream
-        .try_next()
-        .await
-        .context(CannotReadObjectStoreSnafu)?;
-
-    // store seems to be readable
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::env;
+    use std::{env, str::FromStr};
     use tempfile::TempDir;
 
     #[test]
@@ -645,6 +672,22 @@ mod tests {
             &object_store.to_string(),
             "LimitStore(16, AmazonS3(mybucket))"
         )
+    }
+
+    #[test]
+    #[cfg(feature = "aws")]
+    fn valid_s3_endpoint_url() {
+        ObjectStoreConfig::try_parse_from(["server", "--aws-endpoint", "http://whatever.com"])
+            .expect("must successfully parse config with absolute AWS endpoint URL");
+    }
+
+    #[test]
+    #[cfg(feature = "aws")]
+    fn invalid_s3_endpoint_url_fails_clap_parsing() {
+        let result =
+            ObjectStoreConfig::try_parse_from(["server", "--aws-endpoint", "whatever.com"]);
+
+        assert!(result.is_err(), "{result:?}")
     }
 
     #[test]
@@ -869,6 +912,26 @@ mod tests {
                     .join(parquet_file_path)
                     .display()
             )
+        );
+    }
+
+    #[test]
+    fn endpoint() {
+        assert_eq!(
+            Endpoint::from_str("http://localhost:8080")
+                .unwrap()
+                .to_string(),
+            "http://localhost:8080",
+        );
+        assert_eq!(
+            Endpoint::from_str("http://localhost:8080/")
+                .unwrap()
+                .to_string(),
+            "http://localhost:8080",
+        );
+        assert_eq!(
+            Endpoint::from_str("whatever.com").unwrap_err().to_string(),
+            "relative URL without a base",
         );
     }
 }

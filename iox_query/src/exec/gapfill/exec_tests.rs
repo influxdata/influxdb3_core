@@ -15,8 +15,11 @@ use arrow_util::test_util::batches_to_lines;
 use datafusion::{
     error::Result,
     execution::runtime_env::{RuntimeConfig, RuntimeEnv},
+    functions::datetime::date_bin::DateBinFunc,
     physical_plan::{
-        collect, expressions::col as phys_col, expressions::lit as phys_lit, memory::MemoryExec,
+        collect,
+        expressions::{col as phys_col, lit as phys_lit},
+        memory::MemoryExec,
     },
     prelude::{SessionConfig, SessionContext},
     scalar::ScalarValue,
@@ -50,8 +53,7 @@ fn test_gapfill_simple() {
             // TestCase when running with a memory limit.
             let batches = tc.run_with_memory_limit(16384).unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -63,7 +65,7 @@ fn test_gapfill_simple() {
             - "| a  | 1970-01-01T00:00:01.100Z | 11 |"
             - "| a  | 1970-01-01T00:00:01.125Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -93,8 +95,7 @@ fn test_gapfill_simple_tz() {
             // TestCase when running with a memory limit.
             let batches = tc.run_with_memory_limit(16384).unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+-------------------------------+----+
             - "| g0 | time                          | a0 |"
             - +----+-------------------------------+----+
@@ -106,7 +107,7 @@ fn test_gapfill_simple_tz() {
             - "| a  | 1970-01-01T09:30:01.100+09:30 | 11 |"
             - "| a  | 1970-01-01T09:30:01.125+09:30 |    |"
             - +----+-------------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -136,8 +137,7 @@ fn test_gapfill_simple_no_group_no_aggr() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +--------------------------+
             - "| time                     |"
             - +--------------------------+
@@ -150,7 +150,7 @@ fn test_gapfill_simple_no_group_no_aggr() {
             - "| 1970-01-01T00:00:01.100Z |"
             - "| 1970-01-01T00:00:01.125Z |"
             - +--------------------------+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -177,8 +177,7 @@ fn test_gapfill_multi_group_simple() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -197,7 +196,7 @@ fn test_gapfill_multi_group_simple() {
             - "| b  | 1970-01-01T00:00:01.100Z |    |"
             - "| b  | 1970-01-01T00:00:01.125Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -210,13 +209,13 @@ fn test_gapfill_multi_group_simple_origin() {
         for input_batch_size in [1, 2, 4] {
             let records = TestRecords {
                 group_cols: vec![vec![Some("a"), Some("a"), Some("b"), Some("b")]],
-                time_col: vec![Some(1_000), Some(1_100), Some(1_025), Some(1_050)],
+                time_col: vec![Some(1_003), Some(1_103), Some(1_028), Some(1_053)],
                 timezone: None,
                 agg_cols: vec![vec![Some(10), Some(11), Some(20), Some(21)]],
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_origin_fill_strategy(&records, 25, Some(975), 1_125, Some(3), FillStrategy::Null);
+            let params = get_params_ms_with_origin_fill_strategy(&records, 25, Some(975), 1_125, Some(3), None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
@@ -225,8 +224,7 @@ fn test_gapfill_multi_group_simple_origin() {
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
             // timestamps are now offset by 3ms
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -245,7 +243,7 @@ fn test_gapfill_multi_group_simple_origin() {
             - "| b  | 1970-01-01T00:00:01.078Z |    |"
             - "| b  | 1970-01-01T00:00:01.103Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -296,8 +294,7 @@ fn test_gapfill_multi_group_with_nulls() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -319,7 +316,7 @@ fn test_gapfill_multi_group_with_nulls() {
             - "| b  | 1970-01-01T00:00:01.100Z | 21 |"
             - "| b  | 1970-01-01T00:00:01.125Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -381,8 +378,7 @@ fn test_gapfill_multi_group_cols_with_nulls() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+----+--------------------------+----+
             - "| g0 | g1 | time                     | a0 |"
             - +----+----+--------------------------+----+
@@ -404,7 +400,7 @@ fn test_gapfill_multi_group_cols_with_nulls() {
             - "| a  | d  | 1970-01-01T00:00:01.100Z | 21 |"
             - "| a  | d  | 1970-01-01T00:00:01.125Z |    |"
             - +----+----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -443,8 +439,7 @@ fn test_gapfill_multi_group_cols_with_more_nulls() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -459,7 +454,7 @@ fn test_gapfill_multi_group_cols_with_more_nulls() {
             - "| b  | 1970-01-01T00:00:01Z     |    |"
             - "| b  | 1970-01-01T00:00:01.025Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -532,8 +527,7 @@ fn test_gapfill_multi_aggr_cols_with_nulls() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+----+--------------------------+----+----+
             - "| g0 | g1 | time                     | a0 | a1 |"
             - +----+----+--------------------------+----+----+
@@ -555,7 +549,7 @@ fn test_gapfill_multi_aggr_cols_with_nulls() {
             - "| b  | d  | 1970-01-01T00:00:01.100Z | 21 | 41 |"
             - "| b  | d  | 1970-01-01T00:00:01.125Z |    |    |"
             - +----+----+--------------------------+----+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -582,8 +576,7 @@ fn test_gapfill_simple_no_lower_bound() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -597,7 +590,7 @@ fn test_gapfill_simple_no_lower_bound() {
             - "| b  | 1970-01-01T00:00:01.100Z | 21 |"
             - "| b  | 1970-01-01T00:00:01.125Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -644,7 +637,7 @@ fn test_gapfill_fill_prev() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, FillStrategy::PrevNullAsIntentional);
+            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, Some(FillStrategy::PrevNullAsIntentional));
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
@@ -655,8 +648,7 @@ fn test_gapfill_fill_prev() {
             insta::with_settings!({
                 description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
             }, {
-                insta::assert_yaml_snapshot!(actual, @r###"
-                ---
+                insta::assert_yaml_snapshot!(actual, @r#"
                 - +----+--------------------------+----+
                 - "| g0 | time                     | a0 |"
                 - +----+--------------------------+----+
@@ -675,7 +667,7 @@ fn test_gapfill_fill_prev() {
                 - "| b  | 1970-01-01T00:00:01.100Z | 21 |"
                 - "| b  | 1970-01-01T00:00:01.125Z | 21 |"
                 - +----+--------------------------+----+
-                "###)
+                "#)
             });
             assert_batch_count(&batches, output_batch_size);
         }
@@ -724,7 +716,7 @@ fn test_gapfill_fill_prev_null_as_missing() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, FillStrategy::PrevNullAsMissing);
+            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, Some(FillStrategy::PrevNullAsMissing));
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
@@ -735,8 +727,7 @@ fn test_gapfill_fill_prev_null_as_missing() {
             insta::with_settings!({
                 description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
             }, {
-                insta::assert_yaml_snapshot!(actual, @r###"
-                ---
+                insta::assert_yaml_snapshot!(actual, @r#"
                 - +----+--------------------------+----+
                 - "| g0 | time                     | a0 |"
                 - +----+--------------------------+----+
@@ -755,7 +746,7 @@ fn test_gapfill_fill_prev_null_as_missing() {
                 - "| b  | 1970-01-01T00:00:01.100Z | 21 |"
                 - "| b  | 1970-01-01T00:00:01.125Z | 21 |"
                 - +----+--------------------------+----+
-                "###)
+                "#)
             });
             assert_batch_count(&batches, output_batch_size);
         }
@@ -825,7 +816,7 @@ fn test_gapfill_fill_prev_null_as_missing_many_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, FillStrategy::PrevNullAsMissing);
+            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, Some(FillStrategy::PrevNullAsMissing));
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
@@ -836,8 +827,7 @@ fn test_gapfill_fill_prev_null_as_missing_many_nulls() {
             insta::with_settings!({
                 description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
             }, {
-                insta::assert_yaml_snapshot!(actual, @r###"
-                ---
+                insta::assert_yaml_snapshot!(actual, @r#"
                 - +----+--------------------------+----+
                 - "| g0 | time                     | a0 |"
                 - +----+--------------------------+----+
@@ -858,7 +848,7 @@ fn test_gapfill_fill_prev_null_as_missing_many_nulls() {
                 - "| b  | 1970-01-01T00:00:01.100Z | 22 |"
                 - "| b  | 1970-01-01T00:00:01.125Z | 22 |"
                 - +----+--------------------------+----+
-                "###)
+                "#)
             });
             assert_batch_count(&batches, output_batch_size);
         }
@@ -937,7 +927,7 @@ fn test_gapfill_fill_interpolate() {
                 25,
                 Some(975),
                 1_125,
-                FillStrategy::LinearInterpolate
+                Some(FillStrategy::LinearInterpolate)
             );
             let tc = TestCase {
                 test_records: records,
@@ -949,8 +939,7 @@ fn test_gapfill_fill_interpolate() {
             insta::with_settings!({
                 description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
             }, {
-                insta::assert_yaml_snapshot!(actual, @r###"
-                ---
+                insta::assert_yaml_snapshot!(actual, @r#"
                 - +----+--------------------------+------+
                 - "| g0 | time                     | a0   |"
                 - +----+--------------------------+------+
@@ -971,7 +960,7 @@ fn test_gapfill_fill_interpolate() {
                 - "| b  | 1970-01-01T00:00:01.100Z | 1450 |"
                 - "| b  | 1970-01-01T00:00:01.125Z | 1550 |"
                 - +----+--------------------------+------+
-                "###)
+                "#)
             });
             assert_batch_count(&batches, output_batch_size);
         }
@@ -1038,8 +1027,7 @@ fn test_gapfill_simple_no_lower_bound_with_nulls() {
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
-            insta::assert_yaml_snapshot!(actual, @r###"
-            ---
+            insta::assert_yaml_snapshot!(actual, @r#"
             - +----+--------------------------+----+
             - "| g0 | time                     | a0 |"
             - +----+--------------------------+----+
@@ -1061,7 +1049,7 @@ fn test_gapfill_simple_no_lower_bound_with_nulls() {
             - "| c  | 1970-01-01T00:00:01.100Z | 21 |"
             - "| c  | 1970-01-01T00:00:01.125Z |    |"
             - +----+--------------------------+----+
-            "###);
+            "#);
             assert_batch_count(&batches, output_batch_size);
         }
     }}
@@ -1157,7 +1145,7 @@ fn test_gapfill_interpolate_struct() {
                 25,
                 Some(975),
                 1_125,
-                FillStrategy::LinearInterpolate
+                Some(FillStrategy::LinearInterpolate)
             );
             let tc = TestCase {
                 test_records: records,
@@ -1169,8 +1157,7 @@ fn test_gapfill_interpolate_struct() {
             insta::with_settings!({
                 description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
             }, {
-                insta::assert_yaml_snapshot!(actual, @r###"
-                ---
+                insta::assert_yaml_snapshot!(actual, @r#"
                 - +----+--------------------------+------------------------+
                 - "| g0 | time                     | a0                     |"
                 - +----+--------------------------+------------------------+
@@ -1191,7 +1178,7 @@ fn test_gapfill_interpolate_struct() {
                 - "| b  | 1970-01-01T00:00:01.100Z | {value: 1450, time: }  |"
                 - "| b  | 1970-01-01T00:00:01.125Z | {value: 1550, time: 0} |"
                 - +----+--------------------------+------------------------+
-                "###)
+                "#)
             });
             assert_batch_count(&batches, output_batch_size);
         }
@@ -1264,8 +1251,9 @@ fn test_gapfill_interpolate_struct_additional_data() {
                 25,
                 Some(975),
                 1_125,
-                FillStrategy::LinearInterpolate
+                Some(FillStrategy::LinearInterpolate)
             );
+            println!("🐈 params: {params:#?}");
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
@@ -1276,8 +1264,7 @@ fn test_gapfill_interpolate_struct_additional_data() {
             insta::with_settings!({
                 description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
             }, {
-                insta::assert_yaml_snapshot!(actual, @r###"
-                ---
+                insta::assert_yaml_snapshot!(actual, @r#"
                 - +----+--------------------------+--------------------------------------------------+
                 - "| g0 | time                     | a0                                               |"
                 - +----+--------------------------+--------------------------------------------------+
@@ -1298,7 +1285,7 @@ fn test_gapfill_interpolate_struct_additional_data() {
                 - "| b  | 1970-01-01T00:00:01.100Z | {value: 1450, time: , other_0: , other_1: }      |"
                 - "| b  | 1970-01-01T00:00:01.125Z | {value: 1550, time: 0, other_0: 14, other_1: 14} |"
                 - +----+--------------------------+--------------------------------------------------+
-                "###)
+                "#)
             });
             assert_batch_count(&batches, output_batch_size);
         }
@@ -1525,7 +1512,7 @@ impl TestCase {
             "input_batch_size is {input_batch_size}, output_batch_size is {}",
             self.output_batch_size
         );
-        let input = Arc::new(MemoryExec::try_new(&[batches], schema, None)?);
+        let input = Arc::new(MemoryExec::try_new(&[batches], Arc::clone(&schema), None)?);
         let plan = Arc::new(GapFillExec::try_new(
             input,
             group_expr,
@@ -1554,13 +1541,19 @@ fn bound_included_from_option<T>(o: Option<T>) -> Bound<T> {
 
 fn phys_fill_strategies(
     records: &TestRecords,
-    fill_strategy: FillStrategy,
+    fill_strategy: Option<FillStrategy>,
 ) -> Result<Vec<(Arc<dyn PhysicalExpr>, FillStrategy)>> {
     let start = records.group_cols.len() + 1; // 1 is for time col
     let end = start + records.agg_cols.len() + records.struct_cols.len();
     let mut v = Vec::with_capacity(records.agg_cols.len());
     for f in &records.schema().fields()[start..end] {
-        v.push((phys_col(f.name(), &records.schema())?, fill_strategy));
+        v.push((
+            phys_col(f.name(), &records.schema())?,
+            match fill_strategy {
+                Some(ref fs) => fs.clone(),
+                None => FillStrategy::Default(f.data_type().try_into()?),
+            },
+        ));
     }
     Ok(v)
 }
@@ -1570,7 +1563,7 @@ fn get_params_ms_with_fill_strategy(
     stride_ms: i64,
     start: Option<i64>,
     end: i64,
-    fill_strategy: FillStrategy,
+    fill_strategy: Option<FillStrategy>,
 ) -> GapFillExecParams {
     get_params_ms_with_origin_fill_strategy(batch, stride_ms, start, end, None, fill_strategy)
 }
@@ -1581,7 +1574,7 @@ fn get_params_ms_with_origin_fill_strategy(
     start: Option<i64>,
     end: i64,
     origin_ms: Option<i64>,
-    fill_strategy: FillStrategy,
+    fill_strategy: Option<FillStrategy>,
 ) -> GapFillExecParams {
     // stride is in ms
     let stride = ScalarValue::new_interval_mdn(0, 0, stride_ms * 1_000_000);
@@ -1589,6 +1582,7 @@ fn get_params_ms_with_origin_fill_strategy(
         origin_ms.map(|o| phys_lit(ScalarValue::TimestampNanosecond(Some(o * 1_000_000), None)));
 
     GapFillExecParams {
+        date_bin_udf: Arc::new(ScalarUDF::new_from_impl(DateBinFunc::new())),
         stride: phys_lit(stride),
         time_column: Column::new("t", batch.group_cols.len()),
         origin,
@@ -1615,5 +1609,5 @@ fn get_params_ms(
     start: Option<i64>,
     end: i64,
 ) -> GapFillExecParams {
-    get_params_ms_with_fill_strategy(batch, stride, start, end, FillStrategy::Null)
+    get_params_ms_with_fill_strategy(batch, stride, start, end, None)
 }

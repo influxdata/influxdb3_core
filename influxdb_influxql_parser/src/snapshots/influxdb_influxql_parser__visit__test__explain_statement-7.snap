@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit.rs
 expression: "visit_statement!(\"EXPLAIN SHOW DATABASES\")"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_explain_statement
@@ -10,4 +11,3 @@ expression: "visit_statement!(\"EXPLAIN SHOW DATABASES\")"
 - post_visit_statement
 - post_visit_explain_statement
 - post_visit_statement
-

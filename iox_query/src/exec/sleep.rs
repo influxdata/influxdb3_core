@@ -28,7 +28,7 @@ use futures::TryStreamExt;
 /// This will be lowered to [`SleepExpr`].
 ///
 /// See [module](super) docs for more details.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub struct SleepNode {
     input: LogicalPlan,
     duration: Vec<Expr>,

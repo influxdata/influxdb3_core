@@ -16,7 +16,6 @@ use std::sync::Arc;
 use crate::plan::{parse_regex, InfluxQLToLogicalPlan, SchemaProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
-use datafusion::functions::datetime::functions as datafusion_datetime_udfs;
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{
@@ -252,13 +251,7 @@ impl InfluxQLQueryPlanner {
             }
         }
 
-        let date_bin = datafusion_datetime_udfs()
-            .iter()
-            .find(|fun| fun.name().eq("date_bin"))
-            .ok_or(DataFusionError::Execution("no date_bin UDF found".into()))?
-            .to_owned();
-
-        let planner = InfluxQLToLogicalPlan::new(&sp, &ctx, date_bin);
+        let planner = InfluxQLToLogicalPlan::new(&sp, &ctx);
         let logical_plan = planner.statement_to_plan_with_params(statement, params.into())?;
         debug!(plan=%logical_plan.display_graphviz(), "logical plan");
         Ok(logical_plan)

@@ -90,8 +90,8 @@ use base64::{prelude::BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, CompactionLevelProtoError, InfluxDbType,
-    NamespaceId, ObjectStoreId, ParquetFileParams, PartitionHashId, PartitionId, PartitionKey,
-    StatValues, Statistics, TableId, Timestamp, TimestampMinMax,
+    MaxL0CreatedAt, NamespaceId, ObjectStoreId, ParquetFileParams, PartitionHashId, PartitionId,
+    PartitionKey, StatValues, Statistics, TableId, Timestamp, TimestampMinMax,
 };
 use generated_types::influxdata::iox::ingester::v1 as proto;
 use iox_time::Time;
@@ -215,6 +215,9 @@ pub enum Error {
     #[snafu(display("Parquet metadata does not contain IOx metadata"))]
     IoxMetadataMissing {},
 
+    #[snafu(display("Parquet file does not contain timestamp statistics"))]
+    TimestampStatisticsMissing {},
+
     #[snafu(display("Field missing while parsing IOx metadata: {}", field))]
     IoxMetadataFieldMissing { field: String },
 
@@ -292,11 +295,8 @@ pub struct IoxMetadata {
     /// Sort key of this chunk
     pub sort_key: Option<SortKey>,
 
-    /// Max timestamp of creation timestamp of L0 files
-    /// If this metadata is for an L0 file, this value will be the same as the `creation_timestamp`
-    /// If this metadata is for an L1/L2 file, this value will be the max of all L0 files
-    ///  that are compacted into this file
-    pub max_l0_created_at: Time,
+    /// Max timestamp of creation timestamp of L0 files, if applicable
+    pub max_l0_created_at: MaxL0CreatedAt,
 }
 
 impl TryFrom<&IoxMetadata> for Vec<KeyValue> {
@@ -339,6 +339,14 @@ impl IoxMetadata {
                 .collect(),
         });
 
+        let max_l0_created_at = self
+            .max_l0_created_at
+            .maybe_computed_timestamp()
+            .map(iox_time::Time::from)
+            .unwrap_or(self.creation_timestamp)
+            .date_time()
+            .into();
+
         let proto_msg = proto::IoxMetadata {
             object_store_id: self.object_store_id.get_uuid().as_bytes().to_vec(),
             creation_timestamp: Some(self.creation_timestamp.date_time().into()),
@@ -349,7 +357,7 @@ impl IoxMetadata {
             partition_key: self.partition_key.to_string(),
             sort_key,
             compaction_level: self.compaction_level as i32,
-            max_l0_created_at: Some(self.max_l0_created_at.date_time().into()),
+            max_l0_created_at: Some(max_l0_created_at),
         };
 
         let mut buf = Vec::new();
@@ -365,11 +373,27 @@ impl IoxMetadata {
             .map_err(|err| Box::new(err) as _)
             .context(IoxMetadataBrokenSnafu)?;
 
+        let compaction_level =
+            proto_msg
+                .compaction_level
+                .try_into()
+                .context(InvalidCompactionLevelSnafu {
+                    compaction_level: proto_msg.compaction_level,
+                })?;
+
         // extract creation timestamp
         let creation_timestamp =
             decode_timestamp_from_field(proto_msg.creation_timestamp, "creation_timestamp")?;
-        let max_l0_created_at =
+
+        let max_l0_created_at_timestamp =
             decode_timestamp_from_field(proto_msg.max_l0_created_at, "max_l0_created_at")?;
+        let max_l0_created_at = if max_l0_created_at_timestamp == creation_timestamp
+            && compaction_level == CompactionLevel::Initial
+        {
+            MaxL0CreatedAt::NotCompacted
+        } else {
+            MaxL0CreatedAt::Computed(max_l0_created_at_timestamp.into())
+        };
 
         // extract strings
         let namespace_name = Arc::from(proto_msg.namespace_name.as_ref());
@@ -400,11 +424,7 @@ impl IoxMetadata {
             table_name,
             partition_key,
             sort_key,
-            compaction_level: proto_msg.compaction_level.try_into().context(
-                InvalidCompactionLevelSnafu {
-                    compaction_level: proto_msg.compaction_level,
-                },
-            )?,
+            compaction_level,
             max_l0_created_at,
         })
     }
@@ -424,13 +444,8 @@ impl IoxMetadata {
             partition_key: "unknown".into(),
             compaction_level: CompactionLevel::Initial,
             sort_key: None,
-            max_l0_created_at: Time::from_timestamp_nanos(creation_timestamp_ns),
+            max_l0_created_at: MaxL0CreatedAt::NotCompacted,
         }
-    }
-
-    /// verify uuid
-    pub fn match_object_store_id(&self, id: ObjectStoreId) -> bool {
-        id == self.object_store_id
     }
 
     /// Create a corresponding iox catalog's ParquetFile
@@ -474,6 +489,8 @@ impl IoxMetadata {
             max: max_time,
         } = derive_min_max_time(stats);
 
+        let created_at = Timestamp::from(self.creation_timestamp);
+
         ParquetFileParams {
             namespace_id: self.namespace_id,
             table_id: self.table_id,
@@ -485,9 +502,9 @@ impl IoxMetadata {
             file_size_bytes: file_size_bytes as i64,
             compaction_level: self.compaction_level,
             row_count: row_count.try_into().expect("row count overflows i64"),
-            created_at: Timestamp::from(self.creation_timestamp),
+            created_at,
             column_set: ColumnSet::new(columns),
-            max_l0_created_at: Timestamp::from(self.max_l0_created_at),
+            max_l0_created_at: self.max_l0_created_at,
             // Currently, we're only setting the `source` field if the Parquet file is being
             // created by bulk ingest, which does not use this code path. So for now, always set
             // `source` to `None` here.
@@ -533,7 +550,7 @@ fn decode_timestamp_from_field(
         .try_into()
         .map_err(|e: &str| Error::IoxInvalidTimestamp { e: e.to_string() })?;
 
-    Ok(Time::from_date_time(date_time))
+    Ok(Time::from_datetime(date_time))
 }
 
 /// Range of timestamps from min to max.
@@ -863,7 +880,8 @@ fn read_statistics_from_parquet_row_group(
                 column: field.name().clone(),
             })?;
 
-        let min_max_set = parquet_stats.has_min_max_set();
+        let min_max_set =
+            parquet_stats.min_bytes_opt().is_some() || parquet_stats.max_bytes_opt().is_some();
         if min_max_set && parquet_stats.is_min_max_deprecated() {
             StatisticsMinMaxDeprecatedSnafu {
                 row_group: row_group_idx,
@@ -874,14 +892,9 @@ fn read_statistics_from_parquet_row_group(
 
         let count = row_group.num_rows().max(0) as u64;
 
-        let stats = extract_iox_statistics(
-            parquet_stats,
-            min_max_set,
-            iox_type,
-            count,
-            row_group_idx,
-            field.name(),
-        )?;
+        let stats =
+            extract_iox_statistics(parquet_stats, iox_type, count, row_group_idx, field.name())?;
+
         column_summaries.push(ColumnSummary {
             name: field.name().clone(),
             influxdb_type: match iox_type {
@@ -912,25 +925,27 @@ fn combine_column_summaries(total: &mut Vec<ColumnSummary>, other: Vec<ColumnSum
 
 /// Extract IOx statistics from parquet statistics.
 ///
-/// This is required because upstream does not have a mapper from
-/// parquet statistics back to arrow or Rust native types.
+/// Note could use [`StatisticsConverter`] to convert parquet statistics to arrow statistics or
+/// [`statistics_from_parquet_meta_calc`] to convert to DataFusion statistics
+///
+/// [`StatisticsConverter`]: <https://docs.rs/parquet/latest/parquet/arrow/arrow_reader/statistics/struct.StatisticsConverter.html>
+/// [`statistics_from_parquet_meta_calc`]: https://docs.rs/datafusion/latest/datafusion/datasource/file_format/parquet/fn.statistics_from_parquet_meta_calc.html
 fn extract_iox_statistics(
     parquet_stats: &ParquetStatistics,
-    min_max_set: bool,
     iox_type: InfluxColumnType,
     total_count: u64,
     row_group_idx: usize,
     column_name: &str,
 ) -> Result<Statistics> {
-    let null_count = parquet_stats.null_count();
+    let null_count = parquet_stats.null_count_opt().unwrap_or_default();
 
     match (parquet_stats, iox_type) {
         (ParquetStatistics::Boolean(stats), InfluxColumnType::Field(InfluxFieldType::Boolean)) => {
             Ok(Statistics::Bool(StatValues {
-                min: min_max_set.then(|| *stats.min()),
-                max: min_max_set.then(|| *stats.max()),
+                min: stats.min_opt().copied(),
+                max: stats.max_opt().copied(),
                 distinct_count: parquet_stats
-                    .distinct_count()
+                    .distinct_count_opt()
                     .and_then(|x| x.try_into().ok()),
                 null_count: Some(null_count),
                 total_count,
@@ -938,10 +953,10 @@ fn extract_iox_statistics(
         }
         (ParquetStatistics::Int64(stats), InfluxColumnType::Field(InfluxFieldType::Integer)) => {
             Ok(Statistics::I64(StatValues {
-                min: min_max_set.then(|| *stats.min()),
-                max: min_max_set.then(|| *stats.max()),
+                min: stats.min_opt().copied(),
+                max: stats.max_opt().copied(),
                 distinct_count: parquet_stats
-                    .distinct_count()
+                    .distinct_count_opt()
                     .and_then(|x| x.try_into().ok()),
                 null_count: Some(null_count),
                 total_count,
@@ -949,10 +964,10 @@ fn extract_iox_statistics(
         }
         (ParquetStatistics::Int64(stats), InfluxColumnType::Field(InfluxFieldType::UInteger)) => {
             Ok(Statistics::U64(StatValues {
-                min: min_max_set.then(|| *stats.min() as u64),
-                max: min_max_set.then(|| *stats.max() as u64),
+                min: stats.min_opt().map(|i| *i as u64),
+                max: stats.max_opt().map(|i| *i as u64),
                 distinct_count: parquet_stats
-                    .distinct_count()
+                    .distinct_count_opt()
                     .and_then(|x| x.try_into().ok()),
                 null_count: Some(null_count),
                 total_count,
@@ -960,10 +975,10 @@ fn extract_iox_statistics(
         }
         (ParquetStatistics::Double(stats), InfluxColumnType::Field(InfluxFieldType::Float)) => {
             Ok(Statistics::F64(StatValues {
-                min: min_max_set.then(|| *stats.min()),
-                max: min_max_set.then(|| *stats.max()),
+                min: stats.min_opt().copied(),
+                max: stats.max_opt().copied(),
                 distinct_count: parquet_stats
-                    .distinct_count()
+                    .distinct_count_opt()
                     .and_then(|x| x.try_into().ok()),
                 null_count: Some(null_count),
                 total_count,
@@ -971,10 +986,10 @@ fn extract_iox_statistics(
         }
         (ParquetStatistics::Int64(stats), InfluxColumnType::Timestamp) => {
             Ok(Statistics::I64(StatValues {
-                min: Some(*stats.min()),
-                max: Some(*stats.max()),
+                min: stats.min_opt().copied(),
+                max: stats.max_opt().copied(),
                 distinct_count: parquet_stats
-                    .distinct_count()
+                    .distinct_count_opt()
                     .and_then(|x| x.try_into().ok()),
                 null_count: Some(null_count),
                 total_count,
@@ -983,10 +998,10 @@ fn extract_iox_statistics(
         (ParquetStatistics::ByteArray(stats), InfluxColumnType::Tag)
         | (ParquetStatistics::ByteArray(stats), InfluxColumnType::Field(InfluxFieldType::String)) => {
             Ok(Statistics::String(StatValues {
-                min: min_max_set
-                    .then(|| {
-                        stats
-                            .min()
+                min: stats
+                    .min_opt()
+                    .map(|byte_arr| {
+                        byte_arr
                             .as_utf8()
                             .context(StatisticsUtf8Snafu {
                                 row_group: row_group_idx,
@@ -995,10 +1010,10 @@ fn extract_iox_statistics(
                             .map(|x| x.to_string())
                     })
                     .transpose()?,
-                max: min_max_set
-                    .then(|| {
-                        stats
-                            .max()
+                max: stats
+                    .max_opt()
+                    .map(|byte_arr| {
+                        byte_arr
                             .as_utf8()
                             .context(StatisticsUtf8Snafu {
                                 row_group: row_group_idx,
@@ -1008,7 +1023,7 @@ fn extract_iox_statistics(
                     })
                     .transpose()?,
                 distinct_count: parquet_stats
-                    .distinct_count()
+                    .distinct_count_opt()
                     .and_then(|x| x.try_into().ok()),
                 null_count: Some(null_count),
                 total_count,
@@ -1074,7 +1089,15 @@ fn timestamp_min_max(
 
     match statistics {
         ParquetStatistics::Int64(inner_stats) => {
-            Ok(TimestampMinMax::new(*inner_stats.min(), *inner_stats.max()))
+            let min = inner_stats
+                .min_opt()
+                .copied()
+                .ok_or(TimestampMinMaxError::NoColumnStatisticsFound)?;
+            let max = inner_stats
+                .max_opt()
+                .copied()
+                .ok_or(TimestampMinMaxError::NoColumnStatisticsFound)?;
+            Ok(TimestampMinMax::new(min, max))
         }
         other => Err(TimestampMinMaxError::IncorrectTimeColumnType {
             actual: other.physical_type(),
@@ -1111,7 +1134,7 @@ mod tests {
             partition_key: PartitionKey::from("part"),
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key),
-            max_l0_created_at: create_time,
+            max_l0_created_at: MaxL0CreatedAt::NotCompacted,
         };
 
         let proto = iox_metadata.to_protobuf().unwrap();
@@ -1133,7 +1156,7 @@ mod tests {
             partition_key: "potato".into(),
             compaction_level: CompactionLevel::FileNonOverlapped,
             sort_key: None,
-            max_l0_created_at: Time::from_timestamp_nanos(42),
+            max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
         };
 
         let array = StringArray::from_iter([Some("bananas")]);

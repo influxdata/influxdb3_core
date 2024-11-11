@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use data_types::{
     partition_template::NamespacePartitionTemplateOverride, Column, ColumnId, ColumnSet,
-    ColumnType, Namespace, NamespaceId, NamespaceVersion, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, ParquetFileSource, Partition, PartitionId, SkippedCompaction,
-    SortKeyIds, Table, TableId, Timestamp,
+    ColumnType, CompactionLevel, MaxL0CreatedAt, Namespace, NamespaceId, NamespaceVersion,
+    ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, ParquetFileSource, Partition,
+    PartitionId, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
 };
+use generated_types::google::protobuf as google;
 use generated_types::influxdata::iox::catalog::v2 as proto;
 use uuid::Uuid;
 
@@ -231,6 +232,20 @@ pub(crate) fn deserialize_table(t: proto::Table) -> Result<Table, Error> {
     })
 }
 
+pub(crate) fn serialize_timestamp(t: iox_time::Time) -> google::Timestamp {
+    google::Timestamp {
+        seconds: t.timestamp(),
+        nanos: t.timestamp_subsec_nanos() as i32,
+    }
+}
+
+pub(crate) fn deserialize_timestamp(t: google::Timestamp) -> Result<iox_time::Time, Error> {
+    let time = iox_time::Time::from_timestamp(t.seconds, t.nanos as u32);
+    time.ok_or(Error::new(format!(
+        "timestamp {t:?} could not be converted to iox time"
+    )))
+}
+
 pub(crate) fn serialize_column_type(t: ColumnType) -> i32 {
     use generated_types::influxdata::iox::column_type::v1 as proto;
     proto::ColumnType::from(t).into()
@@ -286,6 +301,7 @@ pub(crate) fn serialize_partition(partition: Partition) -> proto::Partition {
         )),
         new_file_at: partition.new_file_at.map(|ts| ts.get()),
         cold_compact_at: partition.cold_compact_at.map(|ts| ts.get()),
+        created_at: partition.created_at().map(|ts| ts.get()),
     }
 }
 
@@ -301,6 +317,7 @@ pub(crate) fn deserialize_partition(partition: proto::Partition) -> Result<Parti
         deserialize_sort_key_ids(partition.sort_key_ids.required().ctx("sort_key_ids")?),
         partition.new_file_at.map(Timestamp::new),
         partition.cold_compact_at.map(Timestamp::new),
+        partition.created_at.map(Timestamp::new),
     ))
 }
 
@@ -349,6 +366,8 @@ pub(crate) fn deserialize_column_set(set: proto::ColumnSet) -> ColumnSet {
     ColumnSet::new(set.column_ids.into_iter().map(ColumnId::new))
 }
 
+// See comment in the body for why the use of deprecated `max_l0_created_at` is fine.
+#[allow(deprecated)]
 pub(crate) fn serialize_parquet_file_params(
     params: &ParquetFileParams,
 ) -> proto::ParquetFileParams {
@@ -368,14 +387,65 @@ pub(crate) fn serialize_parquet_file_params(
         compaction_level: params.compaction_level as i32,
         created_at: params.created_at.get(),
         column_set: Some(serialize_column_set(&params.column_set)),
-        max_l0_created_at: params.max_l0_created_at.get(),
+
+        maybe_max_l0_created_at: Some(
+            params
+                .max_l0_created_at
+                .maybe_computed_timestamp()
+                .map(|t| proto::parquet_file_params::MaybeMaxL0CreatedAt::Computed(t.get()))
+                .unwrap_or(
+                    proto::parquet_file_params::MaybeMaxL0CreatedAt::NotCompacted(
+                        Default::default(),
+                    ),
+                ),
+        ),
+
+        // This field is in the process of being deprecated in favor of `maybe_max_l0_created_at`.
+        // Services running old code that receive this message may still use this value, but new
+        // code will ignore it. When all services in all environments are using
+        // `maybe_max_l0_created_at` instead, this field can be removed.
+        max_l0_created_at: params
+            .max_l0_created_at
+            .maybe_computed_timestamp()
+            .unwrap_or(params.created_at)
+            .get(),
+
         source: ParquetFileSource::to_proto(params.source),
     }
 }
 
+// See comment in the body for why the use of deprecated `max_l0_created_at` is fine.
+#[allow(deprecated)]
 pub(crate) fn deserialize_parquet_file_params(
     params: proto::ParquetFileParams,
 ) -> Result<ParquetFileParams, Error> {
+    let compaction_level = params.compaction_level.convert().ctx("compaction_level")?;
+
+    // The proto field `max_l0_created_at` is in the process of being deprecated in favor of
+    // `maybe_max_l0_created_at`. If `maybe_max_l0_created_at` is set, use that value. If not, fall
+    // back to `max_l0_created_at` as this message came from a service running older code. When all
+    // services in all environments are using `maybe_max_l0_created_at` instead, this field can be
+    // removed.
+    let max_l0_created_at = match params.maybe_max_l0_created_at {
+        Some(maybe_max) => match maybe_max {
+            proto::parquet_file_params::MaybeMaxL0CreatedAt::Computed(max) => {
+                MaxL0CreatedAt::Computed(Timestamp::new(max))
+            }
+            proto::parquet_file_params::MaybeMaxL0CreatedAt::NotCompacted(_) => {
+                MaxL0CreatedAt::NotCompacted
+            }
+        },
+        None => {
+            if compaction_level == CompactionLevel::Initial
+                && params.max_l0_created_at == params.created_at
+            {
+                MaxL0CreatedAt::NotCompacted
+            } else {
+                MaxL0CreatedAt::Computed(Timestamp::new(params.max_l0_created_at))
+            }
+        }
+    };
+
     Ok(ParquetFileParams {
         namespace_id: NamespaceId::new(params.namespace_id),
         table_id: TableId::new(params.table_id),
@@ -392,10 +462,10 @@ pub(crate) fn deserialize_parquet_file_params(
         max_time: Timestamp::new(params.max_time),
         file_size_bytes: params.file_size_bytes,
         row_count: params.row_count,
-        compaction_level: params.compaction_level.convert().ctx("compaction_level")?,
+        compaction_level,
         created_at: Timestamp::new(params.created_at),
         column_set: deserialize_column_set(params.column_set.required().ctx("column_set")?),
-        max_l0_created_at: Timestamp::new(params.max_l0_created_at),
+        max_l0_created_at,
         source: ParquetFileSource::from_proto(params.source),
     })
 }
@@ -625,6 +695,7 @@ mod tests {
             SortKeyIds::new([ColumnId::new(3), ColumnId::new(4)]),
             Some(Timestamp::new(5)),
             Default::default(),
+            Some(Timestamp::new(4)),
         ));
         assert_partition_roundtrip(Partition::new_catalog_only(
             PartitionId::new(2),
@@ -634,6 +705,7 @@ mod tests {
             SortKeyIds::new(std::iter::empty()),
             Some(Timestamp::new(5)),
             Default::default(),
+            Some(Timestamp::new(4)),
         ));
     }
 
@@ -711,12 +783,157 @@ mod tests {
             compaction_level: CompactionLevel::Final,
             created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
-            max_l0_created_at: Timestamp::new(11),
+            max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(11)),
             source: None,
         };
         let protobuf = serialize_parquet_file_params(&params);
         let params2 = deserialize_parquet_file_params(protobuf).unwrap();
         assert_eq!(params, params2);
+
+        let params_without_max_l0_created_at = ParquetFileParams {
+            namespace_id: NamespaceId::new(1),
+            table_id: TableId::new(2),
+            partition_id: PartitionId::new(3),
+            partition_hash_id: Some(PartitionHashId::arbitrary_for_testing()),
+            object_store_id: ObjectStoreId::from_uuid(Uuid::from_u128(1337)),
+            min_time: Timestamp::new(4),
+            max_time: Timestamp::new(5),
+            file_size_bytes: 6,
+            row_count: 7,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(8),
+            column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
+            max_l0_created_at: MaxL0CreatedAt::NotCompacted,
+            source: None,
+        };
+        let protobuf = serialize_parquet_file_params(&params_without_max_l0_created_at);
+        let params_without_max_l0_created_at2 = deserialize_parquet_file_params(protobuf).unwrap();
+        assert_eq!(
+            params_without_max_l0_created_at,
+            params_without_max_l0_created_at2
+        );
+    }
+
+    // This test is exercising uses of the deprecated `max_l0_created_at` field.
+    #[allow(deprecated)]
+    #[test]
+    fn max_l0_created_at_deprecated_but_still_supported() {
+        let (high64, low64) = ObjectStoreId::from_uuid(Uuid::from_u128(1337))
+            .get_uuid()
+            .as_u64_pair();
+        let object_store_id = proto::ObjectStoreId { high64, low64 };
+
+        let old_proto_l2_max_l0_and_created_at_equal = proto::ParquetFileParams {
+            namespace_id: 1,
+            table_id: 2,
+            partition_id: 3,
+            partition_hash_id: Some(PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()),
+            object_store_id: Some(object_store_id.clone()),
+            min_time: 4,
+            max_time: 5,
+            file_size_bytes: 6,
+            row_count: 7,
+            compaction_level: CompactionLevel::Final as i32,
+            created_at: 8,
+            column_set: Some(proto::ColumnSet {
+                column_ids: vec![1],
+            }),
+            // This is simulating a message created by a service running older code than when this
+            // field was introduced
+            maybe_max_l0_created_at: None,
+            max_l0_created_at: 8,
+            source: 0,
+        };
+        let params2 =
+            deserialize_parquet_file_params(old_proto_l2_max_l0_and_created_at_equal).unwrap();
+        let protobuf = serialize_parquet_file_params(&params2);
+        assert_eq!(
+            protobuf,
+            proto::ParquetFileParams {
+                namespace_id: 1,
+                table_id: 2,
+                partition_id: 3,
+                partition_hash_id: Some(
+                    PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()
+                ),
+                object_store_id: Some(object_store_id.clone()),
+                min_time: 4,
+                max_time: 5,
+                file_size_bytes: 6,
+                row_count: 7,
+                compaction_level: CompactionLevel::Final as i32,
+                created_at: 8,
+                column_set: Some(proto::ColumnSet {
+                    column_ids: vec![1],
+                }),
+                // Because we're now running newer code, this should now be set to Computed (even
+                // though max_l0_created_at and created_at are 8; L2 files can only ever be
+                // Computed)
+                maybe_max_l0_created_at: Some(
+                    proto::parquet_file_params::MaybeMaxL0CreatedAt::Computed(8)
+                ),
+                // `max_l0_created_at` should still be sent in case we're sending this to a service running older code
+                max_l0_created_at: 8,
+                source: 0,
+            }
+        );
+
+        let old_proto_l0_max_l0_and_created_at_unequal = proto::ParquetFileParams {
+            namespace_id: 1,
+            table_id: 2,
+            partition_id: 3,
+            partition_hash_id: Some(PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()),
+            object_store_id: Some(object_store_id.clone()),
+            min_time: 4,
+            max_time: 5,
+            file_size_bytes: 6,
+            row_count: 7,
+            compaction_level: CompactionLevel::Initial as i32,
+            created_at: 8,
+            column_set: Some(proto::ColumnSet {
+                column_ids: vec![1],
+            }),
+            // This is simulating a message created by a service running older code than when this
+            // field was introduced
+            maybe_max_l0_created_at: None,
+            max_l0_created_at: 2,
+            source: 0,
+        };
+        let params2 =
+            deserialize_parquet_file_params(old_proto_l0_max_l0_and_created_at_unequal).unwrap();
+        let protobuf = serialize_parquet_file_params(&params2);
+        assert_eq!(
+            protobuf,
+            proto::ParquetFileParams {
+                namespace_id: 1,
+                table_id: 2,
+                partition_id: 3,
+                partition_hash_id: Some(
+                    PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()
+                ),
+                object_store_id: Some(object_store_id),
+                min_time: 4,
+                max_time: 5,
+                file_size_bytes: 6,
+                row_count: 7,
+                compaction_level: CompactionLevel::Initial as i32,
+                created_at: 8,
+                column_set: Some(proto::ColumnSet {
+                    column_ids: vec![1],
+                }),
+                // Because we're now running newer code, this should now be set to Computed (even
+                // though the compaction level is L0; the compactor can create L0s with computed
+                // max_l0_created_ats but they'll be unequal because the compactor created file
+                // will always be created later
+                maybe_max_l0_created_at: Some(
+                    proto::parquet_file_params::MaybeMaxL0CreatedAt::Computed(2)
+                ),
+                // `max_l0_created_at` should still be sent in case we're sending this to a service
+                // running older code
+                max_l0_created_at: 2,
+                source: 0,
+            }
+        );
     }
 
     #[test]
@@ -742,5 +959,13 @@ mod tests {
         let protobuf = serialize_parquet_file(file.clone());
         let file2 = deserialize_parquet_file(protobuf).unwrap();
         assert_eq!(file, file2);
+    }
+
+    #[test]
+    fn test_timestamp_roundtrip() {
+        let t = iox_time::Time::from_timestamp_nanos(0);
+        let protobuf = serialize_timestamp(t);
+        let t2 = deserialize_timestamp(protobuf).unwrap();
+        assert_eq!(t, t2);
     }
 }

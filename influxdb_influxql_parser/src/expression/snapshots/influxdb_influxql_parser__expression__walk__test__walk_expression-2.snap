@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/expression/walk.rs
 expression: "walk_expression(\"time > now() + 1h\")"
+snapshot_kind: text
 ---
 0: Arithmetic(VarRef(VarRef { name: Identifier("time"), data_type: None }))
 1: Conditional(Expr(VarRef(VarRef { name: Identifier("time"), data_type: None })))

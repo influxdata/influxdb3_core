@@ -83,11 +83,6 @@ impl LinesConverter {
         }
     }
 
-    /// Sets a multiplier to convert line protocol timestamps to nanoseconds
-    pub fn set_timestamp_base(&mut self, timestamp_base: i64) {
-        self.timestamp_base = timestamp_base
-    }
-
     /// Write some line protocol data.
     ///
     /// If a field / tag name appears more than once in a single line, the
@@ -389,7 +384,7 @@ mod tests {
         mem,tag1=v5 ival=2i 1
         "#;
 
-        let batches = lines_to_batches(lp, 5).unwrap();
+        let mut batches = lines_to_batches(lp, 5).unwrap();
         assert_eq!(batches.len(), 2);
 
         assert_batches_eq!(
@@ -403,7 +398,11 @@ mod tests {
                 "| 2.0  | v1   | v2   | 1970-01-01T00:00:00.000000005Z |     |",
                 "+------+------+------+--------------------------------+-----+",
             ],
-            &[batches["cpu"].to_arrow(Projection::All).unwrap()]
+            &[batches
+                .remove("cpu")
+                .unwrap()
+                .try_into_arrow(Projection::All)
+                .unwrap()]
         );
 
         assert_batches_eq!(
@@ -415,7 +414,11 @@ mod tests {
                 "| 2    | v5   | 1970-01-01T00:00:00.000000001Z |",
                 "+------+------+--------------------------------+",
             ],
-            &[batches["mem"].to_arrow(Projection::All).unwrap()]
+            &[batches
+                .remove("mem")
+                .unwrap()
+                .try_into_arrow(Projection::All)
+                .unwrap()]
         );
     }
 
@@ -437,7 +440,7 @@ mod tests {
             Err(Error::PerLine { lines }) if matches!(&lines[..], [LineError::LineProtocol { .. }, LineError::LineProtocol { .. }]),
             "expected an error returned from write_lp(), but found {:?}", result
         );
-        let (batches, _) = converter.finish().unwrap();
+        let (mut batches, _) = converter.finish().unwrap();
         assert_eq!(
             batches.len(),
             2,
@@ -455,7 +458,11 @@ mod tests {
                 "| 2.0  | v1   | v2   | 1970-01-01T00:00:00.000000005Z |     |",
                 "+------+------+------+--------------------------------+-----+",
             ],
-            &[batches["cpu"].to_arrow(Projection::All).unwrap()]
+            &[batches
+                .remove("cpu")
+                .unwrap()
+                .try_into_arrow(Projection::All)
+                .unwrap()]
         );
 
         assert_batches_eq!(
@@ -467,7 +474,11 @@ mod tests {
                 "| 2    | v5   | 1970-01-01T00:00:00.000000001Z |",
                 "+------+------+--------------------------------+",
             ],
-            &[batches["mem"].to_arrow(Projection::All).unwrap()]
+            &[batches
+                .remove("mem")
+                .unwrap()
+                .try_into_arrow(Projection::All)
+                .unwrap()]
         );
     }
 
@@ -477,10 +488,14 @@ mod tests {
 m f1=10i 1639612800000000000
         "#;
 
-        let batches = lines_to_batches(lp, 5).unwrap();
+        let mut batches = lines_to_batches(lp, 5).unwrap();
         assert_eq!(batches.len(), 1);
 
-        let batch = batches["m"].to_arrow(Projection::All).unwrap();
+        let batch = batches
+            .remove("m")
+            .unwrap()
+            .try_into_arrow(Projection::All)
+            .unwrap();
         assert_batches_eq!(
             &[
                 "+-----+----+----------------------+",
@@ -514,7 +529,10 @@ m b=t 1639612800000000000
         let batches = lines_to_batches(lp, 5).unwrap();
         assert_eq!(batches.len(), 1);
 
-        let batch = batches["m"].to_arrow(Projection::All).unwrap();
+        let batch = batches["m"]
+            .clone()
+            .try_into_arrow(Projection::All)
+            .unwrap();
         assert_batches_eq!(
             &[
                 "+------+---+----------------------+---+",
@@ -555,7 +573,7 @@ m b=t 1639612800000000000
         fn test_duplicate_field_same_value() {
             let lp = "m1 val=2i,val=2i 0";
 
-            let batches = lines_to_batches(lp, 5).unwrap();
+            let mut batches = lines_to_batches(lp, 5).unwrap();
             assert_eq!(batches.len(), 1);
 
             assert_batches_eq!(
@@ -566,7 +584,11 @@ m b=t 1639612800000000000
                     "| 1970-01-01T00:00:00Z | 2   |",
                     "+----------------------+-----+",
                 ],
-                &[batches["m1"].to_arrow(Projection::All).unwrap()]
+                &[batches
+                    .remove("m1")
+                    .unwrap()
+                    .try_into_arrow(Projection::All)
+                    .unwrap()]
             );
         }
 
@@ -574,7 +596,7 @@ m b=t 1639612800000000000
         fn test_duplicate_field_different_values() {
             let lp = "m1 val=1i,val=2i 0";
 
-            let batches = lines_to_batches(lp, 5).unwrap();
+            let mut batches = lines_to_batches(lp, 5).unwrap();
             assert_eq!(batches.len(), 1);
 
             // "last value wins"
@@ -586,7 +608,11 @@ m b=t 1639612800000000000
                     "| 1970-01-01T00:00:00Z | 2   |",
                     "+----------------------+-----+",
                 ],
-                &[batches["m1"].to_arrow(Projection::All).unwrap()]
+                &[batches
+                    .remove("m1")
+                    .unwrap()
+                    .try_into_arrow(Projection::All)
+                    .unwrap()]
             );
         }
 

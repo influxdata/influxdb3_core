@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit_mut.rs
 expression: "visit_statement!(\"SHOW TAG KEYS ON telegraf FROM cpu WHERE host = \\\"west\\\" LIMIT 5 OFFSET 10\")"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_show_tag_keys_statement
@@ -36,4 +37,3 @@ expression: "visit_statement!(\"SHOW TAG KEYS ON telegraf FROM cpu WHERE host = 
 - post_visit_offset_clause
 - post_visit_show_tag_keys_statement
 - post_visit_statement
-

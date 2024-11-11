@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/expression/walk.rs
 expression: "walk_expr(\"5 + 6\")"
+snapshot_kind: text
 ---
 0: Literal(Integer(5))
 1: Literal(Integer(6))

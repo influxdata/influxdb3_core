@@ -10,13 +10,10 @@ use super::{
 use crate::{
     analyzer::register_iox_analyzers,
     config::IoxConfigExt,
-    exec::{
-        query_tracing::TracedStream,
-        schema_pivot::{SchemaPivotExec, SchemaPivotNode},
-        split::StreamSplitExec,
-    },
+    exec::{query_tracing::TracedStream, split::StreamSplitExec},
     logical_optimizer::register_iox_logical_optimizers,
     physical_optimizer::register_iox_physical_optimizers,
+    Extension,
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -31,8 +28,6 @@ use datafusion::{
         session_state::SessionStateBuilder,
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
-    optimizer::{AnalyzerRule, OptimizerRule},
-    physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
         EmptyRecordBatchStream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
@@ -96,13 +91,9 @@ impl ExtensionPlanner for IOxExtensionPlanner {
         session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let any = node.as_any();
-        let plan = if let Some(schema_pivot) = any.downcast_ref::<SchemaPivotNode>() {
-            assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
-            Some(Arc::new(SchemaPivotExec::new(
-                Arc::clone(&physical_inputs[0]),
-                schema_pivot.schema().as_ref().clone().into(),
-            )) as Arc<dyn ExecutionPlan>)
-        } else if let Some(stream_split) = any.downcast_ref::<StreamSplitNode>() {
+        let plan: Option<Arc<dyn ExecutionPlan>> = if let Some(stream_split) =
+            any.downcast_ref::<StreamSplitNode>()
+        {
             assert_eq!(
                 logical_inputs.len(),
                 1,
@@ -123,14 +114,14 @@ impl ExtensionPlanner for IOxExtensionPlanner {
             Some(Arc::new(StreamSplitExec::new(
                 Arc::clone(&physical_inputs[0]),
                 split_exprs,
-            )) as Arc<dyn ExecutionPlan>)
+            )))
         } else if let Some(gap_fill) = any.downcast_ref::<GapFill>() {
             let gap_fill_exec =
                 plan_gap_fill(session_state, gap_fill, logical_inputs, physical_inputs)?;
-            Some(Arc::new(gap_fill_exec) as Arc<dyn ExecutionPlan>)
+            Some(Arc::new(gap_fill_exec))
         } else if let Some(sleep) = any.downcast_ref::<SleepNode>() {
             let sleep = sleep.plan(planner, logical_inputs, physical_inputs, session_state)?;
-            Some(Arc::new(sleep) as _)
+            Some(Arc::new(sleep))
         } else {
             None
         };
@@ -158,17 +149,8 @@ pub struct IOxSessionConfig {
     /// Span context from which to create spans for this query
     span_ctx: Option<SpanContext>,
 
-    /// Planners for extensions that are provided by the consumer.
-    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
-
-    /// Analyzer rules for extensions that are provided by the consumer.
-    analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
-
-    /// Optimizer rules for extensions that are provided by the consumer.
-    optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
-
-    /// Physical optimizer rules for extensions that are provided by the consumer.
-    physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
+    /// Registered extensions to the IOx querier.
+    query_extensions: Vec<Arc<dyn Extension>>,
 }
 
 impl fmt::Debug for IOxSessionConfig {
@@ -191,10 +173,7 @@ impl IOxSessionConfig {
             runtime,
             default_catalog: None,
             span_ctx: None,
-            extension_planners: vec![],
-            analyzer_rules: vec![],
-            optimizer_rules: vec![],
-            physical_optimizer_rules: vec![],
+            query_extensions: vec![],
         }
     }
 
@@ -262,41 +241,9 @@ impl IOxSessionConfig {
         self
     }
 
-    /// Add an [`ExtensionPlanner`] to the  context. `ExtensionPlanner`s
-    /// take precedence in the order they are added, and take precedence
-    /// over the `iox_query` and datafusion planners.
-    pub fn with_extension_planner(
-        mut self,
-        extension_planner: Arc<dyn ExtensionPlanner + Send + Sync>,
-    ) -> Self {
-        self.extension_planners.push(extension_planner);
-        self
-    }
-
-    /// Add an [`AnalyzerRule`] to the context.
-    pub fn with_analyzer_rule(
-        mut self,
-        analyzer_rule: Arc<dyn AnalyzerRule + Send + Sync>,
-    ) -> Self {
-        self.analyzer_rules.push(analyzer_rule);
-        self
-    }
-
-    /// Add an [`OptimizerRule`] to the context.
-    pub fn with_optimizer_rule(
-        mut self,
-        optimizer_rule: Arc<dyn OptimizerRule + Send + Sync>,
-    ) -> Self {
-        self.optimizer_rules.push(optimizer_rule);
-        self
-    }
-
-    /// Add an [`PhysicalOptimizerRule`] to the context.
-    pub fn with_physical_optimizer_rule(
-        mut self,
-        physical_optimizer_rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
-    ) -> Self {
-        self.physical_optimizer_rules.push(physical_optimizer_rule);
+    /// Add an ['Extension'] to the session config.
+    pub fn with_query_extension(mut self, extension: Arc<dyn Extension>) -> Self {
+        self.query_extensions.push(extension);
         self
     }
 
@@ -320,27 +267,23 @@ impl IOxSessionConfig {
             cache_manager: Arc::clone(&self.runtime.cache_manager),
             object_store_registry: Arc::clone(&self.runtime.object_store_registry),
         };
-        let mut extension_planners = self.extension_planners;
+        let mut extension_planners = self
+            .query_extensions
+            .iter()
+            .filter_map(|e| e.planner())
+            .collect::<Vec<Arc<dyn ExtensionPlanner + Send + Sync>>>();
         extension_planners.push(Arc::new(IOxExtensionPlanner {}));
 
-        let state = SessionStateBuilder::new()
+        let mut state = SessionStateBuilder::new()
             .with_config(session_config)
             .with_runtime_env(Arc::new(runtime))
             .with_default_features()
             .with_query_planner(Arc::new(IOxQueryPlanner { extension_planners }));
-
-        let state = register_iox_physical_optimizers(state);
-        let state = register_iox_logical_optimizers(state);
-        let mut state = register_iox_analyzers(state);
-
-        for analyzer_rule in self.analyzer_rules {
-            state = state.with_analyzer_rule(analyzer_rule);
-        }
-        for optimizer_rule in self.optimizer_rules {
-            state = state.with_optimizer_rule(optimizer_rule);
-        }
-        for physical_optimizer_rule in self.physical_optimizer_rules {
-            state = state.with_physical_optimizer_rule(physical_optimizer_rule);
+        state = register_iox_analyzers(state);
+        state = register_iox_logical_optimizers(state);
+        state = register_iox_physical_optimizers(state);
+        for extension in self.query_extensions {
+            state = extension.extend_session_state(state);
         }
 
         let state = state.build();

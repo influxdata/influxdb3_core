@@ -18,7 +18,8 @@ use data_types::{
 };
 use iox_time::TimeProvider;
 use metric::{DurationHistogram, Metric};
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use std::time::Duration;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use trace::{
     ctx::SpanContext,
     span::{SpanExt, SpanRecorder},
@@ -57,6 +58,39 @@ impl CatalogMetrics {
             inner,
             state: Arc::clone(&self.state),
             span_ctx: None,
+        }
+    }
+}
+
+/// A metric for calls to `Catalog::get_time()`
+#[derive(Debug)]
+pub(crate) struct GetTimeMetric {
+    pub metric: MethodMetric,
+}
+
+impl GetTimeMetric {
+    /// Create a new `GetTimeMetric` for instrumenting the `get_time()` trait method for `catalog_type`
+    pub(crate) fn new(registry: &Arc<metric::Registry>, catalog_type: &'static str) -> Self {
+        let observer = registry.register_metric("catalog_op_duration", "catalog call duration");
+
+        Self {
+            metric: MethodMetric::new(&observer, catalog_type, "get_time"),
+        }
+    }
+
+    fn record_ok(&self, d: Duration) {
+        self.metric.record(d, true);
+    }
+
+    fn record_err(&self, d: Duration) {
+        self.metric.record(d, false);
+    }
+
+    /// Record the result of call to `Catalog::get_time()`
+    pub(crate) fn record<T, E>(&self, d: Duration, r: &Result<T, E>) {
+        match r {
+            Ok(_) => self.record_ok(d),
+            Err(_) => self.record_err(d),
         }
     }
 }
@@ -105,13 +139,13 @@ impl RepoCollection for MetricDecorator {
 }
 
 #[derive(Debug)]
-struct MethodMetric {
+pub(crate) struct MethodMetric {
     success: DurationHistogram,
     error: DurationHistogram,
 }
 
 impl MethodMetric {
-    fn new(
+    pub(crate) fn new(
         observer: &Metric<DurationHistogram>,
         catalog_type: &'static str,
         op: &'static str,
@@ -126,7 +160,7 @@ impl MethodMetric {
         }
     }
 
-    fn record(&self, d: Duration, ok: bool) {
+    pub(crate) fn record(&self, d: Duration, ok: bool) {
         if ok {
             self.success.record(d);
         } else {
@@ -320,12 +354,13 @@ decorate! {
         repo = parquet_files,
         methods = [
             parquet_flag_for_delete_by_retention = flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
-            parquet_delete_old_ids_only = delete_old_ids_only(&mut self, older_than: Timestamp, cutoff: Duration) -> Result<Vec<ObjectStoreId>>;
+            parquet_delete_old_ids_only = delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
             parquet_list_by_partition_not_to_delete_batch = list_by_partition_not_to_delete_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<ParquetFile>>;
             parquet_active_as_of = active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
             parquet_get_by_object_store_id = get_by_object_store_id(&mut self, object_store_id: ObjectStoreId) -> Result<Option<ParquetFile>>;
             parquet_exists_by_object_store_id_batch = exists_by_object_store_id_batch(&mut self, object_store_ids: Vec<ObjectStoreId>) -> Result<Vec<ObjectStoreId>>;
             parquet_create_upgrade_delete = create_upgrade_delete(&mut self, partition_id: PartitionId, delete: &[ObjectStoreId], upgrade: &[ObjectStoreId], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFileId>>;
+            parquet_list_files_by_table_id = list_by_table_id(&mut self, _table_id: TableId, _compaction_level: Option<CompactionLevel>) -> Result<Vec<ParquetFile>>;
         ],
     },
 }

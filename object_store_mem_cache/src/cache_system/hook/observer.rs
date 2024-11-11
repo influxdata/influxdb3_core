@@ -1,7 +1,7 @@
 use metric::{U64Counter, U64Gauge};
 use observability_deps::tracing::debug;
 
-use crate::cache_system::{hook::Hook, interfaces::DynError};
+use crate::cache_system::{hook::Hook, DynError};
 
 use super::{EvictResult, HookDecision};
 

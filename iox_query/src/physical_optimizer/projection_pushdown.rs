@@ -3,16 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use arrow::datatypes::SchemaRef;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     datasource::physical_plan::{parquet::ParquetExecBuilder, FileScanConfig, ParquetExec},
     error::{DataFusionError, Result},
-    physical_expr::{
-        utils::{collect_columns, reassign_predicate_columns},
-        PhysicalSortExpr,
-    },
+    physical_expr::{utils::collect_columns, PhysicalSortExpr},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         empty::EmptyExec,
@@ -34,226 +30,12 @@ use crate::provider::{DeduplicateExec, RecordBatchesExec};
 pub struct ProjectionPushdown;
 
 impl PhysicalOptimizerRule for ProjectionPushdown {
-    #[allow(clippy::only_used_in_recursion)]
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        config: &ConfigOptions,
+        _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(|plan| {
-            let plan_any = plan.as_any();
-
-            if let Some(projection_exec) = plan_any.downcast_ref::<ProjectionExec>() {
-                let child = projection_exec.input();
-
-                let mut column_indices = Vec::with_capacity(projection_exec.expr().len());
-                let mut column_names = Vec::with_capacity(projection_exec.expr().len());
-                for (expr, output_name) in projection_exec.expr() {
-                    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
-                        if column.name() == output_name {
-                            column_indices.push(column.index());
-                            column_names.push(output_name.as_str());
-                        } else {
-                            // don't bother w/ renames
-                            return Ok(Transformed::no(plan));
-                        }
-                    } else {
-                        // don't bother to deal w/ calculation within projection nodes
-                        return Ok(Transformed::no(plan));
-                    }
-                }
-
-                let child_any = child.as_any();
-                if let Some(child_empty) = child_any.downcast_ref::<EmptyExec>() {
-                    let new_child =
-                        EmptyExec::new(Arc::new(child_empty.schema().project(&column_indices)?));
-                    return Ok(Transformed::yes(Arc::new(new_child)));
-                } else if let Some(child_placeholder) =
-                    child_any.downcast_ref::<PlaceholderRowExec>()
-                {
-                    let new_child = PlaceholderRowExec::new(Arc::new(
-                        child_placeholder.schema().project(&column_indices)?,
-                    ));
-                    return Ok(Transformed::yes(Arc::new(new_child)));
-                } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
-                    let new_inputs = child_union
-                        .inputs()
-                        .iter()
-                        .map(|input| {
-                            let exec = ProjectionExec::try_new(
-                                projection_exec.expr().to_vec(),
-                                Arc::clone(input),
-                            )?;
-                            Ok(Arc::new(exec) as _)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let new_union = UnionExec::new(new_inputs);
-                    return Ok(Transformed::yes(Arc::new(new_union)));
-                } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
-                    let projection = match child_parquet.base_config().projection.as_ref() {
-                        Some(projection) => column_indices
-                            .into_iter()
-                            .map(|idx| {
-                                projection.get(idx).copied().ok_or_else(|| {
-                                    DataFusionError::Execution("Projection broken".to_string())
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                        None => column_indices,
-                    };
-                    let output_ordering = child_parquet
-                        .base_config()
-                        .output_ordering
-                        .iter()
-                        .map(|output_ordering| {
-                            project_output_ordering(output_ordering, projection_exec.schema())
-                        })
-                        .collect::<Result<_>>()?;
-                    let base_config = FileScanConfig {
-                        projection: Some(projection),
-                        output_ordering,
-                        ..child_parquet.base_config().clone()
-                    };
-                    let mut builder =
-                        ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-                    if let Some(predicate) = child_parquet.predicate() {
-                        builder = builder.with_predicate(Arc::clone(predicate));
-                    }
-                    return Ok(Transformed::yes(builder.build_arc()));
-                } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
-                    let filter_required_cols = collect_columns(child_filter.predicate());
-                    let filter_required_cols = filter_required_cols
-                        .iter()
-                        .map(|col| col.name())
-                        .collect::<HashSet<_>>();
-
-                    let plan = wrap_user_into_projections(
-                        &filter_required_cols,
-                        &column_names,
-                        Arc::clone(child_filter.input()),
-                        |plan| {
-                            Ok(Arc::new(FilterExec::try_new(
-                                reassign_predicate_columns(
-                                    Arc::clone(child_filter.predicate()),
-                                    &plan.schema(),
-                                    false,
-                                )?,
-                                plan,
-                            )?))
-                        },
-                    )?;
-
-                    return Ok(Transformed::yes(plan));
-                } else if let Some(child_sort) = child_any.downcast_ref::<SortExec>() {
-                    let sort_required_cols = child_sort
-                        .expr()
-                        .iter()
-                        .map(|expr| collect_columns(&expr.expr))
-                        .collect::<Vec<_>>();
-                    let sort_required_cols = sort_required_cols
-                        .iter()
-                        .flat_map(|cols| cols.iter())
-                        .map(|col| col.name())
-                        .collect::<HashSet<_>>();
-
-                    let plan = wrap_user_into_projections(
-                        &sort_required_cols,
-                        &column_names,
-                        Arc::clone(child_sort.input()),
-                        |plan| {
-                            Ok(Arc::new(
-                                SortExec::new(
-                                    reassign_sort_exprs_columns(child_sort.expr(), &plan.schema())?,
-                                    plan,
-                                )
-                                .with_preserve_partitioning(child_sort.preserve_partitioning())
-                                .with_fetch(child_sort.fetch()),
-                            ))
-                        },
-                    )?;
-
-                    return Ok(Transformed::yes(plan));
-                } else if let Some(child_sort) = child_any.downcast_ref::<SortPreservingMergeExec>()
-                {
-                    let sort_required_cols = child_sort
-                        .expr()
-                        .iter()
-                        .map(|expr| collect_columns(&expr.expr))
-                        .collect::<Vec<_>>();
-                    let sort_required_cols = sort_required_cols
-                        .iter()
-                        .flat_map(|cols| cols.iter())
-                        .map(|col| col.name())
-                        .collect::<HashSet<_>>();
-
-                    let plan = wrap_user_into_projections(
-                        &sort_required_cols,
-                        &column_names,
-                        Arc::clone(child_sort.input()),
-                        |plan| {
-                            Ok(Arc::new(SortPreservingMergeExec::new(
-                                reassign_sort_exprs_columns(child_sort.expr(), &plan.schema())?,
-                                plan,
-                            )))
-                        },
-                    )?;
-
-                    return Ok(Transformed::yes(plan));
-                } else if let Some(child_proj) = child_any.downcast_ref::<ProjectionExec>() {
-                    let expr = column_indices
-                        .iter()
-                        .map(|idx| child_proj.expr()[*idx].clone())
-                        .collect();
-                    let plan = Arc::new(ProjectionExec::try_new(
-                        expr,
-                        Arc::clone(child_proj.input()),
-                    )?);
-
-                    // need to call `optimize` directly on the plan, because otherwise we would continue with the child
-                    // and miss the optimization of that particular new ProjectionExec
-                    let plan = self.optimize(plan, config)?;
-
-                    return Ok(Transformed::yes(plan));
-                } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
-                    let dedup_required_cols = child_dedup.sort_columns();
-
-                    let mut children = child_dedup.children();
-                    assert_eq!(children.len(), 1);
-                    let input = children.pop().expect("just checked len");
-
-                    let plan = wrap_user_into_projections(
-                        &dedup_required_cols,
-                        &column_names,
-                        Arc::clone(input),
-                        |plan| {
-                            let sort_keys = reassign_sort_exprs_columns(
-                                child_dedup.sort_keys(),
-                                &plan.schema(),
-                            )?;
-                            Ok(Arc::new(DeduplicateExec::new(
-                                plan,
-                                sort_keys,
-                                child_dedup.use_chunk_order_col(),
-                            )))
-                        },
-                    )?;
-
-                    return Ok(Transformed::yes(plan));
-                } else if let Some(child_recordbatches) =
-                    child_any.downcast_ref::<RecordBatchesExec>()
-                {
-                    let new_child = RecordBatchesExec::new(
-                        child_recordbatches.chunks().cloned(),
-                        Arc::new(child_recordbatches.schema().project(&column_indices)?),
-                        child_recordbatches.output_sort_key_memo().cloned(),
-                    );
-                    return Ok(Transformed::yes(Arc::new(new_child)));
-                }
-            }
-
-            Ok(Transformed::no(plan))
-        })
-        .map(|t| t.data)
+        plan.transform_down(optimize_plan).map(|t| t.data)
     }
 
     fn name(&self) -> &str {
@@ -263,6 +45,198 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Run the projection pushdown optimization on a single plan node.
+fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    let plan_any = plan.as_any();
+
+    let Some(projection_exec) = plan_any.downcast_ref::<ProjectionExec>() else {
+        return Ok(Transformed::no(plan));
+    };
+    let child = projection_exec.input();
+
+    let mut columns = Vec::with_capacity(projection_exec.expr().len());
+    let mut column_indices = Vec::with_capacity(projection_exec.expr().len());
+    for (expr, output_name) in projection_exec.expr() {
+        if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+            if column.name() == output_name {
+                columns.push(column.clone());
+                column_indices.push(column.index());
+            } else {
+                // don't bother w/ renames
+                return Ok(Transformed::no(plan));
+            }
+        } else {
+            // don't bother to deal w/ calculation within projection nodes
+            return Ok(Transformed::no(plan));
+        }
+    }
+    let child_any = child.as_any();
+    if let Some(child_empty) = child_any.downcast_ref::<EmptyExec>() {
+        let new_child = EmptyExec::new(Arc::new(child_empty.schema().project(&column_indices)?));
+        return Ok(Transformed::yes(Arc::new(new_child)));
+    } else if let Some(child_placeholder) = child_any.downcast_ref::<PlaceholderRowExec>() {
+        let new_child = PlaceholderRowExec::new(Arc::new(
+            child_placeholder.schema().project(&column_indices)?,
+        ));
+        return Ok(Transformed::yes(Arc::new(new_child)));
+    } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
+        let new_inputs = child_union
+            .inputs()
+            .iter()
+            .map(|input| {
+                let exec =
+                    ProjectionExec::try_new(projection_exec.expr().to_vec(), Arc::clone(input))?;
+                Ok(Arc::new(exec) as _)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let new_union = UnionExec::new(new_inputs);
+        return Ok(Transformed::yes(Arc::new(new_union)));
+    } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
+        let projection = match child_parquet.base_config().projection.as_ref() {
+            Some(projection) => column_indices
+                .into_iter()
+                .map(|idx| {
+                    projection
+                        .get(idx)
+                        .copied()
+                        .ok_or_else(|| DataFusionError::Execution("Projection broken".to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => column_indices,
+        };
+        let col_map = columns
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, col)| (col, idx))
+            .collect();
+        let output_ordering = child_parquet
+            .base_config()
+            .output_ordering
+            .iter()
+            .map(|output_ordering| project_output_ordering(output_ordering, &col_map))
+            .collect::<Result<_>>()?;
+        let base_config = FileScanConfig {
+            projection: Some(projection),
+            output_ordering,
+            ..child_parquet.base_config().clone()
+        };
+        let mut builder =
+            ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        if let Some(predicate) = child_parquet.predicate() {
+            builder = builder.with_predicate(Arc::clone(predicate));
+        }
+        return Ok(Transformed::yes(builder.build_arc()));
+    } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
+        let filter_required_cols = collect_columns(child_filter.predicate());
+
+        let plan = wrap_user_into_projections(
+            filter_required_cols,
+            &columns,
+            Arc::clone(child_filter.input()),
+            |plan, col_map| {
+                Ok(Arc::new(FilterExec::try_new(
+                    remap_columns(Arc::clone(child_filter.predicate()), col_map)?,
+                    plan,
+                )?))
+            },
+        )?;
+
+        return Ok(Transformed::yes(plan));
+    } else if let Some(child_sort) = child_any.downcast_ref::<SortExec>() {
+        let sort_required_cols = child_sort
+            .expr()
+            .iter()
+            .flat_map(|expr| collect_columns(&expr.expr))
+            .collect::<HashSet<_>>();
+
+        let plan = wrap_user_into_projections(
+            sort_required_cols,
+            &columns,
+            Arc::clone(child_sort.input()),
+            |plan, col_map| {
+                Ok(Arc::new(
+                    SortExec::new(
+                        reassign_sort_exprs_columns(child_sort.expr(), col_map)?,
+                        plan,
+                    )
+                    .with_preserve_partitioning(child_sort.preserve_partitioning())
+                    .with_fetch(child_sort.fetch()),
+                ))
+            },
+        )?;
+
+        return Ok(Transformed::yes(plan));
+    } else if let Some(child_sort) = child_any.downcast_ref::<SortPreservingMergeExec>() {
+        let sort_required_cols = child_sort
+            .expr()
+            .iter()
+            .flat_map(|expr| collect_columns(&expr.expr))
+            .collect::<HashSet<_>>();
+
+        let plan = wrap_user_into_projections(
+            sort_required_cols,
+            &columns,
+            Arc::clone(child_sort.input()),
+            |plan, col_map| {
+                Ok(Arc::new(SortPreservingMergeExec::new(
+                    reassign_sort_exprs_columns(child_sort.expr(), col_map)?,
+                    plan,
+                )))
+            },
+        )?;
+
+        return Ok(Transformed::yes(plan));
+    } else if let Some(child_proj) = child_any.downcast_ref::<ProjectionExec>() {
+        let expr = column_indices
+            .iter()
+            .map(|idx| child_proj.expr()[*idx].clone())
+            .collect();
+        let plan = Arc::new(ProjectionExec::try_new(
+            expr,
+            Arc::clone(child_proj.input()),
+        )?);
+
+        // need to call `optimize_plan` directly on the plan, because otherwise
+        // we would continue with the child and miss the optimization of that
+        // particular new ProjectionExec
+        let plan = optimize_plan(plan)?.data;
+
+        return Ok(Transformed::yes(plan));
+    } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
+        let dedup_required_cols = child_dedup.sort_column_iter();
+
+        let mut children = child_dedup.children();
+        assert_eq!(children.len(), 1);
+        let input = children.pop().expect("just checked len");
+
+        let plan = wrap_user_into_projections(
+            dedup_required_cols,
+            &columns,
+            Arc::clone(input),
+            |plan, col_map| {
+                let sort_keys = reassign_sort_exprs_columns(child_dedup.sort_keys(), col_map)?;
+                Ok(Arc::new(DeduplicateExec::new(
+                    plan,
+                    sort_keys,
+                    child_dedup.use_chunk_order_col(),
+                )))
+            },
+        )?;
+
+        return Ok(Transformed::yes(plan));
+    } else if let Some(child_recordbatches) = child_any.downcast_ref::<RecordBatchesExec>() {
+        let new_child = RecordBatchesExec::new(
+            child_recordbatches.chunks().cloned(),
+            Arc::new(child_recordbatches.schema().project(&column_indices)?),
+            child_recordbatches.output_sort_key_memo().cloned(),
+        );
+        return Ok(Transformed::yes(Arc::new(new_child)));
+    }
+
+    Ok(Transformed::no(plan))
 }
 
 /// Given the output ordering and a projected schema, returns the
@@ -288,21 +262,14 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
 /// It is sorted on `a,b` but *not* sorted on `b`
 fn project_output_ordering(
     output_ordering: &[PhysicalSortExpr],
-    projected_schema: SchemaRef,
+    col_map: &HashMap<Column, usize>,
 ) -> Result<Vec<PhysicalSortExpr>> {
-    // filter out sort exprs columns that got projected away
-    let known_columns = projected_schema
-        .flattened_fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect::<HashSet<_>>();
-
     // take longest prefix
     let sort_exprs = output_ordering
         .iter()
         .take_while(|expr| {
             if let Some(col) = expr.expr.as_any().downcast_ref::<Column>() {
-                known_columns.contains(col.name())
+                col_map.contains_key(col)
             } else {
                 // do not keep exprs like `a+1` or `-a` as they may
                 // not maintain ordering
@@ -312,30 +279,25 @@ fn project_output_ordering(
         .cloned()
         .collect::<Vec<_>>();
 
-    reassign_sort_exprs_columns(&sort_exprs, &projected_schema)
+    reassign_sort_exprs_columns(&sort_exprs, col_map)
 }
 
-fn schema_name_projection(
-    schema: &SchemaRef,
-    cols: &[&str],
-) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-    let idx_lookup = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| (field.name().as_str(), idx))
-        .collect::<HashMap<_, _>>();
-
-    cols.iter()
-        .map(|col| {
-            let idx = *idx_lookup.get(col).ok_or_else(|| {
-                DataFusionError::Execution(format!("Cannot find column to project: {col}"))
-            })?;
-
-            let expr = Arc::new(Column::new(col, idx)) as _;
-            Ok((expr, (*col).to_owned()))
-        })
-        .collect::<Result<Vec<_>>>()
+/// remap the column references in the expression to the new
+/// indices specified in the map.
+fn remap_columns(
+    expr: Arc<dyn PhysicalExpr>,
+    col_map: &HashMap<Column, usize>,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    expr.transform_down(|expr| {
+        if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+            let idx = *col_map.get(col).unwrap();
+            if idx != col.index() {
+                return Ok(Transformed::yes(Arc::new(Column::new(col.name(), idx))));
+            }
+        }
+        Ok(Transformed::no(expr))
+    })
+    .map(|t| t.data)
 }
 
 /// Wraps an intermediate node (like [`FilterExec`]) that has a single input but also uses some columns itself into
@@ -359,75 +321,78 @@ fn schema_name_projection(
 ///     projection:  # if `inner` outputs too many cols
 ///       inner:
 /// ```
-fn wrap_user_into_projections<F>(
-    user_required_cols: &HashSet<&str>,
-    outer_cols: &[&str],
+fn wrap_user_into_projections<I, F>(
+    user_required_cols: I,
+    outer_cols: &[Column],
     inner_plan: Arc<dyn ExecutionPlan>,
     user_constructor: F,
 ) -> Result<Arc<dyn ExecutionPlan>>
 where
-    F: FnOnce(Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>>,
+    I: IntoIterator<Item = Column>,
+    F: FnOnce(Arc<dyn ExecutionPlan>, &HashMap<Column, usize>) -> Result<Arc<dyn ExecutionPlan>>,
 {
     let mut plan = inner_plan;
 
-    let inner_required_cols = user_required_cols
-        .iter()
-        .chain(outer_cols.iter())
-        .copied()
-        .collect::<HashSet<_>>();
-
-    // sort inner required cols according the final projection
-    let outer_cols_order = outer_cols
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(idx, col)| (col, idx))
-        .collect::<HashMap<_, _>>();
-    let mut inner_projection_cols = inner_required_cols
-        .iter()
-        .copied()
-        .map(|col| {
-            // Note: if the col is NOT known, this will fail in `schema_name_projection`, so we just default it here
-            let idx = outer_cols_order.get(col).copied().unwrap_or_default();
-            (idx, col)
-        })
-        .collect::<Vec<_>>();
-    inner_projection_cols.sort();
-    let inner_projection_cols = inner_projection_cols
-        .into_iter()
-        .map(|(_idx, col)| col)
-        .collect::<Vec<_>>();
-
+    // put the user_required_cols in a determinisic order.
+    let mut user_required_cols = user_required_cols.into_iter().collect::<Vec<_>>();
+    user_required_cols.sort_by_key(|col| col.index());
+    let cap = user_required_cols.len() + outer_cols.len();
+    let mut inner_projection_cols = Vec::with_capacity(cap);
+    let mut col_map = HashMap::with_capacity(cap);
+    for col in outer_cols.iter().chain(user_required_cols.iter()) {
+        if !col_map.contains_key(col) {
+            col_map.insert(col.clone(), col_map.len());
+            inner_projection_cols.push(col.clone());
+        }
+    }
     let plan_schema = plan.schema();
     let plan_cols = plan_schema
         .fields()
         .iter()
-        .map(|f| f.name().as_str())
+        .enumerate()
+        .map(|(idx, f)| Column::new(f.name(), idx))
         .collect::<Vec<_>>();
     if plan_cols != inner_projection_cols {
-        let expr = schema_name_projection(&plan.schema(), &inner_projection_cols)?;
+        let expr = column_projection(inner_projection_cols);
         plan = Arc::new(ProjectionExec::try_new(expr, plan)?);
     }
 
-    plan = user_constructor(plan)?;
+    plan = user_constructor(plan, &col_map)?;
 
     if outer_cols.len() < plan.schema().fields().len() {
-        let expr = schema_name_projection(&plan.schema(), outer_cols)?;
+        let expr = column_projection(outer_cols.iter().map(|col| {
+            let idx = col_map.get(col).copied().unwrap();
+            Column::new(col.name(), idx)
+        }));
         plan = Arc::new(ProjectionExec::try_new(expr, plan)?);
     }
 
     Ok(plan)
 }
 
+/// Create a projection expression for the given columns.
+fn column_projection<T>(columns: T) -> Vec<(Arc<dyn PhysicalExpr>, String)>
+where
+    T: IntoIterator<Item = Column>,
+{
+    columns
+        .into_iter()
+        .map(|c| {
+            let name = c.name().to_string();
+            (Arc::new(c) as _, name)
+        })
+        .collect()
+}
+
 fn reassign_sort_exprs_columns(
     sort_exprs: &[PhysicalSortExpr],
-    schema: &SchemaRef,
+    col_map: &HashMap<Column, usize>,
 ) -> Result<Vec<PhysicalSortExpr>> {
     sort_exprs
         .iter()
         .map(|expr| {
             Ok(PhysicalSortExpr {
-                expr: reassign_predicate_columns(Arc::clone(&expr.expr), schema, false)?,
+                expr: remap_columns(Arc::clone(&expr.expr), col_map)?,
                 options: expr.options,
             })
         })
@@ -438,14 +403,17 @@ fn reassign_sort_exprs_columns(
 mod tests {
     use arrow::{
         compute::SortOptions,
-        datatypes::{DataType, Field, Fields, Schema, SchemaRef},
+        datatypes::{DataType, Field, Schema, SchemaRef},
     };
     use datafusion::{
+        common::JoinType,
         datasource::object_store::ObjectStoreUrl,
+        functions::core::coalesce,
         logical_expr::Operator,
-        physical_expr::EquivalenceProperties,
+        physical_expr::{EquivalenceProperties, ScalarFunctionExpr},
         physical_plan::{
-            expressions::{BinaryExpr, Literal},
+            expressions::{BinaryExpr, IsNullExpr, Literal},
+            joins::{utils::JoinFilter, HashJoinExec, NestedLoopJoinExec, PartitionMode},
             DisplayAs, ExecutionMode, PhysicalExpr, PlanProperties, Statistics,
         },
         scalar::ScalarValue,
@@ -473,15 +441,14 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
 
         let empty_exec = test
@@ -512,15 +479,14 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag2@1 as tag2, tag1@0 as tag1, field@2 as field]"
           - "   EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
 
         let empty_exec = test
@@ -550,8 +516,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag2@1 as tag1]"
           - "   EmptyExec"
@@ -559,7 +524,7 @@ mod tests {
           Ok:
             - " ProjectionExec: expr=[tag2@1 as tag1]"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -579,8 +544,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag3]"
           - "   EmptyExec"
@@ -588,7 +552,7 @@ mod tests {
           Ok:
             - " ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag3]"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -608,8 +572,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[foo as tag1]"
           - "   EmptyExec"
@@ -617,7 +580,7 @@ mod tests {
           Ok:
             - " ProjectionExec: expr=[foo as tag1]"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -634,8 +597,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   Test"
@@ -643,7 +605,7 @@ mod tests {
           Ok:
             - " ProjectionExec: expr=[tag1@0 as tag1]"
             - "   Test"
-        "###
+        "#
         );
     }
 
@@ -663,8 +625,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   UnionExec"
@@ -677,7 +638,7 @@ mod tests {
             - "     Test"
             - "   ProjectionExec: expr=[tag1@0 as tag1]"
             - "     Test"
-        "###
+        "#
         );
     }
 
@@ -700,8 +661,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   UnionExec"
@@ -719,7 +679,7 @@ mod tests {
             - "       Test"
             - "   ProjectionExec: expr=[tag1@0 as tag1]"
             - "     Test"
-        "###
+        "#
         );
     }
 
@@ -773,15 +733,14 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag2@2 as tag2, tag3@1 as tag3]"
           - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
             - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
-        "###
+        "#
         );
 
         let parquet_exec = test
@@ -816,8 +775,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   FilterExec: tag2@1 = foo"
@@ -828,7 +786,7 @@ mod tests {
             - "   FilterExec: tag2@1 = foo"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
-        "###
+        "#
         );
     }
 
@@ -849,8 +807,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   FilterExec: tag2@1 = foo"
@@ -860,7 +817,7 @@ mod tests {
             - " ProjectionExec: expr=[tag1@0 as tag1]"
             - "   FilterExec: tag2@1 = foo"
             - "     Test"
-        "###
+        "#
         );
     }
 
@@ -883,8 +840,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag2@1 as tag2]"
           - "   FilterExec: tag2@1 = foo"
@@ -894,7 +850,7 @@ mod tests {
             - " FilterExec: tag2@0 = foo"
             - "   ProjectionExec: expr=[tag2@1 as tag2]"
             - "     Test"
-        "###
+        "#
         );
     }
 
@@ -915,8 +871,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag2@0 as tag2]"
           - "   FilterExec: tag2@0 = foo"
@@ -925,7 +880,7 @@ mod tests {
           Ok:
             - " FilterExec: tag2@0 = foo"
             - "   Test"
-        "###
+        "#
         );
     }
 
@@ -955,8 +910,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag2@1 as tag2, tag1@0 as tag1, field@2 as field]"
           - "   FilterExec: tag2@1 = foo AND tag1@0 = foo"
@@ -966,7 +920,7 @@ mod tests {
             - " FilterExec: tag2@0 = foo AND tag1@1 = foo"
             - "   ProjectionExec: expr=[tag2@1 as tag2, tag1@0 as tag1, field@2 as field]"
             - "     Test"
-        "###
+        "#
         );
     }
 
@@ -996,8 +950,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[false]"
@@ -1008,7 +961,7 @@ mod tests {
             - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[false]"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
-        "###
+        "#
         );
     }
 
@@ -1042,8 +995,7 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[true]"
@@ -1054,7 +1006,7 @@ mod tests {
             - "   SortExec: TopK(fetch=42), expr=[tag2@1 DESC], preserve_partitioning=[true]"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
-        "###
+        "#
         );
 
         assert_unknown_partitioning(
@@ -1090,8 +1042,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   SortPreservingMergeExec: [tag2@1 DESC]"
@@ -1102,7 +1053,7 @@ mod tests {
             - "   SortPreservingMergeExec: [tag2@1 DESC]"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
-        "###
+        "#
         );
     }
 
@@ -1136,8 +1087,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   ProjectionExec: expr=[foo as tag1, bar as tag2]"
@@ -1146,7 +1096,7 @@ mod tests {
           Ok:
             - " ProjectionExec: expr=[foo as tag1]"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -1175,8 +1125,7 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
@@ -1184,7 +1133,7 @@ mod tests {
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
         let empty_exec = test
             .output_plan()
@@ -1220,8 +1169,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   DeduplicateExec: [tag2@1 DESC]"
@@ -1232,7 +1180,7 @@ mod tests {
             - "   DeduplicateExec: [tag2@1 DESC]"
             - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2]"
             - "       Test"
-        "###
+        "#
         );
     }
 
@@ -1276,19 +1224,18 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1, field1@2 as field1]"
           - "   DeduplicateExec: [tag1@0 DESC,tag2@1 ASC]"
           - "     Test"
         output:
           Ok:
-            - " ProjectionExec: expr=[tag1@0 as tag1, field1@2 as field1]"
-            - "   DeduplicateExec: [tag1@0 DESC,tag2@1 ASC]"
-            - "     ProjectionExec: expr=[tag1@0 as tag1, tag2@1 as tag2, field1@2 as field1]"
+            - " ProjectionExec: expr=[tag1@0 as tag1, field1@1 as field1]"
+            - "   DeduplicateExec: [tag1@0 DESC,tag2@2 ASC]"
+            - "     ProjectionExec: expr=[tag1@0 as tag1, field1@2 as field1, tag2@1 as tag2]"
             - "       Test"
-        "###
+        "#
         );
     }
 
@@ -1313,15 +1260,14 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[tag1@0 as tag1]"
           - "   RecordBatchesExec: chunks=1, projection=[tag1, tag2, field]"
         output:
           Ok:
             - " RecordBatchesExec: chunks=1, projection=[tag1]"
-        "###
+        "#
         );
 
         let recordbatches_exec = test
@@ -1332,6 +1278,224 @@ mod tests {
             .unwrap();
         let expected_schema = Schema::new(vec![Field::new("tag1", DataType::Utf8, true)]);
         assert_eq!(recordbatches_exec.schema().as_ref(), &expected_schema);
+    }
+
+    #[test]
+    fn test_preserve_schema_with_duplicate_column_names() {
+        let table_schema = Arc::new(Schema::new([Arc::new(Field::new(
+            "col1",
+            DataType::Utf8,
+            true,
+        ))]));
+        let plan = HashJoinExec::try_new(
+            Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
+            vec![(
+                Arc::new(Column::new("col1", 0)),
+                Arc::new(Column::new("col1", 0)),
+            )],
+            None,
+            &JoinType::Full,
+            None,
+            PartitionMode::Auto,
+            false,
+        )
+        .unwrap();
+        let plan = ProjectionExec::try_new(
+            vec![
+                (
+                    Arc::new(ScalarFunctionExpr::new(
+                        "COALESCE",
+                        coalesce(),
+                        vec![
+                            Arc::new(Column::new("col1", 0)),
+                            Arc::new(Column::new("col1", 1)),
+                        ],
+                        DataType::Utf8,
+                    )),
+                    "__common_expr".to_string(),
+                ),
+                (Arc::new(Column::new("col1", 0)), "col1".to_string()),
+                (Arc::new(Column::new("col1", 1)), "col1".to_string()),
+            ],
+            Arc::new(plan),
+        )
+        .unwrap();
+        let plan = FilterExec::try_new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("__common_expr", 0)),
+                Operator::Lt,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("a".to_string())))),
+            )),
+            Arc::new(plan),
+        )
+        .unwrap();
+        let plan = ProjectionExec::try_new(
+            vec![
+                (Arc::new(Column::new("col1", 1)), "col1".to_string()),
+                (Arc::new(Column::new("col1", 2)), "col1".to_string()),
+            ],
+            Arc::new(plan),
+        )
+        .unwrap();
+        let plan = ProjectionExec::try_new(
+            vec![(
+                Arc::new(ScalarFunctionExpr::new(
+                    "COALESCE",
+                    coalesce(),
+                    vec![
+                        Arc::new(Column::new("col1", 0)),
+                        Arc::new(Column::new("col1", 1)),
+                    ],
+                    DataType::Utf8,
+                )),
+                "value".to_string(),
+            )],
+            Arc::new(plan),
+        )
+        .unwrap();
+        let test = OptimizationTest::new(Arc::new(plan), ProjectionPushdown);
+        insta::assert_yaml_snapshot!(
+            test,
+            @r#"
+        input:
+          - " ProjectionExec: expr=[COALESCE(col1@0, col1@1) as value]"
+          - "   ProjectionExec: expr=[col1@1 as col1, col1@2 as col1]"
+          - "     FilterExec: __common_expr@0 < a"
+          - "       ProjectionExec: expr=[COALESCE(col1@0, col1@1) as __common_expr, col1@0 as col1, col1@1 as col1]"
+          - "         HashJoinExec: mode=Auto, join_type=Full, on=[(col1@0, col1@0)]"
+          - "           EmptyExec"
+          - "           EmptyExec"
+        output:
+          Ok:
+            - " ProjectionExec: expr=[COALESCE(col1@0, col1@1) as value]"
+            - "   ProjectionExec: expr=[col1@0 as col1, col1@1 as col1]"
+            - "     FilterExec: __common_expr@2 < a"
+            - "       ProjectionExec: expr=[col1@0 as col1, col1@1 as col1, COALESCE(col1@0, col1@1) as __common_expr]"
+            - "         HashJoinExec: mode=Auto, join_type=Full, on=[(col1@0, col1@0)]"
+            - "           EmptyExec"
+            - "           EmptyExec"
+        "#
+        );
+    }
+
+    #[test]
+    fn test_preserve_schema_with_duplicate_input_column_names() {
+        let table_schema = Arc::new(Schema::new([
+            Arc::new(Field::new("col1", DataType::Int64, false)),
+            Arc::new(Field::new("col2", DataType::Utf8, true)),
+        ]));
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("col2", 1)),
+                    Operator::NotEq,
+                    Arc::new(Column::new("col2", 3)),
+                )),
+                Operator::And,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("col1", 0)),
+                    Operator::Gt,
+                    Arc::new(Column::new("col1", 1)),
+                )),
+            )),
+            JoinFilter::build_column_indices(vec![0, 1], vec![0, 1]),
+            Schema::new([
+                Arc::new(Field::new("col1", DataType::Int64, false)),
+                Arc::new(Field::new("col2", DataType::Utf8, true)),
+                Arc::new(Field::new("col1", DataType::Int64, false)),
+                Arc::new(Field::new("col2", DataType::Utf8, true)),
+            ]),
+        );
+        let plan = NestedLoopJoinExec::try_new(
+            Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
+            Some(filter),
+            &JoinType::Inner,
+        )
+        .unwrap();
+        let plan = ProjectionExec::try_new(
+            vec![
+                (Arc::new(Column::new("col1", 0)), "col1".to_string()),
+                (Arc::new(Column::new("col1", 2)), "col1".to_string()),
+            ],
+            Arc::new(plan),
+        )
+        .unwrap();
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("col1", 0)),
+                    Operator::Gt,
+                    Arc::new(Column::new("col1", 2)),
+                )),
+                Operator::And,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("col1", 2)),
+                    Operator::Gt,
+                    Arc::new(Column::new("col1", 1)),
+                )),
+            )),
+            JoinFilter::build_column_indices(vec![0, 1], vec![0]),
+            Schema::new([
+                Arc::new(Field::new("col1", DataType::Int64, false)),
+                Arc::new(Field::new("col1", DataType::Int64, false)),
+                Arc::new(Field::new("col1", DataType::Int64, false)),
+            ]),
+        );
+        let plan = NestedLoopJoinExec::try_new(
+            Arc::new(plan),
+            Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
+            Some(filter),
+            &JoinType::Left,
+        )
+        .unwrap();
+        let plan = ProjectionExec::try_new(
+            vec![
+                (Arc::new(Column::new("col1", 0)), "col1".to_string()),
+                (Arc::new(Column::new("col1", 2)), "col1".to_string()),
+            ],
+            Arc::new(plan),
+        )
+        .unwrap();
+        let plan = FilterExec::try_new(
+            Arc::new(IsNullExpr::new(Arc::new(Column::new("col1", 1)))),
+            Arc::new(plan),
+        )
+        .unwrap();
+        let plan = ProjectionExec::try_new(
+            vec![(Arc::new(Column::new("col1", 0)), "col1".to_string())],
+            Arc::new(plan),
+        )
+        .unwrap();
+
+        let test = OptimizationTest::new(Arc::new(plan), ProjectionPushdown);
+        insta::assert_yaml_snapshot!(
+            test,
+            @r#"
+        input:
+          - " ProjectionExec: expr=[col1@0 as col1]"
+          - "   FilterExec: col1@1 IS NULL"
+          - "     ProjectionExec: expr=[col1@0 as col1, col1@2 as col1]"
+          - "       NestedLoopJoinExec: join_type=Left, filter=col1@0 > col1@2 AND col1@2 > col1@1"
+          - "         ProjectionExec: expr=[col1@0 as col1, col1@2 as col1]"
+          - "           NestedLoopJoinExec: join_type=Inner, filter=col2@1 != col2@3 AND col1@0 > col1@1"
+          - "             EmptyExec"
+          - "             EmptyExec"
+          - "         EmptyExec"
+        output:
+          Ok:
+            - " ProjectionExec: expr=[col1@0 as col1]"
+            - "   FilterExec: col1@1 IS NULL"
+            - "     ProjectionExec: expr=[col1@0 as col1, col1@2 as col1]"
+            - "       NestedLoopJoinExec: join_type=Left, filter=col1@0 > col1@2 AND col1@2 > col1@1"
+            - "         ProjectionExec: expr=[col1@0 as col1, col1@2 as col1]"
+            - "           NestedLoopJoinExec: join_type=Inner, filter=col2@1 != col2@3 AND col1@0 > col1@1"
+            - "             EmptyExec"
+            - "             EmptyExec"
+            - "         EmptyExec"
+        "#
+        );
     }
 
     #[test]
@@ -1382,8 +1546,7 @@ mod tests {
         let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ProjectionExec: expr=[field1@2 as field1]"
           - "   FilterExec: tag2@1 = foo"
@@ -1394,11 +1557,11 @@ mod tests {
           Ok:
             - " ProjectionExec: expr=[field1@0 as field1]"
             - "   FilterExec: tag2@1 = foo"
-            - "     ProjectionExec: expr=[field1@0 as field1, tag2@2 as tag2]"
-            - "       DeduplicateExec: [tag1@1 ASC,tag2@2 ASC]"
+            - "     ProjectionExec: expr=[field1@0 as field1, tag2@1 as tag2]"
+            - "       DeduplicateExec: [tag1@2 ASC,tag2@1 ASC]"
             - "         UnionExec"
-            - "           ParquetExec: file_groups={0 groups: []}, projection=[field1, tag1, tag2]"
-        "###
+            - "           ParquetExec: file_groups={0 groups: []}, projection=[field1, tag2, tag1]"
+        "#
         );
     }
 
@@ -1419,8 +1582,7 @@ mod tests {
 
         insta::assert_yaml_snapshot!(
             ProjectOutputOrdering::new(&schema, output_ordering, projection),
-            @r###"
-        ---
+            @r"
         output_ordering:
           - tag1@0
           - tag2@1
@@ -1430,7 +1592,7 @@ mod tests {
         projected_ordering:
           - tag1@0
           - tag2@1
-        "###
+        "
         );
     }
 
@@ -1451,8 +1613,7 @@ mod tests {
 
         insta::assert_yaml_snapshot!(
             ProjectOutputOrdering::new(&schema, output_ordering, projection),
-            @r###"
-        ---
+            @r"
         output_ordering:
           - tag1@0
           - tag2@1
@@ -1460,7 +1621,7 @@ mod tests {
           - tag1
         projected_ordering:
           - tag1@0
-        "###
+        "
         );
     }
 
@@ -1481,15 +1642,14 @@ mod tests {
 
         insta::assert_yaml_snapshot!(
             ProjectOutputOrdering::new(&schema, output_ordering, projection),
-            @r###"
-        ---
+            @r"
         output_ordering:
           - tag1@0
           - tag2@1
         projection:
           - tag2
         projected_ordering: []
-        "###
+        "
         );
     }
 
@@ -1510,8 +1670,7 @@ mod tests {
 
         insta::assert_yaml_snapshot!(
             ProjectOutputOrdering::new(&schema, output_ordering, projection),
-            @r###"
-        ---
+            @r"
         output_ordering:
           - tag1@0
           - tag2@1
@@ -1522,7 +1681,7 @@ mod tests {
         projected_ordering:
           - tag1@1
           - tag2@0
-        "###
+        "
         );
     }
 
@@ -1544,15 +1703,14 @@ mod tests {
 
         insta::assert_yaml_snapshot!(
             ProjectOutputOrdering::new(&schema, output_ordering, projection),
-            @r###"
-        ---
+            @r#"
         output_ordering:
           - "1"
           - tag2@1
         projection:
           - tag2
         projected_ordering: []
-        "###
+        "#
         );
     }
 
@@ -1574,8 +1732,7 @@ mod tests {
 
         insta::assert_yaml_snapshot!(
             ProjectOutputOrdering::new(&schema, output_ordering, projection),
-            @r###"
-        ---
+            @r#"
         output_ordering:
           - tag2@1
           - "1"
@@ -1583,7 +1740,7 @@ mod tests {
           - tag2
         projected_ordering:
           - tag2@0
-        "###
+        "#
         );
     }
 
@@ -1602,18 +1759,19 @@ mod tests {
             output_ordering: Vec<PhysicalSortExpr>,
             projection: Vec<&'static str>,
         ) -> Self {
-            let projected_fields: Fields = projection
+            let col_map = projection
                 .iter()
                 .map(|field_name| {
-                    schema
-                        .field_with_name(field_name)
-                        .expect("finding field")
-                        .clone()
+                    Column::new(
+                        field_name,
+                        schema.index_of(field_name).expect("finding field"),
+                    )
                 })
+                .enumerate()
+                .map(|(idx, col)| (col, idx))
                 .collect();
-            let projected_schema = Arc::new(Schema::new(projected_fields));
 
-            let projected_ordering = project_output_ordering(&output_ordering, projected_schema);
+            let projected_ordering = project_output_ordering(&output_ordering, &col_map);
 
             let projected_ordering = match projected_ordering {
                 Ok(projected_ordering) => format_sort_exprs(&projected_ordering),

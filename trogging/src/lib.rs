@@ -368,7 +368,9 @@ pub mod test_util {
                 r"(?m)( ?time=[0-9]+|^(\d{4})-\d{1,2}-\d{1,2}T\d{2}:\d{2}:\d{2}.\d+Z *)",
             )
             .unwrap();
-            timestamp.replace_all(&self.to_string(), "").to_string()
+            let ts = regex::Regex::new(r"( ?ts=\d+-\d+-\d+T\d+:\d+:\d+.\d+Z)").unwrap();
+            let stripped = timestamp.replace_all(&self.to_string(), "").to_string();
+            ts.replace_all(&stripped, "").to_string()
         }
     }
 

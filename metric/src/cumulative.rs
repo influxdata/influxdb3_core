@@ -67,11 +67,6 @@ impl CumulativeRecorder {
         }
     }
 
-    /// Gets the local contribution from this instance
-    pub fn get_local(&self) -> u64 {
-        self.local
-    }
-
     /// Increment the local value for this CumulativeRecorder
     pub fn inc(&mut self, delta: u64) {
         self.local += delta;

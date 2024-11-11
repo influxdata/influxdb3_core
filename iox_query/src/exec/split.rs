@@ -90,7 +90,7 @@ use tokio::sync::mpsc::Sender;
 ///   in which rows are only evaluated to true in at most one of the expressions.
 /// * partition n (n = partition split_exprs.len())  are the rows for which all split_exprs
 ///   do not evaluate to true (e.g. Null or false)
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, PartialOrd)]
 pub struct StreamSplitNode {
     input: LogicalPlan,
     split_exprs: Vec<Expr>,

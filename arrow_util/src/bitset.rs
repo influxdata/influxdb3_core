@@ -193,10 +193,11 @@ impl BitSet {
         (self.buffer[byte_idx] >> bit_idx) & 1 != 0
     }
 
-    /// Converts this BitSet to a buffer compatible with arrows boolean encoding
-    pub fn to_arrow(&self) -> BooleanBuffer {
+    /// Converts this BitSet to a buffer compatible with arrows boolean
+    /// encoding, consuming self.
+    pub fn into_arrow(self) -> BooleanBuffer {
         let offset = 0;
-        BooleanBuffer::new(Buffer::from(&self.buffer), offset, self.len)
+        BooleanBuffer::new(Buffer::from_vec(self.buffer), offset, self.len)
     }
 
     /// Returns the number of values stored in the bitset
@@ -612,7 +613,7 @@ mod tests {
         let collected = compact_bools(bools);
         let mut mask = BitSet::new();
         mask.append_bits(bools.len(), &collected);
-        let mask_buffer = mask.to_arrow();
+        let mask_buffer = mask.into_arrow();
 
         assert_eq!(collected.as_slice(), buffer.values());
         assert_eq!(buffer.values(), mask_buffer.into_inner().as_slice());

@@ -24,7 +24,7 @@ pub(crate) static REGEX_MATCH_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
         REGEX_MATCH_UDF_NAME,
         // takes two arguments: regex, pattern
         vec![DataType::Utf8, DataType::Utf8],
-        Arc::new(DataType::Boolean),
+        DataType::Boolean,
         Volatility::Stable,
         regex_match_expr_impl(true),
     ))
@@ -36,7 +36,7 @@ pub(crate) static REGEX_NOT_MATCH_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(
         REGEX_NOT_MATCH_UDF_NAME,
         // takes two arguments: regex, pattern
         vec![DataType::Utf8, DataType::Utf8],
-        Arc::new(DataType::Boolean),
+        DataType::Boolean,
         Volatility::Stable,
         regex_match_expr_impl(false),
     ))

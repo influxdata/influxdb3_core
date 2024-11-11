@@ -45,6 +45,9 @@ message TableUpdated {
   string table_name = 1;
   string namespace_name = 2;
   int64 table_id = 3;
+  // The namespace ID must be included to allow receivers to process messages
+  // correctly for mutable namespace names. 
+  int64 namespace_id = 5;
 
   // The set of columns in this update.
   repeated Column columns = 4;

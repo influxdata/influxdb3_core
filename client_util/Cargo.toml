@@ -10,13 +10,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-http = "0.2.12"
-reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
-thiserror = "1.0.63"
+http = { workspace = true }
+reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
+thiserror = "2.0.0"
 tonic = { workspace = true }
-tower = "0.4"
+tower = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["macros", "parking_lot", "rt-multi-thread"] }
+tokio = { version = "1.41", features = ["macros", "parking_lot", "rt-multi-thread"] }
 mockito = { version = "1.5", default-features = false }

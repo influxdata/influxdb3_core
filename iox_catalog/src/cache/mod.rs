@@ -71,6 +71,9 @@ pub struct CachingCatalogParams {
 
     /// linger timeout for writes impacting the table snapshot
     pub table_linger: Duration,
+
+    /// Enable Admin UI Storage API
+    pub admin_ui_storage_api_enabled: bool,
 }
 
 /// Caching catalog.
@@ -103,6 +106,7 @@ impl CachingCatalog {
             quorum_fanout,
             partition_linger,
             table_linger,
+            admin_ui_storage_api_enabled,
         } = params;
 
         // We set a more aggressive backoff configuration than normal as we expect latencies to be low
@@ -150,6 +154,15 @@ impl CachingCatalog {
             Duration::from_secs(0),
         );
 
+        if admin_ui_storage_api_enabled {
+            // TODO (chunchun): Enable Admin UI Storage APIs, such as
+            // `get_count` and `get_size`, by creating a new CacheHandlerCatalog,
+            // similar to how partitions, tables, namespaces, and root
+            // are created
+            //
+            // https://github.com/influxdata/influxdb_iox/issues/12430
+        }
+
         Self {
             backing,
             metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
@@ -187,6 +200,10 @@ impl Catalog for CachingCatalog {
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    async fn get_time(&self) -> Result<iox_time::Time, Error> {
+        self.backing.get_time().await
     }
 
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
@@ -918,15 +935,11 @@ impl ParquetFileRepo for Repos {
         Ok(res)
     }
 
-    async fn delete_old_ids_only(
-        &mut self,
-        older_than: Timestamp,
-        cutoff: Duration,
-    ) -> Result<Vec<ObjectStoreId>> {
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         // deleted files are NOT part of the snapshot, so this bypasses the cache
         self.backing
             .parquet_files()
-            .delete_old_ids_only(older_than, cutoff)
+            .delete_old_ids_only(older_than)
             .await
     }
 
@@ -1017,6 +1030,17 @@ impl ParquetFileRepo for Repos {
             .await?;
 
         Ok(res)
+    }
+
+    async fn list_by_table_id(
+        &mut self,
+        table_id: TableId,
+        compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>> {
+        self.backing
+            .parquet_files()
+            .list_by_table_id(table_id, compaction_level)
+            .await
     }
 }
 
@@ -1135,24 +1159,31 @@ where
 
 #[cfg(test)]
 mod tests {
-    use catalog_cache::local::CatalogCache;
-    use catalog_cache::CacheValue;
-    use catalog_cache::{api::server::test_util::TestCacheServer, CacheKey};
-    use data_types::ColumnSet;
-    use generated_types::influxdata::iox::catalog_cache::v1 as proto;
-    use generated_types::prost::Message;
+    use super::*;
+
+    use crate::{
+        cache::snapshot::Snapshot,
+        interface_tests::TestCatalog,
+        mem::MemCatalog,
+        test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
+    };
+
+    use std::{
+        fmt::Debug,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
+    use catalog_cache::{
+        api::server::test_util::TestCacheServer, local::CatalogCache, CacheKey, CacheValue,
+    };
+    use generated_types::{influxdata::iox::catalog_cache::v1 as proto, prost::Message};
     use iox_time::{MockProvider, SystemProvider, Time};
     use metric::{Attributes, DurationHistogram, Metric};
-    use std::fmt::Debug;
     use test_helpers::maybe_start_logging;
     use test_utils::AssertPendingExt;
-
-    use crate::{interface_tests::TestCatalog, mem::MemCatalog};
-
-    use super::*;
-    use crate::cache::snapshot::Snapshot;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
@@ -1451,16 +1482,8 @@ mod tests {
 
         let mut repos = catalog.repositories();
 
-        let ns = repos
-            .namespaces()
-            .create(&NamespaceName::new("ns").unwrap(), None, None, None)
-            .await
-            .unwrap();
-        let table = repos
-            .tables()
-            .create("t", Default::default(), ns.id)
-            .await
-            .unwrap();
+        let ns = arbitrary_namespace(&mut *repos, "ns").await;
+        let table = arbitrary_table(&mut *repos, "t", &ns).await;
 
         // check PUT metrics:
         // - root:
@@ -1501,22 +1524,7 @@ mod tests {
         assert_metric_cache_put(&catalog.metrics(), "table", 2);
         assert_metric_cache_put(&catalog.metrics(), "partition", 0);
 
-        let params_1 = ParquetFileParams {
-            namespace_id: ns.id,
-            table_id: table.id,
-            partition_id: partition_1.id,
-            partition_hash_id: partition_1.hash_id().cloned(),
-            object_store_id: ObjectStoreId::new(),
-            min_time: Timestamp::new(0),
-            max_time: Timestamp::new(1),
-            file_size_bytes: 3,
-            row_count: 4,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(5),
-            column_set: ColumnSet::new([]),
-            max_l0_created_at: Timestamp::new(6),
-            source: None,
-        };
+        let params_1 = arbitrary_parquet_file_params(&ns, &table, &partition_1);
         let params_2 = ParquetFileParams {
             object_store_id: ObjectStoreId::new(),
             ..params_1.clone()
@@ -1601,6 +1609,7 @@ mod tests {
                 quorum_fanout: 10,
                 partition_linger: batch_delay,
                 table_linger: batch_delay,
+                admin_ui_storage_api_enabled: false,
             },
             2,
         );

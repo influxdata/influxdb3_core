@@ -1,7 +1,7 @@
 use data_types::{
-    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, NamespaceId, ObjectStoreId,
-    ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
-    PartitionKey, SkippedCompaction, Table, TableId, Timestamp,
+    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxL0CreatedAt, NamespaceId,
+    ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId,
+    PartitionId, PartitionKey, SkippedCompaction, Table, TableId, Timestamp,
 };
 use uuid::Uuid;
 
@@ -125,7 +125,7 @@ impl ParquetFileBuilder {
             compaction_level: self.file.compaction_level,
             created_at: self.file.created_at,
             column_set: self.file.column_set,
-            max_l0_created_at: self.file.max_l0_created_at,
+            max_l0_created_at: MaxL0CreatedAt::Computed(self.file.max_l0_created_at),
             source: self.file.source,
         };
         (params, file)
@@ -240,6 +240,7 @@ impl PartitionBuilder {
                 Default::default(),
                 None,
                 Default::default(),
+                Some(Timestamp::new(5)),
             ),
         }
     }

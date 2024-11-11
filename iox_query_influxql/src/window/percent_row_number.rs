@@ -1,7 +1,8 @@
 use crate::error;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, UInt64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion::common::{downcast_value, DataFusionError, Result};
+use datafusion::logical_expr::function::WindowUDFFieldArgs;
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
@@ -39,8 +40,8 @@ impl WindowUDFImpl for PercentRowNumberUDWF {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::UInt64)
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
+        Ok(Field::new(field_args.name(), DataType::UInt64, true))
     }
 
     fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {

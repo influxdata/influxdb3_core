@@ -49,15 +49,15 @@ fn level() {
 
     let expected = [
         "level=info msg=\"This is an info message\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:36\" time=1612181556329599000",
+            location=\"logfmt/tests/logging.rs:36\" ts=2024-09-11T15:58:08.256738871Z time=1612181556329599000",
         "level=debug msg=\"This is a debug message\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:37\" time=1612181556329618000",
+            location=\"logfmt/tests/logging.rs:37\" ts=2024-09-11T15:58:08.256738871Z time=1612181556329618000",
         "level=trace msg=\"This is a trace message\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:38\" time=1612181556329634000",
+            location=\"logfmt/tests/logging.rs:38\" ts=2024-09-11T15:58:08.256738871Z time=1612181556329634000",
         "level=warn msg=\"This is a warn message\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:39\" time=1612181556329646000",
+            location=\"logfmt/tests/logging.rs:39\" ts=2024-09-11T15:58:08.256738871Z time=1612181556329646000",
         "level=error msg=\"This is a error message\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:40\" time=1612181556329661000",
+            location=\"logfmt/tests/logging.rs:40\" ts=2024-09-11T15:58:08.256738871Z time=1612181556329661000",
     ];
 
     assert_logs!(capture, expected);
@@ -74,7 +74,7 @@ fn event_fields_strings() {
 
     let expected = [
         "level=info msg=\"This is an info message\" event_name=\"foo bar\" other_event=baz \
-            target=\"logging\" location=\"logfmt/tests/logging.rs:59\" time=1612187170712973000",
+            target=\"logging\" location=\"logfmt/tests/logging.rs:59\" ts=2024-09-11T15:58:08.256738871Z time=1612187170712973000",
     ];
 
     assert_logs!(capture, expected);
@@ -89,7 +89,7 @@ fn event_fields_strings_quoting() {
 
     let expected = [&format!(
         "level=info foo=\"{escaped_foo_value}\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:59\" time=1612187170712973000"
+            location=\"logfmt/tests/logging.rs:59\" ts=2024-09-11T15:58:08.256738871Z time=1612187170712973000"
     )];
 
     assert_logs!(capture, expected);
@@ -121,7 +121,7 @@ fn event_fields_numeric() {
 
     let expected = [
         "level=info msg=\"This is an info message\" bar=1 frr=false target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:72\" time=1612187170712947000",
+            location=\"logfmt/tests/logging.rs:72\" ts=2024-09-11T15:58:08.256738871Z time=1612187170712947000",
     ];
 
     assert_logs!(capture, expected);
@@ -134,7 +134,7 @@ fn event_fields_repeated() {
 
     let expected = [
         "level=info msg=\"This is an info message\" bar=1 bar=2 target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:84\" time=1612187170712948000",
+            location=\"logfmt/tests/logging.rs:84\" ts=2024-09-11T15:58:08.256738871Z time=1612187170712948000",
     ];
 
     assert_logs!(capture, expected);
@@ -152,7 +152,7 @@ fn event_fields_errors() {
         "level=error msg=\"This is an error message\" the_error=\"\\\"Custom { kind: Other, \
             error: \\\\\\\"shaving yak failed!\\\\\\\" }\\\"\" \
             the_error.display=\"shaving yak failed!\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:99\" time=1612187170712947000",
+            location=\"logfmt/tests/logging.rs:99\" ts=2024-09-11T15:58:08.256738871Z time=1612187170712947000",
     ];
 
     assert_logs!(capture, expected);
@@ -168,7 +168,7 @@ fn event_fields_structs() {
     let expected = [
         "level=info msg=\"This is an info message\" s=\"TestDebugStruct { b: true, \
             s: \\\"The String\\\" }\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:111\" time=1612187170712937000",
+            location=\"logfmt/tests/logging.rs:111\" ts=2024-09-11T15:58:08.256738871Z time=1612187170712937000",
     ];
 
     assert_logs!(capture, expected);
@@ -184,9 +184,9 @@ fn event_spans() {
     std::mem::drop(enter);
 
     let expected = [
-        "level=info span_name=\"my_span\" foo=bar span=1 time=1612209178717290000",
+        "level=info span_name=\"my_span\" foo=bar span=1 ts=2024-09-11T15:58:08.256738871Z time=1612209178717290000",
         "level=info msg=\"info message in span\" shave=\"mo yak!\" span=1 target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:132\" time=1612209178717329000",
+            location=\"logfmt/tests/logging.rs:132\" ts=2024-09-11T15:58:08.256738871Z time=1612209178717329000",
     ];
 
     assert_logs!(capture, expected);
@@ -212,13 +212,13 @@ fn event_multi_span() {
     }
 
     let expected = [
-        "level=info span_name=\"my_span\" foo=bar span=1 time=1612209327939714000",
-        "level=info span_name=\"my_second_span\" foo=baz span=2 time=1612209327939743000",
+        "level=info span_name=\"my_span\" foo=bar span=1 ts=2024-09-11T15:58:08.256738871Z time=1612209327939714000",
+        "level=info span_name=\"my_second_span\" foo=baz span=2 ts=2024-09-11T15:58:08.256738871Z time=1612209327939743000",
         "level=info msg=\"info message in span 2\" shave=yak! target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:154\" time=1612209327939774000",
-        "level=info span_name=\"my_second_span\" foo=brmp span=3 time=1612209327939795000",
+            location=\"logfmt/tests/logging.rs:154\" ts=2024-09-11T15:58:08.256738871Z time=1612209327939774000",
+        "level=info span_name=\"my_second_span\" foo=brmp span=3 ts=2024-09-11T15:58:08.256738871Z time=1612209327939795000",
         "level=info msg=\"info message in span 3\" shave=\"mo yak!\" target=\"logging\" \
-            location=\"logfmt/tests/logging.rs:160\" time=1612209327939828000",
+            location=\"logfmt/tests/logging.rs:160\" ts=2024-09-11T15:58:08.256738871Z time=1612209327939828000",
     ];
 
     assert_logs!(capture, expected);
@@ -255,10 +255,17 @@ impl fmt::Display for TestDebugStruct {
 /// Normalize lines for easy comparison
 fn normalize<'a>(lines: impl Iterator<Item = &'a String>) -> Vec<String> {
     let lines = lines
-        .map(|line| normalize_timestamp(line))
+        .map(|line| normalize_ts(line))
+        .map(|line| normalize_timestamp(&line))
         .map(|line| normalize_location(&line))
         .collect();
     normalize_spans(lines)
+}
+
+/// s/ts=2024-09-11T15:58:59.413080195Z/ts=NORMALIZED/g
+fn normalize_ts(v: &str) -> String {
+    let re = Regex::new(r"ts=\d+-\d+-\d+T\d+:\d+:\d+.\d+Z").unwrap();
+    re.replace_all(v, "ts=NORMALIZED").to_string()
 }
 
 /// s/time=1612187170712947000/time=NORMALIZED/g

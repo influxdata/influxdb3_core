@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit_mut.rs
 expression: "visit_statement!(\"DELETE WHERE 'foo bar' =~ /foo/\")"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_delete_statement
@@ -24,4 +25,3 @@ expression: "visit_statement!(\"DELETE WHERE 'foo bar' =~ /foo/\")"
 - post_visit_where_clause
 - post_visit_delete_statement
 - post_visit_statement
-

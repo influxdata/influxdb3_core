@@ -223,15 +223,14 @@ mod tests {
         let plan = dedup_plan(schema, vec![]);
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, SplitDedup),
-            @r###"
-        ---
+            @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
           - "   EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -257,8 +256,7 @@ mod tests {
         ));
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, SplitDedup),
-            @r###"
-        ---
+            @r#"
         input:
           - " DeduplicateExec: [tag@0 ASC,time@1 ASC]"
           - "   FilterExec: false"
@@ -270,7 +268,7 @@ mod tests {
             - "   FilterExec: false"
             - "     UnionExec"
             - "       RecordBatchesExec: chunks=1, projection=[tag, time]"
-        "###
+        "#
         );
     }
 
@@ -286,8 +284,7 @@ mod tests {
             let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3]);
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new(plan, SplitDedup),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -300,7 +297,7 @@ mod tests {
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
                 - "       ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -319,8 +316,7 @@ mod tests {
             config.execution.target_partitions = 2;
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -337,7 +333,7 @@ mod tests {
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
                 - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -346,7 +342,7 @@ mod tests {
             // Partition without hash ID in the catalog
             let legacy_partition_id = 1;
             let legacy_transition_partition_id =
-                TransitionPartitionId::Deprecated(PartitionId::new(legacy_partition_id));
+                TransitionPartitionId::Catalog(PartitionId::new(legacy_partition_id));
 
             // Partition with hash ID in the catalog
             let transition_partition_id =
@@ -373,8 +369,7 @@ mod tests {
             config.execution.target_partitions = 2;
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -391,7 +386,7 @@ mod tests {
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
                 - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -415,8 +410,7 @@ mod tests {
             });
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -426,7 +420,7 @@ mod tests {
                 - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "   UnionExec"
                 - "     RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
     }
@@ -445,8 +439,7 @@ mod tests {
             let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3]);
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new(plan, SplitDedup),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -459,7 +452,7 @@ mod tests {
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
                 - "       ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -486,8 +479,7 @@ mod tests {
             config.execution.target_partitions = 2;
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -504,7 +496,7 @@ mod tests {
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
                 - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -528,8 +520,7 @@ mod tests {
             });
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -539,7 +530,7 @@ mod tests {
                 - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "   UnionExec"
                 - "     RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
     }
@@ -554,8 +545,7 @@ mod tests {
             let plan = dedup_plan(schema, vec![chunk1]);
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new(plan, SplitDedup),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -565,7 +555,7 @@ mod tests {
                 - " UnionExec"
                 - "   UnionExec"
                 - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -576,8 +566,7 @@ mod tests {
             let plan = dedup_plan(schema, vec![chunk1]);
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new(plan, SplitDedup),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -588,7 +577,7 @@ mod tests {
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
 
@@ -600,8 +589,7 @@ mod tests {
             let plan = dedup_plan(schema, vec![chunk1, chunk2]);
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new(plan, SplitDedup),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
@@ -612,7 +600,7 @@ mod tests {
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-            "###
+            "#
             );
         }
     }
@@ -647,8 +635,7 @@ mod tests {
             let plan = dedup_plan(schema, vec![chunk1, chunk3, chunk2, chunk5, chunk4]);
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new(plan, SplitDedup),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [time@0 ASC]"
               - "   UnionExec"
@@ -663,7 +650,7 @@ mod tests {
                 - "       ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[time]"
                 - "   UnionExec"
                 - "     ParquetExec: file_groups={2 groups: [[4.parquet], [5.parquet]]}, projection=[time]"
-            "###
+            "#
             );
         }
 
@@ -691,8 +678,7 @@ mod tests {
             });
             insta::assert_yaml_snapshot!(
                 OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r###"
-            ---
+                @r#"
             input:
               - " DeduplicateExec: [time@0 ASC]"
               - "   UnionExec"
@@ -702,7 +688,7 @@ mod tests {
                 - " DeduplicateExec: [time@0 ASC]"
                 - "   UnionExec"
                 - "     ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
-            "###
+            "#
             );
         }
     }

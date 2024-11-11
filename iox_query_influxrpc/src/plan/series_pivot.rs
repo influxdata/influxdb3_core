@@ -1,11 +1,12 @@
+use crate::schema::{FieldExt, SeriesColumnType, SeriesSchema};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::logical_expr::{
     expr_vec_fmt, Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore,
 };
+use datafusion_util::ThenWithOpt;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
-
-use crate::schema::{FieldExt, SeriesColumnType, SeriesSchema};
 
 /// Pivot a wide table into a set of narrow tables, one for each field.
 /// Any field which contains a null value is considered not present, and
@@ -51,6 +52,18 @@ pub(crate) struct SeriesPivot {
     pub(crate) tag_exprs: Vec<Expr>,
     pub(crate) time_exprs: Vec<Expr>,
     pub(crate) field_exprs: Vec<Expr>,
+}
+
+// Manual impl because FieldsPivot has a Range and is not PartialOrd
+impl PartialOrd for SeriesPivot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.input
+            .partial_cmp(&other.input)
+            .then_with_opt(|| self.measurement_expr.partial_cmp(&other.measurement_expr))
+            .then_with_opt(|| self.tag_exprs.partial_cmp(&other.tag_exprs))
+            .then_with_opt(|| self.time_exprs.partial_cmp(&other.time_exprs))
+            .then_with_opt(|| self.field_exprs.partial_cmp(&other.field_exprs))
+    }
 }
 
 impl SeriesPivot {

@@ -1,8 +1,13 @@
 //! Memory cache implementation for [`ObjectStore`](object_store::ObjectStore)
 
+// paste is only used in the tests, but cannot be hidden behind #[cfg(test)]
+// because we also use those functions in another module.
+use paste as _;
+
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+pub mod attributes;
 pub mod cache_system;
 pub mod object_store_cache_tests;
 pub mod object_store_helpers;

@@ -311,6 +311,10 @@ impl InputStreams {
                 1,
             );
             num_read_inputs_counter.add(1);
+            trace!(
+                "+1 to num_read_inputs_counter: {}",
+                num_read_inputs_counter.value()
+            );
 
             if i == 0 {
                 current_input_stream = Some(input_stream);
@@ -343,11 +347,16 @@ impl InputStreams {
 
             self.current_input_stream = None;
         } else {
-            // prefetch one more input stream before setting next strem to the current input stream
+            // prefetch one more input stream before setting next stream to the current input stream
             if self.current_stream_idx + self.num_input_streams_to_prefetch
                 < self.input_stream_count
             {
                 self.num_read_inputs_counter.add(1);
+                trace!(
+                    "+1 to num_read_inputs_counter: {}",
+                    self.num_read_inputs_counter.value()
+                );
+
                 self.prefetched_input_streams.push(spawn_buffered(
                     self.input_plan
                         .execute(
@@ -482,8 +491,14 @@ impl Stream for ProgressiveEvalStream {
 
         let poll = match ready!(poll) {
             // This input stream has data, return its next record batch
-            Some(Ok(batch)) => {
+            Some(Ok(mut batch)) => {
                 self.produced += batch.num_rows();
+                if let Some(fetch) = self.fetch {
+                    if self.produced > fetch {
+                        batch = batch.slice(0, batch.num_rows() - (self.produced - fetch));
+                        self.produced = fetch;
+                    }
+                };
                 Poll::Ready(Some(Ok(batch)))
             }
             // This input stream has an error, return the error and set aborted to true to stop polling next round
@@ -530,7 +545,6 @@ pub(crate) fn spawn_buffered(
                         return Ok(());
                     }
                 }
-
                 Ok(())
             });
 
@@ -649,7 +663,7 @@ mod tests {
         )
         .await;
 
-        // still return all even select 3 rows becasue first record batch is returned
+        // return only 3 rows from the first record batch
         _test_progressive_eval(
             &[vec![b1.clone()]],
             None,
@@ -661,8 +675,6 @@ mod tests {
                 "| 1 | a | 1970-01-01T00:00:00.000000008 |",
                 "| 2 | c | 1970-01-01T00:00:00.000000007 |",
                 "| 7 | e | 1970-01-01T00:00:00.000000006 |",
-                "| 9 | g | 1970-01-01T00:00:00.000000005 |",
-                "| 3 | j | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
             1, // 1 input stream
@@ -931,7 +943,7 @@ mod tests {
 
         // [b2, b1]
         // b2 has 3 rows. b1 has 5 rows
-        // Fetch limit is 1 --> return all 3 rows of the first batch (b2) that covers that limit
+        // Fetch limit is 1 --> return only 1 row of the first batch (b2)
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
@@ -941,8 +953,6 @@ mod tests {
                 "| a  | b | c                             |",
                 "+----+---+-------------------------------+",
                 "| 70 | c | 1970-01-01T00:00:00.000000004 |",
-                "| 90 | d | 1970-01-01T00:00:00.000000006 |",
-                "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
@@ -953,7 +963,7 @@ mod tests {
 
         // [b1, b2]
         // b1 has 5 rows. b2 has 3 rows
-        // Fetch limit is 1 --> return all 5 rows of the first batch (b1) that covers that limit
+        // Fetch limit is 1 --> return only 1 row of the first batch (b1)
         _test_progressive_eval(
             &[vec![b1], vec![b2]],
             None,
@@ -963,15 +973,145 @@ mod tests {
                 "| a | b | c                             |",
                 "+---+---+-------------------------------+",
                 "| 1 | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2 | b | 1970-01-01T00:00:00.000000007 |",
-                "| 7 | c | 1970-01-01T00:00:00.000000006 |",
-                "| 9 | d | 1970-01-01T00:00:00.000000005 |",
-                "| 3 | e | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
             2, // 2 input streams
             2, // all 2 input streams are prefetched by default even thouggh only the first one is actally polled
             task_ctx,
+        )
+        .await;
+    }
+
+    /// Progressive Eval should be only used for non-overlapping batches.
+    /// This use of ProgressiveEval is decided at plan-time.
+    #[rustfmt::skip]
+    #[tokio::test]
+    async fn test_two_streams_does_not_interleave() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let stream1: ArrayRef = Arc::new(Int32Array::from(vec![1, 3, 5,]));
+        let b1 = RecordBatch::try_from_iter(vec![("a", stream1)]).unwrap();
+
+        let stream2: ArrayRef = Arc::new(Int32Array::from(vec![2, 4, 6]));
+        let b2 = RecordBatch::try_from_iter(vec![("a", stream2)]).unwrap();
+
+        // Does not interleave. Will return all of first batch (b1), then second batch (b2).
+        _test_progressive_eval(
+            &[vec![b1.clone()], vec![b2.clone()]],
+            None,
+            None,
+            &[
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 1 |",
+                "| 3 |",
+                "| 5 |",
+                "| 2 |",
+                "| 4 |",
+                "| 6 |",
+                "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // The first batch is based upon the order provided, not the minimum value.
+        _test_progressive_eval(
+            &[vec![b2], vec![b1]], // inverse the order, b2 first
+            None,
+            None,
+            &[
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 2 |",
+                "| 4 |",
+                "| 6 |",
+                "| 1 |",
+                "| 3 |",
+                "| 5 |",
+                "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+    }
+
+    /// Progressive Eval fetches as many batches are sufficient to cover the limit requested.
+    #[rustfmt::skip]
+    #[tokio::test]
+    async fn test_two_streams_limit() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let stream1: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3,]));
+        let b1 = RecordBatch::try_from_iter(vec![("a", stream1)]).unwrap();
+
+        let stream2: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
+        let b2 = RecordBatch::try_from_iter(vec![("a", stream2)]).unwrap();
+
+        // Limit 4 --> should slice the second batch seen
+        _test_progressive_eval(
+            &[vec![b1.clone()], vec![b2.clone()]],
+            None,
+            Some(4),
+            &[
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 1 |",
+                "| 2 |",
+                "| 3 |",
+                "| 4 |",
+                "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // The first batch is based upon the order provided, not the minimum value.
+        // Limit 4 --> should slice the second batch seen
+        _test_progressive_eval(
+            &[vec![b2.clone()], vec![b1.clone()]],  // inverse the order, b2 first
+            None,
+            Some(4),
+            &[
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 4 |",
+                "| 5 |",
+                "| 6 |",
+                "| 1 |",
+                "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
+        )
+        .await;
+
+        // The first batch is based upon the order provided, not the minimum value.
+        // Limit 2 --> should slice the first batch seen
+        _test_progressive_eval(
+            &[vec![b2], vec![b1]],
+            None,
+            Some(2),
+            &[
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 4 |",
+                "| 5 |",
+                "+---+",
+            ],
+            2, // 2 input streams
+            2, // all 2 input streams are prefetched and polled
+            Arc::clone(&task_ctx),
         )
         .await;
     }
@@ -1071,7 +1211,7 @@ mod tests {
 
         // [b2, b1]
         // b2 has 3 rows. b1 has 5 rows
-        // Fetch limit is 4 --> return all rows of both batches in the order of b2, b1
+        // Fetch limit is 4 --> return all rows of first batch b2 and part of b1
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
@@ -1084,10 +1224,6 @@ mod tests {
                 "| 90 | d | 1970-01-01T00:00:00.000000006 |",
                 "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "| 1  | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2  | b | 1970-01-01T00:00:00.000000007 |",
-                "| 7  | c | 1970-01-01T00:00:00.000000006 |",
-                "| 9  | d | 1970-01-01T00:00:00.000000005 |",
-                "| 3  | e | 1970-01-01T00:00:00.000000008 |",
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
@@ -1098,7 +1234,7 @@ mod tests {
 
         // [b1, b2]
         // b1 has 5 rows. b2 has 3 rows
-        // Fetch limit is 6 --> return all rows of both batches in the order of b1, b2
+        // Fetch limit is 6 --> return all rows of first batch b1 and part of b2
         _test_progressive_eval(
             &[vec![b1], vec![b2]],
             None,
@@ -1113,8 +1249,6 @@ mod tests {
                 "| 9  | d | 1970-01-01T00:00:00.000000005 |",
                 "| 3  | e | 1970-01-01T00:00:00.000000008 |",
                 "| 70 | c | 1970-01-01T00:00:00.000000004 |",
-                "| 90 | d | 1970-01-01T00:00:00.000000006 |",
-                "| 30 | e | 1970-01-01T00:00:00.000000002 |",
                 "+----+---+-------------------------------+",
             ],
             2, // 2 input streams
@@ -1159,7 +1293,7 @@ mod tests {
 
         // [b1, b2, b3]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows
-        // Fetch limit is 1 --> return all rows of the b1
+        // Fetch limit is 1 --> return first row of the b1
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()], vec![b3.clone()]],
             None,
@@ -1169,10 +1303,6 @@ mod tests {
                 "| a | b | c                             |",
                 "+---+---+-------------------------------+",
                 "| 1 | a | 1970-01-01T00:00:00.000000008 |",
-                "| 2 | b | 1970-01-01T00:00:00.000000007 |",
-                "| 7 | c | 1970-01-01T00:00:00.000000006 |",
-                "| 9 |   | 1970-01-01T00:00:00.000000005 |",
-                "| 3 | f | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
             3, // 3 input streams
@@ -1183,7 +1313,7 @@ mod tests {
 
         // [b1, b2, b3]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows
-        // Fetch limit is 7 --> return all rows of the b1 & b2 in the order of b1, b2
+        // Fetch limit is 7 --> return all rows of the b1 & part of b2, in the order of b1, b2
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()], vec![b3.clone()]],
             None,
@@ -1199,7 +1329,6 @@ mod tests {
                 "| 3  | f | 1970-01-01T00:00:00.000000008 |",
                 "| 10 | e | 1970-01-01T00:00:00.000000040 |",
                 "| 20 | g | 1970-01-01T00:00:00.000000060 |",
-                "| 70 | h | 1970-01-01T00:00:00.000000020 |",
                 "+----+---+-------------------------------+",
             ],
             3, // 3 input streams
@@ -1305,7 +1434,7 @@ mod tests {
 
         // [b1, b2, b3, b4]
         // b1 has 5 rows. b2 has 3 rows. b3 has 4 rows. b4 has 2 rows
-        // Fetch limit is 3 --> return all 5 rows of b1
+        // Fetch limit is 4 --> return 4 rows of b1
         // Prefetch minum 2 input streams
         _test_progressive_eval(
             &[
@@ -1315,7 +1444,7 @@ mod tests {
                 vec![b4.clone()],
             ],
             None,
-            Some(3),
+            Some(4),
             &[
                 "+---+---+-------------------------------+",
                 "| a | b | c                             |",
@@ -1324,7 +1453,6 @@ mod tests {
                 "| 2 | b | 1970-01-01T00:00:00.000000007 |",
                 "| 7 | c | 1970-01-01T00:00:00.000000006 |",
                 "| 9 |   | 1970-01-01T00:00:00.000000005 |",
-                "| 3 | f | 1970-01-01T00:00:00.000000008 |",
                 "+---+---+-------------------------------+",
             ],
             4, // 4 input streams

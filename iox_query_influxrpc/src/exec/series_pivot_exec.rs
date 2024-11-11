@@ -54,6 +54,26 @@ impl SeriesPivotExec {
             execution_mode,
         )
     }
+
+    pub(crate) fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    pub(crate) fn measurement_expr(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.measurement_expr
+    }
+
+    pub(crate) fn tag_exprs(&self) -> &Vec<Arc<dyn PhysicalExpr>> {
+        &self.tag_exprs
+    }
+
+    pub(crate) fn time_exprs(&self) -> &Vec<Arc<dyn PhysicalExpr>> {
+        &self.time_exprs
+    }
+
+    pub(crate) fn field_exprs(&self) -> &Vec<(Arc<dyn PhysicalExpr>, Arc<str>)> {
+        &self.field_exprs
+    }
 }
 
 impl ExecutionPlan for SeriesPivotExec {

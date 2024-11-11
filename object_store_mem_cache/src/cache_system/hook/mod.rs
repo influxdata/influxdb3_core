@@ -5,7 +5,7 @@ mod notify;
 pub mod observer;
 pub mod test_utils;
 
-use crate::cache_system::interfaces::DynError;
+use crate::cache_system::DynError;
 
 /// A trait for hooking into cache updates.
 ///

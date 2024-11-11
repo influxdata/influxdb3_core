@@ -1,4 +1,5 @@
 use arrow::datatypes::TimeUnit::Nanosecond;
+use assert_matches::assert_matches;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -7,9 +8,12 @@ use arrow::{
     array::{cast, Array, ArrayRef},
     datatypes::{DataType, Field},
 };
-use datafusion::logical_expr::{
-    function::{AccumulatorArgs, StateFieldsArgs},
-    AggregateUDFImpl,
+use datafusion::{
+    common::plan_err,
+    logical_expr::{
+        function::{AccumulatorArgs, StateFieldsArgs},
+        AggregateUDFImpl,
+    },
 };
 use datafusion::{
     common::Result,
@@ -18,7 +22,6 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use itertools::Itertools;
-use schema::TIME_DATA_TIMEZONE;
 
 #[derive(Debug)]
 pub(super) struct ModeUDF {
@@ -50,11 +53,22 @@ impl AggregateUDFImpl for ModeUDF {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if arg_types.len() != 2 {
+            return plan_err!("mode() requires two arguments");
+        }
+        match arg_types[1] {
+            DataType::Timestamp(Nanosecond, _) => {}
+            _ => return plan_err!("mode() requires the second argument to be a timestamp"),
+        }
         Ok(arg_types[0].clone())
     }
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(ModeAccumulator::new(arg.return_type.clone())))
+        let time_data_type = arg.exprs[1].data_type(arg.schema)?;
+        Ok(Box::new(ModeAccumulator::new(
+            arg.return_type.clone(),
+            time_data_type,
+        )))
     }
 
     fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<Field>> {
@@ -62,7 +76,7 @@ impl AggregateUDFImpl for ModeUDF {
             DataType::List(Arc::new(Field::new("item", args.return_type.clone(), true)));
         let timestamp_list = DataType::List(Arc::new(Field::new(
             "item",
-            DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
+            args.input_types[1].clone(),
             true,
         )));
 
@@ -80,14 +94,16 @@ impl AggregateUDFImpl for ModeUDF {
 #[derive(Debug)]
 struct ModeAccumulator {
     data_type: DataType,
+    time_data_type: DataType,
     point_values: Vec<ScalarValue>,
     point_times: Vec<ScalarValue>,
 }
 
 impl ModeAccumulator {
-    fn new(data_type: DataType) -> Self {
+    fn new(data_type: DataType, time_data_type: DataType) -> Self {
         Self {
             data_type,
+            time_data_type,
             point_values: Vec::new(),
             point_times: Vec::new(),
         }
@@ -95,10 +111,7 @@ impl ModeAccumulator {
 
     fn update(&mut self, point_values: ArrayRef, point_times: ArrayRef) -> Result<()> {
         assert_eq!(point_values.data_type(), &self.data_type);
-        assert_eq!(
-            point_times.data_type(),
-            &DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE())
-        );
+        assert_matches!(point_times.data_type(), &DataType::Timestamp(Nanosecond, _));
 
         let nulls = point_values.nulls();
         let null_len = nulls.map_or(0, |nb| nb.null_count());
@@ -148,7 +161,7 @@ impl ModeAccumulator {
                 curr_time = time;
                 most_time = time;
             }
-            None => return Ok(ScalarValue::Null), // We have an empty set of points
+            None => return ScalarValue::try_from(&self.data_type), // We have an empty set of points
         }
 
         for (value, time) in sorted_points {
@@ -217,10 +230,7 @@ impl Accumulator for ModeAccumulator {
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         let v_arr = ScalarValue::new_list_nullable(&self.point_values, &self.data_type);
-        let t_arr = ScalarValue::new_list_nullable(
-            &self.point_times,
-            &DataType::Timestamp(Nanosecond, TIME_DATA_TIMEZONE()),
-        );
+        let t_arr = ScalarValue::new_list_nullable(&self.point_times, &self.time_data_type);
 
         Ok(vec![ScalarValue::List(v_arr), ScalarValue::List(t_arr)])
     }

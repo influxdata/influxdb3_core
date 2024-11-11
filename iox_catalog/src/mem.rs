@@ -2,6 +2,7 @@
 //! used for testing or for an IOx designed to run without catalog persistence.
 
 use crate::interface::namespace_snapshot_by_name;
+use crate::metrics::GetTimeMetric;
 use crate::util::should_delete_partition;
 use crate::{
     constants::{
@@ -41,10 +42,13 @@ use std::{
 };
 use trace::ctx::SpanContext;
 
+const ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+
 /// In-memory catalog that implements the `RepoCollection` and individual repo traits from
 /// the catalog interface.
 pub struct MemCatalog {
-    metrics: CatalogMetrics,
+    catalog_metrics: CatalogMetrics,
+    get_time_metric: GetTimeMetric,
     collections: Arc<Mutex<MemCollections>>,
     time_provider: Arc<dyn TimeProvider>,
 }
@@ -55,7 +59,8 @@ impl MemCatalog {
     /// return new initialized [`MemCatalog`]
     pub fn new(metrics: Arc<metric::Registry>, time_provider: Arc<dyn TimeProvider>) -> Self {
         Self {
-            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
+            get_time_metric: GetTimeMetric::new(&metrics, Self::NAME),
+            catalog_metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             collections: Default::default(),
             time_provider,
         }
@@ -130,6 +135,18 @@ impl Default for MemCollections {
     }
 }
 
+#[cfg(test)]
+impl MemCollections {
+    fn clear_all(&mut self) {
+        self.namespaces.clear();
+        self.tables.clear();
+        self.columns.clear();
+        self.partitions.clear();
+        self.skipped_compactions.clear();
+        self.parquet_files.clear();
+    }
+}
+
 /// transaction bound to an in-memory catalog.
 #[derive(Debug)]
 pub struct MemTxn {
@@ -146,7 +163,7 @@ impl Catalog for MemCatalog {
     fn repositories(&self) -> Box<dyn RepoCollection> {
         let collections = Arc::clone(&self.collections);
 
-        Box::new(self.metrics.repos(Box::new(MemTxn {
+        Box::new(self.catalog_metrics.repos(Box::new(MemTxn {
             collections,
             time_provider: self.time_provider(),
         })))
@@ -154,11 +171,18 @@ impl Catalog for MemCatalog {
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
-        self.metrics.registry()
+        self.catalog_metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    async fn get_time(&self) -> Result<iox_time::Time, Error> {
+        let start = tokio::time::Instant::now();
+        let res = Ok(self.time_provider.now());
+        self.get_time_metric.record(start.elapsed(), &res);
+        res
     }
 
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
@@ -648,6 +672,7 @@ impl PartitionRepo for MemTxn {
                     SortKeyIds::default(),
                     None,
                     Default::default(),
+                    Some(self.time_provider.now().into()),
                 );
                 stage.partitions.push(p.into());
                 stage.partitions.last().unwrap()
@@ -906,7 +931,7 @@ impl PartitionRepo for MemTxn {
     }
 
     async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
-        let stage = self.collections.lock();
+        let mut stage = self.collections.lock();
 
         let now = self.time_provider.now();
         let retention: HashMap<_, _> = stage
@@ -921,6 +946,8 @@ impl PartitionRepo for MemTxn {
             .map(|x| (x.id, (x.namespace_id, x.partition_template.clone())))
             .collect();
 
+        let older_than = (self.time_provider.now() - ONE_DAY).into();
+
         let mut candidates: HashMap<_, _> = stage
             .partitions
             .iter()
@@ -928,14 +955,26 @@ impl PartitionRepo for MemTxn {
                 let (ns_id, template) = tables.get(&x.table_id)?;
                 let retention = *retention.get(ns_id)?;
 
-                should_delete_partition(&x.partition_key, template, retention, now)
-                    .then_some((x.id, x.table_id))
+                (x.created_at()
+                    .map(|created| created < older_than)
+                    .unwrap_or(true)
+                    && should_delete_partition(&x.partition_key, template, retention, now))
+                .then_some((x.id, x.table_id))
             })
             .collect();
 
         for p in &stage.parquet_files {
             candidates.remove(&p.partition_id);
         }
+
+        let keep = stage
+            .partitions
+            .iter()
+            .filter(|p| !candidates.contains_key(&p.id))
+            .cloned()
+            .collect();
+
+        stage.partitions = keep;
 
         Ok(candidates.into_iter().map(|(p, t)| (t, p)).collect())
     }
@@ -1015,14 +1054,8 @@ impl ParquetFileRepo for MemTxn {
             .collect())
     }
 
-    async fn delete_old_ids_only(
-        &mut self,
-        _older_than: Timestamp,
-        cutoff: Duration,
-    ) -> Result<Vec<ObjectStoreId>> {
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         let mut stage = self.collections.lock();
-
-        let older_than = Timestamp::from(self.time_provider.now() - cutoff);
 
         let (delete, keep): (Vec<_>, Vec<_>) = stage.parquet_files.iter().cloned().partition(
             |f| matches!(f.to_delete, Some(marked_deleted) if marked_deleted < older_than),
@@ -1139,6 +1172,24 @@ impl ParquetFileRepo for MemTxn {
         *collections = stage;
 
         Ok(ids)
+    }
+
+    async fn list_by_table_id(
+        &mut self,
+        table_id: TableId,
+        compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>> {
+        Ok(self
+            .collections
+            .lock()
+            .parquet_files
+            .iter()
+            .filter(|pf| match compaction_level {
+                Some(level) => pf.table_id == table_id && pf.compaction_level == level,
+                None => pf.table_id == table_id,
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -1341,12 +1392,58 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
-        crate::interface_tests::test_catalog(|| async {
-            let metrics = Arc::new(metric::Registry::default());
-            let time_provider = Arc::new(SystemProvider::new());
-            let x: Arc<dyn Catalog> = Arc::new(MemCatalog::new(metrics, time_provider));
-            x
-        })
+        let metrics = Arc::new(metric::Registry::default());
+        let time_provider = Arc::new(SystemProvider::new());
+
+        let mem_catalog = MemCatalog::new(metrics, time_provider);
+
+        let collections = Arc::clone(&mem_catalog.collections);
+
+        let catalog: Arc<dyn Catalog> = Arc::new(mem_catalog);
+
+        let catalog_reset_fn = || async {
+            let mut stage = collections.lock();
+            stage.clear_all();
+
+            Arc::clone(&catalog)
+        };
+
+        crate::interface_tests::test_catalog(catalog_reset_fn).await;
+
+        crate::interface_tests::test_partition_retention(
+            catalog_reset_fn().await,
+            |key, table_id, created_at| {
+                let collections = Arc::clone(&collections);
+                async move {
+                    let mut stage = collections.lock();
+
+                    let partition = match stage
+                        .partitions
+                        .iter()
+                        .find(|p| p.partition_key == key && p.table_id == table_id)
+                    {
+                        Some(p) => p,
+                        None => {
+                            let hash_id = PartitionHashId::new(table_id, &key);
+                            let p = Partition::new_catalog_only(
+                                PartitionId::new(stage.partitions.len() as i64 + 1),
+                                Some(hash_id),
+                                table_id,
+                                key,
+                                SortKeyIds::default(),
+                                None,
+                                Default::default(),
+                                created_at,
+                            );
+                            stage.partitions.push(p.into());
+                            stage.partitions.last().unwrap()
+                        }
+                    };
+
+                    partition.value.clone()
+                }
+            },
+        )
         .await;
     }
 }

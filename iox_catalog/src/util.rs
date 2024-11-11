@@ -7,7 +7,7 @@ use crate::{
     constants::TIME_COLUMN,
     interface::{CasFailure, Catalog, Error, RepoCollection, SoftDeletedRows},
 };
-use data_types::partition_template::ColumnValue;
+use data_types::{partition_template::ColumnValue, CompactionLevel};
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, PartitionKey,
@@ -378,33 +378,45 @@ impl TableScopedError {
 
 /// Given an iterator of `(table_name, batch)` to validate, this function
 /// ensures all the columns within `batch` match the existing schema for
-/// `table_name` in `schema`. If the column does not already exist in `schema`,
-/// it is created and an updated [`NamespaceSchema`] is returned.
+/// `table_name` in `namespace_table_schema`, belonging to `namespace_id`
+/// with `namespace_partition_template`. If the column does not already exist
+/// in `namespace_table_schema`, it is created and an updated `(table_name,
+/// table_schema)` mapping is returned.
 ///
-/// This function pushes schema additions through to the backend catalog, and
-/// relies on the catalog to serialize concurrent additions of a given column,
-/// ensuring only one type is ever accepted per column.
+/// This function pushes schema additions through to the backend catalog,
+/// relying on the catalog to serialize concurrent additions of a given
+/// column.
 pub async fn validate_or_insert_schema<'a, T, U, R>(
-    tables: T,
-    schema: &NamespaceSchema,
+    new_tables: T,
+    namespace_id: NamespaceId,
+    namespace_partition_template: &NamespacePartitionTemplateOverride,
+    namespace_table_schema: &BTreeMap<String, TableSchema>,
     repos: &mut R,
-) -> Result<Option<NamespaceSchema>, TableScopedError>
+) -> Result<Option<BTreeMap<String, TableSchema>>, TableScopedError>
 where
     T: IntoIterator<IntoIter = U, Item = (&'a str, &'a MutableBatch)> + Send + Sync,
     U: Iterator<Item = T::Item> + Send,
     R: RepoCollection + ?Sized,
 {
-    let tables = tables.into_iter();
+    let new_tables = new_tables.into_iter();
 
     // The (potentially updated) NamespaceSchema to return to the caller.
-    let mut schema = Cow::Borrowed(schema);
+    let mut namespace_table_schema = Cow::Borrowed(namespace_table_schema);
 
-    for (table_name, batch) in tables {
-        validate_mutable_batch(batch, table_name, &mut schema, repos).await?;
+    for (table_name, batch) in new_tables {
+        validate_mutable_batch(
+            batch,
+            table_name,
+            namespace_id,
+            namespace_partition_template,
+            &mut namespace_table_schema,
+            repos,
+        )
+        .await?;
     }
 
-    match schema {
-        Cow::Owned(v) => Ok(Some(v)),
+    match namespace_table_schema {
+        Cow::Owned(updated_namespace_table_schema) => Ok(Some(updated_namespace_table_schema)),
         Cow::Borrowed(_) => Ok(None),
     }
 }
@@ -414,7 +426,9 @@ where
 async fn validate_mutable_batch<R>(
     mb: &MutableBatch,
     table_name: &str,
-    schema: &mut Cow<'_, NamespaceSchema>,
+    namespace_id: NamespaceId,
+    namespace_partition_template: &NamespacePartitionTemplateOverride,
+    namespace_table_schema: &mut Cow<'_, BTreeMap<String, TableSchema>>,
     repos: &mut R,
 ) -> Result<(), TableScopedError>
 where
@@ -424,25 +438,28 @@ where
     //
     // Because the entry API requires &mut it is not used to avoid a premature
     // clone of the Cow.
-    let mut table = match schema.tables.get(table_name) {
+    let mut table = match namespace_table_schema.get(table_name) {
         Some(t) => Cow::Borrowed(t),
         None => {
             // The table does not exist in the cached schema.
             //
             // Attempt to load an existing table from the catalog or create a new table in the
             // catalog to populate the cache.
-            let table =
-                table_load_or_create(repos, schema.id, &schema.partition_template, table_name)
-                    .await
-                    .map_err(|e| TableScopedError(table_name.to_string(), e))?;
+            let table = table_load_or_create(
+                repos,
+                namespace_id,
+                namespace_partition_template,
+                table_name,
+            )
+            .await
+            .map_err(|e| TableScopedError(table_name.to_string(), e))?;
 
-            assert!(schema
+            assert!(namespace_table_schema
                 .to_mut()
-                .tables
                 .insert(table_name.to_string(), table)
                 .is_none());
 
-            Cow::Borrowed(schema.tables.get(table_name).unwrap())
+            Cow::Borrowed(namespace_table_schema.get(table_name).unwrap())
         }
     };
 
@@ -464,9 +481,8 @@ where
     if let Cow::Owned(table) = table {
         // The table schema was mutated and needs inserting into the namespace
         // schema to make the changes visible to the caller.
-        assert!(schema
+        assert!(namespace_table_schema
             .to_mut()
-            .tables
             .insert(table_name.to_string(), table)
             .is_some());
     }
@@ -627,6 +643,23 @@ pub fn should_delete_partition(
     false
 }
 
+/// Corresponding SQL predicates based on compaction level.
+///
+/// When provided with [`None`], this will simply return all parquet files,
+/// rather than constraining based on compaction level.
+pub(crate) const fn compaction_level_sql_predicate(
+    compaction_level: Option<CompactionLevel>,
+) -> &'static str {
+    match compaction_level {
+        Some(level) => match level {
+            CompactionLevel::Initial => "compaction_level = 0",
+            CompactionLevel::FileNonOverlapped => "compaction_level = 1",
+            CompactionLevel::Final => "compaction_level = 2",
+        },
+        None => "1=1",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
@@ -675,7 +708,12 @@ mod tests {
                             let writes = mutable_batch_lp::lines_to_batches(lp.as_str(), 42)
                                 .expect("failed to build test writes from LP");
 
-                            let got = validate_or_insert_schema(writes.iter().map(|(k, v)| (k.as_str(), v)), &schema, txn.deref_mut())
+                            let got = validate_or_insert_schema(
+                                writes.iter().map(|(k, v)| (k.as_str(), v)),
+                                schema.id,
+                                &schema.partition_template,
+                                &schema.tables,
+                                txn.deref_mut())
                                 .await;
 
                             match got {
@@ -684,7 +722,10 @@ mod tests {
                                     schema
                                 },
                                 Err(e) => panic!("unexpected error: {}", e),
-                                Ok(Some(new_schema)) => new_schema,
+                                Ok(Some(tables)) => NamespaceSchema {
+                                    tables,
+                                    ..schema
+                                },
                                 Ok(None) => schema,
                             }
                         };
@@ -914,7 +955,9 @@ mod tests {
         let writes = mutable_batch_lp::lines_to_batches("m1,t1=a f1=2i", 42).unwrap();
         validate_or_insert_schema(
             writes.iter().map(|(k, v)| (k.as_str(), v)),
-            &schema_with_table,
+            schema_with_table.id,
+            &schema_with_table.partition_template,
+            &schema_with_table.tables,
             txn.deref_mut(),
         )
         .await
@@ -922,9 +965,11 @@ mod tests {
 
         // then the empty schema adds the same table with some different columns
         let other_writes = mutable_batch_lp::lines_to_batches("m1,t2=a f2=2i", 43).unwrap();
-        let formerly_empty_schema = validate_or_insert_schema(
+        let formerly_empty_tables = validate_or_insert_schema(
             other_writes.iter().map(|(k, v)| (k.as_str(), v)),
-            &empty_schema,
+            empty_schema.id,
+            &empty_schema.partition_template,
+            &empty_schema.tables,
             txn.deref_mut(),
         )
         .await
@@ -933,7 +978,7 @@ mod tests {
 
         // the formerly-empty schema should NOT have all the columns; schema convergence is handled
         // at a higher level by the namespace cache/gossip system
-        let table = formerly_empty_schema.tables.get("m1").unwrap();
+        let table = formerly_empty_tables.get("m1").unwrap();
         assert_eq!(table.columns.names(), BTreeSet::from(["t2", "f2", "time"]));
     }
 }

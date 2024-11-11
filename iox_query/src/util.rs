@@ -15,15 +15,13 @@ use arrow::{
 use data_types::TimestampMinMax;
 use datafusion::common::DFSchema;
 use datafusion::physical_expr::{analyze, AnalysisContext, ExprBoundaries};
+use datafusion::{common::stats::Precision, execution::context::SessionState};
 use datafusion::{
-    self,
-    datasource::{provider_as_source, MemTable},
     error::DataFusionError,
-    logical_expr::{interval_arithmetic::Interval, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{interval_arithmetic::Interval, SortExpr},
     physical_plan::expressions::{col as physical_col, PhysicalSortExpr},
     prelude::{Column, Expr},
 };
-use datafusion::{common::stats::Precision, execution::context::SessionState};
 use itertools::Itertools;
 use schema::{sort::SortKey, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
@@ -50,20 +48,7 @@ pub enum Error {
 /// A specialized `Error`
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Create a logical plan that produces the record batch
-pub fn make_scan_plan(batch: RecordBatch) -> std::result::Result<LogicalPlan, DataFusionError> {
-    let schema = batch.schema();
-    let partitions = vec![vec![batch]];
-    let projection = None; // scan all columns
-
-    let table = MemTable::try_new(schema, partitions)?;
-
-    let source = provider_as_source(Arc::new(table));
-
-    LogicalPlanBuilder::scan("memtable", source, projection)?.build()
-}
-
-pub fn logical_sort_key_exprs(sort_key: &SortKey) -> Vec<Expr> {
+pub fn logical_sort_key_exprs(sort_key: &SortKey) -> Vec<SortExpr> {
     sort_key
         .iter()
         .map(|(key, options)| {

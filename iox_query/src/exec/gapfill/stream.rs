@@ -47,7 +47,7 @@ pub(super) struct GapFillStream {
     aggr_expr: Vec<Arc<dyn PhysicalExpr>>,
     /// The producer of the input record batches.
     input: SendableRecordBatchStream,
-    /// Input that has been read from the iput stream.
+    /// Input that has been read from the input stream.
     buffered_input: BufferedInput,
     /// The thing that does the gap filling.
     gap_filler: GapFiller,

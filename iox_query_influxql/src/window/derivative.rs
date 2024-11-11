@@ -1,7 +1,8 @@
 use crate::{error, NUMERICS};
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::{DataType, IntervalUnit::MonthDayNano, TimeUnit};
+use arrow::datatypes::{DataType, Field, IntervalUnit::MonthDayNano, TimeUnit};
 use datafusion::common::{Result, ScalarValue};
+use datafusion::logical_expr::function::WindowUDFFieldArgs;
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl, TIMEZONE_WILDCARD,
 };
@@ -56,8 +57,8 @@ impl WindowUDFImpl for DerivativeUDWF {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Float64)
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
+        Ok(Field::new(field_args.name(), DataType::Float64, true))
     }
 
     fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {

@@ -868,8 +868,8 @@ mod serialization {
     {
         fn encode_by_ref(
             &self,
-            buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer,
-        ) -> sqlx::encode::IsNull {
+            buf: &mut DB::ArgumentBuffer<'q>,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
             <sqlx::types::Json<&proto::PartitionTemplate> as sqlx::Encode<'_, DB>>::encode_by_ref(
                 &sqlx::types::Json(&self.0),
                 buf,
@@ -883,7 +883,7 @@ mod serialization {
         sqlx::types::Json<proto::PartitionTemplate>: sqlx::Decode<'q, DB>,
     {
         fn decode(
-            value: <DB as sqlx::database::HasValueRef<'q>>::ValueRef,
+            value: DB::ValueRef<'q>,
         ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
             Ok(Self(
                 <sqlx::types::Json<proto::PartitionTemplate> as sqlx::Decode<'_, DB>>::decode(

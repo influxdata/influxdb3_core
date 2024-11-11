@@ -2,7 +2,7 @@ use crate::error;
 use crate::plan::ir::Field;
 use arrow::datatypes::DataType;
 use datafusion::common::{DFSchemaRef, Result};
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion_util::AsExpr;
 use generated_types::influxdata::iox::querier::v1::influx_ql_metadata::TagKeyColumn;
 use influxdb_influxql_parser::expression::{Call, Expr as IQLExpr, VarRef, VarRefDataType};
@@ -56,12 +56,12 @@ pub(super) fn make_tag_key_column_meta(
 /// Sort expressions referring to tag keys are always specified in lexicographically ascending order.
 pub(super) fn plan_with_sort(
     plan: LogicalPlan,
-    mut sort_exprs: Vec<Expr>,
+    mut sort_exprs: Vec<SortExpr>,
     sort_by_measurement: bool,
     group_by_tag_set: &[&str],
     projection_tag_set: &[&str],
 ) -> Result<LogicalPlan> {
-    let mut series_sort = if sort_by_measurement {
+    let mut series_sort: Vec<SortExpr> = if sort_by_measurement {
         vec![Expr::sort(
             INFLUXQL_MEASUREMENT_COLUMN_NAME.as_expr(),
             true,
@@ -76,7 +76,7 @@ pub(super) fn plan_with_sort(
     fn map_to_expr<'a>(
         schema: &'a DFSchemaRef,
         fields: &'a [&str],
-    ) -> impl Iterator<Item = Expr> + 'a {
+    ) -> impl Iterator<Item = SortExpr> + 'a {
         fields_to_exprs_no_nulls(schema, fields).map(|f| Expr::sort(f, true, false))
     }
 

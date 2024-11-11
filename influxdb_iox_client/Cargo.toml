@@ -17,7 +17,7 @@ format = ["arrow", "arrow_util"]
 arrow = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true }
 arrow_util = { path = "../arrow_util", optional = true }
-bytes = "1.7"
+bytes = "1.8"
 client_util = { path = "../client_util" }
 comfy-table = { version = "7.1", default-features = false}
 futures = "0.3"
@@ -27,12 +27,12 @@ iox_query_params = { path = "../iox_query_params" }
 generated_types = { path = "../generated_types" }
 prost = { workspace = true }
 rand = "0.8.5"
-reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
+reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
 schema = { path = "../schema" }
-serde_json = "1.0.128"
-tokio = { version = "1.40", features = ["macros", "parking_lot", "rt-multi-thread"] }
+serde_json = "1.0.132"
+tokio = { version = "1.41", features = ["macros", "parking_lot", "rt-multi-thread"] }
 tokio-stream = "0.1.16"
-thiserror = "1.0.63"
+thiserror = "2.0.0"
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 

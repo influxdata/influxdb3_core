@@ -9,15 +9,14 @@ use sha2::Digest;
 use std::{fmt::Display, sync::Arc};
 use thiserror::Error;
 
-/// Unique ID for a `Partition` during the transition from catalog-assigned sequential
-/// `PartitionId`s to deterministic `PartitionHashId`s.
+/// For issue idpe#17476 we introduced a new, deterministic partition identifier.  We never stopped
+/// allocating the identifiers in the catalog, and have no plans to stop doing so.  Components that
+/// need to support both can use this type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransitionPartitionId {
-    /// The old catalog-assigned sequential `PartitionId`s that are in the process of being
-    /// deprecated.
-    Deprecated(PartitionId),
-    /// The new deterministic, hash-based `PartitionHashId`s that will be the new way to identify
-    /// partitions.
+    /// The classic, catalog-assigned sequential `PartitionId`.
+    Catalog(PartitionId),
+    /// The deterministic, hash-based `PartitionHashId`.
     Deterministic(PartitionHashId),
 }
 
@@ -26,14 +25,14 @@ impl TransitionPartitionId {
     pub fn from_parts(id: PartitionId, hash_id: Option<PartitionHashId>) -> Self {
         match hash_id {
             Some(x) => Self::Deterministic(x),
-            None => Self::Deprecated(id),
+            None => Self::Catalog(id),
         }
     }
 
     /// Size in bytes including `self`.
     pub fn size(&self) -> usize {
         match self {
-            Self::Deprecated(_) => std::mem::size_of::<Self>(),
+            Self::Catalog(_) => std::mem::size_of::<Self>(),
             Self::Deterministic(id) => {
                 std::mem::size_of::<Self>() + id.size() - std::mem::size_of_val(id)
             }
@@ -56,7 +55,7 @@ where
 
         let transition_partition_id = match (partition_id, partition_hash_id) {
             (_, Some(hash_id)) => Self::Deterministic(hash_id),
-            (Some(id), _) => Self::Deprecated(id),
+            (Some(id), _) => Self::Catalog(id),
             (None, None) => {
                 return Err(sqlx::Error::ColumnDecode {
                     index: "partition_id".into(),
@@ -78,7 +77,7 @@ impl From<(PartitionId, Option<&PartitionHashId>)> for TransitionPartitionId {
 impl std::fmt::Display for TransitionPartitionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Deprecated(old_partition_id) => write!(f, "{}", old_partition_id.0),
+            Self::Catalog(old_partition_id) => write!(f, "{}", old_partition_id.0),
             Self::Deterministic(partition_hash_id) => write!(f, "{}", partition_hash_id),
         }
     }
@@ -89,17 +88,17 @@ impl TransitionPartitionId {
     /// ID and partition key. Provided to reduce typing and duplication a bit,
     /// and because this variant should be most common now.
     ///
-    /// This MUST NOT be used for partitions that are addressed using legacy /
-    /// deprecated catalog row IDs, which should use
-    /// [`TransitionPartitionId::Deprecated`] instead.
-    pub fn new(table_id: TableId, partition_key: &PartitionKey) -> Self {
+    /// This MUST NOT be used for partitions that are addressed using
+    /// classical catalog row IDs, which should use
+    /// [`TransitionPartitionId::Catalog`] instead.
+    pub fn deterministic(table_id: TableId, partition_key: &PartitionKey) -> Self {
         Self::Deterministic(PartitionHashId::new(table_id, partition_key))
     }
 
     /// Create a new `TransitionPartitionId` for cases in tests where you need some value but the
     /// value doesn't matter. Public and not test-only so that other crates' tests can use this.
     pub fn arbitrary_for_testing() -> Self {
-        Self::new(TableId::new(0), &PartitionKey::from("arbitrary"))
+        Self::deterministic(TableId::new(0), &PartitionKey::from("arbitrary"))
     }
 }
 
@@ -122,7 +121,7 @@ impl From<TransitionPartitionId>
     fn from(value: TransitionPartitionId) -> Self {
         use generated_types::influxdata::iox::catalog::v1 as proto;
         match value {
-            TransitionPartitionId::Deprecated(id) => Self {
+            TransitionPartitionId::Catalog(id) => Self {
                 id: Some(proto::partition_identifier::Id::CatalogId(id.get())),
             },
             TransitionPartitionId::Deterministic(hash) => Self {
@@ -148,7 +147,7 @@ impl TryFrom<generated_types::influxdata::iox::catalog::v1::PartitionIdentifier>
         let id = value.id.ok_or(PartitionIdProtoError::NoId)?;
 
         Ok(match id {
-            proto::partition_identifier::Id::CatalogId(v) => Self::Deprecated(PartitionId::new(v)),
+            proto::partition_identifier::Id::CatalogId(v) => Self::Catalog(PartitionId::new(v)),
             proto::partition_identifier::Id::HashId(hash) => {
                 Self::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
             }
@@ -182,7 +181,7 @@ impl
 
         Ok(match (id, partition_key) {
             (proto::partition_identifier::Id::CatalogId(v), None) => {
-                Self::Deprecated(PartitionId::new(v))
+                Self::Catalog(PartitionId::new(v))
             }
             (proto::partition_identifier::Id::CatalogId(v), Some(partition_key)) => {
                 Self::from_parts(
@@ -274,15 +273,15 @@ impl sqlx::Type<sqlx::Postgres> for PartitionKey {
 impl sqlx::Encode<'_, sqlx::Postgres> for PartitionKey {
     fn encode_by_ref(
         &self,
-        buf: &mut <sqlx::Postgres as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
-    ) -> sqlx::encode::IsNull {
+        buf: &mut <sqlx::Postgres as sqlx::database::Database>::ArgumentBuffer<'_>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         <&str as sqlx::Encode<sqlx::Postgres>>::encode(&self.0, buf)
     }
 }
 
 impl sqlx::Decode<'_, sqlx::Postgres> for PartitionKey {
     fn decode(
-        value: <sqlx::Postgres as sqlx::database::HasValueRef<'_>>::ValueRef,
+        value: <sqlx::Postgres as sqlx::database::Database>::ValueRef<'_>,
     ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
         Ok(Self(
             <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?.into(),
@@ -299,15 +298,15 @@ impl sqlx::Type<sqlx::Sqlite> for PartitionKey {
 impl sqlx::Encode<'_, sqlx::Sqlite> for PartitionKey {
     fn encode_by_ref(
         &self,
-        buf: &mut <sqlx::Sqlite as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
-    ) -> sqlx::encode::IsNull {
+        buf: &mut <sqlx::Sqlite as sqlx::database::Database>::ArgumentBuffer<'_>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         <String as sqlx::Encode<sqlx::Sqlite>>::encode(self.0.to_string(), buf)
     }
 }
 
 impl sqlx::Decode<'_, sqlx::Sqlite> for PartitionKey {
     fn decode(
-        value: <sqlx::Sqlite as sqlx::database::HasValueRef<'_>>::ValueRef,
+        value: <sqlx::Sqlite as sqlx::database::Database>::ValueRef<'_>,
     ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
         Ok(Self(
             <String as sqlx::Decode<sqlx::Sqlite>>::decode(value)?.into(),
@@ -502,10 +501,13 @@ impl PartitionHashId {
 }
 
 impl<'q> sqlx::encode::Encode<'q, sqlx::Postgres> for &'q PartitionHashId {
-    fn encode_by_ref(&self, buf: &mut sqlx::postgres::PgArgumentBuffer) -> sqlx::encode::IsNull {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         buf.extend_from_slice(self.0.as_ref());
 
-        sqlx::encode::IsNull::No
+        Ok(sqlx::encode::IsNull::No)
     }
 }
 
@@ -513,12 +515,12 @@ impl<'q> sqlx::encode::Encode<'q, sqlx::Sqlite> for &'q PartitionHashId {
     fn encode_by_ref(
         &self,
         args: &mut Vec<sqlx::sqlite::SqliteArgumentValue<'q>>,
-    ) -> sqlx::encode::IsNull {
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         args.push(sqlx::sqlite::SqliteArgumentValue::Blob(
             std::borrow::Cow::Borrowed(self.0.as_ref()),
         ));
 
-        sqlx::encode::IsNull::No
+        Ok(sqlx::encode::IsNull::No)
     }
 }
 
@@ -527,7 +529,7 @@ where
     &'r [u8]: sqlx::Decode<'r, DB>,
 {
     fn decode(
-        value: <DB as ::sqlx::database::HasValueRef<'r>>::ValueRef,
+        value: DB::ValueRef<'r>,
     ) -> ::std::result::Result<
         Self,
         ::std::boxed::Box<
@@ -595,6 +597,10 @@ pub struct Partition {
 
     /// The time at which the partition was last cold compacted
     pub cold_compact_at: Option<Timestamp>,
+
+    /// The time at which this partition was created, or `None` if this partition was created before
+    /// this field existed.
+    created_at: Option<Timestamp>,
 }
 
 impl Partition {
@@ -602,6 +608,7 @@ impl Partition {
     /// care of computing the [`PartitionHashId`].
     ///
     /// This is only appropriate to use in the catalog or in tests.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_catalog_only(
         id: PartitionId,
         hash_id: Option<PartitionHashId>,
@@ -610,6 +617,7 @@ impl Partition {
         sort_key_ids: SortKeyIds,
         new_file_at: Option<Timestamp>,
         cold_compact_at: Option<Timestamp>,
+        created_at: Option<Timestamp>,
     ) -> Self {
         Self {
             id,
@@ -619,6 +627,7 @@ impl Partition {
             sort_key_ids,
             new_file_at,
             cold_compact_at,
+            created_at,
         }
     }
 
@@ -658,6 +667,11 @@ impl Partition {
     pub fn set_sort_key_ids(&mut self, sort_key_ids: &SortKeyIds) {
         self.sort_key_ids = sort_key_ids.clone();
     }
+
+    /// Read access to the created_at time. This should be set by the catalog.
+    pub fn created_at(&self) -> Option<Timestamp> {
+        self.created_at
+    }
 }
 
 #[cfg(test)]
@@ -696,7 +710,7 @@ pub(crate) mod tests {
         ) -> TransitionPartitionId {
             match use_hash {
                 true => TransitionPartitionId::Deterministic(PartitionHashId(hash_id.into())),
-                false => TransitionPartitionId::Deprecated(PartitionId::new(row_id)),
+                false => TransitionPartitionId::Catalog(PartitionId::new(row_id)),
             }
         }
     }

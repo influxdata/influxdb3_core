@@ -119,6 +119,9 @@ impl Planner {
     /// Returns the [`SchemaRef`] to be included in the response to a
     /// `GetFlightInfo` FlightSQL message as described on
     /// [`FlightSQLPlanner::get_schema`], on a separate threadpool.
+    ///
+    /// If query_lang is  Some(InfluxQL), the query is treated as
+    /// InfluxQL. Otherwise, the query is treated as SQL.
     pub(crate) async fn flight_sql_get_flight_info_schema(
         &self,
         namespace_name: impl Into<String> + Send,
@@ -127,6 +130,7 @@ impl Planner {
     ) -> Result<(SchemaRef, RunQuery)> {
         let namespace_name = namespace_name.into();
         let ctx = self.ctx.child_ctx("planner_flight_sql_get_flight_info");
+        let query_lang = query_lang.unwrap_or(QueryLanguage::Sql);
 
         match (cmd, query_lang) {
             // We only want to handle queries with an InfluxQL header like they're actually
@@ -135,7 +139,7 @@ impl Planner {
             // flightsql clients have the capability to switch this header on and off per-request,
             // so instead of just failing on influxql commands that aren't of this variant, we want
             // to let commands kinda do what you'd expect.
-            (FlightSQLCommand::CommandStatementQuery(cmd), Some(QueryLanguage::InfluxQL)) => self
+            (FlightSQLCommand::CommandStatementQuery(cmd), QueryLanguage::InfluxQL) => self
                 .influxql_query_to_schema(&cmd.query)
                 .await
                 .map(|schema| (schema, RunQuery::InfluxQL(cmd.query))),
@@ -148,7 +152,7 @@ impl Planner {
             // we've already verified that, up above, we matched the special case(s) where we want to
             // actually process InfluxQL, and here we just want to fallback to normal sql
             // processing.
-            (cmd, Some(QueryLanguage::Sql | QueryLanguage::InfluxQL) | None) => {
+            (cmd, QueryLanguage::Sql | QueryLanguage::InfluxQL) => {
                 FlightSQLPlanner::get_schema(namespace_name, &cmd, &ctx)
                     .await
                     .map_err(DataFusionError::from)

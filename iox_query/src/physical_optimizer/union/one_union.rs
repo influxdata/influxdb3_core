@@ -74,15 +74,14 @@ mod tests {
         let opt = OneUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " UnionExec"
           - "   EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -92,8 +91,7 @@ mod tests {
         let opt = OneUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " UnionExec"
           - "   EmptyExec"
@@ -103,7 +101,7 @@ mod tests {
             - " UnionExec"
             - "   EmptyExec"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -113,14 +111,13 @@ mod tests {
         let opt = OneUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
     }
 

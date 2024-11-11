@@ -163,7 +163,7 @@ mod tests {
         let pfp = ParquetFilePath::new(
             NamespaceId::new(1),
             TableId::new(2),
-            &TransitionPartitionId::Deprecated(PartitionId::new(4)),
+            &TransitionPartitionId::Catalog(PartitionId::new(4)),
             ObjectStoreId::from_uuid(Uuid::nil()),
         );
         let path = pfp.object_store_path();
@@ -179,7 +179,7 @@ mod tests {
         let pfp = ParquetFilePath::new(
             NamespaceId::new(1),
             table_id,
-            &TransitionPartitionId::new(table_id, &PartitionKey::from("hello there")),
+            &TransitionPartitionId::deterministic(table_id, &PartitionKey::from("hello there")),
             ObjectStoreId::from_uuid(Uuid::nil()),
         );
         let path = pfp.object_store_path();

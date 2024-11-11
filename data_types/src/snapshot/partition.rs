@@ -73,6 +73,9 @@ pub struct PartitionSnapshot {
     skipped_compaction: Option<skipped_compaction_proto::SkippedCompaction>,
     /// The time of the last cold compaction
     cold_compact_at: Option<Timestamp>,
+    /// The time this Partition was created at, or `None` if this partition was created before this
+    /// field existed. Not the time the snapshot was created.
+    created_at: Option<Timestamp>,
 }
 
 impl PartitionSnapshot {
@@ -128,6 +131,7 @@ impl PartitionSnapshot {
             new_file_at: partition.new_file_at,
             skipped_compaction: skipped_compaction.map(|sc| sc.into()),
             cold_compact_at: partition.cold_compact_at,
+            created_at: partition.created_at(),
         })
     }
 
@@ -151,6 +155,7 @@ impl PartitionSnapshot {
             new_file_at: proto.new_file_at.map(Timestamp::new),
             skipped_compaction: proto.skipped_compaction,
             cold_compact_at: proto.cold_compact_at.map(Timestamp::new),
+            created_at: proto.created_at.map(Timestamp::new),
         }
     }
 
@@ -221,6 +226,7 @@ impl PartitionSnapshot {
             self.sort_key.clone(),
             self.new_file_at,
             self.cold_compact_at,
+            self.created_at,
         ))
     }
 
@@ -252,6 +258,7 @@ impl From<PartitionSnapshot> for proto::Partition {
             new_file_at: value.new_file_at.map(|x| x.get()),
             skipped_compaction: value.skipped_compaction,
             cold_compact_at: value.cold_compact_at.map(|x| x.get()),
+            created_at: value.created_at.map(|x| x.get()),
         }
     }
 }

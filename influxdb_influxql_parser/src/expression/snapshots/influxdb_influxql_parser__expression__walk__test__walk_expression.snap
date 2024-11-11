@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/expression/walk.rs
 expression: "walk_expression(\"5 + 6 = 2 + 9\")"
+snapshot_kind: text
 ---
 0: Arithmetic(Literal(Integer(5)))
 1: Arithmetic(Literal(Integer(6)))

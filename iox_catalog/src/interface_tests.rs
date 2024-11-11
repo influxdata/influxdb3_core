@@ -2,21 +2,23 @@
 use ::test_helpers::assert_error;
 use assert_matches::assert_matches;
 use async_trait::async_trait;
-use data_types::snapshot::{
-    namespace::NamespaceSnapshot, root::RootSnapshot, table::TableSnapshot,
-};
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
-    ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams,
-    ParquetFileSource, PartitionId, SortKeyIds, TableId, Timestamp,
+    snapshot::{
+        namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
+        table::TableSnapshot,
+    },
+    Column, ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables,
+    Namespace, NamespaceId, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile,
+    ParquetFileId, ParquetFileParams, ParquetFileSource, Partition, PartitionHashId, PartitionId,
+    PartitionKey, SortKeyIds, TableId, Timestamp,
 };
-use data_types::{snapshot::partition::PartitionSnapshot, Column, PartitionHashId, PartitionKey};
 use futures::{future::try_join_all, stream::FuturesUnordered, Future, StreamExt};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
-use iox_time::TimeProvider;
-use metric::{Observation, RawReporter};
+use iox_time::{SystemProvider, TimeProvider};
+use metric::{assert_histogram, Attributes, DurationHistogram, Observation, RawReporter};
 use parking_lot::Mutex;
+use pretty_assertions::assert_eq;
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -26,6 +28,9 @@ use std::{
     time::Duration,
 };
 
+use crate::grpc::client;
+use crate::grpc::test_server::TestGrpcServer;
+use crate::metrics::GetTimeMetric;
 use crate::{
     constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
     interface::{
@@ -54,7 +59,6 @@ where
     test_list_schemas(clean_state().await).await;
     test_list_schemas_soft_deleted_rows(clean_state().await).await;
     test_delete_namespace(clean_state().await).await;
-    test_partition_retention(clean_state().await).await;
 
     let catalog = clean_state().await;
     test_namespace(Arc::clone(&catalog)).await;
@@ -79,6 +83,8 @@ where
     test_two_repos(clean_state().await).await;
     test_partition_create_or_get_idempotent(clean_state().await).await;
     test_namespace_router_version_atomicity(clean_state().await).await;
+    test_get_time(clean_state().await).await;
+    test_grpc_get_time_with_backed_catalog(clean_state().await).await;
     test_column_create_or_get_many_unchecked(clean_state).await;
 }
 
@@ -1653,6 +1659,29 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap();
 
+    let files_by_table_id = repos
+        .parquet_files()
+        .list_by_table_id(parquet_file_params.table_id, None)
+        .await
+        .unwrap();
+    assert_matches!(files_by_table_id.as_slice(), [got] => {
+        assert_eq!(parquet_file, *got);
+    });
+
+    for (level, expected) in [
+        (CompactionLevel::Initial, 1),
+        (CompactionLevel::FileNonOverlapped, 0),
+        (CompactionLevel::Final, 0),
+    ] {
+        let files = repos
+            .parquet_files()
+            .list_by_table_id(parquet_file_params.table_id, Some(level))
+            .await
+            .unwrap();
+        assert!(files.iter().all(|f| f.compaction_level == level));
+        assert_eq!(files.len(), expected);
+    }
+
     // verify we can get it by its object store id
     let pfg = repos
         .parquet_files()
@@ -1687,11 +1716,12 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
 
     // verify that to_delete is initially set to null and the file does not get deleted
     assert!(parquet_file.to_delete.is_none());
-    let older_than = Timestamp::new(catalog.time_provider().now().timestamp_nanos());
-    let no_time_ago = Duration::from_secs(0);
+    let older_than = Timestamp::new(
+        (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
+    );
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(older_than, no_time_ago)
+        .delete_old_ids_only(older_than)
         .await
         .unwrap();
     assert!(deleted.is_empty());
@@ -1730,12 +1760,12 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .unwrap();
 
     // File is not deleted if it was marked to be deleted after the specified time
-    let before_deleted_ago = Duration::from_secs(100);
-    let before_deleted =
-        Timestamp::new((catalog.time_provider().now() - before_deleted_ago).timestamp_nanos());
+    let before_deleted = Timestamp::new(
+        (catalog.time_provider().now() - Duration::from_secs(100)).timestamp_nanos(),
+    );
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(before_deleted, before_deleted_ago)
+        .delete_old_ids_only(before_deleted)
         .await
         .unwrap();
     assert!(deleted.is_empty());
@@ -1751,7 +1781,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     // File is deleted if it was marked to be deleted before the specified time
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(older_than, no_time_ago)
+        .delete_old_ids_only(older_than)
         .await
         .unwrap();
     assert_eq!(deleted.len(), 1);
@@ -1932,11 +1962,12 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     assert!(files.is_empty());
 
     // test delete_old_ids_only
-    let older_than = Timestamp::new(catalog.time_provider().now().timestamp_nanos());
-    let no_time_ago = Duration::from_secs(0);
+    let older_than = Timestamp::new(
+        (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
+    );
     let ids = repos
         .parquet_files()
-        .delete_old_ids_only(older_than, no_time_ago)
+        .delete_old_ids_only(older_than)
         .await
         .unwrap();
     assert_eq!(ids.len(), 1);
@@ -2333,7 +2364,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         let f_params = ParquetFileParams {
             object_store_id: ObjectStoreId::new(),
             partition_id: partition4.id,
-            max_l0_created_at: Timestamp::new(i),
+            max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(i)),
             min_time: Timestamp::new(0),
             max_time: Timestamp::new(10),
             compaction_level: CompactionLevel::Initial,
@@ -2608,213 +2639,245 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
     let namespace = arbitrary_namespace(&mut *repos, "test_partitions_new_file_between").await;
     let table = arbitrary_table(&mut *repos, "test_table_for_new_file_between", &namespace).await;
+    let one_ms = Duration::from_millis(1);
 
-    // param for the tests
-    let time_now = Timestamp::from(catalog.time_provider().now());
-    let time_one_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(1));
-    let time_two_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(2));
-    let time_three_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(3));
-    let time_five_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(5));
-    let time_six_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(6));
+    // --- Time A ---
+    let time_a = Timestamp::from(catalog.time_provider().now());
+    tokio::time::sleep(one_ms).await;
 
-    // Db has no partitions
+    // Db has no partitions -> no errors, returns empty
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
+        .partitions_new_file_between(time_a, None)
         .await
         .unwrap();
     assert!(partitions.is_empty());
 
     // -----------------
     // PARTITION one
-    // The DB has 1 partition but it does not have any file
+    // partition1 exists but does not have any files
     let partition1 = repos
         .partitions()
         .create_or_get("one".into(), table.id)
         .await
         .unwrap();
+
+    // Partitions that don't have Parquet files are not returned
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
+        .partitions_new_file_between(time_a, None)
         .await
         .unwrap();
     assert!(partitions.is_empty());
 
-    // create files for partition one
+    // create files for partition1
     let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition1);
 
-    // create a deleted L0 file that was created 3 hours ago
-    let delete_l0_file = repos
+    // create then delete an L0 file
+    let deleted_l0_file = repos
         .parquet_files()
-        .create(parquet_file_params.clone())
+        .create(ParquetFileParams {
+            created_at: Timestamp::from(catalog.time_provider().now()),
+            ..parquet_file_params.clone()
+        })
         .await
         .unwrap();
+
+    // --- Time B ---
+    tokio::time::sleep(one_ms).await;
+    let time_b = Timestamp::from(catalog.time_provider().now());
+    tokio::time::sleep(one_ms).await;
+
     repos
         .parquet_files()
         .create_upgrade_delete(
-            delete_l0_file.partition_id,
-            &[delete_l0_file.object_store_id],
+            deleted_l0_file.partition_id,
+            &[deleted_l0_file.object_store_id],
             &[],
             &[],
             CompactionLevel::Initial,
         )
         .await
         .unwrap();
+
+    // Deleting a parquet file does not update new_file_at, so no results should be returned.
+    // Query Time B to present
+    // (range containing parquet file deletion)
+    // = no partitions returned
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert!(partitions.is_empty());
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, Some(time_one_hour_ago))
-        .await
-        .unwrap();
-    assert!(partitions.is_empty());
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_one_hour_ago))
+        .partitions_new_file_between(time_b, None)
         .await
         .unwrap();
     assert!(partitions.is_empty());
 
-    // create a deleted L0 file that was created 1 hour ago
-    let l0_one_hour_ago_file_params = ParquetFileParams {
+    // --- Time C ---
+    tokio::time::sleep(one_ms).await;
+    let time_c = Timestamp::from(catalog.time_provider().now());
+    tokio::time::sleep(one_ms).await;
+
+    // create an active L0 file
+    let active_l0_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: time_one_hour_ago,
+        created_at: Timestamp::from(catalog.time_provider().now()),
         ..parquet_file_params.clone()
     };
-    repos
+    let active_l0 = repos
         .parquet_files()
-        .create(l0_one_hour_ago_file_params.clone())
+        .create(active_l0_file_params)
         .await
         .unwrap();
-    // partition one should be returned
+
+    // --- Time D ---
+    tokio::time::sleep(one_ms).await;
+    let time_d = Timestamp::from(catalog.time_provider().now());
+    tokio::time::sleep(one_ms).await;
+
+    // Query Time B to present
+    //   (range without upper bound contains parquet file creation)
+    // = partition1 should be returned
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
+        .partitions_new_file_between(time_b, None)
         .await
         .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
+    assert_eq!(partitions, [partition1.id]);
+
+    // Query Time B to Time D
+    //   (range with lower and upper bound containing parquet file creation)
+    // = partition1 should be returned
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_two_hour_ago, Some(time_now))
+        .partitions_new_file_between(time_b, Some(time_d))
         .await
         .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
+    assert_eq!(partitions, [partition1.id]);
+
+    // Query Time B to Time C
+    //  (range with lower and upper bound before parquet file creation)
+    // = no partitions returned
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
+        .partitions_new_file_between(time_b, Some(time_c))
         .await
         .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
+    assert!(partitions.is_empty());
+
+    // Query after creation time to present
+    //   (range without upper bound after parquet file creation)
+    // = no partitions returned
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_two_hour_ago))
+        .partitions_new_file_between(active_l0.created_at + 1, None)
+        .await
+        .unwrap();
+    assert!(partitions.is_empty());
+
+    // Query after creation time to Time D
+    //   (range with lower and upper bound after parquet file creation)
+    // = no partitions returned
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(active_l0.created_at + 1, Some(time_d))
+        .await
+        .unwrap();
+    assert!(partitions.is_empty());
+
+    // Query exactly at creation time to present
+    //   (range with lower bound equal to parquet file creation)
+    // = no partitions returned
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(active_l0.created_at, None)
+        .await
+        .unwrap();
+    assert!(partitions.is_empty());
+
+    // Query Time B to exactly at creation time
+    //   (range with upper bound equal to parquet file creation)
+    // = no partitions returned
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_b, Some(active_l0.created_at))
         .await
         .unwrap();
     assert!(partitions.is_empty());
 
     // -----------------
     // PARTITION two
-    // Partition two without any file
     let partition2 = repos
         .partitions()
         .create_or_get("two".into(), table.id)
         .await
         .unwrap();
-    // should return partition one only
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
 
-    // Add a L0 file created 5 hours ago
-    let l0_five_hour_ago_file_params = ParquetFileParams {
+    // Add an L0 file
+    let p2_l0_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: time_five_hour_ago,
+        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition2.id,
         partition_hash_id: partition2.hash_id().cloned(),
         ..parquet_file_params.clone()
     };
     repos
         .parquet_files()
-        .create(l0_five_hour_ago_file_params.clone())
+        .create(p2_l0_file_params)
         .await
         .unwrap();
-    // still return partition one only
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
-    // Between six and three hours ago, return only partition 2
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_six_hour_ago, Some(time_three_hour_ago))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition2.id);
 
-    // Add an L1 file created just now
+    // --- Time E ---
+    tokio::time::sleep(one_ms).await;
+    let time_e = Timestamp::from(catalog.time_provider().now());
+    tokio::time::sleep(one_ms).await;
+
+    // Query range containing only partition1's file time
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_b, Some(time_d))
+        .await
+        .unwrap();
+    assert_eq!(partitions, [partition1.id]);
+
+    // Query range containing only partition2's file time
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_d, None)
+        .await
+        .unwrap();
+    assert_eq!(partitions, [partition2.id]);
+
+    // Query range containing both partitions' file times
+    let mut partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_b, None)
+        .await
+        .unwrap();
+    partitions.sort();
+    assert_eq!(partitions, [partition1.id, partition2.id]);
+
+    // Add an L1 file
     let l1_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: time_now,
+        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition2.id,
         partition_hash_id: partition2.hash_id().cloned(),
         compaction_level: CompactionLevel::FileNonOverlapped,
         ..parquet_file_params.clone()
     };
-    repos
-        .parquet_files()
-        .create(l1_file_params.clone())
-        .await
-        .unwrap();
-    // should return just one partition because L1s don't update new_file_at
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
+    repos.parquet_files().create(l1_file_params).await.unwrap();
 
-    // Add an L0 file created just now, to update new_file_at
-    let l0_file_params = ParquetFileParams {
+    // Should return none because L1s don't update new_file_at
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_e, None)
+        .await
+        .unwrap();
+    assert!(partitions.is_empty());
+
+    // Add an L0 file, to update new_file_at
+    let update_l0_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: time_now,
+        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition2.id,
         partition_hash_id: partition2.hash_id().cloned(),
         compaction_level: CompactionLevel::Initial,
@@ -2822,164 +2885,53 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     };
     repos
         .parquet_files()
-        .create(l0_file_params.clone())
+        .create(update_l0_file_params)
         .await
         .unwrap();
-    // should return both partitions
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 2);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    assert_eq!(partitions[1], partition2.id);
-    // Only return partition1: the creation time must be strictly less than the maximum time,
-    // not equal
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    // Between six and three hours ago, return none
+
+    // Should return partition2 now that its new_file_at is updated
     let partitions = repos
         .partitions()
-        .partitions_new_file_between(time_six_hour_ago, Some(time_three_hour_ago))
+        .partitions_new_file_between(time_e, None)
+        .await
+        .unwrap();
+    assert_eq!(partitions, [partition2.id]);
+
+    // Query range containing only partition2's original new_file_at time now returns none
+    let partitions = repos
+        .partitions()
+        .partitions_new_file_between(time_d, Some(time_e))
         .await
         .unwrap();
     assert!(partitions.is_empty());
 
     // -----------------
     // PARTITION three
-    // Partition three without any file
     let partition3 = repos
         .partitions()
         .create_or_get("three".into(), table.id)
         .await
         .unwrap();
-    // should return partition one and two only
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 2);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    assert_eq!(partitions[1], partition2.id);
-    // Only return partition1: the creation time must be strictly less than the maximum time,
-    // not equal
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
-    // When the maximum time is greater than the creation time of partition2, return it
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now + 1))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 2);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    assert_eq!(partitions[1], partition2.id);
-    // Between six and three hours ago, return none
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_six_hour_ago, Some(time_three_hour_ago))
-        .await
-        .unwrap();
-    assert!(partitions.is_empty());
 
-    // Add an L2 file created just now for partition three
+    // Add an L2 file for partition3
     let l2_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: time_now,
+        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition3.id,
         partition_hash_id: partition3.hash_id().cloned(),
         compaction_level: CompactionLevel::Final,
         ..parquet_file_params.clone()
     };
-    repos
-        .parquet_files()
-        .create(l2_file_params.clone())
-        .await
-        .unwrap();
-    // now should return partition one two and three
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 2);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    assert_eq!(partitions[1], partition2.id);
-    // Only return partition1: the creation time must be strictly less than the maximum time,
-    // not equal
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 1);
-    assert_eq!(partitions[0], partition1.id);
-    // Between six and three hours ago, return none
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_six_hour_ago, Some(time_three_hour_ago))
-        .await
-        .unwrap();
-    assert!(partitions.is_empty());
+    repos.parquet_files().create(l2_file_params).await.unwrap();
 
-    // add an L0 file created one hour ago for partition three
-    let l0_one_hour_ago_file_params = ParquetFileParams {
-        object_store_id: ObjectStoreId::new(),
-        created_at: time_one_hour_ago,
-        partition_id: partition3.id,
-        partition_hash_id: partition3.hash_id().cloned(),
-        ..parquet_file_params.clone()
-    };
-    repos
-        .parquet_files()
-        .create(l0_one_hour_ago_file_params.clone())
-        .await
-        .unwrap();
-    // should return all partitions
+    // Should return just partition1 and partition2 because L2s don't update new_file_at
     let mut partitions = repos
         .partitions()
-        .partitions_new_file_between(time_two_hour_ago, None)
+        .partitions_new_file_between(time_b, None)
         .await
         .unwrap();
-    assert_eq!(partitions.len(), 3);
     partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    assert_eq!(partitions[1], partition2.id);
-    assert_eq!(partitions[2], partition3.id);
-    // Only return partitions 1 and 3; 2 was created just now
-    let mut partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_three_hour_ago, Some(time_now))
-        .await
-        .unwrap();
-    assert_eq!(partitions.len(), 2);
-    partitions.sort();
-    assert_eq!(partitions[0], partition1.id);
-    assert_eq!(partitions[1], partition3.id);
-    // Between six and three hours ago, return none
-    let partitions = repos
-        .partitions()
-        .partitions_new_file_between(time_six_hour_ago, Some(time_three_hour_ago))
-        .await
-        .unwrap();
-    assert!(partitions.is_empty());
+    assert_eq!(partitions, [partition1.id, partition2.id]);
 }
 
 async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
@@ -3341,12 +3293,58 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
         .unwrap();
 }
 
-async fn test_partition_retention(catalog: Arc<dyn Catalog>) {
-    let now = catalog.time_provider().now().date_time();
+const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
+const ONE_DAY: Duration = Duration::from_secs(ONE_HOUR.as_secs() * 24);
+
+/// `partition_with_created_at` is a future that can be called to create a partition with the
+/// specified `created_at` value. The actual catalog interface does not let you create a partition
+/// with `created_at` set to anything other than `now()`, but we want to be able to test partitions
+/// created at particular times without needing to time travel, and we want to be able to test that
+/// the code correctly handles partitions created before this code change that don't have a
+/// `created_at` value.
+///
+/// ## Possible valid states under test
+///
+/// This test sets up the following partition scenarios and asserts the `delete_by_retention` call
+/// retains or deletes the partition as indicated here:
+///
+/// | created_at | partition key            | has parquet files? | Action |
+/// |------------|--------------------------|--------------------|--------|
+/// | now        | within retention window  | ❌                 | retain |
+/// | >1 day ago | within retention window  | ❌                 | retain |
+/// | unknown    | within retention window  | ❌                 | retain |
+/// | now        | outside retention window | ❌                 | retain |
+/// | >1 day ago | outside retention window | ❌                 | 🚮     |
+/// | unknown    | outside retention window | ❌                 | 🚮     |
+/// | now        | within retention window  | ✅                 | retain |
+/// | >1 day ago | within retention window  | ✅                 | retain |
+/// | unknown    | within retention window  | ✅                 | retain |
+/// | now        | outside retention window | ✅                 | retain |
+/// | >1 day ago | outside retention window | ✅                 | retain |
+/// | unknown    | outside retention window | ✅                 | retain |
+/// | now        | non-date-based           | ❌                 | retain |
+/// | >1 day ago | non-date-based           | ❌                 | retain |
+/// | unknown    | non-date-based           | ❌                 | retain |
+/// | now        | non-date-based           | ✅                 | retain |
+/// | >1 day ago | non-date-based           | ✅                 | retain |
+/// | unknown    | non-date-based           | ✅                 | retain |
+///
+/// Partitions whose partition template does not include a date must not be deleted because they
+/// can be written to at any time, regardless of their created_at time and regardless of whether
+/// there are associated Parquet files.
+pub(crate) async fn test_partition_retention<PartitionFunc, PartitionFut>(
+    catalog: Arc<dyn Catalog>,
+    partition_with_created_at: PartitionFunc,
+) where
+    PartitionFunc: Fn(PartitionKey, TableId, Option<Timestamp>) -> PartitionFut + Send + Copy,
+    PartitionFut: Future<Output = Partition> + Send,
+{
+    let now = catalog.time_provider().now();
+    let over_one_day_ago: Timestamp = (catalog.time_provider().now() - ONE_DAY - ONE_HOUR).into();
 
     let mut repos = catalog.repositories();
     let ns_name = NamespaceName::new("test_partition_retention").unwrap();
-    let retention = 1_000_000_000 * 60 * 60 * 24 * 7; // 1 week
+    let retention = 1_000_000_000 * ONE_DAY.as_secs() as i64 * 7; // 1 week
 
     let namespace = repos
         .namespaces()
@@ -3355,38 +3353,96 @@ async fn test_partition_retention(catalog: Arc<dyn Catalog>) {
         .unwrap();
     let table = arbitrary_table(&mut *repos, "test_partition_retention", &namespace).await;
 
-    let part = now - Duration::from_nanos(retention as u64 / 2);
-    let p1 = PartitionKey::from(part.date_naive().to_string());
-    repos
+    let mut expected_deleted: Vec<PartitionId> = vec![];
+    let mut expected_retained = vec![];
+
+    // Date based partitions
+    for (created_at, days_ago, has_parquet_files, retain) in [
+        // within retention, without parquet files
+        (Some(now.into()), 2, false, true),
+        (Some(over_one_day_ago), 3, false, true),
+        (None, 4, false, true),
+        // outside retention, without parquet files
+        (Some(now.into()), 9, false, true),
+        (Some(over_one_day_ago), 10, false, false), // 🚮
+        (None, 11, false, false),                   // 🚮
+        // within retention, with parquet files
+        (Some(now.into()), 5, true, true),
+        (Some(over_one_day_ago), 6, true, true),
+        (None, 7, true, true),
+        // outside retention, with parquet files
+        (Some(now.into()), 12, true, true),
+        (Some(over_one_day_ago), 13, true, true),
+        (None, 14, true, true),
+    ] {
+        let part = now - ONE_DAY * days_ago;
+        let partition_key = PartitionKey::from(part.date_time().date_naive().to_string());
+        let partition = partition_with_created_at(partition_key, table.id, created_at).await;
+
+        if has_parquet_files {
+            repos
+                .parquet_files()
+                .create(arbitrary_parquet_file_params(
+                    &namespace, &table, &partition,
+                ))
+                .await
+                .unwrap();
+        }
+
+        if retain {
+            expected_retained.push(partition.id)
+        } else {
+            expected_deleted.push(partition.id)
+        }
+    }
+
+    // Non-date-based partitions
+    for (index, (created_at, has_parquet_files)) in [
+        // without parquet files
+        (Some(now.into()), false),
+        (Some(over_one_day_ago), false),
+        (None, false),
+        // with parquet files
+        (Some(now.into()), true),
+        (Some(over_one_day_ago), true),
+        (None, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let partition_key = PartitionKey::from(index.to_string());
+        let partition = partition_with_created_at(partition_key, table.id, created_at).await;
+
+        if has_parquet_files {
+            repos
+                .parquet_files()
+                .create(arbitrary_parquet_file_params(
+                    &namespace, &table, &partition,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Non-date-based partitions should always be retained.
+        expected_retained.push(partition.id)
+    }
+
+    let mut to_delete_partition_ids: Vec<_> = repos
         .partitions()
-        .create_or_get(p1, table.id)
+        .delete_by_retention()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|(_table_id, partition_id)| partition_id)
+        .collect();
+    to_delete_partition_ids.sort();
 
-    let part = now - Duration::from_nanos(retention as u64 * 2);
-    let p2 = PartitionKey::from(part.date_naive().to_string());
-    let p2 = repos
-        .partitions()
-        .create_or_get(p2, table.id)
-        .await
-        .unwrap();
+    assert_eq!(to_delete_partition_ids, expected_deleted);
 
-    let part = now - Duration::from_nanos(retention as u64 * 3);
-    let p3 = PartitionKey::from(part.date_naive().to_string());
-    let p3 = repos
-        .partitions()
-        .create_or_get(p3, table.id)
-        .await
-        .unwrap();
+    let mut remaining_partition_ids = repos.partitions().list_ids().await.unwrap();
+    remaining_partition_ids.sort();
 
-    repos
-        .parquet_files()
-        .create(arbitrary_parquet_file_params(&namespace, &table, &p3))
-        .await
-        .unwrap();
-
-    let to_delete = repos.partitions().delete_by_retention().await.unwrap();
-    assert_eq!(to_delete, vec![(p2.table_id, p2.id)]);
+    assert_eq!(remaining_partition_ids, expected_retained);
 }
 
 /// Upsert a namespace called `namespace_name` and write `lines` to it.
@@ -3423,10 +3479,12 @@ where
     let batches = batches.iter().map(|(table, batch)| (table.as_str(), batch));
     let ns = NamespaceSchema::new_empty_from(&namespace);
 
-    let schema = validate_or_insert_schema(batches, &ns, repos)
-        .await
-        .expect("validate schema failed")
-        .unwrap_or(ns);
+    let tables =
+        validate_or_insert_schema(batches, ns.id, &ns.partition_template, &ns.tables, repos)
+            .await
+            .expect("validate schema failed")
+            .unwrap_or(ns.tables);
+    let schema = NamespaceSchema { tables, ..ns };
 
     (namespace, schema)
 }
@@ -3731,18 +3789,86 @@ async fn test_column_create_or_get_many_unchecked_sub<F>(
     want(last_got.unwrap());
 }
 
+async fn test_get_time(catalog: Arc<dyn Catalog>) {
+    let system_provider = SystemProvider::new();
+
+    let system_time = system_provider.now();
+    let catalog_time = catalog.get_time().await;
+
+    assert_matches!(catalog_time, Ok(catalog_time) => {
+        assert!(system_time.second().abs_diff(catalog_time.second()) <= 1);
+    });
+
+    let metrics = catalog.metrics();
+
+    // Calls to `get_time()` have been successful - We should not
+    // have collected any error metrics..
+    assert_histogram!(
+        metrics,
+        DurationHistogram,
+        "catalog_op_duration",
+        labels = Attributes::from(&[
+            ("type", catalog.name()),
+            ("op", "get_time"),
+            ("result", "error")
+        ]),
+        samples = 0,
+    );
+    // ..so we _should_ have collected success metrics!
+    assert_histogram!(
+        metrics,
+        DurationHistogram,
+        "catalog_op_duration",
+        labels = Attributes::from(&[
+            ("type", catalog.name()),
+            ("op", "get_time"),
+            ("result", "success")
+        ]),
+        samples = 1,
+    );
+}
+
+async fn test_grpc_get_time_with_backed_catalog(catalog: Arc<dyn Catalog>) {
+    let time_provider = Arc::new(SystemProvider::new()) as _;
+    let _metrics = Arc::new(metric::Registry::default());
+    let test_server = TestGrpcServer::new(catalog).await;
+    let uri = test_server.uri();
+
+    // create new metrics for client so that they don't overlap w/ server
+    let metrics = Arc::new(metric::Registry::default());
+    let client = Arc::new(
+        client::GrpcCatalogClient::builder(
+            vec![uri],
+            Arc::clone(&metrics),
+            Arc::clone(&time_provider),
+        )
+        .build(),
+    );
+
+    let system_now = client.time_provider().now();
+    let server_now = client.get_time().await;
+
+    assert_matches!(server_now, Ok(t) => {
+        assert!(t.second().abs_diff(system_now.second()) <= 1);
+    });
+}
+
 /// [`Catalog`] wrapper that is helpful for testing.
 #[derive(Debug)]
 pub(crate) struct TestCatalog<T> {
     hold_onto: Mutex<Vec<Box<dyn Any + Send>>>,
+    get_time_metric: GetTimeMetric,
     inner: T,
 }
 
 impl<T: Catalog> TestCatalog<T> {
+    const NAME: &'static str = "test";
+
     /// Create new test catalog.
     pub(crate) fn new(inner: T) -> Self {
         Self {
             hold_onto: Mutex::new(vec![]),
+            get_time_metric: GetTimeMetric::new(&inner.metrics(), Self::NAME),
             inner,
         }
     }
@@ -3778,12 +3904,19 @@ impl<T: Catalog> Catalog for TestCatalog<T> {
         self.inner.time_provider()
     }
 
+    async fn get_time(&self) -> Result<iox_time::Time, Error> {
+        let start = tokio::time::Instant::now();
+        let res = Ok(self.time_provider().now());
+        self.get_time_metric.record(start.elapsed(), &res);
+        res
+    }
+
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
         self.inner.active_applications().await
     }
 
     fn name(&self) -> &'static str {
-        "test"
+        Self::NAME
     }
 }
 

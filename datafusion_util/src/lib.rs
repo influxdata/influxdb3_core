@@ -10,6 +10,7 @@
 //! for expression manipulation functions.
 
 use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -27,8 +28,8 @@ use datafusion::arrow::datatypes::{DataType, Fields};
 use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, ToDFSchema};
 use datafusion::execution::context::TaskContext;
-use datafusion::logical_expr::expr::Sort;
 use datafusion::logical_expr::utils::inspect_expr_pre;
+use datafusion::logical_expr::{expr::Sort, SortExpr};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
@@ -54,12 +55,12 @@ pub trait AsExpr {
     fn as_expr(&self) -> Expr;
 
     /// creates a DataFusion SortExpr
-    fn as_sort_expr(&self) -> Expr {
-        Expr::Sort(Sort {
-            expr: Box::new(self.as_expr()),
-            asc: true, // Sort ASCENDING
-            nulls_first: true,
-        })
+    fn as_sort_expr(&self) -> SortExpr {
+        Sort::new(
+            self.as_expr(),
+            true, // Sort ASCENDING
+            true,
+        )
     }
 }
 
@@ -89,14 +90,6 @@ impl AsExpr for Expr {
     fn as_expr(&self) -> Expr {
         self.clone()
     }
-}
-
-/// `coalsce` expr_fn function that returns the first non-null argument.
-///
-/// workaround for <https://github.com/apache/datafusion/issues/10320> issue in
-/// DataFusion. Should use [datafusion::prelude::coalesce]  when that is fixed
-pub fn coalesce(args: Vec<Expr>) -> Expr {
-    datafusion::functions::core::coalesce().call(args)
 }
 
 /// Creates an `Expr` that represents a Dictionary encoded string (e.g
@@ -315,9 +308,51 @@ pub fn stream_from_batches(
     Box::pin(MemoryStream::new_with_schema(batches, schema))
 }
 
-/// Create a SendableRecordBatchStream that sends back no RecordBatches with a specific schema
-pub fn stream_from_schema(schema: SchemaRef) -> SendableRecordBatchStream {
-    stream_from_batches(schema, vec![])
+/// Helper trait for implementing `partial_cmp` for nested types.
+///
+/// Example
+/// ```rust
+/// use std::cmp::Ordering;
+/// use datafusion_util::ThenWithOpt;
+///
+/// // Struct has two fields, lets pretend one can't be compared
+/// #[derive(Debug, PartialEq)]
+/// struct Foo {
+///    a: i32,
+///    b: i32, // pretend this can't be compared
+///    c: i32,
+/// }
+///
+/// impl PartialOrd for Foo {
+///    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+///       self.a.partial_cmp(&other.a)
+///          // only compare c if a is equal
+///          .then_with_opt(|| self.c.partial_cmp(&other.c))
+///   }
+/// }
+///
+/// let foo1 = Foo { a: 1, b: 2, c: 3 };
+/// let foo2 = Foo { a: 1, b: 4, c: 5 };
+/// let foo3 = Foo { a: 1, b: 4, c: 6 };
+/// let foo4 = Foo { a: 2, b: 4, c: 6 };
+///
+/// assert_eq!(foo1.partial_cmp(&foo1), Some(Ordering::Equal));
+/// assert_eq!(foo1.partial_cmp(&foo2), Some(Ordering::Less));
+/// assert_eq!(foo2.partial_cmp(&foo3), Some(Ordering::Less));
+/// assert_eq!(foo4.partial_cmp(&foo1), Some(Ordering::Greater));
+/// ```
+pub trait ThenWithOpt {
+    /// Invoke the closure if the ordering is equal, otherwise return the ordering.
+    fn then_with_opt<F: FnOnce() -> Self>(self, f: F) -> Self;
+}
+
+impl ThenWithOpt for Option<Ordering> {
+    fn then_with_opt<F: FnOnce() -> Self>(self, f: F) -> Self {
+        match self {
+            Some(Ordering::Equal) => f(),
+            other => other,
+        }
+    }
 }
 
 /// Execute the [ExecutionPlan] with a default [SessionContext] and

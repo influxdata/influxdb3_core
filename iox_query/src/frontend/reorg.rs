@@ -432,17 +432,16 @@ mod test {
         // It is critical that the plan only sorts the inputs and is not resorted after the UnionExec.
         insta::assert_yaml_snapshot!(
             format_execution_plan(&physical_plan),
-            @r###"
-        ---
+            @r#"
         - " SortPreservingMergeExec: [tag1@2 ASC,time@3 ASC]"
         - "   UnionExec"
         - "     SortExec: expr=[tag1@2 ASC,time@3 ASC], preserve_partitioning=[false]"
         - "       RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
-        - "     ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
-        - "       DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
-        - "         SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC], preserve_partitioning=[false]"
-        - "           RecordBatchesExec: chunks=1, projection=[__chunk_order, field_int, field_int2, tag1, time]"
-        "###
+        - "     ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
+        - "       DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
+        - "         SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "           RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
+        "#
         );
 
         assert_eq!(
@@ -507,18 +506,17 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_execution_plan(&physical_plan),
-            @r###"
-        ---
+            @r#"
         - " SortPreservingMergeExec: [tag1@2 DESC,time@3 ASC NULLS LAST]"
         - "   UnionExec"
         - "     SortExec: expr=[tag1@2 DESC,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
         - "       RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
         - "     SortExec: expr=[tag1@2 DESC,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-        - "       ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
-        - "         DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
-        - "           SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC], preserve_partitioning=[false]"
-        - "             RecordBatchesExec: chunks=1, projection=[__chunk_order, field_int, field_int2, tag1, time]"
-        "###
+        - "       ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
+        - "         DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
+        - "           SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "             RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
+        "#
         );
 
         assert_eq!(
@@ -585,19 +583,18 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_execution_plan(&physical_plan),
-            @r###"
-        ---
+            @r#"
         - " StreamSplitExec"
         - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST,tag1@2 ASC]"
         - "     UnionExec"
         - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
         - "         RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
         - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
-        - "         ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
-        - "           DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
-        - "             SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC], preserve_partitioning=[false]"
-        - "               RecordBatchesExec: chunks=1, projection=[__chunk_order, field_int, field_int2, tag1, time]"
-        "###
+        - "         ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
+        - "           DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
+        - "             SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "               RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
+        "#
         );
 
         assert_eq!(
@@ -676,19 +673,18 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_execution_plan(&physical_plan),
-            @r###"
-        ---
+            @r#"
         - " StreamSplitExec"
         - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST,tag1@2 ASC]"
         - "     UnionExec"
         - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
         - "         RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
         - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
-        - "         ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
-        - "           DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
-        - "             SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC], preserve_partitioning=[false]"
-        - "               RecordBatchesExec: chunks=1, projection=[__chunk_order, field_int, field_int2, tag1, time]"
-        "###
+        - "         ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
+        - "           DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
+        - "             SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "               RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
+        "#
         );
 
         assert_eq!(

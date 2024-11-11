@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit_mut.rs
 expression: "visit_statement!(r#\"SELECT DISTINCT value FROM temp\"#)"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_select_statement
@@ -20,4 +21,3 @@ expression: "visit_statement!(r#\"SELECT DISTINCT value FROM temp\"#)"
 - post_visit_select_from_clause
 - post_visit_select_statement
 - post_visit_statement
-

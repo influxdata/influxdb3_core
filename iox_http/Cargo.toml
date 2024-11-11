@@ -10,11 +10,11 @@ license.workspace = true
 [dependencies]
 # crates.io dependencies in alphabetical order
 async-trait = "0.1"
-hyper = "0.14"
+hyper = {workspace = true}
 parking_lot = "0.12"
 serde = "1.0"
 serde_urlencoded = "0.7"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # workspace dependencies in alphabetical order
 authz = { path = "../authz", features = ["http"] }

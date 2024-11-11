@@ -1,5 +1,5 @@
-use crate::exec::{FieldsPivotExec, SeriesPivotExec};
-use crate::plan::{FieldsPivot, SeriesPivot};
+use crate::exec::{FieldsPivotExec, SchemaPivotExec, SeriesPivotExec};
+use crate::plan::{FieldsPivot, SchemaPivot, SeriesPivot};
 use datafusion::common::Result;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{ExprSchemable, LogicalPlan, UserDefinedLogicalNode};
@@ -70,6 +70,12 @@ impl ExtensionPlanner for InfluxRpcExtensionPlanner {
                 field_exprs,
             );
             Ok(Some(Arc::new(exec)))
+        } else if let Some(schema_pivot) = node.downcast_ref::<SchemaPivot>() {
+            assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
+            Ok(Some(Arc::new(SchemaPivotExec::new(
+                Arc::clone(&physical_inputs[0]),
+                schema_pivot.schema().as_ref().clone().into(),
+            ))))
         } else {
             Ok(None)
         }

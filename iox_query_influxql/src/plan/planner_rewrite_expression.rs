@@ -853,16 +853,10 @@ mod test {
         };
 
         let expr = "time".as_expr().gt_eq(lit_timestamptz_nano(1000));
-        assert_eq!(
-            rewrite(expr),
-            "time >= TimestampNanosecond(1000, Some(\"UTC\"))"
-        );
+        assert_eq!(rewrite(expr), "time >= TimestampNanosecond(1000, None)");
 
         let expr = lit_timestamptz_nano(1000).lt_eq("time".as_expr());
-        assert_eq!(
-            rewrite(expr),
-            "TimestampNanosecond(1000, Some(\"UTC\")) <= time"
-        );
+        assert_eq!(rewrite(expr), "TimestampNanosecond(1000, None) <= time");
 
         let expr = "time"
             .as_expr()
@@ -870,7 +864,7 @@ mod test {
             .and("tag0".as_expr().eq(lit("foo")));
         assert_eq!(
             rewrite(expr),
-            r#"time >= TimestampNanosecond(1000, Some("UTC")) AND tag0 = Utf8("foo")"#
+            r#"time >= TimestampNanosecond(1000, None) AND tag0 = Utf8("foo")"#
         );
 
         let expr = "time"
@@ -879,7 +873,7 @@ mod test {
             .and("float_field".as_expr().eq(lit(false)));
         assert_eq!(
             rewrite(expr),
-            r#"time >= TimestampNanosecond(1000, Some("UTC")) AND Boolean(false)"#
+            r#"time >= TimestampNanosecond(1000, None) AND Boolean(false)"#
         );
     }
 

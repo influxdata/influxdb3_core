@@ -4,13 +4,17 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use std::{collections::HashMap, fmt, panic, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    panic::{self, PanicHookInfo},
+    sync::Arc,
+};
 
 use metric::U64Counter;
 use observability_deps::tracing::{error, warn};
-use panic::PanicInfo;
 
-type PanicFunctionPtr = Arc<Box<dyn Fn(&PanicInfo<'_>) + Sync + Send + 'static>>;
+type PanicFunctionPtr = Arc<Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>>;
 
 /// RAII guard that installs a custom panic hook to send panic
 /// information to tracing.
@@ -147,7 +151,7 @@ impl PanicType {
         }
     }
 
-    fn classify(panic_info: &PanicInfo<'_>) -> Self {
+    fn classify(panic_info: &PanicHookInfo<'_>) -> Self {
         match message(panic_info) {
             Some("offset overflow" | "offset") => Self::OffsetOverflow,
             _ => Self::Unknown,
@@ -155,8 +159,8 @@ impl PanicType {
     }
 }
 
-/// Extract string message from [`PanicInfo`]
-fn message<'a>(panic_info: &'a PanicInfo<'a>) -> Option<&'a str> {
+/// Extract string message from [`PanicHookInfo`]
+fn message<'a>(panic_info: &'a PanicHookInfo<'a>) -> Option<&'a str> {
     let payload_any = panic_info.payload();
 
     payload_any

@@ -1,3 +1,4 @@
+use crate::InfluxRpcError;
 use arrow::array::{Int32Builder, Int64Builder, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::cast::as_timestamp_nanosecond_array;
@@ -10,22 +11,9 @@ use futures::stream::Stream;
 use hashbrown::HashSet;
 use observability_deps::tracing::{debug, trace};
 use schema::InfluxFieldType;
-use snafu::Snafu;
 use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-
-#[derive(Debug, Snafu)]
-enum Error {
-    #[snafu(display("Input missing time column"))]
-    InputMissingTimeColumn,
-}
-
-impl From<Error> for DataFusionError {
-    fn from(e: Error) -> Self {
-        Self::External(Box::new(e))
-    }
-}
 
 pub(super) struct FieldsPivotStream<S> {
     input: S,
@@ -100,7 +88,7 @@ where
                         }
                     })
                     .next()
-                    .ok_or(Error::InputMissingTimeColumn)?;
+                    .ok_or_else(|| InfluxRpcError::internal("Input missing time column"))?;
                 let times = as_timestamp_nanosecond_array(batch.column(time_col))?;
                 trace!(?times, "time column");
 

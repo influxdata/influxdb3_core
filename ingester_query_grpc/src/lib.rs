@@ -474,7 +474,7 @@ impl TryFrom<proto2::PartitionIdentifier> for TransitionPartitionId {
             partition_identifier.ok_or_else(|| FieldViolation::required("partition_identifier"))?;
         let id = match id {
             proto2::partition_identifier::PartitionIdentifier::CatalogId(id) => {
-                Self::Deprecated(PartitionId::new(id))
+                Self::Catalog(PartitionId::new(id))
             }
             proto2::partition_identifier::PartitionIdentifier::HashId(id) => {
                 Self::Deterministic(PartitionHashId::try_from(id.as_ref()).map_err(|e| {
@@ -492,7 +492,7 @@ impl TryFrom<proto2::PartitionIdentifier> for TransitionPartitionId {
 impl From<TransitionPartitionId> for proto2::PartitionIdentifier {
     fn from(id: TransitionPartitionId) -> Self {
         let id = match id {
-            TransitionPartitionId::Deprecated(id) => {
+            TransitionPartitionId::Catalog(id) => {
                 proto2::partition_identifier::PartitionIdentifier::CatalogId(id.get())
             }
             TransitionPartitionId::Deterministic(id) => {

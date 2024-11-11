@@ -638,7 +638,7 @@ mod tests {
             ]
         );
 
-        let record_batch = batch.to_arrow(Projection::All).unwrap();
+        let record_batch = batch.try_into_arrow(Projection::All).unwrap();
 
         let keys: Vec<_> = partition_keys(&record_batch, template_parts.into_iter())
             .map(|v| v.expect("non-identical consecutive keys"))
@@ -764,7 +764,7 @@ mod tests {
         .unwrap()
         .is_none());
 
-        let initial_record_batch = batch.to_arrow(Projection::All).unwrap();
+        let initial_record_batch = batch.clone().try_into_arrow(Projection::All).unwrap();
         let filter_record_batch_to_platanos1970 = PartitionWrite::filter_to_partition(
             &initial_record_batch,
             &table_partition_template,

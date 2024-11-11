@@ -4,12 +4,13 @@ use crate::{
     bulk_ingest::BulkIngestConfig,
     gossip::GossipConfig,
     ingester_address::IngesterAddress,
+    memory_size::MemorySize,
     single_tenant::{
         CONFIG_AUTHZ_ENV_NAME, CONFIG_AUTHZ_FLAG, CONFIG_CST_ENV_NAME, CONFIG_CST_FLAG,
     },
 };
 use std::{
-    num::{NonZeroU64, NonZeroUsize, ParseIntError},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize, ParseIntError},
     time::Duration,
 };
 
@@ -60,18 +61,31 @@ pub struct RouterConfig {
         default_value = "200",
         action
     )]
-    pub http_request_limit: usize,
+    pub http_request_limit: NonZeroUsize,
 
-    /// When writing line protocol data, does an error on a single line
-    /// reject the write? Or will all individual valid lines be written?
-    /// Set to true to enable all valid lines to write.
+    /// Maximum size of HTTP requests.
     #[clap(
-        long = "partial-writes-enabled",
-        env = "INFLUXDB_IOX_PARTIAL_WRITES_ENABLED",
-        default_value = "false",
+        long = "max-http-request-size",
+        env = "INFLUXDB_IOX_MAX_HTTP_REQUEST_SIZE",
+        default_value = "10485760", // 10 MiB
+        action,
+    )]
+    pub max_http_request_size: NonZeroU32,
+
+    /// The maximum number of line-protocol bytes that the router will read and
+    /// process concurrently.
+    ///
+    /// This limiter can be used to apply limited control over the memory usage
+    /// of the router.
+    ///
+    /// Once the limiter is exceeded, "HTTP 429 Too Many Requests" are returned
+    /// to the user.
+    #[clap(
+        long = "max-in-flight-byte-limit",
+        env = "INFLUXDB_IOX_MAX_IN_FLIGHT_BYTE_LIMIT",
         action
     )]
-    pub permit_partial_writes: bool,
+    pub max_in_flight_byte_limit: Option<MemorySize>,
 
     /// gRPC address for the router to talk with the ingesters. For
     /// example:
@@ -124,7 +138,8 @@ pub struct RouterConfig {
     #[clap(
         long = "table-column-limit-max",
         env = "INFLUXDB_IOX_TABLE_COLUMN_LIMIT_MAX",
-        default_value = "1000"
+        default_value = "1000",
+        hide = true
     )]
     pub table_column_limit_max: NonZeroUsize,
 

@@ -10,7 +10,8 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-chrono-tz = { version = "0.9" }
+assert_matches = "1"
+chrono-tz = { version = "0.10" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
 generated_types = { path = "../generated_types" }
@@ -23,12 +24,11 @@ predicate = { path = "../predicate" }
 query_functions = { path = "../query_functions" }
 regex = "1"
 schema = { path = "../schema" }
-serde_json = "1.0.128"
-thiserror = "1.0"
+serde_json = "1.0.132"
+thiserror = "2.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-assert_matches = "1"
 chrono = { version = "0.4", default-features = false }
 insta = { version = "1", features = ["yaml"] }
 test_helpers = { path = "../test_helpers" }

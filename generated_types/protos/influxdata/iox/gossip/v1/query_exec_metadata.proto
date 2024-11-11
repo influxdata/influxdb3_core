@@ -1,0 +1,10 @@
+syntax = "proto3";
+package influxdata.iox.gossip.v1;
+option go_package = "github.com/influxdata/iox/gossip/v1";
+
+import "influxdata/iox/catalog/v1/partition_identifier.proto";
+
+// Notification of a partition queried.
+message QueryExecMetadataEvent {
+  repeated influxdata.iox.catalog.v1.PartitionIdentifier identifiers = 1;
+}

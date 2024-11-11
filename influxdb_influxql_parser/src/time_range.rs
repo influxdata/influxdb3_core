@@ -256,7 +256,7 @@ pub fn split_cond(
                             Some(ts) => ts,
                             None => {
                                 return ControlFlow::Break(error::map::internal(
-                                    "timestamp out o range",
+                                    "timestamp out of range",
                                 ));
                             }
                         },

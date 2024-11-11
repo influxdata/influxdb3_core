@@ -1096,6 +1096,7 @@ mod tests {
                 migrations: vec![].into(),
                 ignore_missing: false,
                 locking: false,
+                no_tx: false,
             })
             .unwrap_err();
             assert_eq!(
@@ -1110,6 +1111,7 @@ mod tests {
                 migrations: vec![].into(),
                 ignore_missing: true,
                 locking: true,
+                no_tx: false,
             })
             .unwrap_err();
 
@@ -1128,10 +1130,12 @@ mod tests {
                     migration_type: MigrationType::ReversibleUp,
                     sql: "".into(),
                     checksum: vec![].into(),
+                    no_tx: false,
                 }]
                 .into(),
                 ignore_missing: false,
                 locking: true,
+                no_tx: false,
             })
             .unwrap_err();
 
@@ -1150,10 +1154,12 @@ mod tests {
                     migration_type: MigrationType::ReversibleDown,
                     sql: "".into(),
                     checksum: vec![].into(),
+                    no_tx: false,
                 }]
                 .into(),
                 ignore_missing: false,
                 locking: true,
+                no_tx: false,
             })
             .unwrap_err();
 
@@ -1172,10 +1178,12 @@ mod tests {
                     migration_type: MigrationType::Simple,
                     sql: "-- IOX_OTHER_CHECKSUM: foo".into(),
                     checksum: vec![].into(),
+                    no_tx: false,
                 }]
                 .into(),
                 ignore_missing: false,
                 locking: true,
+                no_tx: false,
             })
             .unwrap_err();
 
@@ -1195,6 +1203,7 @@ mod tests {
                         migration_type: MigrationType::Simple,
                         sql: "SELECT 1;".into(),
                         checksum: vec![1, 2, 3].into(),
+                        no_tx: false,
                     },
                     Migration {
                         version: 10,
@@ -1203,6 +1212,7 @@ mod tests {
                         sql: "SELECT 2;\n-- IOX_STEP_BOUNDARY\n-- IOX_NO_TRANSACTION\nSELECT 3;"
                             .into(),
                         checksum: vec![4, 5, 6].into(),
+                        no_tx: false,
                     },
                     Migration {
                         version: 11,
@@ -1211,11 +1221,13 @@ mod tests {
                         sql: "-- IOX_OTHER_CHECKSUM:1ff\n-- IOX_OTHER_CHECKSUM:   2ff   \nSELECT4;"
                             .into(),
                         checksum: vec![7, 8, 9].into(),
+                        no_tx: false,
                     },
                 ]
                 .into(),
                 ignore_missing: false,
                 locking: true,
+                no_tx: false,
             })
             .unwrap();
 

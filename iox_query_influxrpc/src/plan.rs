@@ -9,11 +9,16 @@ use datafusion::sql::sqlparser::ast::NullTreatment;
 use std::sync::Arc;
 
 mod fields_pivot;
+mod schema_pivot;
 mod series_pivot;
 
-pub(crate) use fields_pivot::make_schema as fields_pivot_schema;
 pub(crate) use fields_pivot::FieldsPivot;
+pub(crate) use schema_pivot::SchemaPivot;
 pub(crate) use series_pivot::SeriesPivot;
+
+pub(crate) use fields_pivot::make_schema as fields_pivot_schema;
+#[cfg(test)]
+pub(crate) use schema_pivot::make_schema_pivot_output_schema as schema_pivot_schema;
 
 use crate::schema::SeriesSchema;
 use crate::STRING_VALUE_COLUMN_NAME;
@@ -89,6 +94,23 @@ pub(crate) trait LogicalPlanBuilderExt: Sized {
         field_exprs: impl IntoIterator<Item = impl Into<Expr>>,
         field_aggregator: FieldAggregator,
     ) -> Result<Self>;
+
+    /// Attach a SchemaPivot node to a builder. A SchemaPivot
+    /// node takes an arbitrary input like
+    ///  ColA | ColB | ColC
+    /// ------+------+------
+    ///   1   | NULL | NULL
+    ///   2   | 2    | NULL
+    ///   3   | 2    | NULL
+    ///
+    /// And pivots it to a table with a single string column for any
+    /// columns that had non null values.
+    ///
+    ///   non_null_column
+    ///  -----------------
+    ///   "ColA"
+    ///   "ColB"
+    fn schema_pivot(self) -> Result<Self>;
 }
 
 impl LogicalPlanBuilderExt for LogicalPlanBuilder {
@@ -136,8 +158,7 @@ impl LogicalPlanBuilderExt for LogicalPlanBuilder {
             .map(|p| {
                 SeriesSchema::try_from(p.schema().as_arrow()).inspect(|s| schema = schema.merge(s))
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_df_error("union_series"))?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         let projections = plan_schemas
             .into_iter()
@@ -224,6 +245,14 @@ impl LogicalPlanBuilderExt for LogicalPlanBuilder {
         }
 
         self.aggregate(group_exprs, aggr_expr)
+    }
+
+    fn schema_pivot(self) -> Result<Self> {
+        self.build()
+            .map(SchemaPivot::new)
+            .map(Arc::new)
+            .map(|node| LogicalPlan::Extension(Extension { node }))
+            .map(Self::from)
     }
 }
 

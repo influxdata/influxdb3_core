@@ -161,7 +161,10 @@ fn test_basic() {
         ),
     ];
 
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected_data,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
     assert_eq!(stats, expected_stats);
 
     let mut writer = Writer::new(&mut batch, 4);
@@ -178,7 +181,10 @@ fn test_basic() {
     let stats: Vec<_> = get_stats(&batch);
 
     // Writer dropped, should not impact stats or data
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected_data,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
     assert_eq!(stats, expected_stats);
 
     let err = Writer::new(&mut batch, 1)
@@ -211,7 +217,10 @@ fn test_basic() {
     let stats: Vec<_> = get_stats(&batch);
 
     // Writer not committed, should not impact stats or data
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected_data,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
     assert_eq!(stats, expected_stats);
 
     let mut writer = Writer::new(&mut batch, 17);
@@ -333,7 +342,10 @@ fn test_basic() {
         ),
     ];
 
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected_data,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
     assert_eq!(stats, expected_stats);
 
     let mut expected_timestamps = TimestampSummary::default();
@@ -428,7 +440,10 @@ fn test_null_only() {
         ),
     ];
 
-    assert_batches_eq!(expected_data, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected_data,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
     pretty_assertions::assert_eq!(expected_stats, stats);
 }
 

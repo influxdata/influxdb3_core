@@ -1,10 +1,8 @@
 //! Querier-related configs.
-
-use url::Url;
-
 use crate::{
     ingester_address::IngesterAddress,
     memory_size::MemorySize,
+    object_store::Endpoint,
     single_tenant::{CONFIG_AUTHZ_ENV_NAME, CONFIG_AUTHZ_FLAG},
 };
 use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf};
@@ -225,7 +223,6 @@ pub struct QuerierConfig {
     #[clap(
         long = "optimize-for-meta-cache",
         env = "INFLUXDB_IOX_OPTIMIZE_FOR_META_CACHE",
-        default_value = "false",
         action
     )]
     pub optimize_for_meta_cache: bool,
@@ -250,7 +247,29 @@ pub struct QuerierConfig {
         num_args=1..,
         value_delimiter = ','
     )]
-    pub object_store_cache_endpoints: Option<Vec<Url>>,
+    pub object_store_cache_endpoints: Option<Vec<Endpoint>>,
+
+    /// Enable the S3Fifo Cache for In Mem Object Store/Metadata Caches
+    #[clap(
+        long = "use-s3fifo-cache",
+        env = "INFLUXDB_IOX_USE_S3FIFO_CACHE",
+        default_value = "false",
+        action
+    )]
+    pub use_s3fifo_cache: bool,
+
+    /// The threshold for moving items from the small queue to main queue
+    /// in S3Fifo. Expressed as a percentage (ie 10 for 10%)
+    ///
+    /// This impacts the permanence of objects, as items in the main queue
+    /// are slower to evict and quicker to return.
+    #[clap(
+        long = "s3fifo-cache-main-threshold",
+        env = "INFLUXDB_IOX_S3FIFO_CACHE_MAIN_THRESHOLD",
+        default_value = "25",
+        action
+    )]
+    pub s3fifo_cache_main_threshold: usize,
 }
 
 fn parse_datafusion_config(

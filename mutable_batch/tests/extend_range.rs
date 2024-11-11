@@ -71,7 +71,7 @@ fn test_extend_range() {
             "|      | v2   | 1970-01-01T00:00:00.000000004Z |",
             "+------+------+--------------------------------+",
         ],
-        &[a.to_arrow(Projection::All).unwrap()]
+        &[a.clone().try_into_arrow(Projection::All).unwrap()]
     );
 
     assert_batches_eq!(
@@ -89,7 +89,7 @@ fn test_extend_range() {
             "|       | v1   | v2   | 1970-01-01T00:00:00.000000012Z |",
             "+-------+------+------+--------------------------------+",
         ],
-        &[b.to_arrow(Projection::All).unwrap()]
+        &[b.clone().try_into_arrow(Projection::All).unwrap()]
     );
 
     a.extend_from_range(&b, 1..4).unwrap();
@@ -109,7 +109,7 @@ fn test_extend_range() {
             "|       |      |      | v1   | 1970-01-01T00:00:00.000000008Z |",
             "+-------+------+------+------+--------------------------------+",
         ],
-        &[a.to_arrow(Projection::All).unwrap()]
+        &[a.clone().try_into_arrow(Projection::All).unwrap()]
     );
 
     let stats: BTreeMap<_, _> = a.columns().map(|(k, v)| (k.as_str(), v.stats())).collect();

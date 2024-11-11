@@ -5,6 +5,7 @@ use parking_lot as _;
 use regex as _;
 use workspace_hack as _;
 
+use humantime::format_rfc3339_micros;
 use observability_deps::tracing::{
     self,
     field::{Field, Visit},
@@ -175,11 +176,14 @@ impl<W: Write> FieldPrinter<W> {
     }
 
     fn write_timestamp(&mut self) {
-        let ns_since_epoch = SystemTime::now()
+        let system_time = SystemTime::now();
+        let rfc3339_ts = format_rfc3339_micros(system_time);
+        let ns_since_epoch = system_time
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("System time should have been after the epoch")
             .as_nanos();
 
+        write!(self.writer, " ts={rfc3339_ts}").ok();
         write!(self.writer, " time={ns_since_epoch:?}").ok();
     }
 }

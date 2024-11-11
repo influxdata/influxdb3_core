@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 
-use arrow::compute::{concat_batches, SortOptions};
+use arrow::compute::concat_batches;
 use arrow::{
     array::{ArrayRef, UInt64Array},
     compute::TakeOptions,
@@ -11,6 +11,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_util::optimize::optimize_dictionaries;
+use datafusion::error::DataFusionError;
 use datafusion::physical_plan::{expressions::PhysicalSortExpr, metrics, PhysicalExpr};
 use observability_deps::tracing::{debug, trace};
 
@@ -94,7 +95,10 @@ impl RecordBatchDeduplicator {
 
     /// Return last_batch if it does not overlap with the given batch
     /// Note that since last_batch, if exists, will include at least one row and all of its rows will have the same key
-    pub fn last_batch_with_no_same_sort_key(&mut self, batch: &RecordBatch) -> Option<RecordBatch> {
+    pub fn last_batch_with_no_same_sort_key(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>, DataFusionError> {
         // Take the previous batch, if any, out of it storage self.last_batch
         if let Some(last_batch) = self.last_batch.take() {
             // Build sorted columns for last_batch and current one
@@ -153,24 +157,27 @@ impl RecordBatchDeduplicator {
             let mut same = true;
             for (l, r) in zipped {
                 let last_idx = l.values.len() - 1;
-                if (l.values.is_valid(last_idx), r.values.is_valid(0)) == (true, true) {
-                    // Both have values, do the actual comparison
-                    let opts = SortOptions::default();
-                    let c =
-                        arrow::array::make_comparator(l.values.as_ref(), r.values.as_ref(), opts)
-                            .unwrap();
+                let c = arrow::array::make_comparator(
+                    l.values.as_ref(),
+                    r.values.as_ref(),
+                    l.options.unwrap_or_default(),
+                )
+                .unwrap();
 
-                    match c(last_idx, 0) {
-                        Ordering::Equal => {}
-                        _ => {
-                            same = false;
-                            break;
-                        }
+                match c(last_idx, 0) {
+                    Ordering::Equal => {} // continue comparing columns across the row
+                    Ordering::Greater => {
+                        // last_batch value overlaps curr_batch.
+                        // This is an overlap, and not just having `same` (equal) sort keys.
+                        //
+                        // This overlap can only occur if the SPM was not properly inserted between the
+                        // unioned'ed inputs and the DedupeExec. Is a query runtime error.
+                        return Err(DataFusionError::Execution("attempted to execute invalid plan, deduplication should not occur on unsorted batch stream".into()));
                     }
-                } else {
-                    // At least one of the value is invalid, consider they are different
-                    same = false;
-                    break;
+                    Ordering::Less => {
+                        same = false;
+                        break;
+                    }
                 }
             }
 
@@ -178,7 +185,7 @@ impl RecordBatchDeduplicator {
                 // The batches overlap and need to be concatinated
                 // So, store it back in self.last_batch for the concat_batches later
                 self.last_batch = Some(last_batch);
-                None
+                Ok(None)
             } else {
                 // The batches do not overlap, deduplicate and then return the last_batch to get sent downstream
 
@@ -197,10 +204,10 @@ impl RecordBatchDeduplicator {
                 };
                 let dedup_last_batch = self.output_from_ranges(&last_batch, &dupe_ranges).unwrap();
 
-                Some(dedup_last_batch)
+                Ok(Some(dedup_last_batch))
             }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -467,6 +474,7 @@ mod test {
 
         let results = dedupe
             .last_batch_with_no_same_sort_key(&current_batch)
+            .unwrap()
             .unwrap();
 
         let expected = vec![
@@ -550,6 +558,7 @@ mod test {
 
         let results = dedupe
             .last_batch_with_no_same_sort_key(&current_batch)
+            .unwrap()
             .unwrap();
 
         let expected = vec![
@@ -617,7 +626,9 @@ mod test {
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
-        let results = dedupe.last_batch_with_no_same_sort_key(&current_batch);
+        let results = dedupe
+            .last_batch_with_no_same_sort_key(&current_batch)
+            .unwrap();
         assert!(results.is_none());
     }
 
@@ -685,7 +696,9 @@ mod test {
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
-        let results = dedupe.last_batch_with_no_same_sort_key(&current_batch);
+        let results = dedupe
+            .last_batch_with_no_same_sort_key(&current_batch)
+            .unwrap();
         assert!(results.is_none());
     }
 
@@ -731,7 +744,9 @@ mod test {
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), None);
 
-        let results = dedupe.last_batch_with_no_same_sort_key(&current_batch);
+        let results = dedupe
+            .last_batch_with_no_same_sort_key(&current_batch)
+            .unwrap();
         assert!(results.is_none());
     }
 

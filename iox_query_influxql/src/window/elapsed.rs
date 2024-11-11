@@ -3,10 +3,11 @@ use std::sync::Arc;
 use crate::error;
 use crate::window::difference::window_difference;
 use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray};
-use arrow::datatypes::DataType;
 use arrow::datatypes::IntervalUnit::MonthDayNano;
 use arrow::datatypes::TimeUnit::Nanosecond;
+use arrow::datatypes::{DataType, Field};
 use datafusion::common::{Result, ScalarValue};
+use datafusion::logical_expr::function::WindowUDFFieldArgs;
 use datafusion::logical_expr::{PartitionEvaluator, Signature, Volatility, WindowUDFImpl};
 
 #[derive(Debug)]
@@ -35,8 +36,8 @@ impl WindowUDFImpl for ElapsedUDWF {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Int64)
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
+        Ok(Field::new(field_args.name(), DataType::Int64, true))
     }
 
     fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {

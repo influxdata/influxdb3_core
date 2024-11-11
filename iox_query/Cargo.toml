@@ -21,7 +21,7 @@ workspace = true
 arrow = { workspace = true }
 arrow_util = { path = "../arrow_util" }
 async-trait = "0.1"
-bytes = "1.7"
+bytes = "1.8"
 chrono = { version = "0.4", default-features = false }
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
@@ -29,7 +29,7 @@ datafusion_util = { path = "../datafusion_util" }
 executor = { path = "../executor"}
 futures = "0.3"
 hashbrown = { workspace = true }
-indexmap = { version = "2.5", features = ["std"] }
+indexmap = { version = "2.6", features = ["std"] }
 itertools = "0.13.0"
 iox_query_params = { path = "../iox_query_params" }
 iox_time = { path = "../iox_time" }
@@ -42,7 +42,7 @@ parquet_file = { path = "../parquet_file" }
 query_functions = { path = "../query_functions"}
 schema = { path = "../schema" }
 snafu = "0.8"
-tokio = { version = "1.40", features = ["macros", "parking_lot"] }
+tokio = { version = "1.41", features = ["macros", "parking_lot"] }
 tokio-stream = "0.1"
 trace = { path = "../trace" }
 tracker = { path = "../tracker" }
@@ -50,6 +50,13 @@ uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
+rand = "0.8"
+criterion = { version = "0.5", default-features = false, features = ["rayon"]}
 insta = { version = "1", features = ["yaml"] }
 serde = { version = "1.0", features = ["derive"] }
 test_helpers = { path = "../test_helpers" }
+
+
+[[bench]]
+name = "deduplicate"
+harness = false

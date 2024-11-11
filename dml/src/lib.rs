@@ -355,8 +355,10 @@ pub mod test_util {
             let b_batch = b.table(table_id).expect("table not found");
 
             assert_eq!(
-                pretty_format_batches(&[a_batch.to_arrow(Projection::All).unwrap()]).unwrap(),
-                pretty_format_batches(&[b_batch.to_arrow(Projection::All).unwrap()]).unwrap(),
+                pretty_format_batches(&[a_batch.clone().try_into_arrow(Projection::All).unwrap()])
+                    .unwrap(),
+                pretty_format_batches(&[b_batch.clone().try_into_arrow(Projection::All).unwrap()])
+                    .unwrap(),
                 "batches for table \"{table_id}\" differ"
             );
         }

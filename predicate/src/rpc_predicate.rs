@@ -8,9 +8,10 @@ use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 use crate::Predicate;
 
 use async_trait::async_trait;
+use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::ToDFSchema;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::prelude::{lit, Expr};
@@ -126,36 +127,54 @@ impl InfluxRpcPredicate {
     /// See [`normalize_predicate`] for more details on the
     /// transformations applied.
     ///
-    /// Returns a list of (TableName, [`Predicate`])
+    /// Returns a list of (TableName, Option<(TableProvider, Schema)>, [`Predicate`])
     pub async fn table_predicates(
         &self,
         session_ctx: &SessionContext,
-        table_info: &dyn QueryNamespaceMeta,
+        schema_provider: Arc<dyn SchemaProvider>,
         concurrent_jobs: usize,
-    ) -> DataFusionResult<Vec<(Arc<str>, Option<Schema>, Predicate)>> {
+    ) -> DataFusionResult<
+        Vec<(
+            Arc<str>,
+            Option<(Arc<dyn TableProvider>, Schema)>,
+            Predicate,
+        )>,
+    > {
         let table_names = match &self.table_names {
             Some(table_names) => itertools::Either::Left(table_names.iter().cloned()),
-            None => itertools::Either::Right(table_info.table_names().into_iter()),
+            None => itertools::Either::Right(schema_provider.table_names().into_iter()),
         };
 
         futures::stream::iter(table_names)
-            .map(|table| async move {
-                let schema = table_info.table_schema(&table).await;
-                let predicate = match &schema {
-                    Some(schema) => normalize_predicate(session_ctx, &table, schema, &self.inner)?,
+            .map(|table_name| {
+                let schema_provider = Arc::clone(&schema_provider);
+                async move {
+                    let maybe_table = schema_provider.table(&table_name).await?;
+                    Ok((table_name, maybe_table))
+                }
+            })
+            .buffered(concurrent_jobs)
+            .and_then(|(table_name, maybe_table)| async move {
+                let (table_and_schema, predicate) = match maybe_table {
+                    Some(table) => {
+                        let schema = Schema::try_from(table.schema())
+                            .map_err(|err| DataFusionError::External(Box::new(err)))?;
+                        let predicate =
+                            normalize_predicate(session_ctx, &table_name, &schema, &self.inner)?;
+                        (Some((table, schema)), predicate)
+                    }
                     None => {
                         // if we don't know about this table, we can't
                         // do any predicate specialization. This can
                         // happen if there is a request for
                         // "measurement fields" for a non existent
                         // measurement, for example
-                        self.inner.clone()
+                        (None, self.inner.clone())
                     }
                 };
 
-                Ok((Arc::from(table), schema, predicate))
+                Ok((Arc::from(table_name), table_and_schema, predicate))
             })
-            .buffered(concurrent_jobs)
             .try_collect()
             .await
     }
@@ -296,7 +315,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use datafusion::{
         execution::context::SessionContext,
-        prelude::{col, lit},
+        prelude::{col, lit, when},
         scalar::ScalarValue,
     };
     use datafusion_util::lit_dict;
@@ -434,6 +453,71 @@ mod tests {
         let expected = Predicate::new().with_field_columns(vec!["f1"]).unwrap();
 
         assert_eq!(predicate, expected);
+    }
+
+    #[test]
+    fn test_rewrite_tag_equality() {
+        // this is what happens with a grpc predicate on a tag
+        //
+        // tag(foo) = 'bar' becomes
+        //
+        // CASE WHEN foo IS NULL then '' ELSE foo END = 'bar'
+        //
+        // It is critical to be rewritten foo = 'bar' correctly so
+        // that it can be evaluated quickly
+        let expr = when(col("t1").is_null(), lit(""))
+            .otherwise(col("t1"))
+            .unwrap();
+        let silly_predicate = Predicate::new().with_expr(expr.eq(lit("bar")));
+        let exprs =
+            normalize_predicate(&SessionContext::new(), "table", &schema(), &silly_predicate)
+                .unwrap()
+                .exprs;
+        // verify that the predicate was rewritten to `foo = 'bar'`
+        let expected_exprs = vec![col("t1").eq(lit_dict("bar"))];
+        assert_eq!(exprs, expected_exprs);
+    }
+
+    #[test]
+    fn test_rewrite_measurement_predicate() {
+        // Validate that _measurement predicates are translated
+        //
+        // https://github.com/influxdata/influxdb_iox/issues/3601
+        // _measurement = 'foo'
+        let silly_predicate = Predicate::new().with_expr(col("_measurement").eq(lit("foo")));
+        let exprs =
+            normalize_predicate(&SessionContext::new(), "table", &schema(), &silly_predicate)
+                .unwrap()
+                .exprs;
+        // verify that the predicate was rewritten to `false` as the
+        // measurement name is `h20`
+        let expected_exprs = vec![lit(false)];
+        assert_eq!(exprs, expected_exprs);
+    }
+
+    #[test]
+    fn test_rewrite_complex_measurement_predicate() {
+        // more complicated _measurement predicates are translated
+        //
+        // https://github.com/influxdata/influxdb_iox/issues/3601
+        // (_measurement = 'foo' or measurement = 'h2o') AND t1 = 'bar'
+        let silly_predicate = Predicate::new().with_expr(
+            col("_measurement")
+                .eq(lit("foo"))
+                .or(col("_measurement").eq(lit("h2o")))
+                .and(col("t1").eq(lit("bar"))),
+        );
+        let exprs = normalize_predicate(&SessionContext::new(), "h2o", &schema(), &silly_predicate)
+            .unwrap()
+            .exprs;
+
+        // verify that the predicate was rewritten to foo = 'bar'
+        let dict = ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some("bar".to_string()))),
+        );
+        let expected_exprs = vec![col("t1").eq(lit(dict))];
+        assert_eq!(exprs, expected_exprs);
     }
 
     fn schema() -> Schema {

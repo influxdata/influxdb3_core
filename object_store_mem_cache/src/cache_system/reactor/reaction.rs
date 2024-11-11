@@ -5,7 +5,7 @@ use iox_time::TimeProvider;
 use metric::DurationHistogram;
 use observability_deps::tracing::{info, warn};
 
-use crate::cache_system::interfaces::DynError;
+use crate::cache_system::DynError;
 
 /// Reaction to a [trigger].
 ///

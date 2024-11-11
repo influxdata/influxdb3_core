@@ -89,15 +89,6 @@ pub struct RunConfig {
     )]
     pub http_server_tcp_kernel_receive_buffer_size: Option<usize>,
 
-    /// Maximum size of HTTP requests.
-    #[clap(
-        long = "max-http-request-size",
-        env = "INFLUXDB_IOX_MAX_HTTP_REQUEST_SIZE",
-        default_value = "10485760", // 10 MiB
-        action,
-    )]
-    pub max_http_request_size: usize,
-
     /// Path to file containing license JWT.
     #[clap(
         long = "license-path",
@@ -114,20 +105,9 @@ impl RunConfig {
         &self.tracing_config
     }
 
-    /// Get a mutable reference to the run config's tracing config.
-    pub fn tracing_config_mut(&mut self) -> &mut TracingConfig {
-        &mut self.tracing_config
-    }
-
     /// Get a reference to the run config's logging config.
     pub fn logging_config(&self) -> &LoggingConfig {
         &self.logging_config
-    }
-
-    /// set the http bind address
-    pub fn with_http_bind_address(mut self, http_bind_address: SocketAddr) -> Self {
-        self.http_bind_address = http_bind_address;
-        self
     }
 
     /// set the grpc bind address
@@ -142,7 +122,6 @@ impl RunConfig {
         tracing_config: TracingConfig,
         http_bind_address: SocketAddr,
         grpc_bind_address: SocketAddr,
-        max_http_request_size: usize,
         license_path: PathBuf,
     ) -> Self {
         Self {
@@ -150,7 +129,6 @@ impl RunConfig {
             tracing_config,
             http_bind_address,
             grpc_bind_address,
-            max_http_request_size,
             http_max_pending_reset_streams: None,
             grpc_server_tcp_kernel_send_buffer_size: None,
             grpc_server_tcp_kernel_receive_buffer_size: None,

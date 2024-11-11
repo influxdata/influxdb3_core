@@ -348,8 +348,8 @@ where
 {
     fn encode_by_ref(
         &self,
-        buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer,
-    ) -> sqlx::encode::IsNull {
+        buf: &mut DB::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         <i16>::encode(*self as i16, buf)
     }
 }
@@ -359,9 +359,7 @@ where
     DB: sqlx::Database,
     i16: sqlx::Decode<'q, DB>,
 {
-    fn decode(
-        value: <DB as sqlx::database::HasValueRef<'q>>::ValueRef,
-    ) -> Result<Self, sqlx::error::BoxDynError> {
+    fn decode(value: DB::ValueRef<'q>) -> Result<Self, sqlx::error::BoxDynError> {
         let discriminant = <i16>::decode(value)?;
 
         Ok(match discriminant {
@@ -481,17 +479,6 @@ impl PartialEq<InfluxColumnType> for ColumnType {
     }
 }
 
-/// Returns the `ColumnType` for the passed in line protocol `FieldValue` type
-pub fn column_type_from_field(field_value: &FieldValue<'_>) -> ColumnType {
-    match field_value {
-        FieldValue::I64(_) => ColumnType::I64,
-        FieldValue::U64(_) => ColumnType::U64,
-        FieldValue::F64(_) => ColumnType::F64,
-        FieldValue::String(_) => ColumnType::String,
-        FieldValue::Boolean(_) => ColumnType::Bool,
-    }
-}
-
 impl TryFrom<proto::ColumnType> for ColumnType {
     type Error = &'static str;
 
@@ -539,7 +526,7 @@ where
     Vec<ColumnId>: ::sqlx::decode::Decode<'r, DB>,
 {
     fn decode(
-        value: <DB as ::sqlx::database::HasValueRef<'r>>::ValueRef,
+        value: DB::ValueRef<'r>,
     ) -> Result<Self, Box<dyn ::std::error::Error + 'static + Send + Sync>> {
         <Vec<ColumnId> as ::sqlx::decode::Decode<'r, DB>>::decode(value).map(Self::new)
     }

@@ -3,11 +3,17 @@
 
 mod interpolate;
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::{Bound, Range},
+    sync::Arc,
+};
 
 use arrow::{
     array::{Array, ArrayRef, TimestampNanosecondArray, UInt64Array},
-    compute::{kernels::take, partition},
+    compute::{
+        kernels::{interleave, take},
+        partition,
+    },
     datatypes::SchemaRef,
     record_batch::RecordBatch,
 };
@@ -19,7 +25,7 @@ use hashbrown::HashMap;
 
 use self::interpolate::Segment;
 
-use super::{params::GapFillParams, FillStrategy};
+use super::{params::GapFillParams, FillStrategy, GapExpander};
 
 /// Provides methods to the [`GapFillStream`](super::stream::GapFillStream)
 /// module that fill gaps in buffered input.
@@ -157,7 +163,7 @@ impl GapFiller {
 
     /// Produces a vector of offsets that are the exclusive ends of each series
     /// in the buffered input. It will return the ends of only those series
-    /// that can at least  be started in the output batch.
+    /// that can at least be started in the output batch.
     ///
     /// Uses [`lexicographical_partition_ranges`](arrow::compute::lexicographical_partition_ranges)
     /// to partition input rows into series.
@@ -194,7 +200,7 @@ impl GapFiller {
                     );
 
                     if let Some(nrows) =
-                        cursor.count_series_rows(&self.params, input_time_array, end)
+                        cursor.count_series_rows(&self.params, input_time_array, end)?
                     {
                         output_row_count += nrows;
                         series_ends.push(end);
@@ -252,7 +258,7 @@ impl GapFiller {
                 )));
             }
             let take_arr = UInt64Array::from(take_vec);
-            output_arrays.push((*idx, take::take(ga, &take_arr, None)?))
+            output_arrays.push((*idx, take::take(ga, &take_arr, None)?));
         }
 
         // Build the aggregate columns
@@ -285,13 +291,14 @@ impl GapFiller {
 /// for building vectors that build time, group, and aggregate output arrays.
 #[derive(Debug)]
 pub(crate) struct Cursor {
+    gap_expander: Arc<dyn GapExpander + Send + Sync>,
     /// Where to read the next row from the input.
     next_input_offset: usize,
     /// The next timestamp to be produced for the current series.
     /// Since the lower bound for gap filling could just be "whatever
     /// the first timestamp in the series is," this may be `None` before
     /// any rows with non-null timestamps are produced for a series.
-    next_ts: Option<i64>,
+    next_ts: Bound<i64>,
     /// How many rows may be output before we need to start a new record batch.
     remaining_output_batch_size: usize,
     /// True if there are trailing gaps from after the last input row for a series
@@ -309,9 +316,14 @@ impl Cursor {
             .iter()
             .map(|(idx, fs)| (*idx, AggrColState::new(fs)))
             .collect();
+        let next_ts = match params.first_ts {
+            Some(ts) => Bound::Included(ts),
+            None => Bound::Unbounded,
+        };
         Self {
+            gap_expander: Arc::clone(&params.gap_expander),
             next_input_offset: 0,
-            next_ts: params.first_ts,
+            next_ts,
             remaining_output_batch_size: 0,
             trailing_gaps: false,
             aggr_col_states,
@@ -331,6 +343,7 @@ impl Cursor {
     /// When `idx` is `None`, return a `Cursor` with an empty [Cursor::aggr_col_states].
     fn clone_for_aggr_col(&self, idx: Option<usize>) -> Result<Self> {
         let mut cur = Self {
+            gap_expander: Arc::clone(&self.gap_expander),
             next_input_offset: self.next_input_offset,
             next_ts: self.next_ts,
             remaining_output_batch_size: self.remaining_output_batch_size,
@@ -396,9 +409,9 @@ impl Cursor {
         params: &GapFillParams,
         input_time_array: &TimestampNanosecondArray,
         series_end: usize,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>> {
         if !self.trailing_gaps && self.next_input_offset == series_end {
-            return None;
+            return Ok(None);
         }
 
         let mut count = if input_time_array.null_count() > 0 {
@@ -410,14 +423,24 @@ impl Cursor {
         };
 
         self.next_input_offset += count;
-        if self.maybe_init_next_ts(input_time_array, series_end) {
-            count += params.valid_row_count(self.next_ts.unwrap());
-        }
+        let tz = input_time_array.timezone().map(Arc::from);
+        let range = Range {
+            start: self
+                .next_ts
+                .map(|ts| ScalarValue::TimestampNanosecond(Some(ts), tz.clone())),
+            end: Bound::Included(ScalarValue::TimestampNanosecond(
+                Some(params.last_ts),
+                tz.clone(),
+            )),
+        };
+        let array =
+            input_time_array.slice(self.next_input_offset, series_end - self.next_input_offset);
+        count += self.gap_expander.as_ref().count_rows(range, &array)?;
 
         self.next_input_offset = series_end;
-        self.next_ts = params.first_ts;
+        self.next_ts = Bound::Excluded(params.last_ts);
 
-        Some(count)
+        Ok(Some(count))
     }
 
     /// Update this cursor to reflect that `offset` older rows are being sliced off from the
@@ -428,37 +451,6 @@ impl Cursor {
         }
         self.next_input_offset -= offset;
         Ok(())
-    }
-
-    /// Attempts to assign a value to `self.next_ts` if it does not have one.
-    ///
-    /// This bit of abstraction is needed because the lower bound for gap filling may be
-    /// determined in one of two ways:
-    /// * If the [`GapFillParams`] provided by client code has `first_ts` set to `Some`, this
-    ///   will be the first timestamp for each series. In this case `self.next_ts`
-    ///   will never `None`, and this function does nothing.
-    /// * Otherwise it is determined to be whatever the first timestamp in the input series is.
-    ///   In this case `params.first_ts == None`, and we need to extract the timestamp from
-    ///   the input time array.
-    ///
-    /// Returns true if `self.next_ts` ends up containing a value.
-    fn maybe_init_next_ts(
-        &mut self,
-        input_time_array: &TimestampNanosecondArray,
-        series_end: usize,
-    ) -> bool {
-        self.next_ts = match self.next_ts {
-            Some(_) => self.next_ts,
-            None if self.next_input_offset < series_end
-                && input_time_array.is_valid(self.next_input_offset) =>
-            {
-                Some(input_time_array.value(self.next_input_offset))
-            }
-            // This may happen if current input offset points at a row
-            // with a null timestamp, or is past the end of the current series.
-            _ => None,
-        };
-        self.next_ts.is_some()
     }
 
     /// Builds a vector that can be used to produce a timestamp array.
@@ -543,9 +535,6 @@ impl Cursor {
         input_aggr_array: &ArrayRef,
     ) -> Result<ArrayRef> {
         match self.get_aggr_col_state() {
-            AggrColState::Null => {
-                self.build_aggr_fill_null(params, series_ends, input_time_array, input_aggr_array)
-            }
             AggrColState::PrevNullAsIntentional { .. } | AggrColState::PrevNullAsMissing { .. } => {
                 self.build_aggr_fill_prev(params, series_ends, input_time_array, input_aggr_array)
             }
@@ -561,42 +550,60 @@ impl Cursor {
                 input_time_array,
                 input_aggr_array,
             ),
+            AggrColState::Default(val) => self.build_aggr_fill_val(
+                params,
+                series_ends,
+                input_time_array,
+                input_aggr_array,
+                val.clone(),
+            ),
         }
     }
 
-    /// Builds an array using the [`take`](take::take) kernel
-    /// to produce an aggregate output column, filling gaps with
-    /// null values.
-    fn build_aggr_fill_null(
+    /// Build a gap-filled array that takes from input_aggr_array and fills with `val` wherever
+    /// `input_aggr_array` does not have a value. Assumes that `val` has the same datatype as
+    /// `input_aggr_array`. Uses the [`interleave::interleave`] kernel to produce this output.
+    fn build_aggr_fill_val(
         &mut self,
         params: &GapFillParams,
         series_ends: &[usize],
         input_time_array: &TimestampNanosecondArray,
         input_aggr_array: &ArrayRef,
+        val: ScalarValue,
     ) -> Result<ArrayRef> {
+        // at this point, we assume that the data type of `val` is the same as the data type of
+        // `input_aggr_array`. This should be true as long as the AggregateFunction that created
+        // this array upheld the invariants of its trait contract (specifically, that it returns a
+        // value of Datatype `X` when someone calls `return_type(_)` with an argument of
+        // DataType::X). If they're not the same, the `interleave` kernel will throw an error and
+        // we'll bubble it up
+
+        let other_arr = val.to_array()?;
+
         struct AggrBuilder {
-            take_idxs: Vec<Option<u64>>,
+            // slice to pass into interleave::interleave as the second arg
+            idxes: Vec<(usize, usize)>,
         }
 
         impl VecBuilder for AggrBuilder {
             fn push(&mut self, row_status: RowStatus) -> Result<()> {
                 match row_status {
                     RowStatus::NullTimestamp { offset, .. } | RowStatus::Present { offset, .. } => {
-                        self.take_idxs.push(Some(offset as u64))
+                        self.idxes.push((0, offset));
                     }
-                    RowStatus::Missing { .. } => self.take_idxs.push(None),
+                    RowStatus::Missing { .. } => self.idxes.push((1, 0)),
                 }
                 Ok(())
             }
         }
 
         let mut aggr_builder = AggrBuilder {
-            take_idxs: Vec::with_capacity(self.remaining_output_batch_size),
+            idxes: Vec::with_capacity(self.remaining_output_batch_size),
         };
+
         self.build_vec(params, input_time_array, series_ends, &mut aggr_builder)?;
 
-        let take_arr = UInt64Array::from(aggr_builder.take_idxs);
-        take::take(input_aggr_array, &take_arr, None)
+        interleave::interleave(&[input_aggr_array, &other_arr], &aggr_builder.idxes)
             .map_err(|err| DataFusionError::ArrowError(err, None))
     }
 
@@ -722,12 +729,12 @@ impl Cursor {
         vec_builder: &mut impl VecBuilder,
     ) -> Result<()> {
         for series in series_ends {
-            if self
-                .next_ts
-                .map_or(false, |next_ts| next_ts > params.last_ts)
-            {
+            if self.next_ts == Bound::Excluded(params.last_ts) {
                 vec_builder.start_new_series()?;
-                self.next_ts = params.first_ts;
+                self.next_ts = match params.first_ts {
+                    Some(ts) => Bound::Included(ts),
+                    None => Bound::Unbounded,
+                };
             }
 
             self.append_series_items(params, input_time_array, *series, vec_builder)?;
@@ -738,9 +745,7 @@ impl Cursor {
         ))?;
 
         self.trailing_gaps = self.next_input_offset == *last_series_end
-            && self
-                .next_ts
-                .map_or(true, |next_ts| next_ts <= params.last_ts);
+            && self.next_ts != Bound::Excluded(params.last_ts);
         Ok(())
     }
 
@@ -768,57 +773,45 @@ impl Cursor {
             self.next_input_offset += 1;
         }
 
-        if !self.maybe_init_next_ts(input_times, series_end) {
+        if self.remaining_output_batch_size == 0 {
             return Ok(());
         }
-        let mut next_ts = self.next_ts.unwrap();
-
-        let output_row_count = std::cmp::min(
-            params.valid_row_count(next_ts),
-            self.remaining_output_batch_size,
-        );
-        if output_row_count == 0 {
-            return Ok(());
-        }
-
-        // last_ts is the last timestamp that will fit in the output batch
-        let last_ts = next_ts + (output_row_count - 1) as i64 * params.stride;
-
-        loop {
-            if self.next_input_offset >= series_end {
-                break;
-            }
-            let in_ts = input_times.value(self.next_input_offset);
-            if in_ts > last_ts {
-                break;
-            }
-            while next_ts < in_ts {
-                vec_builder.push(RowStatus::Missing {
+        let array = input_times.slice(self.next_input_offset, series_end - self.next_input_offset);
+        let tz = input_times.timezone().map(Arc::from);
+        let range = Range {
+            start: self
+                .next_ts
+                .map(|ts| ScalarValue::TimestampNanosecond(Some(ts), tz.clone())),
+            end: Bound::Included(ScalarValue::TimestampNanosecond(Some(params.last_ts), tz)),
+        };
+        let (pairs, input_rows_processed) =
+            self.gap_expander
+                .expand_gaps(range, &array, self.remaining_output_batch_size)?;
+        for (ts, idx) in pairs {
+            let ts = match ts {
+                ScalarValue::TimestampNanosecond(Some(ts), _) => ts,
+                _ => {
+                    return Err(DataFusionError::Execution(format!(
+                        "gap expander produced unexpected type for timestamp: {:?}",
+                        ts.data_type()
+                    )))
+                }
+            };
+            self.next_ts = Bound::Excluded(ts);
+            vec_builder.push(match idx {
+                Some(idx) => RowStatus::Present {
                     series_end_offset: series_end,
-                    ts: next_ts,
-                })?;
-                next_ts += params.stride;
-            }
-            vec_builder.push(RowStatus::Present {
-                series_end_offset: series_end,
-                offset: self.next_input_offset,
-                ts: next_ts,
+                    offset: self.next_input_offset + idx,
+                    ts,
+                },
+                None => RowStatus::Missing {
+                    series_end_offset: series_end,
+                    ts,
+                },
             })?;
-            next_ts += params.stride;
-            self.next_input_offset += 1;
+            self.remaining_output_batch_size -= 1;
         }
-
-        // Add any additional missing values after the last of the input.
-        while next_ts <= last_ts {
-            vec_builder.push(RowStatus::Missing {
-                series_end_offset: series_end,
-                ts: next_ts,
-            })?;
-            next_ts += params.stride;
-        }
-
-        self.next_ts = Some(last_ts + params.stride);
-        self.remaining_output_batch_size -= output_row_count;
+        self.next_input_offset += input_rows_processed;
         Ok(())
     }
 }
@@ -827,8 +820,8 @@ impl Cursor {
 /// depending on the fill strategy.
 #[derive(Clone, Debug)]
 enum AggrColState {
-    /// For [FillStrategy::Null] there is no state to maintain.
-    Null,
+    /// For [FillStrategy::Default]
+    Default(ScalarValue),
     /// For [FillStrategy::PrevNullAsIntentional].
     PrevNullAsIntentional { offset: Option<u64> },
     /// For [FillStrategy::PrevNullAsMissing].
@@ -850,7 +843,7 @@ impl AggrColState {
     /// Create a new [AggrColState] based on the [FillStrategy] for the column.
     fn new(fill_strategy: &FillStrategy) -> Self {
         match fill_strategy {
-            FillStrategy::Null => Self::Null,
+            FillStrategy::Default(val) => Self::Default(val.clone()),
             FillStrategy::PrevNullAsIntentional => Self::PrevNullAsIntentional { offset: None },
             FillStrategy::PrevNullAsMissing => Self::PrevNullAsMissing { offset: None },
             FillStrategy::LinearInterpolate => Self::LinearInterpolate(None),
@@ -866,7 +859,9 @@ impl AggrColState {
     fn prev_offset(&self) -> Option<u64> {
         match self {
             Self::PrevNullAsIntentional { offset } | Self::PrevNullAsMissing { offset } => *offset,
-            _ => unreachable!(),
+            Self::Default(_)
+            | Self::LinearInterpolate(_)
+            | Self::PrevNullAsMissingStashed { stash: _ } => unreachable!(),
         }
     }
 
@@ -1035,20 +1030,21 @@ impl<'a> VecBuilder for StashedAggrBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{ops::Bound, sync::Arc};
 
     use arrow::{
         array::{ArrayRef, Float64Array, TimestampNanosecondArray},
-        datatypes::{Field, Schema},
+        datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
     use arrow_util::test_util::batches_to_lines;
-    use datafusion::error::Result;
+    use datafusion::{common::ScalarValue, error::Result};
     use hashbrown::HashMap;
     use schema::{InfluxColumnType, TIME_DATA_TIMEZONE};
 
     use crate::exec::gapfill::{
         algo::{AggrColState, Cursor},
+        date_bin_gap_expander::DateBinGapExpander,
         params::GapFillParams,
         FillStrategy,
     };
@@ -1060,10 +1056,10 @@ mod tests {
         let series = input_times.len();
 
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
-            fill_strategy: simple_fill_strategy(),
+            fill_strategy: simple_fill_strategy(DataType::Null),
         };
 
         let output_batch_size = 10000;
@@ -1095,10 +1091,10 @@ mod tests {
         let series = input_times.len();
 
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: None,
             last_ts: 1250,
-            fill_strategy: simple_fill_strategy(),
+            fill_strategy: simple_fill_strategy(DataType::Null),
         };
 
         let output_batch_size = 10000;
@@ -1123,10 +1119,10 @@ mod tests {
         let series = input_times.len();
 
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
-            fill_strategy: simple_fill_strategy(),
+            fill_strategy: simple_fill_strategy(DataType::Null),
         };
 
         let output_batch_size = 10000;
@@ -1158,10 +1154,10 @@ mod tests {
         let series = input_times.len();
 
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
-            fill_strategy: simple_fill_strategy(),
+            fill_strategy: simple_fill_strategy(DataType::Null),
         };
 
         let output_batch_size = 10000;
@@ -1181,10 +1177,10 @@ mod tests {
         let series = input_times.len();
 
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
-            fill_strategy: simple_fill_strategy(),
+            fill_strategy: simple_fill_strategy(DataType::Float64),
         };
 
         let output_batch_size = 10000;
@@ -1199,10 +1195,15 @@ mod tests {
         )
         .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
-            .build_aggr_fill_null(&params, &[series], &input_times, &input_aggr_array)
+            .build_aggr_fill_val(
+                &params,
+                &[series],
+                &input_times,
+                &input_aggr_array,
+                ScalarValue::Float64(None),
+            )
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -1214,7 +1215,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001200Z | 12.0 |"
         - "| 1970-01-01T00:00:00.000001250Z |      |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -1229,10 +1230,10 @@ mod tests {
         let series = input_times.len();
 
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
-            fill_strategy: simple_fill_strategy(),
+            fill_strategy: simple_fill_strategy(DataType::Float64),
         };
 
         let output_batch_size = 10000;
@@ -1246,10 +1247,14 @@ mod tests {
                 .unwrap(),
         )
         .with_timezone_opt(TIME_DATA_TIMEZONE());
-        let arr =
-            cursor.build_aggr_fill_null(&params, &[series], &input_times, &input_aggr_array)?;
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        let arr = cursor.build_aggr_fill_val(
+            &params,
+            &[series],
+            &input_times,
+            &input_aggr_array,
+            ScalarValue::Float64(None),
+        )?;
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -1263,7 +1268,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001200Z | 12.0 |"
         - "| 1970-01-01T00:00:00.000001250Z |      |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
 
@@ -1284,7 +1289,7 @@ mod tests {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
             fill_strategy: prev_fill_strategy(idx),
@@ -1304,8 +1309,7 @@ mod tests {
         let arr = cursor
             .build_aggr_fill_prev(&params, &[series], &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -1317,7 +1321,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001200Z | 12.0 |"
         - "| 1970-01-01T00:00:00.000001250Z | 12.0 |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -1342,7 +1346,7 @@ mod tests {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1250,
             fill_strategy: prev_fill_strategy(idx),
@@ -1362,8 +1366,7 @@ mod tests {
         let arr = cursor
             .build_aggr_fill_prev(&params, &[series], &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -1377,7 +1380,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001200Z | 12.0 |"
         - "| 1970-01-01T00:00:00.000001250Z | 12.0 |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -1401,7 +1404,7 @@ mod tests {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1100,
             fill_strategy: prev_fill_strategy(idx),
@@ -1419,10 +1422,15 @@ mod tests {
         )
         .with_timezone_opt(TIME_DATA_TIMEZONE());
         let arr = cursor
-            .build_aggr_fill_null(&params, &series_ends, &input_times, &input_aggr_array)
+            .build_aggr_fill_val(
+                &params,
+                &series_ends,
+                &input_times,
+                &input_aggr_array,
+                ScalarValue::Float64(None),
+            )
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -1435,7 +1443,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001050Z | 11.0 |"
         - "| 1970-01-01T00:00:00.000001100Z |      |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -1468,7 +1476,7 @@ mod tests {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1100,
             fill_strategy: prev_null_as_missing_fill_strategy(idx),
@@ -1488,8 +1496,7 @@ mod tests {
         let arr = cursor
             .build_aggr_fill_prev(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -1502,7 +1509,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001050Z | 21.0 |"
         - "| 1970-01-01T00:00:00.000001100Z | 21.0 |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -1526,7 +1533,7 @@ mod tests {
             Some(1000),
             Some(1050),
             Some(1100),
-            Some(1100),
+            Some(1150),
         ])
         .with_timezone_opt(TIME_DATA_TIMEZONE());
         let input_aggr_array: ArrayRef = Arc::new(Float64Array::from(vec![
@@ -1548,7 +1555,7 @@ mod tests {
 
         let aggr_col_idx = 0;
         let params = GapFillParams {
-            stride: 50,
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             first_ts: Some(950),
             last_ts: 1150,
             fill_strategy: prev_null_as_missing_fill_strategy(aggr_col_idx),
@@ -1558,8 +1565,9 @@ mod tests {
         let stash: ArrayRef = Arc::new(stash);
         let output_batch_size = 10000;
         let mut cursor = Cursor {
+            gap_expander: Arc::new(DateBinGapExpander::new(50)),
             next_input_offset: 1,
-            next_ts: Some(1000),
+            next_ts: Bound::Included(1000),
             remaining_output_batch_size: output_batch_size,
             trailing_gaps: false,
             aggr_col_states: std::iter::once((
@@ -1580,8 +1588,7 @@ mod tests {
         let arr = cursor
             .build_aggr_fill_prev_stashed(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+-------+
         - "| time                           | a0    |"
         - +--------------------------------+-------+
@@ -1596,7 +1603,7 @@ mod tests {
         - "| 1970-01-01T00:00:00.000001100Z | 21.1  |"
         - "| 1970-01-01T00:00:00.000001150Z | 21.1  |"
         - +--------------------------------+-------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -1633,11 +1640,11 @@ mod tests {
         params: &GapFillParams,
     ) {
         assert_eq!(input_times.len(), cursor.next_input_offset);
-        assert_eq!(params.last_ts + params.stride, cursor.next_ts.unwrap());
+        assert_eq!(Bound::Excluded(params.last_ts), cursor.next_ts);
     }
 
-    fn simple_fill_strategy() -> HashMap<usize, FillStrategy> {
-        std::iter::once((1, FillStrategy::Null)).collect()
+    fn simple_fill_strategy(dt: DataType) -> HashMap<usize, FillStrategy> {
+        std::iter::once((1, FillStrategy::Default(dt.try_into().unwrap()))).collect()
     }
 
     fn prev_fill_strategy(idx: usize) -> HashMap<usize, FillStrategy> {

@@ -6,7 +6,6 @@ use std::convert::TryInto;
 use std::time::Duration;
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
-use tower::make::MakeConnection;
 
 /// The connection type used for clients. Use [`Builder`] to create
 /// instances of [`Connection`] objects
@@ -156,20 +155,6 @@ impl Builder {
     {
         let endpoint = self.create_endpoint(dst)?;
         let channel = endpoint.connect().await?;
-        Ok(self.compose_middleware(channel, endpoint))
-    }
-
-    /// Construct the [`Connection`] instance using the specified base URL and custom connector.
-    pub async fn build_with_connector<D, C>(self, dst: D, connector: C) -> Result<Connection>
-    where
-        D: TryInto<Uri, Error = InvalidUri> + Send,
-        C: MakeConnection<Uri> + Send + 'static,
-        C::Connection: Unpin + Send + 'static,
-        C::Future: Send + 'static,
-        Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
-    {
-        let endpoint = self.create_endpoint(dst)?;
-        let channel = endpoint.connect_with_connector(connector).await?;
         Ok(self.compose_middleware(channel, endpoint))
     }
 

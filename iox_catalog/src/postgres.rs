@@ -2,7 +2,7 @@
 
 use crate::constants::MAX_PARTITION_SELECTED_ONCE_FOR_DELETE;
 use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
-use crate::metrics::CatalogMetrics;
+use crate::metrics::{CatalogMetrics, GetTimeMetric};
 use crate::util::should_delete_partition;
 use crate::{
     constants::{
@@ -16,19 +16,22 @@ use crate::{
     migrate::IOxMigrator,
 };
 use async_trait::async_trait;
-use data_types::snapshot::root::RootSnapshot;
+
 use data_types::{
     partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
     },
-    snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot, table::TableSnapshot},
+    snapshot::{
+        namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
+        table::TableSnapshot,
+    },
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceVersion, ObjectStoreId,
     ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
     PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
 };
 use futures::StreamExt;
-use iox_time::{SystemProvider, TimeProvider};
+use iox_time::{SystemProvider, Time, TimeProvider};
 use metric::{Attributes, Instrument, MetricKind};
 use observability_deps::tracing::{debug, info, warn};
 use parking_lot::{RwLock, RwLockWriteGuard};
@@ -54,9 +57,6 @@ use trace::ctx::SpanContext;
 
 static MIGRATOR: LazyLock<IOxMigrator> =
     LazyLock::new(|| IOxMigrator::try_from(&sqlx::migrate!()).expect("valid migration"));
-
-/// Environment variable feature flag for switching to always using the catalog's view of `NOW`.
-static CATALOG_NOW: LazyLock<bool> = LazyLock::new(|| std::env::var("CATALOG_NOW").is_ok());
 
 /// Postgres connection options.
 #[derive(Debug, Clone)]
@@ -129,7 +129,8 @@ impl Default for PostgresConnectionOptions {
 /// PostgreSQL catalog.
 #[derive(Debug)]
 pub struct PostgresCatalog {
-    metrics: CatalogMetrics,
+    catalog_metrics: CatalogMetrics,
+    get_time_metric: GetTimeMetric,
     pool: HotSwapPool<Postgres>,
 
     // keep around in the background
@@ -154,7 +155,8 @@ impl PostgresCatalog {
         Ok(Self {
             pool,
             refresh_task: Arc::new(refresh_task),
-            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
+            get_time_metric: GetTimeMetric::new(&metrics, Self::NAME),
+            catalog_metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             time_provider,
             options,
         })
@@ -233,7 +235,7 @@ impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
         parameters: &'e [<Self::Database as sqlx::Database>::TypeInfo],
     ) -> futures::future::BoxFuture<
         'e,
-        Result<<Self::Database as sqlx::database::HasStatement<'q>>::Statement, sqlx::Error>,
+        Result<<Self::Database as sqlx::database::Database>::Statement<'q>, sqlx::Error>,
     >
     where
         'c: 'e,
@@ -274,7 +276,7 @@ impl Catalog for PostgresCatalog {
     }
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
-        Box::new(self.metrics.repos(Box::new(PostgresTxn {
+        Box::new(self.catalog_metrics.repos(Box::new(PostgresTxn {
             inner: PostgresTxnInner {
                 pool: self.pool.clone(),
             },
@@ -285,11 +287,19 @@ impl Catalog for PostgresCatalog {
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
-        self.metrics.registry()
+        self.catalog_metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    /// Get `CURRENT_TIMESTAMP` from this [`PostgresCatalog`] in microsecond precision, which is the highest resolution postgres provides.
+    async fn get_time(&self) -> Result<Time, Error> {
+        let start = tokio::time::Instant::now();
+        let res = pg_get_time(&self.pool).await;
+        self.get_time_metric.record(start.elapsed(), &res);
+        res
     }
 
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
@@ -314,6 +324,33 @@ impl Catalog for PostgresCatalog {
     fn name(&self) -> &'static str {
         Self::NAME
     }
+}
+
+// Pure helper function to get the current time from postgres.
+async fn pg_get_time(pool: &HotSwapPool<Postgres>) -> Result<iox_time::Time, Error> {
+    let res = pool.acquire().await;
+    let mut connection = match res {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(Error::External {
+                source: Arc::new(e),
+            });
+        }
+    };
+
+    let res = connection
+        .fetch_one(r#"SELECT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000)::INT8"#)
+        .await;
+    let row = match res {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(Error::External {
+                source: Arc::new(e),
+            });
+        }
+    };
+
+    Ok(Time::from_timestamp_micros(row.get(0)).expect("Failed to get `Time` from `PgRow`"))
 }
 
 /// Adapter to connect sqlx pools with our metrics system.
@@ -1343,12 +1380,13 @@ impl PartitionRepo for PostgresTxn {
         let v = sqlx::query_as::<_, Partition>(
             r#"
 INSERT INTO partition
-    (partition_key, table_id, hash_id, sort_key_ids)
+    (partition_key, table_id, hash_id, sort_key_ids, created_at)
 VALUES
-    ( $1, $2, $3, '{}')
+    ( $1, $2, $3, '{}', (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000)::INT8)
 ON CONFLICT ON CONSTRAINT partition_key_unique
 DO UPDATE SET partition_key = partition.partition_key
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at,
+    created_at;
         "#,
         )
         .bind(&key) // $1
@@ -1398,7 +1436,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
 
         sqlx::query_as::<_, Partition>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 WHERE id = ANY($1);
         "#,
@@ -1412,7 +1450,7 @@ WHERE id = ANY($1);
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>> {
         sqlx::query_as::<_, Partition>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 WHERE table_id = $1;
             "#,
@@ -1457,7 +1495,8 @@ WHERE table_id = $1;
 UPDATE partition
 SET sort_key_ids = $1
 WHERE id = $2 AND sort_key_ids = $3
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at,
+    created_at;
         "#,
         )
         .bind(new_sort_key_ids) // $1
@@ -1598,7 +1637,7 @@ RETURNING *
     async fn most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>> {
         sqlx::query_as(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 ORDER BY id DESC
 LIMIT $1;"#,
@@ -1687,7 +1726,7 @@ WHERE id = $1;
         // The load this query saves vastly outsizes the load this query causes.
         sqlx::query_as(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 WHERE hash_id IS NULL
 ORDER BY id DESC;"#,
@@ -1707,6 +1746,10 @@ FROM partition
 JOIN table_name on partition.table_id = table_name.id
 JOIN namespace on table_name.namespace_id = namespace.id
 WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
+    AND (
+        partition.created_at IS NULL
+        OR partition.created_at < EXTRACT(EPOCH FROM (now() - interval '1 day')) * 1000000000
+    )
     AND retention_period_ns IS NOT NULL;
         "#,
         )
@@ -1789,8 +1832,8 @@ WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
 impl ParquetFileRepo for PostgresTxn {
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
         // TODO - include check of table retention period once implemented
-        let flagged = if *CATALOG_NOW {
-            sqlx::query(
+
+        let flagged = sqlx::query(
                 r#"
     WITH parquet_file_ids as (
         SELECT parquet_file.object_store_id
@@ -1809,31 +1852,7 @@ impl ParquetFileRepo for PostgresTxn {
             )
             .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $1
             .fetch_all(&mut self.inner)
-            .await?
-        } else {
-            let flagged_at = Timestamp::from(self.time_provider.now());
-            sqlx::query(
-                r#"
-WITH parquet_file_ids as (
-    SELECT parquet_file.object_store_id
-    FROM namespace, parquet_file
-    WHERE namespace.retention_period_ns IS NOT NULL
-    AND parquet_file.to_delete IS NULL
-    AND parquet_file.max_time < $1 - namespace.retention_period_ns
-    AND namespace.id = parquet_file.namespace_id
-    LIMIT $2
-)
-UPDATE parquet_file
-SET to_delete = $1
-WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
-RETURNING partition_id, object_store_id;
-            "#,
-            )
-            .bind(flagged_at) // $1
-            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $2
-            .fetch_all(&mut self.inner)
-            .await?
-        };
+            .await?;
 
         let flagged = flagged
             .into_iter()
@@ -1842,55 +1861,25 @@ RETURNING partition_id, object_store_id;
         Ok(flagged)
     }
 
-    async fn delete_old_ids_only(
-        &mut self,
-        older_than: Timestamp,
-        cutoff: Duration,
-    ) -> Result<Vec<ObjectStoreId>> {
-        let deleted = if *CATALOG_NOW {
-            let cutoff_nanos: i64 = cutoff
-                .as_nanos()
-                .try_into()
-                .expect("deletion cutoff duration nanos should fit in an i64");
-
-            // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
-            sqlx::query(
-                r#"
-    WITH parquet_file_ids as (
-        SELECT object_store_id
-        FROM parquet_file
-        WHERE to_delete < EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000 - $1
-        LIMIT $2
-    )
-    DELETE FROM parquet_file
-    WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
-    RETURNING object_store_id;
-                 "#,
-            )
-            .bind(cutoff_nanos) // $1
-            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
-            .fetch_all(&mut self.inner)
-            .await?
-        } else {
-            // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
-            sqlx::query(
-                r#"
-        WITH parquet_file_ids as (
-            SELECT object_store_id
-            FROM parquet_file
-            WHERE to_delete < $1
-            LIMIT $2
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
+        // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
+        let deleted = sqlx::query(
+            r#"
+WITH parquet_file_ids as (
+    SELECT object_store_id
+    FROM parquet_file
+    WHERE to_delete < $1
+    LIMIT $2
+)
+DELETE FROM parquet_file
+WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
+RETURNING object_store_id;
+             "#,
         )
-        DELETE FROM parquet_file
-        WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
-        RETURNING object_store_id;
-                     "#,
-            )
-            .bind(older_than) // $1
-            .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
-            .fetch_all(&mut self.inner)
-            .await?
-        };
+        .bind(older_than) // $1
+        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
+        .fetch_all(&mut self.inner)
+        .await?;
 
         let deleted = deleted
             .into_iter()
@@ -2016,8 +2005,7 @@ WHERE object_store_id = ANY($1);
 
         let mut tx = self.inner.pool.begin().await?;
 
-        let marked_at = Timestamp::from(self.time_provider.now());
-        flag_for_delete(&mut *tx, partition_id, delete, marked_at).await?;
+        flag_for_delete(&mut *tx, partition_id, delete).await?;
 
         update_compaction_level(&mut *tx, partition_id, upgrade, target_level).await?;
 
@@ -2057,6 +2045,34 @@ WHERE object_store_id = ANY($1);
         tx.commit().await?;
 
         Ok(ids)
+    }
+
+    async fn list_by_table_id(
+        &mut self,
+        table_id: TableId,
+        compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>> {
+        Ok(sqlx::query_as::<_, ParquetFile>(
+            format!(
+                r#"
+        SELECT
+            id, namespace_id, table_id, partition_id, partition_hash_id,
+            object_store_id, min_time, max_time, to_delete, file_size_bytes,
+            row_count, compaction_level, created_at, column_set,
+            max_l0_created_at, source
+        FROM
+            parquet_file
+        WHERE
+            table_id = {}
+        AND
+            {}"#,
+                table_id,
+                crate::util::compaction_level_sql_predicate(compaction_level)
+            )
+            .as_str(),
+        )
+        .fetch_all(&mut self.inner)
+        .await?)
     }
 }
 
@@ -2109,7 +2125,11 @@ RETURNING id;
     .bind(created_at) // $10
     .bind(namespace_id) // $11
     .bind(column_set) // $12
-    .bind(max_l0_created_at) // $13
+    .bind(
+        max_l0_created_at
+            .maybe_computed_timestamp()
+            .unwrap_or(*created_at),
+    ) // $13
     .bind(source); // $14
 
     let parquet_file_id = query.fetch_one(executor).await.map_err(|e| {
@@ -2135,33 +2155,23 @@ async fn flag_for_delete<'q, E>(
     executor: E,
     partition_id: PartitionId,
     ids: &[ObjectStoreId],
-    marked_at: Timestamp,
 ) -> Result<()>
 where
     E: Executor<'q, Database = Postgres>,
 {
-    let updated = if *CATALOG_NOW {
-        sqlx::query_as::<_, (i64,)>(
-            r#"
+    let updated = sqlx::query_as::<_, (i64,)>(
+        r#"
 UPDATE parquet_file
 SET to_delete = EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000
 WHERE object_store_id = ANY($1)
 AND partition_id = $2
 AND to_delete is NULL
 RETURNING id;"#,
-        )
-        .bind(ids) // $1
-        .bind(partition_id) // $2
-        .fetch_all(executor)
-        .await?
-    } else {
-        sqlx::query_as::<_, (i64,)>(r#"UPDATE parquet_file SET to_delete = $1 WHERE object_store_id = ANY($2) AND partition_id = $3 AND to_delete is NULL RETURNING id;"#)
-                    .bind(marked_at) // $1
-                    .bind(ids) // $2
-                    .bind(partition_id) // $3
-                    .fetch_all(executor)
-                    .await?
-    };
+    )
+    .bind(ids) // $1
+    .bind(partition_id) // $2
+    .fetch_all(executor)
+    .await?;
 
     if updated.len() != ids.len() {
         return Err(Error::NotFound {
@@ -2319,9 +2329,6 @@ pub(crate) mod test_utils {
     pub(crate) async fn setup_db_no_migration_with_overrides(
         f: impl FnOnce(PostgresConnectionOptions) -> PostgresConnectionOptions + Send,
     ) -> PostgresCatalog {
-        unsafe {
-            std::env::set_var("CATALOG_NOW", "1");
-        }
         // create a random schema for this particular pool
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
@@ -2436,6 +2443,35 @@ mod tests {
         .unwrap();
     }
 
+    /// Checks that there are no triggers used because they lead to performance issues.
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/8319> .
+    #[tokio::test]
+    async fn test_no_triggers() {
+        maybe_skip_integration!();
+        maybe_start_logging();
+
+        let postgres = setup_db().await;
+
+        let triggers: Vec<String> = sqlx::query_scalar(
+            r#"
+SELECT trigger_name
+FROM information_schema.triggers
+WHERE trigger_schema = current_schema()
+ORDER BY trigger_name;
+"#,
+        )
+        .fetch_all(&postgres.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            triggers.is_empty(),
+            "found triggers:\n{}\n\nThis will result in performance issues, see https://github.com/influxdata/influxdb_iox/issues/8319 .\n",
+            triggers.join(", "),
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
         maybe_skip_integration!();
@@ -2451,39 +2487,73 @@ mod tests {
         assert_eq!(tz, "UTC");
 
         let pool = postgres.pool.clone();
+        let partition_pool = postgres.pool.clone();
         let schema_name = postgres.schema_name().to_string();
 
         let postgres: Arc<dyn Catalog> = Arc::new(postgres);
 
-        crate::interface_tests::test_catalog(|| async {
+        let catalog_reset_fn = || async {
             // Clean the schema.
-            pool
-                .execute(format!("DROP SCHEMA {schema_name} CASCADE").as_str())
+            pool.execute(format!("DROP SCHEMA {schema_name} CASCADE").as_str())
                 .await
                 .expect("failed to clean schema between tests");
 
             // Recreate the test schema
-            pool
-                .execute(format!("CREATE SCHEMA {schema_name};").as_str())
+            pool.execute(format!("CREATE SCHEMA {schema_name};").as_str())
                 .await
                 .expect("failed to create test schema");
 
             // Ensure the test user has permission to interact with the test schema.
-            pool
-                .execute(
-                    format!(
-                        "GRANT USAGE ON SCHEMA {schema_name} TO public; GRANT CREATE ON SCHEMA {schema_name} TO public;"
-                    )
-                    .as_str(),
+            pool.execute(
+                format!(
+                    "GRANT USAGE ON SCHEMA {schema_name} TO public; \
+                             GRANT CREATE ON SCHEMA {schema_name} TO public;"
                 )
-                .await
-                .expect("failed to grant privileges to schema");
+                .as_str(),
+            )
+            .await
+            .expect("failed to grant privileges to schema");
 
             // Run the migrations against this random schema.
-            postgres.setup().await.expect("failed to initialise database");
+            postgres
+                .setup()
+                .await
+                .expect("failed to initialise database");
 
             Arc::clone(&postgres)
-        })
+        };
+
+        crate::interface_tests::test_catalog(catalog_reset_fn).await;
+
+        crate::interface_tests::test_partition_retention(
+            catalog_reset_fn().await,
+            |key, table_id, created_at| {
+                let partition_pool = partition_pool.clone();
+                async move {
+                    let hash_id = PartitionHashId::new(table_id, &key);
+
+                    sqlx::query_as::<_, Partition>(
+                        r#"
+INSERT INTO partition
+    (partition_key, table_id, hash_id, sort_key_ids, created_at)
+VALUES
+    ( $1, $2, $3, '{}', $4)
+ON CONFLICT ON CONSTRAINT partition_key_unique
+DO UPDATE SET partition_key = partition.partition_key
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at,
+    created_at;
+                            "#,
+                    )
+                    .bind(&key) // $1
+                    .bind(table_id) // $2
+                    .bind(&hash_id) // $3
+                    .bind(created_at) // $4
+                    .fetch_one(&partition_pool)
+                    .await
+                    .unwrap()
+                }
+            },
+        )
         .await;
     }
 
@@ -3270,5 +3340,52 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             .to_string();
 
         assert_contains!(err, "canceling statement due to statement timeout");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_get_time() {
+        maybe_skip_integration!();
+
+        // Create two catalogs - one for manually querying postgres
+        // the other for using the `PostgresCatalog::get_time()` method.
+        let c1 = Arc::new(setup_db_no_migration().await);
+        let c2 = Arc::clone(&c1);
+
+        // Get the system's idea of now - postgres runs
+        // on the same machine as CI, so system time
+        // and postgres time should be somewhat close.
+        let system_now = SystemProvider::new().now();
+
+        // Manually get the current time from postgres
+        // as a timestamp in microseconds.
+        let query_now_row = c1
+            .pool
+            .fetch_one(sqlx::query(
+                r#"SELECT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000)::INT8"#,
+            ))
+            .await
+            .unwrap()
+            .get(0);
+
+        // Finally, get the time from the catalog using
+        // the `PostgresCatalog::get_time()` method.
+        let catalog_now = c2.get_time().await;
+
+        // Convert the timestamp after having gathered all times
+        // to ensure they are as close as possible to one another.
+        let query_now = Time::from_timestamp_micros(query_now_row)
+            .ok_or("Failed to convert postgres timestamp to `Time`");
+
+        // Check that all times are within a second of one another.
+        // CI and postgres is ran on the same machine, so this is reasonable.
+        assert_matches!(
+            (query_now, catalog_now),
+            (Ok(t1), Ok(t2)) => {
+                // Assert that all times are within 1 second of each other.
+                assert!(system_now.second().abs_diff(t1.second()) <= 1);
+                assert!(t1.second().abs_diff(t2.second()) <= 1);
+                assert!(system_now.second().abs_diff(t2.second()) <= 1);
+            }
+        );
     }
 }

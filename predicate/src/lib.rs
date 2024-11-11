@@ -445,7 +445,6 @@ impl TreeNodeVisitor<'_> for RowBasedVisitor {
             | Expr::ScalarSubquery(_)
             | Expr::ScalarVariable(_, _)
             | Expr::SimilarTo { .. }
-            | Expr::Sort { .. }
             | Expr::TryCast { .. }
             | Expr::Wildcard { .. } => Ok(TreeNodeRecursion::Continue),
             Expr::AggregateFunction { .. }

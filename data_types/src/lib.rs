@@ -778,23 +778,45 @@ impl ParquetFile {
     ///
     /// [`to_delete`](Self::to_delete) will be set to `None`.
     pub fn from_params(params: ParquetFileParams, id: ParquetFileId) -> Self {
+        let ParquetFileParams {
+            namespace_id,
+            table_id,
+            partition_id,
+            partition_hash_id,
+            object_store_id,
+            min_time,
+            max_time,
+            file_size_bytes,
+            row_count,
+            compaction_level,
+            created_at,
+            column_set,
+            max_l0_created_at,
+            source,
+        } = params;
+
         Self {
             id,
-            partition_id: params.partition_id,
-            partition_hash_id: params.partition_hash_id,
-            namespace_id: params.namespace_id,
-            table_id: params.table_id,
-            object_store_id: params.object_store_id,
-            min_time: params.min_time,
-            max_time: params.max_time,
+            namespace_id,
+            table_id,
+            partition_id,
+            partition_hash_id,
+            object_store_id,
+            min_time,
+            max_time,
+
+            // Files are always created as not soft-deleted.
             to_delete: None,
-            file_size_bytes: params.file_size_bytes,
-            row_count: params.row_count,
-            compaction_level: params.compaction_level,
-            created_at: params.created_at,
-            column_set: params.column_set,
-            max_l0_created_at: params.max_l0_created_at,
-            source: params.source,
+
+            file_size_bytes,
+            row_count,
+            compaction_level,
+            created_at,
+            column_set,
+            max_l0_created_at: max_l0_created_at
+                .maybe_computed_timestamp()
+                .unwrap_or(created_at),
+            source,
         }
     }
 
@@ -826,16 +848,6 @@ impl ParquetFile {
             // split time is the last timestamp on the "left" side of the split, if it equals
             // the min time, one ns goes left, the rest goes right.
             if self.min_time.get() <= *t && self.max_time.get() > *t {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Return true if the time range of this file overlaps with any of the given file ranges
-    pub fn overlaps_ranges(&self, ranges: &Vec<FileRange>) -> bool {
-        for range in ranges {
-            if self.min_time.get() <= range.max && self.max_time.get() >= range.min {
                 return true;
             }
         }
@@ -940,6 +952,33 @@ pub enum ParquetFileProtoError {
     InvalidCompactionLevel(#[from] CompactionLevelProtoError),
 }
 
+/// Value for a `parquet_file` record's `max_l0_created_at` field. If `MaxL0CreatedAt::Computed`,
+/// the value came from the computation of the maximum of the `created_at` attributes of the source
+/// files compacted into this file. If `MaxL0CreatedAt::SameAsCreatedAt`, this file was not created
+/// from other files (that is, it was created via ingest) and its `max_l0_created_at` field should
+/// be set to the same value for `created_at` that the catalog will assign.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MaxL0CreatedAt {
+    /// Value computed from max of source files' `created_at`
+    Computed(Timestamp),
+
+    /// No source files; this file was created by ingest (regular or bulk); use `created_at`
+    NotCompacted,
+}
+
+impl MaxL0CreatedAt {
+    /// If this is `Computed`, return `Some` with the value as a [`Timestamp`]. If this file was
+    /// not created via compaction of other files and thus the `max_l0_created_at` value should be
+    /// the same as `created_at`, return `None`, and the caller should follow a call to this method
+    /// with `unwrap_or(created_at)`.
+    pub fn maybe_computed_timestamp(&self) -> Option<Timestamp> {
+        match self {
+            Self::Computed(timestamp) => Some(*timestamp),
+            Self::NotCompacted => None,
+        }
+    }
+}
+
 /// Data for a parquet file to be inserted into the catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetFileParams {
@@ -967,8 +1006,9 @@ pub struct ParquetFileParams {
     pub created_at: Timestamp,
     /// columns in this file.
     pub column_set: ColumnSet,
-    /// the max of created_at of all L0 files
-    pub max_l0_created_at: Timestamp,
+    /// the max of `created_at` of all source L0 files, if this file was created from other files,
+    /// or `created_at` if this file was created via ingest.
+    pub max_l0_created_at: MaxL0CreatedAt,
     /// Which component created this Parquet file
     pub source: Option<ParquetFileSource>,
 }
@@ -1005,7 +1045,11 @@ impl From<ParquetFile> for ParquetFileParams {
             compaction_level,
             created_at,
             column_set,
-            max_l0_created_at,
+            max_l0_created_at: if max_l0_created_at == created_at {
+                MaxL0CreatedAt::NotCompacted
+            } else {
+                MaxL0CreatedAt::Computed(max_l0_created_at)
+            },
             source,
         }
     }

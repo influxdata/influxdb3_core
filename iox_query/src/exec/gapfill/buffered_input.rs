@@ -248,6 +248,7 @@ mod tests {
     use arrow_util::test_util::batches_to_lines;
 
     use super::*;
+    use crate::exec::gapfill::date_bin_gap_expander::DateBinGapExpander;
     use crate::exec::gapfill::exec_tests::TestRecords;
 
     fn test_records(batch_size: usize) -> VecDeque<RecordBatch> {
@@ -354,7 +355,7 @@ mod tests {
 
     fn test_params() -> GapFillParams {
         GapFillParams {
-            stride: 50_000_000,
+            gap_expander: Arc::new(DateBinGapExpander::new(50_000_000)),
             first_ts: Some(1_000_000_000),
             last_ts: 1_055_000_000,
             fill_strategy: [
@@ -371,8 +372,7 @@ mod tests {
     fn test_test_records() {
         let batch = test_records(1000).pop_front().unwrap();
         let actual = batches_to_lines(&[batch]);
-        insta::assert_yaml_snapshot!(actual, @r###"
-        ---
+        insta::assert_yaml_snapshot!(actual, @r#"
         - +----+----+--------------------------+----+----+----+
         - "| g0 | g1 | time                     | a0 | a1 | a2 |"
         - +----+----+--------------------------+----+----+----+
@@ -389,7 +389,7 @@ mod tests {
         - "| a  | c  | 1970-01-01T00:00:01.050Z |    |    | 10 |"
         - "| a  | c  | 1970-01-01T00:00:01.055Z | 10 |    | 11 |"
         - +----+----+--------------------------+----+----+----+
-        "###);
+        "#);
     }
 
     #[test]
