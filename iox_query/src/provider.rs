@@ -130,7 +130,7 @@ impl ProviderBuilder {
 ///
 /// This allows DataFusion to see data from Chunks as a single table, as well as
 /// push predicates and selections down to chunks
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChunkTableProvider {
     table_name: Arc<str>,
     /// The IOx schema (wrapper around Arrow Schemaref) for this table
@@ -352,14 +352,13 @@ mod test {
         let plan = provider.scan(&state, None, &[], None).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // projection
@@ -369,14 +368,13 @@ mod test {
             .unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[tag1@1 as tag1, time@3 as time]"
         - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // filters
@@ -389,29 +387,27 @@ mod test {
         let plan = provider.scan(&state, None, &expr, None).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   FilterExec: false"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // limit pushdown is unimplemented at the moment
         let plan = provider.scan(&state, None, &[], Some(1)).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -451,13 +447,12 @@ mod test {
         let plan = provider.scan(&state, None, &[], None).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   UnionExec"
         - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "     ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // projection
@@ -467,13 +462,12 @@ mod test {
             .unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[tag1@1 as tag1, time@3 as time]"
         - "   UnionExec"
         - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "     ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // filters
@@ -495,27 +489,25 @@ mod test {
         let plan = provider.scan(&state, None, &expr, None).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   FilterExec: false AND tag1@1 = CAST(foo AS Dictionary(Int32, Utf8))"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // limit pushdown is unimplemented at the moment
         let plan = provider.scan(&state, None, &[], Some(1)).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   UnionExec"
         - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "     ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -558,15 +550,14 @@ mod test {
             .unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   FilterExec: time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // projection
@@ -576,15 +567,14 @@ mod test {
             .unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[tag1@1 as tag1, time@3 as time]"
         - "   FilterExec: time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // filters
@@ -600,30 +590,28 @@ mod test {
         let plan = provider.scan(&state, None, &expr, None).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   FilterExec: false AND time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
 
         // limit pushdown is unimplemented at the moment
         let plan = provider.scan(&state, None, &[pred], Some(1)).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r###"
-        ---
+            @r#"
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   FilterExec: time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 }

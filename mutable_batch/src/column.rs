@@ -307,10 +307,11 @@ impl Column {
     }
 
     /// Converts this column to an arrow [`ArrayRef`]
-    pub fn to_arrow(&self) -> Result<ArrayRef> {
-        let nulls = Some(NullBuffer::new(self.valid.to_arrow()));
+    pub fn try_into_arrow(self) -> Result<ArrayRef> {
+        let len = self.len();
+        let nulls = Some(NullBuffer::new(self.valid.into_arrow()));
 
-        let data: ArrayRef = match &self.data {
+        let data: ArrayRef = match self.data {
             ColumnData::F64(data, _) => {
                 let data = ArrayDataBuilder::new(DataType::Float64)
                     .len(data.len())
@@ -355,7 +356,7 @@ impl Column {
             ColumnData::Bool(data, _) => {
                 let data = ArrayDataBuilder::new(DataType::Boolean)
                     .len(data.len())
-                    .add_buffer(data.to_arrow().into_inner())
+                    .add_buffer(data.into_arrow().into_inner())
                     .nulls(nulls)
                     .build()
                     .context(CreatingArrowArraySnafu)?;
@@ -366,7 +367,7 @@ impl Column {
             }
         };
 
-        assert_eq!(data.len(), self.len());
+        assert_eq!(data.len(), len);
 
         Ok(data)
     }
@@ -919,7 +920,7 @@ mod tests {
     #[test]
     fn test_split_off() {
         let (data, valid, _) = densify([Some(42), None, None, Some(24)]);
-        valid.to_arrow();
+        valid.clone().into_arrow();
 
         let mut col = Column {
             influx_type: InfluxColumnType::Field(InfluxFieldType::UInteger),
@@ -934,7 +935,10 @@ mod tests {
         // Before the split
         let batch = RecordBatch::try_new(
             schema.clone().into(),
-            vec![col.to_arrow().expect("failed to covert column to arrow")],
+            vec![col
+                .clone()
+                .try_into_arrow()
+                .expect("failed to covert column to arrow")],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -956,7 +960,10 @@ mod tests {
         // After the split, the input column
         let batch = RecordBatch::try_new(
             schema.clone().into(),
-            vec![col.to_arrow().expect("failed to covert column to arrow")],
+            vec![col
+                .clone()
+                .try_into_arrow()
+                .expect("failed to covert column to arrow")],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -974,7 +981,10 @@ mod tests {
         // After the split, the split off column
         let batch = RecordBatch::try_new(
             schema.into(),
-            vec![col2.to_arrow().expect("failed to covert column to arrow")],
+            vec![col2
+                .clone()
+                .try_into_arrow()
+                .expect("failed to covert column to arrow")],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -1087,11 +1097,11 @@ mod tests {
             assert_eq!(input.stats().null_count().unwrap_or_default(), nulls);
 
             // Generate arrow arrays from both inputs
-            let col = col.to_arrow().unwrap();
-            let col2 = col2.to_arrow().unwrap();
+            let col = col.try_into_arrow().unwrap();
+            let col2 = col2.try_into_arrow().unwrap();
 
             // And the test oracle
-            let input = input.to_arrow().unwrap();
+            let input = input.try_into_arrow().unwrap();
 
             // Slice the input data using arrow's slice methods.
             let want = input.slice(0, split_at.min(input.len()));

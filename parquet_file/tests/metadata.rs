@@ -8,8 +8,8 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use data_types::{
-    ColumnId, CompactionLevel, NamespaceId, ObjectStoreId, PartitionHashId, PartitionId,
-    PartitionKey, TableId, Timestamp, TransitionPartitionId,
+    ColumnId, CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, PartitionHashId,
+    PartitionId, PartitionKey, TableId, Timestamp, TransitionPartitionId,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_util::{unbounded_memory_pool, MemoryStream};
@@ -52,7 +52,7 @@ async fn test_decoded_iox_metadata() {
         ),
     ];
 
-    let partition_id = TransitionPartitionId::Deprecated(PartitionId::new(4));
+    let partition_id = TransitionPartitionId::Catalog(PartitionId::new(4));
 
     // And the metadata the batch would be encoded with if it came through the
     // IOx write path.
@@ -66,7 +66,7 @@ async fn test_decoded_iox_metadata() {
         partition_key: "potato".into(),
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: None,
-        max_l0_created_at: Time::from_timestamp_nanos(42),
+        max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
     };
 
     let mut schema_builder = SchemaBuilder::new();
@@ -198,7 +198,7 @@ async fn test_empty_parquet_file_panic() {
         ("some_field", to_string_array(&[])),
     ];
 
-    let partition_id = TransitionPartitionId::Deprecated(PartitionId::new(4));
+    let partition_id = TransitionPartitionId::Catalog(PartitionId::new(4));
 
     // And the metadata the batch would be encoded with if it came through the
     // IOx write path.
@@ -212,7 +212,7 @@ async fn test_empty_parquet_file_panic() {
         partition_key: "potato".into(),
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: None,
-        max_l0_created_at: Time::from_timestamp_nanos(42),
+        max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
     };
 
     let batch = RecordBatch::try_from_iter(data).unwrap();
@@ -298,7 +298,7 @@ async fn test_decoded_many_columns_with_null_cols_iox_metadata() {
     }
     sort_key_data.push(TIME_COLUMN_NAME.to_string());
     let sort_key = SortKey::from_columns(sort_key_data);
-    let partition_id = TransitionPartitionId::Deprecated(PartitionId::new(4));
+    let partition_id = TransitionPartitionId::Catalog(PartitionId::new(4));
     let meta = IoxMetadata {
         object_store_id: ObjectStoreId::new(),
         creation_timestamp: Time::from_timestamp_nanos(42),
@@ -309,7 +309,7 @@ async fn test_decoded_many_columns_with_null_cols_iox_metadata() {
         partition_key: "potato".into(),
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: Some(sort_key),
-        max_l0_created_at: Time::from_timestamp_nanos(42),
+        max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
     };
 
     let mut schema_builder = SchemaBuilder::new();
@@ -404,7 +404,7 @@ async fn test_derive_parquet_file_params() {
         partition_key,
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: None,
-        max_l0_created_at: Time::from_timestamp_nanos(1234),
+        max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(1234)),
     };
 
     // Build a schema that contains the IOx metadata, ensuring it is correctly
@@ -460,7 +460,10 @@ async fn test_derive_parquet_file_params() {
     assert_eq!(catalog_data.row_count, 3);
     assert_eq!(catalog_data.min_time, Timestamp::new(1646917692000000000));
     assert_eq!(catalog_data.max_time, Timestamp::new(1653311292000000000));
-    assert_eq!(catalog_data.max_l0_created_at, Timestamp::new(1234));
+    assert_eq!(
+        catalog_data.max_l0_created_at,
+        MaxL0CreatedAt::Computed(Timestamp::new(1234))
+    );
 }
 
 fn to_string_array(strs: &[&str]) -> ArrayRef {

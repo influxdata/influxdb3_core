@@ -10,11 +10,10 @@ use data_types::{ChunkId, ChunkOrder, TransitionPartitionId};
 use datafusion::{
     error::DataFusionError,
     physical_plan::{SendableRecordBatchStream, Statistics},
-    prelude::{Expr, SessionContext},
+    prelude::SessionContext,
 };
 use datafusion_util::MemoryStream;
 use exec::IOxSessionContext;
-use extension::EmptyExtension;
 use futures::TryStreamExt;
 use iox_query_params::StatementParams;
 use parquet_file::storage::ParquetExecInput;
@@ -51,6 +50,12 @@ use crate::exec::QueryConfig;
 use crate::query_log::QueryLogEntries;
 pub use extension::Extension;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
+
+// Avoid unused dependency clippy warning for dependencies used in benchmarks
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use rand as _;
 
 /// The name of the virtual column that represents the chunk order.
 pub const CHUNK_ORDER_COLUMN_NAME: &str = "__chunk_order";
@@ -103,25 +108,7 @@ pub trait QueryChunk: Debug + Send + Sync + 'static {
 /// `QueryNamespace` is the main trait implemented by the IOx subsystems that store actual data.
 ///
 /// Namespaces store data organized by partitions and each partition stores data in Chunks.
-#[async_trait]
 pub trait QueryNamespace: Debug + Send + Sync {
-    /// Returns a set of chunks within the partition with data that may match the provided
-    /// filter expression.
-    ///
-    /// If possible, chunks which have no rows that can possibly match the filter may be omitted.
-    ///
-    /// If projection is `None`, returned chunks will include all columns of its original data.
-    /// Otherwise, returned chunks will include PK columns (tags and time) and columns specified in
-    /// the projection. Projecting chunks here is optional and a mere optimization. The query
-    /// subsystem does NOT rely on it.
-    async fn chunks(
-        &self,
-        table_name: &str,
-        filters: &[Expr],
-        projection: Option<&Vec<usize>>,
-        ctx: IOxSessionContext,
-    ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError>;
-
     /// Retention cutoff time.
     ///
     /// This gives the timestamp (NOT the duration) at which data should be cut off. This should result in an additional
@@ -149,14 +136,14 @@ pub trait QueryNamespace: Debug + Send + Sync {
         span_ctx: Option<SpanContext>,
         query_config: Option<&QueryConfig>,
     ) -> IOxSessionContext {
-        self.new_extended_query_context(Arc::new(EmptyExtension {}), span_ctx, query_config)
+        self.new_extended_query_context(None, span_ctx, query_config)
     }
 
     /// Returns a new execution context suitable for running queries
     /// with a particular extension.
     fn new_extended_query_context(
         &self,
-        extension: Arc<dyn Extension>,
+        extension: Option<Arc<dyn Extension>>,
         span_ctx: Option<SpanContext>,
         query_config: Option<&QueryConfig>,
     ) -> IOxSessionContext;

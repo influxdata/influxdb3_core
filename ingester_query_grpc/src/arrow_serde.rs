@@ -199,8 +199,10 @@ impl BatchEncoder {
             )?;
 
             read_dictionary(
-                // copy & align
-                &Buffer::from(&arrow_data),
+                // Arrow data must be aligned correctly, but the protobuf does
+                // not ensure any particular alignment. Thus copy to a new
+                // buffer to ensure the correct alignment.
+                &Buffer::from_slice_ref(&arrow_data),
                 dictionary_batch,
                 &self.dict_schema,
                 &mut dictionaries_by_field,
@@ -222,8 +224,8 @@ impl BatchEncoder {
         )?;
 
         let batch = read_record_batch(
-            // copy & align
-            &Buffer::from(&arrow_data),
+            // copy to a new buffer to ensure alignment (see note above)
+            &Buffer::from_slice_ref(&arrow_data),
             record_batch,
             Arc::clone(&self.dict_schema),
             &dictionaries_by_field,

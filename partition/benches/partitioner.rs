@@ -205,7 +205,7 @@ fn bench(
     // Generate the record batch partitioner input
     let record_batch_input: Vec<_> = mutable_batch_input
         .iter()
-        .map(|batch| batch.to_arrow(Projection::All).unwrap())
+        .map(|batch| batch.clone().try_into_arrow(Projection::All).unwrap())
         .collect();
 
     group.throughput(Throughput::Elements(row_count as _));

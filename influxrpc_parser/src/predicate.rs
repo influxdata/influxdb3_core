@@ -5,12 +5,13 @@ use generated_types::{
     node::Value as RPCValue, Node as RPCNode, Predicate as RPCPredicate,
 };
 
-use snafu::{ResultExt, Snafu};
-use sqlparser::{
+use datafusion::sql::sqlparser::{
+    self,
     ast::{BinaryOperator as Operator, Expr, Ident, Value},
     parser::Parser,
     tokenizer::Tokenizer,
 };
+use snafu::{ResultExt, Snafu};
 
 // String and byte representation of a measurement name in a predicate.
 const MEASUREMENT_COLUMN_NAME: &str = "_measurement";

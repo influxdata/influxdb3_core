@@ -223,8 +223,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
@@ -232,7 +231,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
-        "###
+        "#
         );
     }
 
@@ -258,8 +257,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
@@ -267,7 +265,7 @@ mod tests {
           Ok:
             - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
             - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
-        "###
+        "#
         );
     }
 
@@ -297,8 +295,7 @@ mod tests {
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[true]"
           - "   ParquetExec: file_groups={2 groups: [[1.parquet, 2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
@@ -306,7 +303,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[true]"
             - "   ParquetExec: file_groups={3 groups: [[1.parquet], [2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
-        "###
+        "#
         );
 
         assert_unknown_partitioning(
@@ -340,8 +337,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
@@ -349,7 +345,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
-        "###
+        "#
         );
     }
 
@@ -374,8 +370,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
@@ -383,7 +378,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
-        "###
+        "#
         );
     }
 
@@ -408,8 +403,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3]"
@@ -417,7 +411,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3]"
-        "###
+        "#
         );
     }
 
@@ -447,8 +441,7 @@ mod tests {
         });
         insta::assert_yaml_snapshot!(
             OptimizationTest::new_with_config(plan, opt, &config),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
@@ -456,7 +449,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
-        "###
+        "#
         );
     }
 
@@ -471,8 +464,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   PlaceholderRowExec"
@@ -480,7 +472,7 @@ mod tests {
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   PlaceholderRowExec"
-        "###
+        "#
         );
     }
 
@@ -502,14 +494,13 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
         output:
           Ok:
             - " ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
-        "###
+        "#
         );
     }
 
@@ -535,8 +526,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
           - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
@@ -546,7 +536,7 @@ mod tests {
             - " SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
             - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
-        "###
+        "#
         );
     }
 
@@ -572,8 +562,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
           - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
@@ -583,7 +572,7 @@ mod tests {
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC,col1@0 ASC], preserve_partitioning=[false]"
             - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC,col2@1 ASC], preserve_partitioning=[false]"
             - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
-        "###
+        "#
         );
     }
 
@@ -614,8 +603,7 @@ mod tests {
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
           - "   UnionExec"
@@ -627,7 +615,7 @@ mod tests {
             - "   UnionExec"
             - "     RecordBatchesExec: chunks=0, projection=[col1, col2, col3, __chunk_order]"
             - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
-        "###
+        "#
         );
     }
 

@@ -240,6 +240,16 @@ pub struct CatalogConfig {
         value_parser = humantime::parse_duration,
     )]
     pub bypass_detection_clear_interval: Duration,
+
+    /// Enable Admin UI Storage API.
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/12249>
+    #[clap(
+        long = "catalog-cache-admin-ui-storage-api-enabled",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_ADMIN_UI_STORAGE_API_ENABLED",
+        default_value = "false"
+    )]
+    pub admin_ui_storage_api_enabled: bool,
 }
 
 impl CatalogConfig {

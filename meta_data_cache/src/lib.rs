@@ -24,18 +24,18 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_util::create_physical_expr_from_schema;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use iox_time::{SystemProvider, TimeProvider};
 use metric::U64Counter;
 use object_store_mem_cache::cache_system::{
-    cache::Cache,
     hook::{chain::HookChain, limit::MemoryLimiter, observer::ObserverHook},
-    interfaces::{DynError, HasSize},
+    hook_limited::HookLimitedCache,
     reactor::{
         reaction::ReactionExt,
         trigger::{ticker, TriggerExt},
         Reactor,
     },
+    Cache, DynError, HasSize,
 };
 
 // use observability_deps::tracing::warn;
@@ -86,7 +86,7 @@ impl<'a> MetaIndexCacheParams<'a> {
 
         let memory_limiter = MemoryLimiter::new(memory_limit);
         let oom_notify = memory_limiter.oom();
-        let cache = Arc::new(Cache::new(Arc::new(HookChain::new([
+        let cache = Arc::new(HookLimitedCache::new(Arc::new(HookChain::new([
             Arc::new(memory_limiter) as _,
             Arc::new(ObserverHook::new(
                 CACHE_NAME,
@@ -125,7 +125,7 @@ impl<'a> MetaIndexCacheParams<'a> {
     pub fn build_for_default(memory_limit: NonZeroUsize) -> MetaIndexCache {
         // todo: use more consts
         let memory_limiter = MemoryLimiter::new(memory_limit);
-        let cache = Arc::new(Cache::new(Arc::new(HookChain::new([
+        let cache = Arc::new(HookLimitedCache::new(Arc::new(HookChain::new([
             Arc::new(memory_limiter) as _,
         ]))));
         let cache_captured = Arc::downgrade(&cache);
@@ -209,7 +209,7 @@ impl StatsCachedMetrics {
 ///        for 3 different options
 #[derive(Debug)]
 pub struct MetaIndexCache {
-    file_index: Arc<Cache<ObjectStoreId, FileMetas>>,
+    file_index: Arc<HookLimitedCache<ObjectStoreId, FileMetas>>,
 
     // cache metrics
     col_stats_metrics: Arc<StatsCachedMetrics>,
@@ -224,7 +224,7 @@ pub struct MetaIndexCache {
 
 impl MetaIndexCache {
     /// add new file with its stats if not already added
-    pub async fn add_metadata_for_file<R: AsyncFileReader + 'static>(
+    pub async fn add_metadata_for_file<R: AsyncFileReader + Send + 'static>(
         &self,
         file_uuid: &ObjectStoreId,
         table_schema: SchemaRef,
@@ -233,24 +233,30 @@ impl MetaIndexCache {
         let cache_column_stats = self.cache_column_stats;
         let (res, _state) = self
             .file_index
-            .get_or_fetch(file_uuid, |_any| async move {
-                let parquet_metadata = reader
-                    .get_metadata()
-                    .await
-                    .map_err(|e| Arc::new(e) as DynError)?;
-                // get statistics from metadata
-                let col_metas = cache_column_stats
-                    .then(|| {
-                        statistics_from_parquet_meta_calc(&parquet_metadata, table_schema)
-                            .map(ColStats::from_statistics)
-                            .ok()
-                    })
-                    .flatten();
-                Ok(FileMetas {
-                    col_metas,
-                    parquet_metadata,
-                })
-            })
+            .get_or_fetch(
+                file_uuid,
+                Box::new(move |_any| {
+                    async move {
+                        let parquet_metadata = reader
+                            .get_metadata()
+                            .await
+                            .map_err(|e| Arc::new(e) as DynError)?;
+                        // get statistics from metadata
+                        let col_metas = cache_column_stats
+                            .then(|| {
+                                statistics_from_parquet_meta_calc(&parquet_metadata, table_schema)
+                                    .map(ColStats::from_statistics)
+                                    .ok()
+                            })
+                            .flatten();
+                        Ok(FileMetas {
+                            col_metas,
+                            parquet_metadata,
+                        })
+                    }
+                    .boxed()
+                }),
+            )
             .await;
         res
     }
@@ -775,12 +781,18 @@ mod tests {
     ) -> Arc<FileMetas> {
         let (res, _state) = meta_index
             .file_index
-            .get_or_fetch(file_uuid, |_| async move {
-                Ok(FileMetas {
-                    parquet_metadata: parquet_1.into(),
-                    col_metas: Some(ColStats::from_statistics(file_stats_1)),
-                })
-            })
+            .get_or_fetch(
+                file_uuid,
+                Box::new(|_| {
+                    async move {
+                        Ok(FileMetas {
+                            parquet_metadata: parquet_1.into(),
+                            col_metas: Some(ColStats::from_statistics(file_stats_1)),
+                        })
+                    }
+                    .boxed()
+                }),
+            )
             .await;
         res.unwrap()
     }

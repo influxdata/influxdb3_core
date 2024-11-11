@@ -40,7 +40,7 @@ pub(crate) static WINDOW_BOUNDS_UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(||
             DataType::Int64,
             DataType::Boolean,
         ],
-        Arc::new(TIME_DATA_TYPE()),
+        TIME_DATA_TYPE(),
         Volatility::Stable,
         Arc::new(window_bounds_udf),
     ))

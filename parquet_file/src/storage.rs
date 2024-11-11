@@ -474,7 +474,10 @@ mod tests {
         datatypes::{DataType, Schema},
         record_batch::RecordBatch,
     };
-    use data_types::{CompactionLevel, NamespaceId, ObjectStoreId, PartitionId, TableId};
+    use data_types::{
+        CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, PartitionId, TableId,
+        Timestamp,
+    };
     use datafusion::common::{DataFusionError, ScalarValue};
     use datafusion_util::{config::BATCH_SIZE, unbounded_memory_pool, MemoryStream};
     use iox_time::Time;
@@ -1005,7 +1008,7 @@ mod tests {
 
     fn meta() -> (TransitionPartitionId, IoxMetadata) {
         (
-            TransitionPartitionId::Deprecated(PartitionId::new(4)),
+            TransitionPartitionId::Catalog(PartitionId::new(4)),
             IoxMetadata {
                 object_store_id: ObjectStoreId::new(),
                 creation_timestamp: Time::from_timestamp_nanos(42),
@@ -1016,7 +1019,7 @@ mod tests {
                 partition_key: "potato".into(),
                 compaction_level: CompactionLevel::FileNonOverlapped,
                 sort_key: None,
-                max_l0_created_at: Time::from_timestamp_nanos(42),
+                max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
             },
         )
     }

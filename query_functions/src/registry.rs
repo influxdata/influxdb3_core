@@ -9,7 +9,7 @@ use datafusion::{
     logical_expr::{planner::ExprPlanner, AggregateUDF, ScalarUDF, WindowUDF},
 };
 
-use crate::{gapfill, regex, sleep, to_timestamp, window};
+use crate::{date_bin_wallclock, gapfill, regex, sleep, to_timestamp, tz, window};
 
 /// Contains IOx UDFs
 static IOX_REGISTRY: LazyLock<IOxFunctionRegistry> = LazyLock::new(IOxFunctionRegistry::new);
@@ -48,12 +48,15 @@ impl FunctionRegistry for IOxFunctionRegistry {
         [
             to_timestamp::TO_TIMESTAMP_FUNCTION_NAME,
             gapfill::DATE_BIN_GAPFILL_UDF_NAME,
+            gapfill::DATE_BIN_WALLCLOCK_GAPFILL_UDF_NAME,
             gapfill::LOCF_UDF_NAME,
             gapfill::INTERPOLATE_UDF_NAME,
             regex::REGEX_MATCH_UDF_NAME,
             regex::REGEX_NOT_MATCH_UDF_NAME,
             sleep::SLEEP_UDF_NAME,
             window::WINDOW_BOUNDS_UDF_NAME,
+            date_bin_wallclock::DATE_BIN_WALLCLOCK_UDF_NAME,
+            tz::TZ_UDF_NAME,
         ]
         .into_iter()
         .map(|s| s.to_string())
@@ -64,12 +67,19 @@ impl FunctionRegistry for IOxFunctionRegistry {
         match name {
             to_timestamp::TO_TIMESTAMP_FUNCTION_NAME => Ok(to_timestamp::TO_TIMESTAMP_UDF.clone()),
             gapfill::DATE_BIN_GAPFILL_UDF_NAME => Ok(gapfill::DATE_BIN_GAPFILL.clone()),
+            gapfill::DATE_BIN_WALLCLOCK_GAPFILL_UDF_NAME => {
+                Ok(gapfill::DATE_BIN_WALLCLOCK_GAPFILL.clone())
+            }
             gapfill::LOCF_UDF_NAME => Ok(gapfill::LOCF.clone()),
             gapfill::INTERPOLATE_UDF_NAME => Ok(gapfill::INTERPOLATE.clone()),
             regex::REGEX_MATCH_UDF_NAME => Ok(regex::REGEX_MATCH_UDF.clone()),
             regex::REGEX_NOT_MATCH_UDF_NAME => Ok(regex::REGEX_NOT_MATCH_UDF.clone()),
             sleep::SLEEP_UDF_NAME => Ok(sleep::SLEEP_UDF.clone()),
             window::WINDOW_BOUNDS_UDF_NAME => Ok(window::WINDOW_BOUNDS_UDF.clone()),
+            date_bin_wallclock::DATE_BIN_WALLCLOCK_UDF_NAME => {
+                Ok(date_bin_wallclock::DATE_BIN_WALLCLOCK_UDF.clone())
+            }
+            tz::TZ_UDF_NAME => Ok(tz::TZ_UDF.clone()),
             _ => Err(DataFusionError::Plan(format!(
                 "IOx FunctionRegistry does not contain function '{name}'"
             ))),

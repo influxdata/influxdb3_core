@@ -1,30 +1,30 @@
 mod process_item_list {
     use futures::StreamExt as _;
-
     use object_store::{path::Path, ObjectMeta};
 
     use super::super::process_item_list;
 
     #[tokio::test]
     async fn preserves_icebergexporter_config_older_than_the_cutoff() {
+        let last_modified = SystemProvider::new().now().date_time();
         let items = vec![
             Ok(ObjectMeta {
                 location: Path::from_url_path("a").unwrap(),
-                last_modified: chrono::Utc::now(),
+                last_modified,
                 size: 1,
                 e_tag: Some("a".to_owned()),
                 version: Some("1".to_owned()),
             }),
             Ok(ObjectMeta {
                 location: Path::from_url_path("iceberg/conf").unwrap(),
-                last_modified: chrono::Utc::now(),
+                last_modified,
                 size: 1,
                 e_tag: Some("conf".to_owned()),
                 version: Some("1".to_owned()),
             }),
             Ok(ObjectMeta {
                 location: Path::from_url_path("b").unwrap(),
-                last_modified: chrono::Utc::now(),
+                last_modified,
                 size: 1,
                 e_tag: Some("b".to_owned()),
                 version: Some("1".to_owned()),

@@ -1,4 +1,7 @@
-use futures::{future, StreamExt};
+use crate::PathsInCatalogBackups;
+
+use catalog_backup_file_list::catalog_backup_directory_with_bloom_filter_file;
+use futures::StreamExt;
 use metric::U64Counter;
 use object_store::{DynObjectStore, ObjectMeta};
 use observability_deps::tracing::*;
@@ -37,6 +40,7 @@ pub(crate) async fn perform(
     shutdown: CancellationToken,
     object_store: Arc<DynObjectStore>,
     items: mpsc::Receiver<ObjectMeta>,
+    paths_in_catalog_backups: Arc<PathsInCatalogBackups>,
 ) {
     let locations = tokio_stream::wrappers::ReceiverStream::new(items).map(|item| item.location);
     let metrics = DeleterMetrics::new(metric_registry);
@@ -51,14 +55,32 @@ pub(crate) async fn perform(
                     })
                     .boxed(),
             )
-            .for_each(|ret| {
-                if let Err(e) = ret {
-                    metrics.object_delete_error_count.inc(1);
-                    warn!("error deleting files from object storage: {e}");
-                } else {
-                    metrics.object_delete_success_count.inc(1);
+            .for_each(|ret| async {
+                match ret {
+                    Ok(path) => {
+                        metrics.object_delete_success_count.inc(1);
+                        // If a catalog snapshot has just fallen out of
+                        // retention and has been deleted, then the file list
+                        // bloom filter must be reloaded to remove the entries
+                        // that existed in the now-deleted snapshot.
+                        if catalog_backup_directory_with_bloom_filter_file(&path).is_some() {
+                            if let Err(e) =
+                                paths_in_catalog_backups.reload_from_object_store().await
+                            {
+                                // If reloading the bloom filter fails, the GC
+                                // MAY continue operating, which will result in
+                                // GC incorrectly retaining the files that
+                                // belong to the just-deleted snapshot until the
+                                // next successful bloom filter reload.
+                                warn!("error reloading bloom filters from object storage: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        metrics.object_delete_error_count.inc(1);
+                        warn!("error deleting files from object storage: {e}");
+                    }
                 }
-                future::ready(())
             })
             .await
     };
@@ -77,12 +99,15 @@ pub(crate) async fn perform(
 mod tests {
     use super::*;
     use crate::test_utils::ARBITRARY_BAD_OBJECT_META;
+
     use bytes::Bytes;
-    use chrono::Utc;
+    use catalog_backup_file_list::{
+        BloomFilter, BloomFilterFilePath, CatalogBackupDirectory, DesiredFileListTime,
+    };
     use data_types::{NamespaceId, ObjectStoreId, PartitionId, TableId, TransitionPartitionId};
+    use iox_time::{SystemProvider, TimeProvider};
     use metric::{assert_counter, Attributes, Metric};
-    use object_store::path::Path;
-    use object_store::PutPayload;
+    use object_store::{path::Path, PutPayload};
     use parquet_file::ParquetFilePath;
     use std::time::Duration;
 
@@ -93,6 +118,7 @@ mod tests {
         let nitems = 3;
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let items = populate_os_with_items(&object_store, nitems).await;
+        let paths_in_catalog_backups = Arc::new(PathsInCatalogBackups::empty_for_testing(true));
 
         assert_eq!(count_os_element(&object_store).await, nitems);
 
@@ -126,6 +152,7 @@ mod tests {
             shutdown,
             Arc::clone(&object_store),
             rx,
+            paths_in_catalog_backups,
         );
         // Unusual test because there is no assertion but the call below should
         // not panic which verifies that the deleter task shutdown gracefully.
@@ -146,6 +173,7 @@ mod tests {
         let nitems = 3;
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let items = populate_os_with_items(&object_store, nitems).await;
+        let paths_in_catalog_backups = Arc::new(PathsInCatalogBackups::empty_for_testing(true));
 
         assert_eq!(count_os_element(&object_store).await, nitems);
 
@@ -168,6 +196,7 @@ mod tests {
             shutdown,
             Arc::clone(&object_store),
             rx,
+            paths_in_catalog_backups,
         );
         // Unusual test because there is no assertion but the call below should
         // not panic which verifies that the deleter task shutdown gracefully.
@@ -180,6 +209,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_bloom_reloads_union() {
+        let metric_registry = Arc::new(metric::Registry::new());
+        let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let time_provider = SystemProvider::new();
+
+        let parquet_file_path1 = new_object_meta_location();
+        let parquet_file_path2 = new_object_meta_location();
+
+        // Save 2 bloom filters to object storage
+        let mut bloom_filter1 = BloomFilter::empty();
+        bloom_filter1.insert(&parquet_file_path1);
+        let directory1 = CatalogBackupDirectory::new(DesiredFileListTime::new(time_provider.now()));
+        bloom_filter1
+            .save(&object_store, &directory1)
+            .await
+            .unwrap();
+        let mut bloom_filter2 = BloomFilter::empty();
+        bloom_filter2.insert(&parquet_file_path2);
+        let directory2 = CatalogBackupDirectory::new(DesiredFileListTime::new(time_provider.now()));
+        bloom_filter2
+            .save(&object_store, &directory2)
+            .await
+            .unwrap();
+
+        // Load unified bloom filter from object storage; should contain both paths
+        let paths_in_catalog_backups = Arc::new(
+            PathsInCatalogBackups::try_new(&object_store, true)
+                .await
+                .unwrap(),
+        );
+        assert!(paths_in_catalog_backups.contains(&parquet_file_path1));
+        assert!(paths_in_catalog_backups.contains(&parquet_file_path2));
+
+        // Delete the first bloom filter file
+        let items = vec![ObjectMeta {
+            location: BloomFilterFilePath::new(&directory1).object_store_path(),
+            last_modified: time_provider.now().date_time(),
+            size: 0,
+            e_tag: None,
+            version: None,
+        }];
+        let (tx, rx) = mpsc::channel(1000);
+
+        tokio::spawn(async move {
+            for item in items {
+                tx.send(item.clone()).await.unwrap();
+            }
+            // Drop tx, closing channel.
+        });
+
+        let perform_fu = perform(
+            Arc::clone(&metric_registry),
+            CancellationToken::new(),
+            Arc::clone(&object_store),
+            rx,
+            Arc::clone(&paths_in_catalog_backups),
+        );
+        tokio::time::timeout(Duration::from_secs(3), perform_fu)
+            .await
+            .unwrap();
+        assert_object_delete_success_counter(&metric_registry, 1);
+
+        // That should have reloaded the unified bloom filter; should contain only the 2nd path
+        assert!(!paths_in_catalog_backups.contains(&parquet_file_path1));
+        assert!(paths_in_catalog_backups.contains(&parquet_file_path2));
+    }
+
+    #[tokio::test]
     async fn try_delete_invalid_items() {
         let metric_registry = Arc::new(metric::Registry::new());
         let shutdown = CancellationToken::new();
@@ -189,6 +286,7 @@ mod tests {
         let items = (0..nitems)
             .map(|_| ARBITRARY_BAD_OBJECT_META.clone())
             .collect::<Vec<ObjectMeta>>();
+        let paths_in_catalog_backups = Arc::new(PathsInCatalogBackups::empty_for_testing(true));
 
         let (tx, rx) = mpsc::channel(1000);
 
@@ -199,8 +297,8 @@ mod tests {
             // Drop tx, closing channel.
         });
 
-        // Spawn a thread to run the parquet retention loop; spawn another thread to cancel the
-        // the parquet retention loop once we have a metric indicating a successful run.
+        // Spawn a thread to run the deleter loop; spawn another thread to cancel the
+        // the deleter loop once we have a metric indicating a successful run.
         let (perform_res, loop_res) = (
             tokio::spawn({
                 let metric_registry = Arc::clone(&metric_registry);
@@ -211,6 +309,7 @@ mod tests {
                         shutdown,
                         Arc::clone(&object_store),
                         rx,
+                        paths_in_catalog_backups,
                     )
                     .await
                 }
@@ -254,7 +353,7 @@ mod tests {
         for i in 0..nitems {
             let object_meta = ObjectMeta {
                 location: new_object_meta_location(),
-                last_modified: Utc::now(),
+                last_modified: SystemProvider::new().now().date_time(),
                 size: 0,
                 e_tag: None,
                 version: None,
@@ -274,7 +373,7 @@ mod tests {
         ParquetFilePath::new(
             NamespaceId::new(1),
             TableId::new(2),
-            &TransitionPartitionId::Deprecated(PartitionId::new(4)),
+            &TransitionPartitionId::Catalog(PartitionId::new(4)),
             ObjectStoreId::new(),
         )
         .object_store_path()

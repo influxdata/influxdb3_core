@@ -99,8 +99,7 @@ mod tests {
         let opt = NestedUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " UnionExec"
           - "   EmptyExec"
@@ -108,7 +107,7 @@ mod tests {
           Ok:
             - " UnionExec"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -121,8 +120,7 @@ mod tests {
         let opt = NestedUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " UnionExec"
           - "   UnionExec"
@@ -135,7 +133,7 @@ mod tests {
             - "   EmptyExec"
             - "   EmptyExec"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -151,8 +149,7 @@ mod tests {
         let opt = NestedUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " UnionExec"
           - "   UnionExec"
@@ -166,7 +163,7 @@ mod tests {
             - "   EmptyExec"
             - "   EmptyExec"
             - "   EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -176,14 +173,13 @@ mod tests {
         let opt = NestedUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
     }
 

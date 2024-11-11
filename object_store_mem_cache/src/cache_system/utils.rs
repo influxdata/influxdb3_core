@@ -10,7 +10,7 @@ use std::{
 use futures::FutureExt;
 use tokio::task::JoinHandle;
 
-use super::interfaces::DynError;
+use super::DynError;
 
 /// Holds a tokio task that is aborted when the handle is dropped.
 ///

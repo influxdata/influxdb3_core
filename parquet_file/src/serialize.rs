@@ -355,7 +355,9 @@ mod tests {
         record_batch::RecordBatch,
     };
     use bytes::Bytes;
-    use data_types::{CompactionLevel, NamespaceId, ObjectStoreId, TableId};
+    use data_types::{
+        CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, TableId, Timestamp,
+    };
     use datafusion::{
         common::file_options::parquet_writer::ParquetWriterOptions,
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
@@ -377,7 +379,7 @@ mod tests {
             partition_key: "potato".into(),
             compaction_level: CompactionLevel::FileNonOverlapped,
             sort_key: None,
-            max_l0_created_at: Time::from_timestamp_nanos(42),
+            max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
         };
 
         let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
@@ -535,9 +537,9 @@ mod tests {
         // will have different created_by (parquet-rs vs datafusion)
         assert_eq!(
             single_threaded_props.created_by(),
-            "parquet-rs version 52.2.0"
+            "parquet-rs version 53.0.0"
         );
-        assert_eq!(parallel_props.created_by(), "datafusion version 41.0.0");
+        assert_eq!(parallel_props.created_by(), "datafusion version 42.0.0");
 
         // assert they are the same
         assert_writer_properties_are_eq(single_threaded_props, parallel_props);

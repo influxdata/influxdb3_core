@@ -398,7 +398,7 @@ fn test_writer_fuzz() {
         expected.concat(&ret.filter(&ranges));
     }
 
-    let actual = batch.to_arrow(Projection::All).unwrap();
+    let actual = batch.clone().try_into_arrow(Projection::All).unwrap();
 
     assert_eq!(
         arrow_util::display::pretty_format_batches(&[actual]).unwrap(),

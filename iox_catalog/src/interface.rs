@@ -12,14 +12,10 @@ use data_types::{
     ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
     SortKeyIds, Table, TableId, Timestamp,
 };
-use iox_time::TimeProvider;
+use iox_time::{AsyncTimeProvider, TimeProvider};
 use snafu::Snafu;
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    sync::Arc,
-    time::Duration,
-};
+use std::collections::HashSet;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use trace::ctx::SpanContext;
 
 /// An error wrapper detailing the reason for a compare-and-swap failure.
@@ -193,7 +189,12 @@ pub trait Catalog: Send + Sync + Debug {
     #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry>;
 
+    /// Get the current time from the catalog's perspective. This function is
+    /// distinct from `Catalog::time_provider.now()`. They **may** return different times.
+    async fn get_time(&self) -> Result<iox_time::Time>;
+
     /// Gets the time provider associated with this catalog.
+    /// This function is distinct from `get_time()`. They may return different times.
     fn time_provider(&self) -> Arc<dyn TimeProvider>;
 
     /// Detect active applications running on this catalog instance.
@@ -207,6 +208,31 @@ pub trait Catalog: Send + Sync + Debug {
     fn name(&self) -> &'static str;
 }
 
+/// A time provider that uses the catalog's time.
+#[derive(Debug)]
+pub struct CatalogTimeProvider(Arc<dyn Catalog>);
+
+/// Implementations for [`CatalogTimeProvider`]
+impl CatalogTimeProvider {
+    /// Create a new instance of [`CatalogTimeProvider`]
+    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+        Self(catalog)
+    }
+}
+
+impl std::fmt::Display for CatalogTimeProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CatalogTimeProvider")
+    }
+}
+
+impl AsyncTimeProvider for CatalogTimeProvider {
+    type Error = crate::interface::Error;
+
+    async fn now(&self) -> Result<iox_time::Time> {
+        self.0.get_time().await
+    }
+}
 /// Methods for working with the catalog's various repositories (collections of entities).
 ///
 /// # Repositories
@@ -516,7 +542,9 @@ pub trait PartitionRepo: Send + Sync {
     /// longer needed.
     async fn list_old_style(&mut self) -> Result<Vec<Partition>>;
 
-    /// Delete empty partitions more than a day outside the retention interval
+    /// Delete empty partitions more than a day outside the retention interval (as determined by
+    /// their partition key) that were created at least 24 hours ago (to avoid immediately deleting
+    /// backfill partitions added via bulk ingest).
     ///
     /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
     /// changes. The caller MAY call this method again if the result was NOT empty.
@@ -598,18 +626,13 @@ pub trait ParquetFileRepo: Send + Sync {
     /// Flag all parquet files for deletion that are older than their namespace's retention period.
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
 
-    /// Delete parquet files that were marked to be deleted longer ago than the specified duration
-    /// from the current time according to the catalog.
+    /// Delete parquet files that were marked to be deleted earlier than the specified time.
     ///
     /// Returns the deleted IDs only.
     ///
     /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
     /// changes. The caller MAY call this method again if the result was NOT empty.
-    async fn delete_old_ids_only(
-        &mut self,
-        older_than: Timestamp,
-        cutoff: Duration,
-    ) -> Result<Vec<ObjectStoreId>>;
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
 
     /// List parquet files for given partitions that are NOT marked as
     /// [`to_delete`](ParquetFile::to_delete).
@@ -651,4 +674,12 @@ pub trait ParquetFileRepo: Send + Sync {
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
     ) -> Result<Vec<ParquetFileId>>;
+
+    /// List parquet files for a particular table (via [`TableId`]) and
+    /// optionally at a specific [`CompactionLevel`].
+    async fn list_by_table_id(
+        &mut self,
+        table_id: TableId,
+        compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>>;
 }

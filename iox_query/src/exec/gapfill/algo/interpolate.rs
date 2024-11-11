@@ -82,7 +82,13 @@ impl Cursor {
                     .zip(arrays.into_iter())
                     .map(|(cursor, a)| {
                         if let Some(mut c) = cursor {
-                            c.build_aggr_fill_null(params, series_ends, input_time_array, &a)
+                            c.build_aggr_fill_val(
+                                params,
+                                series_ends,
+                                input_time_array,
+                                &a,
+                                a.data_type().try_into()?,
+                            )
                         } else {
                             self.build_aggr_fill_interpolate(
                                 params,
@@ -357,6 +363,7 @@ mod test {
 
     use crate::exec::gapfill::{
         algo::tests::{array_to_lines, assert_cursor_end_state, new_cursor_with_batch_size},
+        date_bin_gap_expander::DateBinGapExpander,
         params::GapFillParams,
         FillStrategy,
     };
@@ -396,7 +403,7 @@ mod test {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 100,
+            gap_expander: Arc::new(DateBinGapExpander::new(100)),
             first_ts: Some(1000),
             last_ts: 2000,
             fill_strategy: interpolate_fill_strategy(idx),
@@ -416,8 +423,7 @@ mod test {
         let arr = cursor
             .build_aggr_fill_interpolate(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -433,7 +439,7 @@ mod test {
         - "| 1970-01-01T00:00:00.000001900Z | 0    |"
         - "| 1970-01-01T00:00:00.000002Z    |      |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -470,7 +476,7 @@ mod test {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 100,
+            gap_expander: Arc::new(DateBinGapExpander::new(100)),
             first_ts: Some(1000),
             last_ts: 2000,
             fill_strategy: interpolate_fill_strategy(idx),
@@ -490,8 +496,7 @@ mod test {
         let arr = cursor
             .build_aggr_fill_interpolate(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+------+
         - "| time                           | a0   |"
         - +--------------------------------+------+
@@ -507,7 +512,7 @@ mod test {
         - "| 1970-01-01T00:00:00.000001900Z | 0    |"
         - "| 1970-01-01T00:00:00.000002Z    |      |"
         - +--------------------------------+------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }
@@ -544,7 +549,7 @@ mod test {
 
         let idx = 0;
         let params = GapFillParams {
-            stride: 100,
+            gap_expander: Arc::new(DateBinGapExpander::new(100)),
             first_ts: Some(1000),
             last_ts: 2000,
             fill_strategy: interpolate_fill_strategy(idx),
@@ -564,8 +569,7 @@ mod test {
         let arr = cursor
             .build_aggr_fill_interpolate(&params, &series_ends, &input_times, &input_aggr_array)
             .unwrap();
-        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r###"
-        ---
+        insta::assert_yaml_snapshot!(array_to_lines(&time_arr, &arr), @r#"
         - +--------------------------------+--------+
         - "| time                           | a0     |"
         - +--------------------------------+--------+
@@ -581,7 +585,7 @@ mod test {
         - "| 1970-01-01T00:00:00.000001900Z | 0.0    |"
         - "| 1970-01-01T00:00:00.000002Z    |        |"
         - +--------------------------------+--------+
-        "###);
+        "#);
 
         assert_cursor_end_state(&cursor, &input_times, &params);
     }

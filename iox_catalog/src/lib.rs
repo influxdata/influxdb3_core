@@ -4,6 +4,13 @@
 #![warn(missing_docs)]
 
 // Workaround for "unused crate" lint false positives.
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use futures_concurrency as _;
+#[cfg(test)]
+use pgtemp as _;
+
 use workspace_hack as _;
 
 pub mod cache;

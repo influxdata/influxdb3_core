@@ -43,11 +43,6 @@ impl Client {
         }
     }
 
-    /// Returns `Ok(true)` if the storage service is serving
-    pub async fn check_storage(&mut self) -> Result<bool, Error> {
-        self.check(generated_types::STORAGE_SERVICE).await
-    }
-
     /// Returns `Ok(true)` if the Arrow Flight service is serving
     pub async fn check_arrow(&mut self) -> Result<bool, Error> {
         self.check(generated_types::ARROW_SERVICE).await

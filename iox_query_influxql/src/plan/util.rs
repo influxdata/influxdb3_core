@@ -1,16 +1,14 @@
 use crate::error;
 use arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::scalar::ScalarStructBuilder;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchemaRef, Result};
+use datafusion::common::{
+    scalar::{ScalarStructBuilder, ScalarValue},
+    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    DFSchemaRef, Result,
+};
 use datafusion::logical_expr::utils::expr_as_column_expr;
 use datafusion::logical_expr::{lit, Expr, ExprSchemable, LogicalPlan, Operator};
-use datafusion::scalar::ScalarValue;
-use influxdb_influxql_parser::expression::BinaryOperator;
-use influxdb_influxql_parser::literal::Number;
-use influxdb_influxql_parser::string::Regex;
-use query_functions::clean_non_meta_escapes;
-use query_functions::coalesce_struct::coalesce_struct;
+use influxdb_influxql_parser::{expression::BinaryOperator, literal::Number, string::Regex};
+use query_functions::{clean_non_meta_escapes, coalesce_struct::coalesce_struct};
 use schema::InfluxColumnType;
 use std::sync::Arc;
 
@@ -95,7 +93,7 @@ pub(crate) fn parse_regex(re: &Regex) -> Result<regex::Regex> {
 }
 
 /// Returns `n` as a scalar value of the specified `data_type`.
-fn number_to_scalar(n: &Number, data_type: &DataType) -> Result<ScalarValue> {
+pub(crate) fn number_to_scalar(n: &Number, data_type: &DataType) -> Result<ScalarValue> {
     Ok(match (n, data_type) {
         (Number::Integer(v), DataType::Int64) => ScalarValue::from(*v),
         (Number::Integer(v), DataType::Float64) => ScalarValue::from(*v as f64),
@@ -148,28 +146,23 @@ pub(crate) fn rebase_expr(
     fill_if_null: &Option<Number>,
     plan: &LogicalPlan,
 ) -> Result<Transformed<Expr>> {
-    if let Some(value) = fill_if_null {
-        expr.clone().transform_up(&|nested_expr| {
-            Ok(if base_exprs.contains(&nested_expr) {
-                let col_expr = expr_as_column_expr(&nested_expr, plan)?;
-                let data_type = col_expr.get_type(plan.schema())?;
-                Transformed::yes(coalesce_struct(vec![
-                    col_expr,
-                    lit(number_to_scalar(value, &data_type)?),
-                ]))
-            } else {
-                Transformed::no(nested_expr)
-            })
+    expr.clone().transform_up(&|nested_expr| {
+        Ok(if base_exprs.contains(&nested_expr) {
+            Transformed::yes(fill_if_null.map_or_else(
+                || expr_as_column_expr(&nested_expr, plan),
+                |value| {
+                    let col_expr = expr_as_column_expr(&nested_expr, plan)?;
+                    let data_type = col_expr.get_type(plan.schema())?;
+                    Ok(coalesce_struct(vec![
+                        col_expr,
+                        lit(number_to_scalar(&value, &data_type)?),
+                    ]))
+                },
+            )?)
+        } else {
+            Transformed::no(nested_expr)
         })
-    } else {
-        expr.clone().transform_up(&|nested_expr| {
-            Ok(if base_exprs.contains(&nested_expr) {
-                Transformed::yes(expr_as_column_expr(&nested_expr, plan)?)
-            } else {
-                Transformed::no(nested_expr)
-            })
-        })
-    }
+    })
 }
 
 pub(crate) fn contains_expr(expr: &Expr, needle: &Expr) -> bool {

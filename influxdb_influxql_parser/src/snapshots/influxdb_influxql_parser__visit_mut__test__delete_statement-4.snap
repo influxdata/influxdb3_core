@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit_mut.rs
 expression: "visit_statement!(\"DELETE FROM /^cpu/\")"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_delete_statement
@@ -10,4 +11,3 @@ expression: "visit_statement!(\"DELETE FROM /^cpu/\")"
 - post_visit_delete_from_clause
 - post_visit_delete_statement
 - post_visit_statement
-

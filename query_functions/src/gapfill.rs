@@ -14,35 +14,63 @@
 //! GROUP BY LOCATION, MINUTE
 //! ```
 //!
-//! The functions `DATE_BIN_GAPFILL`, `LOCF`, and `INTERPOLATE` are special,
-//! in that they don't have normal implementations, but instead
-//! are transformed by logical optimizer rule `HandleGapFill` to
-//! produce a plan that fills gaps.
+//! The functions `DATE_BIN_GAPFILL`, `DATE_BIN_WALLCLOCK_GAPFILL`,
+//! `LOCF`, and `INTERPOLATE` are special, in that they don't have
+//! normal implementations, but instead are transformed by logical
+//! analyzer rule `HandleGapFill` to produce a plan that fills gaps.
 use std::sync::{Arc, LazyLock};
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
+    functions::datetime::date_bin,
     logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
     physical_plan::ColumnarValue,
 };
 use schema::InfluxFieldType;
 
+use crate::date_bin_wallclock;
+
 /// The name of the date_bin_gapfill UDF given to DataFusion.
 pub const DATE_BIN_GAPFILL_UDF_NAME: &str = "date_bin_gapfill";
 
+/// (Non-)Implementation of date_bin_gapfill.
+/// This function takes arguments identical to `date_bin()` but
+/// works in conjunction with the logical optimizer rule
+/// `HandleGapFill` to fill gaps in time series data.
+pub(crate) static DATE_BIN_GAPFILL: LazyLock<Arc<ScalarUDF>> =
+    LazyLock::new(|| Arc::new(ScalarUDF::from(GapFillWrapper::new(date_bin()))));
+
+/// The name of the date_bin_wallclock_gapfill UDF given to DataFusion.
+pub const DATE_BIN_WALLCLOCK_GAPFILL_UDF_NAME: &str = "date_bin_wallclock_gapfill";
+
+/// (Non-)Implementation of date_bin_wallclock_gapfill.
+/// This function takes arguments identical to `date_bin_wallclock()` but
+/// works in conjunction with the logical optimizer rule
+/// `HandleGapFill` to fill gaps in time series data.
+pub(crate) static DATE_BIN_WALLCLOCK_GAPFILL: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::from(GapFillWrapper::new(
+        date_bin_wallclock::date_bin_wallclock(),
+    )))
+});
+
+/// Wrapper around date_bin style functions to enable gap filling
+/// functionality. Although presented as a scalar function the planner
+/// will rewrite queries including this wrapper to use a GapFill node.
 #[derive(Debug)]
-struct DateBinGapFillUDF {
+pub struct GapFillWrapper {
+    udf: Arc<ScalarUDF>,
+    name: String,
     signature: Signature,
 }
 
-impl ScalarUDFImpl for DateBinGapFillUDF {
+impl ScalarUDFImpl for GapFillWrapper {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn name(&self) -> &str {
-        DATE_BIN_GAPFILL_UDF_NAME
+        &self.name
     }
 
     fn signature(&self) -> &Signature {
@@ -50,51 +78,52 @@ impl ScalarUDFImpl for DateBinGapFillUDF {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        let timezone = if arg_types.len() > 1 {
-            if let DataType::Timestamp(_, timezone) = &arg_types[1] {
-                timezone.clone()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        Ok(DataType::Timestamp(TimeUnit::Nanosecond, timezone))
+        self.udf.inner().return_type(arg_types)
     }
 
     fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
         Err(DataFusionError::NotImplemented(format!(
-            "{DATE_BIN_GAPFILL_UDF_NAME} is not yet implemented"
+            "{} is not yet implemented",
+            self.name
         )))
     }
 }
 
-/// (Non-)Implementation of date_bin_gapfill.
-/// This function takes arguments identical to `date_bin()` but
-/// works in conjunction with the logical optimizer rule
-/// `HandleGapFill` to fill gaps in time series data.
-pub(crate) static DATE_BIN_GAPFILL: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
-    // DATE_BIN_GAPFILL should have the same signature as DATE_BIN,
-    // so that just adding _GAPFILL can turn a query into a gap-filling query.
-    let mut signatures = datafusion::functions::datetime::functions()
-        .iter()
-        .find(|fun| fun.name().eq("date_bin"))
-        .expect("should have date_bin UDF")
-        .signature()
-        .to_owned();
-    // We don't want this to be optimized away before we can give a helpful error message
-    signatures.volatility = Volatility::Volatile;
+impl GapFillWrapper {
+    /// Create a new GapFillUDFWrapper around a date_bin style UDF.
+    fn new(udf: Arc<ScalarUDF>) -> Self {
+        let name = format!("{}_gapfill", udf.name());
+        // The gapfill UDFs have the same type signature as the underlying UDF.
+        let Signature {
+            type_signature,
+            volatility: _,
+        } = udf.signature().clone();
+        // We don't want this to be optimized away before we can give a helpful error message
+        let signature = Signature {
+            type_signature,
+            volatility: Volatility::Volatile,
+        };
+        Self {
+            udf,
+            name,
+            signature,
+        }
+    }
 
-    Arc::new(ScalarUDF::from(DateBinGapFillUDF {
-        signature: signatures,
-    }))
-});
+    /// Get the wrapped UDF.
+    pub fn inner(&self) -> &Arc<ScalarUDF> {
+        &self.udf
+    }
+}
 
 /// The name of the locf UDF given to DataFusion.
 pub const LOCF_UDF_NAME: &str = "locf";
 
+/// The virtual function definition for the `locf` gap-filling
+/// function. This function is never actually invoked, but is used to
+/// provider parameters for the GapFill node that is added to the plan.
 #[derive(Debug)]
-struct LocfUDF {
+pub struct LocfUDF {
     signature: Signature,
 }
 
@@ -143,8 +172,11 @@ pub(crate) static LOCF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 /// The name of the interpolate UDF given to DataFusion.
 pub const INTERPOLATE_UDF_NAME: &str = "interpolate";
 
+/// The virtual function definition for the `interpolate` gap-filling
+/// function. This function is never actually invoked, but is used to
+/// provider parameters for the GapFill node that is added to the plan.
 #[derive(Debug)]
-struct InterpolateUDF {
+pub struct InterpolateUDF {
     signature: Signature,
 }
 

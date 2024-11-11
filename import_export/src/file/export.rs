@@ -506,7 +506,7 @@ fn to_partition_id(partition_identifier: Option<&PartitionIdentifier>) -> Transi
                 .expect("Catalog service should send valid hash_id bytes"),
         ),
         partition_identifier::Id::CatalogId(id) => {
-            TransitionPartitionId::Deprecated(PartitionId::new(*id))
+            TransitionPartitionId::Catalog(PartitionId::new(*id))
         }
     }
 }

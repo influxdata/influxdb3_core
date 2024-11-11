@@ -111,6 +111,10 @@ macro_rules! define_service_limit {
             fn type_info() -> DB::TypeInfo {
                 <i32 as sqlx::Type<DB>>::type_info()
             }
+
+            fn compatible(ty: &DB::TypeInfo) -> bool {
+                <i32 as sqlx::Type<DB>>::compatible(ty)
+            }
         }
 
         impl<'q, DB> sqlx::Encode<'q, DB> for $type_name
@@ -120,8 +124,8 @@ macro_rules! define_service_limit {
         {
             fn encode_by_ref(
                 &self,
-                buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer,
-            ) -> sqlx::encode::IsNull {
+                buf: &mut DB::ArgumentBuffer<'q>,
+            ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
                 <i32 as sqlx::Encode<'_, DB>>::encode_by_ref(&self.get_i32(), buf)
             }
         }
@@ -134,7 +138,7 @@ macro_rules! define_service_limit {
             i32: sqlx::Decode<'r, DB>,
         {
             fn decode(
-                value: <DB as ::sqlx::database::HasValueRef<'r>>::ValueRef,
+                value: DB::ValueRef<'r>,
             ) -> ::std::result::Result<
                 Self,
                 ::std::boxed::Box<

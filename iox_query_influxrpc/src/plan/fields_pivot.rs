@@ -1,8 +1,9 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DFSchemaRef, DataFusionError, Result, ToDFSchema};
 use datafusion::logical_expr::{expr_vec_fmt, Expr, LogicalPlan, UserDefinedLogicalNodeCore};
-use datafusion_util::AsExpr;
+use datafusion_util::{AsExpr, ThenWithOpt};
 use schema::Schema as IoxSchema;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// A plan which outputs one row for each non-null field in the input.
@@ -22,6 +23,15 @@ pub(crate) struct FieldsPivot {
     input: LogicalPlan,
     schema: DFSchemaRef,
     exprs: Vec<Expr>,
+}
+
+// Manual impl because FieldsPivot has a Range and is not PartialOrd
+impl PartialOrd for FieldsPivot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.input
+            .partial_cmp(&other.input)
+            .then_with_opt(|| self.exprs.partial_cmp(&other.exprs))
+    }
 }
 
 impl FieldsPivot {

@@ -206,6 +206,9 @@ pub mod influxdata {
                 /// Notifications for non-schema changes to namespace state in
                 /// the cluster.
                 NamespaceEvents = 6,
+
+                /// Metadata after query exec completion (currently only emitted by ingester).
+                QueryExecMetadata = 7,
             }
 
             impl TryFrom<u64> for Topic {
@@ -223,6 +226,7 @@ pub mod influxdata {
                             Self::PartitionSortKeyUpdates
                         }
                         v if v == Self::NamespaceEvents as u64 => Self::NamespaceEvents,
+                        v if v == Self::QueryExecMetadata as u64 => Self::QueryExecMetadata,
                         _ => return Err(format!("unknown topic id {}", v).into()),
                     })
                 }
@@ -477,6 +481,7 @@ mod tests {
             Topic::SchemaCacheConsistency,
             Topic::PartitionSortKeyUpdates,
             Topic::NamespaceEvents,
+            Topic::QueryExecMetadata,
         ];
 
         for topic in topics {
@@ -495,6 +500,7 @@ mod tests {
             Topic::SchemaCacheConsistency => {}
             Topic::PartitionSortKeyUpdates => {}
             Topic::NamespaceEvents => {}
+            Topic::QueryExecMetadata => {}
         }
     }
 

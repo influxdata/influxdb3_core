@@ -15,7 +15,7 @@ use datafusion::{
 
 use crate::{
     physical_optimizer::sort::util::{
-        all_sort_execs_on_same_sort_exprs_from_starting_position, sort_by_value_ranges,
+        all_sort_execs_on_same_sort_exprs_from_starting_position, sort_plans_by_value_ranges,
     },
     provider::progressive_eval::ProgressiveEvalExec,
 };
@@ -138,7 +138,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputsForConstants {
             }
 
             // Sort the stream by the two-first-column-value-ranges
-            let Some(plans_value_ranges) = sort_by_value_ranges(
+            let Some(plans_value_ranges) = sort_plans_by_value_ranges(
                 union_inputs.to_vec(),
                 val_ranges_and_col_vals.value_ranges,
                 sort_options,
@@ -270,8 +270,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -291,7 +290,7 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-        "###
+        "#
         );
     }
 
@@ -351,8 +350,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -380,7 +378,7 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-        "###
+        "#
         );
     }
 
@@ -429,8 +427,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -450,7 +447,7 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[2 as iox::measurement, 20 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -499,8 +496,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -520,7 +516,7 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag1 as key, tag2 as another_key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -568,8 +564,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement ASC NULLS LAST]"
           - "   UnionExec"
@@ -589,7 +584,7 @@ mod test {
             - "     SortExec: expr=[iox::measurement ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -622,8 +617,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
@@ -635,7 +629,7 @@ mod test {
             - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-        "###
+        "#
         );
     }
 
@@ -679,8 +673,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -698,7 +691,7 @@ mod test {
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
             - "     ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "       RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -742,8 +735,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -763,7 +755,7 @@ mod test {
             - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -811,8 +803,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -832,7 +823,7 @@ mod test {
             - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[tag0 as iox::measurement, tag1 as key, tag1@2 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -886,8 +877,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -907,7 +897,7 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -962,8 +952,7 @@ mod test {
         let opt = OrderUnionSortedInputsForConstants;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
           - "   UnionExec"
@@ -983,7 +972,7 @@ mod test {
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 

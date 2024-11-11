@@ -159,6 +159,13 @@ impl DeduplicateExec {
             .collect()
     }
 
+    /// Iterator of all of the columns in the sort key and potentially the chunk order column.
+    pub fn sort_column_iter(&self) -> impl Iterator<Item = Column> + '_ {
+        self.input_order
+            .iter()
+            .filter_map(|sk| sk.expr.as_any().downcast_ref::<Column>().cloned())
+    }
+
     pub fn use_chunk_order_col(&self) -> bool {
         self.use_chunk_order_col
     }
@@ -328,7 +335,7 @@ async fn deduplicate(
         // First check if this batch has same sort key with its previous batch
         let timer = elapsed_compute.timer();
         if let Some(last_batch) = deduplicator
-            .last_batch_with_no_same_sort_key(&batch)
+            .last_batch_with_no_same_sort_key(&batch)?
             .record_output(&baseline_metrics)
         {
             timer.done();
@@ -373,7 +380,7 @@ async fn deduplicate(
 
 #[cfg(test)]
 mod test {
-    use arrow::compute::SortOptions;
+    use arrow::compute::{concat_batches, SortOptions};
     use arrow::datatypes::{Int32Type, SchemaRef};
     use arrow::{
         array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray},
@@ -385,6 +392,7 @@ mod test {
 
     use super::*;
     use arrow::array::{DictionaryArray, Int64Array};
+    use arrow_util::display::pretty_format_batches;
     use schema::TIME_DATA_TIMEZONE;
     use std::iter::FromIterator;
 
@@ -830,6 +838,483 @@ mod test {
         assert_eq!(results.num_dupes(), 5 - 3);
     }
 
+    fn make_single_row_batch(t1: Option<&str>, t2: Option<&str>, f1: Option<f64>) -> RecordBatch {
+        make_multi_row_batch(vec![t1], vec![t2], vec![f1])
+    }
+
+    fn make_multi_row_batch(
+        t1: Vec<Option<&str>>,
+        t2: Vec<Option<&str>>,
+        f1: Vec<Option<f64>>,
+    ) -> RecordBatch {
+        RecordBatch::try_from_iter_with_nullable(vec![
+            ("t1", Arc::new(StringArray::from(t1)) as ArrayRef, true),
+            ("t2", Arc::new(StringArray::from(t2)) as ArrayRef, true),
+            ("f1", Arc::new(Float64Array::from(f1)) as ArrayRef, true),
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_with_nulls_multitag_and_multiple_batches() {
+        // INPUT
+        // sort order on t1,t2 with nulls in the tags and nulls that span batch boundaries.
+        //
+        // t1 | t2 | f1
+        // ---+----+----
+        //    |    | 1
+        //    |    | 2
+        //    | a  | 3
+        //    | a  | 4
+        //    | b  | 5
+        //  a |    | 6
+        //  a |    | 7
+        //  b |    | 8
+        //  b |    | 9
+        //  b | a  | 10
+        //  b | a  | 11
+        //  b | b  | 12
+
+        // OUTPUT
+        let expected = vec![
+            "+----+----+------+",
+            "| t1 | t2 | f1   |",
+            "+----+----+------+",
+            "|    |    | 2.0  |",
+            "|    | a  | 4.0  |",
+            "|    | b  | 5.0  |",
+            "| a  |    | 7.0  |",
+            "| b  |    | 9.0  |",
+            "| b  | a  | 11.0 |",
+            "| b  | b  | 12.0 |",
+            "+----+----+------+",
+        ];
+
+        // Example -- how to construct an example single input batch
+        let b1 = make_single_row_batch(None, None, Some(1.0));
+        let expected_input_batch = vec![
+            "+----+----+-----+",
+            "| t1 | t2 | f1  |",
+            "+----+----+-----+",
+            "|    |    | 1.0 |",
+            "+----+----+-----+",
+        ];
+        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+
+        // sort on t1, t2
+        let sort_keys = vec![
+            PhysicalSortExpr {
+                expr: col("t1", &b1.schema()).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+            PhysicalSortExpr {
+                expr: col("t2", &b1.schema()).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+        ];
+
+        // TEST CASE 1. DEDUPE ACROSS BATCH BOUNDARIES
+        //
+        // each row is a separate batch (to dedupe across):
+        // t1 | t2 | f1
+        // ---+----+----
+        //    |    | 1
+        //    |    | 2
+        //    | a  | 3
+        //    | a  | 4
+        //    | b  | 5
+        //  a |    | 6
+        //  a |    | 7
+        //  b |    | 8
+        //  b |    | 9
+        //  b | a  | 10
+        //  b | a  | 11
+        //  b | b  | 12
+        let input_batches = vec![
+            b1,
+            make_single_row_batch(None, None, Some(2.0)),
+            make_single_row_batch(None, Some("a"), Some(3.0)),
+            make_single_row_batch(None, Some("a"), Some(4.0)),
+            make_single_row_batch(None, Some("b"), Some(5.0)),
+            make_single_row_batch(Some("a"), None, Some(6.0)),
+            make_single_row_batch(Some("a"), None, Some(7.0)),
+            make_single_row_batch(Some("b"), None, Some(8.0)),
+            make_single_row_batch(Some("b"), None, Some(9.0)),
+            make_single_row_batch(Some("b"), Some("a"), Some(10.0)),
+            make_single_row_batch(Some("b"), Some("a"), Some(11.0)),
+            make_single_row_batch(Some("b"), Some("b"), Some(12.0)),
+        ];
+        // see that the dupes at the batch boundaries are de-duped
+        let results = dedupe(input_batches, sort_keys.clone()).await;
+        assert_batches_eq!(&expected, &results.output);
+
+        // TEST CASE 2. DEDUPES WITHIN BACTHES TOO
+        //
+        // multi-row batches for the input:
+        // t1 | t2 | f1
+        // ---+----+----
+        //    |    | 1
+        //    |    | 2
+        //    | a  | 3
+        // ---------------- batch boundary
+        //    | a  | 4
+        //    | b  | 5
+        //  a |    | 6
+        //  a |    | 7
+        //  b |    | 8
+        //  b |    | 9
+        //  b | a  | 10
+        // ---------------- batch boundary
+        //  b | a  | 11
+        //  b | b  | 12
+        let input_batches = vec![
+            make_multi_row_batch(
+                vec![None, None, None],
+                vec![None, None, Some("a")],
+                vec![Some(1.0), Some(2.0), Some(3.0)],
+            ),
+            make_multi_row_batch(
+                vec![
+                    None,
+                    None,
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                    Some("b"),
+                    Some("b"),
+                ],
+                vec![Some("a"), Some("b"), None, None, None, None, Some("a")],
+                vec![
+                    Some(4.0),
+                    Some(5.0),
+                    Some(6.0),
+                    Some(7.0),
+                    Some(8.0),
+                    Some(9.0),
+                    Some(10.0),
+                ],
+            ),
+            make_multi_row_batch(
+                vec![Some("b"), Some("b")],
+                vec![Some("a"), Some("b")],
+                vec![Some(11.0), Some(12.0)],
+            ),
+        ];
+        // see that the dupes within the batch are still deduped
+        let results = dedupe(input_batches, sort_keys).await;
+        assert_batches_eq!(&expected, &results.output);
+    }
+
+    #[tokio::test]
+    async fn test_with_nulls_multitag_and_multiple_batches_nondefault_sort() {
+        // INPUT
+        // sort order on t1,t2 with nulls in the tags and nulls that span batch boundaries.
+        // t1 = nulls last and descending
+        // t2 = nulls first and ascending
+        //
+        // t1 | t2 | f1
+        // ---+----+----
+        //  b |    | 1
+        //  b |    | 2
+        //  b | a  | 3
+        //  b | a  | 4
+        //  b | b  | 5
+        //  b | b  | 6
+        //  a |    | 7
+        //  a |    | 8
+        //  a | a  | 9
+        //  a | a  | 10
+        //  a | b  | 11
+        //  a | b  | 12
+        //    |    | 13
+        //    |    | 14
+        //    | a  | 15
+        //    | a  | 16
+
+        // OUTPUT
+        let expected = vec![
+            "+----+----+------+",
+            "| t1 | t2 | f1   |",
+            "+----+----+------+",
+            "| b  |    | 2.0  |",
+            "| b  | a  | 4.0  |",
+            "| b  | b  | 6.0  |",
+            "| a  |    | 8.0  |",
+            "| a  | a  | 10.0 |",
+            "| a  | b  | 12.0 |",
+            "|    |    | 14.0 |",
+            "|    | a  | 16.0 |",
+            "+----+----+------+",
+        ];
+
+        // make schema from example batch
+        let b1 = make_single_row_batch(Some("b"), None, Some(1.0));
+        let expected_input_batch = vec![
+            "+----+----+-----+",
+            "| t1 | t2 | f1  |",
+            "+----+----+-----+",
+            "| b  |    | 1.0 |",
+            "+----+----+-----+",
+        ];
+        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+
+        // sort on t1, t2
+        let sort_keys = vec![
+            PhysicalSortExpr {
+                expr: col("t1", &b1.schema()).unwrap(),
+                options: SortOptions {
+                    descending: true,   // not the default
+                    nulls_first: false, // nulls last (not the default)
+                },
+            },
+            PhysicalSortExpr {
+                expr: col("t2", &b1.schema()).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+        ];
+
+        // TEST CASE 1. DEDUPE ACROSS BATCH BOUNDARIES
+        //
+        // each row is a separate batch (to dedupe across):
+        // t1 | t2 | f1
+        // ---+----+----
+        //  b |    | 1
+        //  b |    | 2
+        //  b | a  | 3
+        //  b | a  | 4
+        //  b | b  | 5
+        //  b | b  | 6
+        //  a |    | 7
+        //  a |    | 8
+        //  a | a  | 9
+        //  a | a  | 10
+        //  a | b  | 11
+        //  a | b  | 12
+        //    |    | 13
+        //    |    | 14
+        //    | a  | 15
+        //    | a  | 16
+        let input_batches = vec![
+            b1,
+            make_single_row_batch(Some("b"), None, Some(2.0)),
+            make_single_row_batch(Some("b"), Some("a"), Some(3.0)),
+            make_single_row_batch(Some("b"), Some("a"), Some(4.0)),
+            make_single_row_batch(Some("b"), Some("b"), Some(5.0)),
+            make_single_row_batch(Some("b"), Some("b"), Some(6.0)),
+            make_single_row_batch(Some("a"), None, Some(7.0)),
+            make_single_row_batch(Some("a"), None, Some(8.0)),
+            make_single_row_batch(Some("a"), Some("a"), Some(9.0)),
+            make_single_row_batch(Some("a"), Some("a"), Some(10.0)),
+            make_single_row_batch(Some("a"), Some("b"), Some(11.0)),
+            make_single_row_batch(Some("a"), Some("b"), Some(12.0)),
+            make_single_row_batch(None, None, Some(13.0)),
+            make_single_row_batch(None, None, Some(14.0)),
+            make_single_row_batch(None, Some("a"), Some(15.0)),
+            make_single_row_batch(None, Some("a"), Some(16.0)),
+        ];
+        // see that the dupes at the batch boundaries are de-duped
+        let results = dedupe(input_batches, sort_keys.clone()).await;
+        assert_batches_eq!(&expected, &results.output);
+
+        // TEST CASE 2. DEDUPES WITHIN BACTHES TOO
+        //
+        // multi-row batches for the input:
+        // t1 | t2 | f1
+        // ---+----+----
+        //  b |    | 1
+        //  b |    | 2
+        //  b | a  | 3
+        // ---------------- batch boundary
+        //  b | a  | 4
+        //  b | b  | 5
+        //  b | b  | 6
+        //  a |    | 7
+        // ---------------- batch boundary
+        //  a |    | 8
+        //  a | a  | 9
+        //  a | a  | 10
+        //  a | b  | 11
+        //  a | b  | 12
+        //    |    | 13
+        // ---------------- batch boundary
+        //    |    | 14
+        //    | a  | 15
+        //    | a  | 16
+        let input_batches = vec![
+            make_multi_row_batch(
+                vec![Some("b"), Some("b"), Some("b")],
+                vec![None, None, Some("a")],
+                vec![Some(1.0), Some(2.0), Some(3.0)],
+            ),
+            make_multi_row_batch(
+                vec![Some("b"), Some("b"), Some("b"), Some("a")],
+                vec![Some("a"), Some("b"), Some("b"), None],
+                vec![Some(4.0), Some(5.0), Some(6.0), Some(7.0)],
+            ),
+            make_multi_row_batch(
+                vec![Some("a"), Some("a"), Some("a"), Some("a"), Some("a"), None],
+                vec![None, Some("a"), Some("a"), Some("b"), Some("b"), None],
+                vec![
+                    Some(8.0),
+                    Some(9.0),
+                    Some(10.0),
+                    Some(11.0),
+                    Some(12.0),
+                    Some(13.0),
+                ],
+            ),
+            make_multi_row_batch(
+                vec![None, None, None],
+                vec![None, Some("a"), Some("a")],
+                vec![Some(14.0), Some(15.0), Some(16.0)],
+            ),
+        ];
+
+        // see that the dupes within the batch are still deduped
+        let results = dedupe(input_batches, sort_keys).await;
+        assert_batches_eq!(&expected, &results.output);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "attempted to execute invalid plan, deduplication should not occur on unsorted batch stream"
+    )]
+    async fn test_when_unsorted_input_stream_of_batches() {
+        // INPUT
+        // have multiple separate batches, from separate overlapping files, which are UNIONed then deduped
+        //      DeduplicateExec: [tag1@1 DESC NULLS LAST,tag2@2]
+        //          UnionExec
+        //              RecordBatchesExec
+        //              ParquetExec
+        //
+        // t1 | t2 | f1
+        // ---+----+----
+        //  b | a  | 1
+        //  b | a  | 2
+        //  b | b  | 3
+        //  a | a  | 7
+        // ---------------- batch boundary
+        //  b | b  | 4
+        //  b |    | 5
+        //  b |    | 6
+        //  a | a  | 8
+        //  a | b  | 9
+        //  a | b  | 10
+        //    | b  | 12
+        // ---------------- batch boundary
+        //    | a  | 11
+        //    | b  | 13
+
+        // THIS INPUT IS INVALID, and should error.
+        //
+        // Our optimizer passes OrderUnionSortedInputs or OrderUnionSortedInputsForConstants
+        // should insert an SPM btwn the UNION and DeduplicateExec. If not => then we introduced
+        // a bug & the query should error.
+
+        // make schema from example batch
+        let b1 = make_single_row_batch(Some("b"), Some("a"), Some(1.0));
+        let expected_input_batch = vec![
+            "+----+----+-----+",
+            "| t1 | t2 | f1  |",
+            "+----+----+-----+",
+            "| b  | a  | 1.0 |",
+            "+----+----+-----+",
+        ];
+        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+
+        // sort on t1, t2
+        let sort_keys = vec![
+            PhysicalSortExpr {
+                expr: col("t1", &b1.schema()).unwrap(),
+                options: SortOptions {
+                    descending: true,   // not the default
+                    nulls_first: false, // nulls last (not the default)
+                },
+            },
+            PhysicalSortExpr {
+                expr: col("t2", &b1.schema()).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+        ];
+
+        // multi-row batches for the input:
+        // t1 | t2 | f1
+        // ---+----+----
+        //  b | a  | 1
+        //  b | a  | 2
+        //  b | b  | 3
+        //  a | a  | 7
+        // ---------------- batch boundary
+        //  b | b  | 4
+        //  b |    | 5
+        //  b |    | 6
+        //  a | a  | 8
+        //  a | b  | 9
+        //  a | b  | 10
+        //    | b  | 12
+        // ---------------- batch boundary
+        //    | a  | 11
+        //    | b  | 13
+        let input_batches = vec![
+            Ok(make_multi_row_batch(
+                vec![Some("b"), Some("b"), Some("b"), Some("a")],
+                vec![Some("a"), Some("a"), Some("b"), Some("a")],
+                vec![Some(1.0), Some(2.0), Some(3.0), Some(7.0)],
+            )),
+            Ok(make_multi_row_batch(
+                vec![
+                    Some("b"),
+                    Some("b"),
+                    Some("b"),
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    None,
+                ],
+                vec![
+                    Some("b"),
+                    None,
+                    None,
+                    Some("a"),
+                    Some("b"),
+                    Some("b"),
+                    Some("b"),
+                ],
+                vec![
+                    Some(4.0),
+                    Some(5.0),
+                    Some(6.0),
+                    Some(8.0),
+                    Some(9.0),
+                    Some(10.0),
+                    Some(12.0),
+                ],
+            )),
+            Ok(make_multi_row_batch(
+                vec![None, None],
+                vec![Some("a"), Some("b")],
+                vec![Some(11.0), Some(13.0)],
+            )),
+        ];
+
+        // call and return an error
+        let input = Arc::new(DummyExec::new(Arc::clone(&b1.schema()), input_batches));
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(input, sort_keys, false));
+        test_collect(exec).await;
+    }
+
     #[tokio::test]
     async fn test_no_dupes() {
         // special case test for data without duplicates (fast path)
@@ -1147,8 +1632,36 @@ mod test {
         }
     }
 
-    /// Run the input through the deduplicator and return results
+    /// Run the input through a `DeduplicateExec` and return results
+    ///
+    /// This function also verifies that splitting the record batches along
+    /// different boundaries does not affect the output.
     async fn dedupe(input: Vec<RecordBatch>, sort_keys: Vec<PhysicalSortExpr>) -> TestResults {
+        let results = dedupe_inner(input.clone(), sort_keys.clone()).await;
+
+        let results_strings = pretty_format_batches(&results.output).unwrap();
+
+        // Split the input into different record batches (to test the boundary conditions more)
+        let single_batch = concat_batches(&input[0].schema(), &input).unwrap();
+        for start_size in [1, 2, 3] {
+            let split_batches = split_batch(single_batch.clone(), start_size);
+            let split_results = dedupe_inner(split_batches, sort_keys.clone()).await;
+            let split_results_strings = pretty_format_batches(&split_results.output).unwrap();
+            // output should be the same regardless of how the input is split
+            assert_eq!(
+                results_strings, split_results_strings,
+                "start_size: {}",
+                start_size
+            );
+        }
+        results
+    }
+
+    /// Actally run the deduplicator
+    async fn dedupe_inner(
+        input: Vec<RecordBatch>,
+        sort_keys: Vec<PhysicalSortExpr>,
+    ) -> TestResults {
         test_helpers::maybe_start_logging();
 
         // Setup in memory stream
@@ -1161,6 +1674,26 @@ mod test {
         let output = test_collect(Arc::clone(&exec) as Arc<dyn ExecutionPlan>).await;
 
         TestResults { output, exec }
+    }
+
+    /// Split the RecordBatch into RecordBatches of sizes
+    /// start_size, start_size + 1, ...,
+    fn split_batch(mut batch: RecordBatch, start_size: usize) -> Vec<RecordBatch> {
+        let mut batches = vec![];
+        let start_batch_size = batch.num_rows();
+        let mut batch_size = start_size;
+        while batch.num_rows() > batch_size {
+            batches.push(batch.slice(0, batch_size));
+            batch = batch.slice(batch_size, batch.num_rows() - batch_size);
+            batch_size += 1;
+        }
+        batches.push(batch);
+        // verify that we didn't lose any rows
+        assert_eq!(
+            start_batch_size,
+            batches.iter().map(|b| b.num_rows()).sum::<usize>()
+        );
+        batches
     }
 
     /// A PhysicalPlan that sends a specific set of

@@ -163,15 +163,14 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = foo"
           - "   EmptyExec"
         output:
           Ok:
             - " EmptyExec"
-        "###
+        "#
         );
     }
 
@@ -188,8 +187,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = foo"
           - "   PlaceholderRowExec"
@@ -197,7 +195,7 @@ mod tests {
           Ok:
             - " FilterExec: tag1@0 = foo"
             - "   PlaceholderRowExec"
-        "###
+        "#
         );
     }
 
@@ -218,8 +216,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = foo"
           - "   UnionExec"
@@ -232,7 +229,7 @@ mod tests {
             - "     PlaceholderRowExec"
             - "   FilterExec: tag1@0 = foo"
             - "     PlaceholderRowExec"
-        "###
+        "#
         );
     }
 
@@ -253,8 +250,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = foo"
           - "   UnionExec"
@@ -269,7 +265,7 @@ mod tests {
             - "       PlaceholderRowExec"
             - "     FilterExec: tag1@0 = foo"
             - "       PlaceholderRowExec"
-        "###
+        "#
         );
     }
 
@@ -293,8 +289,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = field@2"
           - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
@@ -302,7 +297,7 @@ mod tests {
           Ok:
             - " FilterExec: tag1@0 = field@2"
             - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
-        "###
+        "#
         );
     }
 
@@ -323,8 +318,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: field@2 = val"
           - "   DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
@@ -334,7 +328,7 @@ mod tests {
             - " FilterExec: field@2 = val"
             - "   DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
             - "     PlaceholderRowExec"
-        "###
+        "#
         );
     }
 
@@ -355,8 +349,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = foo"
           - "   DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
@@ -366,7 +359,7 @@ mod tests {
             - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
             - "   FilterExec: tag1@0 = foo"
             - "     PlaceholderRowExec"
-        "###
+        "#
         );
     }
 
@@ -394,8 +387,7 @@ mod tests {
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " FilterExec: tag1@0 = foo AND tag1@0 = tag2@1 AND field@2 = val AND tag1@0 = field@2 AND true"
           - "   DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
@@ -406,7 +398,7 @@ mod tests {
             - "   DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
             - "     FilterExec: tag1@0 = foo AND tag1@0 = tag2@1 AND true"
             - "       PlaceholderRowExec"
-        "###
+        "#
         );
     }
 

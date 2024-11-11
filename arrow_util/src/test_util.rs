@@ -228,6 +228,11 @@ static REGEX_LINESEP: LazyLock<Regex> =
 ///   `         |` -> `    |`
 static REGEX_COL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+\|").expect("col regex"));
 
+/// Matches line like `required_guarantees=[state in (CA, MA)]`
+static REGEX_REQUIRE_GUARANTEES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"required_guarantees=\[([^\]]*)\]").expect("require guarantees regex")
+});
+
 /// Matches line like `metrics=[foo=1, bar=2]`
 static REGEX_METRICS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"metrics=\[([^\]]*)\]").expect("metrics regex"));
@@ -290,6 +295,16 @@ pub struct Normalizer {
 
     /// if `true`, render tables without borders.
     pub no_table_borders: bool,
+
+    /// if `true`, normalize require guarantees in explain plans
+    /// with deterministics order
+    ///
+    /// Example: `required_guarantees=[state in (MA, CA)]`
+    ///   is normalized to `required_guarantees=[state in (CA, MA)]`
+    ///
+    /// Can be removed after <https://github.com/apache/datafusion/issues/12473>
+    /// is available which does the normalization in the explain plan itself.
+    pub normalized_required_guarantees: bool,
 }
 
 impl Normalizer {
@@ -394,6 +409,36 @@ impl Normalizer {
                             let expr = normalize_time_ops(expr);
 
                             format!("{prefix}{expr}")
+                        })
+                        .to_string()
+                })
+                .collect();
+        }
+
+        // normalize require guarantees, if requested
+        // e.g required_guarantees=[state in (MA, CA)] -> required_guarantees=[state in (CA, MA)]
+        if self.normalized_required_guarantees {
+            current_results = current_results
+                .into_iter()
+                .map(|s| {
+                    REGEX_REQUIRE_GUARANTEES
+                        .replace_all(&s, |c: &Captures<'_>| {
+                            // split xxx(yyy) into xxx and (yyy)
+                            // find '(' and split the string into two parts xxx and (yyy)
+                            let (prefix, suffix) = c[1].split_once('(').unwrap_or((&c[1], ""));
+
+                            // remove ( and ) from suffix
+                            let suffix = suffix.trim_matches(|c| c == '(' || c == ')');
+
+                            // split suffix by ', ' and sort the elements
+                            let mut guarantees: Vec<_> = suffix.split(", ").collect();
+                            guarantees.sort();
+
+                            format!(
+                                "required_guarantees=[{}({})]",
+                                prefix,
+                                guarantees.join(", ")
+                            )
                         })
                         .to_string()
                 })

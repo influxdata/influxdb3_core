@@ -2,7 +2,7 @@
 
 use crate::constants::MAX_PARTITION_SELECTED_ONCE_FOR_DELETE;
 use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
-use crate::metrics::CatalogMetrics;
+use crate::metrics::{CatalogMetrics, GetTimeMetric};
 use crate::util::should_delete_partition;
 use crate::{
     constants::{
@@ -30,7 +30,7 @@ use data_types::{
     SortKeyIds, Table, TableId, Timestamp,
 };
 use futures::StreamExt;
-use iox_time::{SystemProvider, TimeProvider};
+use iox_time::{SystemProvider, Time, TimeProvider};
 use metric::Registry;
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
@@ -46,7 +46,6 @@ use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 use trace::ctx::SpanContext;
 
@@ -62,7 +61,8 @@ pub struct SqliteConnectionOptions {
 /// SQLite catalog.
 #[derive(Debug)]
 pub struct SqliteCatalog {
-    metrics: CatalogMetrics,
+    catalog_metrics: CatalogMetrics,
+    get_time_metric: GetTimeMetric,
     pool: Pool<Sqlite>,
     time_provider: Arc<dyn TimeProvider>,
 }
@@ -125,7 +125,7 @@ impl<'c> Executor<'c> for &'c mut SqliteTxnInner {
         parameters: &'e [<Self::Database as sqlx::Database>::TypeInfo],
     ) -> futures::future::BoxFuture<
         'e,
-        Result<<Self::Database as sqlx::database::HasStatement<'q>>::Statement, sqlx::Error>,
+        Result<<Self::Database as sqlx::database::Database>::Statement<'q>, sqlx::Error>,
     >
     where
         'c: 'e,
@@ -156,7 +156,8 @@ impl SqliteCatalog {
 
         let pool = SqlitePool::connect_with(opts).await?;
         Ok(Self {
-            metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
+            get_time_metric: GetTimeMetric::new(&metrics, Self::NAME),
+            catalog_metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             pool,
             time_provider,
         })
@@ -172,7 +173,7 @@ impl Catalog for SqliteCatalog {
     }
 
     fn repositories(&self) -> Box<dyn RepoCollection> {
-        Box::new(self.metrics.repos(Box::new(SqliteTxn {
+        Box::new(self.catalog_metrics.repos(Box::new(SqliteTxn {
             inner: Mutex::new(SqliteTxnInner {
                 pool: self.pool.clone(),
             }),
@@ -182,11 +183,19 @@ impl Catalog for SqliteCatalog {
 
     #[cfg(test)]
     fn metrics(&self) -> Arc<Registry> {
-        self.metrics.registry()
+        self.catalog_metrics.registry()
     }
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    /// Get the current time from this `SqliteCatalog`. Note that Sqlite timestamps are precise to the nearest millisecond.
+    async fn get_time(&self) -> Result<iox_time::Time, Error> {
+        let start = tokio::time::Instant::now();
+        let res = sqlite_get_time(&self.pool).await;
+        self.get_time_metric.record(start.elapsed(), &res);
+        res
     }
 
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
@@ -226,6 +235,22 @@ impl RepoCollection for SqliteTxn {
     }
 
     fn set_span_context(&mut self, _span_ctx: Option<SpanContext>) {}
+}
+
+async fn sqlite_get_time(pool: &Pool<Sqlite>) -> Result<iox_time::Time, Error> {
+    // Sqlite's timestamp precision is limited to milliseconds; but we convert to microseconds to use `Time::from_timestamp_micros()`
+    let res = sqlx::query(r#"SELECT CAST((SELECT (unixepoch('subsec') * 1000000)) AS INT)"#)
+        .fetch_one(pool)
+        .await;
+    let row = match res {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(Error::External {
+                source: Arc::new(e),
+            })
+        }
+    };
+    Ok(Time::from_timestamp_micros(row.get(0)).expect("Failed to get `Time` from `SqliteRow`"))
 }
 
 #[async_trait]
@@ -914,6 +939,7 @@ struct PartitionPod {
     sort_key_ids: Json<Vec<i64>>,
     new_file_at: Option<Timestamp>,
     cold_compact_at: Option<Timestamp>,
+    created_at: Option<Timestamp>,
 }
 
 impl From<PartitionPod> for Partition {
@@ -928,6 +954,7 @@ impl From<PartitionPod> for Partition {
             sort_key_ids,
             value.new_file_at,
             value.cold_compact_at,
+            value.created_at,
         )
     }
 }
@@ -944,12 +971,13 @@ impl PartitionRepo for SqliteTxn {
         let v = sqlx::query_as::<_, PartitionPod>(
             r#"
 INSERT INTO partition
-    (partition_key, table_id, hash_id, sort_key_ids)
+    (partition_key, table_id, hash_id, sort_key_ids, created_at)
 VALUES
-    ($1, $2, $3, '[]')
+    ($1, $2, $3, '[]', unixepoch('now', 'subsec') * 1000000000)
 ON CONFLICT (table_id, partition_key)
 DO UPDATE SET partition_key = partition.partition_key
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at,
+    created_at;
         "#,
         )
         .bind(key) // $1
@@ -988,7 +1016,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
 
         sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 WHERE id IN (SELECT value FROM json_each($1));
             "#,
@@ -1003,7 +1031,7 @@ WHERE id IN (SELECT value FROM json_each($1));
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 WHERE table_id = $1;
             "#,
@@ -1050,7 +1078,8 @@ WHERE table_id = $1;
 UPDATE partition
 SET sort_key_ids = $1
 WHERE id = $2 AND sort_key_ids = $3
-RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at,
+    created_at;
         "#,
         )
         .bind(Json(raw_new_sort_key_ids)) // $1
@@ -1186,7 +1215,7 @@ RETURNING *
     async fn most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 ORDER BY id DESC
 LIMIT $1;
@@ -1271,7 +1300,7 @@ WHERE id = $2;
     async fn list_old_style(&mut self) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at
+SELECT id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at, created_at
 FROM partition
 WHERE hash_id IS NULL
 ORDER BY id DESC;
@@ -1294,6 +1323,10 @@ FROM partition
 JOIN table_name on partition.table_id = table_name.id
 JOIN namespace on table_name.namespace_id = namespace.id
 WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
+    AND (
+        partition.created_at IS NULL
+        OR partition.created_at < unixepoch('now', '-1 day', 'subsec') * 1000000000
+    )
     AND retention_period_ns IS NOT NULL;
         "#,
         )
@@ -1314,10 +1347,13 @@ WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
         drop(stream);
 
         // We use a JSON-based "IS IN" check.
-        let ids: Vec<_> = to_remove.iter().map(|(p, _)| p.get()).collect();
+        // This type annotation and extra Vec allocation are to ensure we're selecting the
+        // partition ID rather than the table ID.
+        let ids: Vec<PartitionId> = to_remove.iter().map(|(_table_id, p)| *p).collect();
+        let raw_ids: Vec<_> = ids.iter().map(|p| p.get()).collect();
 
         sqlx::query(r#"DELETE FROM partition WHERE id IN (SELECT value FROM json_each($1));"#)
-            .bind(Json(&ids[..])) // $1
+            .bind(Json(&raw_ids[..])) // $1
             .execute(&mut *tx)
             .await?;
 
@@ -1460,23 +1496,14 @@ RETURNING partition_id, object_store_id;
         Ok(flagged)
     }
 
-    async fn delete_old_ids_only(
-        &mut self,
-        _older_than: Timestamp,
-        cutoff: Duration,
-    ) -> Result<Vec<ObjectStoreId>> {
-        let cutoff_nanos: i64 = cutoff
-            .as_nanos()
-            .try_into()
-            .expect("deletion cutoff duration nanos should fit in an i64");
-
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-sqlite-ctes-to-the-rescue
         let deleted = sqlx::query(
             r#"
 WITH parquet_file_ids as (
     SELECT object_store_id
     FROM parquet_file
-    WHERE to_delete < unixepoch('now', 'subsec') * 1000000000 - $1
+    WHERE to_delete < $1
     LIMIT $2
 )
 DELETE FROM parquet_file
@@ -1484,7 +1511,7 @@ WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
 RETURNING object_store_id;
              "#,
         )
-        .bind(cutoff_nanos) // $1
+        .bind(older_than) // $1
         .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
         .fetch_all(self.inner.get_mut())
         .await?;
@@ -1670,6 +1697,43 @@ WHERE object_store_id IN ({v});",
 
         Ok(ids)
     }
+
+    async fn list_by_table_id(
+        &mut self,
+        table_id: TableId,
+        compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>> {
+        let result = sqlx::query(
+            format!(
+                r#"
+        SELECT
+            id, namespace_id, table_id, partition_id, partition_hash_id,
+            object_store_id, min_time, max_time, to_delete, file_size_bytes,
+            row_count, compaction_level, created_at, column_set,
+            max_l0_created_at, source
+        FROM
+            parquet_file
+        WHERE
+            table_id = {}
+        AND
+            {}"#,
+                table_id,
+                crate::util::compaction_level_sql_predicate(compaction_level)
+            )
+            .as_str(),
+        )
+        .fetch_all(self.inner.get_mut())
+        .await?;
+
+        Ok(result
+            .iter()
+            .map(|pf| {
+                ParquetFilePod::from_row(pf)
+                    .expect("ParquetFilePod FromRow derive works")
+                    .into()
+            })
+            .collect())
+    }
 }
 
 // The following three functions are helpers to the create_upgrade_delete method.
@@ -1723,7 +1787,11 @@ RETURNING
     .bind(created_at) // $10
     .bind(namespace_id) // $11
     .bind(from_column_set(&column_set)) // $12
-    .bind(max_l0_created_at) // $13
+    .bind(
+        max_l0_created_at
+            .maybe_computed_timestamp()
+            .unwrap_or(created_at),
+    ) // $13
     .bind(source) // $14
     .fetch_one(executor)
     .await;
@@ -1876,11 +1944,60 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
-        crate::interface_tests::test_catalog(|| async {
-            let sqlite = setup_db().await;
-            let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+        let sqlite = setup_db().await;
+        let pool = sqlite.pool.clone();
+
+        let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+
+        let catalog_reset_fn = || async {
+            pool.execute(
+                r#"
+DELETE FROM skipped_compactions;
+DELETE FROM parquet_file;
+DELETE FROM partition;
+DELETE FROM column_name;
+DELETE FROM table_name;
+DELETE FROM namespace;
+"#,
+            )
+            .await
+            .expect("failed to clean database between tests");
+
+            let sqlite = Arc::clone(&sqlite);
+            sqlite.setup().await.expect("failed to reset database");
             sqlite
-        })
+        };
+
+        crate::interface_tests::test_catalog(catalog_reset_fn).await;
+
+        crate::interface_tests::test_partition_retention(
+            catalog_reset_fn().await,
+            |key, table_id, created_at| {
+                let pool = pool.clone();
+                async move {
+                    let hash_id = PartitionHashId::new(table_id, &key);
+                    sqlx::query_as::<_, PartitionPod>(
+                        r#"
+INSERT INTO partition
+    (partition_key, table_id, hash_id, sort_key_ids, created_at)
+VALUES
+    ($1, $2, $3, '[]', $4)
+ON CONFLICT (table_id, partition_key)
+DO UPDATE SET partition_key = partition.partition_key
+RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_compact_at,
+    created_at;"#,
+                    )
+                    .bind(&key) // $1
+                    .bind(table_id) // $2
+                    .bind(&hash_id) // $3
+                    .bind(created_at) // $4
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .into()
+                }
+            },
+        )
         .await;
     }
 
@@ -2511,5 +2628,50 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             .await
             .unwrap();
         assert_eq!(need_cold.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_catalog_get_time() {
+        // Create two catalogs - one for manually querying sqlite
+        // the other for using the `SqliteCatalog::get_time()` method.
+        let c1 = Arc::new(setup_db().await);
+        let c2 = Arc::clone(&c1);
+
+        // Get the system's idea of now - sqlite runs
+        // on the same machine as CI, so system time
+        // and sqlite time should be somewhat close.
+        let system_now = SystemProvider::new().now();
+
+        // Manually get the current time from sqlite
+        // as a timestamp in microseconds.
+        let query_now_row = c1
+            .pool
+            .fetch_one(sqlx::query(
+                r#"SELECT CAST((SELECT (unixepoch('subsec') * 1000000)) AS INT)"#,
+            ))
+            .await
+            .unwrap()
+            .get(0);
+
+        // Finally, get the time from the catalog using
+        // the `SqliteCatalog::get_time()` method.
+        let catalog_now = c2.get_time().await;
+
+        // Convert the timestamp after having gathered all times
+        // to ensure they are as close as possible to one another.
+        let query_now = Time::from_timestamp_micros(query_now_row)
+            .ok_or("Failed to convert sqlite timestamp to `Time`");
+
+        // Check that all times are within a second of one another.
+        // CI and sqlite is ran on the same machine, so this is reasonable.
+        assert_matches!(
+            (query_now, catalog_now),
+            (Ok(t1), Ok(t2)) => {
+                // Assert that all times are within 1 second of each other.
+                assert!(system_now.second().abs_diff(t1.second()) <= 1);
+                assert!(t1.second().abs_diff(t2.second()) <= 1);
+                assert!(system_now.second().abs_diff(t2.second()) <= 1);
+            }
+        );
     }
 }

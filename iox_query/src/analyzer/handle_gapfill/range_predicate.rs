@@ -513,7 +513,7 @@ mod tests {
         // - through projections that alias columns
         let plan = LogicalPlanBuilder::from(table_scan()?)
             .filter(col("time").gt_eq(lit_timestamptz_nano(1000)))?
-            .sort(vec![col("time")])?
+            .sort(vec![col("time").sort(true, true)])?
             .limit(0, Some(10))?
             .project(vec![col("time").alias("other_time")])?
             .filter(col("other_time").lt(lit_timestamptz_nano(2000)))?

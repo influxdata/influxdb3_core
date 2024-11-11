@@ -26,7 +26,10 @@ fn test_new_column() {
         "+-------+",
     ];
 
-    assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
 
     let mut writer = Writer::new(&mut batch, 1);
     writer
@@ -36,5 +39,8 @@ fn test_new_column() {
     std::mem::drop(writer);
 
     // Should not include tag1 column
-    assert_batches_eq!(expected, &[batch.to_arrow(Projection::All).unwrap()]);
+    assert_batches_eq!(
+        expected,
+        &[batch.clone().try_into_arrow(Projection::All).unwrap()]
+    );
 }

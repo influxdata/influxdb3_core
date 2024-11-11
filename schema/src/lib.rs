@@ -11,7 +11,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt,
     mem::{size_of, size_of_val},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use arrow::datatypes::{
@@ -36,13 +36,8 @@ pub const INFLUXQL_METADATA_KEY: &str = "iox::influxql::group_key::metadata";
 // https://github.com/influxdata/idpe/issues/18154
 #[allow(non_snake_case)]
 pub fn TIME_DATA_TIMEZONE() -> Option<Arc<str>> {
-    _TIME_DATA_TIMEZONE.clone()
+    None
 }
-
-/// This enables setting the default timezone. This is currently only tested for UTC and other timezone may cause issues.
-static _TIME_DATA_TIMEZONE: LazyLock<Option<Arc<str>>> = LazyLock::new(|| {
-    std::env::var("INFLUXDB_IOX_TIME_DATA_TIMEZONE").map_or_else(|_| None, |v| Some(v.into()))
-});
 
 /// the [`ArrowDataType`] to use for InfluxDB timestamps
 #[allow(non_snake_case)]
@@ -1486,7 +1481,7 @@ mod test {
             .unwrap();
 
         // this is mostly a smoke test
-        assert_eq!(schema.estimate_size(), 1246);
+        assert_eq!(schema.estimate_size(), 1243);
     }
 
     #[cfg(feature = "v3")]

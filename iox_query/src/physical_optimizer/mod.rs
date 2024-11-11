@@ -60,14 +60,14 @@ pub fn register_iox_physical_optimizers(mut state: SessionStateBuilder) -> Sessi
             .rules,
     );
 
-    // install cached parquet readers AFTER DataFusion (re-)creates ParquetExec's
-    optimizers.push(Arc::new(CachedParquetData));
-
     // Add a rule to optimize plan that use ProgressiveEval
     // for limit query
     optimizers.push(Arc::new(OrderUnionSortedInputs));
     // for show tag values query
     optimizers.push(Arc::new(OrderUnionSortedInputsForConstants));
+
+    // install cached parquet readers AFTER DataFusion (re-)creates ParquetExec's
+    optimizers.push(Arc::new(CachedParquetData));
 
     // Perform the limits check last giving the other rules the best chance
     // to keep the under the limit.

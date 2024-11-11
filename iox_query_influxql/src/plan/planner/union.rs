@@ -23,8 +23,8 @@ pub(crate) fn union_and_coerce(
     next: LogicalPlan,
 ) -> datafusion::common::Result<LogicalPlan> {
     let union_schema = coerce_union_schema(vec![&prev, &next]);
-    let prev = coerce_plan_expr_for_schema(&prev, &union_schema)?;
-    let next = coerce_plan_expr_for_schema(&next, &union_schema)?;
+    let prev = coerce_plan_expr_for_schema(prev, &union_schema)?;
+    let next = coerce_plan_expr_for_schema(next, &union_schema)?;
     union(prev, next)
 }
 

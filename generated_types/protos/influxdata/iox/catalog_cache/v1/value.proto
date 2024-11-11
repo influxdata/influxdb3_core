@@ -78,6 +78,10 @@ message Partition {
 
   // The time of the last cold compaction
   optional int64 cold_compact_at = 12;
+
+  // The time this partition was created, or `None` if this partition was created before this field
+  // existed
+  optional int64 created_at = 13;
 }
 
 enum ParquetFileSource {

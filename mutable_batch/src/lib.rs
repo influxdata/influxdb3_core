@@ -81,12 +81,12 @@ impl MutableBatch {
         }
     }
 
-    /// Returns the schema for a given selection
+    /// Returns the schema for a given projection
     ///
-    /// If Selection::All the returned columns are sorted by name
-    pub fn schema(&self, selection: Projection<'_>) -> Result<Schema> {
+    /// If [`Projection::All`] the returned columns are sorted by name
+    pub fn schema(&self, projection: Projection<'_>) -> Result<Schema> {
         let mut schema_builder = SchemaBuilder::new();
-        let schema = match selection {
+        let schema = match projection {
             Projection::All => {
                 for (column_name, column_idx) in &self.column_names {
                     let column = &self.columns[*column_idx];
@@ -110,23 +110,40 @@ impl MutableBatch {
         Ok(schema)
     }
 
-    /// Convert all the data in this `MutableBatch` into a `RecordBatch`
-    pub fn to_arrow(&self, selection: Projection<'_>) -> Result<RecordBatch> {
-        let schema = self.schema(selection)?;
-        let columns = schema
+    /// Convert all the data in this `MutableBatch` into a `RecordBatch`,
+    /// consuming self.
+    ///
+    /// Note this panics if the `projection` contains a column that does not
+    /// exist in the batch or a repeated column name.
+    pub fn try_into_arrow(self, projection: Projection<'_>) -> Result<RecordBatch> {
+        let schema = self.schema(projection)?;
+
+        let Self {
+            column_names,
+            columns,
+            row_count: _,
+        } = self;
+
+        // Convert to Vec<Option<_>> to remove each Column avoid copying the
+        // underlying data
+        let mut columns = columns.into_iter().map(Some).collect::<Vec<_>>();
+
+        let arrays: Result<Vec<_>, Error> = schema
             .iter()
             .map(|(_, field)| {
-                let column = self
-                    .column(field.name())
-                    .expect("schema contains non-existent column");
-
-                column.to_arrow().context(ColumnSnafu {
-                    column: field.name(),
-                })
+                let column_index = column_names
+                    .get(field.name())
+                    .expect("schema contains non-existent or column");
+                std::mem::take(&mut columns[*column_index])
+                    .expect("schema contains repeated column name")
+                    .try_into_arrow()
+                    .context(ColumnSnafu {
+                        column: field.name(),
+                    })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
-        RecordBatch::try_new(schema.into(), columns).context(ArrowSnafu {})
+        RecordBatch::try_new(schema.into(), arrays?).context(ArrowSnafu {})
     }
 
     /// Returns an iterator over the columns in this batch in no particular order
@@ -392,7 +409,7 @@ mod tests {
                 "| 1.1 |    | hello | world | 1970-01-01T00:00:00.000001234Z |",
                 "+-----+----+-------+-------+--------------------------------+",
             ],
-            &[batch.to_arrow(Projection::All).unwrap()]
+            &[batch.clone().try_into_arrow(Projection::All).unwrap()]
         );
         assert_batches_eq!(
             &[
@@ -402,7 +419,7 @@ mod tests {
                 "| 2.2 | 2  |    | w  | 1970-01-01T00:00:00.000001234Z |",
                 "+-----+----+----+----+--------------------------------+",
             ],
-            &[got.to_arrow(Projection::All).unwrap()]
+            &[got.clone().try_into_arrow(Projection::All).unwrap()]
         );
 
         assert_eq!(batch.rows(), 1);
@@ -452,7 +469,7 @@ mod tests {
                 "| 2.2 | 2  |       | w     | 1970-01-01T00:00:00.000001234Z |",
                 "+-----+----+-------+-------+--------------------------------+",
             ],
-            &[got.to_arrow(Projection::All).unwrap()]
+            &[got.clone().try_into_arrow(Projection::All).unwrap()]
         );
 
         assert_eq!(batch.rows(), 0);
@@ -502,7 +519,7 @@ mod tests {
                 "| 2.2 | 2  |       | w     | 1970-01-01T00:00:00.000001234Z |",
                 "+-----+----+-------+-------+--------------------------------+",
             ],
-            &[batch.to_arrow(Projection::All).unwrap()]
+            &[batch.clone().try_into_arrow(Projection::All).unwrap()]
         );
 
         assert_eq!(batch.rows(), 2);
@@ -525,44 +542,5 @@ mod tests {
             got.schema(Projection::All).unwrap().len(),
             got.columns().len()
         );
-    }
-}
-
-/// Test helpers for randomised testing.
-#[cfg(any(test, feature = "arbitrary"))]
-pub mod arbitrary {
-    use proptest::prelude::*;
-
-    use crate::{
-        column::{arbitrary::arbitrary_column, Column},
-        MutableBatch,
-    };
-
-    /// Deterministically generate a name for `c` derived from the column type.
-    fn column_name(c: &Column) -> String {
-        format!("col-{}", c.influx_type())
-    }
-
-    /// Instantiate a [`MutableBatch`] containing random columns and data.
-    ///
-    /// The batch will contain at most one column of each data type.
-    pub fn arbitrary_mutable_batch() -> impl Strategy<Value = MutableBatch> {
-        prop::collection::vec(arbitrary_column(), 0..20).prop_map(|v| {
-            v.into_iter().fold(MutableBatch::new(), |mut acc, v| {
-                // Convert this column into a single-column batch, and then
-                // merge it into the accumulator.
-                //
-                // This allows us to build batches that contain null ranges,
-                // correct batch statistics, etc.
-                let c = MutableBatch {
-                    column_names: [(column_name(&v), 0)].into_iter().collect(),
-                    row_count: v.len(),
-                    columns: vec![v],
-                };
-
-                acc.extend_from(&c).expect("must merge batch");
-                acc
-            })
-        })
     }
 }

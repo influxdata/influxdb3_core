@@ -109,7 +109,11 @@ fn object_store_error_to_tonic_code(e: &object_store::Error) -> tonic::Code {
         | Error::Precondition { .. }
         | Error::NotModified { .. }
         | Error::NotImplemented
+        | Error::PermissionDenied { .. }
+        | Error::Unauthenticated { .. }
         | Error::UnknownConfigurationKey { .. } => tonic::Code::Internal,
+        // enum is non exhaustive so it is not possible to match all variants here
+        _ => tonic::Code::Internal,
     }
 }
 

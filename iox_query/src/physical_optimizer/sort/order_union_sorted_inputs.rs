@@ -10,14 +10,18 @@ use datafusion::{
         union::UnionExec, ExecutionPlan,
     },
 };
-use observability_deps::tracing::{debug, trace, warn};
+use observability_deps::tracing::{trace, warn};
 
 use crate::{
     physical_optimizer::sort::util::{
-        accepted_union_exec, add_sort_preserving_merge, collect_statistics_min_max,
-        sort_by_value_ranges,
+        accepted_union_exec, collect_statistics_min_max, sort_plans_by_value_ranges,
+        split_files_or_add_sort_preserving_merge,
     },
     provider::progressive_eval::ProgressiveEvalExec,
+};
+
+use super::util::{
+    has_deduplicate, only_one_parquet_exec, transform_parquet_exec_single_file_each_group,
 };
 
 /// IOx specific optimization that eliminates a `SortPreservingMerge` by reordering inputs in terms
@@ -106,65 +110,99 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
             if sort_expr.len() != 1 {
                 trace!(
                     ?sort_expr,
-                    "-------- sortExpr is not on one column. No optimization"
+                    "sortExpr is not on one column. No optimization"
                 );
                 return Ok(Transformed::no(plan));
             };
             let Some(sorted_col) = sort_expr[0].expr.as_any().downcast_ref::<Column>() else {
                 trace!(
                     ?sort_expr,
-                    "-------- sortExpr is not on pure column but expression. No optimization"
+                    "sortExpr is not on pure column but expression. No optimization"
                 );
                 return Ok(Transformed::no(plan));
             };
             let sort_options = sort_expr[0].options;
 
+            let mut input_value_ranges= None;
             // Find UnionExec
-            let Some(union_exec) = accepted_union_exec(sort_preserving_merge_exec)
-            else {
-                trace!("-------- SortPreservingMergeExec input is not UnionExec. No optimization");
-                return Ok(Transformed::no(plan));
+            let transformed_input_plan: Option<Arc<dyn ExecutionPlan>> = if let Some(union_exec) = accepted_union_exec(sort_preserving_merge_exec) {
+                // Check all inputs of UnionExec must be already sorted and on the same sort_expr of SortPreservingMergeExec
+                let Some(union_output_ordering) = union_exec.properties().output_ordering() else {
+                    warn!(plan=%displayable(plan.as_ref()).indent(false), "Union input to SortPreservingMerge is not sorted");
+                    return Ok(Transformed::no(plan));
+                };
+
+                // Check if the first PhysicalSortExpr is the same as the sortExpr[0] in SortPreservingMergeExec
+                if sort_expr[0] != union_output_ordering[0] {
+                    // this happens in production https://github.com/influxdata/influxdb_iox/issues/10641
+                    trace!(?sort_expr, ?union_output_ordering, plan=%displayable(plan.as_ref()).indent(false),
+                        "Sort order of SortPreservingMerge and its children are different");
+                    return Ok(Transformed::no(plan));
+                }
+
+                let Some(value_ranges) = collect_statistics_min_max(union_exec.inputs(), sorted_col.name())?
+                else {
+                    return Ok(Transformed::no(plan));
+                };
+
+                // Sort the inputs by their value ranges
+                trace!("value_ranges: {:?}", value_ranges);
+                let Some(plans_value_ranges) =
+                    sort_plans_by_value_ranges(union_exec.inputs().to_vec(), value_ranges, sort_options)?
+                else {
+                    trace!("inputs are not sorted by value ranges. No optimization");
+                    return Ok(Transformed::no(plan));
+                };
+
+                // If each input of UnionExec outputs many sorted streams, data of different streams may overlap and
+                // even if they do not overlapped, their streams can be in any order. We need to (sort) merge them first
+                // to have a single output stream out to guarantee the output is sorted.
+                let new_inputs = split_files_or_add_sort_preserving_merge(plans_value_ranges.plans, sorted_col.name(), sort_options, sort_expr, sort_preserving_merge_exec.fetch())?;
+                input_value_ranges = Some(plans_value_ranges.value_ranges);
+
+                Some(Arc::new(UnionExec::new(new_inputs)))
+
+            } else { // No union under SortPreservingMergeExec
+
+                // No union means underneath SortPreservingMergeExec is one input. Still optimize using ProgressiveEval if
+                // it is a LIMIT plan of all non-overlapped parquet files. It means we need to check for:
+                //   1. limit
+                //   2. no DeduplicateExec
+                //   3. one ParquetExec
+                //   4. and all files of that ParquetExec are non-overlapped
+
+                let input = sort_preserving_merge_exec.input();
+                let is_limit_query = sort_preserving_merge_exec.fetch().is_some();
+
+                // three top conditions meet
+                let try_transform = is_limit_query && !has_deduplicate(input)? && only_one_parquet_exec(input)?;
+
+                let transformed_input_plan = if try_transform {
+                    // get statistics of the files
+                    input_value_ranges = collect_statistics_min_max(&[Arc::clone(input)], sorted_col.name())?;
+                    // transform the files if the files are non-overlapped
+                    let transformed_input_plan = transform_parquet_exec_single_file_each_group(Arc::clone(input), sorted_col.name(), sort_options);
+
+                    if let Ok(transformed_input_plan) = transformed_input_plan {
+                        Some(transformed_input_plan)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                transformed_input_plan
             };
 
-            // Check all inputs of UnionExec must be already sorted and on the same sort_expr of SortPreservingMergeExec
-            let Some(union_output_ordering) = union_exec.properties().output_ordering() else {
-                warn!(plan=%displayable(plan.as_ref()).indent(false), "Union input to SortPreservingMerge is not sorted");
+            let Some(transformed_input_plan) = transformed_input_plan else {
                 return Ok(Transformed::no(plan));
             };
-
-            // Check if the first PhysicalSortExpr is the same as the sortExpr[0] in SortPreservingMergeExec
-            if sort_expr[0] != union_output_ordering[0] {
-                // this happens in production https://github.com/influxdata/influxdb_iox/issues/10641
-                debug!(?sort_expr, ?union_output_ordering, plan=%displayable(plan.as_ref()).indent(false),
-                    "-------- Sort order of SortPreservingMerge and its children are different");
-                return Ok(Transformed::no(plan));
-            }
-
-            let Some(value_ranges) = collect_statistics_min_max(union_exec.inputs(), sorted_col.name())?
-            else {
-                return Ok(Transformed::no(plan));
-            };
-
-            // Sort the inputs by their value ranges
-            trace!("-------- value_ranges: {:?}", value_ranges);
-            let Some(plans_value_ranges) =
-                sort_by_value_ranges(union_exec.inputs().to_vec(), value_ranges, sort_options)?
-            else {
-                trace!("-------- inputs are not sorted by value ranges. No optimization");
-                return Ok(Transformed::no(plan));
-            };
-
-            // If each input of UnionExec outputs many sorted streams, data of different streams may overlap and
-            // even if they do not overlapped, their streams can be in any order. We need to (sort) merge them first
-            // to have a single output stream out to guarantee the output is sorted.
-            let new_inputs = add_sort_preserving_merge(plans_value_ranges.plans, sort_expr, sort_preserving_merge_exec.fetch())?;
-
-            let new_union_exec = Arc::new(UnionExec::new(new_inputs));
 
             // Replace SortPreservingMergeExec with ProgressiveEvalExec
             let progresive_eval_exec = Arc::new(ProgressiveEvalExec::new(
-                new_union_exec,
-                Some(plans_value_ranges.value_ranges),
+                transformed_input_plan,
+                input_value_ranges,
                 sort_preserving_merge_exec.fetch(),
             ));
 
@@ -187,7 +225,8 @@ mod test {
 
     use arrow::{compute::SortOptions, datatypes::SchemaRef};
     use datafusion::{
-        logical_expr::Operator,
+        datasource::provider_as_source,
+        logical_expr::{LogicalPlanBuilder, Operator},
         physical_expr::PhysicalSortExpr,
         physical_plan::{
             expressions::{BinaryExpr, Column},
@@ -198,172 +237,141 @@ mod test {
             union::UnionExec,
             ExecutionPlan, Partitioning, PhysicalExpr,
         },
+        prelude::{col, lit},
         scalar::ScalarValue,
     };
-    use schema::{InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
+    use executor::DedicatedExecutor;
+    use schema::{sort::SortKey, InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
 
     use crate::{
+        exec::{Executor, ExecutorConfig},
         physical_optimizer::{
-            sort::order_union_sorted_inputs::OrderUnionSortedInputs, test_util::OptimizationTest,
+            sort::{
+                order_union_sorted_inputs::OrderUnionSortedInputs,
+                util::{has_deduplicate, only_one_parquet_exec},
+            },
+            test_util::OptimizationTest,
         },
-        provider::{chunks_to_physical_nodes, DeduplicateExec, RecordBatchesExec},
+        provider::{chunks_to_physical_nodes, DeduplicateExec, ProviderBuilder, RecordBatchesExec},
         statistics::{column_statistics_min_max, compute_stats_column_min_max},
         test::{format_execution_plan, TestChunk},
         QueryChunk, CHUNK_ORDER_COLUMN_NAME,
     };
 
     // ------------------------------------------------------------------
+    // Test only one ParquetExec & no deduplicate
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_one_parquet_exec_and_has_dedup() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+
+        let final_sort_exprs = [("time", SortOp::Desc)];
+
+        let target_partition = 3;
+        let plan_parquet_1 = PlanBuilder::parquet_exec_non_overlapped_chunks(
+            &schema,
+            5,
+            1000,
+            200,
+            target_partition,
+        );
+        insta::assert_yaml_snapshot!(
+            plan_parquet_1.formatted(),
+            @r#"- " ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan = plan_parquet_1.clone().build();
+        assert!(only_one_parquet_exec(&plan).unwrap());
+        assert!(!has_deduplicate(&plan).unwrap());
+
+        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan_sort_1 = plan_parquet_1.sort_with_preserve_partitioning(final_sort_exprs);
+        let plan = plan_sort_1.clone().build();
+        assert!(only_one_parquet_exec(&plan).unwrap());
+        assert!(!has_deduplicate(&plan).unwrap());
+
+        // ------------------------------------------------------------------
+        // Sort plan of a parquet overlapped files
+        // Two overlapped files [2001, 2202] and [2201, 2402]
+        let plan_parquet_2 = PlanBuilder::parquet_exec_overlapped_chunks(&schema, 3, 2001, 200, 2);
+        insta::assert_yaml_snapshot!(
+            plan_parquet_2.formatted(),
+            @r#"- " ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan = plan_parquet_2.clone().build();
+        assert!(only_one_parquet_exec(&plan).unwrap());
+        assert!(!has_deduplicate(&plan).unwrap());
+
+        // sort expression for deduplication
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan_spm_2 = plan_parquet_2.sort_preserving_merge(sort_exprs);
+        let plan = plan_spm_2.clone().build();
+        assert!(only_one_parquet_exec(&plan).unwrap());
+        assert!(!has_deduplicate(&plan).unwrap());
+
+        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan_dedup_2 = plan_spm_2.deduplicate(sort_exprs, false);
+        let plan = plan_dedup_2.clone().build();
+        assert!(only_one_parquet_exec(&plan).unwrap());
+        assert!(has_deduplicate(&plan).unwrap());
+
+        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan_sort_2 = plan_dedup_2.sort(final_sort_exprs);
+        let plan = plan_sort_2.clone().build();
+        assert!(only_one_parquet_exec(&plan).unwrap());
+        assert!(has_deduplicate(&plan).unwrap());
+
+        // union 2 plan
+        //   - "   UnionExec"
+        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan_union = plan_sort_1.union(plan_sort_2);
+        let plan = plan_union.clone().build();
+        assert!(!only_one_parquet_exec(&plan).unwrap());
+        assert!(has_deduplicate(&plan).unwrap());
+
+        //   - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
+        //   - "   UnionExec"
+        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        let plan_spm = plan_union.sort_preserving_merge(final_sort_exprs);
+        let plan = plan_spm.clone().build();
+        assert!(!only_one_parquet_exec(&plan).unwrap());
+        assert!(has_deduplicate(&plan).unwrap());
+    }
+
+    // ------------------------------------------------------------------
     // Positive tests: the right structure found -> plan optimized
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_limit_mix_record_batch_parquet_1_desc() {
-        test_helpers::maybe_start_logging();
-
-        // Input plan:
-        //
-        // GlobalLimitExec: skip=0, fetch=2
-        //  SortPreservingMerge: [time@2 DESC]
-        //    UnionExec
-        //      SortExec: expr=[time@2 DESC]   -- time range [1000, 2000]
-        //        ParquetExec                         -- [1000, 2000]
-        //      SortExec: expr=[time@2 DESC]   -- time range [2001, 3500] from combine time range of two record batches
-        //        UnionExec
-        //          RecordBatchesExec                 -- 3 chunks [2001, 3000]
-        //          RecordBatchesExec                 -- 2 chunks [2500, 3500]
-        //
-        // Output plan: the 2 SortExecs will be swapped the order to have time range [2001, 3500] first
-
-        let schema = schema();
-
-        let sort_exprs = [("time", SortOp::Desc)];
-
-        let plan_sort2 = PlanBuilder::record_batches_exec(3, 2001, 3000)
-            .union(PlanBuilder::record_batches_exec(2, 2500, 3500))
-            .sort(sort_exprs);
-
-        let plan_sort1 = PlanBuilder::parquet_exec(&schema, 1000, 2000).sort(sort_exprs);
-
-        // min max of plan_sorted1 is [1000, 2000]
-        // structure of plan_sorted1
-        insta::assert_yaml_snapshot!(
-            plan_sort1.formatted(),
-            @r###"
-        ---
-        - " SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
-        );
-        let min_max_sort1 = compute_stats_column_min_max(plan_sort1.inner(), "time").unwrap();
-        let min_max = column_statistics_min_max(&min_max_sort1).unwrap();
-        assert_eq!(
-            min_max,
-            (
-                ScalarValue::TimestampNanosecond(Some(1000), None),
-                ScalarValue::TimestampNanosecond(Some(2000), None)
-            )
-        );
-        //
-        // min max of plan_sorted2 is [2001, 3500]
-        insta::assert_yaml_snapshot!(plan_sort2.formatted(),
-            @r###"
-        ---
-        - " SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        - "   UnionExec"
-        - "     RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
-        - "     RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-        "###
-        );
-        let min_max_sort2 = compute_stats_column_min_max(plan_sort2.inner(), "time").unwrap();
-        let min_max = column_statistics_min_max(&min_max_sort2).unwrap();
-        assert_eq!(
-            min_max,
-            (
-                ScalarValue::TimestampNanosecond(Some(2001), None),
-                ScalarValue::TimestampNanosecond(Some(3500), None)
-            )
-        );
-
-        let plan_spm = plan_sort1
-            .union(plan_sort2)
-            .sort_preserving_merge(sort_exprs);
-
-        // min max of plan_spm is [1000, 3500]
-        insta::assert_yaml_snapshot!(
-            plan_spm.formatted(),
-            @r###"
-        ---
-        - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
-        - "   UnionExec"
-        - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        - "       UnionExec"
-        - "         RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
-        - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-        "###
-        );
-        let min_max_spm = compute_stats_column_min_max(plan_spm.inner(), "time").unwrap();
-        let min_max = column_statistics_min_max(&min_max_spm).unwrap();
-        assert_eq!(
-            min_max,
-            (
-                ScalarValue::TimestampNanosecond(Some(1000), None),
-                ScalarValue::TimestampNanosecond(Some(3500), None)
-            )
-        );
-
-        let plan_limit = plan_spm.limit(0, Some(1));
-
-        // Output plan: the 2 SortExecs will be swapped the order
-        let opt = OrderUnionSortedInputs;
-        insta::assert_yaml_snapshot!(
-            OptimizationTest::new(plan_limit.build(), opt),
-            @r###"
-        ---
-        input:
-          - " GlobalLimitExec: skip=0, fetch=1"
-          - "   SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
-          - "     UnionExec"
-          - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-          - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "         UnionExec"
-          - "           RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
-          - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-        output:
-          Ok:
-            - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
-            - "     UnionExec"
-            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         UnionExec"
-            - "           RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
-            - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
-        );
-    }
-
-    #[test]
     fn test_limit_mix_record_batch_parquet_2_desc() {
         test_helpers::maybe_start_logging();
-
-        // Input plan:
-        //
-        // GlobalLimitExec: skip=0, fetch=2
-        //  SortPreservingMerge: [time@2 DESC]
-        //    UnionExec
-        //      SortExec: expr=[time@2 DESC]   -- time range [1000, 2000]
-        //        ParquetExec                         -- [1000, 2000]
-        //      SortExec: expr=[time@2 DESC]   -- time range [2001, 3500] from combine time range of two record batches
-        //        UnionExec
-        //           SortExec: expr=[time@2 DESC]
-        //              RecordBatchesExec             -- 2 chunks [2500, 3500]
-        //           ParquetExec                      -- [2001, 3000]
-        //
-        // Output plan: the 2 SortExecs will be swapped the order to have time range [2001, 3500] first
 
         let schema = schema();
         let sort_exprs = [
@@ -378,11 +386,12 @@ mod test {
 
         let plan_sort1 = plan_batches.sort(sort_exprs);
         let plan_union_1 = plan_sort1.union(plan_parquet2);
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
 
         let sort_exprs = [("time", SortOp::Desc)];
-
         let plan_sort2 = plan_parquet.sort(sort_exprs);
-        let plan_sort3 = plan_union_1.sort(sort_exprs);
+        let plan_sort3 = plan_dedupe.sort(sort_exprs);
 
         let plan_union_2 = plan_sort2.union(plan_sort3);
 
@@ -393,8 +402,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_limit.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " GlobalLimitExec: skip=0, fetch=1"
           - "   SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
@@ -402,23 +410,27 @@ mod test {
           - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
           - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "         UnionExec"
-          - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "             UnionExec"
+          - "               SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
+            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
             - "     UnionExec"
             - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         UnionExec"
-            - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
             - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -427,26 +439,10 @@ mod test {
     fn test_limit_mix_record_batch_parquet_non_time_sort_desc() {
         test_helpers::maybe_start_logging();
 
-        // Input plan:
-        //
-        // GlobalLimitExec: skip=0, fetch=2
-        //  SortPreservingMerge: [field1@2 DESC]
-        //    UnionExec
-        //      SortExec: expr=[field1@2 DESC]   -- time range [1000, 2000]
-        //        ParquetExec                         -- [1000, 2000]
-        //      SortExec: expr=[field1@2 DESC]   -- time range [2001, 3500] from combine time range of two record batches
-        //        UnionExec
-        //           SortExec: expr=[field1@2 DESC]
-        //              RecordBatchesExec             -- 2 chunks [2500, 3500]
-        //           ParquetExec                      -- [2001, 3000]
-        //
-        // Output plan: the 2 SortExecs will be swapped the order to have time range [2001, 3500] first
-
         let schema = schema();
         let sort_exprs = [
             ("col2", SortOp::Asc),
             ("col1", SortOp::Asc),
-            ("field1", SortOp::Asc),
             ("time", SortOp::Asc),
         ];
 
@@ -457,10 +453,13 @@ mod test {
         let plan_sort1 = plan_batches.sort(sort_exprs);
         let plan_union_1 = plan_sort1.union(plan_parquet2);
 
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
+
         let sort_exprs = [("field1", SortOp::Desc)];
 
         let plan_sort2 = plan_parquet.sort(sort_exprs);
-        let plan_sort3 = plan_union_1.sort(sort_exprs);
+        let plan_sort3 = plan_dedupe.sort(sort_exprs);
 
         let plan_union_2 = plan_sort2.union(plan_sort3);
 
@@ -472,8 +471,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_limit.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " GlobalLimitExec: skip=0, fetch=1"
           - "   SortPreservingMergeExec: [field1@2 DESC NULLS LAST]"
@@ -481,23 +479,27 @@ mod test {
           - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
           - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "         UnionExec"
-          - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,field1@2 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "             UnionExec"
+          - "               SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
             - "   ProgressiveEvalExec: input_ranges=[(Int64(2001), Int64(3500)), (Int64(1000), Int64(2000))]"
             - "     UnionExec"
             - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         UnionExec"
-            - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,field1@2 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
             - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -506,26 +508,10 @@ mod test {
     fn test_limit_mix_record_batch_parquet_non_time_sort_asc() {
         test_helpers::maybe_start_logging();
 
-        // Input plan:
-        //
-        // GlobalLimitExec: skip=0, fetch=2
-        //  SortPreservingMerge: [field1@2 ASC]
-        //    UnionExec
-        //      SortExec: expr=[field1@2 ASC]   -- time range [1000, 2000]
-        //        ParquetExec                         -- [1000, 2000]
-        //      SortExec: expr=[field1@2 ASC]   -- time range [2001, 3500] from combine time range of two record batches
-        //        UnionExec
-        //           SortExec: expr=[field1@2 ASC]
-        //              RecordBatchesExec             -- 2 chunks [2500, 3500]
-        //           ParquetExec                      -- [2001, 3000]
-        //
-        // Output plan: same as input plan
-
         let schema = schema();
         let sort_exprs = [
             ("col2", SortOp::Asc),
             ("col1", SortOp::Asc),
-            ("field1", SortOp::Asc),
             ("time", SortOp::Asc),
         ];
 
@@ -535,11 +521,13 @@ mod test {
 
         let plan_sort1 = plan_batches.sort(sort_exprs);
         let plan_union_1 = plan_sort1.union(plan_parquet2);
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
 
         let sort_exprs = [("field1", SortOp::Asc)];
 
         let plan_sort2 = plan_parquet.sort(sort_exprs);
-        let plan_sort3 = plan_union_1.sort(sort_exprs);
+        let plan_sort3 = plan_dedupe.sort(sort_exprs);
 
         let plan_union_2 = plan_sort2.union(plan_sort3);
 
@@ -551,8 +539,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_limit.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " GlobalLimitExec: skip=0, fetch=1"
           - "   SortPreservingMergeExec: [field1@2 ASC NULLS LAST]"
@@ -560,10 +547,12 @@ mod test {
           - "       SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
           - "       SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "         UnionExec"
-          - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,field1@2 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "             UnionExec"
+          - "               SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
@@ -572,11 +561,13 @@ mod test {
             - "       SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
             - "       SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "         UnionExec"
-            - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,field1@2 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        "#
         );
     }
 
@@ -585,29 +576,25 @@ mod test {
     fn test_spm_time_desc() {
         test_helpers::maybe_start_logging();
 
-        // plan:
-        //  SortPreservingMerge: [time@2 DESC]
-        //    UnionExec
-        //      SortExec: expr=[time@2 DESC]
-        //        ParquetExec
-        //      SortExec: expr=[time@2 DESC]
-        //        UnionExec
-        //          RecordBatchesExec
-        //          ParquetExec
-        //
-        // Output: 2 SortExec are swapped
-
         let schema = schema();
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
 
         let plan_parquet = PlanBuilder::parquet_exec(&schema, 1000, 2000);
         let plan_parquet2 = PlanBuilder::parquet_exec(&schema, 2001, 3000);
         let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
 
-        let plan_union_1 = plan_batches.union(plan_parquet2);
+        let plan_sort1 = plan_batches.sort(sort_exprs);
+        let plan_union_1 = plan_sort1.union(plan_parquet2);
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
 
         let sort_exprs = [("time", SortOp::Desc)];
         let plan_sort1 = plan_parquet.sort(sort_exprs);
-        let plan_sort2 = plan_union_1.sort(sort_exprs);
+        let plan_sort2 = plan_dedupe.sort(sort_exprs);
 
         let plan_union_2 = plan_sort1.union(plan_sort2);
 
@@ -617,28 +604,33 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
           - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
           - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "       UnionExec"
-          - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           UnionExec"
+          - "             SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
             - "   UnionExec"
             - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       UnionExec"
-            - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
             - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -660,16 +652,24 @@ mod test {
         // Output: 2 SortExec are swapped
 
         let schema = schema();
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
 
         let plan_parquet = PlanBuilder::parquet_exec(&schema, 1000, 2000);
         let plan_parquet2 = PlanBuilder::parquet_exec(&schema, 2001, 3000);
         let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
 
-        let plan_union_1 = plan_batches.union(plan_parquet2);
+        let plan_sort1 = plan_batches.sort(sort_exprs);
+        let plan_union_1 = plan_sort1.union(plan_parquet2);
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
 
         let sort_exprs = [("field1", SortOp::Desc)];
         let plan_sort1 = plan_parquet.sort(sort_exprs);
-        let plan_sort2 = plan_union_1.sort(sort_exprs);
+        let plan_sort2 = plan_dedupe.sort(sort_exprs);
 
         let plan_union_2 = plan_sort1.union(plan_sort2);
 
@@ -679,28 +679,33 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [field1@2 DESC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
           - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
           - "     SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "       UnionExec"
-          - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           UnionExec"
+          - "             SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " ProgressiveEvalExec: input_ranges=[(Int64(2001), Int64(3500)), (Int64(1000), Int64(2000))]"
             - "   UnionExec"
             - "     SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       UnionExec"
-            - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
             - "     SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -709,29 +714,25 @@ mod test {
     fn test_spm_non_time_asc() {
         test_helpers::maybe_start_logging();
 
-        // plan:
-        //  SortPreservingMerge: [field1@2 ASC]
-        //    UnionExec
-        //      SortExec: expr=[field1@2 ASC]
-        //        ParquetExec
-        //      SortExec: expr=[field1@2 ASC]
-        //        UnionExec
-        //          RecordBatchesExec
-        //          ParquetExec
-        //
-        // Output: 2 SortExec ordered as above
-
         let schema = schema();
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
 
         let plan_parquet = PlanBuilder::parquet_exec(&schema, 1000, 2000);
         let plan_parquet2 = PlanBuilder::parquet_exec(&schema, 2001, 3000);
         let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
 
-        let plan_union_1 = plan_batches.union(plan_parquet2);
+        let plan_sort1 = plan_batches.sort(sort_exprs);
+        let plan_union_1 = plan_sort1.union(plan_parquet2);
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
 
         let sort_exprs = [("field1", SortOp::Asc)];
         let plan_sort1 = plan_parquet.sort(sort_exprs);
-        let plan_sort2 = plan_union_1.sort(sort_exprs);
+        let plan_sort2 = plan_dedupe.sort(sort_exprs);
 
         let plan_union_2 = plan_sort1.union(plan_sort2);
 
@@ -741,17 +742,19 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [field1@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
           - "     SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "       UnionExec"
-          - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           UnionExec"
+          - "             SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " ProgressiveEvalExec: input_ranges=[(Int64(1000), Int64(2000)), (Int64(2001), Int64(3500))]"
@@ -759,10 +762,13 @@ mod test {
             - "     SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
             - "     SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "       UnionExec"
-            - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        "#
         );
     }
 
@@ -847,8 +853,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [time@0 DESC NULLS LAST]"
           - "   UnionExec"
@@ -866,7 +871,7 @@ mod test {
           - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, Some(\"UTC\")), TimestampNanosecond(3500, Some(\"UTC\"))), (TimestampNanosecond(1000, Some(\"UTC\")), TimestampNanosecond(2000, Some(\"UTC\")))]"
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
             - "   UnionExec"
             - "     SortExec: expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[time@3 as time]"
@@ -880,7 +885,463 @@ mod test {
             - "     SortExec: expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[time@3 as time]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
+        );
+    }
+
+    // Test split non-overlapped parquet files in the same parquet exec
+    // 5 non-overlapped files split into 3 DF partitions
+    #[test]
+    fn test_split_partitioned_files_in_multiple_groups() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+
+        let final_sort_exprs = [("time", SortOp::Desc)];
+
+        // ------------------------------------------------------------------
+        // Sort plan of the first parquet of 5 non-overlapped files split into 3 DF partitions:
+        //      SortExec: expr=[time@2 DESC]   -- time range [1000, 1999]
+        //          ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, ..."
+
+        // 5 non-overlapped files split into 3 DF partitions that cover the time range [1000, 1999]
+        // Larger the file name more recent their time range
+        //   . 0.parquet: [1000, 1199]
+        //   . 1.parquet: [1200, 1399]
+        //   . 2.parquet: [1400, 1599]
+        //   . 3.parquet: [1600, 1799]
+        //   . 4.parquet: [1800, 1999]
+        let target_partition = 3;
+        let plan_parquet_1 = PlanBuilder::parquet_exec_non_overlapped_chunks(
+            &schema,
+            5,
+            1000,
+            200,
+            target_partition,
+        );
+        insta::assert_yaml_snapshot!(
+            plan_parquet_1.formatted(),
+            @r#"- " ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        let plan_sort1 = plan_parquet_1.sort_with_preserve_partitioning(final_sort_exprs);
+
+        let min_max_sort1 = compute_stats_column_min_max(plan_sort1.inner(), "time").unwrap();
+        let min_max = column_statistics_min_max(&min_max_sort1).unwrap();
+        assert_eq!(
+            min_max,
+            (
+                ScalarValue::TimestampNanosecond(Some(1000), None),
+                ScalarValue::TimestampNanosecond(Some(1999), None)
+            )
+        );
+
+        // ------------------------------------------------------------------
+        // Sort plan of a parquet overlapped with the record batch:
+        let plan_parquet_2 = PlanBuilder::parquet_exec(&schema, 2001, 3000);
+        let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
+        let dedupe_sort_exprs = [
+            ("col1", SortOp::Asc),
+            ("col2", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+        let plan_sort_rb = plan_batches.sort(dedupe_sort_exprs);
+        let plan_union_1 = plan_sort_rb.union(plan_parquet_2);
+        let plan_spm_1 = plan_union_1.sort_preserving_merge(dedupe_sort_exprs);
+
+        let plan_dedupe = plan_spm_1.deduplicate(dedupe_sort_exprs, false);
+        let plan_sort2 = plan_dedupe.sort(final_sort_exprs);
+
+        let plan_union_2 = plan_sort1.union(plan_sort2);
+
+        let plan_spm = plan_union_2.sort_preserving_merge(final_sort_exprs);
+
+        // Differences between the input and output plan:
+        //   1. The top SortPreservingMergeExec is replaced with ProgressiveEvalExec to get the
+        //      benefits of reading its inputs sequentailly and stop when the limit hits
+        //   2. The two SortExecs are swap order to have latest time range as first input to
+        //      garuantee correct results
+        //   3. Five non-overlapped parquet files are now in 5 different groups one each and
+        //      sorted by final_sort_exprs which is time DESC. This is needed to ensure files are
+        //      executed sequentially, one by one, and the latest time range is read first by the ProgressiveEvalExec above
+        //      - File are sorted in time descending order: 4.parquet, 3.parquet, 2.parquet, 1.parquet, 0.parquet
+        //      - Larger the file name represents more recent their time range
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_spm.build(), opt),
+            @r#"
+        input:
+          - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
+          - "   UnionExec"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+          - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           UnionExec"
+          - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        output:
+          Ok:
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
+            - "   UnionExec"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        "#
+        );
+    }
+
+    // Test split non-overlapped parquet files in the same parquet exec
+    // 5 non-overlapped files all in the same DF partition/group and preserve_partitioning is set to true
+    #[test]
+    fn test_split_partitioned_files_in_one_group() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+
+        let final_sort_exprs = [("time", SortOp::Desc)];
+
+        // ------------------------------------------------------------------
+        // Sort plan of the first parquet of 5 non-overlapped files all in one group:
+        //      SortExec: expr=[time@2 DESC]   -- time range [1000, 1999]
+        //          ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, ..."
+
+        // 5 non-overlapped files all in one DF partitions that cover the time range [1000, 1999]
+        // Larger the file name more recent their time range
+        //   . 0.parquet: [1000, 1199]
+        //   . 1.parquet: [1200, 1399]
+        //   . 2.parquet: [1400, 1599]
+        //   . 3.parquet: [1600, 1799]
+        //   . 4.parquet: [1800, 1999]
+        let target_partition = 1;
+        let plan_parquet_1 = PlanBuilder::parquet_exec_non_overlapped_chunks(
+            &schema,
+            5,
+            1000,
+            200,
+            target_partition,
+        );
+        insta::assert_yaml_snapshot!(
+            plan_parquet_1.formatted(),
+            @r#"- " ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        let plan_sort1 = plan_parquet_1.sort_with_preserve_partitioning(final_sort_exprs);
+        // verify preserve_partitioning is set to true from the function above
+        insta::assert_yaml_snapshot!(
+            plan_sort1.formatted(),
+            @r#"
+        - " SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+        - "   ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        "#
+        );
+
+        let min_max_sort1 = compute_stats_column_min_max(plan_sort1.inner(), "time").unwrap();
+        let min_max = column_statistics_min_max(&min_max_sort1).unwrap();
+        assert_eq!(
+            min_max,
+            (
+                ScalarValue::TimestampNanosecond(Some(1000), None),
+                ScalarValue::TimestampNanosecond(Some(1999), None)
+            )
+        );
+
+        // ------------------------------------------------------------------
+        // Sort plan of a parquet overlapped with the record batch:
+        let plan_parquet_2 = PlanBuilder::parquet_exec(&schema, 2001, 3000);
+        let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
+        let dedupe_sort_exprs = [
+            ("col1", SortOp::Asc),
+            ("col2", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+        let plan_sort_rb = plan_batches.sort(dedupe_sort_exprs);
+        let plan_sort_pq = plan_parquet_2.sort(dedupe_sort_exprs);
+        let plan_union_1 = plan_sort_rb.union(plan_sort_pq);
+        let plan_spm_1 = plan_union_1.sort_preserving_merge(dedupe_sort_exprs);
+
+        let plan_dedupe = plan_spm_1.deduplicate(dedupe_sort_exprs, false);
+        let plan_sort2 = plan_dedupe.sort(final_sort_exprs);
+
+        let plan_union_2 = plan_sort1.union(plan_sort2);
+
+        let plan_spm = plan_union_2.sort_preserving_merge(final_sort_exprs);
+
+        // Differences between the input and output plan:
+        //   1. The top SortPreservingMergeExec is replaced with ProgressiveEvalExec
+        //   2. The two SortExecs are swap order to have latest time range first
+        //   3. Five non-overlapped parquet files are now in 5 different groups one eachand sorted by final_sort_exprs which is time DESC
+        //      File are sorted in time descending order: 4.parquet, 3.parquet, 2.parquet, 1.parquet, 0.parquet
+        //      Larger the file name more recent their time range
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_spm.build(), opt),
+            @r#"
+        input:
+          - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
+          - "   UnionExec"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+          - "       ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           UnionExec"
+          - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        output:
+          Ok:
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
+            - "   UnionExec"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        "#
+        );
+    }
+
+    // Reproducer of https://github.com/influxdata/influxdb_iox/issues/12584
+    // Test split non-overlapped parquet files in the same parquet exec
+    // 5 non-overlapped files all in the same DF partition/group and preserve_partitioning is set to false
+    #[test]
+    fn test_split_partitioned_files_in_one_group_and_preserve_partitioning_is_false() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+
+        let final_sort_exprs = [("time", SortOp::Desc)];
+
+        // ------------------------------------------------------------------
+        // Sort plan of the first parquet of 5 non-overlapped files all in one group:
+        //      SortExec: expr=[time@2 DESC]   -- time range [1000, 1999]
+        //          ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, ..."
+
+        // 5 non-overlapped files all in one DF partitions that cover the time range [1000, 1999]
+        // Larger the file name more recent their time range
+        //   . 0.parquet: [1000, 1199]
+        //   . 1.parquet: [1200, 1399]
+        //   . 2.parquet: [1400, 1599]
+        //   . 3.parquet: [1600, 1799]
+        //   . 4.parquet: [1800, 1999]
+        let target_partition = 1;
+        let plan_parquet_1 = PlanBuilder::parquet_exec_non_overlapped_chunks(
+            &schema,
+            5,
+            1000,
+            200,
+            target_partition,
+        );
+        insta::assert_yaml_snapshot!(
+            plan_parquet_1.formatted(),
+            @r#"- " ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        let plan_sort1 =
+            plan_parquet_1.sort_with_preserve_partitioning_setting(final_sort_exprs, false);
+        // verify preserve_partitioning is false
+        insta::assert_yaml_snapshot!(
+            plan_sort1.formatted(),
+            @r#"
+        - " SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+        - "   ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        "#
+        );
+
+        let min_max_sort1 = compute_stats_column_min_max(plan_sort1.inner(), "time").unwrap();
+        let min_max = column_statistics_min_max(&min_max_sort1).unwrap();
+        assert_eq!(
+            min_max,
+            (
+                ScalarValue::TimestampNanosecond(Some(1000), None),
+                ScalarValue::TimestampNanosecond(Some(1999), None)
+            )
+        );
+
+        // ------------------------------------------------------------------
+        // Sort plan of a parquet overlapped with the record batch
+        // There must be SortPreservingMergeExec and DeduplicateExec in this subplan to deduplicate data of
+        //   the record batch and the parquet file
+        let plan_parquet_2 = PlanBuilder::parquet_exec(&schema, 2001, 3000);
+        let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
+        let dedupe_sort_exprs = [
+            ("col1", SortOp::Asc),
+            ("col2", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+        let plan_sort_rb = plan_batches.sort(dedupe_sort_exprs);
+        let plan_sort_pq = plan_parquet_2.sort(dedupe_sort_exprs);
+        let plan_union_1 = plan_sort_rb.union(plan_sort_pq);
+        let plan_spm_1 = plan_union_1.sort_preserving_merge(dedupe_sort_exprs);
+
+        let plan_dedupe = plan_spm_1.deduplicate(dedupe_sort_exprs, false);
+        let plan_sort2 = plan_dedupe.sort(final_sort_exprs);
+
+        // Union them together
+        let plan_union_2 = plan_sort1.union(plan_sort2);
+
+        // SortPreservingMerge them
+        let plan_spm = plan_union_2.sort_preserving_merge(final_sort_exprs);
+
+        // Differences between the input and output plan:
+        //   1. The top SortPreservingMergeExec is replaced with ProgressiveEvalExec
+        //   2. The two SortExecs are swap order to have latest time range first
+        //   3. Five non-overlapped parquet files are now in 5 different groups one eachand sorted by final_sort_exprs which is time DESC
+        //      File are sorted in time descending order: 4.parquet, 3.parquet, 2.parquet, 1.parquet, 0.parquet
+        //      Larger the file name more recent their time range
+        //   4. The  SortExec of the non-overlapped parquet files is now have preserve_partitioning set to true
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_spm.build(), opt),
+            @r#"
+        input:
+          - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
+          - "   UnionExec"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           UnionExec"
+          - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        output:
+          Ok:
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
+            - "   UnionExec"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        "#
+        );
+    }
+
+    // Test mix of split non-overlapped parquet files in the same parquet exec & non split on overllaped parquet files
+    //  . One parquet exec with 5 non-overlapped files split into 3 DF partitions
+    //  . One parquet exec with 2 overlapped files
+    #[test]
+    fn test_split_mix() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+
+        let final_sort_exprs = [("time", SortOp::Desc)];
+
+        // ------------------------------------------------------------------
+        // Sort plan of the first parquet of 5 non-overlapped files split into 3 DF partitions:
+        //      SortExec: expr=[time@2 DESC]   -- time range [1000, 1999]
+        //          ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, ..."
+
+        // 5 non-overlapped files split into 3 DF partitions that cover the time range [1000, 1999]
+        // Larger the file name more recent their time range
+        //   . 0.parquet: [1000, 1199]
+        //   . 1.parquet: [1200, 1399]
+        //   . 2.parquet: [1400, 1599]
+        //   . 3.parquet: [1600, 1799]
+        //   . 4.parquet: [1800, 1999]
+        let target_partition = 3;
+        let plan_parquet_1 = PlanBuilder::parquet_exec_non_overlapped_chunks(
+            &schema,
+            5,
+            1000,
+            200,
+            target_partition,
+        );
+        insta::assert_yaml_snapshot!(
+            plan_parquet_1.formatted(),
+            @r#"- " ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        let plan_sort_1 = plan_parquet_1.sort_with_preserve_partitioning(final_sort_exprs);
+        let min_max_sort1 = compute_stats_column_min_max(plan_sort_1.inner(), "time").unwrap();
+        let min_max = column_statistics_min_max(&min_max_sort1).unwrap();
+        assert_eq!(
+            min_max,
+            (
+                ScalarValue::TimestampNanosecond(Some(1000), None),
+                ScalarValue::TimestampNanosecond(Some(1999), None)
+            )
+        );
+
+        // ------------------------------------------------------------------
+        // Sort plan of a parquet overlapped files
+        // Two overlapped files [2001, 2202] and [2201, 2402]
+        let plan_parquet_2 = PlanBuilder::parquet_exec_overlapped_chunks(&schema, 3, 2001, 200, 2);
+        insta::assert_yaml_snapshot!(
+            plan_parquet_2.formatted(),
+            @r#"- " ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
+        );
+
+        // sort expression for deduplication
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+        let plan_spm_2 = plan_parquet_2.sort_preserving_merge(sort_exprs);
+        let plan_dedup_2 = plan_spm_2.deduplicate(sort_exprs, false);
+        let plan_sort_2 = plan_dedup_2.sort(final_sort_exprs);
+
+        // union 2 plan
+        let plan_union = plan_sort_1.union(plan_sort_2);
+
+        let plan_spm = plan_union.sort_preserving_merge(final_sort_exprs);
+
+        // Differences between the input and output plan:
+        //   1. The top SortPreservingMergeExec is replaced with ProgressiveEvalExec
+        //   2. The two SortExecs are swap order to have latest time range first
+        //   3. Five non-overlapped parquet files are now in 5 different groups one eachand sorted by final_sort_exprs which is time DESC
+        //      File are sorted in time descending order: 4.parquet, 3.parquet, 2.parquet, 1.parquet, 0.parquet
+        //      Larger the file name more recent their time range
+        //  Note that the other parquet exec with 2 non-overlapped files are not split
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_spm.build(), opt),
+            @r#"
+        input:
+          - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
+          - "   UnionExec"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+          - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+        output:
+          Ok:
+            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(2602, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
+            - "   UnionExec"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        "#
         );
     }
 
@@ -925,8 +1386,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [time@3 DESC NULLS LAST,field1@2 DESC NULLS LAST]"
           - "   UnionExec"
@@ -946,7 +1406,7 @@ mod test {
             - "       UnionExec"
             - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -976,8 +1436,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
           - "   SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
@@ -995,7 +1454,7 @@ mod test {
             - "         UnionExec"
             - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
             - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -1022,8 +1481,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_limit.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " GlobalLimitExec: skip=0, fetch=1"
           - "   UnionExec"
@@ -1043,7 +1501,7 @@ mod test {
             - "       UnionExec"
             - "         RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
             - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-        "###
+        "#
         );
     }
 
@@ -1093,8 +1551,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_limit.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " GlobalLimitExec: skip=0, fetch=1"
           - "   SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
@@ -1118,7 +1575,7 @@ mod test {
             - "           SortExec: expr=[col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
             - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
             - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -1155,8 +1612,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_union_2.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " UnionExec"
           - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
@@ -1174,7 +1630,7 @@ mod test {
             - "     UnionExec"
             - "       RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
         );
     }
 
@@ -1273,8 +1729,7 @@ mod test {
         let opt = OrderUnionSortedInputs;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan_spm.build(), opt),
-            @r###"
-        ---
+            @r#"
         input:
           - " SortPreservingMergeExec: [time@1 DESC NULLS LAST]"
           - "   UnionExec"
@@ -1306,7 +1761,332 @@ mod test {
             - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
             - "               SortExec: expr=[col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
             - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-        "###
+        "#
+        );
+    }
+
+    // Reproduce of https://github.com/influxdata/influxdb_iox/issues/12461#issuecomment-2430196754
+    // The reproducer needs big non-overlapped files so its first physical plan will have ParquetExec with multiple
+    // file groups, each file group has multiple partitioned files.
+    // The  OrderUnionSortedInputs optimizer step will merge those partitioned files of the same file into one partitioned file
+    // and each will be in its own file group
+    #[tokio::test]
+    async fn test_many_partition_files() {
+        // DF session setup
+        let config = ExecutorConfig {
+            target_query_partitions: 4.try_into().unwrap(),
+            ..ExecutorConfig::testing()
+        };
+        let exec = Executor::new_with_config_and_executor(config, DedicatedExecutor::new_testing());
+        let ctx = exec.new_context();
+        let state = ctx.inner().state();
+
+        // chunks
+        let c = TestChunk::new("t").with_tag_column("tag");
+
+        // Ingester data time[90, 100]
+        let c_mem = c
+            .clone()
+            .with_may_contain_pk_duplicates(true)
+            .with_time_column_with_full_stats(Some(90), Some(100), 100_000, None);
+
+        // Two files overlapping with each other and with c_mem
+        //
+        // File 1: time[90, 100] and overlaps with c_mem
+        let c_file_1 = c
+            .clone()
+            .with_time_column_with_full_stats(Some(90), Some(100), 100_000, None)
+            .with_dummy_parquet_file_and_size(1000)
+            .with_may_contain_pk_duplicates(false)
+            .with_sort_key(SortKey::from_columns([Arc::from("tag"), Arc::from("time")]));
+        // File 2: overlaps with c_file_1 and c_mem
+        let c_file_2 = c_file_1.clone();
+
+        // Five files that are not overlapped with any
+        let overlapped_c = c
+            .clone()
+            .with_sort_key(SortKey::from_columns([Arc::from("tag"), Arc::from("time")]))
+            .with_dummy_parquet_file_and_size(100000000)
+            .with_may_contain_pk_duplicates(false);
+        //
+        // File 3: time[65, 69] that is not overlapped any
+        let c_file_3 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(65),
+            Some(69),
+            1_000_000,
+            None,
+        );
+        let c_file_4 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(60),
+            Some(64),
+            1_000_000,
+            None,
+        );
+        let c_file_5 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(55),
+            Some(58),
+            1_000_000,
+            None,
+        );
+        let c_file_6 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(50),
+            Some(54),
+            1_000_000,
+            None,
+        );
+        let c_file_7 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(45),
+            Some(49),
+            1_000_000,
+            None,
+        );
+
+        // Schema & provider
+        let schema = c_mem.schema().clone();
+        let provider = ProviderBuilder::new("t".into(), schema)
+            .add_chunk(Arc::new(c_mem.clone().with_id(1).with_order(i64::MAX)))
+            .add_chunk(Arc::new(c_file_1.with_id(2).with_order(2)))
+            .add_chunk(Arc::new(c_file_2.with_id(3).with_order(3)))
+            // add non-overlapped chunks in random order
+            .add_chunk(Arc::new(c_file_7.with_id(8).with_order(8)))
+            .add_chunk(Arc::new(c_file_3.with_id(4).with_order(4)))
+            .add_chunk(Arc::new(c_file_5.with_id(6).with_order(6)))
+            .add_chunk(Arc::new(c_file_6.with_id(7).with_order(7)))
+            .add_chunk(Arc::new(c_file_4.with_id(5).with_order(5)))
+            .build()
+            .unwrap();
+
+        // expression: time > 0
+        let expr = col("time").gt(lit(ScalarValue::TimestampNanosecond(Some(0), None)));
+
+        // logical plan: select * from t where time > 0 order by time desc limit 1
+        let plan = LogicalPlanBuilder::scan(
+            "t".to_owned(),
+            provider_as_source(Arc::new(provider.clone())),
+            None,
+        )
+        .unwrap()
+        .filter(expr.clone())
+        .unwrap()
+        // order by time DESC
+        .sort(vec![col("time").sort(false, true)])
+        .unwrap()
+        // limit
+        .limit(0, Some(1))
+        .unwrap()
+        .build()
+        .unwrap();
+
+        // create physical plan
+        let plan = state.create_physical_plan(&plan).await.unwrap();
+
+        // Since this is time DESC, the ProgressiveEvalExec must reflect the correct input ranges from largest to smallest
+        // The LAST ParquetExec must include non-overlapped files sorted from smallest file name: 4.parquet, 5.parquet, 6.parquet, 7.parquet, 8.parquet
+        //   Note: larger file name includes older time range
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&plan),
+            @r#"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(90, None), TimestampNanosecond(100, None)), (TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
+        - "   UnionExec"
+        - "     SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[false]"
+        - "       ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
+        - "         DeduplicateExec: [tag@0 ASC,time@1 ASC]"
+        - "           SortPreservingMergeExec: [tag@0 ASC,time@1 ASC,__chunk_order@2 ASC]"
+        - "             UnionExec"
+        - "               SortExec: expr=[tag@0 ASC,time@1 ASC,__chunk_order@2 ASC], preserve_partitioning=[true]"
+        - "                 CoalesceBatchesExec: target_batch_size=8192"
+        - "                   FilterExec: time@1 > 0"
+        - "                     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1"
+        - "                       RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
+        - "               CoalesceBatchesExec: target_batch_size=8192"
+        - "                 FilterExec: time@1 > 0"
+        - "                   ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "     SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
+        - "       CoalesceBatchesExec: target_batch_size=8192"
+        - "         FilterExec: time@1 > 0"
+        - "           ParquetExec: file_groups={5 groups: [[4.parquet], [5.parquet], [6.parquet], [7.parquet], [8.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        "#
+        );
+
+        // logical plan: select * from t where time > 0 order by time ASC limit 1
+        let plan =
+            LogicalPlanBuilder::scan("t".to_owned(), provider_as_source(Arc::new(provider)), None)
+                .unwrap()
+                .filter(expr)
+                .unwrap()
+                // order by time ASC
+                .sort(vec![col("time").sort(true, true)])
+                .unwrap()
+                // limit
+                .limit(0, Some(1))
+                .unwrap()
+                .build()
+                .unwrap();
+
+        // create physical plan
+        let plan = state.create_physical_plan(&plan).await.unwrap();
+
+        // Since this is time ASC, the ProgressiveEvalExec must reflect the correct input ranges from smallest to largest
+        // The FRIST ParquetExec must include non-overlapped files sorted from largest file name: 8.parquet, 7.parquet, 6.parquet, 5.parquet, 4.parquet
+        //   Note: larger file name includes older time range
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&plan),
+            @r#"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None)), (TimestampNanosecond(90, None), TimestampNanosecond(100, None))]"
+        - "   UnionExec"
+        - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
+        - "       CoalesceBatchesExec: target_batch_size=8192"
+        - "         FilterExec: time@1 > 0"
+        - "           ParquetExec: file_groups={5 groups: [[8.parquet], [7.parquet], [6.parquet], [5.parquet], [4.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[false]"
+        - "       ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
+        - "         DeduplicateExec: [tag@0 ASC,time@1 ASC]"
+        - "           SortPreservingMergeExec: [tag@0 ASC,time@1 ASC,__chunk_order@2 ASC]"
+        - "             UnionExec"
+        - "               SortExec: expr=[tag@0 ASC,time@1 ASC,__chunk_order@2 ASC], preserve_partitioning=[true]"
+        - "                 CoalesceBatchesExec: target_batch_size=8192"
+        - "                   FilterExec: time@1 > 0"
+        - "                     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1"
+        - "                       RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
+        - "               CoalesceBatchesExec: target_batch_size=8192"
+        - "                 FilterExec: time@1 > 0"
+        - "                   ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        "#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_many_partition_files_all_non_overlapped_files_no_ingester_data() {
+        // DF session setup
+        let config = ExecutorConfig {
+            target_query_partitions: 4.try_into().unwrap(),
+            ..ExecutorConfig::testing()
+        };
+        let exec = Executor::new_with_config_and_executor(config, DedicatedExecutor::new_testing());
+        let ctx = exec.new_context();
+        let state = ctx.inner().state();
+
+        // chunks
+        let c = TestChunk::new("t").with_tag_column("tag");
+
+        // Five files that are not overlapped with any
+        let overlapped_c = c
+            .clone()
+            .with_sort_key(SortKey::from_columns([Arc::from("tag"), Arc::from("time")]))
+            .with_dummy_parquet_file_and_size(100000000)
+            .with_may_contain_pk_duplicates(false);
+        //
+        let c_file_1 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(65),
+            Some(69),
+            1_000_000,
+            None,
+        );
+        let c_file_2 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(60),
+            Some(64),
+            1_000_000,
+            None,
+        );
+        let c_file_3 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(55),
+            Some(58),
+            1_000_000,
+            None,
+        );
+        let c_file_4 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(50),
+            Some(54),
+            1_000_000,
+            None,
+        );
+        let c_file_5 = overlapped_c.clone().with_time_column_with_full_stats(
+            Some(45),
+            Some(49),
+            1_000_000,
+            None,
+        );
+
+        // Schema & provider
+        let schema = c_file_1.schema().clone();
+        let provider = ProviderBuilder::new("t".into(), schema)
+            // add non-overlapped chunks in random order
+            .add_chunk(Arc::new(c_file_4.with_id(4).with_order(4)))
+            .add_chunk(Arc::new(c_file_3.with_id(3).with_order(3)))
+            .add_chunk(Arc::new(c_file_1.with_id(1).with_order(1)))
+            .add_chunk(Arc::new(c_file_2.with_id(2).with_order(2)))
+            .add_chunk(Arc::new(c_file_5.with_id(5).with_order(5)))
+            .build()
+            .unwrap();
+
+        // expression: time > 0
+        let expr = col("time").gt(lit(ScalarValue::TimestampNanosecond(Some(0), None)));
+
+        // logical plan: select * from t where time > 0 order by time desc limit 1
+        let plan = LogicalPlanBuilder::scan(
+            "t".to_owned(),
+            provider_as_source(Arc::new(provider.clone())),
+            None,
+        )
+        .unwrap()
+        .filter(expr.clone())
+        .unwrap()
+        // order by time DESC
+        .sort(vec![col("time").sort(false, true)])
+        .unwrap()
+        // limit
+        .limit(0, Some(1))
+        .unwrap()
+        .build()
+        .unwrap();
+
+        // create physical plan
+        let plan = state.create_physical_plan(&plan).await.unwrap();
+
+        // Since this is time DESC, the ProgressiveEvalExec must reflect the correct input ranges from largest to smallest
+        // The LAST ParquetExec must include non-overlapped files sorted from smallest file name: 1.parquet, 2.parquet, 3.parquet, 4.parquet, 5.parquet
+        //   Note: larger file name includes older time range
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&plan),
+            @r#"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
+        - "   SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
+        - "     CoalesceBatchesExec: target_batch_size=8192"
+        - "       FilterExec: time@1 > 0"
+        - "         ParquetExec: file_groups={5 groups: [[1.parquet], [2.parquet], [3.parquet], [4.parquet], [5.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        "#
+        );
+
+        // logical plan: select * from t where time > 0 order by time ASC limit 1
+        let plan =
+            LogicalPlanBuilder::scan("t".to_owned(), provider_as_source(Arc::new(provider)), None)
+                .unwrap()
+                .filter(expr)
+                .unwrap()
+                // order by time ASC
+                .sort(vec![col("time").sort(true, true)])
+                .unwrap()
+                // limit
+                .limit(0, Some(1))
+                .unwrap()
+                .build()
+                .unwrap();
+
+        // create physical plan
+        let plan = state.create_physical_plan(&plan).await.unwrap();
+
+        // Since this is time ASC, the ProgressiveEvalExec must reflect the correct input ranges from smallest to largest
+        // The FRIST ParquetExec must include non-overlapped files sorted from largest file name: 5.parquet, 4.parquet, 3.parquet, 2.parquet, 1.parquet
+        //   Note: larger file name includes older time range
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&plan),
+            @r#"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
+        - "   SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
+        - "     CoalesceBatchesExec: target_batch_size=8192"
+        - "       FilterExec: time@1 > 0"
+        - "         ParquetExec: file_groups={5 groups: [[5.parquet], [4.parquet], [3.parquet], [2.parquet], [1.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        "#
         );
     }
 
@@ -1316,7 +2096,7 @@ mod test {
 
     /// Builder for plans that uses the correct schemas are used when
     /// constructing embedded expressions.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct PlanBuilder {
         /// The current plan being constructed
         inner: Arc<dyn ExecutionPlan>,
@@ -1328,6 +2108,52 @@ mod test {
             let chunk = test_chunk(min, max, true);
             let plan = chunks_to_physical_nodes(schema, None, vec![chunk], 1);
 
+            Self::remove_union(plan)
+        }
+
+        // Create a parquet_exec with a given number of chunks
+        fn parquet_exec_non_overlapped_chunks(
+            schema: &SchemaRef,
+            n_chunks: usize,
+            min: i64,
+            duration: usize,
+            target_partition: usize,
+        ) -> Self {
+            let mut chunks = Vec::with_capacity(n_chunks);
+            for i in 0..n_chunks {
+                let min = min + (duration * i) as i64;
+                let max = min + duration as i64 - 1;
+                let chunk = test_chunk_with_id(min, max, true, i as u128);
+                chunks.push(chunk);
+            }
+
+            let inner = chunks_to_physical_nodes(schema, None, chunks, target_partition);
+
+            Self::remove_union(inner)
+        }
+
+        // Create a parquet_exec with a given number of chunks
+        fn parquet_exec_overlapped_chunks(
+            schema: &SchemaRef,
+            n_chunks: usize,
+            min: i64,
+            duration: usize,
+            target_partition: usize,
+        ) -> Self {
+            let mut chunks = Vec::with_capacity(n_chunks);
+            for i in 0..n_chunks {
+                let min = min + (duration * i) as i64;
+                let max = min + duration as i64 + 1; // overlap by 2
+                let chunk = test_chunk_with_id(min, max, true, i as u128);
+                chunks.push(chunk);
+            }
+
+            let inner = chunks_to_physical_nodes(schema, None, chunks, target_partition);
+
+            Self::remove_union(inner)
+        }
+
+        fn remove_union(plan: Arc<dyn ExecutionPlan>) -> Self {
             let inner = if let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() {
                 if union_exec.inputs().len() == 1 {
                     Arc::clone(&union_exec.inputs()[0])
@@ -1361,6 +2187,28 @@ mod test {
         fn sort<'a>(self, cols: impl IntoIterator<Item = (&'a str, SortOp)>) -> Self {
             Self {
                 inner: Arc::new(SortExec::new(self.sort_exprs(cols), self.inner)),
+            }
+        }
+
+        /// Sort the output of this plan with the specified expressions
+        fn sort_with_preserve_partitioning<'a>(
+            self,
+            cols: impl IntoIterator<Item = (&'a str, SortOp)>,
+        ) -> Self {
+            Self::sort_with_preserve_partitioning_setting(self, cols, true)
+        }
+
+        /// Sort the output of this plan with the specified expressions &
+        fn sort_with_preserve_partitioning_setting<'a>(
+            self,
+            cols: impl IntoIterator<Item = (&'a str, SortOp)>,
+            preserve_partitioning: bool,
+        ) -> Self {
+            Self {
+                inner: Arc::new(
+                    SortExec::new(self.sort_exprs(cols), self.inner)
+                        .with_preserve_partitioning(preserve_partitioning),
+                ),
             }
         }
 
@@ -1516,7 +2364,18 @@ mod test {
 
     // test chunk with time range and field1's value range
     fn test_chunk(min: i64, max: i64, parquet_data: bool) -> Arc<dyn QueryChunk> {
+        test_chunk_with_id(min, max, parquet_data, 0)
+    }
+
+    // test chunk with time range and field1's value range and with a given chunk id
+    fn test_chunk_with_id(
+        min: i64,
+        max: i64,
+        parquet_data: bool,
+        chunk_id: u128,
+    ) -> Arc<dyn QueryChunk> {
         let chunk = TestChunk::new("t")
+            .with_id(chunk_id)
             .with_time_column_with_stats(Some(min), Some(max))
             .with_tag_column_with_stats("col1", Some("AL"), Some("MT"))
             .with_tag_column_with_stats("col2", Some("MA"), Some("VY"))

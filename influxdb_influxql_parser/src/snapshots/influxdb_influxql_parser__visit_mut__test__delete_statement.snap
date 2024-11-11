@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit_mut.rs
 expression: "visit_statement!(\"DELETE FROM a WHERE b = \\\"c\\\"\")"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_delete_statement
@@ -28,4 +29,3 @@ expression: "visit_statement!(\"DELETE FROM a WHERE b = \\\"c\\\"\")"
 - post_visit_where_clause
 - post_visit_delete_statement
 - post_visit_statement
-

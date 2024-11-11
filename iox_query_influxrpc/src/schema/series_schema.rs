@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
 use datafusion::common::{Column, DFSchema, DFSchemaRef};
-use datafusion::logical_expr::{lit, Expr};
+use datafusion::logical_expr::{lit, Expr, SortExpr};
 use datafusion::scalar::ScalarValue;
 use generated_types::influxdata::platform::storage::read_response::DataType as StorageDataType;
 use schema::TIME_DATA_TYPE;
@@ -153,7 +153,7 @@ impl SeriesSchema {
     }
 
     /// The sort expressions required to sort the series.
-    pub(crate) fn sort(&self, partition_key: &[Arc<str>]) -> Vec<Expr> {
+    pub(crate) fn sort(&self, partition_key: &[Arc<str>]) -> Vec<SortExpr> {
         partition_key
             .iter()
             .filter_map(|key| {
@@ -190,7 +190,7 @@ impl SeriesSchema {
 }
 
 impl TryFrom<&SchemaRef> for SeriesSchema {
-    type Error = crate::Error;
+    type Error = crate::InfluxRpcError;
 
     fn try_from(schema: &SchemaRef) -> Result<Self, Self::Error> {
         // Check that this schema represents a series.
@@ -217,7 +217,21 @@ impl TryFrom<&SchemaRef> for SeriesSchema {
                 _ => {}
             }
         }
-        if !has_measurement || !has_field || !has_timestamp || !has_value {
+        let mut missing = Vec::with_capacity(4);
+        if !has_measurement {
+            missing.push("_measurement");
+        }
+        if !has_field {
+            missing.push("_field");
+        }
+        if !has_timestamp {
+            missing.push("_time");
+        }
+        if !has_value {
+            missing.push("_value");
+        }
+
+        if !missing.is_empty() {
             observability_deps::tracing::debug!(
                 has_measurement,
                 has_field,
@@ -225,7 +239,10 @@ impl TryFrom<&SchemaRef> for SeriesSchema {
                 has_value,
                 "invalid schema"
             );
-            return Err(crate::Error::InternalInvalidArrowSchema {});
+            return Err(crate::InfluxRpcError::internal(format!(
+                "invalid series schema, missing: {}",
+                missing.join(",")
+            )));
         }
 
         Ok(Self {
@@ -235,7 +252,7 @@ impl TryFrom<&SchemaRef> for SeriesSchema {
 }
 
 impl TryFrom<SchemaRef> for SeriesSchema {
-    type Error = crate::Error;
+    type Error = crate::InfluxRpcError;
 
     fn try_from(schema: SchemaRef) -> Result<Self, Self::Error> {
         Self::try_from(&schema)

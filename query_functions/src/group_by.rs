@@ -2,7 +2,6 @@
 //! and Aggregate functions in IOx, designed to be compatible with
 //! InfluxDB classic
 
-use datafusion::prelude::Expr;
 use snafu::Snafu;
 
 use crate::window;
@@ -76,23 +75,6 @@ pub enum WindowDuration {
 
     /// fixed size, in nanoseconds
     Fixed { nanoseconds: i64 },
-}
-
-impl Aggregate {
-    /// Create the appropriate DataFusion expression for this aggregate
-    pub fn to_datafusion_expr(self, input: Expr) -> Result<Expr> {
-        use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
-        match self {
-            Self::Sum => Ok(sum(input)),
-            Self::Count => Ok(count(input)),
-            Self::Min => Ok(min(input)),
-            Self::Max => Ok(max(input)),
-            Self::First => AggregateNotSupportedSnafu { agg: "First" }.fail(),
-            Self::Last => AggregateNotSupportedSnafu { agg: "Last" }.fail(),
-            Self::Mean => Ok(avg(input)),
-            Self::None => AggregateNotSupportedSnafu { agg: "None" }.fail(),
-        }
-    }
 }
 
 impl WindowDuration {

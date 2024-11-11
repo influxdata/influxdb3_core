@@ -6,9 +6,10 @@ use arrow::{
 };
 use data_types::{
     partition_template::TablePartitionTemplateOverride, snapshot::table::TableSnapshot, Column,
-    ColumnSet, ColumnType, ColumnsByName, CompactionLevel, MaxColumnsPerTable, MaxTables,
-    Namespace, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile, ParquetFileParams,
-    Partition, PartitionId, SortKeyIds, Table, TableSchema, Timestamp, TransitionPartitionId,
+    ColumnSet, ColumnType, ColumnsByName, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt,
+    MaxTables, Namespace, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile,
+    ParquetFileParams, Partition, PartitionId, SortKeyIds, Table, TableSchema, Timestamp,
+    TransitionPartitionId,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::metrics::Count;
@@ -519,7 +520,7 @@ impl TestPartition {
             partition_key: self.partition.partition_key.clone(),
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key.clone()),
-            max_l0_created_at: Time::from_timestamp_nanos(max_l0_created_at),
+            max_l0_created_at,
         };
         let real_file_size_bytes = create_parquet_file(
             ParquetStorage::new(
@@ -609,7 +610,7 @@ impl TestPartition {
             created_at: Timestamp::new(creation_time),
             compaction_level,
             column_set,
-            max_l0_created_at: Timestamp::new(max_l0_created_at),
+            max_l0_created_at,
             source: None,
         };
 
@@ -660,7 +661,7 @@ pub struct TestParquetFileBuilder {
     to_delete: bool,
     object_store_id: Option<ObjectStoreId>,
     row_count: Option<usize>,
-    max_l0_created_at: i64,
+    max_l0_created_at: MaxL0CreatedAt,
 }
 
 impl Default for TestParquetFileBuilder {
@@ -678,7 +679,7 @@ impl Default for TestParquetFileBuilder {
             to_delete: false,
             object_store_id: None,
             row_count: None,
-            max_l0_created_at: 1,
+            max_l0_created_at: MaxL0CreatedAt::NotCompacted,
         }
     }
 }
@@ -689,7 +690,7 @@ impl TestParquetFileBuilder {
         let (table, batch) = lp_to_mutable_batch(line_protocol);
 
         let schema = batch.schema(Projection::All).unwrap();
-        let record_batch = batch.to_arrow(Projection::All).unwrap();
+        let record_batch = batch.try_into_arrow(Projection::All).unwrap();
 
         self.with_record_batch(record_batch)
             .with_table(table)
@@ -735,9 +736,9 @@ impl TestParquetFileBuilder {
         self
     }
 
-    /// specify max creation time of all L0 this file was created from
+    /// specify max creation time to be `MaxL0CreatedAt::Computed` of the given value
     pub fn with_max_l0_created_at(mut self, time: iox_time::Time) -> Self {
-        self.max_l0_created_at = time.timestamp_nanos();
+        self.max_l0_created_at = MaxL0CreatedAt::Computed(time.into());
         self
     }
 

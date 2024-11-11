@@ -126,8 +126,8 @@ impl Instrument for TokioInstrumentDispatcher {
         rt_metric!(
             this = guard,
             reporter = reporter,
-            metric = injection_queue_depth,
-            descr = "The number of tasks currently scheduled in the runtime's injection queue.",
+            metric = global_queue_depth,
+            descr = "The number of tasks currently scheduled in the runtime's global queue.",
             t = U64Gauge,
         );
         rt_metric!(

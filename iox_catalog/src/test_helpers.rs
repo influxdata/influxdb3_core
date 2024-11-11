@@ -1,8 +1,8 @@
 //! Catalog helper functions for creation of catalog objects
 use data_types::{
     partition_template::TablePartitionTemplateOverride, ColumnId, ColumnSet, CompactionLevel,
-    Namespace, NamespaceName, ObjectStoreId, ParquetFileParams, Partition, Table, TableSchema,
-    Timestamp,
+    MaxL0CreatedAt, Namespace, NamespaceName, ObjectStoreId, ParquetFileParams, Partition, Table,
+    TableSchema, Timestamp,
 };
 
 use crate::interface::RepoCollection;
@@ -111,7 +111,7 @@ pub fn arbitrary_parquet_file_params(
         compaction_level: CompactionLevel::Initial,
         created_at: Timestamp::new(1),
         column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-        max_l0_created_at: Timestamp::new(1),
+        max_l0_created_at: MaxL0CreatedAt::NotCompacted,
         source: None,
     }
 }

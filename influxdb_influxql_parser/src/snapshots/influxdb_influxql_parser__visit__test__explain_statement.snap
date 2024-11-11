@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit.rs
 expression: "visit_statement!(\"EXPLAIN SELECT * FROM cpu\")"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_explain_statement
@@ -24,4 +25,3 @@ expression: "visit_statement!(\"EXPLAIN SELECT * FROM cpu\")"
 - post_visit_statement
 - post_visit_explain_statement
 - post_visit_statement
-

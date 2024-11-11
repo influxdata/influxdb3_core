@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-use crate::cache_system::interfaces::DynError;
+use crate::cache_system::DynError;
 
 use super::{
     notify::{Mailbox, Notifier},

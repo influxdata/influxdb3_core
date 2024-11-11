@@ -7,6 +7,8 @@ option go_package = "github.com/influxdata/iox/catalog/v2";
 import "influxdata/iox/partition_template/v1/template.proto";
 import "influxdata/iox/column_type/v1/type.proto";
 import "influxdata/iox/catalog_cache/v1/value.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
 
 service CatalogService {
   rpc RootSnapshot(RootSnapshotRequest) returns (RootSnapshotResponse);
@@ -59,6 +61,9 @@ service CatalogService {
   rpc ParquetFileGetByObjectStoreId(ParquetFileGetByObjectStoreIdRequest) returns (ParquetFileGetByObjectStoreIdResponse);
   rpc ParquetFileExistsByObjectStoreIdBatch(stream ParquetFileExistsByObjectStoreIdBatchRequest) returns (stream ParquetFileExistsByObjectStoreIdBatchResponse);
   rpc ParquetFileCreateUpgradeDelete(ParquetFileCreateUpgradeDeleteRequest) returns (ParquetFileCreateUpgradeDeleteResponse);
+  rpc ParquetFileListByTableId(ParquetFileListByTableIdRequest) returns (stream ParquetFileListByTableIdResponse);
+
+  rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
 }
 
 message RootSnapshotRequest {}
@@ -80,7 +85,13 @@ message NamespaceCreateResponse {
 }
 
 message NamespaceUpdateRetentionPeriodRequest {
-  string name = 1;
+  oneof target {
+    // The name of the namespace to update the retention period for.
+    string name = 1 [deprecated = true];
+    // The unique, immutable ID of the namespace to update the retention period for.
+    int64 id = 3;
+  }
+
   optional int64 retention_period_ns = 2;
 }
 
@@ -115,7 +126,12 @@ message NamespaceGetByNameResponse {
 }
 
 message NamespaceSoftDeleteRequest {
-  string name = 1;
+  oneof target {
+    // The name of the namespace to soft delete.
+    string name = 1 [deprecated = true];
+    // The unique, immutable ID of the namespace to soft delete.
+    int64 id = 2;
+  }
 }
 
 message NamespaceSoftDeleteResponse {
@@ -123,7 +139,12 @@ message NamespaceSoftDeleteResponse {
 }
 
 message NamespaceUpdateTableLimitRequest {
-  string name = 1;
+  oneof target {
+    // The name of the namespace to update the table limit for.
+    string name = 1 [deprecated = true];
+    // The unique, immutable ID of the namespace to update the table limit for.
+    int64 id = 3;
+  }
   int32 new_max = 2;
 }
 
@@ -132,7 +153,13 @@ message NamespaceUpdateTableLimitResponse {
 }
 
 message NamespaceUpdateColumnLimitRequest {
-  string name = 1;
+  oneof target {
+    // The name of the namespace to update the per-table column limit for.
+    string name = 1 [deprecated = true];
+    // The unique, immutable ID of the namespace to update the per-table column
+    // limit for.
+    int64 id = 3;
+  }
   int32 new_max = 2;
 }
 
@@ -398,8 +425,10 @@ message ParquetFileFlagForDeleteByRetentionResponse {
 }
 
 message ParquetFileDeleteOldIdsOnlyRequest {
+  reserved "cutoff";
+  reserved 2;
+
   int64 older_than = 1;
-  int64 cutoff = 2;
 }
 
 message ParquetFileDeleteOldIdsOnlyResponse {
@@ -448,6 +477,21 @@ message ParquetFileCreateUpgradeDeleteRequest {
 
 message ParquetFileCreateUpgradeDeleteResponse {
   repeated int64 created_parquet_file_ids = 1;
+}
+
+message ParquetFileListByTableIdRequest {
+  int64 table_id = 1;
+  optional int32 compaction_level = 2;
+}
+
+message ParquetFileListByTableIdResponse {
+  ParquetFile file = 1;
+}
+
+message GetTimeRequest {}
+
+message GetTimeResponse {
+  google.protobuf.Timestamp time = 1;
 }
 
 message ServiceProtectionLimits {
@@ -501,6 +545,7 @@ message Partition {
   SortKeyIds sort_key_ids = 5;
   optional int64 new_file_at = 6;
   optional int64 cold_compact_at = 7;
+  optional int64 created_at = 8;
 }
 
 message SkippedCompaction {
@@ -541,7 +586,18 @@ message ParquetFileParams {
   int32 compaction_level = 10;
   int64 created_at = 11;
   ColumnSet column_set = 12;
-  int64 max_l0_created_at = 13;
+
+  oneof maybe_max_l0_created_at {
+    int64 computed = 15;
+    google.protobuf.Empty not_compacted = 16;
+  }
+
+  // This field is in the process of being deprecated in favor of `maybe_max_l0_created_at`.
+  // Services running old code that receive this message may still use this value, but new
+  // code will ignore it. When all services in all environments are using
+  // `maybe_max_l0_created_at` instead, this field can be removed.
+  int64 max_l0_created_at = 13 [deprecated = true];
+
   ParquetFileSource source = 14;
 }
 

@@ -8,6 +8,9 @@ service NamespaceService {
   // Get all namespaces
   rpc GetNamespaces(GetNamespacesRequest) returns (GetNamespacesResponse);
 
+  // Get a specific namespace.
+  rpc GetNamespace(GetNamespaceRequest) returns (GetNamespaceResponse);
+
   // Create a namespace
   rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
 
@@ -28,6 +31,10 @@ service NamespaceService {
 message GetNamespacesRequest {}
 
 message GetNamespacesResponse { repeated Namespace namespaces = 1; }
+
+message GetNamespaceRequest { string name = 1; }
+
+message GetNamespaceResponse { Namespace namespace = 1; }
 
 message CreateNamespaceRequest {
   // Name of the namespace to be created

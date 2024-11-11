@@ -371,7 +371,7 @@ mod tests {
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(results.len(), 2);
 
-        assert_snapshot!(batches_to_lines(&results).join("\n"), @r###"
+        assert_snapshot!(batches_to_lines(&results).join("\n"), @r"
         +--------------+------+------+--------+--------------------------------+--------------+
         | _measurement | tag1 | tag2 | _field | _time                          | _value       |
         +--------------+------+------+--------+--------------------------------+--------------+
@@ -384,7 +384,7 @@ mod tests {
         | test_m       | B    | X    | field2 | 1970-01-01T00:00:00.000000200Z | {float=20.0} |
         | test_m       | A    | Y    | field2 | 1970-01-01T00:00:00.000000500Z | {float=50.0} |
         +--------------+------+------+--------+--------------------------------+--------------+
-        "###);
+        ");
 
         assert_eq!(memory_pool.reserved(), 0);
     }

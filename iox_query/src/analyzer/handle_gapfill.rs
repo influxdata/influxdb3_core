@@ -2,9 +2,12 @@
 //! to fill gaps in time series data.
 
 pub mod range_predicate;
+mod virtual_function;
 
 use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
-use datafusion::functions::datetime::functions as datafusion_datetime_udfs;
+use datafusion::common::{internal_datafusion_err, plan_datafusion_err, plan_err, DFSchema};
+use datafusion::logical_expr::{expr::AggregateFunction, ExprSchemable};
+use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
@@ -18,12 +21,14 @@ use datafusion::{
     prelude::{col, Column, Expr},
 };
 use hashbrown::{hash_map, HashMap};
-use query_functions::gapfill::{DATE_BIN_GAPFILL_UDF_NAME, INTERPOLATE_UDF_NAME, LOCF_UDF_NAME};
+use query_functions::gapfill::{GapFillWrapper, INTERPOLATE_UDF_NAME, LOCF_UDF_NAME};
+use query_functions::tz::TzUDF;
 use std::{
     collections::HashSet,
     ops::{Bound, Range},
     sync::Arc,
 };
+use virtual_function::{VirtualFunction, VirtualFunctionFinder};
 
 /// This optimizer rule enables gap-filling semantics for SQL queries
 /// that contain calls to `DATE_BIN_GAPFILL()` and related functions
@@ -121,16 +126,18 @@ fn handle_aggregate(aggr: Aggregate) -> Result<Transformed<LogicalPlan>> {
             new_aggr,
             date_bin_gapfill_index,
             date_bin_gapfill_args,
+            date_bin_udf,
         } => {
-            let new_aggr_plan = {
-                let new_aggr_plan = LogicalPlan::Aggregate(new_aggr);
-                check_node(&new_aggr_plan).map_err(|e| e.context("check_node"))?;
-                new_aggr_plan
-            };
+            let new_aggr_plan = LogicalPlan::Aggregate(new_aggr);
+            check_node(&new_aggr_plan).map_err(|e| e.context("check_node"))?;
 
-            let new_gap_fill_plan =
-                build_gapfill_node(new_aggr_plan, date_bin_gapfill_index, date_bin_gapfill_args)
-                    .map_err(|e| e.context("build_gapfill_node"))?;
+            let new_gap_fill_plan = build_gapfill_node(
+                new_aggr_plan,
+                date_bin_gapfill_index,
+                date_bin_gapfill_args,
+                date_bin_udf,
+            )
+            .map_err(|e| e.context("build_gapfill_node"))?;
             Ok(Transformed::yes(new_gap_fill_plan))
         }
     }
@@ -140,10 +147,11 @@ fn build_gapfill_node(
     new_aggr_plan: LogicalPlan,
     date_bin_gapfill_index: usize,
     date_bin_gapfill_args: Vec<Expr>,
+    date_bin_udf: Arc<str>,
 ) -> Result<LogicalPlan> {
     match date_bin_gapfill_args.len() {
         2 | 3 => (),
-        nargs => {
+        nargs @ (0 | 1 | 4..) => {
             return Err(DataFusionError::Plan(format!(
                 "DATE_BIN_GAPFILL expects 2 or 3 arguments, got {nargs}",
             )));
@@ -161,6 +169,11 @@ fn build_gapfill_node(
         match expr {
             Expr::Column(c) => Ok(c),
             Expr::Cast(c) => get_column(*c.expr),
+            Expr::ScalarFunction(ScalarFunction { func, args })
+                if func.inner().as_any().is::<TzUDF>() =>
+            {
+                get_column(args[0].clone())
+            }
             _ => Err(DataFusionError::Plan(
                 "DATE_BIN_GAPFILL requires a column as the source argument".to_string(),
             )),
@@ -209,11 +222,40 @@ fn build_gapfill_node(
         .collect();
     let aggr_expr = new_group_expr.split_off(aggr.group_expr.len());
 
+    match (aggr_expr.len(), aggr.aggr_expr.len()) {
+        (f, e) if f != e => return Err(internal_datafusion_err!(
+            "The number of aggregate expressions has gotten lost; expected {e}, found {f}. This is a bug, please report it."
+        )),
+        _ => ()
+    }
+
+    // this schema is used for the `FillStrategy::Default` checks below. It also represents the
+    // schema of the projection of `aggr`, meaning that it shows the columns/fields as they exist
+    // after they've been transformed by `aggr` and once they're being input into the next step.
+    // Because we are using it to get the data types of the output columns, to then get the default
+    // value of those types according to the AggregateFunction below, it all works out.
+    let schema = &aggr.schema;
+
     let fill_behavior = aggr_expr
         .iter()
         .cloned()
-        .map(|e| (e, FillStrategy::Null))
-        .collect();
+        // `aggr_expr` and `aggr.aggr_expr` should line up in the sense that `aggr.aggr_expr[n]`
+        // represents a transformation that was done to produce `aggr_expr[n]`, so we can zip them
+        // together like this to determine the correct fill type for the produced expression
+        .zip(aggr.aggr_expr.iter())
+        .map(|(col_expr, aggr_expr)| {
+            // if aggr_expr is a function, then it may need special handling for what its
+            // FillStrategy may be - specifically, it may produce a non-nullable column, so we need
+            // to check if that's the case, and if it is, we need to determine the correct default
+            // type to fill in with gapfill instead of just placing nulls. We also need to verify
+            // that, after it's passed through `Aggregate`, it does produce a column - since
+            // `col_expr` should be the 'computed'/'transformed' representation of `aggr_expr`, we
+            // `aggr_expr`, we need to make sure that it's a column or else this doesn't really
+            // matter to calculate.
+            default_return_value_for_aggr_fn(aggr_expr, schema, col_expr.try_as_col())
+                .map(|rt| (col_expr, FillStrategy::Default(rt)))
+        })
+        .collect::<Result<_>>()?;
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(
@@ -222,6 +264,7 @@ fn build_gapfill_node(
                 new_group_expr,
                 aggr_expr,
                 GapFillParams {
+                    date_bin_udf,
                     stride,
                     time_column,
                     origin,
@@ -280,6 +323,8 @@ enum RewriteInfo {
         date_bin_gapfill_index: usize,
         // The arguments to the call to DATE_BIN_GAPFILL.
         date_bin_gapfill_args: Vec<Expr>,
+        // The name of the UDF that provides the DATE_BIN like functionality.
+        date_bin_udf: Arc<str>,
     },
 }
 
@@ -294,43 +339,38 @@ fn replace_date_bin_gapfill(aggr: Aggregate) -> Result<RewriteInfo> {
         .iter()
         .enumerate()
         .try_for_each(|(i, e)| -> Result<()> {
-            let fn_cnt = count_udf(e, DATE_BIN_GAPFILL_UDF_NAME)?;
+            let mut functions = vec![];
+            e.visit(&mut VirtualFunctionFinder::new(&mut functions))?;
+            let fn_cnt = functions
+                .iter()
+                .filter(|vf| matches!(vf, VirtualFunction::GapFill(_)))
+                .count();
             date_bin_gapfill_count += fn_cnt;
             if fn_cnt > 0 {
                 dbg_idx = Some(i);
             }
             Ok(())
         })?;
-    match date_bin_gapfill_count {
+
+    let (date_bin_gapfill_index, date_bin) = match date_bin_gapfill_count {
         0 => return Ok(RewriteInfo::Unchanged(aggr)),
         1 => {
             // Make sure that the call to DATE_BIN_GAPFILL is root expression
             // excluding aliases.
-            let dbg_idx = dbg_idx.expect("should have found exactly one call");
-            if !matches_udf(
-                unwrap_alias(&aggr.group_expr[dbg_idx]),
-                DATE_BIN_GAPFILL_UDF_NAME,
-            ) {
-                return Err(DataFusionError::Plan(
-                    "DATE_BIN_GAPFILL must be a top-level expression in the GROUP BY clause when gap filling. It cannot be part of another expression or cast".to_string(),
-                ));
-            }
+            let dbg_idx = dbg_idx.expect("should be found exactly one call");
+            VirtualFunction::maybe_from_expr(unwrap_alias(&aggr.group_expr[dbg_idx]))
+                .and_then(|vf| vf.date_bin_udf().cloned())
+                .map(|f| (dbg_idx, f))
+                .ok_or(plan_datafusion_err!("DATE_BIN_GAPFILL must be a top-level expression in the GROUP BY clause when gap filling. It cannot be part of another expression or cast"))?
         }
         _ => {
             return Err(DataFusionError::Plan(
                 "DATE_BIN_GAPFILL specified more than once".to_string(),
             ))
         }
-    }
+    };
 
-    let date_bin_gapfill_index = dbg_idx.expect("should be found exactly one call");
-
-    let date_bin = datafusion_datetime_udfs()
-        .iter()
-        .find(|fun| fun.name().eq("date_bin"))
-        .ok_or(DataFusionError::Execution("no date_bin UDF found".into()))?
-        .to_owned();
-
+    let date_bin_udf = Arc::from(date_bin.name());
     let mut rewriter = DateBinGapfillRewriter {
         args: None,
         date_bin,
@@ -360,6 +400,7 @@ fn replace_date_bin_gapfill(aggr: Aggregate) -> Result<RewriteInfo> {
         new_aggr,
         date_bin_gapfill_index,
         date_bin_gapfill_args,
+        date_bin_udf,
     })
 }
 
@@ -381,7 +422,7 @@ impl TreeNodeRewriter for DateBinGapfillRewriter {
     type Node = Expr;
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match &expr {
-            Expr::ScalarFunction(fun) if fun.name() == DATE_BIN_GAPFILL_UDF_NAME => {
+            Expr::ScalarFunction(fun) if fun.func.inner().as_any().is::<GapFillWrapper>() => {
                 Ok(Transformed::new(expr, true, TreeNodeRecursion::Jump))
             }
             _ => Ok(Transformed::no(expr)),
@@ -394,7 +435,7 @@ impl TreeNodeRewriter for DateBinGapfillRewriter {
         let orig_name = expr.schema_name().to_string();
         match expr {
             Expr::ScalarFunction(ScalarFunction { func, args })
-                if func.name() == DATE_BIN_GAPFILL_UDF_NAME =>
+                if func.inner().as_any().is::<GapFillWrapper>() =>
             {
                 self.args = Some(args.clone());
                 Ok(Transformed::yes(
@@ -418,16 +459,6 @@ fn udf_to_fill_strategy(name: &str) -> Option<FillStrategy> {
     }
 }
 
-fn fill_strategy_to_udf(fs: &FillStrategy) -> Result<&'static str> {
-    match fs {
-        FillStrategy::PrevNullAsMissing => Ok(LOCF_UDF_NAME),
-        FillStrategy::LinearInterpolate => Ok(INTERPOLATE_UDF_NAME),
-        _ => Err(DataFusionError::Internal(format!(
-            "unknown UDF for fill strategy {fs:?}"
-        ))),
-    }
-}
-
 fn handle_projection(mut proj: Projection) -> Result<Transformed<LogicalPlan>> {
     let Some(child_gapfill) = (match proj.input.as_ref() {
         LogicalPlan::Extension(Extension { node }) => node.as_any().downcast_ref::<GapFill>(),
@@ -441,6 +472,7 @@ fn handle_projection(mut proj: Projection) -> Result<Transformed<LogicalPlan>> {
     let mut fill_fn_rewriter = FillFnRewriter {
         aggr_col_fill_map: HashMap::new(),
     };
+
     let new_proj_exprs = proj
         .expr
         .iter()
@@ -452,6 +484,7 @@ fn handle_projection(mut proj: Projection) -> Result<Transformed<LogicalPlan>> {
         })
         .collect::<Result<Vec<Expr>>>()?;
     let FillFnRewriter { aggr_col_fill_map } = fill_fn_rewriter;
+
     if aggr_col_fill_map.is_empty() {
         return Ok(Transformed::no(LogicalPlan::Projection(proj)));
     }
@@ -459,8 +492,7 @@ fn handle_projection(mut proj: Projection) -> Result<Transformed<LogicalPlan>> {
     // Clone the existing GapFill node, then modify it in place
     // to reflect the new fill strategy.
     let mut new_gapfill = child_gapfill.clone();
-    for (e, fs) in aggr_col_fill_map {
-        let udf = fill_strategy_to_udf(&fs).map_err(|e| e.context("fill_strategy_to_udf"))?;
+    for (e, (fs, udf)) in aggr_col_fill_map {
         if new_gapfill.replace_fill_strategy(&e, fs).is_none() {
             // There was a gap filling function called on a non-aggregate column.
             return Err(DataFusionError::Plan(format!(
@@ -477,12 +509,12 @@ fn handle_projection(mut proj: Projection) -> Result<Transformed<LogicalPlan>> {
 
 /// Implements `TreeNodeRewriter`:
 /// - Traverses over the expressions in a projection node
-/// - If it finds `locf(col)` or `interpolate(col)`,
-///   it replaces them with `col AS <original name>`
+/// - If it finds a function that requires a non-Null FillStrategy (determined by
+///   `udf_to_fill_strategy`), it replaces them with `col AS <original name>`
 /// - Collects into [`Self::aggr_col_fill_map`] which correlates
 ///   aggregate columns to their [`FillStrategy`].
 struct FillFnRewriter {
-    aggr_col_fill_map: HashMap<Expr, FillStrategy>,
+    aggr_col_fill_map: HashMap<Expr, (FillStrategy, String)>,
 }
 
 impl TreeNodeRewriter for FillFnRewriter {
@@ -499,13 +531,13 @@ impl TreeNodeRewriter for FillFnRewriter {
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         let orig_name = expr.schema_name().to_string();
         match expr {
-            Expr::ScalarFunction(ref fun) if udf_to_fill_strategy(fun.name()).is_none() => {
-                Ok(Transformed::no(expr))
-            }
             Expr::ScalarFunction(mut fun) => {
-                let fs = udf_to_fill_strategy(fun.name()).expect("must be a fill fn");
+                let Some(fs) = udf_to_fill_strategy(fun.name()) else {
+                    return Ok(Transformed::no(Expr::ScalarFunction(fun)));
+                };
+
                 let arg = fun.args.remove(0);
-                self.add_fill_strategy(arg.clone(), fs)?;
+                self.add_fill_strategy(arg.clone(), fs, fun.name().to_string())?;
                 Ok(Transformed::yes(arg.alias(orig_name)))
             }
             _ => Ok(Transformed::no(expr)),
@@ -514,55 +546,105 @@ impl TreeNodeRewriter for FillFnRewriter {
 }
 
 impl FillFnRewriter {
-    fn add_fill_strategy(&mut self, e: Expr, fs: FillStrategy) -> Result<()> {
+    fn add_fill_strategy(&mut self, e: Expr, fs: FillStrategy, name: String) -> Result<()> {
         match self.aggr_col_fill_map.entry(e) {
             hash_map::Entry::Occupied(_) => Err(DataFusionError::NotImplemented(
                 "multiple fill strategies for the same column".to_string(),
             )),
             hash_map::Entry::Vacant(ve) => {
-                ve.insert(fs);
+                ve.insert((fs, name));
                 Ok(())
             }
         }
     }
 }
 
-fn count_udf(e: &Expr, name: &str) -> Result<usize> {
-    let mut count = 0;
-    e.apply(|expr| {
-        if matches_udf(expr, name) {
-            count += 1;
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(count)
-}
-
-fn matches_udf(e: &Expr, name: &str) -> bool {
-    matches!(
-        e,
-        Expr::ScalarFunction(fun) if fun.name() == name
-    )
-}
-
 fn check_node(node: &LogicalPlan) -> Result<()> {
     node.expressions().iter().try_for_each(|expr| {
-        let dbg_count = count_udf(expr, DATE_BIN_GAPFILL_UDF_NAME)?;
-        if dbg_count > 0 {
-            return Err(DataFusionError::Plan(format!(
-                "{DATE_BIN_GAPFILL_UDF_NAME} may only be used as a GROUP BY expression"
-            )));
-        }
-
-        for fn_name in [LOCF_UDF_NAME, INTERPOLATE_UDF_NAME] {
-            if count_udf(expr, fn_name)? > 0 {
-                return Err(DataFusionError::Plan(format!(
-                    "{fn_name} may only be used in the SELECT list of a gap-filling query"
-                )));
+        let mut functions = vec![];
+        expr.visit(&mut VirtualFunctionFinder::new(&mut functions))?;
+        if functions.is_empty() {
+            Ok(())
+        } else {
+            // There should be no virtual functions in this node, base the error message on the first one.
+            match &functions[0] {
+                VirtualFunction::GapFill(wrapped) => plan_err!(
+                    "{}_gapfill may only be used as a GROUP BY expression",
+                    wrapped.name()
+                ),
+                VirtualFunction::Locf => plan_err!("{LOCF_UDF_NAME} may only be used in the SELECT list of a gap-filling query"),
+                VirtualFunction::Interpolate=> plan_err!("{INTERPOLATE_UDF_NAME} may only be used in the SELECT list of a gap-filling query"),
             }
         }
-        Ok(())
     })
+}
+
+/// Tries to process `maybe_wrapped_fun` as an [`AggregateFunction`] which may be wrapped by a type
+/// which does not change its return type (e.g. [`Alias`]; read comment on `get_aggr_fn` inside for
+/// more detail) and get its default return value, assuming that its output column (if `Some(_)` is
+/// passed in for `output_column`) or its arguments (if `None` is passed in for `output_column`)
+/// exist in `schema`.
+///
+/// This also only returns `Ok(Some(_))` if the wrapped func produces non-nullable output - because
+/// this function, at time of writing, is only used to facilitate gapfilling values for
+/// non-nullable columns, we only care about the return types for functions that cannot have
+/// nullable outputs
+///
+/// # Arguments
+///
+/// * `maybe_wrapped_fun` - An expression that may contain an `AggregateFunction` whose output type
+///   will not be transformed by the expressions wrapping it. If this turns out to not contain such a
+///   AggregateFunction, this function returns Ok(None)
+/// * `schema` - The schema that the output column or agg func argument types are expected to
+///   reside in. read comment above for meaning of 'or' here
+/// * `output_column` - A [`Column`] representing the output of this AggregateFunction with this
+///   schema, if it is already know. `None` can be passed in for this function if unknown; passing in
+///   `Some` just unlocks small performance gains.
+pub fn default_return_value_for_aggr_fn(
+    maybe_wrapped_fun: &Expr,
+    schema: &DFSchema,
+    output_column: Option<&Column>,
+) -> Result<ScalarValue> {
+    // we use this function to recurse through the structure of the expr that we're given to try to
+    // find an aggregate function nested deep in it which still retains its same return type. E.g.
+    // if an aggregate function is nested inside a `between`, it doesn't retain its return type,
+    // since the type of the column is the return type of `between`, not of the function. But if
+    // it's inside an `Alias`, it does retain its return type, since the output is not transformed
+    // at all (just labeled differently).
+    fn get_aggr_fn(expr: &Expr) -> Option<&AggregateFunction> {
+        match expr {
+            Expr::AggregateFunction(ref fun) => Some(fun),
+            Expr::Alias(alias) => get_aggr_fn(&alias.expr),
+            _ => None,
+        }
+    }
+
+    // If there's not an aggregate function in there, we don't care
+    let Some(fun) = get_aggr_fn(maybe_wrapped_fun) else {
+        return maybe_wrapped_fun.get_type(schema)?.try_into();
+    };
+
+    // so if we already know the output column...
+    output_column
+        .map(|col| {
+            // ...just get its type.
+            schema
+                .field_from_column(col)
+                .map(|field| field.data_type().clone())
+        })
+        .unwrap_or_else(|| {
+            // if we don't know the output column, query the aggregate function for its return type
+            // with the provided arguments
+            let args = fun
+                .args
+                .iter()
+                .map(|arg| arg.get_type(schema))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            fun.func.return_type(&args)
+        })
+        // and then get the default value for that return type.
+        .and_then(|return_type| fun.func.default_value(&return_type))
 }
 
 #[cfg(test)]
@@ -894,13 +976,12 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+            @r#"
+        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp)]]"
-        - "    Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+        - "    Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "      TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
 
@@ -924,13 +1005,12 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, Some(\"UTC\")))], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, Some(\"UTC\"))), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
-        - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time, TimestampNanosecond(7, Some(\"UTC\"))) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, Some(\"UTC\")))]], aggr=[[avg(temps.temp)]]"
-        - "    Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+            @r#"
+        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None))], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None)), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
+        - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time, TimestampNanosecond(7, None)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None))]], aggr=[[avg(temps.temp)]]"
+        - "    Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "      TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
     #[test]
@@ -953,13 +1033,12 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), temps.loc], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+            @r#"
+        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), temps.loc], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), temps.loc]], aggr=[[avg(temps.temp)]]"
-        - "    Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+        - "    Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "      TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
 
@@ -1004,14 +1083,13 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
+            @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), avg(temps.temp)"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp)]]"
-        - "      Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+        - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
 
@@ -1039,14 +1117,13 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
+            @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), avg(temps.temp) AS locf(avg(temps.temp)), min(temps.temp) AS locf(min(temps.temp))"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[LOCF(avg(temps.temp)), LOCF(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[LOCF(avg(temps.temp)), LOCF(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp), min(temps.temp)]]"
-        - "      Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+        - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
 
@@ -1073,14 +1150,13 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
+            @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), min(temps.temp) AS locf(min(temps.temp)) AS locf_min_temp"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp), LOCF(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp), LOCF(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp), min(temps.temp)]]"
-        - "      Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+        - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
 
@@ -1108,14 +1184,13 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
-            @r###"
-        ---
+            @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), avg(temps.temp) AS interpolate(avg(temps.temp)), min(temps.temp) AS interpolate(min(temps.temp))"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[INTERPOLATE(avg(temps.temp)), INTERPOLATE(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[INTERPOLATE(avg(temps.temp)), INTERPOLATE(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp), min(temps.temp)]]"
-        - "      Filter: temps.time >= TimestampNanosecond(1000, Some(\"UTC\")) AND temps.time < TimestampNanosecond(2000, Some(\"UTC\"))"
+        - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
-        "###);
+        "#);
         Ok(())
     }
 
@@ -1146,11 +1221,10 @@ mod test {
 
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan).unwrap(),
-            @r###"
-        ---
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, Some(\"UTC\"))))..Excluded(Literal(TimestampNanosecond(2000, Some(\"UTC\"))))"
+            @r#"
+        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[]]"
-        - "    TableScan: temps projection=[time], full_filters=[temps.time >= TimestampNanosecond(1000, Some(\"UTC\")), temps.time < TimestampNanosecond(2000, Some(\"UTC\")), temps.loc = Utf8(\"foo\")]"
-        "###);
+        - "    TableScan: temps projection=[time], full_filters=[temps.time >= TimestampNanosecond(1000, None), temps.time < TimestampNanosecond(2000, None), temps.loc = Utf8(\"foo\")]"
+        "#);
     }
 }

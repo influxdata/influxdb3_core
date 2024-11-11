@@ -516,14 +516,6 @@ impl TaskRegistration {
 
         Self { state }
     }
-
-    /// Converts the registration into a tracker with id 0 and specified metadata
-    pub fn into_tracker<T>(self, metadata: T) -> TaskTracker<T>
-    where
-        T: Send + Sync,
-    {
-        TaskTracker::new(TaskId(0), &self, metadata)
-    }
 }
 
 impl Drop for TaskRegistration {

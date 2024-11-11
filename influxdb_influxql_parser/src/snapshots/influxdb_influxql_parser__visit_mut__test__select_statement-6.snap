@@ -1,6 +1,7 @@
 ---
 source: influxdb_influxql_parser/src/visit_mut.rs
 expression: "visit_statement!(r#\"SELECT value FROM (SELECT usage FROM cpu WHERE host = \"node1\")\n            WHERE region =~ /west/ AND value > 5\n            GROUP BY TIME(5m), host\n            FILL(previous)\n            ORDER BY TIME DESC\n            LIMIT 1 OFFSET 2\n            SLIMIT 3 SOFFSET 4\n            TZ('Australia/Hobart')\n        \"#)"
+snapshot_kind: text
 ---
 - pre_visit_statement
 - pre_visit_select_statement
@@ -118,4 +119,3 @@ expression: "visit_statement!(r#\"SELECT value FROM (SELECT usage FROM cpu WHERE
 - post_visit_timezone_clause
 - post_visit_select_statement
 - post_visit_statement
-

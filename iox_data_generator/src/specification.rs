@@ -222,14 +222,6 @@ pub struct ValuesSpec {
     pub belongs_to: Option<String>,
 }
 
-impl ValuesSpec {
-    /// returns true if there are other value collections that this values spec must use to
-    /// be generated
-    pub fn has_dependent_values(&self) -> bool {
-        self.has_one.is_some() || self.belongs_to.is_some()
-    }
-}
-
 /// The specification of tag sets that can be referenced in measurements to pull a pre-generated
 /// set of tags in.
 #[derive(Deserialize, Debug)]

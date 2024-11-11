@@ -1,8 +1,10 @@
+use crate::InfluxRpcError;
+
 use super::fields_pivot_stream::FieldsPivotStream;
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::Result;
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortRequirement};
@@ -13,18 +15,7 @@ use datafusion::physical_plan::{
 };
 use hashbrown::HashSet;
 use schema::TIME_DATA_TYPE;
-use snafu::Snafu;
 use std::sync::Arc;
-
-/// Error type for FieldsPivotExec.
-#[derive(Debug, Snafu)]
-enum Error {
-    #[snafu(display("No inputs provided"))]
-    NoInputs,
-
-    #[snafu(display("Time column not found in input schema"))]
-    TimeColumnNotFound,
-}
 
 pub(crate) struct FieldsPivotExec {
     schema: SchemaRef,
@@ -68,7 +59,7 @@ impl FieldsPivotExec {
             .enumerate()
             .find(|(_, f)| f.data_type() == &TIME_DATA_TYPE())
             .map(|(n, f)| Column::new(f.name(), n))
-            .ok_or_else(|| DataFusionError::External(Box::new(Error::TimeColumnNotFound)))?;
+            .ok_or_else(|| InfluxRpcError::internal("Time column not found"))?;
 
         Ok(PhysicalSortRequirement::new(
             Arc::new(col),
@@ -108,7 +99,7 @@ impl ExecutionPlan for FieldsPivotExec {
         let input = children
             .into_iter()
             .next()
-            .ok_or_else(|| DataFusionError::External(Box::new(Error::NoInputs)))?;
+            .ok_or_else(|| InfluxRpcError::internal("No inputs provided"))?;
         let properties = Self::make_properties(&self.schema, &input);
         let physical_sort_requirement = Self::make_physical_sort_requirement(&input)?;
         Ok(Arc::new(Self {

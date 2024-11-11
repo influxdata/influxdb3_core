@@ -9,14 +9,15 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 catalog_backup_file_list = { path = "../catalog_backup_file_list" }
-chrono = { version = "0.4", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 clap_blocks = { path = "../clap_blocks" }
 data_types = { path = "../data_types" }
 futures = "0.3"
 humantime = "2.1.0"
 iox_catalog = { path = "../iox_catalog" }
+iox_time = { path = "../iox_time" }
 object_store = { workspace = true }
 observability_deps = { path = "../observability_deps" }
 snafu = "0.8"
@@ -28,13 +29,13 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 metric = { path = "../metric" }
 
 [dev-dependencies]
-async-trait = "0.1"
-bytes = "1.7"
+bytes = "1.8"
+chrono = { version = "0.4", default-features = false }
 data_types = { path = "../data_types" }
 filetime = "0.2"
-iox_time = { path = "../iox_time" }
+flate2 = "1"
 metric = { path = "../metric" }
 parquet_file = { path = "../parquet_file" }
 paste = "1.0.15"
-service_grpc_bulk_ingest = { path = "../service_grpc_bulk_ingest" }
 tempfile = "3"
+test_helpers = { path = "../test_helpers" }

@@ -25,7 +25,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 assert_matches = "1.5.0"
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 partition = { path = "../partition" }
-pretty_assertions = "1.4.0"
+pretty_assertions = "1.4.1"
 proptest = { workspace = true }
 rand = "0.8"
 

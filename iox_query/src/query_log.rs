@@ -504,6 +504,12 @@ where
         self.entry.as_ref().expect("valid state")
     }
 
+    fn collect_execution_data(&self, state: &mut QueryLogEntryState) {
+        self.collect_compute_time(state);
+        self.collect_memory_usage(state);
+        self.collect_ingester_metrics(state);
+    }
+
     fn collect_compute_time(&self, state: &mut QueryLogEntryState) {
         let Some(plan) = self.state.plan() else {
             return;
@@ -636,9 +642,7 @@ impl QueryCompletedToken<StatePermit> {
             set_relative(origin, now, &mut state.execute_duration);
         }
 
-        self.collect_compute_time(&mut state);
-        self.collect_memory_usage(&mut state);
-        self.collect_ingester_metrics(&mut state);
+        self.collect_execution_data(&mut state);
         entry.set(state);
     }
 }
@@ -656,9 +660,7 @@ where
 
                 if state.permit_duration.is_some() {
                     // started computation, collect partial stats
-                    self.collect_compute_time(&mut state);
-                    self.collect_ingester_metrics(&mut state);
-                    self.collect_memory_usage(&mut state);
+                    self.collect_execution_data(&mut state);
                 }
             }
 

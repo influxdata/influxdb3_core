@@ -349,7 +349,7 @@ impl InnerPointsWriter {
 
                 for (measurement, batch) in batches_by_measurement {
                     let record_batch = batch
-                        .to_arrow(Projection::All)
+                        .try_into_arrow(Projection::All)
                         .context(ConvertToArrowSnafu)?;
                     let stream = Box::pin(MemoryStream::new(vec![record_batch]));
                     let meta = IoxMetadata::external(crate::now_ns(), &*measurement);

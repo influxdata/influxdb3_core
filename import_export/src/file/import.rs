@@ -6,9 +6,9 @@ use data_types::{
     partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, PARTITION_BY_DAY_PROTO,
     },
-    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, CompactionLevelProtoError, Namespace,
-    NamespaceId, NamespaceName, NamespaceNameError, ParquetFileParams, Partition, PartitionKey,
-    SortKeyIds, Statistics, Table, TableId, Timestamp,
+    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, CompactionLevelProtoError,
+    MaxL0CreatedAt, Namespace, NamespaceId, NamespaceName, NamespaceNameError, ParquetFileParams,
+    Partition, PartitionKey, SortKeyIds, Statistics, Table, TableId, Timestamp,
 };
 use generated_types::influxdata::iox::catalog::v1 as proto;
 use generated_types::influxdata::iox::table::v1 as table;
@@ -782,7 +782,9 @@ impl RemoteImporter {
                 compaction_level,
                 created_at: Timestamp::new(proto_parquet_file.created_at),
                 column_set,
-                max_l0_created_at: Timestamp::new(proto_parquet_file.max_l0_created_at),
+                max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(
+                    proto_parquet_file.max_l0_created_at,
+                )),
                 source: None,
             }
         } else {
@@ -803,11 +805,10 @@ impl RemoteImporter {
                 // should stop immediately (and get an exact stack trace)
                 file_size_bytes: file_size_bytes.try_into().unwrap(),
                 row_count: decoded_iox_parquet_metadata.row_count().try_into().unwrap(),
-                //compaction_level: CompactionLevel::Final,
                 compaction_level: CompactionLevel::Initial,
                 created_at,
                 column_set,
-                max_l0_created_at: created_at,
+                max_l0_created_at: MaxL0CreatedAt::NotCompacted,
                 source: None,
             }
         };

@@ -1,9 +1,10 @@
-use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::optimizer::utils::NamePreserver;
 use datafusion::{
     common::tree_node::TreeNodeRewriter,
     error::DataFusionError,
-    logical_expr::{expr_rewriter::rewrite_preserving_name, LogicalPlan, Operator},
+    logical_expr::{LogicalPlan, Operator},
     optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
     prelude::{binary_expr, lit, Expr},
     scalar::ScalarValue,
@@ -59,14 +60,17 @@ impl OptimizerRule for InfluxRegexToDataFusionRegex {
 }
 
 fn optimize(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>, DataFusionError> {
-    // Inputs have already been rewritten (due to bottom-up traversal handled by Optimizer)
-    // Just need to rewrite our own expressions
-
+    // Inputs have already been rewritten (due to bottom-up traversal handled by
+    // Optimizer). Just need to rewrite our own expressions
     let mut expr_rewriter = InfluxRegexToDataFusionRegex {};
 
+    let name_preserver = NamePreserver::new(&plan);
     plan.map_expressions(|expr| {
-        let new_expr = rewrite_preserving_name(expr, &mut expr_rewriter)?;
-        Ok(Transformed::yes(new_expr))
+        let saved_name = name_preserver.save(&expr);
+        let transformed = expr
+            .rewrite(&mut expr_rewriter)?
+            .update_data(|expr| saved_name.restore(expr));
+        Ok(transformed)
     })
 }
 

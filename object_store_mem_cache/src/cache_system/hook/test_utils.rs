@@ -3,7 +3,7 @@ use std::{
     sync::Mutex,
 };
 
-use crate::cache_system::{hook::Hook, interfaces::DynError};
+use crate::cache_system::{hook::Hook, DynError};
 
 use super::{EvictResult, HookDecision};
 

@@ -152,7 +152,7 @@ impl RewriteSelect {
         //
         // See: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L172-L179
         let time_range = match (interval, time_range.upper) {
-            (Some(interval), None) if interval.duration > 0 => TimeRange {
+            (Some(Interval { duration: 1.., .. }), None) => TimeRange {
                 lower: time_range.lower,
                 upper: Some(now.timestamp_nanos_opt().expect("'now' in nano range")),
             },

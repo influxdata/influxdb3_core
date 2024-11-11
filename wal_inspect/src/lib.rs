@@ -144,7 +144,7 @@ where
     {
         for (table_id, mb) in table_batches {
             let schema = mb.schema(schema::Projection::All)?;
-            let record_batch = mb.to_arrow(schema::Projection::All)?;
+            let record_batch = mb.try_into_arrow(schema::Projection::All)?;
             let measurement_name = match &self.table_name_lookup {
                 Some(idx) => Cow::Borrowed(idx.get(&table_id).ok_or(
                     WriteError::RecordBatchTranslationFailure(format!(

@@ -5,7 +5,6 @@ pub(crate) mod context;
 pub mod gapfill;
 mod metrics;
 pub mod query_tracing;
-mod schema_pivot;
 pub mod sleep;
 pub(crate) mod split;
 use datafusion_util::config::register_iox_object_store;
@@ -19,21 +18,17 @@ use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 
 use datafusion::{
     self,
-    error::DataFusionError,
     execution::{
         disk_manager::DiskManagerConfig,
         memory_pool::MemoryPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
-    logical_expr::{
-        expr_rewriter::normalize_col, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
-    },
+    logical_expr::{expr_rewriter::normalize_col, Expr, Extension, LogicalPlan},
 };
 
 pub use context::{
     IOxSessionConfig, IOxSessionContext, QueryConfig, QueryLanguage, SessionContextIOxExt,
 };
-use schema_pivot::SchemaPivotNode;
 
 use crate::exec::metrics::DataFusionMemoryPoolMetricsBridge;
 
@@ -152,7 +147,7 @@ impl Executor {
         }
     }
 
-    /// Return a new ession config, suitable for executing a new query or system task.
+    /// Return a new session config, suitable for executing a new query or system task.
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
     pub fn new_session_config(&self) -> IOxSessionConfig {
@@ -205,48 +200,6 @@ impl Executor {
 
 // No need to implement `Drop` because this is done by DedicatedExecutor already
 
-/// Create a SchemaPivot node which takes an arbitrary input like
-///  ColA | ColB | ColC
-/// ------+------+------
-///   1   | NULL | NULL
-///   2   | 2    | NULL
-///   3   | 2    | NULL
-///
-/// And pivots it to a table with a single string column for any
-/// columns that had non null values.
-///
-///   non_null_column
-///  -----------------
-///   "ColA"
-///   "ColB"
-pub fn make_schema_pivot(input: LogicalPlan) -> LogicalPlan {
-    let node = Arc::new(SchemaPivotNode::new(input));
-
-    LogicalPlan::Extension(Extension { node })
-}
-
-/// Attach a SchemaPivot node to a builder. A SchemaPivot
-/// node takes an arbitrary input like
-///  ColA | ColB | ColC
-/// ------+------+------
-///   1   | NULL | NULL
-///   2   | 2    | NULL
-///   3   | 2    | NULL
-///
-/// And pivots it to a table with a single string column for any
-/// columns that had non null values.
-///
-///   non_null_column
-///  -----------------
-///   "ColA"
-///   "ColB"
-pub fn build_schema_pivot(
-    builder: LogicalPlanBuilder,
-) -> Result<LogicalPlanBuilder, DataFusionError> {
-    let input = builder.build()?;
-    Ok(LogicalPlanBuilder::from(make_schema_pivot(input)))
-}
-
 /// Create a StreamSplit node which takes an input stream of record
 /// batches and produces multiple output streams based on  a list of `N` predicates.
 /// The output will have `N+1` streams, and each row is sent to the stream
@@ -295,66 +248,25 @@ pub fn make_stream_split(input: LogicalPlan, split_exprs: Vec<Expr>) -> LogicalP
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use arrow::{
-        array::{ArrayRef, Int64Array, StringArray},
+        array::Int64Array,
         datatypes::{DataType, Field, SchemaRef},
     };
     use datafusion::{
-        datasource::{provider_as_source, MemTable},
         error::DataFusionError,
-        logical_expr::LogicalPlanBuilder,
         physical_expr::{EquivalenceProperties, PhysicalSortExpr},
         physical_plan::{
             expressions::Column, sorts::sort::SortExec, DisplayAs, ExecutionMode, ExecutionPlan,
             PlanProperties, RecordBatchStream,
         },
     };
-    use futures::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
+    use futures::{stream::BoxStream, Stream, StreamExt};
     use metric::{Observation, RawReporter};
 
     use tokio::sync::Barrier;
 
     use super::*;
     use arrow::record_batch::RecordBatch;
-
-    #[tokio::test]
-    async fn make_schema_pivot_is_planned() {
-        // Test that all the planning logic is wired up and that we
-        // can make a plan using a SchemaPivot node
-        let batch = RecordBatch::try_from_iter_with_nullable(vec![
-            ("f1", to_string_array(&["foo", "bar"]), true),
-            ("f2", to_string_array(&["baz", "bzz"]), true),
-        ])
-        .expect("created new record batch");
-
-        let scan = make_plan(batch.schema(), vec![batch]);
-        let pivot = make_schema_pivot(scan);
-
-        let exec = Executor::new_testing();
-        let ctx = exec.new_context();
-        let physical_plan = ctx
-            .create_physical_plan(&pivot)
-            .await
-            .expect("Created physical plan");
-        let mut stream = ctx
-            .execute_stream(physical_plan)
-            .await
-            .expect("Executed plan");
-
-        let mut results = BTreeSet::<String>::default();
-        while let Some(batch) = stream.try_next().await.expect("Got next batch") {
-            let arr = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Cast to string array");
-            results.extend(arr.into_iter().map(|x| String::from(x.expect("No nulls"))));
-        }
-
-        assert_eq!(results, to_set(&["f1", "f2"]));
-    }
 
     #[tokio::test]
     async fn test_metrics_integration() {
@@ -402,32 +314,6 @@ mod tests {
                 limit: TESTING_MEM_POOL_SIZE as u64,
             },
         );
-    }
-
-    /// return a set for testing
-    fn to_set(strs: &[&str]) -> BTreeSet<String> {
-        strs.iter().map(|s| s.to_string()).collect()
-    }
-
-    fn to_string_array(strs: &[&str]) -> ArrayRef {
-        let array: StringArray = strs.iter().map(|s| Some(*s)).collect();
-        Arc::new(array)
-    }
-
-    // creates a DataFusion plan that reads the RecordBatches into memory
-    fn make_plan(schema: SchemaRef, data: Vec<RecordBatch>) -> LogicalPlan {
-        let partitions = vec![data];
-
-        let projection = None;
-
-        // model one partition,
-        let table = MemTable::try_new(schema, partitions).unwrap();
-        let source = provider_as_source(Arc::new(table));
-
-        LogicalPlanBuilder::scan("memtable", source, projection)
-            .unwrap()
-            .build()
-            .unwrap()
     }
 
     #[derive(Debug)]

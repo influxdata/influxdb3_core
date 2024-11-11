@@ -74,8 +74,8 @@ impl ParquetFileMetrics {
         metrics.collect_for_plan(plan, false);
 
         Self {
-            parquet_files: metrics.parquet_files,
-            deduplicated_parquet_files: metrics.deduplicated_parquet_files,
+            parquet_files: metrics.parquet_files.len(),
+            deduplicated_parquet_files: metrics.deduplicated_parquet_files.len(),
             partitions: metrics.partitions.len(),
             deduplicated_partitions: metrics.deduplicated_partitions.len(),
         }
@@ -84,8 +84,8 @@ impl ParquetFileMetrics {
 
 #[derive(Default)]
 struct ParquetFileMetricsVisitor<'plan> {
-    pub(crate) parquet_files: usize,
-    pub(crate) deduplicated_parquet_files: usize,
+    pub(crate) parquet_files: HashSet<&'plan str>,
+    pub(crate) deduplicated_parquet_files: HashSet<&'plan str>,
     pub(crate) partitions: HashSet<&'plan str>,
     pub(crate) deduplicated_partitions: HashSet<&'plan str>,
 }
@@ -129,11 +129,14 @@ impl<'plan> ParquetFileMetricsVisitor<'plan> {
         }
     }
 
-    fn add_parts_and_files_from_iter<I>(iter: I, files: &mut usize, parts: &mut HashSet<&'plan str>)
-    where
+    fn add_parts_and_files_from_iter<I>(
+        iter: I,
+        files: &mut HashSet<&'plan str>,
+        parts: &mut HashSet<&'plan str>,
+    ) where
         I: Iterator<Item = &'plan Path> + Clone,
     {
-        *files += iter.clone().count();
+        files.extend(iter.clone().map(|path| path.as_ref()));
         parts.extend(iter.flat_map(|path| {
             path.as_ref()
                 .rsplit_once(object_store::path::DELIMITER)
@@ -274,7 +277,62 @@ mod tests {
         );
     }
 
-    fn parquet_exec(files: &[&str]) -> Arc<dyn ExecutionPlan> {
+    #[test]
+    fn test_parquet_files_with_ranges() {
+        let execs: Vec<Arc<dyn ExecutionPlan>> = vec![
+            parquet_exec_with_ranges(&[
+                ("1/2/partition1/file1", (1, 2)),
+                ("1/2/partition1/file2", (1, 2)),
+                ("1/2/partition1/file2", (2, 3)),
+                ("1/2/partition1/file3", (1, 2)),
+            ]),
+            parquet_exec_with_ranges(&[
+                ("1/2/partition1/file2", (1, 2)),
+                ("1/2/partition1/file4", (1, 2)),
+            ]),
+            Arc::new(DeduplicateExec::new(
+                parquet_exec_with_ranges(&[
+                    ("1/2/partition2/file1", (1, 2)),
+                    ("1/2/partition2/file2", (1, 2)),
+                    ("1/2/partition2/file2", (2, 3)),
+                    ("1/2/partition2/file3", (1, 2)),
+                ]),
+                Vec::new(),
+                false,
+            )),
+            Arc::new(DeduplicateExec::new(
+                parquet_exec_with_ranges(&[
+                    ("1/2/partition2/file2", (1, 2)),
+                    ("1/2/partition2/file4", (1, 2)),
+                ]),
+                Vec::new(),
+                false,
+            )),
+        ];
+        let plan = UnionExec::new(execs);
+        let metrics = ParquetFileMetrics::plan_metrics(&plan);
+        assert_eq!(
+            metrics,
+            ParquetFileMetrics {
+                parquet_files: 8,
+                deduplicated_parquet_files: 4,
+                partitions: 2,
+                deduplicated_partitions: 1
+            }
+        );
+    }
+
+    fn parquet_exec(files: &[&'static str]) -> Arc<dyn ExecutionPlan> {
+        parquet_exec_with_optional_ranges(files.iter().map(|f| (*f, None)))
+    }
+
+    fn parquet_exec_with_ranges(files: &[(&'static str, (i64, i64))]) -> Arc<dyn ExecutionPlan> {
+        parquet_exec_with_optional_ranges(files.iter().map(|(f, r)| (*f, Some(*r))))
+    }
+
+    fn parquet_exec_with_optional_ranges(
+        files: impl IntoIterator<Item = (&'static str, Option<(i64, i64)>)>,
+    ) -> Arc<dyn ExecutionPlan> {
         let base_config = FileScanConfig {
             object_store_url: ObjectStoreUrl::local_filesystem(),
             file_schema: Arc::new(Schema {
@@ -282,8 +340,14 @@ mod tests {
                 metadata: Default::default(),
             }),
             file_groups: files
-                .iter()
-                .map(|f| vec![PartitionedFile::new(*f, 0)])
+                .into_iter()
+                .map(|(f, r)| {
+                    let mut file = PartitionedFile::new(f, 0);
+                    if let Some((start, end)) = r {
+                        file = file.with_range(start, end);
+                    }
+                    vec![file]
+                })
                 .collect(),
             statistics: Statistics {
                 num_rows: Precision::Absent,

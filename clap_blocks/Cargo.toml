@@ -12,8 +12,7 @@ workspace = true
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env", "string"] }
 ed25519-dalek = { version = "2", features = ["pem"] }
-futures = "0.3"
-http = "0.2"
+http = { workspace = true }
 # object store crate uses new version of http crate
 http_1 = { version = "1.1", package = "http" }
 humantime = "2.1.0"
@@ -21,17 +20,16 @@ iox_catalog = { path = "../iox_catalog" }
 iox_time = { path = "../iox_time" }
 itertools = "0.13.0"
 metric = { path = "../metric" }
-non-empty-string = "0.2.4"
+non-empty-string = "0.2.5"
 object_store = { workspace = true }
 observability_deps = { path = "../observability_deps" }
 paste = "1.0.15"
 snafu = "0.8"
-sysinfo = "0.31.4"
-tokio = { version = "1.40", features = ["rt-multi-thread"] }
+sysinfo = "0.32.0"
+tokio = { version = "1.41", features = ["rt-multi-thread"] }
 trace_exporters = { path = "../trace_exporters" }
 trogging = { path = "../trogging", default-features = false, features = ["clap"] }
 url = "2.5"
-uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # use libc on unix like platforms to set worker priority of the tokio runtime workers
@@ -39,8 +37,9 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 version = "0.2"
 
 [dev-dependencies]
-tempfile = "3.12.0"
+tempfile = "3.14.0"
 test_helpers = { path = "../test_helpers" }
+futures = "0.3.31"
 
 [features]
 azure = ["object_store/azure"] # Optional Azure Object store support

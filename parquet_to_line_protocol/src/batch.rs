@@ -228,7 +228,7 @@ m,tag2=multi_field bool_field=false,str_field="blargh" 610
         let (table_name, mutable_batch) = mutable_batches.into_iter().next().unwrap();
 
         let selection = Projection::All;
-        let record_batch = mutable_batch.to_arrow(selection).unwrap();
+        let record_batch = mutable_batch.clone().try_into_arrow(selection).unwrap();
         let iox_schema = mutable_batch.schema(selection).unwrap();
 
         let output_lp = convert_to_lines(&table_name, &iox_schema, &record_batch)

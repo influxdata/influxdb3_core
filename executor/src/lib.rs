@@ -37,7 +37,7 @@ pub use io::{register_current_runtime_for_io, register_io_runtime, spawn_io};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
-/// Errors occuring when polling [`DedicatedExecutor::spawn`].
+/// Errors occurring when polling [`DedicatedExecutor::spawn`].
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
 pub enum JobError {
@@ -48,8 +48,57 @@ pub enum JobError {
     Panic { msg: String },
 }
 
-/// Runs futures (and any `tasks` that are `tokio::task::spawned` by
-/// them) on a separate tokio Executor
+/// Manages a separate tokio runtime (thread pool) for executing tasks.
+///
+/// A `DedicatedExecutor` runs futures (and any `tasks` that are
+/// `tokio::task::spawned` by them) on a separate tokio Executor
+///
+/// # Background
+///
+/// Tokio has the notion of the "current" runtime, which runs the current future
+/// and any tasks spawned by it. Typically, this is the runtime created by
+/// `tokio::main` and is used for the main application logic and I/O handling
+///
+/// For CPU bound work, such as DataFusion plan execution, it is important to
+/// run on a separate thread pool to avoid blocking the I/O handling for extended
+/// periods of time in order to avoid long poll latencies (which decreases the
+/// throughput of small requests under concurrent load).
+///
+/// # IO Scheduling
+///
+/// I/O, such as network calls, should not be performed on the runtime managed
+/// by [`DedicatedExecutor`]. As tokio is a cooperative scheduler, long-running
+/// CPU tasks will not be preempted and can therefore starve servicing of other
+/// tasks. This manifests in long poll-latencies, where a task is ready to run
+/// but isn't being scheduled to run. For CPU-bound work this isn't a problem as
+/// there is no external party waiting on a response, however, for I/O tasks,
+/// long poll latencies can prevent timely servicing of IO, which can have a
+/// significant detrimental effect.
+///
+/// # Details
+///
+/// The worker thread priority is set to low so that such tasks do
+/// not starve other more important tasks (such as answering health checks)
+///
+/// Follows the example from to stack overflow and spawns a new
+/// thread to install a Tokio runtime "context"
+/// <https://stackoverflow.com/questions/62536566>
+///
+/// # Trouble Shooting:
+///
+/// ## "No IO runtime registered. Call `register_io_runtime`/`register_current_runtime_for_io` in current thread!
+///
+/// This means that IO was attempted on a tokio runtime that was not registered
+/// for IO. One solution is to run the task using [DedicatedExecutor::spawn].
+///
+/// ## "Cannot drop a runtime in a context where blocking is not allowed"`
+///
+/// If you try to use this structure from an async context you see something like
+/// thread 'plan::stringset::tests::test_builder_plan' panicked at 'Cannot
+/// drop a runtime in a context where blocking is not allowed. This
+/// happens when a runtime is dropped from within an asynchronous
+/// context.', .../tokio-1.4.0/src/runtime/blocking/shutdown.rs:51:21
+///
 #[derive(Clone)]
 pub struct DedicatedExecutor {
     state: Arc<RwLock<State>>,
@@ -120,33 +169,13 @@ impl DedicatedExecutor {
     /// executor that is separate from the threadpool created via
     /// `[tokio::main]` or similar.
     ///
-    /// The worker thread priority is set to low so that such tasks do
-    /// not starve other more important tasks (such as answering health checks)
+    /// See the documentation on [`DedicatedExecutor`] for more details.
     ///
-    /// Follows the example from to stack overflow and spawns a new
-    /// thread to install a Tokio runtime "context"
-    /// <https://stackoverflow.com/questions/62536566>
-    ///
-    /// If you try to do this from an async context you see something like
-    /// thread 'plan::stringset::tests::test_builder_plan' panicked at 'Cannot
-    /// drop a runtime in a context where blocking is not allowed. This
-    /// happens when a runtime is dropped from within an asynchronous
-    /// context.', .../tokio-1.4.0/src/runtime/blocking/shutdown.rs:51:21
-    ///
-    /// # IO Scheduling
-    ///
-    /// IO, such as network calls, should not be performed on the runtime managed
-    /// by [`DedicatedExecutor`]. As tokio is a cooperative scheduler, long-running
-    /// CPU tasks will not be preempted and can therefore starve servicing of other tasks.
-    /// This manifests in long poll-latencies, where a task is ready to run but isn't
-    /// being scheduled to run. For CPU-bound work this isn't a problem as there is no
-    /// external party, however, for IO tasks, long poll latencies can prevent timely
-    /// servicing of IO, which can have a significant detrimental effect.
-    ///
-    /// As such if [`DedicatedExecutor::new`] is called within the context of
-    /// an existing tokio runtime, this will be passed to [`register_io_runtime`]
-    /// by all threads spawned by the executor. This will allow scheduling IO
-    /// outside the context of [`DedicatedExecutor`] using [`spawn_io`].
+    /// If [`DedicatedExecutor::new`] is called from an existing tokio runtime,
+    /// it will assume that the existing runtime should be used for I/O, and is
+    /// thus set, via [`register_io_runtime`] by all threads spawned by the
+    /// executor. This will allow scheduling IO outside the context of
+    /// [`DedicatedExecutor`] using [`spawn_io`].
     pub fn new(
         name: &str,
         runtime_builder: tokio::runtime::Builder,
@@ -258,11 +287,17 @@ impl DedicatedExecutor {
             .clone()
     }
 
-    /// Runs the specified Future (and any tasks it spawns) on the
-    /// `DedicatedExecutor`.
+    /// Runs the specified [`Future`] (and any tasks it spawns) on the thread
+    /// pool managed by this `DedicatedExecutor`.
     ///
-    /// Currently all tasks are added to the tokio executor
-    /// immediately and compete for the threadpool's resources.
+    /// # Notes
+    ///
+    /// UNLIKE [`tokio::task::spawn`], the returned future is **cancelled** when
+    /// it is dropped. Thus, you need ensure the returned future lives until it
+    /// completes (call `await`) or you wish to cancel it.
+    ///
+    /// Currently all tasks are added to the tokio executor immediately and
+    /// compete for the threadpool's resources.
     pub fn spawn<T>(&self, task: T) -> impl Future<Output = Result<T::Output, JobError>>
     where
         T: Future + Send + 'static,

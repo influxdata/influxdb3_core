@@ -4,7 +4,7 @@
 
 use crate::{
     exec::{Executor, IOxSessionContext, QueryConfig},
-    pruning::prune_chunks,
+    provider::ProviderBuilder,
     query_log::{QueryLog, QueryLogEntries, StateReceived},
     Extension, QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace,
     QueryText,
@@ -197,39 +197,7 @@ impl TestDatabase {
     }
 }
 
-#[async_trait]
 impl QueryNamespace for TestDatabase {
-    async fn chunks(
-        &self,
-        table_name: &str,
-        filters: &[Expr],
-        _projection: Option<&Vec<usize>>,
-        _ctx: IOxSessionContext,
-    ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
-        // save last predicate
-        *self.chunks_predicate.lock() = filters.to_vec();
-
-        let partitions = self.partitions.lock().clone();
-        Ok(partitions
-            .values()
-            .flat_map(|x| x.values())
-            // filter by table
-            .filter(|c| c.table_name == table_name)
-            // only keep chunks if their statistics overlap
-            .filter(|c| {
-                prune_chunks(
-                    c.schema(),
-                    &[Arc::clone(*c) as Arc<dyn QueryChunk>],
-                    filters,
-                )
-                .ok()
-                .map(|res| res[0])
-                .unwrap_or(true)
-            })
-            .map(|x| Arc::clone(x) as Arc<dyn QueryChunk>)
-            .collect::<Vec<_>>())
-    }
-
     fn retention_time_ns(&self) -> Option<i64> {
         self.retention_time_ns
     }
@@ -253,7 +221,7 @@ impl QueryNamespace for TestDatabase {
 
     fn new_extended_query_context(
         &self,
-        extension: Arc<dyn Extension>,
+        extension: Option<Arc<dyn Extension>>,
         span_ctx: Option<SpanContext>,
         query_config: Option<&QueryConfig>,
     ) -> IOxSessionContext {
@@ -265,17 +233,8 @@ impl QueryNamespace for TestDatabase {
                 self,
             )))
             .with_span_context(span_ctx);
-        if let Some(planner) = extension.planner() {
-            cmd = cmd.with_extension_planner(planner);
-        }
-        for analyzer_rule in extension.analyzer_rules() {
-            cmd = cmd.with_analyzer_rule(analyzer_rule);
-        }
-        for optimizer_rule in extension.optimizer_rules() {
-            cmd = cmd.with_optimizer_rule(optimizer_rule);
-        }
-        for physical_optimizer_rule in extension.physical_optimizer_rules() {
-            cmd = cmd.with_physical_optimizer_rule(physical_optimizer_rule);
+        if let Some(extension) = extension {
+            cmd = cmd.with_query_extension(extension);
         }
         if let Some(query_config) = query_config {
             cmd = cmd.with_query_config(query_config);
@@ -336,6 +295,7 @@ impl SchemaProvider for TestDatabaseSchemaProvider {
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         Ok(Some(Arc::new(TestDatabaseTableProvider {
+            name: Arc::from(name),
             partitions: self
                 .partitions
                 .values()
@@ -351,7 +311,19 @@ impl SchemaProvider for TestDatabaseSchemaProvider {
 }
 
 struct TestDatabaseTableProvider {
+    name: Arc<str>,
     partitions: Vec<Arc<TestChunk>>,
+}
+
+impl TestDatabaseTableProvider {
+    fn iox_schema(&self) -> Schema {
+        self.partitions
+            .iter()
+            .fold(SchemaMerger::new(), |merger, chunk| {
+                merger.merge(chunk.schema()).expect("consistent schemas")
+            })
+            .build()
+    }
 }
 
 #[async_trait]
@@ -361,13 +333,7 @@ impl TableProvider for TestDatabaseTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.partitions
-            .iter()
-            .fold(SchemaMerger::new(), |merger, chunk| {
-                merger.merge(chunk.schema()).expect("consistent schemas")
-            })
-            .build()
-            .as_arrow()
+        self.iox_schema().as_arrow()
     }
 
     fn table_type(&self) -> TableType {
@@ -376,12 +342,19 @@ impl TableProvider for TestDatabaseTableProvider {
 
     async fn scan(
         &self,
-        _ctx: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        ctx: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> crate::exec::context::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        let mut builder = ProviderBuilder::new(Arc::clone(&self.name), self.iox_schema());
+        for chunk in &self.partitions {
+            builder = builder.add_chunk(Arc::clone(chunk) as Arc<dyn QueryChunk>);
+        }
+        let provider = builder
+            .build()
+            .map_err(|err| DataFusionError::External(Box::new(err)))?;
+        provider.scan(ctx, projection, filters, limit).await
     }
 }
 
@@ -563,8 +536,10 @@ impl TestChunk {
     }
 
     pub fn with_partition(mut self, id: i64) -> Self {
-        self.partition_id =
-            TransitionPartitionId::new(TableId::new(id), &PartitionKey::from("arbitrary"));
+        self.partition_id = TransitionPartitionId::deterministic(
+            TableId::new(id),
+            &PartitionKey::from("arbitrary"),
+        );
         self
     }
 

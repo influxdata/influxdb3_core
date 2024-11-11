@@ -1,6 +1,6 @@
 //! gRPC server implementation.
 
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc};
 
 use crate::{
     grpc::serialization::{
@@ -18,9 +18,12 @@ use data_types::{
     Timestamp,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use generated_types::influxdata::iox::catalog::v2 as proto;
-use generated_types::influxdata::iox::catalog::v2::PartitionDeleteByRetentionRequest;
+use generated_types::influxdata::iox::catalog::v2::{
+    self as proto, PartitionDeleteByRetentionRequest,
+};
 use tonic::{Request, Response, Status};
+
+use super::serialization::serialize_timestamp;
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
 
@@ -91,6 +94,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     type ParquetFileActiveAsOfStream = TonicStream<proto::ParquetFileActiveAsOfResponse>;
     type ParquetFileExistsByObjectStoreIdBatchStream =
         TonicStream<proto::ParquetFileExistsByObjectStoreIdBatchResponse>;
+    type ParquetFileListByTableIdStream = TonicStream<proto::ParquetFileListByTableIdResponse>;
 
     async fn root_snapshot(
         &self,
@@ -151,11 +155,28 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceUpdateRetentionPeriodRequest>,
     ) -> Result<Response<proto::NamespaceUpdateRetentionPeriodResponse>, tonic::Status> {
+        use proto::namespace_update_retention_period_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
+
+        let name = match req.target.required()? {
+            Target::Name(v) => v,
+            Target::Id(id) => {
+                repos
+                    .namespaces()
+                    .get_by_id(
+                        NamespaceId::new(id),
+                        crate::interface::SoftDeletedRows::ExcludeDeleted,
+                    )
+                    .await
+                    .map_err(catalog_error_to_status)?
+                    .ok_or(tonic::Status::not_found(id.to_string()))?
+                    .name
+            }
+        };
 
         let ns = repos
             .namespaces()
-            .update_retention_period(&req.name, req.retention_period_ns)
+            .update_retention_period(&name, req.retention_period_ns)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -240,11 +261,28 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceSoftDeleteRequest>,
     ) -> Result<Response<proto::NamespaceSoftDeleteResponse>, tonic::Status> {
+        use proto::namespace_soft_delete_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
+
+        let name = match req.target.required()? {
+            Target::Name(v) => v,
+            Target::Id(id) => {
+                repos
+                    .namespaces()
+                    .get_by_id(
+                        NamespaceId::new(id),
+                        crate::interface::SoftDeletedRows::ExcludeDeleted,
+                    )
+                    .await
+                    .map_err(catalog_error_to_status)?
+                    .ok_or(tonic::Status::not_found(id.to_string()))?
+                    .name
+            }
+        };
 
         let id = repos
             .namespaces()
-            .soft_delete(&req.name)
+            .soft_delete(&name)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -257,11 +295,28 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceUpdateTableLimitRequest>,
     ) -> Result<Response<proto::NamespaceUpdateTableLimitResponse>, tonic::Status> {
+        use proto::namespace_update_table_limit_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
+
+        let name = match req.target.required()? {
+            Target::Name(v) => v,
+            Target::Id(id) => {
+                repos
+                    .namespaces()
+                    .get_by_id(
+                        NamespaceId::new(id),
+                        crate::interface::SoftDeletedRows::ExcludeDeleted,
+                    )
+                    .await
+                    .map_err(catalog_error_to_status)?
+                    .ok_or(tonic::Status::not_found(id.to_string()))?
+                    .name
+            }
+        };
 
         let ns = repos
             .namespaces()
-            .update_table_limit(&req.name, req.new_max.convert().ctx("new_max")?)
+            .update_table_limit(&name, req.new_max.convert().ctx("new_max")?)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -276,11 +331,28 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<proto::NamespaceUpdateColumnLimitRequest>,
     ) -> Result<Response<proto::NamespaceUpdateColumnLimitResponse>, tonic::Status> {
+        use proto::namespace_update_column_limit_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
+
+        let name = match req.target.required()? {
+            Target::Name(v) => v,
+            Target::Id(id) => {
+                repos
+                    .namespaces()
+                    .get_by_id(
+                        NamespaceId::new(id),
+                        crate::interface::SoftDeletedRows::ExcludeDeleted,
+                    )
+                    .await
+                    .map_err(catalog_error_to_status)?
+                    .ok_or(tonic::Status::not_found(id.to_string()))?
+                    .name
+            }
+        };
 
         let ns = repos
             .namespaces()
-            .update_column_limit(&req.name, req.new_max.convert().ctx("new_max")?)
+            .update_column_limit(&name, req.new_max.convert().ctx("new_max")?)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -972,10 +1044,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
         let id_list = repos
             .parquet_files()
-            .delete_old_ids_only(
-                Timestamp::new(req.older_than),
-                Duration::from_nanos(req.cutoff as u64),
-            )
+            .delete_old_ids_only(Timestamp::new(req.older_than))
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -1138,5 +1207,50 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
                 created_parquet_file_ids: id_list.into_iter().map(|id| id.get()).collect(),
             },
         ))
+    }
+
+    async fn parquet_file_list_by_table_id(
+        &self,
+        request: Request<proto::ParquetFileListByTableIdRequest>,
+    ) -> Result<Response<Self::ParquetFileListByTableIdStream>, tonic::Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let compaction_level = if let Some(l) = req.compaction_level {
+            Some(l.try_into().map_err(|e| {
+                catalog_error_to_status(crate::interface::Error::External {
+                    source: Arc::new(e),
+                })
+            })?)
+        } else {
+            None
+        };
+
+        let files = repos
+            .parquet_files()
+            .list_by_table_id(TableId::new(req.table_id), compaction_level)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(files.into_iter().map(|f| {
+                let file = serialize_parquet_file(f);
+                Ok(proto::ParquetFileListByTableIdResponse { file: Some(file) })
+            }))
+            .boxed(),
+        ))
+    }
+
+    async fn get_time(
+        &self,
+        _request: Request<proto::GetTimeRequest>,
+    ) -> Result<Response<proto::GetTimeResponse>, tonic::Status> {
+        match self.catalog.get_time().await {
+            Ok(t) => Ok(Response::new(proto::GetTimeResponse {
+                time: Some(serialize_timestamp(t)),
+            })),
+            Err(e) => {
+                return Err(catalog_error_to_status(e));
+            }
+        }
     }
 }

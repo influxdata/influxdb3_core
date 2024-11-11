@@ -40,9 +40,9 @@ use trace_http::tower::TraceService;
 use super::serialization::{
     convert_status, deserialize_column, deserialize_namespace, deserialize_object_store_id,
     deserialize_parquet_file, deserialize_partition, deserialize_skipped_compaction,
-    deserialize_sort_key_ids, deserialize_table, serialize_column_type, serialize_object_store_id,
-    serialize_parquet_file_params, serialize_soft_deleted_rows, serialize_sort_key_ids, ContextExt,
-    RequiredExt,
+    deserialize_sort_key_ids, deserialize_table, deserialize_timestamp, serialize_column_type,
+    serialize_object_store_id, serialize_parquet_file_params, serialize_soft_deleted_rows,
+    serialize_sort_key_ids, ContextExt, RequiredExt,
 };
 
 type InstrumentedChannel = TraceService<Channel>;
@@ -192,6 +192,25 @@ impl Catalog for GrpcCatalogClient {
 
     fn time_provider(&self) -> Arc<dyn TimeProvider> {
         Arc::clone(&self.time_provider)
+    }
+
+    async fn get_time(&self) -> Result<iox_time::Time, Error> {
+        let client_repos = GrpcCatalogClientRepos {
+            channel: self.channel.clone(),
+            span_ctx: None,
+            trace_header_name: self.trace_header_name.clone(),
+            max_decoded_message_size: self.max_decoded_message_size,
+        };
+
+        let req = proto::GetTimeRequest {};
+
+        let resp = client_repos
+            .retry("get_time", req, |data, mut client| async move {
+                client.get_time(data).await
+            })
+            .await?;
+
+        Ok(deserialize_timestamp(resp.time.required().ctx("time")?)?)
     }
 
     async fn active_applications(&self) -> Result<HashSet<String>, Error> {
@@ -387,8 +406,9 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         name: &str,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
+        use generated_types::influxdata::iox::catalog::v2::namespace_update_retention_period_request::Target;
         let n = proto::NamespaceUpdateRetentionPeriodRequest {
-            name: name.to_owned(),
+            target: Some(Target::Name(name.to_owned())),
             retention_period_ns,
         };
 
@@ -457,8 +477,9 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
     }
 
     async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
+        use generated_types::influxdata::iox::catalog::v2::namespace_soft_delete_request::Target;
         let n = proto::NamespaceSoftDeleteRequest {
-            name: name.to_owned(),
+            target: Some(Target::Name(name.to_owned())),
         };
 
         let resp = self
@@ -470,8 +491,9 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
     }
 
     async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
+        use proto::namespace_update_table_limit_request::Target;
         let n = proto::NamespaceUpdateTableLimitRequest {
-            name: name.to_owned(),
+            target: Some(Target::Name(name.to_owned())),
             new_max: new_max.get_i32(),
         };
 
@@ -493,8 +515,9 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         name: &str,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace> {
+        use proto::namespace_update_column_limit_request::Target;
         let n = proto::NamespaceUpdateColumnLimitRequest {
-            name: name.to_owned(),
+            target: Some(Target::Name(name.to_owned())),
             new_max: new_max.get_i32(),
         };
 
@@ -1141,17 +1164,9 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
-    async fn delete_old_ids_only(
-        &mut self,
-        older_than: Timestamp,
-        cutoff: Duration,
-    ) -> Result<Vec<ObjectStoreId>> {
+    async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         let p = proto::ParquetFileDeleteOldIdsOnlyRequest {
             older_than: older_than.get(),
-            cutoff: cutoff
-                .as_nanos()
-                .try_into()
-                .expect("deletion cutoff duration nanos should fit in an i64"),
         };
 
         self.retry(
@@ -1306,6 +1321,33 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
             .into_iter()
             .map(ParquetFileId::new)
             .collect())
+    }
+
+    async fn list_by_table_id(
+        &mut self,
+        table_id: TableId,
+        compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>> {
+        let p = proto::ParquetFileListByTableIdRequest {
+            table_id: table_id.get(),
+            compaction_level: compaction_level.map(|l| l as i32),
+        };
+
+        self.retry(
+            "parquet_file_list_by_table_id",
+            p,
+            |data, mut client| async move {
+                buffer_stream_response(client.parquet_file_list_by_table_id(data).await).await
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|res| {
+            Ok(deserialize_parquet_file(
+                res.file.required().ctx("parquet_file")?,
+            )?)
+        })
+        .collect()
     }
 }
 

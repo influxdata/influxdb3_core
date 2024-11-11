@@ -1,27 +1,10 @@
 //! Utility functions for working with arrow
 
-use std::iter::FromIterator;
 use std::sync::Arc;
 
 use arrow::{
-    array::{new_null_array, ArrayRef, StringArray},
-    datatypes::SchemaRef,
-    error::ArrowError,
-    record_batch::RecordBatch,
+    array::new_null_array, datatypes::SchemaRef, error::ArrowError, record_batch::RecordBatch,
 };
-
-/// Returns a single column record batch of type Utf8 from the
-/// contents of something that can be turned into an iterator over
-/// `Option<&str>`
-pub fn str_iter_to_batch<Ptr, I>(field_name: &str, iter: I) -> Result<RecordBatch, ArrowError>
-where
-    I: IntoIterator<Item = Option<Ptr>>,
-    Ptr: AsRef<str>,
-{
-    let array = StringArray::from_iter(iter);
-
-    RecordBatch::try_from_iter(vec![(field_name, Arc::new(array) as ArrayRef)])
-}
 
 /// Create a new [`RecordBatch`] that has the specified schema, adding null values for columns that
 /// don't appear in the batch.

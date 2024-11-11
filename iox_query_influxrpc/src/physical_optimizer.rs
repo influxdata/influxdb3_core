@@ -1,3 +1,3 @@
-mod coalesce_pivoted_batches;
+mod series_pivot_pushdown;
 
-pub(crate) use coalesce_pivoted_batches::CoalescePivotedBatches;
+pub(crate) use series_pivot_pushdown::SeriesPivotPushdown;

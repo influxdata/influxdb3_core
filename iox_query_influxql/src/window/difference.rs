@@ -2,8 +2,9 @@ use crate::NUMERICS;
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::kernels::numeric::sub_wrapping;
 use arrow::compute::shift;
-use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
 use datafusion::common::{Result, ScalarValue};
+use datafusion::logical_expr::function::WindowUDFFieldArgs;
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
@@ -41,8 +42,12 @@ impl WindowUDFImpl for DifferenceUDWF {
         &self.signature
     }
 
-    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        Ok(arg_types[0].clone())
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
+        Ok(Field::new(
+            field_args.name(),
+            field_args.input_types()[0].clone(),
+            true,
+        ))
     }
 
     fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {

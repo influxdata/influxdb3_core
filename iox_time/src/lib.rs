@@ -61,6 +61,12 @@ impl Time {
         Self(Utc.timestamp_nanos(nanos))
     }
 
+    /// Makes a new `Time` from the number of non-leap microseconds
+    /// since January 1, 1970 0:00:00 UTC (aka "UNIX timestamp").
+    pub fn from_timestamp_micros(micros: i64) -> Option<Self> {
+        Utc.timestamp_micros(micros).single().map(Self)
+    }
+
     /// Makes a new `DateTime` from the number of non-leap milliseconds
     /// since January 1, 1970 0:00:00 UTC (aka "UNIX timestamp").
     pub fn from_timestamp_millis(millis: i64) -> Option<Self> {
@@ -75,13 +81,8 @@ impl Time {
     }
 
     /// Makes a new `Time` from the provided [`DateTime<Utc>`]
-    pub const fn from_date_time(time: chrono::DateTime<Utc>) -> Self {
+    pub const fn from_datetime(time: DateTime<Utc>) -> Self {
         Self(time)
-    }
-
-    /// Makes a new `Time` from the provided [`DateTime<Utc>`]
-    pub fn from_datetime(datetime: DateTime<Utc>) -> Self {
-        Self(datetime)
     }
 
     /// Returns an RFC 3339 and ISO 8601 date and time string such as `1996-12-19T16:39:57+00:00`.
@@ -226,7 +227,7 @@ impl TimeProvider for SystemProvider {
     }
 
     fn sleep_until(&self, t: Time) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let d = t.checked_duration_since(self.now());
+        let d = t.checked_duration_since(TimeProvider::now(self));
 
         Box::pin(async move {
             if let Some(d) = d {
@@ -318,7 +319,7 @@ impl Future for MockSleep {
 
 impl<T> TimeProvider for Arc<T>
 where
-    T: TimeProvider,
+    T: TimeProvider + ?Sized,
 {
     fn now(&self) -> Time {
         (**self).now()
@@ -333,59 +334,152 @@ where
     }
 }
 
+/// An asynchronous version of [`TimeProvider`]. This trait provides
+/// the same functionality as `TimeProvider` - but the idea is that
+/// looking at the clock is async.
+pub trait AsyncTimeProvider: Debug + Display + Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Returns the current `Time`. No guarantees are made about monotonicity
+    fn now(&self) -> impl std::future::Future<Output = Result<Time, Self::Error>> + Send;
+}
+
+impl AsyncTimeProvider for SystemProvider {
+    type Error = std::convert::Infallible;
+
+    async fn now(&self) -> Result<Time, Self::Error> {
+        Ok(TimeProvider::now(self))
+    }
+}
+
+impl AsyncTimeProvider for MockProvider {
+    type Error = std::convert::Infallible;
+
+    async fn now(&self) -> Result<Time, Self::Error> {
+        Ok(TimeProvider::now(self))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
-    #[test]
-    fn test_system_provider_now() {
+    #[tokio::test]
+    async fn test_system_provider_now() {
         let provider = SystemProvider::new();
-        let a = provider.now();
+        let (a, async_a) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
         std::thread::sleep(Duration::from_secs(1));
-        let b = provider.now();
-        let c = provider.now();
+        let (b, async_b) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
+        let (c, async_c) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
 
         let delta = b.checked_duration_since(a).unwrap();
+        let async_delta = async_b.checked_duration_since(async_a).unwrap();
+
+        // Assert that the deltas are within a millisecond of each other,
+        // they should be relatively close but not necessarily equal.
+        assert!(delta.abs_diff(async_delta) <= Duration::from_millis(1));
+
         assert!(delta > Duration::from_millis(500));
         assert!(delta < Duration::from_secs(5));
         assert!(b <= c);
+
+        assert!(async_delta > Duration::from_millis(500));
+        assert!(async_delta < Duration::from_secs(5));
+        assert!(async_b <= async_c);
     }
 
     #[tokio::test]
     async fn test_system_provider_sleep() {
         let provider = SystemProvider::new();
 
-        let a = provider.now();
-        provider.sleep(Duration::from_secs(1)).await;
-        let b = provider.now();
+        let (a, async_a) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
+        TimeProvider::sleep(&provider, Duration::from_secs(1)).await;
+        let (b, async_b) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
 
         let delta = b.checked_duration_since(a).unwrap();
+        let async_delta = async_b.checked_duration_since(async_a).unwrap();
+
+        // Assert that the deltas are within a millisecond of each other,
+        // they should be relatively close but not necessarily equal.
+        assert!(delta.abs_diff(async_delta) <= Duration::from_millis(1));
         assert!(delta > Duration::from_millis(500));
         assert!(delta < Duration::from_secs(5));
+
+        assert!(async_delta > Duration::from_millis(500));
+        assert!(async_delta < Duration::from_secs(5));
     }
 
     #[tokio::test]
     async fn test_system_provider_sleep_until() {
         let provider = SystemProvider::new();
 
-        let a = provider.now();
-        provider.sleep_until(a + Duration::from_secs(1)).await;
-        let b = provider.now();
+        let (a, async_a) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
+        TimeProvider::sleep_until(&provider, a + Duration::from_secs(1)).await;
+        let (b, async_b) = (
+            TimeProvider::now(&provider),
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+        );
 
         let delta = b.checked_duration_since(a).unwrap();
+        let async_delta = async_b.checked_duration_since(async_a).unwrap();
+
+        // Assert that the deltas are within a millisecond of each other,
+        // they should be relatively close but not necessarily equal.
+        assert!(delta.abs_diff(async_delta) <= Duration::from_millis(1));
         assert!(delta > Duration::from_millis(500));
         assert!(delta < Duration::from_secs(5));
+
+        assert!(async_delta > Duration::from_millis(500));
+        assert!(async_delta < Duration::from_secs(5));
     }
 
-    #[test]
-    fn test_mock_provider_now() {
+    #[tokio::test]
+    async fn test_mock_provider_now() {
         let provider = MockProvider::new(Time::from_timestamp_nanos(0));
-        assert_eq!(provider.now().timestamp_nanos(), 0);
-        assert_eq!(provider.now().timestamp_nanos(), 0);
+        assert_eq!(TimeProvider::now(&provider).timestamp_nanos(), 0);
+        assert_eq!(
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+            TimeProvider::now(&provider)
+        );
+        assert_eq!(
+            AsyncTimeProvider::now(&provider)
+                .await
+                .unwrap()
+                .timestamp_nanos(),
+            0
+        );
 
         provider.set(Time::from_timestamp_nanos(12));
-        assert_eq!(provider.now().timestamp_nanos(), 12);
-        assert_eq!(provider.now().timestamp_nanos(), 12);
+        assert_eq!(TimeProvider::now(&provider).timestamp_nanos(), 12);
+        assert_eq!(
+            AsyncTimeProvider::now(&provider).await.unwrap(),
+            TimeProvider::now(&provider)
+        );
+        assert_eq!(
+            AsyncTimeProvider::now(&provider)
+                .await
+                .unwrap()
+                .timestamp_nanos(),
+            12
+        );
     }
 
     #[tokio::test]
@@ -545,7 +639,7 @@ mod test {
             );
             assert_eq!(
                 Time::from_timestamp_millis(date_time.timestamp_millis()).unwrap(),
-                Time::from_date_time(
+                Time::from_datetime(
                     Utc.timestamp_millis_opt(date_time.timestamp_millis())
                         .unwrap()
                 )
@@ -562,12 +656,12 @@ mod test {
 
             assert_eq!(
                 time + duration,
-                Time::from_date_time(date_time + chrono::Duration::from_std(duration).unwrap())
+                Time::from_datetime(date_time + chrono::Duration::from_std(duration).unwrap())
             );
 
             assert_eq!(
                 time - duration,
-                Time::from_date_time(date_time - chrono::Duration::from_std(duration).unwrap())
+                Time::from_datetime(date_time - chrono::Duration::from_std(duration).unwrap())
             );
 
             assert_eq!(time, Time::from_rfc3339(&time.to_rfc3339()).unwrap());
@@ -612,39 +706,39 @@ mod test {
             .is_none());
     }
 
-    #[test]
-    fn test_minutes_ago() {
+    #[tokio::test]
+    async fn test_minutes_ago() {
         let now = "2022-07-07T00:00:00+00:00";
         let ago = "2022-07-06T22:38:00+00:00";
 
         let provider = MockProvider::new(Time::from_rfc3339(now).unwrap());
 
-        let min_ago = provider.minutes_ago(82);
-        assert_eq!(min_ago, Time::from_timestamp_nanos(1657147080000000000));
-        assert_eq!(min_ago.to_rfc3339(), ago);
+        let t = TimeProvider::minutes_ago(&provider, 82);
+        assert_eq!(t, Time::from_timestamp_nanos(1657147080000000000));
+        assert_eq!(t.to_rfc3339(), ago);
     }
 
-    #[test]
-    fn test_minutes_into_future() {
+    #[tokio::test]
+    async fn test_minutes_into_future() {
         let now = "2022-07-07T00:00:00+00:00";
         let future = "2022-07-07T00:10:00+00:00";
 
         let provider = MockProvider::new(Time::from_rfc3339(now).unwrap());
 
-        let min_future = provider.minutes_into_future(10);
-        assert_eq!(min_future, Time::from_timestamp_nanos(1657152600000000000));
-        assert_eq!(min_future.to_rfc3339(), future);
+        let t = TimeProvider::minutes_into_future(&provider, 10);
+        assert_eq!(t, Time::from_timestamp_nanos(1657152600000000000));
+        assert_eq!(t.to_rfc3339(), future);
     }
 
-    #[test]
-    fn test_hours_ago() {
+    #[tokio::test]
+    async fn test_hours_ago() {
         let now = "2022-07-07T00:00:00+00:00";
         let ago = "2022-07-03T14:00:00+00:00";
 
         let provider = MockProvider::new(Time::from_rfc3339(now).unwrap());
 
-        let hrs_ago = provider.hours_ago(82);
-        assert_eq!(hrs_ago, Time::from_timestamp_nanos(1656856800000000000));
-        assert_eq!(hrs_ago.to_rfc3339(), ago);
+        let t = TimeProvider::hours_ago(&provider, 82);
+        assert_eq!(t, Time::from_timestamp_nanos(1656856800000000000));
+        assert_eq!(t.to_rfc3339(), ago);
     }
 }

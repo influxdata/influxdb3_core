@@ -47,6 +47,7 @@ pub(crate) async fn perform(
 
     loop {
         let start = Instant::now();
+
         match catalog
             .repositories()
             .partitions()
@@ -55,6 +56,10 @@ pub(crate) async fn perform(
         {
             Ok(deleted) => {
                 info!(deleted_count = %deleted.len(), "gc::retention::partition");
+
+                for (table_id, partition_id) in &deleted {
+                    info!(%table_id, %partition_id, "deleted old partition from catalog");
+                }
 
                 if deleted.len() == MAX_PARTITION_SELECTED_ONCE_FOR_DELETE {
                     if sleep_interval_minutes > 1 {

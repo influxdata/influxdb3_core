@@ -1,8 +1,9 @@
 use arrow::array::Array;
 use arrow::compute::kernels::cmp::lt;
 use arrow::compute::nullif;
-use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
 use datafusion::common::{Result, ScalarValue};
+use datafusion::logical_expr::function::WindowUDFFieldArgs;
 use datafusion::logical_expr::window_state::WindowAggState;
 use datafusion::logical_expr::{PartitionEvaluator, Signature, WindowUDFImpl};
 use std::any::Any;
@@ -39,8 +40,8 @@ impl<U: WindowUDFImpl + 'static> WindowUDFImpl for NonNegativeUDWF<U> {
         self.inner.signature()
     }
 
-    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        self.inner.return_type(arg_types)
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
+        self.inner.field(field_args)
     }
 
     fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {

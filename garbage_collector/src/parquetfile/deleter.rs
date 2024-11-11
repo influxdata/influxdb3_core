@@ -1,7 +1,13 @@
+use async_trait::async_trait;
+use catalog_backup_file_list::FindFileList;
+use clap_blocks::garbage_collector::CutoffDuration;
 use data_types::Timestamp;
 use iox_catalog::interface::Catalog;
+use iox_time::TimeProvider;
 use metric::{DurationHistogram, Metric, U64Histogram, U64HistogramOptions};
+use object_store::DynObjectStore;
 use observability_deps::tracing::*;
+use snafu::Snafu;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -53,34 +59,20 @@ pub(crate) async fn perform(
     metric_registry: Arc<metric::Registry>,
     shutdown: CancellationToken,
     catalog: Arc<dyn Catalog>,
-    cutoff: Duration,
+    older_than_calculator: Arc<dyn OlderThanCalculator>,
     sleep_interval: Duration,
 ) {
     let metrics = DeleterMetrics::new(metric_registry);
 
     loop {
         let start = Instant::now();
-        let older_than = Timestamp::from(catalog.time_provider().now() - cutoff);
 
-        // do the delete, returning the deleted files. log any errors
-        match catalog
-            .repositories()
-            .parquet_files()
-            .delete_old_ids_only(older_than, cutoff) // read/write
-            .await
-        {
-            Ok(deleted) => {
-                let elapsed = start.elapsed();
-                info!(delete_count = %deleted.len(), ?elapsed, "iox_catalog::delete_old()");
-                metrics.parquet_delete_count.record(deleted.len() as u64);
-                metrics.parquet_delete_success_duration.record(elapsed);
+        match older_than_calculator.older_than().await {
+            Ok(older_than) => {
+                delete_from_catalog(&metrics, Arc::clone(&catalog), older_than, start).await;
             }
             Err(e) => {
-                metrics.parquet_delete_count.record(0);
-                metrics
-                    .parquet_delete_error_duration
-                    .record(start.elapsed());
-                warn!("error deleting old parquet files from the catalog, continuing: {e}")
+                warn!("error getting older_than time; continuing: {e}");
             }
         }
 
@@ -93,24 +85,124 @@ pub(crate) async fn perform(
     }
 }
 
+#[derive(Debug, Snafu)]
+pub(crate) enum OlderThanCalculatorError {
+    #[snafu(display("No catalog backup list files found"))]
+    NoneFound,
+
+    #[snafu(display("Error attempting to find file lists: {source}"))]
+    Find {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+}
+
+#[async_trait]
+pub(crate) trait OlderThanCalculator: Send + Sync + 'static {
+    async fn older_than(&self) -> Result<Timestamp, OlderThanCalculatorError>;
+}
+
+/// Use when the `older_than` value passed to the catalog `delete_old_ids_only` method should
+/// always be approximately the configured Parquet file cutoff value ago from now.
+pub(crate) struct PlainOldCutoffFromNow {
+    /// The garbage collector's `SystemTimeProvider` is fine; this doesn't need to use the catalog's
+    /// `NOW` value because if this value isn't coming from a catalog backup file list, it doesn't
+    /// need to be exactly in sync.
+    pub(crate) time_provider: Arc<dyn TimeProvider>,
+    pub(crate) cutoff: CutoffDuration,
+}
+
+#[async_trait]
+impl OlderThanCalculator for PlainOldCutoffFromNow {
+    async fn older_than(&self) -> Result<Timestamp, OlderThanCalculatorError> {
+        let now = self.time_provider.now();
+        Ok(Timestamp::from(now - self.cutoff.duration()))
+    }
+}
+
+/// Use when the `older_than` value passed to the catalog `delete_old_ids_only` method should be
+/// whichever is older: the time at which the last successful catalog backup file list snapshot
+/// was created, or approximately the configured Parquet file cutoff value ago from now.
+///
+/// This ensures that if catalog backups stop being created, we aren't cleaning up catalog records
+/// that should be in a catalog backup.
+pub(crate) struct CheckLastCatalogFileList {
+    pub(crate) file_list_finder: Arc<DynObjectStore>,
+    pub(crate) cutoff_from_now: PlainOldCutoffFromNow,
+}
+
+#[async_trait]
+impl OlderThanCalculator for CheckLastCatalogFileList {
+    async fn older_than(&self) -> Result<Timestamp, OlderThanCalculatorError> {
+        match self.file_list_finder.most_recent().await {
+            Ok(Some(most_recent)) => {
+                let cutoff_ago: Timestamp = self
+                    .cutoff_from_now
+                    .older_than()
+                    .await
+                    .expect("PlainOldCutoffFromNow::older_than is infallible");
+                let most_recent_timestamp: Timestamp = most_recent.time().into();
+                Ok(std::cmp::min(most_recent_timestamp, cutoff_ago))
+            }
+            Ok(None) => Err(OlderThanCalculatorError::NoneFound),
+            Err(source) => Err(OlderThanCalculatorError::Find { source }),
+        }
+    }
+}
+
+/// Call the catalog method that will delete Parquet file records older than `cutoff` ago.
+/// If successful, log and add to metrics the number of deleted files. If unsuccessful, log and add
+/// to metrics the error information.
+async fn delete_from_catalog(
+    metrics: &DeleterMetrics,
+    catalog: Arc<dyn Catalog>,
+    older_than: Timestamp,
+    start: Instant,
+) {
+    match catalog
+        .repositories()
+        .parquet_files()
+        .delete_old_ids_only(older_than) // read/write
+        .await
+    {
+        Ok(deleted) => {
+            let elapsed = start.elapsed();
+            info!(delete_count = %deleted.len(), ?elapsed, "iox_catalog::delete_old()");
+            metrics.parquet_delete_count.record(deleted.len() as u64);
+            metrics.parquet_delete_success_duration.record(elapsed);
+        }
+        Err(e) => {
+            metrics.parquet_delete_count.record(0);
+            metrics
+                .parquet_delete_error_duration
+                .record(start.elapsed());
+            warn!("error deleting old parquet files from the catalog, continuing: {e}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::create_catalog_and_file_with_max_time;
+    use iox_time::SystemProvider;
     use metric::{assert_histogram, Attributes, Metric};
-    use std::assert_eq;
 
     #[tokio::test]
     async fn delete_old_file() {
         let shutdown = CancellationToken::new();
         let metric_registry = Arc::new(metric::Registry::new());
         let (catalog, _file) = create_catalog_and_file_with_max_time(Timestamp::new(1)).await;
+        let time_provider = Arc::new(SystemProvider::new());
 
-        // Set cutoff to anything older than 5 nanoseconds
-        let cutoff = Duration::from_nanos(5);
+        // Set cutoff to anything older than 5 hours
+        let cutoff_calculator = Arc::new(PlainOldCutoffFromNow {
+            time_provider: Arc::clone(&time_provider) as _,
+            cutoff: CutoffDuration::try_new("5h").unwrap(),
+        });
         let sleep_interval = Duration::from_secs(5);
 
-        // Mark file as deletable, since it's older than the cutoff.
+        // Mark file as deletable, since its max time is older than the 60ns namespace retention
+        // period ago
         catalog
             .repositories()
             .parquet_files()
@@ -129,7 +221,7 @@ mod tests {
                         Arc::clone(&metric_registry),
                         shutdown.clone(),
                         catalog,
-                        cutoff,
+                        cutoff_calculator,
                         sleep_interval,
                     )
                     .await
