@@ -122,11 +122,19 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         .bytes([".influxdata.iox.catalog_cache.v1"]);
 
     let descriptor_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("proto_descriptor.bin");
+
+    // distributions which obtain `google/protobuf/{duration,timestamp}.proto` from rpm package:
+    // `protobuf-devel` (eg: centos, fedora, etc), require a `--proto_path=/usr/include` protoc arg
+    let protobuf_devel_include_path = PathBuf::from("/usr/include");
+    let includes = vec![
+        root,
+        protobuf_devel_include_path.as_path(),
+    ];
     tonic_build::configure()
         .file_descriptor_set_path(&descriptor_path)
         // protoc in ubuntu builder needs this option
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_with_config(config, &proto_files, &[root])?;
+        .compile_with_config(config, &proto_files, &includes)?;
 
     let descriptor_set = std::fs::read(descriptor_path)?;
 
