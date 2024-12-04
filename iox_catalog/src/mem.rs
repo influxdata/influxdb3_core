@@ -169,7 +169,6 @@ impl Catalog for MemCatalog {
         })))
     }
 
-    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
         self.catalog_metrics.registry()
     }
@@ -314,67 +313,71 @@ impl NamespaceRepo for MemTxn {
 
     // performs a cascading delete of all things attached to the namespace, then deletes the
     // namespace
-    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
         let mut stage = self.collections.lock();
         let timestamp = self.time_provider.now();
         // get namespace by name
-        match stage.namespaces.iter_mut().find(|n| n.name == name) {
+        match stage.namespaces.iter_mut().find(|n| n.id == id) {
             Some(n) => {
                 n.deleted_at = Some(Timestamp::from(timestamp));
                 Ok(n.id)
             }
             None => Err(Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             }),
         }
     }
 
-    async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
+    async fn update_table_limit(
+        &mut self,
+        id: NamespaceId,
+        new_max: MaxTables,
+    ) -> Result<Namespace> {
         let mut stage = self.collections.lock();
-        match stage.namespaces.iter_mut().find(|n| n.name == name) {
+        match stage.namespaces.iter_mut().find(|n| n.id == id) {
             Some(n) => {
                 n.max_tables = new_max;
                 update_namespace_router_version(n);
                 Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             }),
         }
     }
 
     async fn update_column_limit(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace> {
         let mut stage = self.collections.lock();
-        match stage.namespaces.iter_mut().find(|n| n.name == name) {
+        match stage.namespaces.iter_mut().find(|n| n.id == id) {
             Some(n) => {
                 n.max_columns_per_table = new_max;
                 update_namespace_router_version(n);
                 Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             }),
         }
     }
 
     async fn update_retention_period(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
         let mut stage = self.collections.lock();
-        match stage.namespaces.iter_mut().find(|n| n.name == name) {
+        match stage.namespaces.iter_mut().find(|n| n.id == id) {
             Some(n) => {
                 n.retention_period_ns = retention_period_ns;
                 update_namespace_router_version(n);
                 Ok(n.value.clone())
             }
             None => Err(Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             }),
         }
     }
@@ -1139,7 +1142,9 @@ impl ParquetFileRepo for MemTxn {
         upgrade: &[ObjectStoreId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
+    ) -> Result<Vec<ParquetFile>> {
+        let marked_at = Timestamp::from(self.time_provider.now());
+
         let delete_set = delete.iter().copied().collect::<HashSet<_>>();
         let upgrade_set = upgrade.iter().copied().collect::<HashSet<_>>();
 
@@ -1152,26 +1157,25 @@ impl ParquetFileRepo for MemTxn {
         let mut stage = collections.clone();
 
         for id in delete {
-            let marked_at = Timestamp::from(self.time_provider.now());
             flag_for_delete(&mut stage, partition_id, *id, marked_at)?;
         }
 
         update_compaction_level(&mut stage, partition_id, upgrade, target_level)?;
 
-        let mut ids = Vec::with_capacity(create.len());
+        let mut created = Vec::with_capacity(create.len());
         for file in create {
             if file.partition_id != partition_id {
                 return Err(Error::Malformed {
                     descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
                 });
             }
-            let res = create_parquet_file(&mut stage, file.clone())?;
-            ids.push(res.id);
+            let res = create_parquet_file(&mut stage, marked_at, file.clone())?;
+            created.push(res);
         }
 
         *collections = stage;
 
-        Ok(ids)
+        Ok(created)
     }
 
     async fn list_by_table_id(
@@ -1285,8 +1289,13 @@ fn create_or_get_column(
 
 // The following three functions are helpers to the create_upgrade_delete method.
 // They are also used by the respective create/flag_for_delete/update_compaction_level methods.
+
+// Don't make this function public: `created_at` should only be set to a value internal and private
+// to the catalog because the value needs to match any `to_delete` values if any files are deleted
+// in the same operation.
 fn create_parquet_file(
     stage: &mut MemCollections,
+    created_at: Timestamp,
     parquet_file_params: ParquetFileParams,
 ) -> Result<ParquetFile> {
     if stage
@@ -1299,11 +1308,43 @@ fn create_parquet_file(
         });
     }
 
-    let parquet_file = ParquetFile::from_params(
-        parquet_file_params,
-        ParquetFileId::new(stage.parquet_files.len() as i64 + 1),
-    );
-    let created_at = parquet_file.created_at;
+    let ParquetFileParams {
+        partition_id,
+        partition_hash_id,
+        namespace_id,
+        table_id,
+        object_store_id,
+        min_time,
+        max_time,
+        file_size_bytes,
+        row_count,
+        compaction_level,
+        column_set,
+        max_l0_created_at,
+        source,
+        ..
+    } = parquet_file_params;
+
+    let parquet_file = ParquetFile {
+        id: ParquetFileId::new(stage.parquet_files.len() as i64 + 1),
+        created_at,
+        to_delete: None,
+        partition_id,
+        partition_hash_id,
+        namespace_id,
+        table_id,
+        object_store_id,
+        min_time,
+        max_time,
+        file_size_bytes,
+        row_count,
+        compaction_level,
+        column_set,
+        max_l0_created_at: max_l0_created_at
+            .maybe_computed_timestamp()
+            .unwrap_or(created_at),
+        source,
+    };
     let partition_id = parquet_file.partition_id;
     let level = parquet_file.compaction_level;
     stage.parquet_files.push(parquet_file);
@@ -1323,6 +1364,9 @@ fn create_parquet_file(
     Ok(stage.parquet_files.last().unwrap().clone())
 }
 
+// Don't make this function public: `marked_at` should only be set to a value internal and private
+// to the catalog because the value needs to match any `created_at` values if any files are created
+// in the same operation.
 fn flag_for_delete(
     stage: &mut MemCollections,
     partition_id: PartitionId,

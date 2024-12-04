@@ -86,7 +86,7 @@ pub struct HashProbe<'a> {
     mask: usize,
 }
 
-impl<'a> Iterator for HashProbe<'a> {
+impl Iterator for HashProbe<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {

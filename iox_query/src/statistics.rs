@@ -322,8 +322,19 @@ impl SchemaBoundStatistics {
     }
 }
 
-/// Traverse the physical plan and build statistics min max for the given column each node
-/// Note: This is a temporary solution until DF's statistics is more mature
+/// Traverse the physical plan and find the min max for the given column each node
+///
+/// Note on correctness: The statistics may not be exact, but the values in the plan
+/// are guaranteed to be within the min/max.
+///
+/// Specifically, the values must fall within the range, but the range
+/// itself may be larger than the actual values.
+///
+/// At the time of writing, DataFusion statistics can't distinguish "inexact"
+/// from "known to be within the range" so this is somewhat of a temporary
+/// solution until DF's statistics is more mature
+///
+/// See
 /// <https://github.com/apache/arrow-datafusion/issues/8078>
 struct StatisticsVisitor<'a> {
     column_name: &'a str, //String,  // todo: not sure enough
@@ -335,6 +346,24 @@ impl<'a> StatisticsVisitor<'a> {
         Self {
             column_name,
             statistics: VecDeque::new(),
+        }
+    }
+
+    /// DataFusion statistics can't distinguish "inexact" from "known to be within the range"
+    ///
+    /// Converts inexact values to exact if possible for the purposes of
+    /// analysis by [`StatisticsVisitor`]
+    fn convert_min_max_to_exact(mut column_statistics: ColumnStatistics) -> ColumnStatistics {
+        column_statistics.min_value = Self::to_exact(column_statistics.min_value);
+        column_statistics.max_value = Self::to_exact(column_statistics.max_value);
+        column_statistics
+    }
+
+    /// Convert [`Precision::Inexact`] to [`Precision::Exact`] if possible
+    fn to_exact(v: Precision<ScalarValue>) -> Precision<ScalarValue> {
+        match v {
+            Precision::Exact(v) | Precision::Inexact(v) => Precision::Exact(v),
+            Precision::Absent => Precision::Absent,
         }
     }
 }
@@ -351,32 +380,42 @@ impl ExecutionPlanVisitor for StatisticsVisitor<'_> {
         if plan.as_any().downcast_ref::<EmptyExec>().is_some()
             || plan.as_any().downcast_ref::<PlaceholderRowExec>().is_some()
         {
-            self.statistics.push_back(ColumnStatistics {
-                null_count: Precision::Absent,
-                max_value: Precision::Absent,
-                min_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-            });
+            self.statistics.push_back(ColumnStatistics::new_unknown());
         }
-        // If this is leaf node (ParquetExec or RecordBatchExec), compute its statistics and push it to the stack
-        else if plan.as_any().downcast_ref::<ParquetExec>().is_some()
-            || plan.as_any().downcast_ref::<RecordBatchesExec>().is_some()
-        {
+        // ParquetExec (leaf): compute its statistics and push it to the stack
+        else if plan.as_any().downcast_ref::<ParquetExec>().is_some() {
             // get index of the given column in the schema
             let statistics = match plan.schema().index_of(self.column_name) {
-                Ok(col_index) => plan.statistics()?.column_statistics[col_index].clone(),
+                Ok(col_index) => {
+                    let col_stats = plan.statistics()?.column_statistics.swap_remove(col_index);
+                    // ParquetExec statistics may not be exact due to filter
+                    // pushdown, but the values in the plan are guaranteed to be
+                    // within the min/max.
+                    Self::convert_min_max_to_exact(col_stats)
+                }
                 // This is the case of alias, do not optimize by returning no statistics
                 Err(_) => {
                     trace!(
                         " ------------------- No statistics for column {} in PQ/RB",
                         self.column_name
                     );
-                    ColumnStatistics {
-                        null_count: Precision::Absent,
-                        max_value: Precision::Absent,
-                        min_value: Precision::Absent,
-                        distinct_count: Precision::Absent,
-                    }
+                    ColumnStatistics::new_unknown()
+                }
+            };
+            self.statistics.push_back(statistics);
+        }
+        // RecordBatchesExec (leaf): compute its statistics and push it to the stack
+        else if plan.as_any().downcast_ref::<RecordBatchesExec>().is_some() {
+            // get index of the given column in the schema
+            let statistics = match plan.schema().index_of(self.column_name) {
+                Ok(col_index) => plan.statistics()?.column_statistics.swap_remove(col_index),
+                // This is the case of alias, do not optimize by returning no statistics
+                Err(_) => {
+                    trace!(
+                        " ------------------- No statistics for column {} in PQ/RB",
+                        self.column_name
+                    );
+                    ColumnStatistics::new_unknown()
                 }
             };
             self.statistics.push_back(statistics);
@@ -440,12 +479,7 @@ impl ExecutionPlanVisitor for StatisticsVisitor<'_> {
                     self.column_name
                 );
                 // Make them absent for other cases
-                self.statistics.push_back(ColumnStatistics {
-                    null_count: Precision::Absent,
-                    max_value: Precision::Absent,
-                    min_value: Precision::Absent,
-                    distinct_count: Precision::Absent,
-                });
+                self.statistics.push_back(ColumnStatistics::new_unknown());
             }
         }
 

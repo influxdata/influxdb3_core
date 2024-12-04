@@ -7,7 +7,9 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::Result;
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortRequirement};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexRequirement, Partitioning, PhysicalSortRequirement,
+};
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
@@ -156,8 +158,10 @@ impl ExecutionPlan for FieldsPivotExec {
         vec![datafusion::physical_plan::Distribution::SinglePartition]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
-        vec![Some(vec![self.physical_sort_requirement.clone()])]
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
+        vec![Some(LexRequirement::new(vec![self
+            .physical_sort_requirement
+            .clone()]))]
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

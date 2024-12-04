@@ -23,8 +23,8 @@ use data_types::{
         namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
         table::TableSnapshot,
     },
-    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables,
-    Namespace, NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride,
+    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt,
+    MaxTables, Namespace, NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride,
     NamespaceVersion, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams,
     ParquetFileSource, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
     SortKeyIds, Table, TableId, Timestamp,
@@ -181,7 +181,6 @@ impl Catalog for SqliteCatalog {
         })))
     }
 
-    #[cfg(test)]
     fn metrics(&self) -> Arc<Registry> {
         self.catalog_metrics.registry()
     }
@@ -404,21 +403,21 @@ WHERE name=$1 AND {v};
         Ok(Some(namespace))
     }
 
-    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
         let flagged_at = Timestamp::from(self.time_provider.now());
 
         // note that there is a uniqueness constraint on the name column in the DB
         let rec = sqlx::query_as::<_, NamespaceId>(
-            r#"UPDATE namespace SET deleted_at=$1 WHERE name = $2 RETURNING id;"#,
+            r#"UPDATE namespace SET deleted_at=$1 WHERE id = $2 RETURNING id;"#,
         )
         .bind(flagged_at) // $1
-        .bind(name) // $2
+        .bind(id) // $2
         .fetch_one(self.inner.get_mut())
         .await;
 
         let id = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -428,24 +427,28 @@ WHERE name=$1 AND {v};
         Ok(id)
     }
 
-    async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
+    async fn update_table_limit(
+        &mut self,
+        id: NamespaceId,
+        new_max: MaxTables,
+    ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET max_tables = $1, router_version = router_version + 1
-WHERE name = $2
+WHERE id = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
         "#,
         )
         .bind(new_max)
-        .bind(name)
+        .bind(id.get())
         .fetch_one(self.inner.get_mut())
         .await;
 
         let namespace = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -457,26 +460,26 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
     async fn update_column_limit(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET max_columns_per_table = $1, router_version = router_version + 1
-WHERE name = $2
+WHERE id = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
         "#,
         )
         .bind(new_max)
-        .bind(name)
+        .bind(id.get())
         .fetch_one(self.inner.get_mut())
         .await;
 
         let namespace = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -488,26 +491,26 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
     async fn update_retention_period(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET retention_period_ns = $1, router_version = router_version + 1
-WHERE name = $2
+WHERE id = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
             "#,
         )
         .bind(retention_period_ns) // $1
-        .bind(name) // $2
+        .bind(id.get()) // $2
         .fetch_one(self.inner.get_mut())
         .await;
 
         let namespace = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -1498,29 +1501,25 @@ RETURNING partition_id, object_store_id;
 
     async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-sqlite-ctes-to-the-rescue
-        let deleted = sqlx::query(
+        sqlx::query(
             r#"
 WITH parquet_file_ids as (
-    SELECT object_store_id
+    SELECT id
     FROM parquet_file
     WHERE to_delete < $1
     LIMIT $2
 )
 DELETE FROM parquet_file
-WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
-RETURNING object_store_id;
+WHERE id IN parquet_file_ids
+RETURNING object_store_id
              "#,
         )
         .bind(older_than) // $1
         .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
         .fetch_all(self.inner.get_mut())
-        .await?;
-
-        let deleted = deleted
-            .into_iter()
-            .map(|row| row.get("object_store_id"))
-            .collect();
-        Ok(deleted)
+        .await
+        .map(|rows| rows.into_iter().map(|r| r.get("object_store_id")).collect())
+        .map_err(Into::into)
     }
 
     async fn list_by_partition_not_to_delete_batch(
@@ -1644,7 +1643,14 @@ WHERE object_store_id IN ({v});",
         upgrade: &[ObjectStoreId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
+    ) -> Result<Vec<ParquetFile>> {
+        // In postgres, all uses of CURRENT_TIMESTAMP within a transaction will return the same
+        // value. sqlite doesn't have a similar guarantee with `unixepoch`, so to get the semantics
+        // we want for this function, that all files created have the same `created_at` and all
+        // files deleted have the same `to_delete`, we have to pass in that time rather than using
+        // something native to the database as we can with postgres.
+        let marked_at = Timestamp::from(self.time_provider.now());
+
         let delete_set = delete.iter().copied().collect::<HashSet<_>>();
         let upgrade_set = upgrade.iter().copied().collect::<HashSet<_>>();
 
@@ -1655,12 +1661,12 @@ WHERE object_store_id IN ({v});",
         let mut tx = self.inner.get_mut().pool.begin().await?;
 
         for id in delete {
-            flag_for_delete(&mut *tx, partition_id, *id).await?;
+            flag_for_delete(&mut *tx, partition_id, *id, marked_at).await?;
         }
 
         update_compaction_level(&mut *tx, partition_id, upgrade, target_level).await?;
 
-        let mut ids = Vec::with_capacity(create.len());
+        let mut created = Vec::with_capacity(create.len());
         let mut created_at_max = None;
         for file in create {
             if file.partition_id != partition_id {
@@ -1668,14 +1674,14 @@ WHERE object_store_id IN ({v});",
                     descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
                 });
             }
+            let created_file = create_parquet_file(&mut *tx, marked_at, file.clone()).await?;
             if file.compaction_level == CompactionLevel::Initial {
                 created_at_max = match created_at_max {
-                    None => Some(file.created_at),
-                    Some(current) => Some(current.max(file.created_at)),
+                    None => Some(created_file.created_at),
+                    Some(current) => Some(current.max(created_file.created_at)),
                 };
             }
-            let res = create_parquet_file(&mut *tx, file.clone()).await?;
-            ids.push(res.id);
+            created.push(created_file);
         }
 
         // update partition
@@ -1695,7 +1701,7 @@ WHERE object_store_id IN ({v});",
 
         tx.commit().await?;
 
-        Ok(ids)
+        Ok(created)
     }
 
     async fn list_by_table_id(
@@ -1738,8 +1744,13 @@ WHERE object_store_id IN ({v});",
 
 // The following three functions are helpers to the create_upgrade_delete method.
 // They are also used by the respective create/flag_for_delete/update_compaction_level methods.
+
+// Don't make this function public: `created_at` should only be set to a value internal and private
+// to the catalog because the value needs to match any `to_delete` values if any files are deleted
+// in the same operation.
 async fn create_parquet_file<'q, E>(
     executor: E,
+    created_at: Timestamp,
     parquet_file_params: ParquetFileParams,
 ) -> Result<ParquetFile>
 where
@@ -1756,45 +1767,77 @@ where
         file_size_bytes,
         row_count,
         compaction_level,
-        created_at,
         column_set,
         max_l0_created_at,
         source,
     } = parquet_file_params;
 
-    let res = sqlx::query_as::<_, ParquetFilePod>(
-        r#"
+    let query = match max_l0_created_at {
+        MaxL0CreatedAt::Computed(max) => sqlx::query_as::<_, ParquetFilePod>(
+            r#"
 INSERT INTO parquet_file (
     table_id, partition_id, partition_hash_id, object_store_id,
     min_time, max_time, file_size_bytes,
     row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at, source )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
+VALUES (
+    $1, $2, $3, $4,
+    $5, $6, $7,
+    $8, $9, $10, $11, $12, $13, $14 )
 RETURNING
     id, table_id, partition_id, partition_hash_id, object_store_id, min_time, max_time, to_delete,
     file_size_bytes, row_count, compaction_level, created_at, namespace_id, column_set,
     max_l0_created_at, source;
         "#,
-    )
-    .bind(table_id) // $1
-    .bind(partition_id) // $2
-    .bind(partition_hash_id.as_ref()) // $3
-    .bind(object_store_id) // $4
-    .bind(min_time) // $5
-    .bind(max_time) // $6
-    .bind(file_size_bytes) // $7
-    .bind(row_count) // $8
-    .bind(compaction_level) // $9
-    .bind(created_at) // $10
-    .bind(namespace_id) // $11
-    .bind(from_column_set(&column_set)) // $12
-    .bind(
-        max_l0_created_at
-            .maybe_computed_timestamp()
-            .unwrap_or(created_at),
-    ) // $13
-    .bind(source) // $14
-    .fetch_one(executor)
-    .await;
+        )
+        .bind(table_id) // $1
+        .bind(partition_id) // $2
+        .bind(partition_hash_id.as_ref()) // $3
+        .bind(object_store_id) // $4
+        .bind(min_time) // $5
+        .bind(max_time) // $6
+        .bind(file_size_bytes) // $7
+        .bind(row_count) // $8
+        .bind(compaction_level) // $9
+        .bind(created_at) // $10
+        .bind(namespace_id) // $11
+        .bind(from_column_set(&column_set)) // $12
+        .bind(max) // $13
+        .bind(source), // $14
+        MaxL0CreatedAt::NotCompacted => sqlx::query_as::<_, ParquetFilePod>(
+            r#"
+INSERT INTO parquet_file (
+    table_id, partition_id, partition_hash_id, object_store_id,
+    min_time, max_time, file_size_bytes,
+    row_count, compaction_level, created_at, namespace_id, column_set,
+    max_l0_created_at, source )
+VALUES (
+    $1, $2, $3, $4,
+    $5, $6, $7,
+    $8, $9, $10, $11, $12,
+    $13, $14 )
+RETURNING
+    id, table_id, partition_id, partition_hash_id, object_store_id, min_time, max_time, to_delete,
+    file_size_bytes, row_count, compaction_level, created_at, namespace_id, column_set,
+    max_l0_created_at, source;
+        "#,
+        )
+        .bind(table_id) // $1
+        .bind(partition_id) // $2
+        .bind(partition_hash_id.as_ref()) // $3
+        .bind(object_store_id) // $4
+        .bind(min_time) // $5
+        .bind(max_time) // $6
+        .bind(file_size_bytes) // $7
+        .bind(row_count) // $8
+        .bind(compaction_level) // $9
+        .bind(created_at) // $10
+        .bind(namespace_id) // $11
+        .bind(from_column_set(&column_set)) // $12
+        .bind(created_at) // $13
+        .bind(source), // $14
+    };
+
+    let res = query.fetch_one(executor).await;
 
     let rec = res.map_err(|e| {
         if is_unique_violation(&e) {
@@ -1815,10 +1858,14 @@ RETURNING
     Ok(rec.into())
 }
 
+// Don't make this function public: `marked_at` should only be set to a value internal and private
+// to the catalog because the value needs to match any `created_at` values if any files are created
+// in the same operation.
 async fn flag_for_delete<'q, E>(
     executor: E,
     partition_id: PartitionId,
     id: ObjectStoreId,
+    marked_at: Timestamp,
 ) -> Result<()>
 where
     E: Executor<'q, Database = Sqlite>,
@@ -1826,14 +1873,15 @@ where
     let updated = sqlx::query_as::<_, (i64,)>(
         r#"
 UPDATE parquet_file
-SET to_delete = unixepoch('now', 'subsec') * 1000000000
-WHERE object_store_id = $1
-AND partition_id = $2
+SET to_delete = $1
+WHERE object_store_id = $2
+AND partition_id = $3
 AND to_delete is NULL
 RETURNING id;"#,
     )
-    .bind(id) // $1
-    .bind(partition_id) // $2
+    .bind(marked_at) // $1
+    .bind(id) // $2
+    .bind(partition_id) // $3
     .fetch_all(executor)
     .await?;
 
@@ -2053,11 +2101,19 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
         // Create a Parquet file record in this partition to ensure we don't break new data
         // ingestion for old-style partitions
         let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, partition);
-        let parquet_file = repos
+        let object_store_id = parquet_file_params.object_store_id;
+        repos
             .parquet_files()
             .create(parquet_file_params)
             .await
             .unwrap();
+        let parquet_file = repos
+            .parquet_files()
+            .get_by_object_store_id(object_store_id)
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(parquet_file.partition_hash_id, None);
 
         // Add a partition record WITH a hash ID
@@ -2516,11 +2572,18 @@ RETURNING *;
             source: Some(ParquetFileSource::BulkIngest),
             ..arbitrary_parquet_file_params(&namespace, &table, &partition)
         };
-        let parquet_file = repos
+        repos
             .parquet_files()
             .create(parquet_file_params.clone())
             .await
             .unwrap();
+        let parquet_file = repos
+            .parquet_files()
+            .get_by_object_store_id(parquet_file_params.object_store_id)
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(parquet_file.source, Some(ParquetFileSource::BulkIngest));
     }
 

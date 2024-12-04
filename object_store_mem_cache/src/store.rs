@@ -12,7 +12,7 @@ use object_store::{
 };
 use tokio::runtime::Handle;
 
-use crate::cache_system::{s3fifo::S3FifoCache, Cache};
+use crate::cache_system::{s3_fifo_cache::S3FifoCache, Cache};
 use crate::{
     attributes::ATTR_CACHE_STATE,
     cache_system::{
@@ -136,11 +136,23 @@ pub struct MemCacheObjectStoreParams<'a> {
     /// Tokio runtime handle for the background task that drives the GC (= garbage collector).
     pub handle: &'a Handle,
 
+    /// Should we use the new S3-FIFO implementation?
+    ///
+    /// The implementation promises to be a better, more robust eviction policy.
     pub use_s3fifo: bool,
+
+    /// The relative size (in percentage) of the "small" S3-FIFO queue.
+    ///
+    /// Only relevant if [`use_s3fifo`](Self::use_s3fifo) is set.
     pub s3fifo_main_threshold: usize,
+
+    /// Size of S3-FIFO ghost set in bytes.
+    ///
+    /// Only relevant if [`use_s3fifo`](Self::use_s3fifo) is set.
+    pub s3_fifo_ghost_memory_limit: NonZeroUsize,
 }
 
-impl<'a> MemCacheObjectStoreParams<'a> {
+impl MemCacheObjectStoreParams<'_> {
     /// Build store from parameters.
     pub fn build(self) -> MemCacheObjectStore {
         let Self {
@@ -153,39 +165,35 @@ impl<'a> MemCacheObjectStoreParams<'a> {
             handle,
             use_s3fifo,
             s3fifo_main_threshold,
+            s3_fifo_ghost_memory_limit,
         } = self;
-
-        let memory_limiter = MemoryLimiter::new(memory_limit);
-        let oom_notify = memory_limiter.oom();
-
-        let level_trigger_nearly_oom =
-            LevelTrigger::new((memory_limit.get() as f64 * 0.9).floor() as usize);
-        let nearly_oom_notify = level_trigger_nearly_oom.level_reached();
-
-        let level_trigger_pressure =
-            LevelTrigger::new((memory_limit.get() as f64 * 0.75).floor() as usize);
-        let pressure_notify = level_trigger_pressure.level_reached();
 
         let (cache, reactor) = if use_s3fifo {
             let cache = Arc::new(S3FifoCache::new(
                 memory_limit.get(),
+                s3_fifo_ghost_memory_limit.get(),
                 s3fifo_main_threshold as f64 / 100.0,
                 Arc::new(HookChain::new([Arc::new(ObserverHook::new(
                     CACHE_NAME,
                     metrics,
                     Some(memory_limit.get() as u64),
                 )) as _])),
+                metrics,
             ));
 
-            let cache_captured = Arc::downgrade(&cache);
-            let reactor = Reactor::new(
-                [ticker(gc_interval).observe(CACHE_NAME, "gc", metrics)],
-                cache_captured.observe(CACHE_NAME, metrics, Arc::clone(&time_provider)),
-                handle,
-            );
-
-            (cache as Arc<dyn Cache<Path, CacheValue>>, reactor)
+            (cache as Arc<dyn Cache<Path, CacheValue>>, None)
         } else {
+            let memory_limiter = MemoryLimiter::new(memory_limit);
+            let oom_notify = memory_limiter.oom();
+
+            let level_trigger_nearly_oom =
+                LevelTrigger::new((memory_limit.get() as f64 * 0.9).floor() as usize);
+            let nearly_oom_notify = level_trigger_nearly_oom.level_reached();
+
+            let level_trigger_pressure =
+                LevelTrigger::new((memory_limit.get() as f64 * 0.75).floor() as usize);
+            let pressure_notify = level_trigger_pressure.level_reached();
+
             let cache = Arc::new(HookLimitedCache::new(Arc::new(HookChain::new([
                 Arc::new(memory_limiter) as _,
                 Arc::new(level_trigger_nearly_oom) as _,
@@ -220,7 +228,7 @@ impl<'a> MemCacheObjectStoreParams<'a> {
                 handle,
             );
 
-            (cache as Arc<dyn Cache<Path, CacheValue>>, reactor)
+            (cache as Arc<dyn Cache<Path, CacheValue>>, Some(reactor))
         };
 
         MemCacheObjectStore {
@@ -237,9 +245,14 @@ pub struct MemCacheObjectStore {
     store: Arc<DynObjectStore>,
     hit_metrics: HitMetrics,
     cache: Arc<dyn Cache<Path, CacheValue>>,
-    // reactor must just kept alive
+
+    /// Reactor that drives background tasks like garbage collection.
+    ///
+    /// Is is NOT used for the S3-FIFO implementation.
+    ///
+    /// Marked as dead code because we need to keep the task around but don't actively access it.
     #[allow(dead_code)]
-    reactor: Reactor,
+    reactor: Option<Reactor>,
 }
 
 impl MemCacheObjectStore {
@@ -248,7 +261,7 @@ impl MemCacheObjectStore {
         let (res, state) = self
             .cache
             .get_or_fetch(
-                location,
+                &Arc::new(location.clone()),
                 Box::new(|location| {
                     let location = location.clone();
 
@@ -445,6 +458,7 @@ mod tests {
                     MemCacheObjectStoreParams {
                         inner: Arc::clone(&inner) as _,
                         memory_limit: NonZeroUsize::MAX,
+                        s3_fifo_ghost_memory_limit: NonZeroUsize::MAX,
                         memory_pressure_throttle: Duration::from_secs(1),
                         gc_interval: Duration::from_secs(1),
                         time_provider: Arc::clone(&time_provider) as _,

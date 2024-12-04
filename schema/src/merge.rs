@@ -105,7 +105,7 @@ impl SchemaMerger<'static> {
     }
 }
 
-impl<'a> SchemaMerger<'a> {
+impl SchemaMerger<'_> {
     pub fn with_interner(self, interner: &mut SchemaInterner) -> SchemaMerger<'_> {
         SchemaMerger {
             fields: self.fields,

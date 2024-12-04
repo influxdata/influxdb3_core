@@ -20,8 +20,8 @@ mod tests {
     use test_helpers::{maybe_start_logging, timeout::FutureTimeout};
 
     use crate::{
-        grpc::test_server::TestGrpcServer, interface::Catalog, interface_tests::TestCatalog,
-        mem::MemCatalog,
+        grpc::test_server::TestGrpcServer, interface::Catalog, mem::MemCatalog,
+        test_helpers::TestCatalog,
     };
 
     use super::*;

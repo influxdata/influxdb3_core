@@ -434,8 +434,6 @@ fn test_partition_write() {
             _ => unreachable!(),
         };
 
-        assert_eq!(write.min_timestamp(), stats.min.unwrap());
-        assert_eq!(write.max_timestamp(), stats.max.unwrap());
         assert_eq!(write.rows().get() as u64, stats.total_count);
     };
 

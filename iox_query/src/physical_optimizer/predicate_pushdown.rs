@@ -70,10 +70,17 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                     if let Some(predicate) = both {
                         builder = builder.with_predicate(predicate);
                     }
-                    let new_node = Arc::new(FilterExec::try_new(
-                        Arc::clone(filter_exec.predicate()),
-                        builder.build_arc(),
-                    )?);
+
+                    let mut new_node: Arc<dyn ExecutionPlan> = builder.build_arc();
+                    if !child_parquet
+                        .table_parquet_options()
+                        .global
+                        .pushdown_filters
+                    {
+                        let filter =
+                            FilterExec::try_new(Arc::clone(filter_exec.predicate()), new_node)?;
+                        new_node = Arc::new(filter);
+                    }
                     return Ok(Transformed::yes(new_node));
                 } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
                     let dedup_cols = child_dedup.sort_columns();
@@ -153,6 +160,42 @@ mod tests {
     use crate::{physical_optimizer::test_util::OptimizationTest, util::arrow_sort_key_exprs};
 
     use super::*;
+
+    #[test]
+    fn test_parquet_pushdown_disabled() {
+        // basically just the same as the test_parquet but with pushdown disabled to ensure the
+        // FilterExec is still preserved if so
+        let schema = schema();
+        let base_config = FileScanConfig {
+            object_store_url: ObjectStoreUrl::parse("test://").unwrap(),
+            file_schema: Arc::clone(&schema),
+            file_groups: vec![],
+            statistics: Statistics::new_unknown(&schema),
+            projection: None,
+            limit: None,
+            table_partition_cols: vec![],
+            output_ordering: vec![],
+        };
+        let mut table_opts = table_parquet_options();
+        table_opts.global.pushdown_filters = false;
+        let builder = ParquetExecBuilder::new_with_options(base_config, table_opts)
+            .with_predicate(predicate_tag(&schema));
+        let plan =
+            Arc::new(FilterExec::try_new(predicate_mixed(&schema), builder.build_arc()).unwrap());
+        let opt = PredicatePushdown;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan, opt),
+            @r#"
+        input:
+          - " FilterExec: tag1@0 = field@2"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+        output:
+          Ok:
+            - " FilterExec: tag1@0 = field@2"
+            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+        "#
+        );
+    }
 
     #[test]
     fn test_empty_no_rows() {
@@ -295,8 +338,7 @@ mod tests {
           - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
-            - " FilterExec: tag1@0 = field@2"
-            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+            - " ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
         "#
         );
     }

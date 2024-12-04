@@ -22,8 +22,10 @@ pub mod metrics;
 pub mod migrate;
 pub mod postgres;
 pub mod sqlite;
-pub mod test_helpers;
+pub mod storage;
 pub mod util;
 
 #[cfg(test)]
 pub(crate) mod interface_tests;
+#[cfg(any(test, feature = "test_helpers"))]
+pub mod test_helpers;

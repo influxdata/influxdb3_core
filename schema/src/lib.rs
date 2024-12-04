@@ -817,7 +817,7 @@ impl<'a> SchemaIter<'a> {
     }
 }
 
-impl<'a> fmt::Debug for SchemaIter<'a> {
+impl fmt::Debug for SchemaIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SchemaIter<{}>", self.idx)
     }

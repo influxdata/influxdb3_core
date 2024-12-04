@@ -19,7 +19,7 @@ struct FieldValueRewriter<'a> {
     value_exprs: &'a mut Vec<ValueExpr>,
 }
 
-impl<'a> TreeNodeRewriter for FieldValueRewriter<'a> {
+impl TreeNodeRewriter for FieldValueRewriter<'_> {
     type Node = Expr;
 
     fn f_up(&mut self, expr: Expr) -> DataFusionResult<Transformed<Expr>> {

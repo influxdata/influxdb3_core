@@ -8,10 +8,10 @@ use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) mod bucket;
-use bucket::BucketHasher;
+pub use bucket::BucketHasher;
 
-mod strftime;
-use strftime::StrftimeFormatter;
+pub(crate) mod strftime;
+pub use strftime::StrftimeFormatter;
 
 /// A [`TablePartitionTemplateOverride`] is made up of one of more
 /// [`TemplatePart`]s that are rendered and joined together by
@@ -58,7 +58,7 @@ where
     }
 }
 
-impl<'a, T> Template<'a, T>
+impl<T> Template<'_, T>
 where
     T: PartitioningColumn,
 {

@@ -890,7 +890,7 @@ fn compute_stats<'a, T, U, F>(
     stats.update_for_nulls(to_insert as u64 - non_null_count);
 }
 
-impl<'a, T> Drop for Writer<'a, T> {
+impl<T> Drop for Writer<'_, T> {
     fn drop(&mut self) {
         if !self.success {
             let initial_rows = self.initial_rows;

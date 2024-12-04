@@ -15,7 +15,7 @@ pub enum Projection<'a> {
     Some(&'a [&'a str]),
 }
 
-impl<'a> Display for Projection<'a> {
+impl Display for Projection<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Projection::All => write!(f, "*")?,
@@ -32,7 +32,7 @@ impl<'a> Display for Projection<'a> {
     }
 }
 
-impl<'a> Projection<'a> {
+impl Projection<'_> {
     /// Compute projected schema.
     pub fn project_schema(
         &self,

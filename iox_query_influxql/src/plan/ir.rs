@@ -181,7 +181,7 @@ pub(super) enum DataSourceSchema<'a> {
     Subquery(&'a Select),
 }
 
-impl<'a> DataSourceSchema<'a> {
+impl DataSourceSchema<'_> {
     /// Returns `true` if the specified name is a tag field or a projection of a tag field if
     /// the `DataSource` is a subquery.
     pub(super) fn is_tag_field(&self, name: &str) -> bool {

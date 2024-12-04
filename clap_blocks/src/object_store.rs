@@ -285,6 +285,14 @@ pub struct ObjectStoreConfig {
         action
     )]
     pub http2_max_frame_size: Option<u32>,
+
+    /// Endpoint of an S3 compatible, HTTP/2 enabled object store cache.
+    #[clap(
+        long = "object-store-cache-endpoint",
+        env = "OBJECT_STORE_CACHE_ENDPOINT",
+        action
+    )]
+    pub cache_endpoint: Option<Endpoint>,
 }
 
 impl ObjectStoreConfig {
@@ -314,6 +322,7 @@ impl ObjectStoreConfig {
             object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
             http2_only: Default::default(),
             http2_max_frame_size: Default::default(),
+            cache_endpoint: Default::default(),
         }
     }
 
@@ -486,6 +495,49 @@ fn new_azure(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseErr
 #[cfg(not(feature = "azure"))]
 fn new_azure(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     panic!("Azure blob storage support not enabled, recompile with the azure feature enabled")
+}
+
+/// Build cache store.
+#[cfg(feature = "aws")]
+pub fn make_cache_store(
+    config: &ObjectStoreConfig,
+) -> Result<Option<Arc<DynObjectStore>>, ParseError> {
+    let Some(endpoint) = &config.cache_endpoint else {
+        return Ok(None);
+    };
+
+    let store = object_store::aws::AmazonS3Builder::new()
+        // bucket name is ignored by our cache server
+        .with_bucket_name(config.bucket.as_deref().unwrap_or("dummy"))
+        .with_client_options(
+            object_store::ClientOptions::new()
+                .with_allow_http(true)
+                .with_http2_only()
+                // this is the maximum that is allowed by the HTTP/2 standard and is meant to lower the overhead of
+                // submitting TCP packages to the kernel
+                .with_http2_max_frame_size(16777215),
+        )
+        .with_endpoint(endpoint.clone())
+        .with_retry(object_store::RetryConfig {
+            max_retries: 3,
+            ..Default::default()
+        })
+        .with_skip_signature(true)
+        .build()
+        .context(InvalidS3ConfigSnafu)?;
+
+    Ok(Some(Arc::new(store)))
+}
+
+/// Build cache store.
+#[cfg(not(feature = "aws"))]
+pub fn make_cache_store(
+    config: &ObjectStoreConfig,
+) -> Result<Option<Arc<DynObjectStore>>, ParseError> {
+    match &config.cache_endpoint {
+        Some(_) => panic!("Cache support not enabled, recompile with the aws feature enabled"),
+        None => Ok(None),
+    }
 }
 
 /// Create config-dependant object store.

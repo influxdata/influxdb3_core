@@ -8,6 +8,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+test_helpers = ["dep:pgtemp"]
+
 [dependencies] # In alphabetical order
 async-trait = "0.1.83"
 backoff = { version = "0.1.0", path = "../backoff" }
@@ -16,6 +19,7 @@ catalog_cache = { path = "../catalog_cache" }
 client_util = { path = "../client_util" }
 dashmap = "6.1.0"
 data_types = { path = "../data_types" }
+error_reporting = { path = "../error_reporting" }
 futures = "0.3"
 generated_types = { path = "../generated_types" }
 hashbrown = "0.14"
@@ -23,7 +27,6 @@ http = { workspace = true }
 iox_time = { version = "0.1.0", path = "../iox_time" }
 log = "0.4"
 metric = { version = "0.1.0", path = "../metric" }
-mutable_batch = { path = "../mutable_batch" }
 observability_deps = { path = "../observability_deps" }
 parking_lot = { version = "0.12" }
 ring = "0.17"
@@ -32,13 +35,16 @@ siphasher = "1.0"
 snafu = "0.8"
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "sqlite"] }
 sqlx-hotswap-pool = { path = "../sqlx-hotswap-pool" }
-thiserror = "2.0.0"
+thiserror = "2.0.3"
 tokio = { version = "1.41", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
 tonic = { workspace = true }
 trace = { path = "../trace" }
 trace_http = { path = "../trace_http" }
 uuid = "1"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# for test_helpers feature
+pgtemp = { version = "0.5.0", optional = true }
 
 [dev-dependencies] # In alphabetical order
 assert_matches = "1.5.0"
@@ -57,3 +63,4 @@ test_helpers = { path = "../test_helpers" }
 [[bench]]
 name = "quorum"
 harness = false
+required-features = ["test_helpers"]

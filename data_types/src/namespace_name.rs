@@ -157,7 +157,7 @@ impl<'a> std::convert::TryFrom<&'a str> for NamespaceName<'a> {
     }
 }
 
-impl<'a> std::convert::TryFrom<String> for NamespaceName<'a> {
+impl std::convert::TryFrom<String> for NamespaceName<'_> {
     type Error = NamespaceNameError;
 
     fn try_from(v: String) -> Result<Self, Self::Error> {
@@ -165,7 +165,7 @@ impl<'a> std::convert::TryFrom<String> for NamespaceName<'a> {
     }
 }
 
-impl<'a> std::ops::Deref for NamespaceName<'a> {
+impl std::ops::Deref for NamespaceName<'_> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -173,13 +173,13 @@ impl<'a> std::ops::Deref for NamespaceName<'a> {
     }
 }
 
-impl<'a> AsRef<[u8]> for NamespaceName<'a> {
+impl AsRef<[u8]> for NamespaceName<'_> {
     fn as_ref(&self) -> &[u8] {
         self.as_str().as_bytes()
     }
 }
 
-impl<'a> std::fmt::Display for NamespaceName<'a> {
+impl std::fmt::Display for NamespaceName<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }

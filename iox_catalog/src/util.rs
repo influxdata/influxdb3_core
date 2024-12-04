@@ -7,14 +7,14 @@ use crate::{
     constants::TIME_COLUMN,
     interface::{CasFailure, Catalog, Error, RepoCollection, SoftDeletedRows},
 };
-use data_types::{partition_template::ColumnValue, CompactionLevel};
+use data_types::{partition_template::ColumnValue, CompactionLevel, NamespaceName};
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, PartitionKey,
     SortKeyIds, TableId, TableSchema,
 };
+use error_reporting::DisplaySourceChain;
 use iox_time::Time;
-use mutable_batch::MutableBatch;
 use std::time::Duration;
 use std::{
     borrow::Cow,
@@ -23,12 +23,31 @@ use std::{
 };
 use thiserror::Error;
 
-/// Gets the namespace schema including all tables and columns.
+/// Converts the catalog error to tonic status
+pub(crate) fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Status {
+    use crate::interface::Error;
+
+    match e {
+        Error::External { source } => {
+            // walk cause chain to display full details
+            // see https://github.com/influxdata/influxdb_iox/issues/12373
+            tonic::Status::internal(DisplaySourceChain::new(source).to_string())
+        }
+        Error::AlreadyExists { descr } => tonic::Status::already_exists(descr),
+        Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
+        Error::NotFound { descr } => tonic::Status::not_found(descr),
+        Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
+        Error::NotImplemented { descr } => tonic::Status::unimplemented(descr),
+    }
+}
+
+/// Gets the name and schema for the provided namespace ID, including all tables
+/// and columns.
 pub async fn get_schema_by_id<R>(
     id: NamespaceId,
     repos: &mut R,
     deleted: SoftDeletedRows,
-) -> Result<Option<NamespaceSchema>, crate::interface::Error>
+) -> Result<Option<(NamespaceName<'static>, NamespaceSchema)>, crate::interface::Error>
 where
     R: RepoCollection + ?Sized,
 {
@@ -36,7 +55,12 @@ where
         return Ok(None);
     };
 
-    Ok(Some(get_schema_internal(namespace, repos).await?))
+    let schema = get_schema_internal(&namespace, repos).await?;
+
+    Ok(Some((
+        NamespaceName::new(namespace.name).expect("namespace name in catalog must be valid"),
+        schema,
+    )))
 }
 
 /// Gets the namespace schema including all tables and columns.
@@ -52,11 +76,11 @@ where
         return Ok(None);
     };
 
-    Ok(Some(get_schema_internal(namespace, repos).await?))
+    Ok(Some(get_schema_internal(&namespace, repos).await?))
 }
 
 async fn get_schema_internal<R>(
-    namespace: Namespace,
+    namespace: &Namespace,
     repos: &mut R,
 ) -> Result<NamespaceSchema, crate::interface::Error>
 where
@@ -66,7 +90,7 @@ where
     let columns = repos.columns().list_by_namespace_id(namespace.id).await?;
     let tables = repos.tables().list_by_namespace_id(namespace.id).await?;
 
-    let mut namespace = NamespaceSchema::new_empty_from(&namespace);
+    let mut namespace = NamespaceSchema::new_empty_from(namespace);
 
     let mut table_id_to_schema = BTreeMap::new();
     for t in tables {
@@ -386,7 +410,7 @@ impl TableScopedError {
 /// This function pushes schema additions through to the backend catalog,
 /// relying on the catalog to serialize concurrent additions of a given
 /// column.
-pub async fn validate_or_insert_schema<'a, T, U, R>(
+pub async fn validate_or_insert_schema<'a, T, U, C, R>(
     new_tables: T,
     namespace_id: NamespaceId,
     namespace_partition_template: &NamespacePartitionTemplateOverride,
@@ -394,8 +418,9 @@ pub async fn validate_or_insert_schema<'a, T, U, R>(
     repos: &mut R,
 ) -> Result<Option<BTreeMap<String, TableSchema>>, TableScopedError>
 where
-    T: IntoIterator<IntoIter = U, Item = (&'a str, &'a MutableBatch)> + Send + Sync,
-    U: Iterator<Item = T::Item> + Send,
+    T: IntoIterator<IntoIter = U> + Send + Sync,
+    U: Iterator<Item = (&'a str, C)> + Send, // Tables and column iters
+    C: Iterator<Item = (&'a String, ColumnType)> + Send, // Column iters
     R: RepoCollection + ?Sized,
 {
     let new_tables = new_tables.into_iter();
@@ -403,9 +428,9 @@ where
     // The (potentially updated) NamespaceSchema to return to the caller.
     let mut namespace_table_schema = Cow::Borrowed(namespace_table_schema);
 
-    for (table_name, batch) in new_tables {
-        validate_mutable_batch(
-            batch,
+    for (table_name, columns) in new_tables {
+        validate_mutable_table(
+            columns,
             table_name,
             namespace_id,
             namespace_partition_template,
@@ -423,8 +448,8 @@ where
 
 // &mut Cow is used to avoid a copy, so allow it
 #[allow(clippy::ptr_arg)]
-async fn validate_mutable_batch<R>(
-    mb: &MutableBatch,
+async fn validate_mutable_table<R>(
+    columns: impl Iterator<Item = (&String, ColumnType)> + Send,
     table_name: &str,
     namespace_id: NamespaceId,
     namespace_partition_template: &NamespacePartitionTemplateOverride,
@@ -469,14 +494,7 @@ where
     // If the table itself needs to be updated during column validation it
     // becomes a Cow::owned() copy and the modified copy should be inserted into
     // the schema before returning.
-    validate_and_insert_columns(
-        mb.columns()
-            .map(|(name, col)| (name, col.influx_type().into())),
-        table_name,
-        &mut table,
-        repos,
-    )
-    .await?;
+    validate_and_insert_columns(columns, table_name, &mut table, repos).await?;
 
     if let Cow::Owned(table) = table {
         // The table schema was mutated and needs inserting into the namespace
@@ -709,7 +727,7 @@ mod tests {
                                 .expect("failed to build test writes from LP");
 
                             let got = validate_or_insert_schema(
-                                writes.iter().map(|(k, v)| (k.as_str(), v)),
+                                writes.iter().map(|(k, v)| (k.as_str(), v.iter_column_types())),
                                 schema.id,
                                 &schema.partition_template,
                                 &schema.tables,
@@ -954,7 +972,9 @@ mod tests {
         let schema_with_table = empty_schema.clone();
         let writes = mutable_batch_lp::lines_to_batches("m1,t1=a f1=2i", 42).unwrap();
         validate_or_insert_schema(
-            writes.iter().map(|(k, v)| (k.as_str(), v)),
+            writes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.iter_column_types())),
             schema_with_table.id,
             &schema_with_table.partition_template,
             &schema_with_table.tables,
@@ -966,7 +986,9 @@ mod tests {
         // then the empty schema adds the same table with some different columns
         let other_writes = mutable_batch_lp::lines_to_batches("m1,t2=a f2=2i", 43).unwrap();
         let formerly_empty_tables = validate_or_insert_schema(
-            other_writes.iter().map(|(k, v)| (k.as_str(), v)),
+            other_writes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.iter_column_types())),
             empty_schema.id,
             &empty_schema.partition_template,
             &empty_schema.tables,

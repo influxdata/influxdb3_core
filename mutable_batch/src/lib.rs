@@ -17,11 +17,10 @@ use workspace_hack as _;
 
 use crate::column::{Column, ColumnData};
 use arrow::record_batch::RecordBatch;
-use data_types::{StatValues, Statistics};
+use data_types::{ColumnType, StatValues, Statistics};
 use hashbrown::HashMap;
 use iox_time::Time;
-use schema::Projection;
-use schema::{builder::SchemaBuilder, Schema, TIME_COLUMN_NAME};
+use schema::{builder::SchemaBuilder, Projection, Schema, TIME_COLUMN_NAME};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{collections::BTreeSet, ops::Range};
 
@@ -151,6 +150,13 @@ impl MutableBatch {
         self.column_names
             .iter()
             .map(move |(name, idx)| (name, &self.columns[*idx]))
+    }
+
+    /// Yield an iterator of column `(name, type)` tuples for all columns in
+    /// this batch.
+    pub fn iter_column_types(&self) -> impl ExactSizeIterator<Item = (&String, ColumnType)> + '_ {
+        self.columns()
+            .map(|(name, col)| (name, ColumnType::from(col.influx_type())))
     }
 
     /// Return the set of column names for this table. Used in combination with a write operation's

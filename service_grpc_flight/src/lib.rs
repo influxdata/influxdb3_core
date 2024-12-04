@@ -26,6 +26,7 @@ use arrow_flight::{
 use authz::{extract_token, Authorizer};
 use data_types::NamespaceNameError;
 use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
+use error_reporting::DisplaySourceChain;
 use flightsql::FlightSQLCommand;
 use futures::{ready, stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
@@ -38,7 +39,7 @@ use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
 use observability_deps::tracing::{debug, info, warn};
 use prost::Message;
 use request::{IoxGetRequest, RunQuery};
-use service_common::datafusion_error_to_tonic_code;
+use service_common::{datafusion_error_to_tonic_code, flight_error_to_tonic_code};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
     fmt::Debug,
@@ -190,6 +191,9 @@ pub enum Error {
     #[snafu(display("Error while planning Flight SQL : {}", source))]
     FlightSQL { source: flightsql::Error },
 
+    #[snafu(display("Error while execution Flight SQL stream: {}", source))]
+    StreamingFlightSql { source: FlightError },
+
     #[snafu(display("No FlightDescriptor in Flight SQL request"))]
     NoFlightDescriptor,
 
@@ -217,19 +221,24 @@ impl From<Error> for tonic::Status {
     /// Converts a result from the business logic into the appropriate tonic
     /// status
     fn from(err: Error) -> Self {
+        // walk cause chain to display full details
+        // see https://github.com/influxdata/influxdb_iox/issues/12373
+        let err = DisplaySourceChain::new(err);
+        let msg = "Error handling Flight gRPC request";
+        let namespace = err.inner().namespace();
+        let query = err.inner().query();
         // An explicit match on the Error enum will ensure appropriate
         // logging is handled for any new error variants.
-        let msg = "Error handling Flight gRPC request";
-        let namespace = err.namespace();
-        let query = err.query();
-        match err {
+        match err.inner() {
             Error::DatabaseNotFound { .. }
             | Error::InvalidTicket { .. }
             | Error::InvalidHandshake { .. }
             | Error::Unauthenticated { .. }
             | Error::PermissionDenied { .. }
             | Error::InvalidDatabaseName { .. }
-            | Error::Query { .. } => info!(e=%err, %namespace, %query, msg),
+            | Error::Query { .. } => {
+                info!(e=%err, %namespace, %query, msg);
+            }
             Error::Database { .. }
             | Error::Optimize { .. }
             | Error::EncodeSchema { .. }
@@ -241,12 +250,13 @@ impl From<Error> for tonic::Status {
             | Error::InternalCreatingTicket { .. }
             | Error::UnsupportedMessageType { .. }
             | Error::FlightSQL { .. }
+            | Error::StreamingFlightSql { .. }
             | Error::AuthzVerification { .. }
             | Error::NoFlightDescriptor { .. } => {
-                warn!(e=%err, %namespace, %query, msg)
+                warn!(e=%err, %namespace, %query, msg);
             }
-        }
-        err.into_status()
+        };
+        err.into_inner().into_status()
     }
 }
 
@@ -254,9 +264,12 @@ impl Error {
     /// Converts a result from the business logic into the appropriate tonic (gRPC)
     /// status message to send back to users
     fn into_status(self) -> tonic::Status {
-        let msg = self.to_string();
+        // walk cause chain to display full details
+        // see https://github.com/influxdata/influxdb_iox/issues/12373
+        let err = DisplaySourceChain::new(self);
+        let msg = err.to_string();
 
-        let code = match self {
+        let code = match err.into_inner() {
             Self::DatabaseNotFound { .. } => tonic::Code::NotFound,
             Self::InvalidTicket { .. }
             | Self::InvalidHandshake { .. }
@@ -279,7 +292,10 @@ impl Error {
                 | flightsql::Error::Protocol { .. }
                 | flightsql::Error::UnknownParameterType { .. }
                 | flightsql::Error::UnsupportedMessageType { .. } => tonic::Code::InvalidArgument,
-                flightsql::Error::Flight { source: e } => return tonic::Status::from(e),
+                flightsql::Error::Flight { source } => {
+                    // only use status code, NOT the message because it does NOT contain the entire chain
+                    flight_error_to_tonic_code(&source)
+                }
                 fs_err @ flightsql::Error::Arrow { .. } => {
                     // wrap in Datafusion error to walk source stacks
                     let df_error = DataFusionError::from(fs_err);
@@ -287,6 +303,10 @@ impl Error {
                 }
                 flightsql::Error::DataFusion { source } => datafusion_error_to_tonic_code(&source),
             },
+            Self::StreamingFlightSql { source } => {
+                // only use status code, NOT the message because it does NOT contain the entire chain
+                flight_error_to_tonic_code(&source)
+            }
             Self::InternalCreatingTicket { .. }
             | Self::Optimize { .. }
             | Self::EncodeSchema { .. } => tonic::Code::Internal,
@@ -313,6 +333,7 @@ impl Error {
             | Self::Optimize { .. }
             | Self::EncodeSchema { .. }
             | Self::FlightSQL { .. }
+            | Self::StreamingFlightSql { .. }
             | Self::Deserialization { .. }
             | Self::UnsupportedMessageType { .. }
             | Self::Unauthenticated
@@ -339,6 +360,7 @@ impl Error {
             | Self::Optimize { .. }
             | Self::EncodeSchema { .. }
             | Self::FlightSQL { .. }
+            | Self::StreamingFlightSql { .. }
             | Self::Deserialization { .. }
             | Self::UnsupportedMessageType { .. }
             | Self::Unauthenticated
@@ -1280,10 +1302,7 @@ impl GetStream {
                 namespace_name: namespace_name.clone(),
                 query: query.to_string(),
             })?
-            .map_err(|e| {
-                let code = datafusion_error_to_tonic_code(&e);
-                tonic::Status::new(code, e.to_string()).into()
-            });
+            .map_err(|e| FlightError::ExternalError(Box::new(e)));
 
         // acquire token (after planning)
         let permit_state: Arc<Mutex<Option<PermitAndToken>>> = Default::default();
@@ -1358,6 +1377,8 @@ impl Stream for GetStream {
                     if let Some(token) = self.finish_stream() {
                         token.fail();
                     }
+                    // convert error type for better formatting of the error chain
+                    let e = Error::StreamingFlightSql { source: e };
                     return Poll::Ready(Some(Err(e.into())));
                 }
             }

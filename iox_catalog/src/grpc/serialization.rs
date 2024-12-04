@@ -116,19 +116,6 @@ impl<T> ContextExt<T> for Result<T, Error> {
     }
 }
 
-pub(crate) fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Status {
-    use crate::interface::Error;
-
-    match e {
-        Error::External { source } => tonic::Status::internal(source.to_string()),
-        Error::AlreadyExists { descr } => tonic::Status::already_exists(descr),
-        Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
-        Error::NotFound { descr } => tonic::Status::not_found(descr),
-        Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
-        Error::NotImplemented { descr } => tonic::Status::unimplemented(descr),
-    }
-}
-
 pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
     use crate::interface::Error;
 
@@ -370,6 +357,7 @@ pub(crate) fn deserialize_column_set(set: proto::ColumnSet) -> ColumnSet {
 #[allow(deprecated)]
 pub(crate) fn serialize_parquet_file_params(
     params: &ParquetFileParams,
+    created_at: Timestamp,
 ) -> proto::ParquetFileParams {
     proto::ParquetFileParams {
         namespace_id: params.namespace_id.get(),
@@ -385,7 +373,7 @@ pub(crate) fn serialize_parquet_file_params(
         file_size_bytes: params.file_size_bytes,
         row_count: params.row_count,
         compaction_level: params.compaction_level as i32,
-        created_at: params.created_at.get(),
+        created_at: created_at.get(),
         column_set: Some(serialize_column_set(&params.column_set)),
 
         maybe_max_l0_created_at: Some(
@@ -407,7 +395,7 @@ pub(crate) fn serialize_parquet_file_params(
         max_l0_created_at: params
             .max_l0_created_at
             .maybe_computed_timestamp()
-            .unwrap_or(params.created_at)
+            .unwrap_or(created_at)
             .get(),
 
         source: ParquetFileSource::to_proto(params.source),
@@ -463,7 +451,6 @@ pub(crate) fn deserialize_parquet_file_params(
         file_size_bytes: params.file_size_bytes,
         row_count: params.row_count,
         compaction_level,
-        created_at: Timestamp::new(params.created_at),
         column_set: deserialize_column_set(params.column_set.required().ctx("column_set")?),
         max_l0_created_at,
         source: ParquetFileSource::from_proto(params.source),
@@ -526,6 +513,7 @@ pub(crate) fn deserialize_parquet_file(file: proto::ParquetFile) -> Result<Parqu
 
 #[cfg(test)]
 mod tests {
+    use crate::util::catalog_error_to_status;
     use data_types::{
         partition_template::TablePartitionTemplateOverride, CompactionLevel, PartitionHashId,
         PartitionKey,
@@ -768,8 +756,11 @@ mod tests {
         assert_eq!(set, set2);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn test_parquet_file_params_roundtrip() {
+        // This is only needed until `created_at` is fully deprecated
+        let created_at = Timestamp::new(8);
         let params = ParquetFileParams {
             namespace_id: NamespaceId::new(1),
             table_id: TableId::new(2),
@@ -781,12 +772,11 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Final,
-            created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
             max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(11)),
             source: None,
         };
-        let protobuf = serialize_parquet_file_params(&params);
+        let protobuf = serialize_parquet_file_params(&params, created_at);
         let params2 = deserialize_parquet_file_params(protobuf).unwrap();
         assert_eq!(params, params2);
 
@@ -801,12 +791,11 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
             max_l0_created_at: MaxL0CreatedAt::NotCompacted,
             source: None,
         };
-        let protobuf = serialize_parquet_file_params(&params_without_max_l0_created_at);
+        let protobuf = serialize_parquet_file_params(&params_without_max_l0_created_at, created_at);
         let params_without_max_l0_created_at2 = deserialize_parquet_file_params(protobuf).unwrap();
         assert_eq!(
             params_without_max_l0_created_at,
@@ -822,6 +811,8 @@ mod tests {
             .get_uuid()
             .as_u64_pair();
         let object_store_id = proto::ObjectStoreId { high64, low64 };
+        // This is only needed until `created_at` is fully deprecated
+        let created_at = Timestamp::new(8);
 
         let old_proto_l2_max_l0_and_created_at_equal = proto::ParquetFileParams {
             namespace_id: 1,
@@ -834,7 +825,7 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Final as i32,
-            created_at: 8,
+            created_at: created_at.get(),
             column_set: Some(proto::ColumnSet {
                 column_ids: vec![1],
             }),
@@ -846,7 +837,7 @@ mod tests {
         };
         let params2 =
             deserialize_parquet_file_params(old_proto_l2_max_l0_and_created_at_equal).unwrap();
-        let protobuf = serialize_parquet_file_params(&params2);
+        let protobuf = serialize_parquet_file_params(&params2, created_at);
         assert_eq!(
             protobuf,
             proto::ParquetFileParams {
@@ -889,7 +880,7 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Initial as i32,
-            created_at: 8,
+            created_at: created_at.get(),
             column_set: Some(proto::ColumnSet {
                 column_ids: vec![1],
             }),
@@ -901,7 +892,7 @@ mod tests {
         };
         let params2 =
             deserialize_parquet_file_params(old_proto_l0_max_l0_and_created_at_unequal).unwrap();
-        let protobuf = serialize_parquet_file_params(&params2);
+        let protobuf = serialize_parquet_file_params(&params2, created_at);
         assert_eq!(
             protobuf,
             proto::ParquetFileParams {

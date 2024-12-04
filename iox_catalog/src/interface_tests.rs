@@ -1,7 +1,6 @@
 //! Abstract tests of the catalog interface w/o relying on the actual implementation.
 use ::test_helpers::assert_error;
 use assert_matches::assert_matches;
-use async_trait::async_trait;
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     snapshot::{
@@ -17,10 +16,7 @@ use futures::{future::try_join_all, stream::FuturesUnordered, Future, StreamExt}
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{assert_histogram, Attributes, DurationHistogram, Observation, RawReporter};
-use parking_lot::Mutex;
-use pretty_assertions::assert_eq;
 use std::{
-    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     ops::DerefMut,
@@ -30,7 +26,6 @@ use std::{
 
 use crate::grpc::client;
 use crate::grpc::test_server::TestGrpcServer;
-use crate::metrics::GetTimeMetric;
 use crate::{
     constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
     interface::{
@@ -174,7 +169,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     let new_table_limit = MaxTables::try_from(15_000).unwrap();
     let modified = repos
         .namespaces()
-        .update_table_limit(namespace_name.as_str(), new_table_limit)
+        .update_table_limit(namespace.id, new_table_limit)
         .await
         .expect("namespace should be updateable");
     assert_eq!(new_table_limit, modified.max_tables);
@@ -188,7 +183,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     let new_column_limit = MaxColumnsPerTable::try_from(1_500).unwrap();
     let modified = repos
         .namespaces()
-        .update_column_limit(namespace_name.as_str(), new_column_limit)
+        .update_column_limit(namespace.id, new_column_limit)
         .await
         .expect("namespace should be updateable");
     assert_eq!(new_column_limit, modified.max_columns_per_table);
@@ -201,7 +196,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     const NEW_RETENTION_PERIOD_NS: i64 = 5 * 60 * 60 * 1000 * 1000 * 1000;
     let modified = repos
         .namespaces()
-        .update_retention_period(namespace_name.as_str(), Some(NEW_RETENTION_PERIOD_NS))
+        .update_retention_period(namespace.id, Some(NEW_RETENTION_PERIOD_NS))
         .await
         .expect("namespace should be updateable");
     assert_eq!(
@@ -217,7 +212,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
 
     let modified = repos
         .namespaces()
-        .update_retention_period(namespace_name.as_str(), None)
+        .update_retention_period(namespace.id, None)
         .await
         .expect("namespace should be updateable");
     assert!(modified.retention_period_ns.is_none());
@@ -248,7 +243,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     // reset retention period to NULL to avoid affecting later tests
     let modified = repos
         .namespaces()
-        .update_retention_period(&namespace4_name, None)
+        .update_retention_period(namespace4.id, None)
         .await
         .expect("namespace should be updateable");
     assert_eq!(
@@ -285,37 +280,21 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(namespace5, lookup_namespace5);
 
-    // remove namespace to avoid it from affecting later tests
-    let id = repos
+    // Remove all created namespaces
+    for namespace in repos
         .namespaces()
-        .soft_delete("test_namespace")
+        .list(SoftDeletedRows::ExcludeDeleted)
         .await
-        .expect("delete namespace should succeed");
-    assert_eq!(namespace.id, id);
-    let id = repos
-        .namespaces()
-        .soft_delete("test_namespace2")
-        .await
-        .expect("delete namespace should succeed");
-    assert_eq!(namespace2.id, id);
-    let id = repos
-        .namespaces()
-        .soft_delete("test_namespace3")
-        .await
-        .expect("delete namespace should succeed");
-    assert_eq!(namespace3.id, id);
-    let id = repos
-        .namespaces()
-        .soft_delete("test_namespace4")
-        .await
-        .expect("delete namespace should succeed");
-    assert_eq!(namespace4.id, id);
-    let err = repos
-        .namespaces()
-        .soft_delete("does_not_exists")
-        .await
-        .expect_err("should errored");
-    assert_matches!(err, Error::NotFound { .. });
+        .unwrap()
+    {
+        let deleted_id = repos.namespaces().soft_delete(namespace.id).await.unwrap();
+        assert_eq!(namespace.id, deleted_id);
+    }
+    // Try to delete a non-existent namespace
+    assert_matches!(
+        repos.namespaces().soft_delete(NamespaceId::new(42)).await,
+        Err(Error::NotFound { .. })
+    );
 }
 
 async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
@@ -350,7 +329,7 @@ async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
         update_futures.push(tokio::spawn(async move {
             repos
                 .namespaces()
-                .update_retention_period(NAMESPACE_NAME, Some(1))
+                .update_retention_period(namespace.id, Some(1))
                 .await
         }));
         let mut repos = Arc::clone(&catalog).repositories();
@@ -358,7 +337,7 @@ async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
             repos
                 .namespaces()
                 .update_table_limit(
-                    NAMESPACE_NAME,
+                    namespace.id,
                     MaxTables::try_from(100).expect("invalid max tables"),
                 )
                 .await
@@ -368,7 +347,7 @@ async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
             repos
                 .namespaces()
                 .update_column_limit(
-                    NAMESPACE_NAME,
+                    namespace.id,
                     MaxColumnsPerTable::try_from(100).expect("invalid max tables"),
                 )
                 .await
@@ -412,12 +391,12 @@ async fn test_namespace_soft_deletion(catalog: Arc<dyn Catalog>) {
     validate_root_snapshot(repos.as_mut(), &s2).await;
 
     // Mark "deleted-ns" as soft-deleted.
-    repos.namespaces().soft_delete("deleted-ns").await.unwrap();
+    repos.namespaces().soft_delete(deleted_ns.id).await.unwrap();
 
     // Which should be idempotent (ignoring the timestamp change - when
     // changing this to "soft delete" it was idempotent, so I am preserving
     // that).
-    repos.namespaces().soft_delete("deleted-ns").await.unwrap();
+    repos.namespaces().soft_delete(deleted_ns.id).await.unwrap();
 
     let s3 = repos.root().snapshot().await.unwrap();
     assert_ge(s3.generation(), s2.generation());
@@ -700,7 +679,7 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
     // test per-namespace table limits
     let latest = repos
         .namespaces()
-        .update_table_limit("namespace_table_test", MaxTables::try_from(1).unwrap())
+        .update_table_limit(namespace.id, MaxTables::try_from(1).unwrap())
         .await
         .expect("namespace should be updateable");
     let err = repos
@@ -826,12 +805,12 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
 
     repos
         .namespaces()
-        .soft_delete("namespace_table_test")
+        .soft_delete(namespace.id)
         .await
         .expect("delete namespace should succeed");
     repos
         .namespaces()
-        .soft_delete("two")
+        .soft_delete(namespace2.id)
         .await
         .expect("delete namespace should succeed");
 }
@@ -933,10 +912,7 @@ async fn test_column(catalog: Arc<dyn Catalog>) {
     // test per-namespace column limits
     repos
         .namespaces()
-        .update_column_limit(
-            "namespace_column_test",
-            MaxColumnsPerTable::try_from(1).unwrap(),
-        )
+        .update_column_limit(namespace.id, MaxColumnsPerTable::try_from(1).unwrap())
         .await
         .expect("namespace should be updateable");
     let err = repos
@@ -962,7 +938,7 @@ async fn test_column(catalog: Arc<dyn Catalog>) {
 
     repos
         .namespaces()
-        .soft_delete("namespace_column_test")
+        .soft_delete(namespace.id)
         .await
         .expect("delete namespace should succeed");
 }
@@ -1459,7 +1435,7 @@ async fn test_partition(catalog: Arc<dyn Catalog>) {
 
     repos
         .namespaces()
-        .soft_delete("namespace_partition_test")
+        .soft_delete(namespace.id)
         .await
         .expect("delete namespace should succeed");
 }
@@ -1653,10 +1629,16 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     validate_table_snapshot(repos.as_mut(), &ts2).await;
 
     let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition);
-    let parquet_file = repos
+    repos
         .parquet_files()
         .create(parquet_file_params.clone())
         .await
+        .unwrap();
+    let parquet_file = repos
+        .parquet_files()
+        .get_by_object_store_id(parquet_file_params.object_store_id)
+        .await
+        .unwrap()
         .unwrap();
 
     let files_by_table_id = repos
@@ -1707,7 +1689,14 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         max_time: Timestamp::new(60),
         ..parquet_file_params.clone()
     };
-    let other_file = repos.parquet_files().create(other_params).await.unwrap();
+    let other_object_store_id = other_params.object_store_id;
+    repos.parquet_files().create(other_params).await.unwrap();
+    let other_file = repos
+        .parquet_files()
+        .get_by_object_store_id(other_object_store_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     let exist_id = parquet_file.id;
     let non_exist_id = ParquetFileId::new(other_file.id.get() + 10);
@@ -1721,10 +1710,10 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     );
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(older_than)
+        .delete_old_ids_count(older_than)
         .await
         .unwrap();
-    assert!(deleted.is_empty());
+    assert_eq!(deleted, 0);
 
     // test list_all that includes soft-deleted file
     // at this time the file is not soft-deleted yet and will be included in the returned list
@@ -1765,10 +1754,10 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     );
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(before_deleted)
+        .delete_old_ids_count(before_deleted)
         .await
         .unwrap();
-    assert!(deleted.is_empty());
+    assert_eq!(deleted, 0);
 
     // not hard-deleted yet
     repos
@@ -1781,11 +1770,10 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     // File is deleted if it was marked to be deleted before the specified time
     let deleted = repos
         .parquet_files()
-        .delete_old_ids_only(older_than)
+        .delete_old_ids_count(older_than)
         .await
         .unwrap();
-    assert_eq!(deleted.len(), 1);
-    assert_eq!(parquet_file.object_store_id, deleted[0]);
+    assert_eq!(deleted, 1);
 
     // test list_all that includes soft-deleted file
     // at this time the file is hard deleted -> the returned list is empty
@@ -1826,10 +1814,16 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         max_time: Timestamp::new(10),
         ..parquet_file_params
     };
-    let f1 = repos
+    repos
         .parquet_files()
         .create(f1_params.clone())
         .await
+        .unwrap();
+    let f1 = repos
+        .parquet_files()
+        .get_by_object_store_id(f1_params.object_store_id)
+        .await
+        .unwrap()
         .unwrap();
 
     let f2_params = ParquetFileParams {
@@ -1838,10 +1832,16 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         max_time: Timestamp::new(60),
         ..f1_params.clone()
     };
-    let f2 = repos
+    repos
         .parquet_files()
         .create(f2_params.clone())
         .await
+        .unwrap();
+    let f2 = repos
+        .parquet_files()
+        .get_by_object_store_id(f2_params.object_store_id)
+        .await
+        .unwrap()
         .unwrap();
     let files =
         list_parquet_files_by_namespace_not_to_delete(Arc::clone(&catalog), namespace2.id).await;
@@ -1877,11 +1877,18 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         max_time: Timestamp::new(60),
         ..f2_params
     };
-    let f3 = repos
+    repos
         .parquet_files()
         .create(f3_params.clone())
         .await
         .unwrap();
+    let f3 = repos
+        .parquet_files()
+        .get_by_object_store_id(f3_params.object_store_id)
+        .await
+        .unwrap()
+        .unwrap();
+
     let files =
         list_parquet_files_by_namespace_not_to_delete(Arc::clone(&catalog), namespace2.id).await;
     assert_eq!(vec![f1.clone(), f2.clone(), f3.clone()], files);
@@ -1961,16 +1968,16 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     .await;
     assert!(files.is_empty());
 
-    // test delete_old_ids_only
+    // test delete_old_ids_count
     let older_than = Timestamp::new(
         (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
     );
     let ids = repos
         .parquet_files()
-        .delete_old_ids_only(older_than)
+        .delete_old_ids_count(older_than)
         .await
         .unwrap();
-    assert_eq!(ids.len(), 1);
+    assert_eq!(ids, 1);
 
     let s3 = repos.partitions().snapshot(partition2.id).await.unwrap();
     assert_ge(s3.generation(), s2.generation()); // no new snapshot required, but some backends will generate a new one
@@ -1986,7 +1993,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     for namespace in namespaces {
         repos
             .namespaces()
-            .update_retention_period(&namespace.name, None) // infinite
+            .update_retention_period(namespace.id, None) // infinite
             .await
             .unwrap();
     }
@@ -2002,7 +2009,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     //    ensure correct files get deleted
     repos
         .namespaces()
-        .update_retention_period(&namespace2.name, Some(60 * 60 * 1_000_000_000)) // 1 hour
+        .update_retention_period(namespace2.id, Some(60 * 60 * 1_000_000_000)) // 1 hour
         .await
         .unwrap();
     let f4_params = ParquetFileParams {
@@ -2013,7 +2020,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         ),
         ..f3_params
     };
-    let f4 = repos
+    repos
         .parquet_files()
         .create(f4_params.clone())
         .await
@@ -2026,7 +2033,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         ),
         ..f4_params
     };
-    let f5 = repos
+    repos
         .parquet_files()
         .create(f5_params.clone())
         .await
@@ -2041,14 +2048,14 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
                             // values change so i'm not asserting len == 4
     let f4 = repos
         .parquet_files()
-        .get_by_object_store_id(f4.object_store_id)
+        .get_by_object_store_id(f4_params.object_store_id)
         .await
         .unwrap()
         .unwrap();
     assert_matches!(f4.to_delete, Some(_)); // f4 is > 1hr old
     let f5 = repos
         .parquet_files()
-        .get_by_object_store_id(f5.object_store_id)
+        .get_by_object_store_id(f5_params.object_store_id)
         .await
         .unwrap()
         .unwrap();
@@ -2119,7 +2126,7 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         object_store_id: ObjectStoreId::new(),
         ..f5_params
     };
-    let f6 = repos
+    repos
         .parquet_files()
         .create(f6_params.clone())
         .await
@@ -2130,14 +2137,15 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         ..f6_params
     };
     let f1_uuid = f1.object_store_id;
-    let f6_uuid = f6.object_store_id;
+    let f6_uuid = f6_params.object_store_id;
     let f5_uuid = f5.object_store_id;
+
     let cud = repos
         .parquet_files()
         .create_upgrade_delete(
             f5.partition_id,
-            &[f5.object_store_id],
-            &[f6.object_store_id],
+            &[f5_uuid],
+            &[f6_uuid],
             &[f7_params.clone()],
             CompactionLevel::Final,
         )
@@ -2168,6 +2176,9 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap()
         .unwrap();
+
+    // The `created_at` time of the new file must equal the `to_delete` time of the deleted file.
+    assert_eq!(f7.created_at, f5_delete.to_delete.unwrap());
 
     let f7_uuid = f7.object_store_id;
 
@@ -2342,11 +2353,18 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         source: Some(ParquetFileSource::BulkIngest),
         ..arbitrary_parquet_file_params(&namespace, &table, &partition)
     };
-    let parquet_file_with_source = repos
+    repos
         .parquet_files()
         .create(params_with_source.clone())
         .await
         .unwrap();
+    let parquet_file_with_source = repos
+        .parquet_files()
+        .get_by_object_store_id(params_with_source.object_store_id)
+        .await
+        .unwrap()
+        .unwrap();
+
     assert_eq!(
         parquet_file_with_source.source,
         Some(ParquetFileSource::BulkIngest)
@@ -2456,13 +2474,10 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
     // - PF E was created after `as_of` and never deleted and should NOT be returned.
 
     let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition1);
-
-    let pf_a = repos
+    let obj_store_a = parquet_file_params.object_store_id;
+    repos
         .parquet_files()
-        .create(ParquetFileParams {
-            created_at: catalog.time_provider().now().into(),
-            ..parquet_file_params.clone()
-        })
+        .create(parquet_file_params.clone())
         .await
         .unwrap();
 
@@ -2472,7 +2487,7 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
         .parquet_files()
         .create_upgrade_delete(
             partition1.id,
-            &[pf_a.object_store_id],
+            &[obj_store_a],
             &[],
             &[],
             CompactionLevel::Initial,
@@ -2482,11 +2497,11 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let pf_b = repos
+    let obj_store_b = ObjectStoreId::new();
+    repos
         .parquet_files()
         .create(ParquetFileParams {
-            created_at: catalog.time_provider().now().into(),
-            object_store_id: ObjectStoreId::new(),
+            object_store_id: obj_store_b,
             partition_id: partition2.id,
             ..parquet_file_params.clone()
         })
@@ -2495,11 +2510,11 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let pf_c = repos
+    let obj_store_c = ObjectStoreId::new();
+    repos
         .parquet_files()
         .create(ParquetFileParams {
-            created_at: catalog.time_provider().now().into(),
-            object_store_id: ObjectStoreId::new(),
+            object_store_id: obj_store_c,
             namespace_id: another_namespace.id,
             table_id: another_table.id,
             partition_id: another_partition.id,
@@ -2514,11 +2529,11 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let pf_d = repos
+    let obj_store_d = ObjectStoreId::new();
+    repos
         .parquet_files()
         .create(ParquetFileParams {
-            created_at: catalog.time_provider().now().into(),
-            object_store_id: ObjectStoreId::new(),
+            object_store_id: obj_store_d,
             table_id: other_table.id,
             partition_id: other_partition.id,
             ..parquet_file_params.clone()
@@ -2532,7 +2547,7 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
         .parquet_files()
         .create_upgrade_delete(
             other_partition.id,
-            &[pf_d.object_store_id],
+            &[obj_store_d],
             &[],
             &[],
             CompactionLevel::Initial,
@@ -2546,7 +2561,7 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
         .parquet_files()
         .create_upgrade_delete(
             another_partition.id,
-            &[pf_c.object_store_id],
+            &[obj_store_c],
             &[],
             &[],
             CompactionLevel::Initial,
@@ -2556,10 +2571,9 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let _pf_e = repos
+    repos
         .parquet_files()
         .create(ParquetFileParams {
-            created_at: catalog.time_provider().now().into(),
             object_store_id: ObjectStoreId::new(),
             ..parquet_file_params.clone()
         })
@@ -2575,14 +2589,14 @@ async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
         active_as_of.len(),
         2,
         "{active_as_of:#?}\n{}, {}\nas_of = {}",
-        pf_b.object_store_id,
-        pf_c.object_store_id,
+        obj_store_b,
+        obj_store_c,
         Timestamp::from(as_of).get()
     );
 
     let active_as_of_ids: Vec<_> = active_as_of.iter().map(|a| a.object_store_id).collect();
-    assert!(active_as_of_ids.contains(&pf_b.object_store_id));
-    assert!(active_as_of_ids.contains(&pf_c.object_store_id));
+    assert!(active_as_of_ids.contains(&obj_store_b));
+    assert!(active_as_of_ids.contains(&obj_store_c));
 }
 
 async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
@@ -2613,12 +2627,16 @@ async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
 
     let parquet_file_params_1 = arbitrary_parquet_file_params(&namespace_1, &table_1, &partition_1);
     let parquet_file_params_2 = arbitrary_parquet_file_params(&namespace_2, &table_2, &partition_2);
-    let _parquet_file_1 = repos
+    let expected_ids = vec![(
+        parquet_file_params_2.partition_id,
+        parquet_file_params_2.object_store_id,
+    )];
+    repos
         .parquet_files()
         .create(parquet_file_params_1)
         .await
         .unwrap();
-    let parquet_file_2 = repos
+    repos
         .parquet_files()
         .create(parquet_file_params_2)
         .await
@@ -2629,10 +2647,7 @@ async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
         .flag_for_delete_by_retention()
         .await
         .unwrap();
-    assert_eq!(
-        ids,
-        vec![(parquet_file_2.partition_id, parquet_file_2.object_store_id)]
-    );
+    assert_eq!(ids, expected_ids);
 }
 
 async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
@@ -2674,12 +2689,9 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition1);
 
     // create then delete an L0 file
-    let deleted_l0_file = repos
+    repos
         .parquet_files()
-        .create(ParquetFileParams {
-            created_at: Timestamp::from(catalog.time_provider().now()),
-            ..parquet_file_params.clone()
-        })
+        .create(parquet_file_params.clone())
         .await
         .unwrap();
 
@@ -2691,8 +2703,8 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     repos
         .parquet_files()
         .create_upgrade_delete(
-            deleted_l0_file.partition_id,
-            &[deleted_l0_file.object_store_id],
+            partition1.id,
+            &[parquet_file_params.object_store_id],
             &[],
             &[],
             CompactionLevel::Initial,
@@ -2717,15 +2729,21 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     tokio::time::sleep(one_ms).await;
 
     // create an active L0 file
+    let active_l0_object_store_id = ObjectStoreId::new();
     let active_l0_file_params = ParquetFileParams {
-        object_store_id: ObjectStoreId::new(),
-        created_at: Timestamp::from(catalog.time_provider().now()),
+        object_store_id: active_l0_object_store_id,
         ..parquet_file_params.clone()
     };
-    let active_l0 = repos
+    repos
         .parquet_files()
         .create(active_l0_file_params)
         .await
+        .unwrap();
+    let active_l0 = repos
+        .parquet_files()
+        .get_by_object_store_id(active_l0_object_store_id)
+        .await
+        .unwrap()
         .unwrap();
 
     // --- Time D ---
@@ -2814,7 +2832,6 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     // Add an L0 file
     let p2_l0_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition2.id,
         partition_hash_id: partition2.hash_id().cloned(),
         ..parquet_file_params.clone()
@@ -2858,7 +2875,6 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     // Add an L1 file
     let l1_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition2.id,
         partition_hash_id: partition2.hash_id().cloned(),
         compaction_level: CompactionLevel::FileNonOverlapped,
@@ -2877,7 +2893,6 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     // Add an L0 file, to update new_file_at
     let update_l0_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition2.id,
         partition_hash_id: partition2.hash_id().cloned(),
         compaction_level: CompactionLevel::Initial,
@@ -2916,7 +2931,6 @@ async fn test_partitions_new_file_between(catalog: Arc<dyn Catalog>) {
     // Add an L2 file for partition3
     let l2_file_params = ParquetFileParams {
         object_store_id: ObjectStoreId::new(),
-        created_at: Timestamp::from(catalog.time_provider().now()),
         partition_id: partition3.id,
         partition_hash_id: partition3.hash_id().cloned(),
         compaction_level: CompactionLevel::Final,
@@ -2956,16 +2970,18 @@ async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
 
     let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition);
 
-    let parquet_file = repos
+    repos
         .parquet_files()
         .create(parquet_file_params.clone())
         .await
         .unwrap();
+
+    let delete_file_object_store_id = ObjectStoreId::new();
     let delete_file_params = ParquetFileParams {
-        object_store_id: ObjectStoreId::new(),
+        object_store_id: delete_file_object_store_id,
         ..parquet_file_params.clone()
     };
-    let delete_file = repos
+    repos
         .parquet_files()
         .create(delete_file_params)
         .await
@@ -2974,18 +2990,19 @@ async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
         .parquet_files()
         .create_upgrade_delete(
             partition.id,
-            &[delete_file.object_store_id],
+            &[delete_file_object_store_id],
             &[],
             &[],
             CompactionLevel::Initial,
         )
         .await
         .unwrap();
+    let level1_file_object_store_id = ObjectStoreId::new();
     let level1_file_params = ParquetFileParams {
-        object_store_id: ObjectStoreId::new(),
+        object_store_id: level1_file_object_store_id,
         ..parquet_file_params.clone()
     };
-    let mut level1_file = repos
+    repos
         .parquet_files()
         .create(level1_file_params)
         .await
@@ -2995,13 +3012,12 @@ async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
         .create_upgrade_delete(
             partition.id,
             &[],
-            &[level1_file.object_store_id],
+            &[level1_file_object_store_id],
             &[],
             CompactionLevel::FileNonOverlapped,
         )
         .await
         .unwrap();
-    level1_file.compaction_level = CompactionLevel::FileNonOverlapped;
 
     let other_partition_params = ParquetFileParams {
         partition_id: partition2.id,
@@ -3009,7 +3025,7 @@ async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
         object_store_id: ObjectStoreId::new(),
         ..parquet_file_params.clone()
     };
-    let _partition2_file = repos
+    repos
         .parquet_files()
         .create(other_partition_params)
         .await
@@ -3022,9 +3038,12 @@ async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(files.len(), 2);
 
-    let mut file_ids: Vec<_> = files.into_iter().map(|f| f.id).collect();
+    let mut file_ids: Vec<_> = files.into_iter().map(|f| f.object_store_id).collect();
     file_ids.sort();
-    let mut expected_ids = vec![parquet_file.id, level1_file.id];
+    let mut expected_ids = vec![
+        parquet_file_params.object_store_id,
+        level1_file_object_store_id,
+    ];
     expected_ids.sort();
     assert_eq!(file_ids, expected_ids);
 
@@ -3037,10 +3056,8 @@ async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(files.len(), 2);
 
-    let mut file_ids: Vec<_> = files.into_iter().map(|f| f.id).collect();
+    let mut file_ids: Vec<_> = files.into_iter().map(|f| f.object_store_id).collect();
     file_ids.sort();
-    let mut expected_ids = vec![parquet_file.id, level1_file.id];
-    expected_ids.sort();
     assert_eq!(file_ids, expected_ids);
 }
 
@@ -3063,7 +3080,7 @@ async fn test_update_to_compaction_level_1(catalog: Arc<dyn Catalog>) {
     let mut parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition);
     parquet_file_params.min_time = query_min_time + 1;
     parquet_file_params.max_time = query_max_time - 1;
-    let parquet_file = repos
+    repos
         .parquet_files()
         .create(parquet_file_params.clone())
         .await
@@ -3080,9 +3097,9 @@ async fn test_update_to_compaction_level_1(catalog: Arc<dyn Catalog>) {
     let created = repos
         .parquet_files()
         .create_upgrade_delete(
-            parquet_file.partition_id,
+            partition.id,
             &[],
-            &[parquet_file.object_store_id],
+            &[parquet_file_params.object_store_id],
             &[],
             CompactionLevel::FileNonOverlapped,
         )
@@ -3093,7 +3110,7 @@ async fn test_update_to_compaction_level_1(catalog: Arc<dyn Catalog>) {
     // remove namespace to avoid it from affecting later tests
     repos
         .namespaces()
-        .soft_delete("namespace_update_to_compaction_level_1_test")
+        .soft_delete(namespace.id)
         .await
         .expect("delete namespace should succeed");
 }
@@ -3183,7 +3200,7 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
     // namespace_2 is gone
     repos
         .namespaces()
-        .soft_delete("namespace_test_delete_namespace_1")
+        .soft_delete(namespace_1.id)
         .await
         .expect("delete namespace should succeed");
     // assert that namespace is soft-deleted, but the table, column, and parquet files are all
@@ -3476,7 +3493,9 @@ where
     };
 
     let batches = mutable_batch_lp::lines_to_batches(lines, 42).unwrap();
-    let batches = batches.iter().map(|(table, batch)| (table.as_str(), batch));
+    let batches = batches
+        .iter()
+        .map(|(table, batch)| (table.as_str(), batch.iter_column_types()));
     let ns = NamespaceSchema::new_empty_from(&namespace);
 
     let tables =
@@ -3535,7 +3554,7 @@ async fn test_list_schemas_soft_deleted_rows(catalog: Arc<dyn Catalog>) {
 
     repos
         .namespaces()
-        .soft_delete(&ns2.0.name)
+        .soft_delete(ns2.0.id)
         .await
         .expect("failed to soft delete namespace");
 
@@ -3851,73 +3870,6 @@ async fn test_grpc_get_time_with_backed_catalog(catalog: Arc<dyn Catalog>) {
     assert_matches!(server_now, Ok(t) => {
         assert!(t.second().abs_diff(system_now.second()) <= 1);
     });
-}
-
-/// [`Catalog`] wrapper that is helpful for testing.
-#[derive(Debug)]
-pub(crate) struct TestCatalog<T> {
-    hold_onto: Mutex<Vec<Box<dyn Any + Send>>>,
-    get_time_metric: GetTimeMetric,
-    inner: T,
-}
-
-impl<T: Catalog> TestCatalog<T> {
-    const NAME: &'static str = "test";
-
-    /// Create new test catalog.
-    pub(crate) fn new(inner: T) -> Self {
-        Self {
-            hold_onto: Mutex::new(vec![]),
-            get_time_metric: GetTimeMetric::new(&inner.metrics(), Self::NAME),
-            inner,
-        }
-    }
-
-    /// Hold onto given value til dropped.
-    pub(crate) fn hold_onto<H>(&self, o: H)
-    where
-        H: Send + 'static,
-    {
-        self.hold_onto.lock().push(Box::new(o) as _)
-    }
-
-    pub(crate) fn inner(&self) -> &T {
-        &self.inner
-    }
-}
-
-#[async_trait]
-impl<T: Catalog> Catalog for TestCatalog<T> {
-    async fn setup(&self) -> Result<(), Error> {
-        self.inner.setup().await
-    }
-
-    fn repositories(&self) -> Box<dyn RepoCollection> {
-        self.inner.repositories()
-    }
-
-    fn metrics(&self) -> Arc<metric::Registry> {
-        self.inner.metrics()
-    }
-
-    fn time_provider(&self) -> Arc<dyn TimeProvider> {
-        self.inner.time_provider()
-    }
-
-    async fn get_time(&self) -> Result<iox_time::Time, Error> {
-        let start = tokio::time::Instant::now();
-        let res = Ok(self.time_provider().now());
-        self.get_time_metric.record(start.elapsed(), &res);
-        res
-    }
-
-    async fn active_applications(&self) -> Result<HashSet<String>, Error> {
-        self.inner.active_applications().await
-    }
-
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
 }
 
 #[track_caller]

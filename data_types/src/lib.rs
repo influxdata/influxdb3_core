@@ -774,10 +774,13 @@ pub struct ParquetFile {
 }
 
 impl ParquetFile {
-    /// Create new file from given parameters and ID.
+    /// For all fields in `params`, check for equality with this existing `ParquetFile`. Don't
+    /// check fields assigned by the database.
     ///
-    /// [`to_delete`](Self::to_delete) will be set to `None`.
-    pub fn from_params(params: ParquetFileParams, id: ParquetFileId) -> Self {
+    /// In other words, if this `ParquetFile` could have plausibly been created by the supplied
+    /// `params`, return `true`. If the supplied `params` would be a conflicting update, return
+    /// `false`.
+    pub fn could_have_been_created_from(&self, params: &ParquetFileParams) -> bool {
         let ParquetFileParams {
             namespace_id,
             table_id,
@@ -789,35 +792,32 @@ impl ParquetFile {
             file_size_bytes,
             row_count,
             compaction_level,
-            created_at,
             column_set,
             max_l0_created_at,
             source,
         } = params;
 
-        Self {
-            id,
-            namespace_id,
-            table_id,
-            partition_id,
-            partition_hash_id,
-            object_store_id,
-            min_time,
-            max_time,
+        let max_l0_created_at_is_compatible = match max_l0_created_at {
+            MaxL0CreatedAt::Computed(max) => self.max_l0_created_at == *max,
+            MaxL0CreatedAt::NotCompacted => {
+                self.created_at == self.max_l0_created_at
+                    && self.compaction_level == CompactionLevel::Initial
+            }
+        };
 
-            // Files are always created as not soft-deleted.
-            to_delete: None,
-
-            file_size_bytes,
-            row_count,
-            compaction_level,
-            created_at,
-            column_set,
-            max_l0_created_at: max_l0_created_at
-                .maybe_computed_timestamp()
-                .unwrap_or(created_at),
-            source,
-        }
+        self.namespace_id == *namespace_id
+            && self.table_id == *table_id
+            && self.partition_id == *partition_id
+            && self.partition_hash_id == *partition_hash_id
+            && self.object_store_id == *object_store_id
+            && self.min_time == *min_time
+            && self.max_time == *max_time
+            && self.file_size_bytes == *file_size_bytes
+            && self.row_count == *row_count
+            && self.compaction_level == *compaction_level
+            && self.column_set == *column_set
+            && self.source == *source
+            && max_l0_created_at_is_compatible
     }
 
     /// Estimate the memory consumption of this object and its contents
@@ -1002,12 +1002,10 @@ pub struct ParquetFileParams {
     pub row_count: i64,
     /// the compaction level of the file
     pub compaction_level: CompactionLevel,
-    /// the creation time of the parquet file
-    pub created_at: Timestamp,
     /// columns in this file.
     pub column_set: ColumnSet,
     /// the max of `created_at` of all source L0 files, if this file was created from other files,
-    /// or `created_at` if this file was created via ingest.
+    /// or the value `created_at` gets assigned by the catalog if this file was created via ingest.
     pub max_l0_created_at: MaxL0CreatedAt,
     /// Which component created this Parquet file
     pub source: Option<ParquetFileSource>,
@@ -1043,7 +1041,6 @@ impl From<ParquetFile> for ParquetFileParams {
             file_size_bytes,
             row_count,
             compaction_level,
-            created_at,
             column_set,
             max_l0_created_at: if max_l0_created_at == created_at {
                 MaxL0CreatedAt::NotCompacted
@@ -1983,7 +1980,6 @@ impl TimestampMinMax {
 
     /// Returns the union of this range with `other` with the minimum of the `min`s
     /// and the maximum of the `max`es
-
     pub fn union(&self, other: &Self) -> Self {
         Self {
             min: self.min.min(other.min),

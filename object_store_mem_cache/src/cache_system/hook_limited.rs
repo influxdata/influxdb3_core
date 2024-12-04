@@ -64,7 +64,7 @@ enum GetOrFetchRes<V> {
 #[derive(Debug)]
 pub struct CacheEntryState<K> {
     gen: u64,
-    key: K,
+    key: Arc<K>,
     hook: Arc<dyn Hook<K>>,
     fetch_size: AtomicUsize,
     fetch_status: AtomicU8,
@@ -103,7 +103,7 @@ where
 {
     gen_counter: AtomicU64,
     hook: Arc<dyn Hook<K>>,
-    cache: Arc<DashMap<K, CacheEntry<K, V>>>,
+    cache: Arc<DashMap<Arc<K>, CacheEntry<K, V>>>,
 }
 
 #[async_trait]
@@ -191,16 +191,17 @@ where
 
         // slow path
         // set up cache entry BEFORE acquiring the map entry
+        let k = Arc::new(k.clone());
         let state = Arc::new(CacheEntryState {
             gen: self.gen_counter.fetch_add(1, Ordering::Relaxed),
-            key: k.clone(),
+            key: Arc::clone(&k),
             hook: Arc::clone(&self.hook),
             fetch_size: AtomicUsize::new(0),
             fetch_status: AtomicU8::new(FetchStatus::NotReady.into()),
         });
         let state_captured = Arc::clone(&state);
         let cache_captured = Arc::downgrade(&self.cache);
-        let fut = f(k);
+        let fut = f(&k);
         let fut = async move {
             let fetch_res = fut.catch_unwind_dyn_error().await;
 
@@ -249,7 +250,7 @@ where
             used: AtomicBool::new(true),
             state,
         };
-        match self.cache.entry(k.clone()) {
+        match self.cache.entry(Arc::clone(&k)) {
             Entry::Occupied(o) => {
                 // race, entry was created in the meantime, this is fine, just use the existing one
                 let entry = o.get();
@@ -259,7 +260,7 @@ where
             Entry::Vacant(v) => {
                 let gen = cache_entry.state.gen;
                 v.insert(cache_entry);
-                self.hook.insert(gen, k);
+                self.hook.insert(gen, &k);
                 GetOrFetchRes::New(fut)
             }
         }
@@ -300,8 +301,9 @@ mod tests {
         observer.mock_next_fetch(HookDecision::Evict);
         let barrier = Arc::new(Barrier::new(2));
         let barrier_captured = Arc::clone(&barrier);
+        let k1 = Arc::new("k1");
         let mut fut = std::pin::pin!(cache.get_or_fetch(
-            &"k1",
+            &k1,
             Box::new(|_k| async move {
                 barrier_captured.wait().await;
                 Ok(TestValue(1001))
@@ -326,7 +328,7 @@ mod tests {
         // entry is gone
         let (_res, state) = cache
             .get_or_fetch(
-                &"k1",
+                &Arc::new("k1"),
                 Box::new(|_k| async move { Ok(TestValue(1002)) }.boxed()),
             )
             .await;
@@ -352,8 +354,9 @@ mod tests {
         {
             let barrier = Arc::new(Barrier::new(2));
             let barrier_captured = Arc::clone(&barrier);
+            let k1 = Arc::new("k1");
             let mut fut = std::pin::pin!(cache.get_or_fetch(
-                &"k1",
+                &k1,
                 Box::new(|_k| async move {
                     barrier_captured.wait().await;
                     Ok(TestValue(1001))
@@ -384,8 +387,9 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(2));
         let barrier_captured = Arc::clone(&barrier);
+        let k1 = Arc::new("k1");
         let mut fut = std::pin::pin!(cache.get_or_fetch(
-            &"k1",
+            &k1,
             Box::new(|_k| async move {
                 barrier_captured.wait().await;
                 Ok(TestValue(1001))
@@ -421,8 +425,9 @@ mod tests {
 
         let barrier_1 = Arc::new(Barrier::new(2));
         let barrier_captured = Arc::clone(&barrier_1);
+        let k1 = Arc::new("k1");
         let mut fut_1 = std::pin::pin!(cache.get_or_fetch(
-            &"k1",
+            &k1,
             Box::new(|_k| async move {
                 barrier_captured.wait().await;
                 Ok(TestValue(1001))
@@ -443,7 +448,7 @@ mod tests {
         let barrier_2 = Arc::new(Barrier::new(2));
         let barrier_captured = Arc::clone(&barrier_2);
         let mut fut_2 = std::pin::pin!(cache.get_or_fetch(
-            &"k1",
+            &k1,
             Box::new(|_k| async move {
                 barrier_captured.wait().await;
                 Ok(TestValue(1002))

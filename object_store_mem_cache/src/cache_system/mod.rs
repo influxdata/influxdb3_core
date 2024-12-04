@@ -41,6 +41,34 @@ pub trait HasSize {
     fn size(&self) -> usize;
 }
 
+impl HasSize for &'static str {
+    fn size(&self) -> usize {
+        // no dynamic allocation
+        0
+    }
+}
+
+impl HasSize for str {
+    fn size(&self) -> usize {
+        self.len()
+    }
+}
+
+impl HasSize for object_store::path::Path {
+    fn size(&self) -> usize {
+        self.as_ref().len()
+    }
+}
+
+impl<T> HasSize for Arc<T>
+where
+    T: HasSize + ?Sized,
+{
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self.as_ref()) + self.as_ref().size()
+    }
+}
+
 /// Dynamic error type.
 pub type DynError = Arc<dyn std::error::Error + Send + Sync>;
 
@@ -52,6 +80,18 @@ impl HasSize for DynError {
 
 /// Result type with value wrapped into [`Arc`]s.
 pub type ArcResult<T> = Result<Arc<T>, DynError>;
+
+impl<T> HasSize for ArcResult<T>
+where
+    T: HasSize,
+{
+    fn size(&self) -> usize {
+        match self {
+            Ok(o) => o.size(),
+            Err(e) => e.size(),
+        }
+    }
+}
 
 type CacheFut<V> = Shared<BoxFuture<'static, ArcResult<V>>>;
 type CacheFn<K, V> = Box<dyn FnOnce(&K) -> BoxFuture<'static, Result<V, DynError>> + Send>;
@@ -99,7 +139,7 @@ pub enum CacheState {
 pub mod hook;
 pub mod hook_limited;
 pub mod reactor;
-pub mod s3fifo;
+pub mod s3_fifo_cache;
 pub mod utils;
 
 #[cfg(test)]
