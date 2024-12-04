@@ -728,7 +728,7 @@ pub trait IOxMigrate: Connection + Migrate + Send {
 }
 
 #[async_trait]
-impl<'a> IOxMigrateTxn for Transaction<'a, Postgres> {
+impl IOxMigrateTxn for Transaction<'_, Postgres> {
     type M = PgConnection;
 
     async fn acquire_conn(&mut self) -> Result<&mut Self::M, MigrateError> {

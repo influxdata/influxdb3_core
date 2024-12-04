@@ -21,7 +21,7 @@ workspace = true
 arrow = { workspace = true }
 arrow_util = { path = "../arrow_util" }
 async-trait = "0.1"
-bytes = "1.8"
+bytes = "1.9"
 chrono = { version = "0.4", default-features = false }
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
@@ -29,7 +29,7 @@ datafusion_util = { path = "../datafusion_util" }
 executor = { path = "../executor"}
 futures = "0.3"
 hashbrown = { workspace = true }
-indexmap = { version = "2.6", features = ["std"] }
+indexmap = { version = "2.7", features = ["std"] }
 itertools = "0.13.0"
 iox_query_params = { path = "../iox_query_params" }
 iox_time = { path = "../iox_time" }

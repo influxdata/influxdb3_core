@@ -16,7 +16,7 @@ hashbrown = { workspace = true }
 mutable_batch = { path = "../mutable_batch" }
 percent-encoding = "2.3.1"
 schema = { path = "../schema" }
-thiserror = "2.0.0"
+thiserror = "2.0.3"
 unicode-segmentation = "1.12.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
@@ -30,7 +30,6 @@ mutable_batch_lp = { path = "../mutable_batch_lp" }
 paste = "1.0.15"
 proptest = { workspace = true }
 rand = "0.8"
-test_helpers = { path = "../test_helpers" }
 
 [[bench]]
 name = "partitioner"

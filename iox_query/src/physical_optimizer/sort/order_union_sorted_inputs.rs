@@ -35,7 +35,7 @@ use super::util::{
 /// and if:
 ///
 /// - all inputs of UnionExec are already sorted (or has SortExec) with sortExpr also on time DESC
-///   or ASC accarsdingly and
+///   or ASC accordingly and
 /// - the streams do not overlap in values of the sorted column
 ///
 /// do:
@@ -89,6 +89,7 @@ use super::util::{
 ///          ...
 ///
 
+#[derive(Debug)]
 pub(crate) struct OrderUnionSortedInputs;
 
 impl PhysicalOptimizerRule for OrderUnionSortedInputs {
@@ -123,7 +124,7 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
             };
             let sort_options = sort_expr[0].options;
 
-            let mut input_value_ranges= None;
+            let mut input_value_ranges = None;
             // Find UnionExec
             let transformed_input_plan: Option<Arc<dyn ExecutionPlan>> = if let Some(union_exec) = accepted_union_exec(sort_preserving_merge_exec) {
                 // Check all inputs of UnionExec must be already sorted and on the same sort_expr of SortPreservingMergeExec
@@ -1898,13 +1899,9 @@ mod test {
         - "                   FilterExec: time@1 > 0"
         - "                     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1"
         - "                       RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
-        - "               CoalesceBatchesExec: target_batch_size=8192"
-        - "                 FilterExec: time@1 > 0"
-        - "                   ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "               ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
         - "     SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
-        - "       CoalesceBatchesExec: target_batch_size=8192"
-        - "         FilterExec: time@1 > 0"
-        - "           ParquetExec: file_groups={5 groups: [[4.parquet], [5.parquet], [6.parquet], [7.parquet], [8.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "       ParquetExec: file_groups={5 groups: [[4.parquet], [5.parquet], [6.parquet], [7.parquet], [8.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
         "#
         );
 
@@ -1935,9 +1932,7 @@ mod test {
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None)), (TimestampNanosecond(90, None), TimestampNanosecond(100, None))]"
         - "   UnionExec"
         - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
-        - "       CoalesceBatchesExec: target_batch_size=8192"
-        - "         FilterExec: time@1 > 0"
-        - "           ParquetExec: file_groups={5 groups: [[8.parquet], [7.parquet], [6.parquet], [5.parquet], [4.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "       ParquetExec: file_groups={5 groups: [[8.parquet], [7.parquet], [6.parquet], [5.parquet], [4.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
         - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[false]"
         - "       ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
         - "         DeduplicateExec: [tag@0 ASC,time@1 ASC]"
@@ -1948,9 +1943,7 @@ mod test {
         - "                   FilterExec: time@1 > 0"
         - "                     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1"
         - "                       RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
-        - "               CoalesceBatchesExec: target_batch_size=8192"
-        - "                 FilterExec: time@1 > 0"
-        - "                   ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "               ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
         "#
         );
     }
@@ -2051,9 +2044,7 @@ mod test {
             @r#"
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
         - "   SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
-        - "     CoalesceBatchesExec: target_batch_size=8192"
-        - "       FilterExec: time@1 > 0"
-        - "         ParquetExec: file_groups={5 groups: [[1.parquet], [2.parquet], [3.parquet], [4.parquet], [5.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "     ParquetExec: file_groups={5 groups: [[1.parquet], [2.parquet], [3.parquet], [4.parquet], [5.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
         "#
         );
 
@@ -2083,9 +2074,7 @@ mod test {
             @r#"
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
         - "   SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
-        - "     CoalesceBatchesExec: target_batch_size=8192"
-        - "       FilterExec: time@1 > 0"
-        - "         ParquetExec: file_groups={5 groups: [[5.parquet], [4.parquet], [3.parquet], [2.parquet], [1.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
+        - "     ParquetExec: file_groups={5 groups: [[5.parquet], [4.parquet], [3.parquet], [2.parquet], [1.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=CASE WHEN time_null_count@1 = time_row_count@2 THEN false ELSE time_max@0 > 0 END, required_guarantees=[]"
         "#
         );
     }

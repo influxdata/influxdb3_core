@@ -11,7 +11,7 @@ use crate::CHUNK_ORDER_COLUMN_NAME;
 
 use self::algo::get_col_name;
 pub use self::algo::RecordBatchDeduplicator;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, LexRequirement};
 use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
@@ -217,7 +217,7 @@ impl ExecutionPlan for DeduplicateExec {
         &self.cache
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         vec![Some(PhysicalSortRequirement::from_sort_exprs(
             &self.input_order,
         ))]

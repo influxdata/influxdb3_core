@@ -130,7 +130,7 @@ where
 /// write batches that span less than 6 days, effectively amortising the cost of
 /// timestamp formatting to O(1) for these very common batches.
 #[derive(Debug)]
-pub(crate) struct StrftimeFormatter<'a> {
+pub struct StrftimeFormatter<'a> {
     /// The strftime formatter definition.
     ///
     /// NOTE: the value below is UNVALIDATED - if the input strftime format
@@ -171,7 +171,7 @@ impl<'a> StrftimeFormatter<'a> {
     ///
     /// [documented here]:
     ///     https://docs.rs/chrono/latest/chrono/format/strftime/index.html
-    pub(super) fn new(format: &'a str) -> Self {
+    pub fn new(format: &'a str) -> Self {
         let mut is_default_format = false;
         if format == YMD_SPEC {
             is_default_format = true;
@@ -187,7 +187,7 @@ impl<'a> StrftimeFormatter<'a> {
 
     /// Format `timestamp` to the format spec provided during initialisation,
     /// writing the result to `out`.
-    pub(super) fn render<W>(&mut self, timestamp: i64, mut out: W) -> Result<(), PartitionKeyError>
+    pub fn render<W>(&mut self, timestamp: i64, mut out: W) -> Result<(), PartitionKeyError>
     where
         W: std::fmt::Write,
     {

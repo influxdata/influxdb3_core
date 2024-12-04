@@ -11,37 +11,34 @@ mod snapshot;
 #[cfg(test)]
 mod test_utils;
 
-use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
-use crate::constants::MAX_PARQUET_L0_FILES_PER_PARTITION;
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use catalog_cache::api::quorum::QuorumCatalogCache;
-use data_types::snapshot::namespace::NamespaceSnapshot;
-use data_types::snapshot::root::RootSnapshot;
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
-    snapshot::partition::PartitionSnapshot,
-    snapshot::table::TableSnapshot,
+    snapshot::{
+        namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
+        table::TableSnapshot,
+    },
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, Timestamp,
+    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
+    TableId, Timestamp,
 };
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
-
 use iox_time::TimeProvider;
-
 use trace::ctx::SpanContext;
 
-use crate::interface::RootRepo;
+use crate::constants::MAX_PARQUET_L0_FILES_PER_PARTITION;
 use crate::interface::{
     CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-    RepoCollection, Result, SoftDeletedRows, TableRepo,
+    RepoCollection, Result, RootRepo, SoftDeletedRows, TableRepo,
 };
 use crate::metrics::CatalogMetrics;
 
@@ -97,7 +94,7 @@ impl CachingCatalog {
         Self::new_inner(params, ETAG_MIN_PAYLOAD_SIZE)
     }
 
-    fn new_inner(params: CachingCatalogParams, etag_min_payload_size: usize) -> Self {
+    pub(crate) fn new_inner(params: CachingCatalogParams, etag_min_payload_size: usize) -> Self {
         let CachingCatalogParams {
             cache,
             backing,
@@ -193,7 +190,6 @@ impl Catalog for CachingCatalog {
         })))
     }
 
-    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
         self.metrics.registry()
     }
@@ -310,19 +306,17 @@ impl NamespaceRepo for Repos {
 
     async fn update_retention_period(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
-        let ns_id = self.namespace_id_by_name(name).await?;
-
         let ns = self
             .backing
             .namespaces()
-            .update_retention_period(name, retention_period_ns)
-            .with_refresh(self.namespaces.refresh(ns_id))
+            .update_retention_period(id, retention_period_ns)
+            .with_refresh(self.namespaces.refresh(id))
             .await?;
 
-        assert_eq!(ns.id, ns_id);
+        assert_eq!(ns.id, id);
 
         Ok(ns)
     }
@@ -372,51 +366,49 @@ impl NamespaceRepo for Repos {
         ))
     }
 
-    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
-        let ns_id = self.namespace_id_by_name(name).await?;
-
-        let id = self
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
+        let deleted_id = self
             .backing
             .namespaces()
-            .soft_delete(name)
-            .with_refresh(self.namespaces.refresh(ns_id))
+            .soft_delete(id)
+            .with_refresh(self.namespaces.refresh(id))
             .await?;
 
-        assert_eq!(id, ns_id);
+        assert_eq!(id, deleted_id);
 
         Ok(id)
     }
 
-    async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
-        let ns_id = self.namespace_id_by_name(name).await?;
-
+    async fn update_table_limit(
+        &mut self,
+        id: NamespaceId,
+        new_max: MaxTables,
+    ) -> Result<Namespace> {
         let ns = self
             .backing
             .namespaces()
-            .update_table_limit(name, new_max)
-            .with_refresh(self.namespaces.refresh(ns_id))
+            .update_table_limit(id, new_max)
+            .with_refresh(self.namespaces.refresh(id))
             .await?;
 
-        assert_eq!(ns.id, ns_id);
+        assert_eq!(ns.id, id);
 
         Ok(ns)
     }
 
     async fn update_column_limit(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace> {
-        let ns_id = self.namespace_id_by_name(name).await?;
-
         let ns = self
             .backing
             .namespaces()
-            .update_column_limit(name, new_max)
-            .with_refresh(self.namespaces.refresh(ns_id))
+            .update_column_limit(id, new_max)
+            .with_refresh(self.namespaces.refresh(id))
             .await?;
 
-        assert_eq!(ns.id, ns_id);
+        assert_eq!(ns.id, id);
 
         Ok(ns)
     }
@@ -943,6 +935,13 @@ impl ParquetFileRepo for Repos {
             .await
     }
 
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+        self.backing
+            .parquet_files()
+            .delete_old_ids_count(older_than)
+            .await
+    }
+
     async fn list_by_partition_not_to_delete_batch(
         &mut self,
         partition_ids: Vec<PartitionId>,
@@ -1021,7 +1020,7 @@ impl ParquetFileRepo for Repos {
         upgrade: &[ObjectStoreId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
+    ) -> Result<Vec<ParquetFile>> {
         let res = self
             .backing
             .parquet_files()
@@ -1162,10 +1161,12 @@ mod tests {
     use super::*;
 
     use crate::{
-        cache::snapshot::Snapshot,
-        interface_tests::TestCatalog,
+        cache::snapshot::Snapshot as _,
         mem::MemCatalog,
-        test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
+        test_helpers::{
+            arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table,
+            catalog_from_backing_and_times, CatalogAndCache, TestCatalog,
+        },
     };
 
     use std::{
@@ -1176,9 +1177,7 @@ mod tests {
         },
     };
 
-    use catalog_cache::{
-        api::server::test_util::TestCacheServer, local::CatalogCache, CacheKey, CacheValue,
-    };
+    use catalog_cache::{CacheKey, CacheValue};
     use generated_types::{influxdata::iox::catalog_cache::v1 as proto, prost::Message};
     use iox_time::{MockProvider, SystemProvider, Time};
     use metric::{Attributes, DurationHistogram, Metric};
@@ -1275,7 +1274,7 @@ mod tests {
 
         // Obtain a new snapshot
         let s3 = catalog
-            .inner()
+            .inner
             .backing
             .repositories()
             .tables()
@@ -1576,48 +1575,19 @@ mod tests {
     }
 
     fn catalog() -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
-        catalog_with_params(
-            Arc::new(SystemProvider::new()),
-            // speed up tests
-            Duration::ZERO,
-        )
+        catalog_with_params(Arc::new(SystemProvider::new()), Duration::ZERO)
     }
 
     fn catalog_with_params(
         time_provider: Arc<dyn TimeProvider>,
         batch_delay: Duration,
-    ) -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
-        let metrics = Arc::new(metric::Registry::default());
-        let backing = Arc::new(MemCatalog::new(
-            Arc::clone(&metrics),
-            Arc::clone(&time_provider),
-        ));
-
-        let peer0 = TestCacheServer::bind_ephemeral(&metrics);
-        let peer1 = TestCacheServer::bind_ephemeral(&metrics);
-        let cache = Arc::new(QuorumCatalogCache::new(
-            Arc::new(CatalogCache::default()),
-            Arc::new([peer0.client(), peer1.client()]),
-        ));
-
-        let caching_catalog = CachingCatalog::new_inner(
-            CachingCatalogParams {
-                cache: Arc::clone(&cache),
-                backing,
-                metrics,
-                time_provider,
-                quorum_fanout: 10,
-                partition_linger: batch_delay,
-                table_linger: batch_delay,
-                admin_ui_storage_api_enabled: false,
-            },
-            2,
-        );
-
-        let test_catalog = TestCatalog::new(caching_catalog);
-        test_catalog.hold_onto(peer0);
-        test_catalog.hold_onto(peer1);
-        (test_catalog, cache)
+    ) -> CatalogAndCache {
+        catalog_from_backing_and_times(
+            MemCatalog::new(Arc::default(), Arc::clone(&time_provider)),
+            time_provider,
+            batch_delay,
+            Some(2),
+        )
     }
 
     #[track_caller]

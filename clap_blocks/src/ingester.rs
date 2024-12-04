@@ -129,9 +129,10 @@ pub struct IngesterConfig {
     /// buffer is persisted.
     #[clap(
         long = "min-partition-snapshot-size",
-        env = "INFLUXDB_IOX_MIN_PARTITION_SNAPSHOT_SIZE"
+        env = "INFLUXDB_IOX_MIN_PARTITION_SNAPSHOT_SIZE",
+        default_value = "5242880" // 5MiB
     )]
-    pub min_partition_snapshot_size: Option<NonZeroUsize>,
+    pub min_partition_snapshot_size: NonZeroUsize,
 
     /// Limit the number of partitions that may be buffered in a single
     /// namespace (across all tables) at any one time.

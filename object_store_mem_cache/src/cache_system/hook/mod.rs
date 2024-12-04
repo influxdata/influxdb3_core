@@ -5,6 +5,8 @@ mod notify;
 pub mod observer;
 pub mod test_utils;
 
+use std::sync::Arc;
+
 use crate::cache_system::DynError;
 
 /// A trait for hooking into cache updates.
@@ -22,19 +24,19 @@ use crate::cache_system::DynError;
 /// To simplify accounting and prevent large-scale locking, [`evict`](Self::evict) will only be called after the
 /// fetching future is finished. This means that a key may be observed concurrently, one version that is dropped from
 /// the cache but that still has a polling future and a new version. Use the generation number to distinguish them.
-pub trait Hook<K>: std::fmt::Debug + Send + Sync {
+pub trait Hook<K: ?Sized>: std::fmt::Debug + Send + Sync {
     /// Called before a value is potentially inserted.
-    fn insert(&self, _gen: u64, _k: &K) {}
+    fn insert(&self, _gen: u64, _k: &Arc<K>) {}
 
     /// A value was fetched.
     ///
     /// The hook can reject a value using an error.
-    fn fetched(&self, _gen: u64, _k: &K, _res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, _gen: u64, _k: &Arc<K>, _res: Result<usize, &DynError>) -> HookDecision {
         HookDecision::default()
     }
 
     /// A key removed.
-    fn evict(&self, _gen: u64, _k: &K, _res: EvictResult) {}
+    fn evict(&self, _gen: u64, _k: &Arc<K>, _res: EvictResult) {}
 }
 
 /// Decision made by [`Hook::fetched`].

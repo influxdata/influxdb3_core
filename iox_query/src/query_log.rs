@@ -24,14 +24,16 @@ use uuid::Uuid;
 /// Phase of a query entry.
 ///
 /// ```text
-///     +-------------------------------+---> fail
-///     |                               |
-/// received ---> planned ---> permit ---+
-///     |           |           |       |
-///     |           |           |       +---> success
-///     |           |           |
-///     |           |           |
-///     +-----------+-----------+-----------> cancel
+///         +---------------------------------+---> fail
+///         |                                 |
+///         |                                 |
+/// ---> received ---> planned ---> permit ---+
+///         |             |           |       |
+///         |             |           |       |
+///         |             |           |       +---> success
+///         |             |           |
+///         |             |           |
+///         +-------------+-----------+-----------> cancel
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum QueryPhase {

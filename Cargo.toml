@@ -87,8 +87,8 @@ arrow = {version = "53.0.0", features = ["prettyprint", "chrono-tz"] }
 arrow-buffer = {version = "53.0.0"}
 arrow-flight = {version = "53.0.0", features = ["flight-sql-experimental"] }
 arrow-ipc = {version = "53.0.0"}
-datafusion = {git = "https://github.com/influxdata/arrow-datafusion.git", rev = "c27d5f2356a21ee6224c149ee971c89c2cc13e18"}
-datafusion-proto = {git = "https://github.com/influxdata/arrow-datafusion.git", rev = "c27d5f2356a21ee6224c149ee971c89c2cc13e18"}
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "f78378fc21551cf1c324918537368d08c715ecb1" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "f78378fc21551cf1c324918537368d08c715ecb1" }
 hashbrown = {version = "0.14.5"}
 http = {version = "0.2.12"}
 http-body = { version = "0.4.6" }
@@ -186,15 +186,16 @@ opt-level = 3
 ## until we have upgraded hyper: https://github.com/influxdata/influxdb_iox/issues/9340
 ## see https://github.com/influxdata/arrow-rs/pull/3
 [patch.crates-io]
-arrow = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-array = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-buffer = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-cast = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-data = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-schema = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-select = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-string = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-ord = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-arrow-flight = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
-parquet = { git = "https://github.com/influxdata/arrow-rs.git", rev = "e38787d2177f2ebfa481bfac62d208eef8ea82fb" }
+arrow = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-array = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-buffer = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-cast = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-data = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-json = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-schema = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-select = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-string = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-ord = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+arrow-flight = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }
+parquet = { git = "https://github.com/influxdata/arrow-rs.git", rev = "aa8c04807d85be763c2099dd4e5095e967f0ca03" }

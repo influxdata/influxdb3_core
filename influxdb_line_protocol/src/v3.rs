@@ -24,7 +24,7 @@ use super::Result;
 /// that, when combined with the `time` column, form the primary key for the table. The elements of
 /// the series key have a specific user-defined order in the line protocol, and are passed like so:
 ///
-/// ```
+/// ```text
 /// measurent,key_1/val_1/key_2/val_2 field=123 12345
 ///             ↑           ↑
 ///             series key columns 'key_1' and 'key_2'
@@ -114,7 +114,7 @@ impl<'a> Deref for SeriesKey<'a> {
     }
 }
 
-impl<'a> DerefMut for SeriesKey<'a> {
+impl DerefMut for SeriesKey<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -128,7 +128,7 @@ pub enum SeriesValue<'a> {
     String(EscapedStr<'a>),
 }
 
-impl<'a> PartialEq<String> for SeriesValue<'a> {
+impl PartialEq<String> for SeriesValue<'_> {
     fn eq(&self, other: &String) -> bool {
         match self {
             SeriesValue::String(s) => s == other,
@@ -136,7 +136,7 @@ impl<'a> PartialEq<String> for SeriesValue<'a> {
     }
 }
 
-impl<'a> PartialEq<&str> for SeriesValue<'a> {
+impl PartialEq<&str> for SeriesValue<'_> {
     fn eq(&self, other: &&str) -> bool {
         match self {
             SeriesValue::String(s) => s.as_str() == *other,

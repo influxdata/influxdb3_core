@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Mutex,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
 };
 
 use crate::cache_system::{hook::Hook, DynError};
@@ -93,35 +94,63 @@ impl<K> Hook<K> for TestHook<K>
 where
     K: Clone + Eq + std::fmt::Debug + Send,
 {
-    fn insert(&self, gen: u64, k: &K) {
+    fn insert(&self, gen: u64, k: &Arc<K>) {
         let mut state = self.state.lock().unwrap();
 
         let gen_norm = state.normalize_gen(gen);
         state
             .records
-            .push(TestHookRecord::Insert(gen_norm, k.clone()))
+            .push(TestHookRecord::Insert(gen_norm, k.as_ref().clone()))
     }
 
-    fn fetched(&self, gen: u64, k: &K, res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, gen: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
         let mut state = self.state.lock().unwrap();
         let gen_norm = state.normalize_gen(gen);
         state.records.push(TestHookRecord::Fetched(
             gen_norm,
-            k.clone(),
+            k.as_ref().clone(),
             res.map_err(|e| e.to_string()),
         ));
         state.fetch_results.pop_front().unwrap_or_default()
     }
 
-    fn evict(&self, gen: u64, k: &K, res: EvictResult) {
+    fn evict(&self, gen: u64, k: &Arc<K>, res: EvictResult) {
         let mut state = self.state.lock().unwrap();
 
         let gen_norm = state.normalize_gen(gen);
         state
             .records
-            .push(TestHookRecord::Evict(gen_norm, k.clone(), res));
+            .push(TestHookRecord::Evict(gen_norm, k.as_ref().clone(), res));
         state.forget_gen(gen);
     }
+}
+
+/// A [`Hook`] that does nothing.
+#[derive(Debug)]
+pub struct NoOpHook<K>(PhantomData<K>)
+where
+    K: std::fmt::Debug + Send + Sync + ?Sized;
+
+impl<K> Default for NoOpHook<K>
+where
+    K: std::fmt::Debug + Send + Sync + ?Sized,
+{
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<K> Hook<K> for NoOpHook<K>
+where
+    K: std::fmt::Debug + Send + Sync + ?Sized,
+{
+    fn insert(&self, _gen: u64, _k: &Arc<K>) {}
+
+    fn fetched(&self, _gen: u64, _k: &Arc<K>, _res: Result<usize, &DynError>) -> HookDecision {
+        HookDecision::default()
+    }
+
+    fn evict(&self, _gen: u64, _k: &Arc<K>, _res: EvictResult) {}
 }
 
 #[cfg(test)]
@@ -146,12 +175,12 @@ mod tests {
     #[test]
     fn test_gen_normalization() {
         let hook = TestHook::<&'static str>::default();
-        hook.insert(10, &"foo");
-        hook.insert(8, &"bar");
-        hook.fetched(10, &"foo", Ok(10));
-        hook.evict(10, &"foo", EvictResult::Fetched { size: 10 });
-        hook.fetched(8, &"bar", Ok(8));
-        hook.insert(10, &"foo");
+        hook.insert(10, &Arc::new("foo"));
+        hook.insert(8, &Arc::new("bar"));
+        hook.fetched(10, &Arc::new("foo"), Ok(10));
+        hook.evict(10, &Arc::new("foo"), EvictResult::Fetched { size: 10 });
+        hook.fetched(8, &Arc::new("bar"), Ok(8));
+        hook.insert(10, &Arc::new("foo"));
 
         assert_eq!(
             hook.records(),

@@ -71,7 +71,7 @@ pub struct MetaIndexCacheParams<'a> {
     pub cache_column_stats: bool,
 }
 
-impl<'a> MetaIndexCacheParams<'a> {
+impl MetaIndexCacheParams<'_> {
     /// Build store from parameters.
     pub fn build(self) -> MetaIndexCache {
         let Self {

@@ -13,6 +13,7 @@ mod stream;
 
 use self::stream::GapFillStream;
 use arrow::{compute::SortOptions, datatypes::SchemaRef};
+use datafusion::physical_expr::LexRequirement;
 use datafusion::{
     common::DFSchemaRef,
     error::{DataFusionError, Result},
@@ -587,7 +588,7 @@ impl ExecutionPlan for GapFillExec {
         vec![Distribution::SinglePartition]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         vec![Some(PhysicalSortRequirement::from_sort_exprs(
             &self.sort_expr,
         ))]

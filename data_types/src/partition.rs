@@ -391,7 +391,7 @@ impl PartitionKeyBuilder {
 const PARTITION_HASH_ID_SIZE_BYTES: usize = 32;
 
 /// Uniquely identify a partition based on its table ID and partition key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
 #[sqlx(transparent)]
 pub struct PartitionHashId(Arc<[u8; PARTITION_HASH_ID_SIZE_BYTES]>);
 
@@ -401,6 +401,16 @@ impl std::fmt::Display for PartitionHashId {
             write!(f, "{:02x}", byte)?;
         }
         Ok(())
+    }
+}
+
+/// Re-use the `Display` format as the `Debug` format rather than using the auto-derived `Debug`
+/// implementation so that `PartitionHashId` values are printed out in a one-line hex string rather
+/// than a list of 32 byte values with each byte on its own line. This makes test output, `dbg!`
+/// output, etc easier to read.
+impl std::fmt::Debug for PartitionHashId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
     }
 }
 
@@ -542,6 +552,10 @@ where
     }
 }
 
+// Clippy was getting this wrong in the upgrade to Rust 1.83.0, the recommendation to remove the 'r
+// so it can be elided resulted in a compiler error. See:
+// https://github.com/influxdata/influxdb_iox/pull/12944
+#[expect(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
 impl<'r, DB: ::sqlx::Database> ::sqlx::Type<DB> for PartitionHashId
 where
     &'r [u8]: ::sqlx::Type<DB>,

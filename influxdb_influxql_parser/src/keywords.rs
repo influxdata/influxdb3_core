@@ -43,12 +43,12 @@ impl PartialEq<Self> for Token<'_> {
     }
 }
 
-impl<'a> Eq for Token<'a> {}
+impl Eq for Token<'_> {}
 
 /// The Hash implementation for Token ensures
 /// that two tokens, regardless of case, hash to the same
 /// value.
-impl<'a> Hash for Token<'a> {
+impl Hash for Token<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0
             .as_bytes()
@@ -150,7 +150,9 @@ pub(crate) fn sql_keyword(i: &str) -> ParseResult<&str, &str> {
 
 /// Recognizes a case-insensitive `keyword`, ensuring it is followed by
 /// a valid separator.
-pub(crate) fn keyword<'a>(keyword: &'static str) -> impl FnMut(&'a str) -> ParseResult<&str, &str> {
+pub(crate) fn keyword<'a>(
+    keyword: &'static str,
+) -> impl FnMut(&'a str) -> ParseResult<&'a str, &'a str> {
     terminated(tag_no_case(keyword), keyword_follow_char)
 }
 

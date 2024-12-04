@@ -1,13 +1,13 @@
 use data_types::partition_template;
 
-#[derive(Debug)]
-pub(crate) struct BucketHasher {
+#[derive(Debug, Clone, Copy)]
+pub struct BucketHasher {
     num_buckets: u32,
     last_assigned_bucket: Option<u32>,
 }
 
 impl BucketHasher {
-    pub(crate) fn new(num_buckets: u32) -> Self {
+    pub fn new(num_buckets: u32) -> Self {
         Self {
             num_buckets,
             last_assigned_bucket: None,
@@ -16,7 +16,7 @@ impl BucketHasher {
 
     /// Assign a bucket for the provided `tag_value` using the [`BucketHasher`]s
     /// configuration.
-    pub(crate) fn assign_bucket(&mut self, tag_value: &str) -> u32 {
+    pub fn assign_bucket(&mut self, tag_value: &str) -> u32 {
         let bucket = partition_template::bucket_for_tag_value(tag_value, self.num_buckets);
         self.last_assigned_bucket = Some(bucket);
         bucket

@@ -39,7 +39,7 @@ struct ContextSchemaProvider<'a> {
     tables: HashMap<String, (Arc<dyn TableSource>, Schema)>,
 }
 
-impl<'a> SchemaProvider for ContextSchemaProvider<'a> {
+impl SchemaProvider for ContextSchemaProvider<'_> {
     fn get_table_provider(&self, name: &str) -> Result<Arc<dyn TableSource>> {
         self.tables
             .get(name)
@@ -273,7 +273,7 @@ impl InfluxQLQueryPlanner {
 
 fn find_all_measurements(stmt: &Statement, tables: &[String]) -> Result<HashSet<String>> {
     struct Matcher<'a>(&'a mut HashSet<String>, &'a [String]);
-    impl<'a> Visitor for Matcher<'a> {
+    impl Visitor for Matcher<'_> {
         type Error = DataFusionError;
 
         fn post_visit_measurement_name(

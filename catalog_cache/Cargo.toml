@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-bytes = "1.8"
+bytes = "1.9"
 dashmap = "6.1.0"
 futures = "0.3"
 generated_types = { path = "../generated_types" }

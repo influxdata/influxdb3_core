@@ -303,7 +303,7 @@ impl Client {
     ///
     /// It is best practice to ensure a successful handshake with IOx
     /// prior to issuing queries.
-
+    ///
     /// Perform a handshake with the server, as defined by the Arrow Flight API.
     pub async fn handshake(&mut self) -> Result<(), Error> {
         // handshake is an echo server. Send some random bytes and

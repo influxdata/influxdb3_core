@@ -13,8 +13,8 @@ use data_types::{
     snapshot::partition::PartitionSnapshot,
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, Timestamp,
+    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
+    TableId, Timestamp,
 };
 use iox_time::TimeProvider;
 use metric::{DurationHistogram, Metric};
@@ -292,13 +292,13 @@ decorate! {
         repo = namespaces,
         methods = [
             namespace_create = create(&mut self, name: &NamespaceName<'_>, partition_template: Option<NamespacePartitionTemplateOverride>, retention_period_ns: Option<i64>, service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>) -> Result<Namespace>;
-            namespace_update_retention_period = update_retention_period(&mut self, name: &str, retention_period_ns: Option<i64>) -> Result<Namespace>;
+            namespace_update_retention_period = update_retention_period(&mut self, id: NamespaceId, retention_period_ns: Option<i64>) -> Result<Namespace>;
             namespace_list = list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
             namespace_get_by_id = get_by_id(&mut self, id: NamespaceId, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
             namespace_get_by_name = get_by_name(&mut self, name: &str, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
-            namespace_soft_delete = soft_delete(&mut self, name: &str) -> Result<NamespaceId>;
-            namespace_update_table_limit = update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace>;
-            namespace_update_column_limit = update_column_limit(&mut self, name: &str, new_max: MaxColumnsPerTable) -> Result<Namespace>;
+            namespace_soft_delete = soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId>;
+            namespace_update_table_limit = update_table_limit(&mut self, id: NamespaceId, new_max: MaxTables) -> Result<Namespace>;
+            namespace_update_column_limit = update_column_limit(&mut self, id: NamespaceId, new_max: MaxColumnsPerTable) -> Result<Namespace>;
             namespace_snapshot = snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot>;
             namespace_snapshot_by_name = snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot>;
         ],
@@ -355,11 +355,12 @@ decorate! {
         methods = [
             parquet_flag_for_delete_by_retention = flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
             parquet_delete_old_ids_only = delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
+            parquet_delete_old_ids_count = delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64>;
             parquet_list_by_partition_not_to_delete_batch = list_by_partition_not_to_delete_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<ParquetFile>>;
             parquet_active_as_of = active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
             parquet_get_by_object_store_id = get_by_object_store_id(&mut self, object_store_id: ObjectStoreId) -> Result<Option<ParquetFile>>;
             parquet_exists_by_object_store_id_batch = exists_by_object_store_id_batch(&mut self, object_store_ids: Vec<ObjectStoreId>) -> Result<Vec<ObjectStoreId>>;
-            parquet_create_upgrade_delete = create_upgrade_delete(&mut self, partition_id: PartitionId, delete: &[ObjectStoreId], upgrade: &[ObjectStoreId], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFileId>>;
+            parquet_create_upgrade_delete = create_upgrade_delete(&mut self, partition_id: PartitionId, delete: &[ObjectStoreId], upgrade: &[ObjectStoreId], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFile>>;
             parquet_list_files_by_table_id = list_by_table_id(&mut self, _table_id: TableId, _compaction_level: Option<CompactionLevel>) -> Result<Vec<ParquetFile>>;
         ],
     },

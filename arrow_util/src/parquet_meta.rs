@@ -13,7 +13,10 @@ use parquet::{arrow::ARROW_SCHEMA_META_KEY, file::metadata::KeyValue};
 fn encode_arrow_schema(schema: &SchemaRef) -> String {
     let options = arrow_ipc::writer::IpcWriteOptions::default();
     let data_gen = arrow_ipc::writer::IpcDataGenerator::default();
-    let mut serialized_schema = data_gen.schema_to_bytes(schema, &options);
+    let error_on_replacement = true;
+    let mut tracker = arrow_ipc::writer::DictionaryTracker::new(error_on_replacement);
+    let mut serialized_schema =
+        data_gen.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
 
     // manually prepending the length to the schema as arrow uses the legacy IPC format
     // TODO: change after addressing ARROW-9777

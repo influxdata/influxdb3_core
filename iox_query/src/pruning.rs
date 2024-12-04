@@ -195,7 +195,7 @@ impl<'a> SchemaPruningStatistics for ChunkPruningStatistics<'a> {
     }
 }
 
-impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
+impl PruningStatistics for ChunkPruningStatistics<'_> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let data_type = self.column_type(column)?;
         let summaries = self.column_summaries(column);

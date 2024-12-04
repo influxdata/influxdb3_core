@@ -56,11 +56,21 @@ service CatalogService {
 
   rpc ParquetFileFlagForDeleteByRetention(ParquetFileFlagForDeleteByRetentionRequest) returns (stream ParquetFileFlagForDeleteByRetentionResponse);
   rpc ParquetFileDeleteOldIdsOnly(ParquetFileDeleteOldIdsOnlyRequest) returns (stream ParquetFileDeleteOldIdsOnlyResponse);
+  rpc ParquetFileDeleteOldIdsCount(ParquetFileDeleteOldIdsCountRequest) returns (ParquetFileDeleteOldIdsCountResponse);
   rpc ParquetFileListByPartitionNotToDeleteBatch(ParquetFileListByPartitionNotToDeleteBatchRequest) returns (stream ParquetFileListByPartitionNotToDeleteBatchResponse);
   rpc ParquetFileActiveAsOf(ParquetFileActiveAsOfRequest) returns (stream ParquetFileActiveAsOfResponse);
   rpc ParquetFileGetByObjectStoreId(ParquetFileGetByObjectStoreIdRequest) returns (ParquetFileGetByObjectStoreIdResponse);
   rpc ParquetFileExistsByObjectStoreIdBatch(stream ParquetFileExistsByObjectStoreIdBatchRequest) returns (stream ParquetFileExistsByObjectStoreIdBatchResponse);
-  rpc ParquetFileCreateUpgradeDelete(ParquetFileCreateUpgradeDeleteRequest) returns (ParquetFileCreateUpgradeDeleteResponse);
+
+  // Returns only the Parquet File ID of created files. Essentially deprecated in favor of
+  // `ParquetFileCreateUpgradeDeleteFull` to get the returned values for the catalog-assigned
+  // `id`, `created_at`, and possibly `max_l0_created_at` fields.
+  rpc ParquetFileCreateUpgradeDelete(ParquetFileCreateUpgradeDeleteRequest) returns (ParquetFileCreateUpgradeDeleteResponse) {
+    option deprecated = true;
+  };
+  // Streams full ParquetFile messages for created files
+  rpc ParquetFileCreateUpgradeDeleteFull(ParquetFileCreateUpgradeDeleteFullRequest) returns (stream ParquetFileCreateUpgradeDeleteFullResponse);
+
   rpc ParquetFileListByTableId(ParquetFileListByTableIdRequest) returns (stream ParquetFileListByTableIdResponse);
 
   rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
@@ -435,6 +445,14 @@ message ParquetFileDeleteOldIdsOnlyResponse {
   ObjectStoreId object_store_id = 1;
 }
 
+message ParquetFileDeleteOldIdsCountRequest {
+  int64 older_than = 1;
+}
+
+message ParquetFileDeleteOldIdsCountResponse {
+  uint64 num_deleted = 1;
+}
+
 message ParquetFileListByPartitionNotToDeleteBatchRequest {
   repeated int64 partition_ids = 1;
 }
@@ -477,6 +495,18 @@ message ParquetFileCreateUpgradeDeleteRequest {
 
 message ParquetFileCreateUpgradeDeleteResponse {
   repeated int64 created_parquet_file_ids = 1;
+}
+
+message ParquetFileCreateUpgradeDeleteFullRequest {
+  repeated ObjectStoreId delete = 1;
+  repeated ObjectStoreId upgrade = 2;
+  repeated ParquetFileParams create = 3;
+  int32 target_level = 4;
+  int64 partition_id = 5;
+}
+
+message ParquetFileCreateUpgradeDeleteFullResponse {
+  ParquetFile parquet_file = 1;
 }
 
 message ParquetFileListByTableIdRequest {
@@ -584,7 +614,7 @@ message ParquetFileParams {
   int64 file_size_bytes = 8;
   int64 row_count = 9;
   int32 compaction_level = 10;
-  int64 created_at = 11;
+  int64 created_at = 11 [deprecated = true];
   ColumnSet column_set = 12;
 
   oneof maybe_max_l0_created_at {

@@ -624,7 +624,7 @@ impl Cursor {
             null_as_missing: bool,
         }
 
-        impl<'a> VecBuilder for AggrBuilder<'a> {
+        impl VecBuilder for AggrBuilder<'_> {
             fn push(&mut self, row_status: RowStatus) -> Result<()> {
                 match row_status {
                     RowStatus::NullTimestamp { offset, .. } => {
@@ -999,7 +999,7 @@ enum StashedAggrState {
     PrevSome { offset: usize },
 }
 
-impl<'a> VecBuilder for StashedAggrBuilder<'a> {
+impl VecBuilder for StashedAggrBuilder<'_> {
     fn push(&mut self, row_status: RowStatus) -> Result<()> {
         match row_status {
             RowStatus::NullTimestamp { offset, .. } => {

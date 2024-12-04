@@ -17,7 +17,7 @@ format = ["arrow", "arrow_util"]
 arrow = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true }
 arrow_util = { path = "../arrow_util", optional = true }
-bytes = "1.8"
+bytes = "1.9"
 client_util = { path = "../client_util" }
 comfy-table = { version = "7.1", default-features = false}
 futures = "0.3"
@@ -29,10 +29,10 @@ prost = { workspace = true }
 rand = "0.8.5"
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
 schema = { path = "../schema" }
-serde_json = "1.0.132"
+serde_json = "1.0.133"
 tokio = { version = "1.41", features = ["macros", "parking_lot", "rt-multi-thread"] }
 tokio-stream = "0.1.16"
-thiserror = "2.0.0"
+thiserror = "2.0.3"
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 

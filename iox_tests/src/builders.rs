@@ -123,7 +123,6 @@ impl ParquetFileBuilder {
             file_size_bytes: self.file.file_size_bytes,
             row_count: self.file.row_count,
             compaction_level: self.file.compaction_level,
-            created_at: self.file.created_at,
             column_set: self.file.column_set,
             max_l0_created_at: MaxL0CreatedAt::Computed(self.file.max_l0_created_at),
             source: self.file.source,

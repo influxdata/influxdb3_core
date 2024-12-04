@@ -81,7 +81,7 @@ where
     }
 }
 
-impl<'p, DB> Executor<'p> for &'_ HotSwapPool<DB>
+impl<DB> Executor<'_> for &'_ HotSwapPool<DB>
 where
     DB: Database,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,

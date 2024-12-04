@@ -29,8 +29,8 @@ use data_types::{
     snapshot::table::TableSnapshot,
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, Timestamp,
+    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
+    TableId, Timestamp,
 };
 use generated_types::influxdata::iox::catalog::v2 as proto;
 use iox_time::TimeProvider;
@@ -182,10 +182,10 @@ impl Catalog for GrpcCatalogClient {
             span_ctx: None,
             trace_header_name: self.trace_header_name.clone(),
             max_decoded_message_size: self.max_decoded_message_size,
+            time_provider: Arc::clone(&self.time_provider),
         })))
     }
 
-    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
         self.metrics.registry()
     }
@@ -200,6 +200,7 @@ impl Catalog for GrpcCatalogClient {
             span_ctx: None,
             trace_header_name: self.trace_header_name.clone(),
             max_decoded_message_size: self.max_decoded_message_size,
+            time_provider: Arc::clone(&self.time_provider),
         };
 
         let req = proto::GetTimeRequest {};
@@ -230,6 +231,7 @@ struct GrpcCatalogClientRepos {
     span_ctx: Option<SpanContext>,
     trace_header_name: HeaderName,
     max_decoded_message_size: usize,
+    time_provider: Arc<dyn TimeProvider>,
 }
 
 type ServiceClient = proto::catalog_service_client::CatalogServiceClient<
@@ -403,12 +405,12 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
 
     async fn update_retention_period(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
         use generated_types::influxdata::iox::catalog::v2::namespace_update_retention_period_request::Target;
         let n = proto::NamespaceUpdateRetentionPeriodRequest {
-            target: Some(Target::Name(name.to_owned())),
+            target: Some(Target::Id(id.get())),
             retention_period_ns,
         };
 
@@ -476,10 +478,10 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         Ok(resp.namespace.map(deserialize_namespace).transpose()?)
     }
 
-    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
         use generated_types::influxdata::iox::catalog::v2::namespace_soft_delete_request::Target;
         let n = proto::NamespaceSoftDeleteRequest {
-            target: Some(Target::Name(name.to_owned())),
+            target: Some(Target::Id(id.get())),
         };
 
         let resp = self
@@ -490,10 +492,14 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         Ok(NamespaceId::new(resp.namespace_id))
     }
 
-    async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
+    async fn update_table_limit(
+        &mut self,
+        id: NamespaceId,
+        new_max: MaxTables,
+    ) -> Result<Namespace> {
         use proto::namespace_update_table_limit_request::Target;
         let n = proto::NamespaceUpdateTableLimitRequest {
-            target: Some(Target::Name(name.to_owned())),
+            target: Some(Target::Id(id.get())),
             new_max: new_max.get_i32(),
         };
 
@@ -512,12 +518,12 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
 
     async fn update_column_limit(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace> {
         use proto::namespace_update_column_limit_request::Target;
         let n = proto::NamespaceUpdateColumnLimitRequest {
-            target: Some(Target::Name(name.to_owned())),
+            target: Some(Target::Id(id.get())),
             new_max: new_max.get_i32(),
         };
 
@@ -1186,6 +1192,35 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+        let p = proto::ParquetFileDeleteOldIdsCountRequest {
+            older_than: older_than.get(),
+        };
+
+        let resp = self.retry(
+            "parquet_file_delete_old_ids_count",
+            p,
+            |data, mut client| async move { client.parquet_file_delete_old_ids_count(data).await },
+        ).await;
+
+        match resp {
+            Ok(resp) => Ok(resp.num_deleted),
+            // If we get an Unimplemented error, that means that the `delete_old_ids_count` method
+            // hasn't been rolled out to the remote end yet, so we have to fallback to calling the
+            // `delete_old_ids_only` method and counting its vec
+            Err(Error::NotImplemented { descr: _ }) => {
+                self.delete_old_ids_only(older_than).await.map(|v| {
+                    v.len()
+                        .try_into()
+                        .expect("128-bit computers don't exist yet")
+                })
+            }
+            // And we're assuming any other error is not recoverable by trying the other method -
+            // we just need to return it.
+            Err(e) => Err(e),
+        }
+    }
+
     async fn list_by_partition_not_to_delete_batch(
         &mut self,
         partition_ids: Vec<PartitionId>,
@@ -1292,8 +1327,15 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         upgrade: &[ObjectStoreId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
-        let p = proto::ParquetFileCreateUpgradeDeleteRequest {
+    ) -> Result<Vec<ParquetFile>> {
+        // If this newer code is sending these requests to a service running older code, that older
+        // code expects `proto::ParquetFileParams` to have `created_at` fields set. If these
+        // requests are sent to services also running newer code, the `created_at` fields will be
+        // ignored and the value will be set by the underlying catalog. When all environments have
+        // been upgraded to ignore the `created_at` fields, this can be removed.
+        let created_at = self.time_provider.now().into();
+
+        let p = proto::ParquetFileCreateUpgradeDeleteFullRequest {
             partition_id: partition_id.get(),
             delete: delete
                 .iter()
@@ -1305,22 +1347,29 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
                 .copied()
                 .map(serialize_object_store_id)
                 .collect(),
-            create: create.iter().map(serialize_parquet_file_params).collect(),
+            create: create
+                .iter()
+                .map(|c| serialize_parquet_file_params(c, created_at))
+                .collect(),
             target_level: target_level as i32,
         };
 
-        let resp = self.retry(
-            "parquet_file_create_upgrade_delete",
+        self.retry(
+            "parquet_file_create_upgrade_delete_full",
             p,
-            |data, mut client| async move { client.parquet_file_create_upgrade_delete(data).await },
+            |data, mut client| async move {
+                buffer_stream_response(client.parquet_file_create_upgrade_delete_full(data).await)
+                    .await
+            },
         )
-        .await?;
-
-        Ok(resp
-            .created_parquet_file_ids
-            .into_iter()
-            .map(ParquetFileId::new)
-            .collect())
+        .await?
+        .into_iter()
+        .map(|res| {
+            Ok(deserialize_parquet_file(
+                res.parquet_file.required().ctx("parquet_file")?,
+            )?)
+        })
+        .collect()
     }
 
     async fn list_by_table_id(

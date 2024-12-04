@@ -4,13 +4,14 @@ use std::{pin::Pin, sync::Arc};
 
 use crate::{
     grpc::serialization::{
-        catalog_error_to_status, deserialize_column_type, deserialize_object_store_id,
-        deserialize_parquet_file_params, deserialize_soft_deleted_rows, deserialize_sort_key_ids,
-        serialize_column, serialize_namespace, serialize_object_store_id, serialize_parquet_file,
+        deserialize_column_type, deserialize_object_store_id, deserialize_parquet_file_params,
+        deserialize_soft_deleted_rows, deserialize_sort_key_ids, serialize_column,
+        serialize_namespace, serialize_object_store_id, serialize_parquet_file,
         serialize_partition, serialize_skipped_compaction, serialize_sort_key_ids, serialize_table,
         ContextExt, ConvertExt, ConvertOptExt, RequiredExt,
     },
     interface::{CasFailure, Catalog, RepoCollection},
+    util::catalog_error_to_status,
 };
 use async_trait::async_trait;
 use data_types::{
@@ -19,7 +20,8 @@ use data_types::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::catalog::v2::{
-    self as proto, PartitionDeleteByRetentionRequest,
+    self as proto, ParquetFileDeleteOldIdsCountRequest, ParquetFileDeleteOldIdsCountResponse,
+    PartitionDeleteByRetentionRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -84,16 +86,17 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     type PartitionListOldStyleStream = TonicStream<proto::PartitionListOldStyleResponse>;
 
     type PartitionDeleteByRetentionStream = TonicStream<proto::PartitionDeleteByRetentionResponse>;
-
-    type ParquetFileFlagForDeleteByRetentionStream =
-        TonicStream<proto::ParquetFileFlagForDeleteByRetentionResponse>;
     type ParquetFileDeleteOldIdsOnlyStream =
         TonicStream<proto::ParquetFileDeleteOldIdsOnlyResponse>;
+    type ParquetFileFlagForDeleteByRetentionStream =
+        TonicStream<proto::ParquetFileFlagForDeleteByRetentionResponse>;
     type ParquetFileListByPartitionNotToDeleteBatchStream =
         TonicStream<proto::ParquetFileListByPartitionNotToDeleteBatchResponse>;
     type ParquetFileActiveAsOfStream = TonicStream<proto::ParquetFileActiveAsOfResponse>;
     type ParquetFileExistsByObjectStoreIdBatchStream =
         TonicStream<proto::ParquetFileExistsByObjectStoreIdBatchResponse>;
+    type ParquetFileCreateUpgradeDeleteFullStream =
+        TonicStream<proto::ParquetFileCreateUpgradeDeleteFullResponse>;
     type ParquetFileListByTableIdStream = TonicStream<proto::ParquetFileListByTableIdResponse>;
 
     async fn root_snapshot(
@@ -158,25 +161,22 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         use proto::namespace_update_retention_period_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
-        let name = match req.target.required()? {
-            Target::Name(v) => v,
-            Target::Id(id) => {
+        let id = match req.target.required()? {
+            Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_id(
-                        NamespaceId::new(id),
-                        crate::interface::SoftDeletedRows::ExcludeDeleted,
-                    )
+                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(id.to_string()))?
-                    .name
+                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .id
             }
+            Target::Id(id) => NamespaceId::new(id),
         };
 
         let ns = repos
             .namespaces()
-            .update_retention_period(&name, req.retention_period_ns)
+            .update_retention_period(id, req.retention_period_ns)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -264,25 +264,22 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         use proto::namespace_soft_delete_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
-        let name = match req.target.required()? {
-            Target::Name(v) => v,
-            Target::Id(id) => {
+        let id = match req.target.required()? {
+            Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_id(
-                        NamespaceId::new(id),
-                        crate::interface::SoftDeletedRows::ExcludeDeleted,
-                    )
+                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(id.to_string()))?
-                    .name
+                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .id
             }
+            Target::Id(v) => NamespaceId::new(v),
         };
 
         let id = repos
             .namespaces()
-            .soft_delete(&name)
+            .soft_delete(id)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -298,25 +295,22 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         use proto::namespace_update_table_limit_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
-        let name = match req.target.required()? {
-            Target::Name(v) => v,
-            Target::Id(id) => {
+        let id = match req.target.required()? {
+            Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_id(
-                        NamespaceId::new(id),
-                        crate::interface::SoftDeletedRows::ExcludeDeleted,
-                    )
+                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(id.to_string()))?
-                    .name
+                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .id
             }
+            Target::Id(id) => NamespaceId::new(id),
         };
 
         let ns = repos
             .namespaces()
-            .update_table_limit(&name, req.new_max.convert().ctx("new_max")?)
+            .update_table_limit(id, req.new_max.convert().ctx("new_max")?)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -334,25 +328,22 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         use proto::namespace_update_column_limit_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
-        let name = match req.target.required()? {
-            Target::Name(v) => v,
-            Target::Id(id) => {
+        let id = match req.target.required()? {
+            Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_id(
-                        NamespaceId::new(id),
-                        crate::interface::SoftDeletedRows::ExcludeDeleted,
-                    )
+                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(id.to_string()))?
-                    .name
+                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .id
             }
+            Target::Id(id) => NamespaceId::new(id),
         };
 
         let ns = repos
             .namespaces()
-            .update_column_limit(&name, req.new_max.convert().ctx("new_max")?)
+            .update_column_limit(id, req.new_max.convert().ctx("new_max")?)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -1059,6 +1050,23 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         ))
     }
 
+    async fn parquet_file_delete_old_ids_count(
+        &self,
+        request: Request<ParquetFileDeleteOldIdsCountRequest>,
+    ) -> Result<Response<ParquetFileDeleteOldIdsCountResponse>, tonic::Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let num_deleted = repos
+            .parquet_files()
+            .delete_old_ids_count(Timestamp::new(req.older_than))
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::ParquetFileDeleteOldIdsCountResponse {
+            num_deleted,
+        }))
+    }
+
     async fn parquet_file_list_by_partition_not_to_delete_batch(
         &self,
         request: Request<proto::ParquetFileListByPartitionNotToDeleteBatchRequest>,
@@ -1168,6 +1176,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         ))
     }
 
+    /// Prost doesn't currently generate deprecated annotations for functions that correspond to
+    /// deprecated rpc functions, but this is essentially deprecated. Please use
+    /// `parquet_file_create_upgrade_delete_full` instead.
     async fn parquet_file_create_upgrade_delete(
         &self,
         request: Request<proto::ParquetFileCreateUpgradeDeleteRequest>,
@@ -1190,7 +1201,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             .map(deserialize_parquet_file_params)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let id_list = repos
+        let created = repos
             .parquet_files()
             .create_upgrade_delete(
                 PartitionId::new(req.partition_id),
@@ -1204,8 +1215,53 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
         Ok(Response::new(
             proto::ParquetFileCreateUpgradeDeleteResponse {
-                created_parquet_file_ids: id_list.into_iter().map(|id| id.get()).collect(),
+                created_parquet_file_ids: created.into_iter().map(|file| file.id.get()).collect(),
             },
+        ))
+    }
+
+    async fn parquet_file_create_upgrade_delete_full(
+        &self,
+        request: Request<proto::ParquetFileCreateUpgradeDeleteFullRequest>,
+    ) -> Result<Response<Self::ParquetFileCreateUpgradeDeleteFullStream>, tonic::Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let delete = req
+            .delete
+            .into_iter()
+            .map(deserialize_object_store_id)
+            .collect::<Vec<_>>();
+        let upgrade = req
+            .upgrade
+            .into_iter()
+            .map(deserialize_object_store_id)
+            .collect::<Vec<_>>();
+        let create = req
+            .create
+            .into_iter()
+            .map(deserialize_parquet_file_params)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let created = repos
+            .parquet_files()
+            .create_upgrade_delete(
+                PartitionId::new(req.partition_id),
+                &delete,
+                &upgrade,
+                &create,
+                req.target_level.convert().ctx("target_level")?,
+            )
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(created.into_iter().map(|file| {
+                let file = serialize_parquet_file(file);
+                Ok(proto::ParquetFileCreateUpgradeDeleteFullResponse {
+                    parquet_file: Some(file),
+                })
+            }))
+            .boxed(),
         ))
     }
 

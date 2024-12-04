@@ -22,6 +22,7 @@ fn main() -> Result<()> {
 /// - `influxdata.iox.authz.v1.rs`
 /// - `influxdata.iox.bulk_ingest.v1.rs`
 /// - `influxdata.iox.catalog.v1.rs`
+/// - `influxdata.iox.catalog_storage.v1.rs`
 /// - `influxdata.iox.compactor.v1.rs`
 /// - `influxdata.iox.delete.v1.rs`
 /// - `influxdata.iox.ingester.v1.rs`
@@ -39,6 +40,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
     let authz_pusher_path = root.join("influxdata/iox/authz/pusher/v1");
     let bulk_ingest_path = root.join("influxdata/iox/bulk_ingest/v1");
     let catalog_cache_path = root.join("influxdata/iox/catalog_cache/v1");
+    let catalog_storage_path = root.join("influxdata/iox/catalog_storage/v1");
     let catalog_v1_path = root.join("influxdata/iox/catalog/v1");
     let catalog_v2_path = root.join("influxdata/iox/catalog/v2");
     let column_type = root.join("influxdata/iox/column_type/v1");
@@ -63,6 +65,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         authz_pusher_path.join("pusher.proto"),
         bulk_ingest_path.join("service.proto"),
         catalog_cache_path.join("value.proto"),
+        catalog_storage_path.join("service.proto"),
         catalog_v1_path.join("parquet_file.proto"),
         catalog_v1_path.join("partition_identifier.proto"),
         catalog_v1_path.join("service.proto"),

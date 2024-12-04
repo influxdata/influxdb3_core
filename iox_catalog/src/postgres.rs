@@ -25,9 +25,9 @@ use data_types::{
         namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
         table::TableSnapshot,
     },
-    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceVersion, ObjectStoreId,
-    ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
+    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables, Namespace,
+    NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceVersion,
+    ObjectStoreId, ParquetFile, ParquetFileParams, Partition, PartitionHashId, PartitionId,
     PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
 };
 use futures::StreamExt;
@@ -149,7 +149,7 @@ impl PostgresCatalog {
         options: PostgresConnectionOptions,
         metrics: Arc<metric::Registry>,
     ) -> Result<Self> {
-        let (pool, refresh_task) = new_pool(&options, Arc::clone(&metrics)).await?;
+        let (pool, refresh_task) = new_pool(&options, &metrics).await?;
         let time_provider = Arc::new(SystemProvider::new()) as _;
 
         Ok(Self {
@@ -285,7 +285,6 @@ impl Catalog for PostgresCatalog {
         })))
     }
 
-    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
         self.catalog_metrics.registry()
     }
@@ -374,7 +373,7 @@ struct PoolMetricsInner {
 
 impl PoolMetrics {
     /// Create new pool metrics.
-    fn new(metrics: Arc<metric::Registry>) -> Self {
+    fn new(metrics: &metric::Registry) -> Self {
         metrics.register_instrument("iox_catalog_postgres", Self::default)
     }
 
@@ -569,7 +568,7 @@ pub fn parse_dsn(dsn: &str) -> Result<String, sqlx::Error> {
 /// is successfull (see [`sqlx::pool::PoolOptions::test_before_acquire`]).
 async fn new_pool(
     options: &PostgresConnectionOptions,
-    metrics: Arc<metric::Registry>,
+    metrics: &metric::Registry,
 ) -> Result<(HotSwapPool<Postgres>, JoinSet<()>), sqlx::Error> {
     let parsed_dsn = parse_dsn(&options.dsn)?;
     let metrics = PoolMetrics::new(metrics);
@@ -920,21 +919,21 @@ WHERE name=$1 AND {v};
         Ok(Some(namespace))
     }
 
-    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
         let flagged_at = Timestamp::from(self.time_provider.now());
 
         // note that there is a uniqueness constraint on the name column in the DB
         let rec = sqlx::query_as::<_, NamespaceId>(
-            r#"UPDATE namespace SET deleted_at=$1 WHERE name = $2 RETURNING id;"#,
+            r#"UPDATE namespace SET deleted_at=$1 WHERE id = $2 RETURNING id;"#,
         )
         .bind(flagged_at) // $1
-        .bind(name) // $2
+        .bind(id) // $2
         .fetch_one(&mut self.inner)
         .await;
 
         let id = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -944,24 +943,28 @@ WHERE name=$1 AND {v};
         Ok(id)
     }
 
-    async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace> {
+    async fn update_table_limit(
+        &mut self,
+        id: NamespaceId,
+        new_max: MaxTables,
+    ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET max_tables = $1, router_version = router_version + 1
-WHERE name = $2
+WHERE id = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
         "#,
         )
         .bind(new_max)
-        .bind(name)
+        .bind(id.get())
         .fetch_one(&mut self.inner)
         .await;
 
         let namespace = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -973,26 +976,26 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
     async fn update_column_limit(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET max_columns_per_table = $1, router_version = router_version + 1
-WHERE name = $2
+WHERE id = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
         "#,
         )
         .bind(new_max)
-        .bind(name)
+        .bind(id.get())
         .fetch_one(&mut self.inner)
         .await;
 
         let namespace = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -1004,26 +1007,26 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
     async fn update_retention_period(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET retention_period_ns = $1, router_version = router_version + 1
-WHERE name = $2
+WHERE id = $2
 RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
           partition_template, router_version;
         "#,
         )
         .bind(retention_period_ns) // $1
-        .bind(name) // $2
+        .bind(id.get()) // $2
         .fetch_one(&mut self.inner)
         .await;
 
         let namespace = rec.map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
-                descr: name.to_string(),
+                descr: id.to_string(),
             },
             _ => Error::External {
                 source: Arc::new(e),
@@ -1866,14 +1869,14 @@ impl ParquetFileRepo for PostgresTxn {
         let deleted = sqlx::query(
             r#"
 WITH parquet_file_ids as (
-    SELECT object_store_id
+    SELECT id
     FROM parquet_file
     WHERE to_delete < $1
     LIMIT $2
 )
 DELETE FROM parquet_file
-WHERE object_store_id IN (SELECT object_store_id FROM parquet_file_ids)
-RETURNING object_store_id;
+WHERE id IN (SELECT id FROM parquet_file_ids)
+RETURNING object_store_id
              "#,
         )
         .bind(older_than) // $1
@@ -1883,9 +1886,39 @@ RETURNING object_store_id;
 
         let deleted = deleted
             .into_iter()
-            .map(|row| row.get("object_store_id"))
+            .map(|r| r.get("object_store_id"))
             .collect();
+
         Ok(deleted)
+    }
+
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+        // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
+        let deleted = sqlx::query(
+            r#"
+WITH parquet_file_ids as (
+    SELECT id
+    FROM parquet_file
+    WHERE to_delete < $1
+    LIMIT $2
+),
+deleted AS (
+    DELETE FROM parquet_file
+    WHERE id IN (SELECT id FROM parquet_file_ids)
+    RETURNING id
+)
+SELECT COUNT(*) FROM deleted;
+             "#,
+        )
+        .bind(older_than) // $1
+        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
+        .fetch_one(&mut self.inner)
+        .await?;
+
+        Ok(deleted
+            .get::<i64, _>("count")
+            .try_into()
+            .expect("This value should be < 10,000 and > 0"))
     }
 
     async fn list_by_partition_not_to_delete_batch(
@@ -1994,7 +2027,7 @@ WHERE object_store_id = ANY($1);
         upgrade: &[ObjectStoreId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
+    ) -> Result<Vec<ParquetFile>> {
         let delete_set: HashSet<_> = delete.iter().map(|d| d.get_uuid()).collect();
         let upgrade_set: HashSet<_> = upgrade.iter().map(|u| u.get_uuid()).collect();
 
@@ -2009,7 +2042,7 @@ WHERE object_store_id = ANY($1);
 
         update_compaction_level(&mut *tx, partition_id, upgrade, target_level).await?;
 
-        let mut ids = Vec::with_capacity(create.len());
+        let mut created = Vec::with_capacity(create.len());
         let mut created_at_max = None;
         for file in create {
             if file.partition_id != partition_id {
@@ -2017,14 +2050,14 @@ WHERE object_store_id = ANY($1);
                     descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
                 });
             }
+            let created_file = create_parquet_file(&mut *tx, partition_id, file).await?;
             if file.compaction_level == CompactionLevel::Initial {
                 created_at_max = match created_at_max {
-                    None => Some(file.created_at),
-                    Some(current) => Some(current.max(file.created_at)),
+                    None => Some(created_file.created_at),
+                    Some(current) => Some(current.max(created_file.created_at)),
                 };
             }
-            let id = create_parquet_file(&mut *tx, partition_id, file).await?;
-            ids.push(id);
+            created.push(created_file);
         }
 
         // update partition
@@ -2044,7 +2077,7 @@ WHERE object_store_id = ANY($1);
 
         tx.commit().await?;
 
-        Ok(ids)
+        Ok(created)
     }
 
     async fn list_by_table_id(
@@ -2082,7 +2115,7 @@ async fn create_parquet_file<'q, E>(
     executor: E,
     partition_id: PartitionId,
     parquet_file_params: &ParquetFileParams,
-) -> Result<ParquetFileId>
+) -> Result<ParquetFile>
 where
     E: Executor<'q, Database = Postgres>,
 {
@@ -2097,42 +2130,77 @@ where
         file_size_bytes,
         row_count,
         compaction_level,
-        created_at,
         column_set,
         max_l0_created_at,
         source,
     } = parquet_file_params;
 
-    let query = sqlx::query_scalar::<_, ParquetFileId>(
-        r#"
+    let query = match max_l0_created_at {
+        MaxL0CreatedAt::Computed(max) => sqlx::query_as::<_, ParquetFile>(
+            r#"
 INSERT INTO parquet_file (
     table_id, partition_id, partition_hash_id, object_store_id,
     min_time, max_time, file_size_bytes,
     row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at, source )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
-RETURNING id;
+VALUES (
+    $1, $2, $3, $4,
+    $5, $6, $7,
+    $8, $9, EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000, $10, $11, $12, $13 )
+RETURNING
+    id, table_id, partition_id, partition_hash_id, object_store_id, min_time, max_time, to_delete,
+    file_size_bytes, row_count, compaction_level, created_at, namespace_id, column_set,
+    max_l0_created_at, source;
+;
         "#,
-    )
-    .bind(table_id) // $1
-    .bind(partition_id) // $2
-    .bind(partition_hash_id.as_ref()) // $3
-    .bind(object_store_id) // $4
-    .bind(min_time) // $5
-    .bind(max_time) // $6
-    .bind(file_size_bytes) // $7
-    .bind(row_count) // $8
-    .bind(compaction_level) // $9
-    .bind(created_at) // $10
-    .bind(namespace_id) // $11
-    .bind(column_set) // $12
-    .bind(
-        max_l0_created_at
-            .maybe_computed_timestamp()
-            .unwrap_or(*created_at),
-    ) // $13
-    .bind(source); // $14
+        )
+        .bind(table_id) // $1
+        .bind(partition_id) // $2
+        .bind(partition_hash_id.as_ref()) // $3
+        .bind(object_store_id) // $4
+        .bind(min_time) // $5
+        .bind(max_time) // $6
+        .bind(file_size_bytes) // $7
+        .bind(row_count) // $8
+        .bind(compaction_level) // $9
+        .bind(namespace_id) // $10
+        .bind(column_set) // $11
+        .bind(max) // $12
+        .bind(source), // $13
 
-    let parquet_file_id = query.fetch_one(executor).await.map_err(|e| {
+        MaxL0CreatedAt::NotCompacted => sqlx::query_as::<_, ParquetFile>(
+            r#"
+INSERT INTO parquet_file (
+    table_id, partition_id, partition_hash_id, object_store_id,
+    min_time, max_time, file_size_bytes,
+    row_count, compaction_level, created_at, namespace_id, column_set,
+    max_l0_created_at, source )
+VALUES (
+    $1, $2, $3, $4,
+    $5, $6, $7,
+    $8, $9, EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000, $10, $11,
+    EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000000, $12 )
+RETURNING
+    id, table_id, partition_id, partition_hash_id, object_store_id, min_time, max_time, to_delete,
+    file_size_bytes, row_count, compaction_level, created_at, namespace_id, column_set,
+    max_l0_created_at, source;
+;
+        "#,
+        )
+        .bind(table_id) // $1
+        .bind(partition_id) // $2
+        .bind(partition_hash_id.as_ref()) // $3
+        .bind(object_store_id) // $4
+        .bind(min_time) // $5
+        .bind(max_time) // $6
+        .bind(file_size_bytes) // $7
+        .bind(row_count) // $8
+        .bind(compaction_level) // $9
+        .bind(namespace_id) // $10
+        .bind(column_set) // $11
+        .bind(source), // $12
+    };
+
+    let parquet_file = query.fetch_one(executor).await.map_err(|e| {
         if is_unique_violation(&e) {
             Error::AlreadyExists {
                 descr: object_store_id.to_string(),
@@ -2148,7 +2216,7 @@ RETURNING id;
         }
     })?;
 
-    Ok(parquet_file_id)
+    Ok(parquet_file)
 }
 
 async fn flag_for_delete<'q, E>(
@@ -2612,11 +2680,19 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
         // Create a Parquet file record in this partition to ensure we don't break new data
         // ingestion for old-style partitions
         let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, partition);
-        let parquet_file = repos
+        let object_store_id = parquet_file_params.object_store_id;
+        repos
             .parquet_files()
             .create(parquet_file_params)
             .await
             .unwrap();
+        let parquet_file = repos
+            .parquet_files()
+            .get_by_object_store_id(object_store_id)
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(parquet_file.partition_hash_id, None);
 
         // Add a partition record WITH a hash ID
@@ -2674,8 +2750,8 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
             hotswap_poll_interval: POLLING_INTERVAL,
             ..Default::default()
         };
-        let metrics = Arc::new(metric::Registry::new());
-        let (pool, _refresh_task) = new_pool(&options, metrics).await.expect("connect");
+        let metrics = metric::Registry::new();
+        let (pool, _refresh_task) = new_pool(&options, &metrics).await.expect("connect");
         println!("got a pool");
 
         // ensure the application name is set as expected

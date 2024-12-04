@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 
-use arrow::compute::concat_batches;
+use arrow::compute::{concat_batches, SortOptions};
 use arrow::{
     array::{ArrayRef, UInt64Array},
     compute::TakeOptions,
@@ -119,12 +119,12 @@ impl RecordBatchDeduplicator {
                     if last_batch_array.len() == 0 {
                         panic!("Key column, {name}, of last_batch has no data");
                     }
-                    arrow::compute::SortColumn {
-                        values: Arc::clone(last_batch_array),
-                        options: Some(skey.options),
+                    DedupSortColumn {
+                        array: last_batch_array,
+                        options: skey.options,
                     }
                 })
-                .collect::<Vec<arrow::compute::SortColumn>>();
+                .collect::<Vec<_>>();
 
             // Build sorted columns for current batch
             // Schema of both batches are the same
@@ -141,12 +141,12 @@ impl RecordBatchDeduplicator {
                     if array.len() == 0 {
                         panic!("Key column, {name}, of current batch has no data");
                     }
-                    arrow::compute::SortColumn {
-                        values: Arc::clone(array),
-                        options: Some(skey.options),
+                    DedupSortColumn {
+                        array,
+                        options: skey.options,
                     }
                 })
-                .collect::<Vec<arrow::compute::SortColumn>>();
+                .collect::<Vec<_>>();
 
             // Zip the 2 key sets of columns for comparison
             let zipped = last_batch_key_columns.iter().zip(batch_key_columns.iter());
@@ -156,13 +156,8 @@ impl RecordBatchDeduplicator {
             // only need to compare last row of the last_batch with the first row of the current batch
             let mut same = true;
             for (l, r) in zipped {
-                let last_idx = l.values.len() - 1;
-                let c = arrow::array::make_comparator(
-                    l.values.as_ref(),
-                    r.values.as_ref(),
-                    l.options.unwrap_or_default(),
-                )
-                .unwrap();
+                let last_idx = l.array.len() - 1;
+                let c = arrow::array::make_comparator(l.array, r.array, l.options)?;
 
                 match c(last_idx, 0) {
                     Ordering::Equal => {} // continue comparing columns across the row
@@ -395,6 +390,12 @@ pub(crate) fn get_col_name(expr: &dyn PhysicalExpr) -> &str {
         .downcast_ref::<datafusion::physical_plan::expressions::Column>()
         .expect("expected column reference")
         .name()
+}
+
+/// Holds one column of values and its sort options
+struct DedupSortColumn<'a> {
+    array: &'a ArrayRef,
+    options: SortOptions,
 }
 
 #[cfg(test)]

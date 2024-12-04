@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::{
     config::{ParquetOptions, TableParquetOptions},
     datasource::{
@@ -261,7 +262,7 @@ pub async fn to_parquet_upload(
         table_paths: vec![table_path], // Sink location used by the demuxer. Single location means no splitting; not a collection of outputs.
         output_schema: batches.schema(),
         table_partition_cols: vec![], // should be empty, since we want sink to be a single parquet
-        overwrite: false,
+        insert_op: InsertOp::Overwrite, // always overwrite (we always write to a new file anyways)
         keep_partition_by_columns: false,
     };
     let sink = ParquetSink::new(sink_config, parquet_options);
@@ -537,7 +538,7 @@ mod tests {
         // will have different created_by (parquet-rs vs datafusion)
         assert_eq!(
             single_threaded_props.created_by(),
-            "parquet-rs version 53.0.0"
+            "parquet-rs version 53.2.0"
         );
         assert_eq!(parallel_props.created_by(), "datafusion version 42.0.0");
 

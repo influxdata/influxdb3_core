@@ -132,7 +132,7 @@ struct FieldColumn<'a> {
     value: LPFieldValue<'a>,
 }
 
-impl<'a> FieldValue for FieldColumn<'a> {
+impl FieldValue for FieldColumn<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.value {
             LPFieldValue::I64(v) => v.fmt(f),
