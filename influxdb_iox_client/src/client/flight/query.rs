@@ -40,7 +40,7 @@ pub struct QueryBuilder<'client, State> {
     _phantom: PhantomData<State>,
 }
 
-impl<'c, State> QueryBuilder<'c, State> {
+impl<State> QueryBuilder<'_, State> {
     /// Supply a new named parameter to use with this query. Parameters referenced using
     /// `$placeholder` syntax in the query will be substituted with the value provided.
     ///

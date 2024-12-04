@@ -118,7 +118,7 @@ pub struct OomNotifyFut<'a> {
     notify: &'a mut OomNotify,
 }
 
-impl<'a> Future for OomNotifyFut<'a> {
+impl Future for OomNotifyFut<'_> {
     type Output = ();
 
     fn poll(

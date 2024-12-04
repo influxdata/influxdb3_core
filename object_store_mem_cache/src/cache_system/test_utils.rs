@@ -20,10 +20,15 @@ use crate::cache_system::{
         EvictResult, HookDecision,
     },
     hook_limited::HookLimitedCache,
-    s3fifo::S3FifoCache,
+    s3_fifo_cache::S3FifoCache,
     utils::str_err,
     Cache, CacheState, HasSize,
 };
+
+/// The extra size of entries when the S3-FIFO is used.
+///
+/// This is because the internal bookkeeping of the S3-FIFO implementation is more precise.
+const S3_FIFO_EXTRA_SIZE: usize = 56;
 
 /// Statistics about a [`Future`].
 pub(crate) struct FutureStats {
@@ -194,13 +199,17 @@ where
 pub(crate) async fn test_happy_path(setup: TestSetup, use_s3fifo: bool) {
     let TestSetup { cache, observer } = setup;
 
+    let test_size = 1001;
+    let test_size_hook = test_size + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
+    let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
-        Box::new(|_k| async move {
+        &k1,
+        Box::new(move |_k| async move {
             barrier_captured.wait().await;
-            Ok(TestValue(1001))
+            Ok(TestValue(test_size))
         }
         .boxed())
     ));
@@ -209,12 +218,12 @@ pub(crate) async fn test_happy_path(setup: TestSetup, use_s3fifo: bool) {
 
     let ((res, state), _) = tokio::join!(fut, barrier.wait());
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(1001)));
+    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
@@ -223,7 +232,7 @@ pub(crate) async fn test_happy_path(setup: TestSetup, use_s3fifo: bool) {
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
@@ -233,8 +242,14 @@ pub(crate) async fn test_happy_path(setup: TestSetup, use_s3fifo: bool) {
             observer.records(),
             vec![
                 TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(1001)),
-                TestHookRecord::Evict(0, "k1", EvictResult::Fetched { size: 1001 })
+                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
+                TestHookRecord::Evict(
+                    0,
+                    "k1",
+                    EvictResult::Fetched {
+                        size: test_size_hook
+                    }
+                )
             ]
         );
     }
@@ -245,8 +260,9 @@ pub(crate) async fn test_panic_loader(setup: TestSetup, use_s3fifo: bool) {
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
+    let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
+        &k1,
         Box::new(|_k| async move {
             barrier_captured.wait().await;
             panic!("foo")
@@ -259,15 +275,28 @@ pub(crate) async fn test_panic_loader(setup: TestSetup, use_s3fifo: bool) {
     let ((res, state), _) = tokio::join!(fut, barrier.wait());
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "panic: foo");
-    assert_eq!(
-        observer.records(),
-        vec![
-            TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned()))
-        ]
-    );
 
-    if !use_s3fifo {
+    if use_s3fifo {
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned())),
+                TestHookRecord::Evict(0, "k1", EvictResult::Failed)
+            ]
+        );
+
+        // data gone
+        assert!(cache.get(&"k1").is_none());
+    } else {
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned()))
+            ]
+        );
+
         cache.prune();
         assert_eq!(
             observer.records(),
@@ -277,6 +306,9 @@ pub(crate) async fn test_panic_loader(setup: TestSetup, use_s3fifo: bool) {
                 TestHookRecord::Evict(0, "k1", EvictResult::Failed)
             ]
         );
+
+        // data gone
+        assert!(cache.get(&"k1").is_none());
     }
 }
 
@@ -285,8 +317,9 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup, use_s3fifo: bool) {
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
+    let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
+        &k1,
         Box::new(|_k| async move {
             barrier_captured.wait().await;
             Err(str_err("my error"))
@@ -299,15 +332,28 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup, use_s3fifo: bool) {
     let ((res, state), _) = tokio::join!(fut, barrier.wait());
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "my error");
-    assert_eq!(
-        observer.records(),
-        vec![
-            TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Err("my error".to_owned()))
-        ]
-    );
 
-    if !use_s3fifo {
+    if use_s3fifo {
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("my error".to_owned())),
+                TestHookRecord::Evict(0, "k1", EvictResult::Failed),
+            ]
+        );
+
+        // data gone
+        assert!(cache.get(&"k1").is_none());
+    } else {
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("my error".to_owned()))
+            ]
+        );
+
         cache.prune();
         assert_eq!(
             observer.records(),
@@ -317,6 +363,9 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup, use_s3fifo: bool) {
                 TestHookRecord::Evict(0, "k1", EvictResult::Failed)
             ]
         );
+
+        // data gone
+        assert!(cache.get(&"k1").is_none());
     }
 }
 
@@ -327,8 +376,9 @@ async fn test_error_path_loader_and_evict_by_observer() {
     observer.mock_next_fetch(HookDecision::Evict);
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
+    let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
+        &k1,
         Box::new(|_k| async move {
             barrier_captured.wait().await;
             Err(str_err("my error"))
@@ -353,7 +403,7 @@ async fn test_error_path_loader_and_evict_by_observer() {
     // entry is gone
     let (_res, state) = cache
         .get_or_fetch(
-            &"k1",
+            &k1,
             Box::new(|_k| async move { Ok(TestValue(1002)) }.boxed()),
         )
         .await;
@@ -376,19 +426,23 @@ async fn test_error_path_loader_and_evict_by_observer() {
 pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup, use_s3fifo: bool) {
     let TestSetup { cache, observer } = setup;
 
+    let test_size = 1001;
+    let test_size_hook = test_size + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+
+    let k1 = Arc::new("k1");
     let (res, state) = cache
         .get_or_fetch(
-            &"k1",
-            Box::new(|_k| async move { Ok(TestValue(1001)) }.boxed()),
+            &k1,
+            Box::new(move |_k| async move { Ok(TestValue(test_size)) }.boxed()),
         )
         .await;
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(1001)));
+    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
@@ -397,25 +451,25 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup, use_s3fifo: bool)
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
     let (res, state) = cache
         .get_or_fetch(
-            &"k1",
-            Box::new(|_k| async move { Ok(TestValue(1001)) }.boxed()),
+            &k1,
+            Box::new(move |_k| async move { Ok(TestValue(test_size)) }.boxed()),
         )
         .await;
     assert_eq!(state, CacheState::WasCached);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(1001)));
+    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
 
     cache.prune();
     assert_eq!(
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
@@ -425,23 +479,34 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup, use_s3fifo: bool)
             observer.records(),
             vec![
                 TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(1001)),
-                TestHookRecord::Evict(0, "k1", EvictResult::Fetched { size: 1001 })
+                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
+                TestHookRecord::Evict(
+                    0,
+                    "k1",
+                    EvictResult::Fetched {
+                        size: test_size_hook
+                    }
+                )
             ]
         );
     }
 }
 
-pub(crate) async fn test_already_loading(setup: TestSetup, _use_s3fifo: bool) {
+pub(crate) async fn test_already_loading(setup: TestSetup, use_s3fifo: bool) {
     let TestSetup { cache, observer } = setup;
+
+    let test_size_1 = 1001;
+    let test_size_1_hook = test_size_1 + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_2 = 1002;
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
+    let k1 = Arc::new("k1");
     let mut fut_1 = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
-        Box::new(|_k| async move {
+        &k1,
+        Box::new(move |_k| async move {
             barrier_captured.wait().await;
-            Ok(TestValue(1001))
+            Ok(TestValue(test_size_1))
         }
         .boxed())
     ));
@@ -449,24 +514,24 @@ pub(crate) async fn test_already_loading(setup: TestSetup, _use_s3fifo: bool) {
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let mut fut_2 = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
-        Box::new(|_k| { { async move { Ok(TestValue(1002)) } }.boxed() })
+        &k1,
+        Box::new(move |_k| { { async move { Ok(TestValue(test_size_2)) } }.boxed() })
     ));
     fut_2.assert_pending().await;
 
     let (_, (fut_res, state)) = tokio::join!(barrier.wait(), fut_1);
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(fut_res.unwrap(), Arc::new(TestValue(1001)));
+    assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size_1)));
 
     let (fut_res, state) = fut_2.await;
     assert_eq!(state, CacheState::AlreadyLoading);
-    assert_eq!(fut_res.unwrap(), Arc::new(TestValue(1001)));
+    assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size_1)));
 
     assert_eq!(
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001)),
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_1_hook)),
         ]
     );
 }
@@ -477,8 +542,9 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup, _use_s3fifo: 
     let barrier = Arc::new(Barrier::new(2));
     {
         let barrier_captured = Arc::clone(&barrier);
+        let k1 = Arc::new("k1");
         let mut fut = std::pin::pin!(cache.get_or_fetch(
-            &"k1",
+            &k1,
             Box::new(move |_k| {
                 {
                     let barrier = Arc::clone(&barrier_captured);
@@ -506,8 +572,9 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup, _use_s3fi
     const N_IO_STEPS: usize = 10;
     let barriers = Arc::new((0..N_IO_STEPS).map(|_| Barrier::new(2)).collect::<Vec<_>>());
     let barriers_captured = Arc::clone(&barriers);
+    let k1 = Arc::new("k1");
     let mut fut = cache.get_or_fetch(
-        &"k1",
+        &k1,
         Box::new(|_k| {
             async move {
                 for barrier in barriers_captured.iter() {
@@ -553,8 +620,9 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup, _use_s3f
     const N_IO_STEPS: usize = 10;
     let barriers = Arc::new((0..N_IO_STEPS).map(|_| Barrier::new(2)).collect::<Vec<_>>());
     let barriers_captured = Arc::clone(&barriers);
+    let k1 = Arc::new("k1");
     let mut fut_1 = cache.get_or_fetch(
-        &"k1",
+        &k1,
         Box::new(|_k| {
             async move {
                 for barrier in barriers_captured.iter() {
@@ -569,7 +637,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup, _use_s3f
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let mut fut_2 = cache
-        .get_or_fetch(&"k1", Box::new(|_k| async move { unreachable!() }.boxed()))
+        .get_or_fetch(&k1, Box::new(|_k| async move { unreachable!() }.boxed()))
         .boxed();
     fut_2.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
@@ -618,16 +686,21 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
     let cache_captured = &cache;
     let mut fut = rt_1
         .block_on(async move {
-            cache_captured.get_or_fetch(
-                &"k1",
-                Box::new(|_k| {
-                    async move {
-                        barrier_captured.wait().await;
-                        panic!("foo")
-                    }
-                    .boxed()
-                }),
-            )
+            Box::new(async move {
+                let k1 = Arc::new("k1");
+                cache_captured
+                    .get_or_fetch(
+                        &k1,
+                        Box::new(|_k| {
+                            async move {
+                                barrier_captured.wait().await;
+                                panic!("foo")
+                            }
+                            .boxed()
+                        }),
+                    )
+                    .await
+            })
         })
         .boxed();
     rt_1.block_on(async {
@@ -654,17 +727,21 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
 pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
     let TestSetup { cache, observer } = setup;
 
+    let test_size = 1001;
+    let test_size_hook = test_size + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+
     // entry does NOT exist yet
-    assert!(cache.get(&"k1").is_none());
+    let k1 = Arc::new("k1");
+    assert!(cache.get(&k1).is_none());
     assert_eq!(observer.records(), vec![],);
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
-        Box::new(|_k| async move {
+        &k1,
+        Box::new(move |_k| async move {
             barrier_captured.wait().await;
-            Ok(TestValue(1001))
+            Ok(TestValue(test_size))
         }
         .boxed())
     ));
@@ -672,30 +749,30 @@ pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     // data is loading but NOT ready yet
-    assert!(cache.get(&"k1").is_none());
+    assert!(cache.get(&k1).is_none());
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (_, (fut_res, state)) = tokio::join!(barrier.wait(), fut);
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(fut_res.unwrap(), Arc::new(TestValue(1001)));
+    assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
     // data ready and loaded
     assert_eq!(
-        cache.get(&"k1").unwrap().unwrap(),
-        Arc::new(TestValue(1001))
+        cache.get(&k1).unwrap().unwrap(),
+        Arc::new(TestValue(test_size))
     );
     assert_eq!(
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
@@ -705,12 +782,12 @@ pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
     assert_eq!(
-        cache.get(&"k1").unwrap().unwrap(),
-        Arc::new(TestValue(1001))
+        cache.get(&k1).unwrap().unwrap(),
+        Arc::new(TestValue(test_size))
     );
 
     cache.prune();
@@ -718,7 +795,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
         observer.records(),
         vec![
             TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Ok(1001))
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
 
@@ -728,19 +805,31 @@ pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
             observer.records(),
             vec![
                 TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(1001)),
-                TestHookRecord::Evict(0, "k1", EvictResult::Fetched { size: 1001 })
+                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
+                TestHookRecord::Evict(
+                    0,
+                    "k1",
+                    EvictResult::Fetched {
+                        size: test_size_hook
+                    }
+                )
             ]
         );
 
         // data gone
-        assert!(cache.get(&"k1").is_none());
+        assert!(cache.get(&k1).is_none());
         assert_eq!(
             observer.records(),
             vec![
                 TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(1001)),
-                TestHookRecord::Evict(0, "k1", EvictResult::Fetched { size: 1001 })
+                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
+                TestHookRecord::Evict(
+                    0,
+                    "k1",
+                    EvictResult::Fetched {
+                        size: test_size_hook
+                    }
+                )
             ]
         );
     }
@@ -750,13 +839,14 @@ pub(crate) async fn test_get_err(setup: TestSetup, use_s3fifo: bool) {
     let TestSetup { cache, observer } = setup;
 
     // entry does NOT exist yet
-    assert!(cache.get(&"k1").is_none());
+    let k1 = Arc::new("k1");
+    assert!(cache.get(&k1).is_none());
     assert_eq!(observer.records(), vec![],);
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &"k1",
+        &k1,
         Box::new(|_k| async move {
             barrier_captured.wait().await;
             Err(str_err("err"))
@@ -767,31 +857,44 @@ pub(crate) async fn test_get_err(setup: TestSetup, use_s3fifo: bool) {
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     // data is loading but NOT ready yet
-    assert!(cache.get(&"k1").is_none());
+    assert!(cache.get(&k1).is_none());
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (_, (fut_res, state)) = tokio::join!(barrier.wait(), fut);
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(fut_res.unwrap_err().to_string(), "err");
-    assert_eq!(
-        observer.records(),
-        vec![
-            TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Err("err".to_owned()))
-        ]
-    );
 
-    // data ready and loaded
-    assert_eq!(cache.get(&"k1").unwrap().unwrap_err().to_string(), "err");
-    assert_eq!(
-        observer.records(),
-        vec![
-            TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Err("err".to_owned()))
-        ]
-    );
+    if use_s3fifo {
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("err".to_owned())),
+                TestHookRecord::Evict(0, "k1", EvictResult::Failed),
+            ]
+        );
 
-    if !use_s3fifo {
+        // data gone
+        assert!(cache.get(&k1).is_none());
+    } else {
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("err".to_owned()))
+            ]
+        );
+
+        // data ready and loaded
+        assert_eq!(cache.get(&k1).unwrap().unwrap_err().to_string(), "err");
+        assert_eq!(
+            observer.records(),
+            vec![
+                TestHookRecord::Insert(0, "k1"),
+                TestHookRecord::Fetched(0, "k1", Err("err".to_owned()))
+            ]
+        );
+
         // errors/failed entries are NOT kept alive
         cache.prune();
         assert_eq!(
@@ -804,7 +907,7 @@ pub(crate) async fn test_get_err(setup: TestSetup, use_s3fifo: bool) {
         );
 
         // data gone
-        assert!(cache.get(&"k1").is_none());
+        assert!(cache.get(&k1).is_none());
         assert_eq!(
             observer.records(),
             vec![
@@ -814,6 +917,46 @@ pub(crate) async fn test_get_err(setup: TestSetup, use_s3fifo: bool) {
             ]
         );
     }
+}
+
+pub(crate) async fn test_hook_gen(setup: TestSetup, use_s3fifo: bool) {
+    let TestSetup { cache, observer } = setup;
+
+    let test_size_1 = 1001;
+    let test_size_2 = 1002;
+    let test_size_1_hook = test_size_1 + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_2_hook = test_size_2 + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+
+    let k1 = Arc::new("k1");
+    let k2 = Arc::new("k2");
+
+    let (res, state) = cache
+        .get_or_fetch(
+            &k1,
+            Box::new(move |_k| async move { Ok(TestValue(test_size_1)) }.boxed()),
+        )
+        .await;
+    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size_1)));
+
+    let (res, state) = cache
+        .get_or_fetch(
+            &k2,
+            Box::new(move |_k| async move { Ok(TestValue(test_size_2)) }.boxed()),
+        )
+        .await;
+    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size_2)));
+
+    assert_eq!(
+        observer.records(),
+        vec![
+            TestHookRecord::Insert(0, "k1"),
+            TestHookRecord::Fetched(0, "k1", Ok(test_size_1_hook)),
+            TestHookRecord::Insert(1, "k2"),
+            TestHookRecord::Fetched(1, "k2", Ok(test_size_2_hook)),
+        ]
+    );
 }
 
 pub(crate) struct TestSetup {
@@ -833,7 +976,13 @@ impl TestSetup {
     pub(crate) fn get_s3fifo() -> Self {
         let observer = Arc::new(TestHook::default());
         Self {
-            cache: Arc::new(S3FifoCache::new(10000, 0.25, Arc::clone(&observer) as _)),
+            cache: Arc::new(S3FifoCache::new(
+                10_000,
+                10_000,
+                0.25,
+                Arc::clone(&observer) as _,
+                &metric::Registry::new(),
+            )),
             observer,
         }
     }
@@ -884,6 +1033,7 @@ macro_rules! gen_cache_tests {
                 test_get_err,
                 test_perfect_waking_two_consumers,
                 test_perfect_waking_one_consumer,
+                test_hook_gen,
             ],
         );
     };

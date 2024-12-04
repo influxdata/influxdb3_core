@@ -13,6 +13,7 @@ workspace = true
 authz = { path = "../authz" }
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
+error_reporting = { path = "../error_reporting" }
 flightsql = { path = "../flightsql" }
 generated_types = { path = "../generated_types" }
 observability_deps = { path = "../observability_deps" }
@@ -20,21 +21,28 @@ iox_query = { path = "../iox_query" }
 iox_query_influxql = { path = "../iox_query_influxql" }
 iox_query_params = { path = "../iox_query_params" }
 service_common = { path = "../service_common" }
-tower_trailer = { path = "../tower_trailer"}
-trace = { path = "../trace"}
-trace_http = { path = "../trace_http"}
-tracker = { path = "../tracker" }
+tower_trailer = { path = "../tower_trailer" }
+trace = { path = "../trace" }
+trace_http = { path = "../trace_http" }
 
 # Crates.io dependencies, in alphabetical order
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
-bytes = "1.8"
+bytes = "1.9"
 futures = "0.3"
 prost = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.132"
+serde_json = "1.0.133"
 snafu = "0.8"
-tokio = { version = "1.41", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.41", features = [
+    "macros",
+    "net",
+    "parking_lot",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tonic = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

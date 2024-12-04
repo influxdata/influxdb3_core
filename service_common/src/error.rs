@@ -1,4 +1,6 @@
-//! Routines for error handling
+//! Utilities for error handling in IOx services
+use arrow::error::ArrowError;
+use arrow_flight::error::FlightError;
 use datafusion::error::DataFusionError;
 
 /// Converts a [`DataFusionError`] into the appropriate [`tonic::Code`]
@@ -36,7 +38,6 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
         // so the user has a chance to see them.
         | DataFusionError::Execution(_)
         | DataFusionError::ExecutionJoin(_)
-        | DataFusionError::ArrowError(_, _)
         // DataFusion most often returns "NotImplemented" when a
         // particular SQL feature is not implemented. This
         // information is useful to the user who may be able to
@@ -52,6 +53,7 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
         | DataFusionError::Plan(_) => tonic::Code::InvalidArgument,
         DataFusionError::Context(_,_) => unreachable!("handled in chain traversal above"),
         // External errors are mostly traversed by the DataFusion already except for some IOx errors
+        DataFusionError::ArrowError(e, _) => arrow_error_to_tonic_code(e),
         DataFusionError::External(e) => {
             dyn_error_to_tonic_code(e.as_ref())
         }
@@ -73,9 +75,51 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
     }
 }
 
+/// Translate [`FlightError`] to [tonic code](tonic::Status).
+///
+/// This is done by traversing the error chain, similar to [`datafusion_error_to_tonic_code`].
+pub fn flight_error_to_tonic_code(e: &FlightError) -> tonic::Code {
+    match e {
+        FlightError::Arrow(e) => arrow_error_to_tonic_code(e),
+        FlightError::NotYetImplemented(_) => tonic::Code::Unimplemented,
+        FlightError::Tonic(status) => status.code(),
+        FlightError::ProtocolError(_) | FlightError::DecodeError(_) => tonic::Code::Internal,
+        FlightError::ExternalError(e) => dyn_error_to_tonic_code(e.as_ref()),
+    }
+}
+
+fn arrow_error_to_tonic_code(e: &ArrowError) -> tonic::Code {
+    match e {
+        ArrowError::NotYetImplemented(_) => tonic::Code::Unimplemented,
+        ArrowError::ExternalError(e) => dyn_error_to_tonic_code(e.as_ref()),
+        ArrowError::CastError(_)
+        | ArrowError::MemoryError(_)
+        | ArrowError::ParseError(_)
+        | ArrowError::SchemaError(_)
+        | ArrowError::ComputeError(_)
+        | ArrowError::DivideByZero
+        | ArrowError::ArithmeticOverflow(_)
+        | ArrowError::CsvError(_)
+        | ArrowError::JsonError(_)
+        | ArrowError::IoError(_, _)
+        | ArrowError::IpcError(_)
+        | ArrowError::InvalidArgumentError(_)
+        | ArrowError::ParquetError(_)
+        | ArrowError::CDataInterface(_)
+        | ArrowError::DictionaryKeyOverflowError
+        | ArrowError::RunEndIndexOverflowError => tonic::Code::InvalidArgument,
+    }
+}
+
 fn dyn_error_to_tonic_code(e: &(dyn std::error::Error + Send + Sync + 'static)) -> tonic::Code {
-    if let Some(e) = e.downcast_ref::<executor::JobError>() {
+    if let Some(e) = e.downcast_ref::<ArrowError>() {
+        arrow_error_to_tonic_code(e)
+    } else if let Some(e) = e.downcast_ref::<DataFusionError>() {
+        datafusion_error_to_tonic_code(e)
+    } else if let Some(e) = e.downcast_ref::<executor::JobError>() {
         executor_error_to_tonic_code(e)
+    } else if let Some(e) = e.downcast_ref::<FlightError>() {
+        flight_error_to_tonic_code(e)
     } else if let Some(e) = e.downcast_ref::<object_store::Error>() {
         object_store_error_to_tonic_code(e)
     } else {
@@ -120,6 +164,7 @@ fn object_store_error_to_tonic_code(e: &object_store::Error) -> tonic::Code {
 #[cfg(test)]
 mod test {
     use datafusion::sql::sqlparser::parser::ParserError;
+    use executor::JobError;
 
     use super::*;
 
@@ -154,6 +199,41 @@ mod test {
                 Box::new(DataFusionError::ResourcesExhausted("foo".to_string())),
             ),
             tonic::Code::ResourceExhausted,
+        );
+
+        // arrow errors
+        do_transl_test(
+            DataFusionError::ArrowError(ArrowError::NotYetImplemented("foo".to_string()), None),
+            tonic::Code::Unimplemented,
+        );
+
+        // flight errors
+        do_transl_test(
+            FlightError::NotYetImplemented("foo".to_string()),
+            tonic::Code::Unimplemented,
+        );
+        do_transl_test(
+            FlightError::Tonic(tonic::Status::new(tonic::Code::DataLoss, "foo")),
+            tonic::Code::DataLoss,
+        );
+        do_transl_test(
+            FlightError::ExternalError(Box::new(ArrowError::NotYetImplemented("foo".to_string()))),
+            tonic::Code::Unimplemented,
+        );
+        do_transl_test(
+            FlightError::ExternalError(Box::new(DataFusionError::External(Box::new(
+                DataFusionError::ResourcesExhausted(s.clone()),
+            )))),
+            tonic::Code::ResourceExhausted,
+        );
+        do_transl_test(
+            FlightError::ExternalError(Box::new(DataFusionError::ObjectStore(
+                object_store::Error::Generic {
+                    store: "foo",
+                    source: Box::new(DataFusionError::Plan(s.clone())),
+                },
+            ))),
+            tonic::Code::InvalidArgument,
         );
 
         // inspect "external" errors
@@ -195,11 +275,38 @@ mod test {
             tonic::Code::InvalidArgument,
         );
 
+        // all dyn errors in a row
+        do_transl_test(
+            DataFusionError::External(Box::new(ArrowError::ExternalError(Box::new(
+                FlightError::ExternalError(Box::new(JobError::WorkerGone)),
+            )))),
+            tonic::Code::Unavailable,
+        );
+
         // make sure that the last s.clone() is OK
         drop(s);
     }
 
-    fn do_transl_test(e: DataFusionError, code: tonic::Code) {
-        assert_eq!(datafusion_error_to_tonic_code(&e), code);
+    fn do_transl_test<E>(e: E, code: tonic::Code)
+    where
+        E: Translate,
+    {
+        assert_eq!(e.to_code(), code);
+    }
+
+    trait Translate {
+        fn to_code(&self) -> tonic::Code;
+    }
+
+    impl Translate for DataFusionError {
+        fn to_code(&self) -> tonic::Code {
+            datafusion_error_to_tonic_code(self)
+        }
+    }
+
+    impl Translate for FlightError {
+        fn to_code(&self) -> tonic::Code {
+            flight_error_to_tonic_code(self)
+        }
     }
 }

@@ -39,7 +39,7 @@ impl MemoryLimiter {
 }
 
 impl<K> Hook<K> for MemoryLimiter {
-    fn fetched(&self, _gen: u64, _k: &K, res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, _gen: u64, _k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
         let Ok(size) = res else {
             return HookDecision::Keep;
         };
@@ -66,7 +66,7 @@ impl<K> Hook<K> for MemoryLimiter {
         }
     }
 
-    fn evict(&self, _gen: u64, _k: &K, res: EvictResult) {
+    fn evict(&self, _gen: u64, _k: &Arc<K>, res: EvictResult) {
         if let EvictResult::Fetched { size } = res {
             self.current.fetch_sub(size, Ordering::Relaxed);
         }
@@ -84,37 +84,58 @@ mod tests {
         let limiter = MemoryLimiter::new(NonZeroUsize::new(100).unwrap());
         let oom_counter = NotificationCounter::new(limiter.oom()).await;
 
-        assert_eq!(limiter.fetched(1, &(), Ok(20)), HookDecision::Keep);
-        assert_eq!(limiter.fetched(2, &(), Ok(70)), HookDecision::Keep);
+        assert_eq!(
+            limiter.fetched(1, &Arc::new(()), Ok(20)),
+            HookDecision::Keep
+        );
+        assert_eq!(
+            limiter.fetched(2, &Arc::new(()), Ok(70)),
+            HookDecision::Keep
+        );
         oom_counter.wait_for(0).await;
 
-        assert_eq!(limiter.fetched(3, &(), Ok(20)), HookDecision::Evict);
+        assert_eq!(
+            limiter.fetched(3, &Arc::new(()), Ok(20)),
+            HookDecision::Evict
+        );
         oom_counter.wait_for(1).await;
 
-        assert_eq!(limiter.fetched(4, &(), Ok(10)), HookDecision::Keep);
-        assert_eq!(limiter.fetched(5, &(), Ok(0)), HookDecision::Keep);
+        assert_eq!(
+            limiter.fetched(4, &Arc::new(()), Ok(10)),
+            HookDecision::Keep
+        );
+        assert_eq!(limiter.fetched(5, &Arc::new(()), Ok(0)), HookDecision::Keep);
 
-        assert_eq!(limiter.fetched(6, &(), Ok(1)), HookDecision::Evict);
+        assert_eq!(
+            limiter.fetched(6, &Arc::new(()), Ok(1)),
+            HookDecision::Evict
+        );
         oom_counter.wait_for(2).await;
 
-        limiter.evict(7, &(), EvictResult::Fetched { size: 10 });
-        assert_eq!(limiter.fetched(8, &(), Ok(10)), HookDecision::Keep);
+        limiter.evict(7, &Arc::new(()), EvictResult::Fetched { size: 10 });
+        assert_eq!(
+            limiter.fetched(8, &Arc::new(()), Ok(10)),
+            HookDecision::Keep
+        );
 
-        limiter.evict(9, &(), EvictResult::Fetched { size: 100 });
+        limiter.evict(9, &Arc::new(()), EvictResult::Fetched { size: 100 });
 
         // Can add single value taking entire range
-        assert_eq!(limiter.fetched(10, &(), Ok(100)), HookDecision::Keep);
-        limiter.evict(11, &(), EvictResult::Fetched { size: 100 });
+        assert_eq!(
+            limiter.fetched(10, &Arc::new(()), Ok(100)),
+            HookDecision::Keep
+        );
+        limiter.evict(11, &Arc::new(()), EvictResult::Fetched { size: 100 });
 
         // Protected against overflow
         assert_eq!(
-            limiter.fetched(12, &(), Ok(usize::MAX)),
+            limiter.fetched(12, &Arc::new(()), Ok(usize::MAX)),
             HookDecision::Evict,
         );
 
         // errors are kept
         assert_eq!(
-            limiter.fetched(13, &(), Err(&str_err("foo"))),
+            limiter.fetched(13, &Arc::new(()), Err(&str_err("foo"))),
             HookDecision::Keep
         );
     }

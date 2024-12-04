@@ -193,7 +193,7 @@ pub struct EvictionStats {
 #[allow(missing_debug_implementations)]
 pub struct CacheIterator<'a>(dashmap::iter::Iter<'a, CacheKey, CacheEntry>);
 
-impl<'a> Iterator for CacheIterator<'a> {
+impl Iterator for CacheIterator<'_> {
     type Item = (CacheKey, CacheValue);
 
     fn next(&mut self) -> Option<Self::Item> {

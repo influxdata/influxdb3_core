@@ -62,7 +62,7 @@ impl<'v> VirtualFunctionFinder<'v> {
     }
 }
 
-impl<'n, 'v> TreeNodeVisitor<'n> for VirtualFunctionFinder<'v> {
+impl<'n> TreeNodeVisitor<'n> for VirtualFunctionFinder<'_> {
     type Node = Expr;
 
     fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {

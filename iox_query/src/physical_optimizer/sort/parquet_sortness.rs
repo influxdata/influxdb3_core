@@ -109,7 +109,7 @@ struct ParquetSortnessRewriter<'a> {
     desired_ordering: &'a [PhysicalSortExpr],
 }
 
-impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
+impl TreeNodeRewriter for ParquetSortnessRewriter<'_> {
     type Node = Arc<dyn ExecutionPlan>;
 
     fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {

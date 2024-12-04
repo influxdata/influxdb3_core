@@ -28,13 +28,13 @@ impl<K> std::fmt::Debug for HookChain<K> {
 }
 
 impl<K> Hook<K> for HookChain<K> {
-    fn insert(&self, gen: u64, k: &K) {
+    fn insert(&self, gen: u64, k: &Arc<K>) {
         for hook in &self.hooks {
             hook.insert(gen, k);
         }
     }
 
-    fn fetched(&self, gen: u64, k: &K, res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, gen: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
         self.hooks
             .iter()
             .map(|hook| hook.fetched(gen, k, res))
@@ -44,7 +44,7 @@ impl<K> Hook<K> for HookChain<K> {
             .unwrap_or_default()
     }
 
-    fn evict(&self, gen: u64, k: &K, res: EvictResult) {
+    fn evict(&self, gen: u64, k: &Arc<K>, res: EvictResult) {
         for hook in &self.hooks {
             hook.evict(gen, k, res);
         }
@@ -64,15 +64,18 @@ mod tests {
     fn test_empty_hook_chain() {
         let chain = HookChain::<()>::new([]);
 
-        chain.insert(1, &());
-        assert_eq!(chain.fetched(2, &(), Ok(1)), HookDecision::default(),);
+        chain.insert(1, &Arc::new(()));
         assert_eq!(
-            chain.fetched(3, &(), Err(&str_err("foo"))),
+            chain.fetched(2, &Arc::new(()), Ok(1)),
             HookDecision::default(),
         );
-        chain.evict(4, &(), EvictResult::Unfetched);
-        chain.evict(5, &(), EvictResult::Fetched { size: 1 });
-        chain.evict(6, &(), EvictResult::Failed);
+        assert_eq!(
+            chain.fetched(3, &Arc::new(()), Err(&str_err("foo"))),
+            HookDecision::default(),
+        );
+        chain.evict(4, &Arc::new(()), EvictResult::Unfetched);
+        chain.evict(5, &Arc::new(()), EvictResult::Fetched { size: 1 });
+        chain.evict(6, &Arc::new(()), EvictResult::Failed);
     }
 
     #[test]
@@ -81,55 +84,64 @@ mod tests {
         let h2 = Arc::new(TestHook::<u8>::default());
         let chain = HookChain::<u8>::new([Arc::clone(&h1) as _, Arc::clone(&h2) as _]);
 
-        chain.insert(0, &0);
+        chain.insert(0, &Arc::new(0));
 
         h1.mock_next_fetch(HookDecision::Keep);
         h2.mock_next_fetch(HookDecision::Keep);
-        assert_eq!(chain.fetched(1, &1, Ok(1000)), HookDecision::Keep);
+        assert_eq!(chain.fetched(1, &Arc::new(1), Ok(1000)), HookDecision::Keep);
 
         h1.mock_next_fetch(HookDecision::Keep);
         h2.mock_next_fetch(HookDecision::Keep);
         assert_eq!(
-            chain.fetched(2, &2, Err(&str_err("e1"))),
+            chain.fetched(2, &Arc::new(2), Err(&str_err("e1"))),
             HookDecision::Keep
         );
 
         h1.mock_next_fetch(HookDecision::Evict);
         h2.mock_next_fetch(HookDecision::Keep);
-        assert_eq!(chain.fetched(3, &3, Ok(2000)), HookDecision::Evict,);
+        assert_eq!(
+            chain.fetched(3, &Arc::new(3), Ok(2000)),
+            HookDecision::Evict,
+        );
 
         h1.mock_next_fetch(HookDecision::Evict);
         h2.mock_next_fetch(HookDecision::Keep);
         assert_eq!(
-            chain.fetched(4, &4, Err(&str_err("e2"))),
+            chain.fetched(4, &Arc::new(4), Err(&str_err("e2"))),
             HookDecision::Evict,
         );
 
         h1.mock_next_fetch(HookDecision::Keep);
         h2.mock_next_fetch(HookDecision::Evict);
-        assert_eq!(chain.fetched(5, &5, Ok(3000)), HookDecision::Evict,);
+        assert_eq!(
+            chain.fetched(5, &Arc::new(5), Ok(3000)),
+            HookDecision::Evict,
+        );
 
         h1.mock_next_fetch(HookDecision::Keep);
         h2.mock_next_fetch(HookDecision::Evict);
         assert_eq!(
-            chain.fetched(6, &6, Err(&str_err("e3"))),
+            chain.fetched(6, &Arc::new(6), Err(&str_err("e3"))),
             HookDecision::Evict,
         );
-
-        h1.mock_next_fetch(HookDecision::Evict);
-        h2.mock_next_fetch(HookDecision::Evict);
-        assert_eq!(chain.fetched(7, &7, Ok(4000)), HookDecision::Evict,);
 
         h1.mock_next_fetch(HookDecision::Evict);
         h2.mock_next_fetch(HookDecision::Evict);
         assert_eq!(
-            chain.fetched(8, &8, Err(&str_err("e4"))),
+            chain.fetched(7, &Arc::new(7), Ok(4000)),
             HookDecision::Evict,
         );
 
-        chain.evict(9, &9, EvictResult::Unfetched);
-        chain.evict(10, &10, EvictResult::Fetched { size: 5000 });
-        chain.evict(11, &11, EvictResult::Failed);
+        h1.mock_next_fetch(HookDecision::Evict);
+        h2.mock_next_fetch(HookDecision::Evict);
+        assert_eq!(
+            chain.fetched(8, &Arc::new(8), Err(&str_err("e4"))),
+            HookDecision::Evict,
+        );
+
+        chain.evict(9, &Arc::new(9), EvictResult::Unfetched);
+        chain.evict(10, &Arc::new(10), EvictResult::Fetched { size: 5000 });
+        chain.evict(11, &Arc::new(11), EvictResult::Failed);
 
         let records = vec![
             TestHookRecord::Insert(0, 0),

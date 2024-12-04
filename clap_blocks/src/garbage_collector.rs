@@ -289,6 +289,18 @@ pub struct GarbageCollectorConfig {
         env = "INFLUXDB_IOX_ENABLE_PG_DUMP"
     )]
     pub enable_pg_dump: bool,
+
+    /// DSN that's direct to postgres for use with pg_dump
+    /// If there is no catalog service, this will match the other DSN, but when the catalog service
+    /// is in use, this will be different.  pg_dump must always go straight to postgres, so this
+    /// variable exists to provide the correct DSN for it.
+    #[clap(
+        hide = true,
+        long = "catalog-direct-dsn",
+        env = "INFLUXDB_IOX_CATALOG_DIRECT_DSN",
+        action
+    )]
+    pub direct_dsn: Option<String>,
 }
 
 impl GarbageCollectorConfig {

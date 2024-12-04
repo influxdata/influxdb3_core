@@ -41,7 +41,7 @@ impl<'a, W: Write> PrometheusTextEncoder<'a, W> {
     }
 }
 
-impl<'a, W: Write> metric::Reporter for PrometheusTextEncoder<'a, W> {
+impl<W: Write> metric::Reporter for PrometheusTextEncoder<'_, W> {
     fn start_metric(
         &mut self,
         metric_name: &'static str,

@@ -285,6 +285,43 @@ pub struct ObjectStoreConfig {
         action
     )]
     pub http2_max_frame_size: Option<u32>,
+
+    /// The maximum number of times to retry a request
+    ///
+    /// Set to 0 to disable retries
+    #[clap(
+        long = "object-store-max-retries",
+        env = "OBJECT_STORE_MAX_RETRIES",
+        action
+    )]
+    pub max_retries: Option<usize>,
+
+    /// The maximum length of time from the initial request
+    /// after which no further retries will be attempted
+    ///
+    /// This not only bounds the length of time before a server
+    /// error will be surfaced to the application, but also bounds
+    /// the length of time a request's credentials must remain valid.
+    ///
+    /// As requests are retried without renewing credentials or
+    /// regenerating request payloads, this number should be kept
+    /// below 5 minutes to avoid errors due to expired credentials
+    /// and/or request payloads
+    #[clap(
+        long = "object-store-retry-timeout",
+        env = "OBJECT_STORE_RETRY_TIMEOUT",
+        value_parser = humantime::parse_duration,
+        action
+    )]
+    pub retry_timeout: Option<Duration>,
+
+    /// Endpoint of an S3 compatible, HTTP/2 enabled object store cache.
+    #[clap(
+        long = "object-store-cache-endpoint",
+        env = "OBJECT_STORE_CACHE_ENDPOINT",
+        action
+    )]
+    pub cache_endpoint: Option<Endpoint>,
 }
 
 impl ObjectStoreConfig {
@@ -314,6 +351,9 @@ impl ObjectStoreConfig {
             object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
             http2_only: Default::default(),
             http2_max_frame_size: Default::default(),
+            max_retries: Default::default(),
+            retry_timeout: Default::default(),
+            cache_endpoint: Default::default(),
         }
     }
 
@@ -329,6 +369,21 @@ impl ObjectStoreConfig {
         }
 
         options
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn retry_config(&self) -> object_store::RetryConfig {
+        let mut retry_config = object_store::RetryConfig::default();
+
+        if let Some(max_retries) = self.max_retries {
+            retry_config.max_retries = max_retries;
+        }
+
+        if let Some(retry_timeout) = self.retry_timeout {
+            retry_config.retry_timeout = retry_timeout;
+        }
+
+        retry_config
     }
 }
 
@@ -375,7 +430,9 @@ fn new_gcs(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError
 
     info!(bucket=?config.bucket, object_store_type="GCS", "Object Store");
 
-    let mut builder = GoogleCloudStorageBuilder::new().with_client_options(config.client_options());
+    let mut builder = GoogleCloudStorageBuilder::new()
+        .with_client_options(config.client_options())
+        .with_retry(config.retry_config());
 
     if let Some(bucket) = &config.bucket {
         builder = builder.with_bucket_name(bucket);
@@ -423,6 +480,7 @@ pub fn s3_builder(config: &ObjectStoreConfig) -> object_store::aws::AmazonS3Buil
         .with_client_options(config.client_options())
         .with_allow_http(config.aws_allow_http)
         .with_region(&config.aws_default_region)
+        .with_retry(config.retry_config())
         .with_skip_signature(config.aws_skip_signature)
         .with_imdsv1_fallback();
 
@@ -465,7 +523,9 @@ fn new_azure(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseErr
     info!(bucket=?config.bucket, account=?config.azure_storage_account,
           object_store_type="Azure", "Object Store");
 
-    let mut builder = MicrosoftAzureBuilder::new().with_client_options(config.client_options());
+    let mut builder = MicrosoftAzureBuilder::new()
+        .with_client_options(config.client_options())
+        .with_retry(config.retry_config());
 
     if let Some(bucket) = &config.bucket {
         builder = builder.with_container_name(bucket);
@@ -486,6 +546,49 @@ fn new_azure(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseErr
 #[cfg(not(feature = "azure"))]
 fn new_azure(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     panic!("Azure blob storage support not enabled, recompile with the azure feature enabled")
+}
+
+/// Build cache store.
+#[cfg(feature = "aws")]
+pub fn make_cache_store(
+    config: &ObjectStoreConfig,
+) -> Result<Option<Arc<DynObjectStore>>, ParseError> {
+    let Some(endpoint) = &config.cache_endpoint else {
+        return Ok(None);
+    };
+
+    let store = object_store::aws::AmazonS3Builder::new()
+        // bucket name is ignored by our cache server
+        .with_bucket_name(config.bucket.as_deref().unwrap_or("dummy"))
+        .with_client_options(
+            object_store::ClientOptions::new()
+                .with_allow_http(true)
+                .with_http2_only()
+                // this is the maximum that is allowed by the HTTP/2 standard and is meant to lower the overhead of
+                // submitting TCP packages to the kernel
+                .with_http2_max_frame_size(16777215),
+        )
+        .with_endpoint(endpoint.clone())
+        .with_retry(object_store::RetryConfig {
+            max_retries: 3,
+            ..Default::default()
+        })
+        .with_skip_signature(true)
+        .build()
+        .context(InvalidS3ConfigSnafu)?;
+
+    Ok(Some(Arc::new(store)))
+}
+
+/// Build cache store.
+#[cfg(not(feature = "aws"))]
+pub fn make_cache_store(
+    config: &ObjectStoreConfig,
+) -> Result<Option<Arc<DynObjectStore>>, ParseError> {
+    match &config.cache_endpoint {
+        Some(_) => panic!("Cache support not enabled, recompile with the aws feature enabled"),
+        None => Ok(None),
+    }
 }
 
 /// Create config-dependant object store.

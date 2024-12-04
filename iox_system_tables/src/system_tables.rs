@@ -20,7 +20,7 @@ use futures::TryStreamExt;
 
 /// The minimal thing that a system table needs to implement
 #[async_trait]
-pub trait IoxSystemTable: Send + Sync {
+pub trait IoxSystemTable: std::fmt::Debug + Send + Sync {
     /// Produce the schema from this system table
     fn schema(&self) -> SchemaRef;
 
@@ -186,7 +186,7 @@ impl<T: IoxSystemTable + 'static> ExecutionPlan for SystemTableExecutionPlan<T> 
             };
 
             // https://stackoverflow.com/a/17974
-            let n_slices = (batch.num_rows() + batch_size - 1) / batch_size;
+            let n_slices = batch.num_rows().div_ceil(batch_size);
 
             Ok(futures::stream::iter((0..n_slices).map(move |n| {
                 let offset = n * batch_size;

@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use tokio::task::JoinHandle;
 
-use crate::interface::Error as CatalogError;
+use crate::interface::{Error as CatalogError, UnhandledError};
 
 #[derive(Debug, Snafu, Clone)]
 pub(crate) enum Error {
@@ -26,8 +26,10 @@ impl From<Error> for CatalogError {
     fn from(err: Error) -> Self {
         match &err {
             Error::Catalog { source } => source.as_ref().clone(),
-            Error::Join { .. } => Self::External {
-                source: Arc::new(err),
+            Error::Join { .. } => Self::Unhandled {
+                source: UnhandledError::CacheLoader {
+                    source: Arc::new(err),
+                },
             },
         }
     }

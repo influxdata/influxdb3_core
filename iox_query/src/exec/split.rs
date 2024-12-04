@@ -58,6 +58,7 @@ use arrow::{
     datatypes::SchemaRef,
     record_batch::RecordBatch,
 };
+use datafusion::physical_expr::LexRequirement;
 use datafusion::{
     common::DFSchemaRef,
     error::{DataFusionError, Result},
@@ -72,7 +73,6 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-
 use datafusion_util::{watch::WatchedTask, AdapterStream};
 use futures::StreamExt;
 use observability_deps::tracing::*;
@@ -223,7 +223,7 @@ impl ExecutionPlan for StreamSplitExec {
         vec![Distribution::SinglePartition]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         // require that the output ordering of the child is preserved
         // (so that this node logically splits what was desired)
         let requirement = self

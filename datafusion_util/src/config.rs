@@ -27,6 +27,12 @@ pub fn iox_session_config() -> SessionConfig {
     options.execution.time_zone = TIME_DATA_TIMEZONE().map(|s| s.to_string());
     options.optimizer.repartition_sorts = true;
     options.optimizer.prefer_existing_union = true;
+    // ParquetExec now returns estimates rather than actual
+    // row counts, so we must use estimates rather than exact to optimize partitioning
+    // Related to https://github.com/apache/datafusion/issues/8078
+    options
+        .execution
+        .use_row_number_estimates_to_optimize_partitioning = true;
 
     SessionConfig::from(options)
         .with_batch_size(BATCH_SIZE)

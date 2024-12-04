@@ -1,0 +1,136 @@
+// The API for the catalog storage service.
+// Provides storage information, such as namespace and table size.
+
+syntax = "proto3";
+package influxdata.iox.catalog_storage.v1;
+option go_package = "github.com/influxdata/iox/catalog_storage/v1";
+
+import "influxdata/iox/partition_template/v1/template.proto";
+
+service CatalogStorageService {
+    rpc GetNamespacesWithStorage(GetNamespacesWithStorageRequest) returns (GetNamespacesWithStorageResponse);
+    rpc GetNamespaceWithStorage(GetNamespaceWithStorageRequest) returns (GetNamespaceWithStorageResponse);
+
+    rpc GetTablesWithStorage(GetTablesWithStorageRequest) returns (GetTablesWithStorageResponse);
+    rpc GetTableWithStorage(GetTableWithStorageRequest) returns (GetTableWithStorageResponse);
+}
+
+// ============
+// Namespace
+// ============
+
+// Request to get a list of namespaces with storage.
+message GetNamespacesWithStorageRequest {
+    // Pagination and sorting options can be added later:
+    // https://github.com/influxdata/influxdb_iox/issues/12775
+}
+
+// Request to get a specific namespace with storage.
+message GetNamespaceWithStorageRequest {
+    // ID of the namespace to get.
+    //
+    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
+    // team and the Product team regarding requests by name vs ID. This might change.
+    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
+    int64 id = 1;
+}
+
+// Response containing a list of namespaces with storage.
+message GetNamespacesWithStorageResponse {
+    repeated NamespaceWithStorage namespace_with_storage = 1;
+}
+
+// Response containing a specific namespace with storage.
+message GetNamespaceWithStorageResponse {
+    NamespaceWithStorage namespace_with_storage = 1;
+}
+
+message NamespaceWithStorage {
+    // Namespace ID.
+    int64 id = 1;
+
+    // Name of the Namespace.
+    string name = 2;
+    
+    // Retention period in nanoseconds.
+    //
+    // NULL means "infinite retention".
+    optional int64 retention_period_ns = 3;
+
+    // The maximum number of tables which this namespace is allowed to contain.
+    int32 max_tables = 4;
+
+    // The maximum number of columns a table belonging to this namespace may have.
+    int32 max_columns_per_table = 5;
+
+    // The default partitioning scheme used for any new tables that are created
+    // in this namespace, if any.
+    influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 6;
+
+    // Total size of the namespace, in bytes.
+    int64 size_bytes = 7;
+
+    // Total number of active tables in this namespace.
+    int32 table_count = 8;
+}
+
+// ============
+// Table
+// ============
+
+// Request to get a list of tables with storage in a namespace.
+message GetTablesWithStorageRequest {
+    // ID of the namespace for which tables are listed.
+    //
+    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
+    // team and the Product team regarding requests by name vs ID. This might change.
+    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
+    int64 namespace_id = 1;
+
+    // Pagination and sorting options can be added later:
+    // https://github.com/influxdata/influxdb_iox/issues/12775
+}
+
+// Request to get a specific table with storage.
+message GetTableWithStorageRequest {
+    // ID of the namespace to get table for.
+    //
+    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
+    // team and the Product team regarding requests by name vs ID. This might change.
+    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
+    int64 namespace_id = 1;
+
+    // ID of the table to get from namespace.
+    //
+    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
+    // team and the Product team regarding requests by name vs ID. This might change.
+    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
+    int64 table_id = 2;
+}
+
+// Response containing a list of tables with storage.
+message GetTablesWithStorageResponse {
+    repeated TableWithStorage table_with_storage = 1;
+}
+
+// Response containing details of a specific table with storage.
+message GetTableWithStorageResponse {
+    TableWithStorage table_with_storage = 1;
+}
+
+message TableWithStorage {
+    // Table ID.
+    int64 id = 1;
+
+    // Name of the Table.
+    string name = 2;
+
+    // Namespace ID.
+    int64 namespace_id = 3;
+    
+    // The partitioning scheme applied to writes for this table.
+    influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 4;
+
+    // Total size of the table, in bytes.
+    int64 size_bytes = 5;
+}

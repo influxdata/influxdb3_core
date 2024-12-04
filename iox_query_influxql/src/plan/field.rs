@@ -52,7 +52,7 @@ pub(super) fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a F
 
 struct BinaryExprNameVisitor<'a>(&'a mut Vec<String>);
 
-impl<'a> Visitor for BinaryExprNameVisitor<'a> {
+impl Visitor for BinaryExprNameVisitor<'_> {
     type Error = ();
 
     fn pre_visit_var_ref(self, n: &VarRef) -> Result<Recursion<Self>, Self::Error> {

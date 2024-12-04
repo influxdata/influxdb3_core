@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use data_types::{
     partition_template::NamespacePartitionTemplateOverride, Column, ColumnId, ColumnSet,
     ColumnType, CompactionLevel, MaxL0CreatedAt, Namespace, NamespaceId, NamespaceVersion,
@@ -10,176 +8,7 @@ use generated_types::google::protobuf as google;
 use generated_types::influxdata::iox::catalog::v2 as proto;
 use uuid::Uuid;
 
-use crate::interface::SoftDeletedRows;
-
-#[derive(Debug)]
-pub struct Error {
-    msg: String,
-    path: Vec<&'static str>,
-}
-
-impl Error {
-    fn new<E>(e: E) -> Self
-    where
-        E: std::fmt::Display,
-    {
-        Self {
-            msg: e.to_string(),
-            path: vec![],
-        }
-    }
-
-    fn ctx(self, arg: &'static str) -> Self {
-        let Self { msg, mut path } = self;
-        path.insert(0, arg);
-        Self { msg, path }
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if !self.path.is_empty() {
-            write!(f, "{}", self.path[0])?;
-            for p in self.path.iter().skip(1) {
-                write!(f, ".{}", p)?;
-            }
-            write!(f, ": ")?;
-        }
-
-        write!(f, "{}", self.msg)?;
-
-        Ok(())
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<Error> for crate::interface::Error {
-    fn from(e: Error) -> Self {
-        Self::External {
-            source: Arc::new(e),
-        }
-    }
-}
-
-impl From<Error> for tonic::Status {
-    fn from(e: Error) -> Self {
-        Self::invalid_argument(e.to_string())
-    }
-}
-
-pub(crate) trait ConvertExt<O> {
-    fn convert(self) -> Result<O, Error>;
-}
-
-impl<T, O> ConvertExt<O> for T
-where
-    T: TryInto<O>,
-    T::Error: std::fmt::Display,
-{
-    fn convert(self) -> Result<O, Error> {
-        self.try_into().map_err(Error::new)
-    }
-}
-
-pub(crate) trait ConvertOptExt<O> {
-    fn convert_opt(self) -> Result<O, Error>;
-}
-
-impl<T, O> ConvertOptExt<Option<O>> for Option<T>
-where
-    T: TryInto<O>,
-    T::Error: std::fmt::Display,
-{
-    fn convert_opt(self) -> Result<Option<O>, Error> {
-        self.map(|x| x.convert()).transpose()
-    }
-}
-
-pub(crate) trait RequiredExt<T> {
-    fn required(self) -> Result<T, Error>;
-}
-
-impl<T> RequiredExt<T> for Option<T> {
-    fn required(self) -> Result<T, Error> {
-        self.ok_or_else(|| Error::new("required"))
-    }
-}
-
-pub(crate) trait ContextExt<T> {
-    fn ctx(self, path: &'static str) -> Result<T, Error>;
-}
-
-impl<T> ContextExt<T> for Result<T, Error> {
-    fn ctx(self, path: &'static str) -> Self {
-        self.map_err(|e| e.ctx(path))
-    }
-}
-
-pub(crate) fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Status {
-    use crate::interface::Error;
-
-    match e {
-        Error::External { source } => tonic::Status::internal(source.to_string()),
-        Error::AlreadyExists { descr } => tonic::Status::already_exists(descr),
-        Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
-        Error::NotFound { descr } => tonic::Status::not_found(descr),
-        Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
-        Error::NotImplemented { descr } => tonic::Status::unimplemented(descr),
-    }
-}
-
-pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
-    use crate::interface::Error;
-
-    match status.code() {
-        tonic::Code::Internal => Error::External {
-            source: Box::<dyn std::error::Error + Send + Sync>::from(status.message().to_owned())
-                .into(),
-        },
-        tonic::Code::AlreadyExists => Error::AlreadyExists {
-            descr: status.message().to_owned(),
-        },
-        tonic::Code::ResourceExhausted => Error::LimitExceeded {
-            descr: status.message().to_owned(),
-        },
-        tonic::Code::NotFound => Error::NotFound {
-            descr: status.message().to_owned(),
-        },
-        tonic::Code::InvalidArgument => Error::Malformed {
-            descr: status.message().to_owned(),
-        },
-        tonic::Code::Unimplemented => Error::NotImplemented {
-            descr: status.message().to_owned(),
-        },
-        _ => Error::External {
-            source: Arc::new(status),
-        },
-    }
-}
-
-pub(crate) fn serialize_soft_deleted_rows(sdr: SoftDeletedRows) -> i32 {
-    let sdr = match sdr {
-        SoftDeletedRows::AllRows => proto::SoftDeletedRows::AllRows,
-        SoftDeletedRows::ExcludeDeleted => proto::SoftDeletedRows::ExcludeDeleted,
-        SoftDeletedRows::OnlyDeleted => proto::SoftDeletedRows::OnlyDeleted,
-    };
-
-    sdr.into()
-}
-
-pub(crate) fn deserialize_soft_deleted_rows(sdr: i32) -> Result<SoftDeletedRows, Error> {
-    let sdr: proto::SoftDeletedRows = sdr.convert().ctx("soft deleted rows")?;
-    let sdr = match sdr {
-        proto::SoftDeletedRows::Unspecified => {
-            return Err(Error::new("unspecified soft deleted rows"));
-        }
-        proto::SoftDeletedRows::AllRows => SoftDeletedRows::AllRows,
-        proto::SoftDeletedRows::ExcludeDeleted => SoftDeletedRows::ExcludeDeleted,
-        proto::SoftDeletedRows::OnlyDeleted => SoftDeletedRows::OnlyDeleted,
-    };
-    Ok(sdr)
-}
+use crate::util_serialization::{ContextExt, ConvertExt, ConvertOptExt, Error, RequiredExt};
 
 pub(crate) fn serialize_namespace(ns: Namespace) -> proto::Namespace {
     proto::Namespace {
@@ -370,6 +199,7 @@ pub(crate) fn deserialize_column_set(set: proto::ColumnSet) -> ColumnSet {
 #[allow(deprecated)]
 pub(crate) fn serialize_parquet_file_params(
     params: &ParquetFileParams,
+    created_at: Timestamp,
 ) -> proto::ParquetFileParams {
     proto::ParquetFileParams {
         namespace_id: params.namespace_id.get(),
@@ -385,7 +215,7 @@ pub(crate) fn serialize_parquet_file_params(
         file_size_bytes: params.file_size_bytes,
         row_count: params.row_count,
         compaction_level: params.compaction_level as i32,
-        created_at: params.created_at.get(),
+        created_at: created_at.get(),
         column_set: Some(serialize_column_set(&params.column_set)),
 
         maybe_max_l0_created_at: Some(
@@ -407,7 +237,7 @@ pub(crate) fn serialize_parquet_file_params(
         max_l0_created_at: params
             .max_l0_created_at
             .maybe_computed_timestamp()
-            .unwrap_or(params.created_at)
+            .unwrap_or(created_at)
             .get(),
 
         source: ParquetFileSource::to_proto(params.source),
@@ -463,7 +293,6 @@ pub(crate) fn deserialize_parquet_file_params(
         file_size_bytes: params.file_size_bytes,
         row_count: params.row_count,
         compaction_level,
-        created_at: Timestamp::new(params.created_at),
         column_set: deserialize_column_set(params.column_set.required().ctx("column_set")?),
         max_l0_created_at,
         source: ParquetFileSource::from_proto(params.source),
@@ -526,6 +355,11 @@ pub(crate) fn deserialize_parquet_file(file: proto::ParquetFile) -> Result<Parqu
 
 #[cfg(test)]
 mod tests {
+    use crate::interface::SoftDeletedRows;
+    use crate::util_serialization::{
+        catalog_error_to_status, convert_status, deserialize_soft_deleted_rows,
+        serialize_soft_deleted_rows,
+    };
     use data_types::{
         partition_template::TablePartitionTemplateOverride, CompactionLevel, PartitionHashId,
         PartitionKey,
@@ -557,9 +391,6 @@ mod tests {
 
         assert_error_roundtrip(Error::AlreadyExists {
             descr: "foo".to_owned(),
-        });
-        assert_error_roundtrip(Error::External {
-            source: Box::<dyn std::error::Error + Send + Sync>::from("foo".to_owned()).into(),
         });
         assert_error_roundtrip(Error::LimitExceeded {
             descr: "foo".to_owned(),
@@ -768,8 +599,11 @@ mod tests {
         assert_eq!(set, set2);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn test_parquet_file_params_roundtrip() {
+        // This is only needed until `created_at` is fully deprecated
+        let created_at = Timestamp::new(8);
         let params = ParquetFileParams {
             namespace_id: NamespaceId::new(1),
             table_id: TableId::new(2),
@@ -781,12 +615,11 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Final,
-            created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
             max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(11)),
             source: None,
         };
-        let protobuf = serialize_parquet_file_params(&params);
+        let protobuf = serialize_parquet_file_params(&params, created_at);
         let params2 = deserialize_parquet_file_params(protobuf).unwrap();
         assert_eq!(params, params2);
 
@@ -801,12 +634,11 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(8),
             column_set: ColumnSet::new([ColumnId::new(9), ColumnId::new(10)]),
             max_l0_created_at: MaxL0CreatedAt::NotCompacted,
             source: None,
         };
-        let protobuf = serialize_parquet_file_params(&params_without_max_l0_created_at);
+        let protobuf = serialize_parquet_file_params(&params_without_max_l0_created_at, created_at);
         let params_without_max_l0_created_at2 = deserialize_parquet_file_params(protobuf).unwrap();
         assert_eq!(
             params_without_max_l0_created_at,
@@ -822,6 +654,8 @@ mod tests {
             .get_uuid()
             .as_u64_pair();
         let object_store_id = proto::ObjectStoreId { high64, low64 };
+        // This is only needed until `created_at` is fully deprecated
+        let created_at = Timestamp::new(8);
 
         let old_proto_l2_max_l0_and_created_at_equal = proto::ParquetFileParams {
             namespace_id: 1,
@@ -834,7 +668,7 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Final as i32,
-            created_at: 8,
+            created_at: created_at.get(),
             column_set: Some(proto::ColumnSet {
                 column_ids: vec![1],
             }),
@@ -846,7 +680,7 @@ mod tests {
         };
         let params2 =
             deserialize_parquet_file_params(old_proto_l2_max_l0_and_created_at_equal).unwrap();
-        let protobuf = serialize_parquet_file_params(&params2);
+        let protobuf = serialize_parquet_file_params(&params2, created_at);
         assert_eq!(
             protobuf,
             proto::ParquetFileParams {
@@ -889,7 +723,7 @@ mod tests {
             file_size_bytes: 6,
             row_count: 7,
             compaction_level: CompactionLevel::Initial as i32,
-            created_at: 8,
+            created_at: created_at.get(),
             column_set: Some(proto::ColumnSet {
                 column_ids: vec![1],
             }),
@@ -901,7 +735,7 @@ mod tests {
         };
         let params2 =
             deserialize_parquet_file_params(old_proto_l0_max_l0_and_created_at_unequal).unwrap();
-        let protobuf = serialize_parquet_file_params(&params2);
+        let protobuf = serialize_parquet_file_params(&params2, created_at);
         assert_eq!(
             protobuf,
             proto::ParquetFileParams {

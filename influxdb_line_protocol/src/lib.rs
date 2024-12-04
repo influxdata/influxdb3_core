@@ -250,7 +250,7 @@ impl<'a> ParsedLine<'a> {
 ///
 /// Thus, if the `ParsedLine` represents invalid line protocol, then
 /// the result of `Display` / `to_string()` will also be invalid.
-impl<'a> Display for ParsedLine<'a> {
+impl Display for ParsedLine<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.series)?;
 
@@ -279,13 +279,13 @@ impl<'a> Display for ParsedLine<'a> {
 /// line protocol data
 #[derive(Debug)]
 pub struct Series<'a> {
-    raw_input: &'a str,
+    pub raw_input: &'a str,
     pub measurement: Measurement<'a>,
     pub tag_set: Option<TagSet<'a>>,
 }
 
 /// Converts `Series` back to line protocol
-impl<'a> Display for Series<'a> {
+impl Display for Series<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         escape_and_write_value(f, self.measurement.as_str(), MEASUREMENT_DELIMITERS)?;
         if let Some(tag_set) = &self.tag_set {
@@ -398,7 +398,7 @@ pub enum FieldValue<'a> {
     Boolean(bool),
 }
 
-impl<'a> FieldValue<'a> {
+impl FieldValue<'_> {
     /// Returns true if `self` and `other` are of the same data type.
     pub fn is_same_type(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -409,7 +409,7 @@ impl<'a> FieldValue<'a> {
 /// See [the line protocol reference] for more detail.
 ///
 /// [the line protocol reference]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#data-types-and-format
-impl<'a> Display for FieldValue<'a> {
+impl Display for FieldValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::I64(v) => write!(f, "{v}i"),
@@ -473,7 +473,7 @@ impl<'a> EscapedStr<'a> {
     }
 }
 
-impl<'a> Deref for EscapedStr<'a> {
+impl Deref for EscapedStr<'_> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -484,25 +484,25 @@ impl<'a> Deref for EscapedStr<'a> {
     }
 }
 
-impl<'a> Hash for EscapedStr<'a> {
+impl Hash for EscapedStr<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
     }
 }
 
-impl<'a> PartialEq for EscapedStr<'a> {
+impl PartialEq for EscapedStr<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
     }
 }
 
-impl<'a> PartialOrd for EscapedStr<'a> {
+impl PartialOrd for EscapedStr<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for EscapedStr<'a> {
+impl Ord for EscapedStr<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_str().cmp(other.as_str())
     }

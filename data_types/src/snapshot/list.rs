@@ -41,7 +41,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// decoding all prior records. [`MessageList`] therefore provides a list encoding, inspired
 /// by arrow, that provides this and is designed to be combined with [`prost`]'s support
 /// for zero-copy decoding of [`Bytes`]
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct MessageList<T: Message + Default> {
     len: usize,
     offsets: Bytes,
@@ -98,6 +98,16 @@ impl<T: Message + Default> MessageList<T> {
         // We slice `Bytes` to preserve zero-copy
         let data = self.values.slice(start..end);
         Ok(T::decode(data)?)
+    }
+}
+
+impl<T: Message + Default> std::fmt::Debug for MessageList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut l = f.debug_list();
+        for idx in 0..self.len() {
+            l.entry(&self.get(idx));
+        }
+        l.finish()
     }
 }
 

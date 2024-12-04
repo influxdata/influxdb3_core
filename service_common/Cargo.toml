@@ -10,8 +10,10 @@ workspace = true
 
 [dependencies] # In alphabetical order
 arrow = { workspace = true }
+arrow-flight = { workspace = true }
 datafusion = { workspace = true }
 executor = { path = "../executor" }
 object_store.workspace = true
 tonic = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+

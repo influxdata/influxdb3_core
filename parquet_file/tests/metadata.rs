@@ -456,7 +456,6 @@ async fn test_derive_parquet_file_params() {
     assert_eq!(catalog_data.object_store_id, meta.object_store_id);
     assert_eq!(catalog_data.file_size_bytes, file_size as i64);
     assert_eq!(catalog_data.compaction_level, meta.compaction_level);
-    assert_eq!(catalog_data.created_at, Timestamp::new(1234));
     assert_eq!(catalog_data.row_count, 3);
     assert_eq!(catalog_data.min_time, Timestamp::new(1646917692000000000));
     assert_eq!(catalog_data.max_time, Timestamp::new(1653311292000000000));

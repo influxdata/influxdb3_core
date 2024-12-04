@@ -225,7 +225,7 @@ pub(super) struct InterpolateBuilder<'a, T: ArrowPrimitiveType> {
     pub input_aggr_array: &'a PrimitiveArray<T>,
 }
 
-impl<'a, T> VecBuilder for InterpolateBuilder<'a, T>
+impl<T> VecBuilder for InterpolateBuilder<'_, T>
 where
     T: ArrowPrimitiveType,
     T::Native: LinearInterpolate,

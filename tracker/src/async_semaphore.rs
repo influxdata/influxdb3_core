@@ -286,7 +286,7 @@ struct InstrumentedAsyncSemaphoreAcquire<'a> {
     span_recorder_all: Option<SpanRecorder>,
 }
 
-impl<'a> std::fmt::Debug for InstrumentedAsyncSemaphoreAcquire<'a> {
+impl std::fmt::Debug for InstrumentedAsyncSemaphoreAcquire<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstrumentedAsyncSemaphoreAcquire")
             .field("metrics", &self.metrics)
@@ -297,7 +297,7 @@ impl<'a> std::fmt::Debug for InstrumentedAsyncSemaphoreAcquire<'a> {
     }
 }
 
-impl<'a> Future for InstrumentedAsyncSemaphoreAcquire<'a> {
+impl Future for InstrumentedAsyncSemaphoreAcquire<'_> {
     type Output = Result<InstrumentedAsyncOwnedSemaphorePermit, AcquireError>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
@@ -462,7 +462,7 @@ pub struct InstrumentedAsyncSemaphorePermit<'a> {
     phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> Deref for InstrumentedAsyncSemaphorePermit<'a> {
+impl Deref for InstrumentedAsyncSemaphorePermit<'_> {
     type Target = InstrumentedAsyncOwnedSemaphorePermit;
 
     fn deref(&self) -> &Self::Target {

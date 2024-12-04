@@ -313,7 +313,7 @@ impl<'a> Iter<'a> {
     }
 }
 
-impl<'a> Iterator for Iter<'a> {
+impl Iterator for Iter<'_> {
     type Item = bool;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -338,7 +338,7 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for Iter<'a> {}
+impl ExactSizeIterator for Iter<'_> {}
 
 /// Returns an iterator over set bit positions in increasing order
 pub fn iter_set_positions(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {

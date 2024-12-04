@@ -5,7 +5,7 @@ use crate::{
     object_store::Endpoint,
     single_tenant::{CONFIG_AUTHZ_ENV_NAME, CONFIG_AUTHZ_FLAG},
 };
-use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf};
+use std::{collections::HashMap, num::NonZeroUsize};
 
 /// CLI config for querier configuration
 #[derive(Debug, Clone, PartialEq, Eq, clap::Parser)]
@@ -124,16 +124,6 @@ pub struct QuerierConfig {
         action
     )]
     pub parquet_data_mem_cache_bytes: Option<MemorySize>,
-
-    /// Storage location for parquet disk data cache.
-    ///
-    /// Cache is NOT used if this value is not provided.
-    #[clap(
-        long = "parquet-data-disk-cache-location",
-        env = "INFLUXDB_IOX_PARQUET_DATA_DISK_CACHE_LOCATION",
-        action
-    )]
-    pub parquet_data_disk_cache_location: Option<PathBuf>,
 
     /// Size of the parquet in-mem metadata cache in bytes.
     ///
@@ -270,6 +260,15 @@ pub struct QuerierConfig {
         action
     )]
     pub s3fifo_cache_main_threshold: usize,
+
+    /// Size of S3-FIFO ghost set in bytes.
+    #[clap(
+        long = "s3fifo-cache-ghost-memory-limit",
+        env = "INFLUXDB_IOX_S3FIFO_CACHE_GHOST_MEMORY_LIMIT",
+        default_value = "134217728",  // 128MB
+        action
+    )]
+    pub s3_fifo_ghost_memory_limit: NonZeroUsize,
 }
 
 fn parse_datafusion_config(

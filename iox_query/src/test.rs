@@ -243,6 +243,7 @@ impl QueryNamespace for TestDatabase {
     }
 }
 
+#[derive(Debug)]
 struct TestDatabaseCatalogProvider {
     partitions: BTreeMap<String, BTreeMap<ChunkId, Arc<TestChunk>>>,
 }
@@ -274,6 +275,7 @@ impl CatalogProvider for TestDatabaseCatalogProvider {
     }
 }
 
+#[derive(Debug)]
 struct TestDatabaseSchemaProvider {
     partitions: BTreeMap<String, BTreeMap<ChunkId, Arc<TestChunk>>>,
 }
@@ -310,6 +312,7 @@ impl SchemaProvider for TestDatabaseSchemaProvider {
     }
 }
 
+#[derive(Debug)]
 struct TestDatabaseTableProvider {
     name: Arc<str>,
     partitions: Vec<Arc<TestChunk>>,

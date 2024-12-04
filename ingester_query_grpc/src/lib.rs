@@ -1,10 +1,10 @@
 // This crate deliberately does not use the same linting rules as the other
 // crates because of all the generated code it contains that we don't have much
 // control over.
-#![allow(
+#![expect(
     clippy::derive_partial_eq_without_eq,
-    clippy::needless_borrow,
-    clippy::needless_borrows_for_generic_args
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_lifetimes
 )]
 
 // Workaround for "unused crate" lint false positives.
@@ -26,7 +26,7 @@ use snafu::{ResultExt, Snafu};
 /// This module imports the generated protobuf code into a Rust module
 /// hierarchy that matches the namespace hierarchy of the protobuf
 /// definitions
-#[allow(clippy::use_self, missing_copy_implementations, unreachable_pub)]
+#[expect(clippy::use_self, missing_copy_implementations)]
 pub mod influxdata {
     pub mod iox {
         pub mod ingester {
@@ -40,7 +40,7 @@ pub mod influxdata {
 
             pub mod v2 {
                 // generated code violates a few lints, so opt-out of them
-                #![allow(clippy::future_not_send)]
+                #![expect(clippy::future_not_send)]
 
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.ingester.v2.rs"));
                 include!(concat!(

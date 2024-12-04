@@ -27,7 +27,7 @@ use crate::{
         loader::Loader,
         snapshot::{Snapshot, SnapshotKey},
     },
-    interface::{Catalog, Error, Result},
+    interface::{Catalog, Result, UnhandledError},
 };
 
 #[derive(Debug)]
@@ -391,9 +391,10 @@ where
             }
             Err(e) => {
                 span_recorder.error(e.to_string());
-                return Err(Error::External {
+                return Err(UnhandledError::CacheHandler {
                     source: Arc::new(e),
-                });
+                }
+                .into());
             }
         }
 

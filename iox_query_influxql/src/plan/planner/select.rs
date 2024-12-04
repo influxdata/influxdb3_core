@@ -400,7 +400,7 @@ impl<'a> Selector<'a> {
     }
 }
 
-impl<'a> Display for Selector<'a> {
+impl Display for Selector<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
             Self::Bottom {

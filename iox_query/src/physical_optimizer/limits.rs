@@ -9,6 +9,7 @@ use object_store::path::Path;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Default)]
 pub struct CheckLimits;
 
 impl PhysicalOptimizerRule for CheckLimits {

@@ -56,6 +56,14 @@ struct IOxQueryPlanner {
     extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
 }
 
+impl fmt::Debug for IOxQueryPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IOxQueryPlanner")
+            .field("extension_planners", &"...")
+            .finish()
+    }
+}
+
 #[async_trait]
 impl QueryPlanner for IOxQueryPlanner {
     /// Given a `LogicalPlan` created from above, create an

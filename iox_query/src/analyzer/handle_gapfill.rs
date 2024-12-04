@@ -73,6 +73,7 @@ use virtual_function::{VirtualFunction, VirtualFunctionFinder};
 ///
 /// Note: both `DATE_BIN_GAPFILL` and `LOCF` are functions that don't have implementations.
 /// This rule must rewrite the plan to get rid of them.
+#[derive(Debug)]
 pub struct HandleGapFill;
 
 impl HandleGapFill {

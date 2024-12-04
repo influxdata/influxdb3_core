@@ -26,10 +26,17 @@ use crate::influxdata::iox::ingester::v2 as proto2;
 
 /// Serialize [`Schema`] to [`Bytes`].
 pub fn schema_to_bytes(schema: &Schema) -> Bytes {
+    let error_on_replacement = true;
+    let mut tracker = DictionaryTracker::new(error_on_replacement);
+
     let EncodedData {
         ipc_message,
         arrow_data,
-    } = IpcDataGenerator::default().schema_to_bytes(schema, &write_options());
+    } = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        schema,
+        &mut tracker,
+        &write_options(),
+    );
     assert!(
         arrow_data.is_empty(),
         "arrow_data should always be empty for schema messages"

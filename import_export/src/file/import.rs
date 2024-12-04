@@ -494,11 +494,20 @@ impl RemoteImporter {
             .await?;
 
         let object_store_id = parquet_params.object_store_id;
-        let parquet_file = repos.parquet_files().create(parquet_params).await;
+        let create_result = repos.parquet_files().create(parquet_params).await;
 
-        match parquet_file {
-            Ok(parquet_file) => {
-                debug!(parquet_file_id=?parquet_file.id, "  Created parquet file entry {}", parquet_file.id);
+        match create_result {
+            Ok(()) => {
+                let parquet_file = repos
+                    .parquet_files()
+                    .get_by_object_store_id(object_store_id)
+                    .await?
+                    .expect("Just created parquet file should exist");
+                debug!(
+                    parquet_file_id=?parquet_file.id,
+                    "  Created parquet file entry {}",
+                    parquet_file.id
+                );
             }
             Err(iox_catalog::interface::Error::AlreadyExists { .. }) => {
                 warn!(%object_store_id, "parquet file already exists, skipping");
@@ -780,7 +789,6 @@ impl RemoteImporter {
                 file_size_bytes: proto_parquet_file.file_size_bytes,
                 row_count: proto_parquet_file.row_count,
                 compaction_level,
-                created_at: Timestamp::new(proto_parquet_file.created_at),
                 column_set,
                 max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(
                     proto_parquet_file.max_l0_created_at,
@@ -791,7 +799,6 @@ impl RemoteImporter {
             warn!("Could not read parquet file metadata, reconstructing based on encoded metadata");
 
             let (min_time, max_time) = get_min_max_times(decoded_iox_parquet_metadata)?;
-            let created_at = Timestamp::new(iox_metadata.creation_timestamp.timestamp_nanos());
             ParquetFileParams {
                 namespace_id: namespace.id,
                 table_id: table.id,
@@ -806,7 +813,6 @@ impl RemoteImporter {
                 file_size_bytes: file_size_bytes.try_into().unwrap(),
                 row_count: decoded_iox_parquet_metadata.row_count().try_into().unwrap(),
                 compaction_level: CompactionLevel::Initial,
-                created_at,
                 column_set,
                 max_l0_created_at: MaxL0CreatedAt::NotCompacted,
                 source: None,

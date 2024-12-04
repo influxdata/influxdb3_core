@@ -1478,7 +1478,7 @@ impl TestCase {
         block_on(async {
             let session_ctx = SessionContext::new_with_config_rt(
                 SessionConfig::default().with_batch_size(self.output_batch_size),
-                RuntimeEnv::new(RuntimeConfig::default().with_memory_limit(limit, 1.0))?.into(),
+                RuntimeEnv::try_new(RuntimeConfig::default().with_memory_limit(limit, 1.0))?.into(),
             )
             .into();
             let result = Self::execute_with_config(&session_ctx, self.plan()?).await;

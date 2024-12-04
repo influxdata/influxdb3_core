@@ -933,7 +933,7 @@ pub enum ColumnValue<'a> {
     },
 }
 
-impl<'a> ColumnValue<'a> {
+impl ColumnValue<'_> {
     /// Returns true if `other` is a byte-wise prefix match of `self`.
     ///
     /// This method can be called for both [`ColumnValue::Identity`] and
@@ -954,7 +954,7 @@ impl<'a> ColumnValue<'a> {
     }
 }
 
-impl<'a, T> PartialEq<T> for ColumnValue<'a>
+impl<T> PartialEq<T> for ColumnValue<'_>
 where
     T: AsRef<str>,
 {

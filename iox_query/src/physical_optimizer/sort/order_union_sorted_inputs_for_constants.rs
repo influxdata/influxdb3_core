@@ -59,6 +59,7 @@ use super::util::{
 ///
 ///  Note: the Sort branches are sorted to guarantee the output is sorted
 
+#[derive(Debug)]
 pub(crate) struct OrderUnionSortedInputsForConstants;
 
 impl PhysicalOptimizerRule for OrderUnionSortedInputsForConstants {

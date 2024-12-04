@@ -117,7 +117,7 @@ impl Executor {
             .with_disk_manager(DiskManagerConfig::Disabled)
             .with_memory_limit(config.mem_pool_size, 1.0);
 
-        let runtime = Arc::new(RuntimeEnv::new(runtime_config).expect("creating runtime"));
+        let runtime = Arc::new(RuntimeEnv::try_new(runtime_config).expect("creating runtime"));
         for (id, store) in &config.object_stores {
             register_iox_object_store(&runtime, id, Arc::clone(store));
         }

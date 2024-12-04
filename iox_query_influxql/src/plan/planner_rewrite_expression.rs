@@ -506,7 +506,7 @@ struct FixRegularExpressions<'a> {
     schema: &'a IQLSchema<'a>,
 }
 
-impl<'a> TreeNodeRewriter for FixRegularExpressions<'a> {
+impl TreeNodeRewriter for FixRegularExpressions<'_> {
     type Node = Expr;
 
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {

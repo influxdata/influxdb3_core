@@ -69,6 +69,11 @@ impl ColumnsByName {
         assert!(old.is_none());
     }
 
+    /// Return the underlying [`BTreeMap`].
+    pub fn inner_mut(&mut self) -> &mut BTreeMap<Arc<str>, ColumnSchema> {
+        &mut self.0
+    }
+
     /// Iterate over the names and columns.
     pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &ColumnSchema)> {
         self.0.iter()

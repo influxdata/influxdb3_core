@@ -1,16 +1,16 @@
 //! Traits and data types for the IOx Catalog API.
 
 use async_trait::async_trait;
-use data_types::snapshot::namespace::NamespaceSnapshot;
-use data_types::snapshot::partition::PartitionSnapshot;
-use data_types::snapshot::root::RootSnapshot;
-use data_types::snapshot::table::TableSnapshot;
 use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
+    snapshot::{
+        namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
+        table::TableSnapshot,
+    },
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, Timestamp,
+    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
+    TableId, Timestamp,
 };
 use iox_time::{AsyncTimeProvider, TimeProvider};
 use snafu::Snafu;
@@ -39,14 +39,15 @@ impl<T> std::fmt::Display for CasFailure<T> {
     }
 }
 
+/// Errors returned to the caller of catalog. All variants other than `Unhandled` may be something
+/// the caller can address; an `Unhandled` error likely indiciates a bug in some component called
+/// by the catalog.
 #[derive(Clone, Debug, Snafu)]
 #[allow(missing_docs)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("unhandled external error: {source}"))]
-    External {
-        source: Arc<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("unhandled: {source}"))]
+    Unhandled { source: UnhandledError },
 
     #[snafu(display("already exists: {descr}"))]
     AlreadyExists { descr: String },
@@ -64,11 +65,61 @@ pub enum Error {
     NotImplemented { descr: String },
 }
 
+/// Errors the catalog can't handle that get logged and propagated to the caller.
+#[derive(Clone, Debug, Snafu)]
+#[allow(missing_docs)]
+pub enum UnhandledError {
+    #[snafu(display("sqlx error: {source}"))]
+    Sqlx { source: Arc<sqlx::Error> },
+
+    #[snafu(display("prost decode error: {source}"))]
+    ProstDecode {
+        source: generated_types::prost::DecodeError,
+    },
+
+    #[snafu(display("gRPC serialization error: {source}"))]
+    GrpcSerialization {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("gRPC request error: {source}"))]
+    GrpcRequest {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("snapshot error: {source}"))]
+    CatalogServiceSnapshot {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("quorum error: {source}"))]
+    Quorum {
+        source: Arc<catalog_cache::api::quorum::Error>,
+    },
+
+    #[snafu(display("cache handler error: {source}"))]
+    CacheHandler {
+        source: Arc<catalog_cache::api::quorum::Error>,
+    },
+
+    #[snafu(display("cache loader error: {source}"))]
+    CacheLoader {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<UnhandledError> for Error {
+    fn from(source: UnhandledError) -> Self {
+        Self::Unhandled { source }
+    }
+}
+
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
-        Self::External {
+        UnhandledError::Sqlx {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
@@ -80,49 +131,52 @@ impl From<sqlx::migrate::MigrateError> for Error {
 
 impl From<data_types::snapshot::partition::Error> for Error {
     fn from(e: data_types::snapshot::partition::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<data_types::snapshot::table::Error> for Error {
     fn from(e: data_types::snapshot::table::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<data_types::snapshot::namespace::Error> for Error {
     fn from(e: data_types::snapshot::namespace::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<data_types::snapshot::root::Error> for Error {
     fn from(e: data_types::snapshot::root::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<catalog_cache::api::quorum::Error> for Error {
     fn from(e: catalog_cache::api::quorum::Error) -> Self {
-        Self::External {
+        UnhandledError::Quorum {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<generated_types::prost::DecodeError> for Error {
     fn from(e: generated_types::prost::DecodeError) -> Self {
-        Self::External {
-            source: Arc::new(e),
-        }
+        UnhandledError::ProstDecode { source: e }.into()
     }
 }
 
@@ -186,7 +240,6 @@ pub trait Catalog: Send + Sync + Debug {
     fn repositories(&self) -> Box<dyn RepoCollection>;
 
     /// Gets metric registry associated with this catalog for testing purposes.
-    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry>;
 
     /// Get the current time from the catalog's perspective. This function is
@@ -292,7 +345,7 @@ pub trait NamespaceRepo: Send + Sync {
     /// Update retention period for a namespace
     async fn update_retention_period(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace>;
 
@@ -313,16 +366,20 @@ pub trait NamespaceRepo: Send + Sync {
         deleted: SoftDeletedRows,
     ) -> Result<Option<Namespace>>;
 
-    /// Soft-delete a namespace by name
-    async fn soft_delete(&mut self, name: &str) -> Result<NamespaceId>;
+    /// Soft-delete a namespace by ID.
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId>;
 
     /// Update the limit on the number of tables that can exist per namespace.
-    async fn update_table_limit(&mut self, name: &str, new_max: MaxTables) -> Result<Namespace>;
+    async fn update_table_limit(
+        &mut self,
+        id: NamespaceId,
+        new_max: MaxTables,
+    ) -> Result<Namespace>;
 
     /// Update the limit on the number of columns that can exist per table in a given namespace.
     async fn update_column_limit(
         &mut self,
-        name: &str,
+        id: NamespaceId,
         new_max: MaxColumnsPerTable,
     ) -> Result<Namespace>;
 
@@ -557,8 +614,11 @@ pub trait PartitionRepo: Send + Sync {
 /// Extension trait for [`ParquetFileRepo`]
 #[async_trait]
 pub trait ParquetFileRepoExt {
-    /// create the parquet file
-    async fn create(self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
+    /// Create the parquet file, returning nothing. If you need the catalog-assigned fields
+    /// after calling this, do another lookup. This is mostly used in tests, so the performance of
+    /// a lookup shouldn't be significant. Revisit this assumption if there's a need for the
+    /// created fields in production.
+    async fn create(self, parquet_file_params: ParquetFileParams) -> Result<()>;
 
     /// Attempt to upsert the parquet file
     ///
@@ -570,19 +630,16 @@ pub trait ParquetFileRepoExt {
 
 #[async_trait]
 impl ParquetFileRepoExt for &mut dyn ParquetFileRepo {
-    /// create the parquet file
-    async fn create(self, params: ParquetFileParams) -> Result<ParquetFile> {
-        let files = self
-            .create_upgrade_delete(
-                params.partition_id,
-                &[],
-                &[],
-                &[params.clone()],
-                CompactionLevel::Initial,
-            )
-            .await?;
-        let id = files.into_iter().next().unwrap();
-        Ok(ParquetFile::from_params(params, id))
+    async fn create(self, params: ParquetFileParams) -> Result<()> {
+        self.create_upgrade_delete(
+            params.partition_id,
+            &[],
+            &[],
+            &[params],
+            CompactionLevel::Initial,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn upsert(mut self, params: ParquetFileParams) -> Result<ParquetFile> {
@@ -598,16 +655,13 @@ impl ParquetFileRepoExt for &mut dyn ParquetFileRepo {
             .await;
 
         match r {
-            Ok(files) => {
-                let id = files.into_iter().next().unwrap();
-                Ok(ParquetFile::from_params(params, id))
-            }
+            Ok(files) => Ok(files.into_iter().next().unwrap()),
             Err(Error::AlreadyExists { .. }) => {
                 let id = params.object_store_id;
                 if let Some(existing) = self.get_by_object_store_id(id).await? {
-                    let expected = ParquetFile::from_params(params, existing.id);
-
-                    if expected == existing {
+                    if existing.could_have_been_created_from(&params)
+                        && existing.to_delete.is_none()
+                    {
                         return Ok(existing);
                     }
                 }
@@ -633,6 +687,17 @@ pub trait ParquetFileRepo: Send + Sync {
     /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
     /// changes. The caller MAY call this method again if the result was NOT empty.
     async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
+
+    /// This does the same thing as calling `self.delete_old_ids_only` and then counting the
+    /// result, but is implemented as a separate method to allow for some performance optimizations
+    /// where possible (e.g. in the postgres catalog, we can avoid allocating the intermediate Vec)
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+        self.delete_old_ids_only(older_than).await.map(|v| {
+            v.len()
+                .try_into()
+                .expect("128-bit computers don't exist yet")
+        })
+    }
 
     /// List parquet files for given partitions that are NOT marked as
     /// [`to_delete`](ParquetFile::to_delete).
@@ -663,9 +728,15 @@ pub trait ParquetFileRepo: Send + Sync {
         object_store_ids: Vec<ObjectStoreId>,
     ) -> Result<Vec<ObjectStoreId>>;
 
+    /// Test a batch of parquet files exist by partition and object store IDs
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
+
     /// Commit deletions, upgrades and creations in a single transaction.
     ///
-    /// Returns IDs of created files.
+    /// Returns created files.
     async fn create_upgrade_delete(
         &mut self,
         partition_id: PartitionId,
@@ -673,7 +744,7 @@ pub trait ParquetFileRepo: Send + Sync {
         upgrade: &[ObjectStoreId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>>;
+    ) -> Result<Vec<ParquetFile>>;
 
     /// List parquet files for a particular table (via [`TableId`]) and
     /// optionally at a specific [`CompactionLevel`].

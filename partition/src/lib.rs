@@ -7,7 +7,7 @@
 use workspace_hack as _;
 
 mod filter;
-mod template;
+pub mod template;
 mod traits;
 
 use std::{num::NonZeroUsize, ops::Range};
@@ -207,8 +207,6 @@ pub enum PartitionWriteError {
 pub struct PartitionWrite<'a, T> {
     batch: &'a T,
     ranges: Vec<Range<usize>>,
-    min_timestamp: i64,
-    max_timestamp: i64,
     row_count: NonZeroUsize,
 }
 
@@ -223,8 +221,6 @@ where
     /// Panics if the batch has no rows
     pub fn new(batch: &'a T) -> Result<Self, PartitionWriteError> {
         let row_count = NonZeroUsize::new(batch.num_rows()).unwrap();
-        let time = batch.time_column()?;
-        let (min_timestamp, max_timestamp) = min_max_time(time);
 
         // This `allow` can be removed when this issue is fixed and released:
         // <https://github.com/rust-lang/rust-clippy/issues/11086>
@@ -232,20 +228,8 @@ where
         Ok(Self {
             batch,
             ranges: vec![0..batch.num_rows()],
-            min_timestamp,
-            max_timestamp,
             row_count,
         })
-    }
-
-    /// Returns the minimum timestamp in the write
-    pub fn min_timestamp(&self) -> i64 {
-        self.min_timestamp
-    }
-
-    /// Returns the maximum timestamp in the write
-    pub fn max_timestamp(&self) -> i64 {
-        self.max_timestamp
     }
 
     /// Returns the number of rows in the write
@@ -260,27 +244,21 @@ where
         partition_template: &TablePartitionTemplateOverride,
     ) -> Result<HashMap<PartitionKey, Self>, PartitionWriteError> {
         use hashbrown::hash_map::Entry;
-        let time = batch.time_column()?;
 
         let mut partition_ranges = HashMap::new();
         for (partition, range) in partition_batch(batch, partition_template) {
             let row_count = NonZeroUsize::new(range.end - range.start).unwrap();
-            let (min_timestamp, max_timestamp) = min_max_time(&time[range.clone()]);
 
             match partition_ranges.entry(PartitionKey::from(partition?)) {
                 Entry::Vacant(v) => {
                     v.insert(PartitionWrite {
                         batch,
                         ranges: vec![range],
-                        min_timestamp,
-                        max_timestamp,
                         row_count,
                     });
                 }
                 Entry::Occupied(mut o) => {
                     let pw = o.get_mut();
-                    pw.min_timestamp = pw.min_timestamp.min(min_timestamp);
-                    pw.max_timestamp = pw.max_timestamp.max(max_timestamp);
                     pw.row_count = NonZeroUsize::new(pw.row_count.get() + row_count.get()).unwrap();
                     pw.ranges.push(range);
                 }
@@ -297,8 +275,6 @@ where
         partition_template: &TablePartitionTemplateOverride,
         partition_key: &PartitionKey,
     ) -> Result<Option<Self>, PartitionWriteError> {
-        let time = batch.time_column()?;
-
         let mut maybe_pw: Option<Self> = None;
 
         for (partition, range) in partition_batch(batch, partition_template) {
@@ -306,14 +282,11 @@ where
 
             if partition == partition_key.inner() {
                 let range_row_count = NonZeroUsize::new(range.end - range.start).unwrap();
-                let (range_min_timestamp, range_max_timestamp) = min_max_time(&time[range.clone()]);
 
                 maybe_pw = match maybe_pw {
                     Some(Self {
                         batch,
                         mut ranges,
-                        min_timestamp,
-                        max_timestamp,
                         row_count,
                     }) => {
                         ranges.push(range);
@@ -321,8 +294,6 @@ where
                         Some(Self {
                             batch,
                             ranges,
-                            min_timestamp: min_timestamp.min(range_min_timestamp),
-                            max_timestamp: max_timestamp.max(range_max_timestamp),
                             row_count: NonZeroUsize::new(row_count.get() + range_row_count.get())
                                 .unwrap(),
                         })
@@ -330,8 +301,6 @@ where
                     None => Some(Self {
                         batch,
                         ranges: vec![range],
-                        min_timestamp: range_min_timestamp,
-                        max_timestamp: range_max_timestamp,
                         row_count: range_row_count,
                     }),
                 }
@@ -342,7 +311,7 @@ where
     }
 }
 
-impl<'a> PartitionWrite<'a, MutableBatch> {
+impl PartitionWrite<'_, MutableBatch> {
     /// Returns a [`PartitionWrite`] containing just the rows of `Self` that pass
     /// the provided time predicate, or None if no rows
     pub fn filter(&self, predicate: impl Fn(i64) -> bool) -> Option<Self> {
@@ -367,20 +336,18 @@ impl<'a> PartitionWrite<'a, MutableBatch> {
         Some(PartitionWrite {
             batch: self.batch,
             ranges,
-            min_timestamp,
-            max_timestamp,
             row_count,
         })
     }
 }
 
-impl<'a> WritePayload for PartitionWrite<'a, MutableBatch> {
+impl WritePayload for PartitionWrite<'_, MutableBatch> {
     fn write_to_batch(&self, batch: &mut MutableBatch) -> mutable_batch::Result<()> {
         batch.extend_from_ranges(self.batch, &self.ranges)
     }
 }
 
-impl<'a> PartitionWrite<'a, RecordBatch> {
+impl PartitionWrite<'_, RecordBatch> {
     /// Given a `PartitionWrite` that holds a `RecordBatch` and some ranges, return a new
     /// `RecordBatch` containing only the rows in the ranges.
     pub fn to_record_batch(&self) -> Result<RecordBatch, ArrowError> {
@@ -400,16 +367,6 @@ impl<'a> PartitionWrite<'a, RecordBatch> {
             .collect::<Result<Vec<_>, _>>()?;
         RecordBatch::try_new(self.batch.schema(), columns)
     }
-}
-
-fn min_max_time(col: &[i64]) -> (i64, i64) {
-    let mut min_timestamp = i64::MAX;
-    let mut max_timestamp = i64::MIN;
-    for t in col {
-        min_timestamp = min_timestamp.min(*t);
-        max_timestamp = max_timestamp.max(*t);
-    }
-    (min_timestamp, max_timestamp)
 }
 
 #[cfg(test)]
@@ -432,17 +389,6 @@ mod tests {
     use proptest::{prelude::*, prop_compose, proptest, strategy::Strategy};
     use rand::prelude::*;
     use schema::{Projection, TIME_COLUMN_NAME};
-    use test_helpers::assert_error;
-
-    #[test]
-    fn return_err_if_no_time_column() {
-        let batch = MutableBatch::new();
-        let table_partition_template = Default::default();
-        assert_error!(
-            PartitionWrite::partition(&batch, &table_partition_template),
-            PartitionWriteError::TimeColumn(TimeColumnError::NotFound),
-        );
-    }
 
     fn make_rng() -> StdRng {
         let seed = rand::rngs::OsRng.next_u64();
@@ -1330,6 +1276,20 @@ mod tests {
         tags = [("a", format!("{}நி", "A".repeat(182)))],
         want_key = format!("{}%E0%AE%A8%E0%AE%BF", "A".repeat(182)),
         want_reversed_tags = [("a", identity(format!("{}நி", "A".repeat(182))))]
+    );
+
+    test_partition_key!(
+        time_format_reserved_chars,
+        template = [
+            TemplatePart::TimeFormat("!%Y|#"),
+            TemplatePart::TagValue("a"),
+        ],
+        tags = [("a", "bananas")],
+        want_key = "%212023%7C%23|bananas", // Unambiguously encoded
+        want_reversed_tags = [
+            // The time column cannot be reversed by the current implementation.
+            ("a", identity("bananas"))
+        ]
     );
 
     /// A test using an invalid strftime format string.

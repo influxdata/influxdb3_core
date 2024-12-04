@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies] # In alphabetical order
 arrow = { workspace = true }
-bytes = "1.8"
+bytes = "1.9"
 base64 = "0.22"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }

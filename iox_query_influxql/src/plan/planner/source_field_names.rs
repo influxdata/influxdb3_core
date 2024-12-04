@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 #[derive(Debug)]
 pub(super) struct SourceFieldNamesVisitor<'a>(pub(super) &'a mut BTreeSet<String>);
 
-impl<'a> Visitor for SourceFieldNamesVisitor<'a> {
+impl Visitor for SourceFieldNamesVisitor<'_> {
     type Error = DataFusionError;
     fn pre_visit_var_ref(self, varref: &VarRef) -> Result<Recursion<Self>, Self::Error> {
         if let Some(dt) = varref.data_type {

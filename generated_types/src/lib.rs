@@ -1,15 +1,14 @@
 // This crate deliberately does not use the same linting rules as the other
 // crates because of all the generated code it contains that we don't have much
 // control over.
-#![allow(
+#![expect(
     clippy::derive_partial_eq_without_eq,
     clippy::future_not_send,
     clippy::large_enum_variant,
-    clippy::needless_borrow,
     clippy::needless_borrows_for_generic_args,
+    clippy::needless_lifetimes,
     clippy::use_self,
-    missing_copy_implementations,
-    unreachable_pub
+    missing_copy_implementations
 )]
 
 // Workaround for "unused crate" lint false positives.
@@ -139,6 +138,19 @@ pub mod influxdata {
                 fn from(value: v1::Uuid) -> Self {
                     uuid::Uuid::from_u64_pair(value.high, value.low)
                 }
+            }
+        }
+
+        pub mod catalog_storage {
+            pub mod v1 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/influxdata.iox.catalog_storage.v1.rs"
+                ));
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/influxdata.iox.catalog_storage.v1.serde.rs"
+                ));
             }
         }
 
@@ -513,6 +525,8 @@ mod tests {
             "influxdata.platform.storage.IOxTesting",
             "google.longrunning.Operations",
             "influxdata.iox.catalog.v1.CatalogService",
+            "influxdata.iox.catalog.v2.CatalogService",
+            "influxdata.iox.catalog_storage.v1.CatalogStorageService",
             "influxdata.iox.schema.v1.SchemaService",
             "influxdata.iox.gossip.v1.AntiEntropyService",
             "influxdata.iox.authz.v1.IoxAuthorizerService",
@@ -524,7 +538,6 @@ mod tests {
             "grpc.health.v1.Health",
             "influxdata.iox.compactor.v1.CompactionService",
             "influxdata.iox.object_store.v1.ObjectStoreService",
-            "influxdata.iox.catalog.v2.CatalogService",
             "influxdata.iox.table.v1.TableService",
             "influxdata.iox.bulk_ingest.v1.BulkIngestService",
         ]

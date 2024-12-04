@@ -2,6 +2,7 @@ use std::{ops::Range, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
+use datafusion::parquet::file::metadata::ParquetMetaDataReader;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
@@ -10,9 +11,7 @@ use datafusion::{
     },
     error::DataFusionError,
     parquet::{
-        arrow::async_reader::{AsyncFileReader, MetadataLoader},
-        errors::ParquetError,
-        file::metadata::ParquetMetaData,
+        arrow::async_reader::AsyncFileReader, errors::ParquetError, file::metadata::ParquetMetaData,
     },
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{metrics::ExecutionPlanMetricsSet, ExecutionPlan},
@@ -252,16 +251,13 @@ impl ParquetFileReader {
     /// Loads [`ParquetMetaData`] from file.
     #[inline]
     async fn load_metadata(&mut self) -> Result<ParquetMetaData, ParquetError> {
-        let preload_column_index = true;
-        let preload_offset_index = true;
-
-        let file_size = self.meta.size;
         let prefetch = self.metadata_size_hint;
-        let mut loader = MetadataLoader::load(self, file_size, prefetch).await?;
-        loader
-            .load_page_index(preload_column_index, preload_offset_index)
-            .await?;
-        Ok(loader.finish())
+        let file_size = self.meta.size;
+        ParquetMetaDataReader::new()
+            .with_prefetch_hint(prefetch)
+            .with_page_indexes(true)
+            .load_and_finish(self, file_size)
+            .await
     }
 }
 

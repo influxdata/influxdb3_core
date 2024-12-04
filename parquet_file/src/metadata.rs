@@ -259,7 +259,9 @@ pub struct IoxMetadata {
     /// This uuid will later be used as the catalog's ParquetFileId
     pub object_store_id: ObjectStoreId,
 
-    /// Timestamp when this file was created.
+    /// Timestamp when this file was created. This has no relation with the `created_at` value of
+    /// the catalog record for this Parquet file and is included in the metadata in the Parquet
+    /// file for debugging/informational purposes only.
     pub creation_timestamp: Time,
 
     /// namespace id of the data
@@ -489,8 +491,6 @@ impl IoxMetadata {
             max: max_time,
         } = derive_min_max_time(stats);
 
-        let created_at = Timestamp::from(self.creation_timestamp);
-
         ParquetFileParams {
             namespace_id: self.namespace_id,
             table_id: self.table_id,
@@ -502,7 +502,6 @@ impl IoxMetadata {
             file_size_bytes: file_size_bytes as i64,
             compaction_level: self.compaction_level,
             row_count: row_count.try_into().expect("row count overflows i64"),
-            created_at,
             column_set: ColumnSet::new(columns),
             max_l0_created_at: self.max_l0_created_at,
             // Currently, we're only setting the `source` field if the Parquet file is being

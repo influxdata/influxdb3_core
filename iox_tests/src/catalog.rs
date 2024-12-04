@@ -15,9 +15,8 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::metrics::Count;
 use datafusion_util::{unbounded_memory_pool, MemoryStream};
 use generated_types::influxdata::iox::partition_template::v1::PartitionTemplate;
-use iox_catalog::interface::PartitionRepoExt;
 use iox_catalog::{
-    interface::{Catalog, ParquetFileRepoExt, RepoCollection, SoftDeletedRows},
+    interface::{Catalog, ParquetFileRepoExt, PartitionRepoExt, RepoCollection, SoftDeletedRows},
     mem::MemCatalog,
     test_helpers::arbitrary_table,
     util::{get_schema_by_id, get_table_columns_by_id},
@@ -240,14 +239,15 @@ impl TestNamespace {
     /// Get namespace schema for this namespace.
     pub async fn schema(&self) -> NamespaceSchema {
         let mut repos = self.catalog.catalog.repositories();
-        get_schema_by_id(
+        let (_, schema) = get_schema_by_id(
             self.namespace.id,
             repos.as_mut(),
             SoftDeletedRows::ExcludeDeleted,
         )
         .await
         .expect("no catalog error")
-        .expect("namespace exists")
+        .expect("namespace exists");
+        schema
     }
 
     /// Set the number of tables allowed in this namespace.
@@ -255,7 +255,7 @@ impl TestNamespace {
         let mut repos = self.catalog.catalog.repositories();
         repos
             .namespaces()
-            .update_table_limit(&self.namespace.name, MaxTables::try_from(new_max).unwrap())
+            .update_table_limit(self.namespace.id, MaxTables::try_from(new_max).unwrap())
             .await
             .unwrap();
     }
@@ -266,7 +266,7 @@ impl TestNamespace {
         repos
             .namespaces()
             .update_column_limit(
-                &self.namespace.name,
+                self.namespace.id,
                 MaxColumnsPerTable::try_from(new_max).unwrap(),
             )
             .await
@@ -475,6 +475,15 @@ impl TestPartition {
         self: &Arc<Self>,
         builder: TestParquetFileBuilder,
     ) -> TestParquetFile {
+        let builder = self.create_parquet_file_in_object_storage(builder).await;
+        self.create_parquet_file_catalog_record(builder).await
+    }
+
+    /// Create a Parquet file in this partition in object storage only
+    pub async fn create_parquet_file_in_object_storage(
+        self: &Arc<Self>,
+        builder: TestParquetFileBuilder,
+    ) -> TestParquetFileBuilder {
         let TestParquetFileBuilder {
             record_batch,
             table,
@@ -483,7 +492,6 @@ impl TestPartition {
             max_time,
             file_size_bytes,
             size_override,
-            creation_time,
             compaction_level,
             to_delete,
             object_store_id,
@@ -508,6 +516,10 @@ impl TestPartition {
         let (record_batch, sort_key) = sort_batch(record_batch, &schema);
         let record_batch = dedup_batch(record_batch, &sort_key);
 
+        let mut repos = self.catalog.catalog.repositories();
+        update_catalog_sort_key_if_needed(repos.as_mut(), self.partition.id, sort_key.clone())
+            .await;
+
         let object_store_id = object_store_id.unwrap_or_else(ObjectStoreId::new);
 
         let metadata = IoxMetadata {
@@ -519,7 +531,7 @@ impl TestPartition {
             table_name: self.table.table.name.clone().into(),
             partition_key: self.partition.partition_key.clone(),
             compaction_level: CompactionLevel::Initial,
-            sort_key: Some(sort_key.clone()),
+            sort_key: Some(sort_key),
             max_l0_created_at,
         };
         let real_file_size_bytes = create_parquet_file(
@@ -533,7 +545,7 @@ impl TestPartition {
         )
         .await;
 
-        let builder = TestParquetFileBuilder {
+        TestParquetFileBuilder {
             record_batch: Some(record_batch),
             table: Some(table),
             schema: Some(schema),
@@ -541,18 +553,12 @@ impl TestPartition {
             max_time,
             file_size_bytes: Some(file_size_bytes.unwrap_or(real_file_size_bytes as u64)),
             size_override,
-            creation_time,
             compaction_level,
             to_delete,
             object_store_id: Some(object_store_id),
             row_count: None, // will be computed from the record batch again
             max_l0_created_at,
-        };
-
-        let result = self.create_parquet_file_catalog_record(builder).await;
-        let mut repos = self.catalog.catalog.repositories();
-        update_catalog_sort_key_if_needed(repos.as_mut(), self.partition.id, sort_key).await;
-        result
+        }
     }
 
     /// Only update the catalog with the builder's info, don't create anything in object storage.
@@ -567,7 +573,6 @@ impl TestPartition {
             max_time,
             file_size_bytes,
             size_override,
-            creation_time,
             compaction_level,
             to_delete,
             object_store_id,
@@ -607,7 +612,6 @@ impl TestPartition {
             max_time: Timestamp::new(max_time),
             file_size_bytes: file_size_bytes.unwrap_or(0) as i64,
             row_count: row_count as i64,
-            created_at: Timestamp::new(creation_time),
             compaction_level,
             column_set,
             max_l0_created_at,
@@ -615,10 +619,17 @@ impl TestPartition {
         };
 
         let mut repos = self.catalog.catalog.repositories();
-        let parquet_file = repos
+        let object_store_id = parquet_file_params.object_store_id;
+        repos
             .parquet_files()
             .create(parquet_file_params)
             .await
+            .unwrap();
+        let parquet_file = repos
+            .parquet_files()
+            .get_by_object_store_id(object_store_id)
+            .await
+            .unwrap()
             .unwrap();
 
         if to_delete {
@@ -647,21 +658,21 @@ impl TestPartition {
 }
 
 /// A builder for creating parquet files within partitions.
+#[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct TestParquetFileBuilder {
-    record_batch: Option<RecordBatch>,
-    table: Option<String>,
-    schema: Option<Schema>,
-    min_time: i64,
-    max_time: i64,
-    file_size_bytes: Option<u64>,
-    size_override: Option<i64>,
-    creation_time: i64,
-    compaction_level: CompactionLevel,
-    to_delete: bool,
-    object_store_id: Option<ObjectStoreId>,
-    row_count: Option<usize>,
-    max_l0_created_at: MaxL0CreatedAt,
+    pub record_batch: Option<RecordBatch>,
+    pub table: Option<String>,
+    pub schema: Option<Schema>,
+    pub min_time: i64,
+    pub max_time: i64,
+    pub file_size_bytes: Option<u64>,
+    pub size_override: Option<i64>,
+    pub compaction_level: CompactionLevel,
+    pub to_delete: bool,
+    pub object_store_id: Option<ObjectStoreId>,
+    pub row_count: Option<usize>,
+    pub max_l0_created_at: MaxL0CreatedAt,
 }
 
 impl Default for TestParquetFileBuilder {
@@ -674,7 +685,6 @@ impl Default for TestParquetFileBuilder {
             max_time: now().timestamp_nanos(),
             file_size_bytes: None,
             size_override: None,
-            creation_time: 1,
             compaction_level: CompactionLevel::Initial,
             to_delete: false,
             object_store_id: None,
@@ -727,12 +737,6 @@ impl TestParquetFileBuilder {
     /// Specify the maximum time for the parquet file metadata.
     pub fn with_max_time(mut self, max_time: i64) -> Self {
         self.max_time = max_time;
-        self
-    }
-
-    /// Specify the creation time for the parquet file metadata.
-    pub fn with_creation_time(mut self, creation_time: iox_time::Time) -> Self {
-        self.creation_time = creation_time.timestamp_nanos();
         self
     }
 

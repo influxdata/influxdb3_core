@@ -123,7 +123,7 @@ impl GapExpander for DateBinGapExpander {
         let array = as_timestamp_nanosecond_array(array)?;
         let range = self.get_bounds(range, array)?;
         let cap = ((range.end - range.start) / self.stride_ns) as usize;
-        let mut pairs = Vec::with_capacity(cap);
+        let mut pairs = Vec::with_capacity(cap.min(max_output_rows));
         let mut ts = range.start;
         let mut input_row = 0;
         while ts < range.end && pairs.len() < max_output_rows {
