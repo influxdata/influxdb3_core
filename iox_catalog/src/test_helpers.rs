@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 
 use crate::{
     cache::{CachingCatalog, CachingCatalogParams},
-    interface::{Catalog, Error, RepoCollection},
+    interface::{Catalog, Error, ParquetFileRepoExt, RepoCollection, SoftDeletedRows},
     metrics::GetTimeMetric,
     postgres::{parse_dsn, PostgresCatalog, PostgresConnectionOptions},
 };
@@ -60,11 +60,20 @@ pub async fn arbitrary_namespace_with_retention_policy<R: RepoCollection + ?Size
     retention_period_ns: i64,
 ) -> Namespace {
     let namespace_name = NamespaceName::new(name).unwrap();
-    repos
+    match repos
         .namespaces()
         .create(&namespace_name, None, Some(retention_period_ns), None)
         .await
-        .unwrap()
+    {
+        Ok(ns) => ns,
+        Err(Error::AlreadyExists { .. }) => repos
+            .namespaces()
+            .get_by_name(name, SoftDeletedRows::AllRows)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// When the details of the table don't matter; the test just needs *a* catalog table
@@ -82,7 +91,7 @@ pub async fn arbitrary_table<R: RepoCollection + ?Sized>(
     name: &str,
     namespace: &Namespace,
 ) -> Table {
-    repos
+    match repos
         .tables()
         .create(
             name,
@@ -91,7 +100,16 @@ pub async fn arbitrary_table<R: RepoCollection + ?Sized>(
             namespace.id,
         )
         .await
-        .unwrap()
+    {
+        Ok(t) => t,
+        Err(Error::AlreadyExists { .. }) => repos
+            .tables()
+            .get_by_namespace_and_name(namespace.id, name)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// Load or create an arbitrary table schema in the same way that a write implicitly creates a
@@ -166,7 +184,6 @@ pub fn catalog_from_backing<C: Catalog + 'static>(backing: C) -> CatalogAndCache
         backing,
         Arc::new(SystemProvider::new()) as _,
         Duration::ZERO,
-        None,
     )
 }
 
@@ -176,7 +193,6 @@ pub fn catalog_from_backing_and_times<C: Catalog + 'static>(
     backing: C,
     time_provider: Arc<dyn TimeProvider>,
     batch_delay: Duration,
-    etag_min_payload_size: Option<usize>,
 ) -> CatalogAndCache {
     let metrics = backing.metrics();
     let peer0 = TestCacheServer::bind_ephemeral(&metrics);
@@ -195,13 +211,10 @@ pub fn catalog_from_backing_and_times<C: Catalog + 'static>(
         quorum_fanout: 10,
         partition_linger: batch_delay,
         table_linger: batch_delay,
-        admin_ui_storage_api_enabled: false,
+        parquet_file_updates_delete_partition_snapshots: false,
     };
 
-    let caching_catalog = match etag_min_payload_size {
-        Some(size) => CachingCatalog::new_inner(params, size),
-        None => CachingCatalog::new(params),
-    };
+    let caching_catalog = CachingCatalog::new(params);
 
     let test_catalog = TestCatalog::new(caching_catalog);
     test_catalog.hold_onto(peer0);
@@ -238,6 +251,54 @@ async fn run_backing_postgres_catalog(
     (postgres_catalog, db)
 }
 
+/// Helper function to set up a table and its partition
+pub async fn setup_table_and_partition(
+    repos: &mut dyn RepoCollection,
+    table_name: &str,
+    namespace: &data_types::Namespace,
+) -> (data_types::Table, data_types::Partition) {
+    let table = arbitrary_table(repos, table_name, namespace).await;
+    let partition = repos
+        .partitions()
+        .create_or_get(format!("{}_partition", table_name).into(), table.id)
+        .await
+        .unwrap();
+    (table, partition)
+}
+
+/// Helper function to create and retrieve a parquet file
+pub async fn create_and_get_file(
+    repos: &mut dyn RepoCollection,
+    namespace: &data_types::Namespace,
+    table: &data_types::Table,
+    partition: &data_types::Partition,
+) -> data_types::ParquetFile {
+    let params = arbitrary_parquet_file_params(namespace, table, partition);
+    let object_store_id = params.object_store_id;
+    repos.parquet_files().create(params).await.unwrap();
+    repos
+        .parquet_files()
+        .get_by_object_store_id(object_store_id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Helper function to delete a file
+pub async fn delete_file(repos: &mut dyn RepoCollection, file: &data_types::ParquetFile) {
+    repos
+        .parquet_files()
+        .create_upgrade_delete(
+            file.partition_id,
+            &[file.object_store_id],
+            &[],
+            &[],
+            CompactionLevel::Initial,
+        )
+        .await
+        .unwrap();
+}
+
 /// [`Catalog`] wrapper that is helpful for testing.
 #[derive(Debug)]
 pub struct TestCatalog<T> {
@@ -247,13 +308,11 @@ pub struct TestCatalog<T> {
 }
 
 impl<T: Catalog> TestCatalog<T> {
-    const NAME: &'static str = "test";
-
     /// Create new test catalog.
     pub(crate) fn new(inner: T) -> Self {
         Self {
             hold_onto: Mutex::new(vec![]),
-            get_time_metric: GetTimeMetric::new(&inner.metrics(), Self::NAME),
+            get_time_metric: GetTimeMetric::new(&inner.metrics(), inner.name()),
             inner,
         }
     }
@@ -297,6 +356,6 @@ impl<T: Catalog> Catalog for TestCatalog<T> {
     }
 
     fn name(&self) -> &'static str {
-        Self::NAME
+        self.inner.name()
     }
 }

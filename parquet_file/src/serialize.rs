@@ -5,6 +5,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
+    num::NonZeroUsize,
     sync::Arc,
 };
 
@@ -212,9 +213,31 @@ pub async fn to_parquet_bytes(
 #[derive(Debug, Clone, Copy)]
 pub struct ParallelParquetWriterOptions {
     /// How many row groups may be serialized at once.
-    pub maximum_parallel_row_group_writers: usize,
+    maximum_parallel_row_group_writers: usize,
     /// How many columns may be written in parallel, across all row groups.
-    pub maximum_buffered_record_batches_per_stream: usize,
+    maximum_buffered_record_batches_per_stream: usize,
+}
+
+impl ParallelParquetWriterOptions {
+    /// Create a new [`ParallelParquetWriterOptions`].
+    pub fn new(
+        num_row_group_writers: NonZeroUsize,
+        num_column_writers_across_row_groups: NonZeroUsize,
+    ) -> Self {
+        Self {
+            maximum_parallel_row_group_writers: num_row_group_writers.into(),
+            maximum_buffered_record_batches_per_stream: num_column_writers_across_row_groups.into(),
+        }
+    }
+}
+
+impl Default for ParallelParquetWriterOptions {
+    fn default() -> Self {
+        Self {
+            maximum_parallel_row_group_writers: 1,
+            maximum_buffered_record_batches_per_stream: 2,
+        }
+    }
 }
 
 /// Performs a parallelized parquet encoding and upload to object_store.
@@ -321,6 +344,10 @@ fn parallel_parquet_options(
             // Refer to <https://github.com/apache/datafusion/issues/11367>
             data_page_row_count_limit: 20_000,
             column_index_truncate_length: Some(64),
+
+            // TODO: enable view types in iox code
+            // Refer to https://github.com/influxdata/influxdb_iox/issues/13093
+            schema_force_view_types: false,
 
             ..default_options.global
         },
@@ -538,9 +565,9 @@ mod tests {
         // will have different created_by (parquet-rs vs datafusion)
         assert_eq!(
             single_threaded_props.created_by(),
-            "parquet-rs version 53.2.0"
+            "parquet-rs version 53.3.0"
         );
-        assert_eq!(parallel_props.created_by(), "datafusion version 42.0.0");
+        assert_eq!(parallel_props.created_by(), "datafusion version 42.1.0");
 
         // assert they are the same
         assert_writer_properties_are_eq(single_threaded_props, parallel_props);

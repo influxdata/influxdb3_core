@@ -21,7 +21,7 @@ observability_deps = { path = "../observability_deps" }
 query_functions = { path = "../query_functions"}
 schema = { path = "../schema" }
 predicate = { path = "../predicate" }
-tokio = { version = "1.41", features = ["macros", "parking_lot"] }
+tokio = { version = "1.42", features = ["macros", "parking_lot"] }
 tokio-stream = "0.1"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

@@ -3,9 +3,12 @@ use arrow::compute::kernels::cmp::lt;
 use arrow::compute::nullif;
 use arrow::datatypes::Field;
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::function::WindowUDFFieldArgs;
+use datafusion::logical_expr::function::{
+    ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
+};
 use datafusion::logical_expr::window_state::WindowAggState;
 use datafusion::logical_expr::{PartitionEvaluator, Signature, WindowUDFImpl};
+use datafusion::physical_expr::PhysicalExpr;
 use std::any::Any;
 use std::ops::Range;
 use std::sync::Arc;
@@ -43,10 +46,17 @@ impl<U: WindowUDFImpl + 'static> WindowUDFImpl for NonNegativeUDWF<U> {
     fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
         self.inner.field(field_args)
     }
+    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
+    fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.inner.expressions(expr_args)
+    }
 
-    fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
+    fn partition_evaluator(
+        &self,
+        args: PartitionEvaluatorArgs<'_>,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
         Ok(Box::new(NonNegative {
-            partition_evaluator: self.inner.partition_evaluator()?,
+            partition_evaluator: self.inner.partition_evaluator(args)?,
         }))
     }
 }

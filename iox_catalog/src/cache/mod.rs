@@ -1,8 +1,5 @@
 //! Cache layer.
 
-/// Minimum size of payload to compute ETags for
-const ETAG_MIN_PAYLOAD_SIZE: usize = 128 * 1024;
-
 mod batcher;
 mod handler;
 mod loader;
@@ -13,6 +10,8 @@ mod test_utils;
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::Hash,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -27,9 +26,9 @@ use data_types::{
         table::TableSnapshot,
     },
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
-    TableId, Timestamp,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
+    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
+    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
 };
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
 use iox_time::TimeProvider;
@@ -69,8 +68,11 @@ pub struct CachingCatalogParams {
     /// linger timeout for writes impacting the table snapshot
     pub table_linger: Duration,
 
-    /// Enable Admin UI Storage API
-    pub admin_ui_storage_api_enabled: bool,
+    /// Do not eagerly update a partition snapshot when parquet files
+    /// are added, upgraded, or removed. Instead clear the partition
+    /// snapshot in a quorum of the cache so that the partition snapshot
+    /// will be read from the backing store the next time it is read.
+    pub parquet_file_updates_delete_partition_snapshots: bool,
 }
 
 /// Caching catalog.
@@ -80,6 +82,7 @@ pub struct CachingCatalog {
     metrics: CatalogMetrics,
     time_provider: Arc<dyn TimeProvider>,
     quorum_fanout: usize,
+    parquet_file_updates_delete_partition_snapshots: bool,
     partitions: CacheHandlerCatalog<PartitionSnapshot>,
     tables: CacheHandlerCatalog<TableSnapshot>,
     namespaces: CacheHandlerCatalog<NamespaceSnapshot>,
@@ -91,10 +94,6 @@ impl CachingCatalog {
 
     /// Create new caching catalog.
     pub fn new(params: CachingCatalogParams) -> Self {
-        Self::new_inner(params, ETAG_MIN_PAYLOAD_SIZE)
-    }
-
-    pub(crate) fn new_inner(params: CachingCatalogParams, etag_min_payload_size: usize) -> Self {
         let CachingCatalogParams {
             cache,
             backing,
@@ -103,7 +102,7 @@ impl CachingCatalog {
             quorum_fanout,
             partition_linger,
             table_linger,
-            admin_ui_storage_api_enabled,
+            parquet_file_updates_delete_partition_snapshots,
         } = params;
 
         // We set a more aggressive backoff configuration than normal as we expect latencies to be low
@@ -119,7 +118,6 @@ impl CachingCatalog {
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-            etag_min_payload_size,
             Arc::clone(&time_provider),
             partition_linger,
         );
@@ -128,7 +126,6 @@ impl CachingCatalog {
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-            etag_min_payload_size,
             Arc::clone(&time_provider),
             table_linger,
         );
@@ -137,7 +134,6 @@ impl CachingCatalog {
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-            etag_min_payload_size,
             Arc::clone(&time_provider),
             Duration::from_secs(0),
         );
@@ -146,25 +142,16 @@ impl CachingCatalog {
             &metrics,
             Arc::clone(&cache),
             Arc::clone(&backoff_config),
-            etag_min_payload_size,
             Arc::clone(&time_provider),
             Duration::from_secs(0),
         );
-
-        if admin_ui_storage_api_enabled {
-            // TODO (chunchun): Enable Admin UI Storage APIs, such as
-            // `get_count` and `get_size`, by creating a new CacheHandlerCatalog,
-            // similar to how partitions, tables, namespaces, and root
-            // are created
-            //
-            // https://github.com/influxdata/influxdb_iox/issues/12430
-        }
 
         Self {
             backing,
             metrics: CatalogMetrics::new(metrics, Arc::clone(&time_provider), Self::NAME),
             time_provider,
             quorum_fanout,
+            parquet_file_updates_delete_partition_snapshots,
             partitions,
             tables,
             namespaces,
@@ -187,6 +174,8 @@ impl Catalog for CachingCatalog {
             partitions: self.partitions.repos(),
             namespaces: self.namespaces.repos(),
             root: self.root.repos(),
+            parquet_file_updates_delete_partition_snapshots:
+                self.parquet_file_updates_delete_partition_snapshots,
         })))
     }
 
@@ -221,6 +210,7 @@ struct Repos {
     root: CacheHandlerRepos<RootSnapshot>,
     backing: Box<dyn RepoCollection>,
     quorum_fanout: usize,
+    parquet_file_updates_delete_partition_snapshots: bool,
 }
 
 impl Repos {
@@ -335,6 +325,67 @@ impl NamespaceRepo for Repos {
         self.backing.namespaces().list(deleted).await
     }
 
+    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+        let root = self.root.get(RootKey).await?;
+
+        let mut namespaces_with_storage: Vec<NamespaceWithStorage> = Vec::new();
+
+        for ns in root.namespaces() {
+            let ns = ns?;
+            let ns_snapshot = match self.namespaces.get(ns.id()).await {
+                Ok(ns_s) => ns_s,
+                Err(Error::NotFound { .. }) => {
+                    // This error indicates that a namespace exists in the root snapshot
+                    // but not in the namespace snapshot. In general, this should not happen.
+                    // However, it might occur if a namespace is deleted, and the namespace snapshot
+                    // is updated to remove the namespace, but the root snapshot has not
+                    // been updated, leaving the namespace still present in the root snapshot.
+                    // In this case, do not calculate the storage information for this namespace.
+                    // Instead, skip to the next iteration of the loop.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            if ns_snapshot.deleted_at().is_some() {
+                // If the namespace is deleted, no need to calculate the storage information.
+                // Instead, skip to the next namespace
+                continue;
+            }
+
+            let n = ns_snapshot.namespace()?;
+
+            // read-through: not latency sensitive
+            let namespace_size_bytes = self
+                .backing
+                .parquet_files()
+                .list_by_namespace_id(n.id, SoftDeletedRows::ExcludeDeleted)
+                .await?
+                .iter()
+                .map(|f| f.file_size_bytes)
+                .sum();
+            let table_count = self
+                .backing
+                .tables()
+                .list_by_namespace_id(n.id)
+                .await?
+                .len() as i64;
+
+            namespaces_with_storage.push(NamespaceWithStorage {
+                id: n.id,
+                name: n.name.clone(),
+                retention_period_ns: n.retention_period_ns,
+                max_tables: n.max_tables,
+                max_columns_per_table: n.max_columns_per_table,
+                partition_template: n.partition_template.clone(),
+                size_bytes: namespace_size_bytes,
+                table_count,
+            })
+        }
+
+        Ok(namespaces_with_storage)
+    }
+
     async fn get_by_id(
         &mut self,
         id: NamespaceId,
@@ -421,6 +472,37 @@ impl NamespaceRepo for Repos {
         let id = self.namespace_id_by_name(name).await?;
         self.namespaces.get(id).await
     }
+
+    async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>> {
+        // read-through: not latency sensitive
+        let namespace_size_bytes = self
+            .backing
+            .parquet_files()
+            .list_by_namespace_id(id, SoftDeletedRows::ExcludeDeleted)
+            .await?
+            .iter()
+            .map(|f| f.file_size_bytes)
+            .sum();
+        let table_count = self.backing.tables().list_by_namespace_id(id).await?.len() as i64;
+
+        match self.namespaces.get(id).await {
+            Ok(n) => {
+                let ns = n.namespace()?;
+                Ok(Some(NamespaceWithStorage {
+                    id: ns.id,
+                    name: ns.name,
+                    retention_period_ns: ns.retention_period_ns,
+                    max_tables: ns.max_tables,
+                    max_columns_per_table: ns.max_columns_per_table,
+                    partition_template: ns.partition_template,
+                    size_bytes: namespace_size_bytes,
+                    table_count,
+                }))
+            }
+            Err(Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[async_trait]
@@ -447,6 +529,33 @@ impl TableRepo for Repos {
     async fn get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>> {
         match self.tables.get(table_id).await {
             Ok(s) => Ok(Some(s.table()?)),
+            Err(Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>> {
+        match self.tables.get(table_id).await {
+            Ok(table_snapshot) => {
+                let mut table_size_bytes: i64 = 0;
+                for partition_snapshot in table_snapshot.partitions() {
+                    for file in self.partitions.get(partition_snapshot?.id()).await?.files() {
+                        let file = file?;
+                        if file.to_delete.is_none() {
+                            table_size_bytes += file.file_size_bytes;
+                        }
+                    }
+                }
+
+                let table = table_snapshot.table()?;
+                Ok(Some(TableWithStorage {
+                    id: table.id,
+                    name: table.name,
+                    namespace_id: table.namespace_id,
+                    partition_template: table.partition_template,
+                    size_bytes: table_size_bytes,
+                }))
+            }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
@@ -512,6 +621,63 @@ impl TableRepo for Repos {
             .try_flatten()
             .try_collect::<Vec<_>>()
             .await
+    }
+
+    async fn list_storage_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<TableWithStorage>> {
+        let namespace_snapshot = match self.namespaces.get(namespace_id).await {
+            Ok(ns) => ns,
+            Err(Error::NotFound { .. }) => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+
+        if namespace_snapshot.deleted_at().is_some() {
+            return Ok(vec![]);
+        }
+
+        let mut tables_with_storage: Vec<TableWithStorage> = Vec::new();
+
+        for table in namespace_snapshot.tables() {
+            let table = table?;
+            let table_snapshot = match self.tables.get(table.id()).await {
+                Ok(ts) => ts,
+                Err(Error::NotFound { .. }) => {
+                    // This error indicates that a table exists in the namespace snapshot
+                    // but not in the table snapshot. In general, this should not happen.
+                    // However, it might occur if a table is deleted, and the table snapshot
+                    // is updated to remove the table, but the namespace snapshot has not
+                    // been updated, leaving the table still present in the namespace snapshot.
+                    // In this case, do not calculate the size for this table.
+                    // Instead, skip to the next iteration of the loop.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let mut table_size: i64 = 0;
+            for partition_snapshot in table_snapshot.partitions() {
+                for file in self.partitions.get(partition_snapshot?.id()).await?.files() {
+                    let file = file?;
+                    if file.to_delete.is_none() {
+                        table_size += file.file_size_bytes;
+                    }
+                }
+            }
+
+            let t = table_snapshot.table()?;
+
+            tables_with_storage.push(TableWithStorage {
+                id: t.id,
+                name: t.name.clone(),
+                namespace_id: t.namespace_id,
+                partition_template: t.partition_template.clone(),
+                size_bytes: table_size,
+            });
+        }
+
+        Ok(tables_with_storage)
     }
 
     async fn list(&mut self) -> Result<Vec<Table>> {
@@ -873,6 +1039,13 @@ impl PartitionRepo for Repos {
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot> {
         self.partitions.get(partition_id).await
     }
+
+    async fn snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64> {
+        (self as &mut dyn PartitionRepo)
+            .snapshot(partition_id)
+            .await
+            .map(|s| s.generation())
+    }
 }
 
 #[async_trait]
@@ -916,7 +1089,11 @@ impl ParquetFileRepo for Repos {
             .map(|p_id| {
                 let this = &self;
                 async move {
-                    this.partitions.refresh(p_id).await?;
+                    if this.parquet_file_updates_delete_partition_snapshots {
+                        this.partitions.delete(p_id).await?;
+                    } else {
+                        this.partitions.refresh(p_id).await?;
+                    };
                     Ok::<(), Error>(())
                 }
             })
@@ -986,6 +1163,7 @@ impl ParquetFileRepo for Repos {
         Ok(files)
     }
 
+    #[allow(deprecated)]
     async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>> {
         // read-through: this is used by the GC, so this is not overall latency-critical
         self.backing.parquet_files().active_as_of(as_of).await
@@ -1013,6 +1191,77 @@ impl ParquetFileRepo for Repos {
             .await
     }
 
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
+        // We use two sources for this implementation and use the union of the them:
+        //
+        // 1. backing catalog:
+        //    That one knows all files, no matter if they are marked for deletion or not.
+        // 2. cache layer:
+        //    Under certain conditions (e.g. pod dies between "backing change" and "quorum write" in
+        //    `ParquetFileRepo::flag_for_delete_by_retention`) it is possible that we still cache a file even when it is
+        //    marked for deletion. Since `ParquetFileRepo::delete_old_ids_only` doesn't affect the cache (we only cache
+        //    non-soft-deleted files), we'll subsequently miss the hard deletion as well. To prevent the GC from
+        //    deleting the file finally, we combine the two results.
+        //
+        // An alternative would to detect the inconsistency and force-refresh the respective cache entries. However the
+        // check between the backing catalog and the cache is racy and a new file COULD be created in-between. This may
+        // lead to many force-refreshs when a GC scans a partition that is under heavy write load. This may degrede
+        // system performance. On the other hand, NOT deleting a few files isn't the worst.
+        //
+        // Also see https://github.com/influxdata/influxdb_iox/issues/12807
+        let backing_result = self
+            .backing
+            .parquet_files()
+            .exists_by_partition_and_object_store_id_batch(ids.clone())
+            .await?;
+
+        let mut cache_result = futures::stream::iter(prepare_set(tuples_to_hash(ids)))
+            .map(|(p_id, os_ids)| {
+                let this = &self;
+                async move {
+                    let snapshot = match this.partitions.get(p_id).await {
+                        Ok(s) => s,
+                        Err(Error::NotFound { .. }) => {
+                            return Ok(futures::stream::empty::<
+                                Result<(PartitionId, ObjectStoreId), Error>,
+                            >()
+                            .boxed());
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
+
+                    // decode object store IDs
+                    let files = snapshot
+                        .files()
+                        .map(|res| res.map(|f| f.object_store_id).map_err(Error::from))
+                        .collect::<Result<HashSet<_>>>()?;
+
+                    Ok::<_, Error>(
+                        futures::stream::iter(
+                            os_ids
+                                .into_iter()
+                                .filter(move |os_id| files.contains(os_id))
+                                .map(move |os_id| Ok((p_id, os_id))),
+                        )
+                        .boxed(),
+                    )
+                }
+            })
+            .buffer_unordered(self.quorum_fanout)
+            .try_flatten()
+            .try_collect::<HashSet<_>>()
+            .await?;
+
+        cache_result.extend(backing_result);
+
+        Ok(prepare_set(cache_result))
+    }
+
     async fn create_upgrade_delete(
         &mut self,
         partition_id: PartitionId,
@@ -1021,11 +1270,18 @@ impl ParquetFileRepo for Repos {
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
     ) -> Result<Vec<ParquetFile>> {
+        let refresh: Pin<Box<dyn Future<Output = Result<()>> + Send>> =
+            if self.parquet_file_updates_delete_partition_snapshots {
+                Box::pin(self.partitions.delete(partition_id))
+            } else {
+                Box::pin(self.partitions.refresh_batched(partition_id))
+            };
+
         let res = self
             .backing
             .parquet_files()
             .create_upgrade_delete(partition_id, delete, upgrade, create, target_level)
-            .with_refresh(self.partitions.refresh_batched(partition_id))
+            .with_refresh(refresh)
             .await?;
 
         Ok(res)
@@ -1039,6 +1295,18 @@ impl ParquetFileRepo for Repos {
         self.backing
             .parquet_files()
             .list_by_table_id(table_id, compaction_level)
+            .await
+    }
+
+    async fn list_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Vec<ParquetFile>> {
+        // read-through: not latency sensitive
+        self.backing
+            .parquet_files()
+            .list_by_namespace_id(namespace_id, deleted)
             .await
     }
 }
@@ -1059,6 +1327,19 @@ where
     set
 }
 
+/// Convert an iterator of tuples into a [`HashMap`].
+fn tuples_to_hash<I, K, V>(it: I) -> HashMap<K, Vec<V>>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Eq + Hash,
+{
+    let mut map = HashMap::<K, Vec<V>>::new();
+    for (k, v) in it {
+        map.entry(k).or_default().push(v);
+    }
+    map
+}
+
 /// Filter namespace according to retrieval policy.
 fn filter_namespace(ns: Namespace, deleted: SoftDeletedRows) -> Option<Namespace> {
     match deleted {
@@ -1077,12 +1358,8 @@ trait ShouldRefresh {
 impl ShouldRefresh for Error {
     fn should_refresh(&self) -> bool {
         match self {
-            Self::External { .. } => false,
-            Self::AlreadyExists { .. } => true,
-            Self::LimitExceeded { .. } => true,
-            Self::NotFound { .. } => true,
-            Self::Malformed { .. } => false,
-            Self::NotImplemented { .. } => false,
+            Self::Unhandled { .. } | Self::Malformed { .. } | Self::NotImplemented { .. } => false,
+            Self::AlreadyExists { .. } | Self::LimitExceeded { .. } | Self::NotFound { .. } => true,
         }
     }
 }
@@ -1323,7 +1600,8 @@ mod tests {
 
         // Insert a new snapshot
         let next_gen = val.generation() + 1;
-        let new_val = CacheValue::new(val.data().clone(), next_gen).with_etag(Arc::clone(etag));
+        let new_val =
+            CacheValue::new(val.data().cloned().unwrap(), next_gen).with_etag(Arc::clone(etag));
         cache.local().insert(key, new_val).unwrap();
 
         // Should use local version even though remotes only have previous version
@@ -1586,7 +1864,6 @@ mod tests {
             MemCatalog::new(Arc::default(), Arc::clone(&time_provider)),
             time_provider,
             batch_delay,
-            Some(2),
         )
     }
 

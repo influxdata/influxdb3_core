@@ -9,6 +9,7 @@ license.workspace = true
 async-trait = { version = "0.1.83", default-features = false }
 bytes = { version = "1.9.0", default-features = false }
 dashmap = "6.1.0"
+data_types = { path = "../data_types" }
 futures = { version = "0.3.31" }
 indexmap = { version = "2.7", features = ["std"] }
 iox_time = { path = "../iox_time" }
@@ -16,12 +17,18 @@ metric = { path = "../metric" }
 object_store.workspace = true
 observability_deps = { path = "../observability_deps" }
 paste = "1"
-tokio = { version = "1.41.0", default-features = false }
+tokio = { version = "1.42.0", default-features = false }
 tracker = { path = "../tracker" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive"] }
 futures-concurrency = "7"
+rand = "0.8.5"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "s3_fifo_concurrency"
+harness = false

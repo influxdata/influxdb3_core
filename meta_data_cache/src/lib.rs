@@ -5,7 +5,7 @@ use observability_deps::tracing::warn;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use std::{collections::HashSet, mem::size_of, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::HashSet, mem::size_of, num::NonZeroUsize, sync::Arc};
 
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, FixedSizeBinaryBuilder, RecordBatch},
@@ -24,22 +24,11 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_util::create_physical_expr_from_schema;
-use futures::{FutureExt, StreamExt};
-use iox_time::{SystemProvider, TimeProvider};
+use futures::FutureExt;
 use metric::U64Counter;
 use object_store_mem_cache::cache_system::{
-    hook::{chain::HookChain, limit::MemoryLimiter, observer::ObserverHook},
-    hook_limited::HookLimitedCache,
-    reactor::{
-        reaction::ReactionExt,
-        trigger::{ticker, TriggerExt},
-        Reactor,
-    },
-    Cache, DynError, HasSize,
+    hook::observer::ObserverHook, s3_fifo_cache::S3FifoCache, Cache, DynError, HasSize,
 };
-
-// use observability_deps::tracing::warn;
-use tokio::runtime::Handle;
 
 const CACHE_NAME: &str = "parquet_metadata";
 
@@ -49,23 +38,14 @@ pub struct MetaIndexCacheParams<'a> {
     /// Memory limit in bytes.
     pub memory_limit: NonZeroUsize,
 
-    /// After an OOM event triggered an emergency GC (= garbage collect) run, how how should we wait until the next
-    /// run?
-    ///
-    /// If there is another OOM event during the cooldown period, new elements will NOT be cached.
-    pub oom_throttle: Duration,
+    /// The relative size (in percentage) of the "small" S3-FIFO queue.
+    pub s3fifo_main_threshold: usize,
 
-    /// How often should the GC (= garbage collector) remove unused elements and elements that failed.
-    pub gc_interval: Duration,
-
-    /// Time provider.
-    pub time_provider: Arc<dyn TimeProvider>,
+    /// Size of S3-FIFO ghost set in bytes.
+    pub s3_fifo_ghost_memory_limit: NonZeroUsize,
 
     /// Metric registry for metrics.
     pub metrics: &'a metric::Registry,
-
-    /// Tokio runtime handle for the background task that drives the GC (= garbage collector).
-    pub handle: &'a Handle,
 
     /// Enable caching of column statistics from parquet metadata to optimize file pruning
     pub cache_column_stats: bool,
@@ -76,75 +56,28 @@ impl MetaIndexCacheParams<'_> {
     pub fn build(self) -> MetaIndexCache {
         let Self {
             memory_limit,
-            oom_throttle,
-            gc_interval,
-            time_provider,
+            s3_fifo_ghost_memory_limit,
+            s3fifo_main_threshold,
             metrics,
-            handle,
             cache_column_stats,
         } = self;
 
-        let memory_limiter = MemoryLimiter::new(memory_limit);
-        let oom_notify = memory_limiter.oom();
-        let cache = Arc::new(HookLimitedCache::new(Arc::new(HookChain::new([
-            Arc::new(memory_limiter) as _,
+        let cache = Arc::new(S3FifoCache::new(
+            memory_limit.get(),
+            s3_fifo_ghost_memory_limit.get(),
+            s3fifo_main_threshold as f64 / 100.0,
             Arc::new(ObserverHook::new(
                 CACHE_NAME,
                 metrics,
                 Some(memory_limit.get() as u64),
             )) as _,
-        ]))));
-        let cache_captured = Arc::downgrade(&cache);
-        let reactor = Reactor::new(
-            [
-                oom_notify
-                    .boxed()
-                    .throttle(
-                        oom_throttle,
-                        Arc::clone(&time_provider),
-                        CACHE_NAME,
-                        "oom",
-                        metrics,
-                    )
-                    .observe(CACHE_NAME, "oom", metrics),
-                ticker(gc_interval).observe(CACHE_NAME, "gc", metrics),
-            ],
-            cache_captured.observe(CACHE_NAME, metrics, Arc::clone(&time_provider)),
-            handle,
-        );
+            metrics,
+        ));
 
         MetaIndexCache {
             file_index: cache,
             col_stats_metrics: Arc::new(StatsCachedMetrics::new(metrics)),
-            reactor,
             cache_column_stats,
-        }
-    }
-
-    /// build store for testing
-    pub fn build_for_default(memory_limit: NonZeroUsize) -> MetaIndexCache {
-        // todo: use more consts
-        let memory_limiter = MemoryLimiter::new(memory_limit);
-        let cache = Arc::new(HookLimitedCache::new(Arc::new(HookChain::new([
-            Arc::new(memory_limiter) as _,
-        ]))));
-        let cache_captured = Arc::downgrade(&cache);
-
-        let metrics = metric::Registry::new();
-        let time_provider = Arc::new(SystemProvider::new()) as _;
-        let col_stats_metrics = Arc::new(StatsCachedMetrics::new(&metrics));
-
-        let reactor = Reactor::new(
-            [ticker(Duration::from_secs(60)).observe(CACHE_NAME, "gc", &metrics)],
-            cache_captured.observe(CACHE_NAME, &metrics, Arc::clone(&time_provider)),
-            &Handle::current(),
-        );
-
-        MetaIndexCache {
-            file_index: cache,
-            col_stats_metrics,
-            reactor,
-            cache_column_stats: true,
         }
     }
 }
@@ -209,14 +142,10 @@ impl StatsCachedMetrics {
 ///        for 3 different options
 #[derive(Debug)]
 pub struct MetaIndexCache {
-    file_index: Arc<HookLimitedCache<ObjectStoreId, FileMetas>>,
+    file_index: Arc<S3FifoCache<ObjectStoreId, FileMetas>>,
 
     // cache metrics
     col_stats_metrics: Arc<StatsCachedMetrics>,
-
-    // reactor must just kept alive
-    #[allow(dead_code)]
-    reactor: Reactor,
 
     /// Cache column statistics for file pruning
     cache_column_stats: bool,
@@ -800,8 +729,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_meta_index() {
         // empty file meta index
-        let meta_index =
-            MetaIndexCacheParams::build_for_default(NonZeroUsize::new(100000).unwrap());
+        let meta_index = cache();
 
         // initial metric values
         let mut col_cache_hit = 0;
@@ -1039,8 +967,7 @@ mod tests {
     #[tokio::test]
     async fn test_prune_files() {
         // empty file meta index
-        let meta_index =
-            MetaIndexCacheParams::build_for_default(NonZeroUsize::new(100000).unwrap());
+        let meta_index = cache();
 
         // add stats for file 1 with 3 columns
         let file_1 = ObjectStoreId::from_uuid(Uuid::from_u128(1));
@@ -1231,5 +1158,16 @@ mod tests {
             .unwrap()
             .to_record_batch(files);
         assert_batches_eq!(expected, &[record_batch]);
+    }
+
+    fn cache() -> MetaIndexCache {
+        MetaIndexCacheParams {
+            memory_limit: NonZeroUsize::new(100_000).unwrap(),
+            s3_fifo_ghost_memory_limit: NonZeroUsize::new(100_000).unwrap(),
+            s3fifo_main_threshold: 20,
+            metrics: &metric::Registry::new(),
+            cache_column_stats: true,
+        }
+        .build()
     }
 }

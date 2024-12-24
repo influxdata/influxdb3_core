@@ -33,6 +33,19 @@ pub(crate) trait Snapshot: Clone + std::fmt::Debug + Send + Sync + 'static {
     fn snapshot(backing: &dyn Catalog, key: Self::Key)
         -> impl Future<Output = Result<Self>> + Send;
 
+    /// Get the generation number of a snapshot for a given key. This
+    /// can be used as an optimization where creating a snapshot is
+    /// expensive.
+    fn snapshot_generation(
+        backing: &dyn Catalog,
+        key: Self::Key,
+    ) -> impl Future<Output = Result<u64>> + Send {
+        async move {
+            let snapshot = Self::snapshot(backing, key).await?;
+            Ok(snapshot.generation())
+        }
+    }
+
     /// Snapshot generation.
     fn generation(&self) -> u64;
 
@@ -63,6 +76,14 @@ impl Snapshot for PartitionSnapshot {
         Ok(snapshot)
     }
 
+    async fn snapshot_generation(backing: &dyn Catalog, key: Self::Key) -> Result<u64> {
+        backing
+            .repositories()
+            .partitions()
+            .snapshot_generation(key)
+            .await
+    }
+
     fn generation(&self) -> u64 {
         self.generation()
     }
@@ -73,7 +94,9 @@ impl Snapshot for PartitionSnapshot {
     }
 
     fn from_cache_value(val: CacheValue) -> Result<Self> {
-        let proto = proto::Partition::decode(val.data().clone())?;
+        let proto = val.data().map_or(Ok(Default::default()), |data| {
+            proto::Partition::decode(data.clone())
+        })?;
         Ok(Self::decode(proto, val.generation()))
     }
 }
@@ -108,7 +131,9 @@ impl Snapshot for TableSnapshot {
     }
 
     fn from_cache_value(val: CacheValue) -> Result<Self> {
-        let proto = proto::Table::decode(val.data().clone())?;
+        let proto = val.data().map_or(Ok(Default::default()), |data| {
+            proto::Table::decode(data.clone())
+        })?;
         Ok(Self::decode(proto, val.generation()))
     }
 }
@@ -143,7 +168,9 @@ impl Snapshot for NamespaceSnapshot {
     }
 
     fn from_cache_value(val: CacheValue) -> Result<Self> {
-        let proto = proto::Namespace::decode(val.data().clone())?;
+        let proto = val.data().map_or(Ok(Default::default()), |data| {
+            proto::Namespace::decode(data.clone())
+        })?;
         Ok(Self::decode(proto, val.generation())?)
     }
 }
@@ -181,7 +208,9 @@ impl Snapshot for RootSnapshot {
     }
 
     fn from_cache_value(val: CacheValue) -> Result<Self> {
-        let proto = proto::Root::decode(val.data().clone())?;
+        let proto = val.data().map_or(Ok(Default::default()), |data| {
+            proto::Root::decode(data.clone())
+        })?;
         Ok(Self::decode(proto, val.generation())?)
     }
 }

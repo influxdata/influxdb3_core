@@ -1,7 +1,7 @@
 //! Server for the cache HTTP API
 
 use crate::api::list::{v1, v2, ListEntry};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2};
+use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE};
 use crate::local::CatalogCache;
 use crate::CacheValue;
 use futures::ready;
@@ -174,15 +174,29 @@ impl CatalogRequestFuture {
 
                         return Ok(match check_preconditions(&value, &self.parts.headers)? {
                             Some(s) => builder.status(s).body(Body::empty())?,
-                            None => builder.body(value.data.into())?,
+                            None => match value.data {
+                                Some(bytes) => builder.body(bytes.into())?,
+                                None => builder.header(&NO_VALUE, "true").body(Body::empty())?,
+                            },
                         });
                     }
                     None => StatusCode::NOT_FOUND,
                 },
                 Method::PUT => {
                     let headers = &self.parts.headers;
-                    let generation = headers.get(&GENERATION).context(MissingGenerationSnafu)?;
-                    let mut value = CacheValue::new(body.into(), parse_generation(generation)?);
+                    let generation = parse_generation(
+                        headers.get(&GENERATION).context(MissingGenerationSnafu)?,
+                    )?;
+                    let no_value = headers
+                        .get(&NO_VALUE)
+                        .map(|v| v.to_str().unwrap_or("false") == "true")
+                        .unwrap_or(false);
+
+                    let mut value = if no_value {
+                        CacheValue::new_empty(generation)
+                    } else {
+                        CacheValue::new(body.into(), generation)
+                    };
 
                     if let Some(x) = headers.get(ETAG) {
                         let etag = x.to_str().context(InvalidEtagSnafu)?.to_string();

@@ -50,7 +50,7 @@ use object_store::path::Path;
 /// let parquet_path2 = ParquetFilePath::try_from(os_path).unwrap();
 /// assert_eq!(parquet_path, parquet_path2);
 /// ```
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParquetFilePath {
     namespace_id: NamespaceId,
     table_id: TableId,
@@ -85,8 +85,8 @@ impl ParquetFilePath {
     }
 
     /// Get partition ID.
-    pub fn partition_id(&self) -> String {
-        self.partition_id.to_string()
+    pub fn partition_id(&self) -> &TransitionPartitionId {
+        &self.partition_id
     }
 
     /// Get object-store path.

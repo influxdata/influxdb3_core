@@ -16,12 +16,12 @@ mod tests {
     use generated_types::influxdata::iox::catalog::v2 as proto;
     use iox_time::{SystemProvider, TimeProvider};
     use metric::{Attributes, Metric, U64Counter};
-    use serialization::{deserialize_namespace, RequiredExt};
+    use serialization::deserialize_namespace;
     use test_helpers::{maybe_start_logging, timeout::FutureTimeout};
 
     use crate::{
         grpc::test_server::TestGrpcServer, interface::Catalog, mem::MemCatalog,
-        test_helpers::TestCatalog,
+        test_helpers::TestCatalog, util_serialization::RequiredExt,
     };
 
     use super::*;

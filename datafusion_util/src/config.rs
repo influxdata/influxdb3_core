@@ -1,6 +1,12 @@
 use std::{fmt::Display, sync::Arc};
 
 use datafusion::config::{ParquetOptions, TableParquetOptions};
+use datafusion::datasource::file_format::arrow::ArrowFormatFactory;
+use datafusion::datasource::file_format::avro::AvroFormatFactory;
+use datafusion::datasource::file_format::csv::CsvFormatFactory;
+use datafusion::datasource::file_format::json::JsonFormatFactory;
+use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
+use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::{
     config::ConfigOptions, execution::runtime_env::RuntimeEnv, prelude::SessionConfig,
 };
@@ -24,6 +30,7 @@ pub fn iox_session_config() -> SessionConfig {
     let mut options = ConfigOptions::new();
     options.execution.parquet.pushdown_filters = true;
     options.execution.parquet.reorder_filters = true;
+    options.execution.parquet.schema_force_view_types = false;
     options.execution.time_zone = TIME_DATA_TIMEZONE().map(|s| s.to_string());
     options.optimizer.repartition_sorts = true;
     options.optimizer.prefer_existing_union = true;
@@ -43,6 +50,19 @@ pub fn iox_session_config() -> SessionConfig {
         .with_prefer_existing_sort(true)
 }
 
+/// Use mostly default file formats, but apply iox-specific [`TableParquetOptions`].
+pub fn iox_file_formats() -> Vec<Arc<dyn FileFormatFactory>> {
+    vec![
+        Arc::new(ParquetFormatFactory::new_with_options(
+            table_parquet_options(),
+        )),
+        Arc::new(JsonFormatFactory::new()),
+        Arc::new(CsvFormatFactory::new()),
+        Arc::new(ArrowFormatFactory::new()),
+        Arc::new(AvroFormatFactory::new()),
+    ]
+}
+
 /// Return a TableParquetOptions object configured for IOx
 /// This is a workaround until DataFusion supports retrieving these options from the ParquetExec
 /// <https://github.com/apache/arrow-datafusion/issues/9908>
@@ -52,6 +72,11 @@ pub fn table_parquet_options() -> TableParquetOptions {
             // should match the configuration in `iox_session_config`
             pushdown_filters: true,
             reorder_filters: true,
+
+            // TODO: enable view types in iox code
+            // Refer to https://github.com/influxdata/influxdb_iox/issues/13093
+            schema_force_view_types: false,
+
             ..ParquetOptions::default()
         },
         ..TableParquetOptions::default()

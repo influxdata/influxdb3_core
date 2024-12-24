@@ -196,6 +196,16 @@ pub struct RouterConfig {
         default_value = "false"
     )]
     pub no_wait_rpc_upstreams: bool,
+
+    /// Enable Admin UI Storage API.
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/12249>
+    #[clap(
+        long = "router-admin-ui-storage-api-enabled",
+        env = "INFLUXDB_IOX_ROUTER_ADMIN_UI_STORAGE_API_ENABLED",
+        default_value = "false"
+    )]
+    pub admin_ui_storage_api_enabled: bool,
 }
 
 /// Map a string containing an integer number of seconds into a [`Duration`].

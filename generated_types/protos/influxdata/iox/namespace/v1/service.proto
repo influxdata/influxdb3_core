@@ -3,6 +3,7 @@ package influxdata.iox.namespace.v1;
 option go_package = "github.com/influxdata/iox/namespace/v1";
 
 import "influxdata/iox/partition_template/v1/template.proto";
+import "influxdata/iox/catalog_storage/v1/service.proto";
 
 service NamespaceService {
   // Get all namespaces
@@ -26,6 +27,12 @@ service NamespaceService {
   rpc UpdateNamespaceServiceProtectionLimit(
       UpdateNamespaceServiceProtectionLimitRequest)
       returns (UpdateNamespaceServiceProtectionLimitResponse);
+
+  // Get all namespaces with storage information
+  rpc GetNamespacesWithStorage(GetNamespacesWithStorageRequest) returns (GetNamespacesWithStorageResponse);
+
+  // Get a specific namespace with storage information
+  rpc GetNamespaceWithStorage(GetNamespaceWithStorageRequest) returns (GetNamespaceWithStorageResponse);
 }
 
 message GetNamespacesRequest {}
@@ -126,4 +133,26 @@ message Namespace {
   // A monotonically increasing counter tracking the version of this namespace's
   // non-schema properties, as used across routers.
   int64 router_version = 7;
+}
+
+// Request to get a list of namespaces with storage.
+message GetNamespacesWithStorageRequest {
+  // Pagination and sorting options will be added in follow-up PRs:
+  // https://github.com/influxdata/influxdb_iox/issues/12775
+}
+
+// Request to get a specific namespace with storage.
+message GetNamespaceWithStorageRequest {
+  // ID of the namespace to get.
+  int64 id = 1;
+}
+
+// Response containing a list of namespaces with storage.
+message GetNamespacesWithStorageResponse {
+  repeated influxdata.iox.catalog_storage.v1.NamespaceWithStorage namespace_with_storage = 1;
+}
+
+// Response containing a specific namespace with storage.
+message GetNamespaceWithStorageResponse {
+  influxdata.iox.catalog_storage.v1.NamespaceWithStorage namespace_with_storage = 1;
 }

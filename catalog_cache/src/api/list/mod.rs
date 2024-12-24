@@ -60,7 +60,7 @@ impl ListEntry {
         Self {
             key: Some(key),
             generation: value.generation,
-            data: Some(value.data),
+            data: value.data,
             etag: value.etag,
         }
     }

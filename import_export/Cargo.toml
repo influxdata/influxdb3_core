@@ -20,7 +20,7 @@ object_store = { workspace=true }
 observability_deps = { path = "../observability_deps" }
 schema = { path = "../schema" }
 serde_json = "1.0.133"
-thiserror = "2.0.3"
-tokio = { version = "1.41" }
-tokio-util = { version = "0.7.12", features = ["compat"] }
+thiserror = "2.0.7"
+tokio = { version = "1.42" }
+tokio-util = { version = "0.7.13", features = ["compat"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

@@ -27,14 +27,19 @@ use crate::{
         loader::Loader,
         snapshot::{Snapshot, SnapshotKey},
     },
-    interface::{Catalog, Error, Result},
+    interface::{Catalog, Result, UnhandledError},
 };
+
+/// ETAG to use for an empty cache value. This is equivalent to
+/// `BASE64_STANDARD.encode(digest(SHA256, &[]))`.
+const EMPTY_ETAG: &str = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
 
 #[derive(Debug)]
 struct CacheMetrics {
     get_hit: DurationHistogram,
     get_miss: DurationHistogram,
     put: DurationHistogram,
+    delete: DurationHistogram,
 }
 
 impl CacheMetrics {
@@ -48,6 +53,7 @@ impl CacheMetrics {
             get_hit: metric.recorder(&[("variant", variant), ("op", "get"), ("result", "hit")]),
             get_miss: metric.recorder(&[("variant", variant), ("op", "get"), ("result", "miss")]),
             put: metric.recorder(&[("variant", variant), ("op", "put")]),
+            delete: metric.recorder(&[("variant", variant), ("op", "delete")]),
         }
     }
 }
@@ -63,7 +69,6 @@ where
     cache: Arc<QuorumCatalogCache>,
     backoff_config: Arc<BackoffConfig>,
     loader: Loader<T::Key, T>,
-    etag_min_payload_size: usize,
     batcher: Batcher<T::Key, Option<SpanContext>>,
 }
 
@@ -132,7 +137,6 @@ where
         let mut span_recorder = SpanRecorder::new(span);
         let backing = Arc::clone(&self.backing);
         let cache = Arc::clone(&self.cache);
-        let min_etag = self.etag_min_payload_size;
         let metrics = Arc::clone(&self.metrics);
 
         let fut = async move {
@@ -142,10 +146,14 @@ where
 
             let mut value = CacheValue::new(data, generation);
 
-            if value.data().len() >= min_etag {
-                let digest = ring::digest::digest(&ring::digest::SHA256, value.data());
-                value = value.with_etag(base64::prelude::BASE64_STANDARD.encode(digest));
-            }
+            let etag: Arc<str> = if let Some(data) = value.data() {
+                base64::prelude::BASE64_STANDARD
+                    .encode(ring::digest::digest(&ring::digest::SHA256, data))
+                    .into()
+            } else {
+                Arc::from(EMPTY_ETAG)
+            };
+            value = value.with_etag(etag);
 
             let start = Instant::now();
             debug!(what = T::NAME, key = k.get(), generation, "refresh");
@@ -181,6 +189,41 @@ where
             }
         }
     }
+
+    /// Write a delete record to a cache quorum.
+    async fn do_delete(&self, k: T::Key, span: Option<Span>) -> Result<()> {
+        let mut span_recorder = SpanRecorder::new(span);
+        let cache = Arc::clone(&self.cache);
+        let metrics = Arc::clone(&self.metrics);
+        let backing = Arc::clone(&self.backing);
+
+        let start = Instant::now();
+        debug!(what = T::NAME, key = k.get(), "delete");
+
+        let generation = T::snapshot_generation(backing.as_ref(), k).await?;
+        let value = CacheValue::new_empty(generation);
+
+        let put_res = cache.put(k.to_key(), value).await.inspect_err(|e| {
+            warn!(
+                what=T::NAME,
+                key=k.get(),
+                %e,
+                "quorum write failed",
+            );
+        });
+        metrics.delete.record(start.elapsed());
+
+        match put_res {
+            Ok(_) => {
+                span_recorder.ok("ok");
+                Ok(())
+            }
+            Err(e) => {
+                span_recorder.error(e.to_string());
+                Err(e.into())
+            }
+        }
+    }
 }
 
 /// Abstract cache access.
@@ -201,7 +244,6 @@ where
         registry: &metric::Registry,
         cache: Arc<QuorumCatalogCache>,
         backoff_config: Arc<BackoffConfig>,
-        etag_min_payload_size: usize,
         time_provider: Arc<dyn TimeProvider>,
         batch_delay: Duration,
     ) -> Self {
@@ -212,7 +254,6 @@ where
                 cache,
                 backoff_config,
                 loader: Loader::default(),
-                etag_min_payload_size,
                 batcher: Batcher::new(time_provider, batch_delay),
             }),
         }
@@ -329,6 +370,18 @@ where
         }
     }
 
+    /// Delete the cached value of a snapshot.
+    pub(crate) async fn delete(&self, key: T::Key) -> Result<()> {
+        let mut span_recorder = self.span_recorder("delete");
+
+        let inner = Arc::clone(&self.inner);
+        inner
+            .do_delete(key, span_recorder.child_span("delete"))
+            .await
+            .inspect(|_| span_recorder.ok("ok"))
+            .inspect_err(|e| span_recorder.error(e.to_string()))
+    }
+
     /// Warm up cached value.
     pub(crate) async fn warm_up(&self, key: T::Key) -> Result<()> {
         let mut span_recorder = self.span_recorder("warm up");
@@ -362,7 +415,7 @@ where
             .get_quorum(key, span_recorder.child_span("get_quorum"))
             .await
         {
-            Ok(Some(val)) => {
+            Ok(Some(val)) if val.data().is_some() => {
                 debug!(
                     what = T::NAME,
                     key = k.get(),
@@ -374,6 +427,18 @@ where
                 span_recorder.ok("HIT");
 
                 return T::from_cache_value(val);
+            }
+            Ok(Some(val)) => {
+                // The value must have been deleted if it makes it to
+                // this branch.
+                debug!(
+                    what = T::NAME,
+                    key = k.get(),
+                    status = "HIT (deleted)",
+                    generation = val.generation(),
+                    "get",
+                );
+                span_recorder.event(SpanEvent::new("HIT (deleted)"));
             }
             Ok(None) => {
                 debug!(what = T::NAME, key = k.get(), status = "MISS", "get",);
@@ -391,9 +456,10 @@ where
             }
             Err(e) => {
                 span_recorder.error(e.to_string());
-                return Err(Error::External {
+                return Err(UnhandledError::CacheHandler {
                     source: Arc::new(e),
-                });
+                }
+                .into());
             }
         }
 

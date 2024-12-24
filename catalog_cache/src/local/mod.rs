@@ -84,12 +84,14 @@ impl CatalogCache {
         match self.map.entry(key) {
             Entry::Occupied(mut o) => {
                 let old = &o.get().value;
-                if value.generation <= old.generation {
+                if value.generation < old.generation
+                    || value.generation == old.generation && old.data().is_some()
+                {
                     return Ok(false);
                 }
                 if let Some(l) = &self.limit {
-                    let new_len = value.data.len();
-                    let cur_len = old.data.len();
+                    let new_len = value.data_len();
+                    let cur_len = old.data_len();
                     match new_len > cur_len {
                         true => l.reserve(new_len - cur_len)?,
                         false => l.free(cur_len - new_len),
@@ -102,7 +104,7 @@ impl CatalogCache {
             }
             Entry::Vacant(v) => {
                 if let Some(l) = &self.limit {
-                    l.reserve(value.data.len())?;
+                    l.reserve(value.data_len())?;
                 }
                 if let Some(v) = &self.observer {
                     v.insert(key, &value, None);
@@ -122,7 +124,7 @@ impl CatalogCache {
                     v.evict(key, old)
                 }
                 if let Some(l) = &self.limit {
-                    l.free(old.data.len())
+                    l.free(old.data_len())
                 }
                 Some(o.remove().value)
             }
@@ -160,7 +162,7 @@ impl CatalogCache {
             let retain = f(key, entry);
 
             if !retain {
-                let size = entry.value.data.len();
+                let size = entry.value.data_len();
                 if let Some(v) = &self.observer {
                     v.evict(*key, &entry.value);
                 }

@@ -3,13 +3,21 @@ package influxdata.iox.table.v1;
 option go_package = "github.com/influxdata/iox/table/v1";
 
 import "influxdata/iox/partition_template/v1/template.proto";
+import "influxdata/iox/catalog_storage/v1/service.proto";
+
 
 service TableService {
   // Get tables within a namespace
   rpc GetTables(GetTablesRequest) returns (GetTablesResponse);
 
   // Get a table within a namespace
-  rpc GetTable(GetTableRequest) returns (GetTableResponse); 
+  rpc GetTable(GetTableRequest) returns (GetTableResponse);
+
+  // Get tables with storage within a namespace
+  rpc GetTablesWithStorage(GetTablesWithStorageRequest) returns (GetTablesWithStorageResponse);
+
+  // Get a table with storage within a namespace
+  rpc GetTableWithStorage(GetTableWithStorageRequest) returns (GetTableWithStorageResponse);
 
   // Create a table in a namespace
   rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
@@ -43,14 +51,18 @@ message Table {
 
   // Namespace ID
   int64 namespace_id = 3;
-  
+
   // The partitioning scheme applied to writes for this table
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 4;
 }
 
 message GetTablesRequest {
-  // Name of the namespace to list tables for.
-  string namespace_name = 1;
+  oneof target {
+    // Name of the namespace to list tables for.
+    string namespace_name = 1 [deprecated = true];
+    // The unique ID of the namespace to list tables for.
+    int64 namespace_id = 2;
+  }
 }
 
 message GetTableRequest {
@@ -69,4 +81,32 @@ message GetTablesResponse {
 message GetTableResponse {
   // Table contained within a namespace
   Table table = 1;
+}
+
+// Request to get a list of tables with storage in a namespace.
+message GetTablesWithStorageRequest {
+  // ID of the namespace for which tables are listed.
+  int64 namespace_id = 1;
+
+  // Pagination and sorting options will be added in follow-up PRs:
+  // https://github.com/influxdata/influxdb_iox/issues/12775
+}
+
+// Request to get a specific table with storage.
+message GetTableWithStorageRequest {
+  // ID of the namespace to get table for.
+  int64 namespace_id = 1;
+
+  // ID of the table to get from namespace.
+  int64 table_id = 2;
+}
+
+// Response containing a list of tables with storage.
+message GetTablesWithStorageResponse {
+  repeated influxdata.iox.catalog_storage.v1.TableWithStorage table_with_storage = 1;
+}
+
+// Response containing details of a specific table with storage.
+message GetTableWithStorageResponse {
+  influxdata.iox.catalog_storage.v1.TableWithStorage table_with_storage = 1;
 }

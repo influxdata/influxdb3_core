@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::future::{BoxFuture, FutureExt, Shared};
-use s3_fifo::{S3Config, S3Fifo};
 use std::{
     fmt::Debug,
     future::Future,
@@ -11,6 +10,9 @@ use std::{
         Arc,
     },
 };
+
+// for benchmarks
+pub use s3_fifo::{S3Config, S3Fifo};
 
 use super::{
     hook::{EvictResult, Hook},

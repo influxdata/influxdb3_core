@@ -374,6 +374,46 @@ pub struct Namespace {
     pub router_version: NamespaceVersion,
 }
 
+/// Data object for a namespace with storage information
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct NamespaceWithStorage {
+    /// The id of the namespace
+    pub id: NamespaceId,
+    /// The unique name of the namespace
+    pub name: String,
+    /// The retention period in ns. None represents infinite duration (i.e. never drop data).
+    pub retention_period_ns: Option<i64>,
+    /// The maximum number of tables that can exist in this namespace
+    pub max_tables: MaxTables,
+    /// The maximum number of columns per table in this namespace
+    pub max_columns_per_table: MaxColumnsPerTable,
+    /// The partition template to use for new tables in this namespace either created implicitly or
+    /// created without specifying a partition template.
+    pub partition_template: NamespacePartitionTemplateOverride,
+    /// The total size of the Namespace, in bytes
+    pub size_bytes: i64,
+    /// Total number of active tables in this namespace
+    pub table_count: i64,
+}
+
+/// Serialise a [`NamespaceWithStorage`] object into its protobuf representation.
+impl From<NamespaceWithStorage>
+    for generated_types::influxdata::iox::catalog_storage::v1::NamespaceWithStorage
+{
+    fn from(value: NamespaceWithStorage) -> Self {
+        Self {
+            id: value.id.get(),
+            name: value.name,
+            retention_period_ns: value.retention_period_ns,
+            max_tables: value.max_tables.get_i32(),
+            max_columns_per_table: value.max_columns_per_table.get_i32(),
+            partition_template: value.partition_template.as_proto().cloned(),
+            size_bytes: value.size_bytes,
+            table_count: value.table_count as i32,
+        }
+    }
+}
+
 /// A container for the mutable, non-schema configuration of a namespace and the
 /// version the configuration is associated with.
 ///
@@ -495,6 +535,36 @@ impl From<Table> for generated_types::influxdata::iox::table::v1::Table {
             name: value.name,
             namespace_id: value.namespace_id.get(),
             partition_template: value.partition_template.as_proto().cloned(),
+        }
+    }
+}
+
+/// Data object for a table with storage information
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq)]
+pub struct TableWithStorage {
+    /// The id of the table
+    pub id: TableId,
+    /// The namespace id that the table is in
+    pub namespace_id: NamespaceId,
+    /// The name of the table, which is unique within the associated namespace
+    pub name: String,
+    /// The partition template to use for writes in this table.
+    pub partition_template: TablePartitionTemplateOverride,
+    /// The total size of the table, in bytes.
+    pub size_bytes: i64,
+}
+
+/// Serialise a [`TableWithStorage`] object into its protobuf representation.
+impl From<TableWithStorage>
+    for generated_types::influxdata::iox::catalog_storage::v1::TableWithStorage
+{
+    fn from(value: TableWithStorage) -> Self {
+        Self {
+            id: value.id.get(),
+            name: value.name,
+            namespace_id: value.namespace_id.get(),
+            partition_template: value.partition_template.as_proto().cloned(),
+            size_bytes: value.size_bytes,
         }
     }
 }

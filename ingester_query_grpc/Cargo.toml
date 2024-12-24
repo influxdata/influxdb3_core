@@ -31,4 +31,4 @@ prost-build = { workspace = true }
 pbjson-build = { workspace = true }
 
 [dev-dependencies]
-tokio = "1.41.0"
+tokio = "1.42.0"

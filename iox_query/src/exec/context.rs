@@ -17,7 +17,6 @@ use crate::{
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion::catalog::Session;
 use datafusion::{
     catalog::CatalogProvider,
     common::ParamValues,
@@ -35,7 +34,10 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::*,
 };
-use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
+use datafusion::{catalog::Session, config::TableOptions};
+use datafusion_util::config::{
+    iox_file_formats, iox_session_config, table_parquet_options, DEFAULT_CATALOG,
+};
 use executor::DedicatedExecutor;
 use futures::TryStreamExt;
 use observability_deps::tracing::debug;
@@ -286,6 +288,11 @@ impl IOxSessionConfig {
             .with_config(session_config)
             .with_runtime_env(Arc::new(runtime))
             .with_default_features()
+            .with_file_formats(iox_file_formats())
+            .with_table_options(TableOptions {
+                parquet: table_parquet_options(),
+                ..Default::default()
+            })
             .with_query_planner(Arc::new(IOxQueryPlanner { extension_planners }));
         state = register_iox_analyzers(state);
         state = register_iox_logical_optimizers(state);

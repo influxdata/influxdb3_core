@@ -15,6 +15,7 @@ use workspace_hack as _;
 
 pub mod cache;
 pub mod constants;
+pub mod fault_injection;
 pub mod grpc;
 pub mod interface;
 pub mod mem;
@@ -24,6 +25,7 @@ pub mod postgres;
 pub mod sqlite;
 pub mod storage;
 pub mod util;
+pub mod util_serialization;
 
 #[cfg(test)]
 pub(crate) mod interface_tests;

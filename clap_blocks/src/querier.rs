@@ -243,7 +243,7 @@ pub struct QuerierConfig {
     #[clap(
         long = "use-s3fifo-cache",
         env = "INFLUXDB_IOX_USE_S3FIFO_CACHE",
-        default_value = "false",
+        default_value = "true",
         action
     )]
     pub use_s3fifo_cache: bool,

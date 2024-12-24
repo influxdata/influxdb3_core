@@ -241,15 +241,14 @@ pub struct CatalogConfig {
     )]
     pub bypass_detection_clear_interval: Duration,
 
-    /// Enable Admin UI Storage API.
-    ///
-    /// See <https://github.com/influxdata/influxdb_iox/issues/12249>
+    /// Enable deletion of partition snapshots when parquet files are
+    /// updated, rather than creating, and disseminating a new snapshot.
     #[clap(
-        long = "catalog-cache-admin-ui-storage-api-enabled",
-        env = "INFLUXDB_IOX_CATALOG_CACHE_ADMIN_UI_STORAGE_API_ENABLED",
+        long = "parquet-file-updates-delete-partition-snapshots",
+        env = "INFLUXDB_IOX_CATALOG_CACHE_PARQUET_FILE_UPDATES_DELETE_PARTITION_SNAPSHOTS",
         default_value = "false"
     )]
-    pub admin_ui_storage_api_enabled: bool,
+    pub parquet_file_updates_delete_partition_snapshots: bool,
 }
 
 impl CatalogConfig {

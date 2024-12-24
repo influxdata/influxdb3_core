@@ -18,6 +18,11 @@ static GENERATION: HeaderName = HeaderName::from_static("x-influx-generation");
 static GENERATION_NOT_MATCH: HeaderName =
     HeaderName::from_static("x-influx-if-generation-not-match");
 
+/// The header used to indicate that there is no value. This creates
+/// CacheValue objects without a body, causing the snapshot to be taken
+/// on read.
+static NO_VALUE: HeaderName = HeaderName::from_static("x-influx-no-value");
+
 /// Value of Accept header for v2 list protocol
 static LIST_PROTOCOL_V2: HeaderValue = HeaderValue::from_static("application/x-list-v2");
 
@@ -96,6 +101,7 @@ mod tests {
     use crate::api::server::test_util::TestCacheServer;
     use crate::api::RequestPath;
     use crate::{CacheKey, CacheValue};
+    use bytes::Bytes;
     use futures::TryStreamExt;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -184,6 +190,20 @@ mod tests {
         let r = client.get_if_modified(key, None, Some("1".into())).await;
         assert!(matches!(r, Err(Error::NotModified)), "{r:?}");
 
+        // Empty value
+        let v4 = CacheValue::new_empty(4);
+        assert!(client.put(key, &v4).await.unwrap());
+        let value = client.get(key).await.unwrap().unwrap();
+        assert_eq!(v4, value);
+        assert!(value.data().is_none());
+
+        // Zero-length value
+        let v5 = CacheValue::new(Bytes::default(), 5);
+        assert!(client.put(key, &v5).await.unwrap());
+        let value = client.get(key).await.unwrap().unwrap();
+        assert_eq!(v5, value);
+        assert!(value.data().is_some());
+
         serve.shutdown().await;
     }
 
@@ -208,14 +228,14 @@ mod tests {
         assert_eq!(res.len(), 3);
 
         assert_eq!(res[0].value(), None);
-        assert_eq!(res[1].value(), Some(&v2.data));
-        assert_eq!(res[2].value(), Some(&v3.data));
+        assert_eq!(res[1].value(), v2.data.as_ref());
+        assert_eq!(res[2].value(), v3.data.as_ref());
 
         let mut res = client.list(Some(3)).try_collect::<Vec<_>>().await.unwrap();
         res.sort_unstable_by_key(|x| x.key());
 
-        assert_eq!(res[0].value(), Some(&v1.data));
-        assert_eq!(res[1].value(), Some(&v2.data));
-        assert_eq!(res[2].value(), Some(&v3.data));
+        assert_eq!(res[0].value(), v1.data.as_ref());
+        assert_eq!(res[1].value(), v2.data.as_ref());
+        assert_eq!(res[2].value(), v3.data.as_ref());
     }
 }

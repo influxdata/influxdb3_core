@@ -2,10 +2,13 @@ use crate::error;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field};
 use datafusion::common::{downcast_value, DataFusionError, Result};
-use datafusion::logical_expr::function::WindowUDFFieldArgs;
+use datafusion::logical_expr::function::{
+    ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
+};
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
+use datafusion::physical_expr::PhysicalExpr;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -44,7 +47,15 @@ impl WindowUDFImpl for PercentRowNumberUDWF {
         Ok(Field::new(field_args.name(), DataType::UInt64, true))
     }
 
-    fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
+    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
+    fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
+        expr_args.input_exprs().into()
+    }
+
+    fn partition_evaluator(
+        &self,
+        _args: PartitionEvaluatorArgs<'_>,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
         Ok(Box::new(PercentRowNumberPartitionEvaluator {}))
     }
 }

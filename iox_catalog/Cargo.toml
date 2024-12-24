@@ -29,14 +29,15 @@ log = "0.4"
 metric = { version = "0.1.0", path = "../metric" }
 observability_deps = { path = "../observability_deps" }
 parking_lot = { version = "0.12" }
+paste = "1.0.15"
 ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 siphasher = "1.0"
 snafu = "0.8"
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "sqlite"] }
 sqlx-hotswap-pool = { path = "../sqlx-hotswap-pool" }
-thiserror = "2.0.3"
-tokio = { version = "1.41", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
+thiserror = "2.0.7"
+tokio = { version = "1.42", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
 tonic = { workspace = true }
 trace = { path = "../trace" }
 trace_http = { path = "../trace_http" }
@@ -52,7 +53,6 @@ criterion = { version = "0.5.1", default-features = false, features = ["async_to
 dotenvy = "0.15.7"
 futures-concurrency = "7.6.2"
 mutable_batch_lp = { path = "../mutable_batch_lp" }
-paste = "1.0.15"
 pgtemp = "0.5.0"
 pretty_assertions = "1.4.1"
 proptest = { workspace = true }

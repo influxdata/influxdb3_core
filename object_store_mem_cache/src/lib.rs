@@ -5,6 +5,10 @@
 use paste as _;
 
 // Workaround for "unused crate" lint false positives.
+#[cfg(test)]
+use clap as _;
+#[cfg(test)]
+use rand as _;
 use workspace_hack as _;
 
 pub mod attributes;
