@@ -5,13 +5,15 @@ use std::{pin::Pin, sync::Arc};
 use crate::{
     grpc::serialization::{
         deserialize_column_type, deserialize_object_store_id, deserialize_parquet_file_params,
-        deserialize_soft_deleted_rows, deserialize_sort_key_ids, serialize_column,
-        serialize_namespace, serialize_object_store_id, serialize_parquet_file,
-        serialize_partition, serialize_skipped_compaction, serialize_sort_key_ids, serialize_table,
-        ContextExt, ConvertExt, ConvertOptExt, RequiredExt,
+        deserialize_sort_key_ids, serialize_column, serialize_namespace, serialize_object_store_id,
+        serialize_parquet_file, serialize_partition, serialize_skipped_compaction,
+        serialize_sort_key_ids, serialize_table,
     },
     interface::{CasFailure, Catalog, RepoCollection},
-    util::catalog_error_to_status,
+    util_serialization::{
+        catalog_error_to_status, deserialize_soft_deleted_rows, ContextExt, ConvertExt,
+        ConvertOptExt, RequiredExt,
+    },
 };
 use async_trait::async_trait;
 use data_types::{
@@ -95,9 +97,13 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     type ParquetFileActiveAsOfStream = TonicStream<proto::ParquetFileActiveAsOfResponse>;
     type ParquetFileExistsByObjectStoreIdBatchStream =
         TonicStream<proto::ParquetFileExistsByObjectStoreIdBatchResponse>;
+    type ParquetFileExistsByPartitionAndObjectStoreIdBatchStream =
+        TonicStream<proto::ParquetFileExistsByPartitionAndObjectStoreIdBatchResponse>;
     type ParquetFileCreateUpgradeDeleteFullStream =
         TonicStream<proto::ParquetFileCreateUpgradeDeleteFullResponse>;
     type ParquetFileListByTableIdStream = TonicStream<proto::ParquetFileListByTableIdResponse>;
+    type ParquetFileListByNamespaceIdStream =
+        TonicStream<proto::ParquetFileListByNamespaceIdResponse>;
 
     async fn root_snapshot(
         &self,
@@ -1099,27 +1105,9 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn parquet_file_active_as_of(
         &self,
-        request: Request<proto::ParquetFileActiveAsOfRequest>,
+        _request: Request<proto::ParquetFileActiveAsOfRequest>,
     ) -> Result<Response<Self::ParquetFileActiveAsOfStream>, tonic::Status> {
-        let (mut repos, req) = self.preprocess_request(request);
-
-        let as_of = Timestamp::new(req.as_of);
-
-        let file_list = repos
-            .parquet_files()
-            .active_as_of(as_of)
-            .await
-            .map_err(catalog_error_to_status)?;
-
-        Ok(Response::new(
-            futures::stream::iter(file_list.into_iter().map(|file| {
-                let file = serialize_parquet_file(file);
-                Ok(proto::ParquetFileActiveAsOfResponse {
-                    parquet_file: Some(file),
-                })
-            }))
-            .boxed(),
-        ))
+        Ok(Response::new(futures::stream::empty().boxed()))
     }
 
     async fn parquet_file_get_by_object_store_id(
@@ -1171,6 +1159,49 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
                 Ok(proto::ParquetFileExistsByObjectStoreIdBatchResponse {
                     object_store_id: Some(object_store_id),
                 })
+            }))
+            .boxed(),
+        ))
+    }
+
+    async fn parquet_file_exists_by_partition_and_object_store_id_batch(
+        &self,
+        request: Request<
+            tonic::Streaming<proto::ParquetFileExistsByPartitionAndObjectStoreIdBatchRequest>,
+        >,
+    ) -> Result<
+        Response<Self::ParquetFileExistsByPartitionAndObjectStoreIdBatchStream>,
+        tonic::Status,
+    > {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let ids = req
+            .map_err(|e| tonic::Status::invalid_argument(e.to_string()))
+            .and_then(|req| async move {
+                let partiton_id = PartitionId::new(req.partition_id);
+                let object_store_id = deserialize_object_store_id(
+                    req.object_store_id.required().ctx("object_store_id")?,
+                );
+                Ok((partiton_id, object_store_id))
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let id_list = repos
+            .parquet_files()
+            .exists_by_partition_and_object_store_id_batch(ids)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(id_list.into_iter().map(|(partition_id, object_store_id)| {
+                let object_store_id = serialize_object_store_id(object_store_id);
+                Ok(
+                    proto::ParquetFileExistsByPartitionAndObjectStoreIdBatchResponse {
+                        object_store_id: Some(object_store_id),
+                        partition_id: partition_id.get(),
+                    },
+                )
             }))
             .boxed(),
         ))
@@ -1273,9 +1304,12 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
         let compaction_level = if let Some(l) = req.compaction_level {
             Some(l.try_into().map_err(|e| {
-                catalog_error_to_status(crate::interface::Error::External {
-                    source: Arc::new(e),
-                })
+                catalog_error_to_status(
+                    crate::interface::UnhandledError::GrpcSerialization {
+                        source: Arc::new(e),
+                    }
+                    .into(),
+                )
             })?)
         } else {
             None
@@ -1291,6 +1325,29 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             futures::stream::iter(files.into_iter().map(|f| {
                 let file = serialize_parquet_file(f);
                 Ok(proto::ParquetFileListByTableIdResponse { file: Some(file) })
+            }))
+            .boxed(),
+        ))
+    }
+
+    async fn parquet_file_list_by_namespace_id(
+        &self,
+        request: Request<proto::ParquetFileListByNamespaceIdRequest>,
+    ) -> Result<Response<Self::ParquetFileListByNamespaceIdStream>, tonic::Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let deleted = deserialize_soft_deleted_rows(req.deleted)?;
+
+        let files = repos
+            .parquet_files()
+            .list_by_namespace_id(NamespaceId::new(req.namespace_id), deleted)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(files.into_iter().map(|f| {
+                let file = serialize_parquet_file(f);
+                Ok(proto::ParquetFileListByNamespaceIdResponse { file: Some(file) })
             }))
             .boxed(),
         ))

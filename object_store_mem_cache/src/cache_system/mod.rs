@@ -30,6 +30,7 @@
 //! [`Reactor`]: self::reactor::Reactor
 //! [shared futures]: futures::future::Shared
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::future::{BoxFuture, Shared};
 use std::{fmt::Debug, hash::Hash};
 
@@ -54,9 +55,22 @@ impl HasSize for str {
     }
 }
 
+impl HasSize for data_types::ObjectStoreId {
+    fn size(&self) -> usize {
+        // no dynamic allocation
+        0
+    }
+}
+
 impl HasSize for object_store::path::Path {
     fn size(&self) -> usize {
         self.as_ref().len()
+    }
+}
+
+impl HasSize for Bytes {
+    fn size(&self) -> usize {
+        self.len()
     }
 }
 

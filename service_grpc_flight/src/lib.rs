@@ -32,7 +32,7 @@ use futures::{ready, stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
 use iox_query::{
     exec::IOxSessionContext,
-    query_log::{QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
+    query_log::{PermitAndToken, QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
     QueryDatabase,
 };
 use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
@@ -58,7 +58,6 @@ use trace_http::{
     ctx::{RequestLogContext, RequestLogContextExt},
     query_variant::QueryVariantExt,
 };
-use tracker::InstrumentedAsyncOwnedSemaphorePermit;
 
 /// The supported names of the grpc header that contain the target database
 /// for FlightSQL requests.
@@ -1264,12 +1263,6 @@ fn get_query_config(metadata: &MetadataMap) -> Option<QueryConfig> {
             .parquet_file_limit = Some(parquet_file_limit);
     }
     config
-}
-
-struct PermitAndToken {
-    #[allow(dead_code)]
-    permit: InstrumentedAsyncOwnedSemaphorePermit,
-    query_completed_token: QueryCompletedToken<StatePermit>,
 }
 
 /// Wrapper over a FlightDataEncodeStream that adds IOx specific

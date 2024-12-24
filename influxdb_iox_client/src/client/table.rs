@@ -32,7 +32,9 @@ impl Client {
         Ok(self
             .inner
             .get_tables(GetTablesRequest {
-                namespace_name: namespace_name.to_string(),
+                target: Some(get_tables_request::Target::NamespaceName(
+                    namespace_name.to_string(),
+                )),
             })
             .await?
             .into_inner()

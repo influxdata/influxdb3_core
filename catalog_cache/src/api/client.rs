@@ -1,7 +1,7 @@
 //! Client for the cache HTTP API
 
 use crate::api::list::{v1, v2, ListEntry, MAX_VALUE_SIZE};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2};
+use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE};
 use crate::{CacheKey, CacheValue};
 use futures::prelude::*;
 use futures::stream::BoxStream;
@@ -123,7 +123,7 @@ impl CatalogCacheClientBuilder {
         }
     }
 
-    /// Set timetout for `GET` requests.
+    /// Set timeout for `GET` requests.
     ///
     /// The timeout is applied from when the request starts connecting until the
     /// response body has finished.
@@ -134,7 +134,7 @@ impl CatalogCacheClientBuilder {
         }
     }
 
-    /// Set timetout for `PUT` requests.
+    /// Set timeout for `PUT` requests.
     ///
     /// The timeout is applied from when the request starts connecting until the
     /// response body has finished.
@@ -145,7 +145,7 @@ impl CatalogCacheClientBuilder {
         }
     }
 
-    /// Set timetout for `LIST` requests.
+    /// Set timeout for `LIST` requests.
     ///
     /// The timeout is applied from when the request starts connecting until the
     /// response body has finished.
@@ -238,8 +238,19 @@ impl CatalogCacheClient {
             None => None,
         };
 
-        let data = resp.bytes().await.context(GetSnafu)?;
-        Ok(Some(CacheValue::new(data, generation).with_etag_opt(etag)))
+        let no_value = resp
+            .headers()
+            .get(&NO_VALUE)
+            .map(|v| v.to_str().unwrap_or("false") == "true")
+            .unwrap_or(false);
+
+        let value = if no_value {
+            CacheValue::new_empty(generation)
+        } else {
+            let data = resp.bytes().await.context(GetSnafu)?;
+            CacheValue::new(data, generation)
+        };
+        Ok(Some(value.with_etag_opt(etag)))
     }
 
     /// Upsert the given key-value pair to the remote cache
@@ -249,16 +260,24 @@ impl CatalogCacheClient {
     pub async fn put(&self, key: CacheKey, value: &CacheValue) -> Result<bool> {
         let url = self.url(RequestPath::Resource(key));
 
-        let mut builder = self.client.put(url);
+        let mut builder = self
+            .client
+            .put(url)
+            .timeout(self.put_request_timeout)
+            .header(&GENERATION, value.generation);
 
         if let Some(etag) = value.etag() {
             builder = builder.header(ETAG, etag.as_ref());
         }
 
+        if let Some(data) = value.data().cloned() {
+            builder = builder.body(data);
+        } else {
+            builder = builder.header(&NO_VALUE, "true");
+            builder = builder.body(hyper::Body::empty());
+        }
+
         let response = builder
-            .timeout(self.put_request_timeout)
-            .header(&GENERATION, value.generation)
-            .body(value.data.clone())
             .send()
             .await
             .context(PutSnafu)?

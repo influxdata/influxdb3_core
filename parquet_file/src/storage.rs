@@ -216,8 +216,8 @@ pub struct ParquetStorage {
     /// Storage ID to hook it into DataFusion.
     id: StorageId,
 
-    /// If some, then parallelized parquet writes will occur.
-    parquet_write_parallelization_settings: Option<ParallelParquetWriterOptions>,
+    /// Parallelized parquet write settings.
+    parquet_write_parallelization_settings: ParallelParquetWriterOptions,
 }
 
 impl Display for ParquetStorage {
@@ -237,23 +237,28 @@ impl ParquetStorage {
         Self {
             object_store,
             id,
-            parquet_write_parallelization_settings: None,
+            parquet_write_parallelization_settings: Default::default(),
         }
     }
 
-    /// Enable parquet write parallelism, and set the amount
-    /// of parallelization per row group and per column.
-    pub fn with_enabled_parallel_writes(
+    /// Provide settings for parallelized writes. Settings determine the
+    /// amount of parallelization per row group and per column.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if an invalid usize (not > 0) is used.
+    pub fn with_parallel_write_settings(
         self,
-        num_row_group_writers: NonZeroUsize,
-        num_column_writers_across_row_groups: NonZeroUsize,
+        num_row_group_writers: usize,
+        num_column_writers_across_row_groups: usize,
     ) -> Self {
         Self {
-            parquet_write_parallelization_settings: Some(ParallelParquetWriterOptions {
-                maximum_parallel_row_group_writers: num_row_group_writers.into(),
-                maximum_buffered_record_batches_per_stream: num_column_writers_across_row_groups
-                    .into(),
-            }),
+            parquet_write_parallelization_settings: ParallelParquetWriterOptions::new(
+                NonZeroUsize::new(num_row_group_writers)
+                    .expect("num_row_groups_in_parallel should be above zero"),
+                NonZeroUsize::new(num_column_writers_across_row_groups)
+                    .expect("num_columns_in_parallel should be above zero"),
+            ),
             ..self
         }
     }
@@ -280,8 +285,7 @@ impl ParquetStorage {
     /// Push `batches`, a stream of [`RecordBatch`] instances, to object
     /// storage.
     ///
-    /// Any buffering needed is registered with the pool provided by the [`RuntimeEnv`]. The
-    /// runtime itself is utilized if parallelized writes are enabled.
+    /// Any buffering needed is registered with the pool provided by the [`RuntimeEnv`].
     ///
     /// # Retries
     ///
@@ -296,25 +300,6 @@ impl ParquetStorage {
         meta: &IoxMetadata,
         runtime: Arc<RuntimeEnv>,
     ) -> Result<(IoxParquetMetaData, usize), UploadError> {
-        if let Some(parallel_writer_options) = &self.parquet_write_parallelization_settings {
-            let write_input = ParquetUploadInput::try_new(
-                partition_id,
-                meta,
-                &self.id(),
-                Arc::clone(&self.object_store),
-            )?;
-
-            return self
-                .parallel_upload(
-                    batches,
-                    write_input,
-                    meta,
-                    runtime,
-                    parallel_writer_options.to_owned(),
-                )
-                .await;
-        };
-
         let start = Instant::now();
 
         // Stream the record batches into a parquet file.
@@ -383,14 +368,24 @@ impl ParquetStorage {
         Ok((parquet_meta, file_size))
     }
 
-    async fn parallel_upload(
+    /// Push `batches`, a stream of [`RecordBatch`] instances, to object
+    /// storage.
+    ///
+    /// The [`RuntimeEnv`] is utilized if parallelized writes are enabled.
+    pub async fn parallel_upload(
         &self,
         batches: SendableRecordBatchStream,
-        upload_input: ParquetUploadInput,
+        partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
         runtime: Arc<RuntimeEnv>,
-        parallel_writer_options: ParallelParquetWriterOptions,
     ) -> Result<(IoxParquetMetaData, usize), UploadError> {
+        let upload_input = ParquetUploadInput::try_new(
+            partition_id,
+            meta,
+            &self.id(),
+            Arc::clone(&self.object_store),
+        )?;
+
         let start = Instant::now();
 
         let parquet_file_meta = serialize::to_parquet_upload(
@@ -398,9 +393,13 @@ impl ParquetStorage {
             meta,
             upload_input.clone(),
             runtime,
-            parallel_writer_options,
+            self.parquet_write_parallelization_settings,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            warn!(error=%e, ?meta, "failed to parallel-upload parquet file to object storage");
+            e
+        })?;
         let num_rows = parquet_file_meta.num_rows;
 
         // Read the IOx-specific parquet metadata from the file metadata
@@ -489,7 +488,8 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    async fn test_upload_metadata(store: ParquetStorage) {
+    /// Test: perform and assert upload of metadata
+    async fn test_upload_metadata(store: ParquetStorage, upload_type: UploadType) {
         let (transition_partition_id, meta) = meta();
         let mut batch = RecordBatch::try_from_iter([
             ("a", to_string_array(&["value"; 8192 * 2])),
@@ -521,8 +521,14 @@ mod tests {
             .expect("should update batch with iox schema");
 
         // Serialize & upload the record batches.
-        let (encoded_file_meta, _file_size) =
-            upload(&store, &transition_partition_id, &meta, batch.clone()).await;
+        let (encoded_file_meta, _file_size) = upload(
+            &store,
+            &transition_partition_id,
+            &meta,
+            batch.clone(),
+            upload_type,
+        )
+        .await;
 
         // Extract the various bits of metadata.
         let file_meta = encoded_file_meta
@@ -549,7 +555,7 @@ mod tests {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-        test_upload_metadata(store).await;
+        test_upload_metadata(store, UploadType::SingleThread).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 20)]
@@ -558,34 +564,25 @@ mod tests {
 
         // test with parallel column writers
         let store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(6).unwrap(), // parallelized only column writing
-            );
-        test_upload_metadata(store).await;
+            .with_parallel_write_settings(1, 6); // parallelized only column writing
+        test_upload_metadata(store, UploadType::MultiThread).await;
 
         // test with parallel rowgroup writers
         let store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(2).unwrap(), // parallelized only rowgroup writing
-                NonZeroUsize::new(1).unwrap(),
-            );
-        test_upload_metadata(store).await;
+            .with_parallel_write_settings(2, 1); // parallelized only rowgroup writing
+        test_upload_metadata(store, UploadType::MultiThread).await;
 
         // test with both parallelized column and rowgroup writers
         let store = ParquetStorage::new(object_store, StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(2).unwrap(),
-                NonZeroUsize::new(6).unwrap(),
-            );
-        test_upload_metadata(store).await;
+            .with_parallel_write_settings(2, 6); // parallelized both rowgroup & column writing
+        test_upload_metadata(store, UploadType::MultiThread).await;
     }
 
-    /// Perform parquet encoding and upload, while monitoring
-    /// the currently active tokio task count.
+    /// Test: perform and assert `upload()` or `parallel_upload()` while counting active tasks.
     async fn run_upload_and_count_max_active_tasks(
         store: ParquetStorage,
         batch: RecordBatch,
+        upload_type: UploadType,
     ) -> Arc<AtomicUsize> {
         // prepare schema
         let schema = batch.schema();
@@ -603,7 +600,15 @@ mod tests {
         });
 
         // Test: start upload on current thread
-        perform_assert_roundtrip(store, batch.clone(), Projection::All, schema, batch).await;
+        assert_roundtrip_with_existing_store(
+            store,
+            batch.clone(),
+            Projection::All,
+            schema,
+            batch,
+            upload_type,
+        )
+        .await;
         counter_handle.abort();
 
         // provide counter for test assertions
@@ -617,21 +622,24 @@ mod tests {
     /// The number of tasks is a proxy for the number of threads,
     /// since tokio distributes tasks across its threadpool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
-    async fn test_default_upload_is_single_threaded() {
+    async fn test_normal_upload_is_single_threaded() {
         // confirm test runtime is multi-threaded
         assert_eq!(
             RuntimeFlavor::MultiThread,
             Handle::current().runtime_flavor()
         );
 
-        // store with default (single threaded) upload
+        // store with single threaded `upload()` -- vs `parallel_upload()`
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
         // Test: single task, even when many columns
-        let counter =
-            run_upload_and_count_max_active_tasks(store.clone(), batch_with_many_cols_and_1_row())
-                .await;
+        let counter = run_upload_and_count_max_active_tasks(
+            store.clone(),
+            batch_with_many_cols_and_1_row(),
+            UploadType::SingleThread,
+        )
+        .await;
         assert_eq!(
             counter.load(Ordering::SeqCst),
             1,
@@ -640,8 +648,12 @@ mod tests {
         );
 
         // Test: single task, even when many rows
-        let counter =
-            run_upload_and_count_max_active_tasks(store, batch_with_many_rows_and_1_col()).await;
+        let counter = run_upload_and_count_max_active_tasks(
+            store,
+            batch_with_many_rows_and_1_col(),
+            UploadType::SingleThread,
+        )
+        .await;
         assert_eq!(
             counter.load(Ordering::SeqCst),
             1,
@@ -666,16 +678,16 @@ mod tests {
         // store with multi-threaded upload
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
         let store = ParquetStorage::new(object_store, StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(1).unwrap(), // only 1
-                NonZeroUsize::new(1).unwrap(), // only 1
-            );
+            .with_parallel_write_settings(1, 1); // only 1 for each
 
         // Test: we should be using multiple tasks
         // w/ the many-cols-in-1-row
-        let counter =
-            run_upload_and_count_max_active_tasks(store.clone(), batch_with_many_cols_and_1_row())
-                .await;
+        let counter = run_upload_and_count_max_active_tasks(
+            store.clone(),
+            batch_with_many_cols_and_1_row(),
+            UploadType::MultiThread,
+        )
+        .await;
         assert!(
             counter.load(Ordering::SeqCst) > 1,
             "should have >1 task, instead found {:?}",
@@ -824,6 +836,19 @@ mod tests {
         ).await;
     }
 
+    /// This test, and the following test [`test_schema_check_ignore_additional_metadata_in_file`]
+    /// demonstrate how the test helpers work. Specifically, during schema-check the test helpers
+    /// ignore added metadata.
+    ///
+    /// | add metadata to expected_schema | add metadata to uploaded batches | upload_batch.schema == download_batch.schema |
+    /// | ------------------------------- | -------------------------------- | -------------------------------------------- |
+    /// |             y                   |              n                   |                     n                        |
+    /// |             n                   |              y                   |                     n                        |
+    /// |             n                   |              n                   |                     y                        |
+    /// |             y                   |              y                   |                     y                        |
+    ///
+    /// In the test `test_schema_arrow_metadata_preserved` the metadata is added to both the uploaded batch & expected_schema.
+    /// As a result, for that test the upload_batch.schema == download_batch.schema.
     #[tokio::test]
     async fn test_schema_check_ignore_additional_metadata_in_mem() {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
@@ -835,27 +860,42 @@ mod tests {
         let schema = batch.schema();
 
         // Serialize & upload the record batches.
-        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, batch).await;
+        let (_iox_md, file_size) = upload(
+            &store,
+            &partition_id,
+            &meta,
+            batch.clone(),
+            UploadType::SingleThread,
+        )
+        .await;
 
-        // add metadata to reference schema
-        let schema = Arc::new(
+        // add metadata to expected_schema
+        let expected_schema = Arc::new(
             schema
                 .as_ref()
                 .clone()
                 .with_metadata(HashMap::from([(String::from("foo"), String::from("bar"))])),
         );
-        download(
+
+        // Test: download() test-helpers
+        // can perform download with expected_schema having extra metadata
+        let downloaded_batch = download(
             &store,
             &partition_id,
             &meta,
             Projection::All,
-            schema,
+            expected_schema,
             file_size,
         )
         .await
-        .unwrap();
+        .unwrap(); // does not error
+
+        // But the downloaded batch.schema will not be equal.
+        assert_ne!(batch.schema(), downloaded_batch.schema());
+        assert_eq!(batch.columns(), downloaded_batch.columns());
     }
 
+    /// Refer to the description on the above test [`test_schema_check_ignore_additional_metadata_in_mem`].
     #[tokio::test]
     async fn test_schema_check_ignore_additional_metadata_in_file() {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
@@ -878,9 +918,18 @@ mod tests {
         .unwrap();
 
         // Serialize & upload the record batches.
-        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, batch).await;
+        let (_iox_md, file_size) = upload(
+            &store,
+            &partition_id,
+            &meta,
+            batch.clone(),
+            UploadType::SingleThread,
+        )
+        .await;
 
-        download(
+        // Test: download() test-helpers
+        // can perform download with batch.schema having extra metadata
+        let downloaded_batch = download(
             &store,
             &partition_id,
             &meta,
@@ -889,7 +938,11 @@ mod tests {
             file_size,
         )
         .await
-        .unwrap();
+        .unwrap(); // does not error
+
+        // But the downloaded batch.schema will not be equal.
+        assert_ne!(batch.schema(), downloaded_batch.schema());
+        assert_eq!(batch.columns(), downloaded_batch.columns());
     }
 
     #[tokio::test]
@@ -918,8 +971,18 @@ mod tests {
         let upload_batch =
             RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
 
-        // Serialize & upload the record batches, then download it:
-        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, upload_batch.clone()).await;
+        // Serialize & upload the record batches
+        let (_iox_md, file_size) = upload(
+            &store,
+            &partition_id,
+            &meta,
+            upload_batch.clone(),
+            UploadType::SingleThread,
+        )
+        .await;
+
+        // Test: download() test-helpers
+        // can perform download with BOTH expected_schema & batch.schema having extra metadata
         let downloaded_batch = download(
             &store,
             &partition_id,
@@ -1024,11 +1087,18 @@ mod tests {
         )
     }
 
+    enum UploadType {
+        SingleThread,
+        MultiThread,
+    }
+
+    /// Perform (not assert): upload based upon [`UploadType`]
     async fn upload(
         store: &ParquetStorage,
         partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
         batch: RecordBatch,
+        upload_type: UploadType,
     ) -> (IoxParquetMetaData, usize) {
         let stream = Box::pin(MemoryStream::new(vec![batch]));
         let runtime = Arc::new(RuntimeEnv {
@@ -1041,12 +1111,19 @@ mod tests {
             Arc::clone(store.object_store()),
         );
 
-        store
-            .upload(stream, partition_id, meta, runtime)
-            .await
-            .expect("should serialize and store sucessfully")
+        let upload_res = match upload_type {
+            UploadType::SingleThread => store.upload(stream, partition_id, meta, runtime).await,
+            UploadType::MultiThread => {
+                store
+                    .parallel_upload(stream, partition_id, meta, runtime)
+                    .await
+            }
+        };
+
+        upload_res.expect("should serialize and store sucessfully")
     }
 
+    /// Perform (not assert): download
     async fn download<'a>(
         store: &ParquetStorage,
         partition_id: &TransitionPartitionId,
@@ -1066,6 +1143,7 @@ mod tests {
             })
     }
 
+    /// Assert: roundtrip for both single- and multi- threaded.
     async fn assert_roundtrip(
         upload_batch: RecordBatch,
         selection: Projection<'_>,
@@ -1085,6 +1163,7 @@ mod tests {
             .await;
     }
 
+    /// Assert: roundtrip for single-threaded.
     async fn assert_roundtrip_single_thread(
         upload_batch: RecordBatch,
         selection: Projection<'_>,
@@ -1094,16 +1173,18 @@ mod tests {
         let object_store: Arc<DynObjectStore> = Arc::new(object_store::memory::InMemory::default());
         let store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"));
 
-        perform_assert_roundtrip(
+        assert_roundtrip_with_existing_store(
             store,
             upload_batch,
             selection,
             expected_schema,
             expected_batch,
+            UploadType::SingleThread,
         )
         .await;
     }
 
+    /// Assert: roundtrip for multi-threaded.
     async fn assert_roundtrip_multi_thread(
         upload_batch: RecordBatch,
         selection: Projection<'_>,
@@ -1114,60 +1195,63 @@ mod tests {
 
         // test with parallel column writer
         let parallel_store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(6).unwrap(), // parallelized only column writing
-            );
-        perform_assert_roundtrip(
+            .with_parallel_write_settings(1, 6); // parallelized only column writing
+        assert_roundtrip_with_existing_store(
             parallel_store,
             upload_batch.clone(),
             selection,
             Arc::clone(&expected_schema),
             expected_batch.clone(),
+            UploadType::MultiThread,
         )
         .await;
 
         // test with parallel rowgroup writers
         let parallel_store = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(6).unwrap(), // parallelized only rowgroup writing
-                NonZeroUsize::new(1).unwrap(),
-            );
-        perform_assert_roundtrip(
+            .with_parallel_write_settings(6, 1); // parallelized only rowgroup writing
+        assert_roundtrip_with_existing_store(
             parallel_store,
             upload_batch.clone(),
             selection,
             Arc::clone(&expected_schema),
             expected_batch.clone(),
+            UploadType::MultiThread,
         )
         .await;
 
         // test with both parallelized column and rowgroup writers
         let parallel_store = ParquetStorage::new(object_store, StorageId::from("iox"))
-            .with_enabled_parallel_writes(
-                NonZeroUsize::new(3).unwrap(),
-                NonZeroUsize::new(3).unwrap(),
-            );
-        perform_assert_roundtrip(
+            .with_parallel_write_settings(3, 3);
+        assert_roundtrip_with_existing_store(
             parallel_store,
             upload_batch,
             selection,
             expected_schema,
             expected_batch,
+            UploadType::MultiThread,
         )
         .await;
     }
 
-    async fn perform_assert_roundtrip(
+    /// Assert: roundtrip using existing store, based upon [`UploadType`]
+    async fn assert_roundtrip_with_existing_store(
         store: ParquetStorage,
         upload_batch: RecordBatch,
         selection: Projection<'_>,
         expected_schema: SchemaRef,
         expected_batch: RecordBatch,
+        upload_type: UploadType,
     ) {
         // Serialize & upload the record batches.
         let (partition_id, meta) = meta();
-        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, upload_batch.clone()).await;
+        let (_iox_md, file_size) = upload(
+            &store,
+            &partition_id,
+            &meta,
+            upload_batch.clone(),
+            upload_type,
+        )
+        .await;
 
         // And compare to the original input
         let actual_batch = download(
@@ -1183,6 +1267,7 @@ mod tests {
         assert_eq!(actual_batch, expected_batch);
     }
 
+    /// Assert: schema check failure for both single- and multi- threaded.
     async fn assert_schema_check_fail(
         persisted_batch: RecordBatch,
         expected_schema: SchemaRef,
@@ -1193,8 +1278,38 @@ mod tests {
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
         let (partition_id, meta) = meta();
-        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, persisted_batch).await;
 
+        // single-threaded
+        let (_iox_md, file_size) = upload(
+            &store,
+            &partition_id,
+            &meta,
+            persisted_batch.clone(),
+            UploadType::SingleThread,
+        )
+        .await;
+        let err = download(
+            &store,
+            &partition_id,
+            &meta,
+            Projection::All,
+            Arc::clone(&expected_schema),
+            file_size,
+        )
+        .await
+        .unwrap_err();
+        // And compare to the original input
+        assert_eq!(err.to_string(), msg);
+
+        // multi-threaded
+        let (_iox_md, file_size) = upload(
+            &store,
+            &partition_id,
+            &meta,
+            persisted_batch,
+            UploadType::MultiThread,
+        )
+        .await;
         let err = download(
             &store,
             &partition_id,
@@ -1205,7 +1320,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-
         // And compare to the original input
         assert_eq!(err.to_string(), msg);
     }

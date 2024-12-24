@@ -932,6 +932,18 @@ mod tests {
     }
 
     test_partition_key!(
+        no_parts,
+        template = [],
+        tags = [
+            ("a", "bananas"),
+            ("b", "are_good"),
+            ("c", "for_test_strings")
+        ],
+        want_key = "",
+        want_reversed_tags = []
+    );
+
+    test_partition_key!(
         simple,
         template = [
             TemplatePart::TimeFormat("%Y"),

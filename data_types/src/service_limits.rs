@@ -83,10 +83,7 @@ macro_rules! define_service_limit {
 
             /// Constant-time default for use in constructing test constants.
             pub const fn const_default() -> Self {
-                // This is safe because the hardcoded value is not 0.
-                let value = unsafe { NonZeroUsize::new_unchecked($default_value) };
-
-                Self(value)
+                Self(NonZeroUsize::new($default_value).expect("default value is NOT zero"))
             }
         }
 

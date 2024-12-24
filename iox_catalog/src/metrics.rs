@@ -1,5 +1,7 @@
 //! Metric instrumentation for catalog implementations.
 
+#![allow(deprecated)] // defining metrics wrappers for deprecated trait methods is fine
+
 use crate::interface::{
     CasFailure, ColumnRepo, NamespaceRepo, ParquetFileRepo, PartitionRepo, RepoCollection, Result,
     RootRepo, SoftDeletedRows, TableRepo,
@@ -12,9 +14,9 @@ use data_types::{
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     snapshot::partition::PartitionSnapshot,
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
-    TableId, Timestamp,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
+    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
+    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
 };
 use iox_time::TimeProvider;
 use metric::{DurationHistogram, Metric};
@@ -294,6 +296,7 @@ decorate! {
             namespace_create = create(&mut self, name: &NamespaceName<'_>, partition_template: Option<NamespacePartitionTemplateOverride>, retention_period_ns: Option<i64>, service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>) -> Result<Namespace>;
             namespace_update_retention_period = update_retention_period(&mut self, id: NamespaceId, retention_period_ns: Option<i64>) -> Result<Namespace>;
             namespace_list = list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
+            namespace_list_storage = list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>>;
             namespace_get_by_id = get_by_id(&mut self, id: NamespaceId, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
             namespace_get_by_name = get_by_name(&mut self, name: &str, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
             namespace_soft_delete = soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId>;
@@ -301,6 +304,7 @@ decorate! {
             namespace_update_column_limit = update_column_limit(&mut self, id: NamespaceId, new_max: MaxColumnsPerTable) -> Result<Namespace>;
             namespace_snapshot = snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot>;
             namespace_snapshot_by_name = snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot>;
+            namespace_get_storage_by_id = get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>>;
         ],
     },
     {
@@ -309,8 +313,10 @@ decorate! {
         methods = [
             table_create = create(&mut self, name: &str, partition_template: TablePartitionTemplateOverride, namespace_id: NamespaceId) -> Result<Table>;
             table_get_by_id = get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
+            table_get_storage_by_id = get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>>;
             table_get_by_namespace_and_name = get_by_namespace_and_name(&mut self, namespace_id: NamespaceId, name: &str) -> Result<Option<Table>>;
             table_list_by_namespace_id = list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Table>>;
+            table_list_storage_by_namespace_id = list_storage_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableWithStorage>>;
             table_list = list(&mut self) -> Result<Vec<Table>>;
             table_snapshot = snapshot(&mut self, table_id: TableId) -> Result<TableSnapshot>;
         ],
@@ -347,6 +353,7 @@ decorate! {
             partition_list_old_style = list_old_style(&mut self) -> Result<Vec<Partition>>;
             partition_delete_by_retention = delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>>;
             partition_snapshot = snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
+            partition_snapshot_generation = snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64>;
         ],
     },
     {
@@ -360,8 +367,10 @@ decorate! {
             parquet_active_as_of = active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
             parquet_get_by_object_store_id = get_by_object_store_id(&mut self, object_store_id: ObjectStoreId) -> Result<Option<ParquetFile>>;
             parquet_exists_by_object_store_id_batch = exists_by_object_store_id_batch(&mut self, object_store_ids: Vec<ObjectStoreId>) -> Result<Vec<ObjectStoreId>>;
+            parquet_exists_by_partition_object_store_id_batch = exists_by_partition_and_object_store_id_batch(&mut self, ids: Vec<(PartitionId, ObjectStoreId)>) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
             parquet_create_upgrade_delete = create_upgrade_delete(&mut self, partition_id: PartitionId, delete: &[ObjectStoreId], upgrade: &[ObjectStoreId], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFile>>;
             parquet_list_files_by_table_id = list_by_table_id(&mut self, _table_id: TableId, _compaction_level: Option<CompactionLevel>) -> Result<Vec<ParquetFile>>;
+            parquet_list_files_by_namespace_id = list_by_namespace_id(&mut self, namespace_id: NamespaceId, deleted: SoftDeletedRows) -> Result<Vec<ParquetFile>>;
         ],
     },
 }

@@ -2,10 +2,13 @@ use crate::NUMERICS;
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::Field;
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::function::WindowUDFFieldArgs;
+use datafusion::logical_expr::function::{
+    ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
+};
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
+use datafusion::physical_expr::PhysicalExpr;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -41,7 +44,15 @@ impl WindowUDFImpl for CumulativeSumUDWF {
         &self.signature
     }
 
-    fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
+    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
+    fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
+        expr_args.input_exprs().into()
+    }
+
+    fn partition_evaluator(
+        &self,
+        _args: PartitionEvaluatorArgs<'_>,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
         Ok(Box::new(CumulativeSumPartitionEvaluator {}))
     }
 

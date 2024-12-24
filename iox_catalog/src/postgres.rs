@@ -27,8 +27,9 @@ use data_types::{
     },
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables, Namespace,
     NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceVersion,
-    ObjectStoreId, ParquetFile, ParquetFileParams, Partition, PartitionHashId, PartitionId,
-    PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
+    NamespaceWithStorage, ObjectStoreId, ParquetFile, ParquetFileParams, Partition,
+    PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId,
+    TableWithStorage, Timestamp,
 };
 use futures::StreamExt;
 use iox_time::{SystemProvider, Time, TimeProvider};
@@ -327,27 +328,11 @@ impl Catalog for PostgresCatalog {
 
 // Pure helper function to get the current time from postgres.
 async fn pg_get_time(pool: &HotSwapPool<Postgres>) -> Result<iox_time::Time, Error> {
-    let res = pool.acquire().await;
-    let mut connection = match res {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(Error::External {
-                source: Arc::new(e),
-            });
-        }
-    };
+    let mut connection = pool.acquire().await?;
 
-    let res = connection
+    let row = connection
         .fetch_one(r#"SELECT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000)::INT8"#)
-        .await;
-    let row = match res {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(Error::External {
-                source: Arc::new(e),
-            });
-        }
-    };
+        .await?;
 
     Ok(Time::from_timestamp_micros(row.get(0)).expect("Failed to get `Time` from `PgRow`"))
 }
@@ -747,7 +732,7 @@ RETURNING *;
             if is_fk_violation(&e) {
                 Error::NotFound { descr: e.to_string() }
             } else {
-                Error::External { source: Arc::new(e) }
+                e.into()
             }
         }})?;
 
@@ -831,9 +816,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                     descr: e.to_string(),
                 }
             } else {
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             }
         })?;
 
@@ -855,6 +838,29 @@ WHERE {v};
         )
         .fetch_all(&mut self.inner)
         .await?;
+
+        Ok(rec)
+    }
+
+    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+        let rec = sqlx::query_as::<_, NamespaceWithStorage>(
+            r#"
+SELECT
+	n.id,
+	n.name,
+	n.retention_period_ns,
+	n.max_tables,
+	n.max_columns_per_table,
+	n.partition_template,
+	COALESCE(SUM(f.file_size_bytes)::BIGINT, 0::BIGINT) AS size_bytes,
+	COUNT(DISTINCT t.id) AS table_count
+FROM namespace n
+LEFT JOIN table_name t ON n.id = t.namespace_id
+LEFT JOIN parquet_file f ON n.id = f.namespace_id
+WHERE f.to_delete IS NULL
+GROUP BY f.namespace_id, n.name, retention_period_ns, max_tables, max_columns_per_table, partition_template;
+            "#,
+        ).fetch_all(&mut self.inner).await?;
 
         Ok(rec)
     }
@@ -924,7 +930,11 @@ WHERE name=$1 AND {v};
 
         // note that there is a uniqueness constraint on the name column in the DB
         let rec = sqlx::query_as::<_, NamespaceId>(
-            r#"UPDATE namespace SET deleted_at=$1 WHERE id = $2 RETURNING id;"#,
+            r#"
+UPDATE namespace
+SET deleted_at=$1, router_version = router_version + 1
+WHERE id = $2
+RETURNING id;"#,
         )
         .bind(flagged_at) // $1
         .bind(id) // $2
@@ -935,9 +945,7 @@ WHERE name=$1 AND {v};
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(id)
@@ -966,9 +974,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(namespace)
@@ -997,9 +1003,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(namespace)
@@ -1028,9 +1032,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(namespace)
@@ -1071,6 +1073,33 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
     async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
         namespace_snapshot_by_name(self, name).await
+    }
+
+    async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>> {
+        let rec = sqlx::query_as::<_, NamespaceWithStorage>(
+            r#"
+SELECT n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_table, n.deleted_at,
+       n.partition_template, n.router_version,
+       COALESCE(SUM(f.file_size_bytes)::BIGINT, 0::BIGINT) as size_bytes,
+       COUNT(DISTINCT t.id) as table_count
+FROM namespace n
+LEFT JOIN table_name t on n.id = t.namespace_id
+LEFT JOIN parquet_file f ON n.id = f.namespace_id AND f.to_delete IS NULL
+WHERE n.id = $1
+GROUP BY n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_table, n.partition_template;
+            "#,
+        )
+        .bind(id) // $1
+        .fetch_one(&mut self.inner)
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let namespace_with_storage = rec?;
+
+        Ok(Some(namespace_with_storage))
     }
 }
 
@@ -1127,9 +1156,7 @@ RETURNING *;
                         descr: e.to_string(),
                     }
                 } else {
-                    Error::External {
-                        source: Arc::new(e),
-                    }
+                    e.into()
                 }
             }
         })?;
@@ -1171,6 +1198,34 @@ WHERE id = $1;
         Ok(Some(table))
     }
 
+    async fn get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>> {
+        let rec = sqlx::query_as::<_, TableWithStorage>(
+            r#"
+SELECT
+  t.id AS id,
+  t.name,
+  t.namespace_id,
+  t.partition_template,
+  COALESCE(SUM(f.file_size_bytes)::BIGINT, 0::BIGINT) AS size_bytes
+FROM table_name t
+LEFT JOIN parquet_file f ON t.id = f.table_id AND f.to_delete IS NULL
+WHERE t.id = $1
+GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
+            "#,
+        )
+        .bind(table_id) // $1
+        .fetch_one(&mut self.inner)
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let table_with_storage = rec?;
+
+        Ok(Some(table_with_storage))
+    }
+
     async fn get_by_namespace_and_name(
         &mut self,
         namespace_id: NamespaceId,
@@ -1206,6 +1261,31 @@ WHERE namespace_id = $1;
             "#,
         )
         .bind(namespace_id)
+        .fetch_all(&mut self.inner)
+        .await?;
+
+        Ok(rec)
+    }
+
+    async fn list_storage_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<TableWithStorage>> {
+        let rec = sqlx::query_as::<_, TableWithStorage>(
+            r#"
+SELECT
+	t.id AS id,
+  t.name,
+  t.namespace_id,
+  t.partition_template,
+  COALESCE(SUM(f.file_size_bytes)::BIGINT, 0::BIGINT) AS size_bytes
+FROM table_name t
+LEFT JOIN parquet_file f ON t.id = f.table_id AND f.to_delete IS NULL
+WHERE t.namespace_id = $1
+GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
+        "#,
+        )
+        .bind(namespace_id) // $1
         .fetch_all(&mut self.inner)
         .await?;
 
@@ -1350,9 +1430,7 @@ RETURNING *;
                     descr: e.to_string(),
                 }
             } else {
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             }
         })?;
 
@@ -1411,13 +1489,9 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                     %hash_id,
                     "possible duplicate partition_hash_id?"
                 );
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             } else {
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             }
         })?;
 
@@ -1533,11 +1607,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                     partition.sort_key_ids().cloned().unwrap_or_default(),
                 ));
             }
-            Err(e) => {
-                return Err(CasFailure::QueryError(Error::External {
-                    source: Arc::new(e),
-                }))
-            }
+            Err(e) => return Err(CasFailure::QueryError(e.into())),
         };
 
         debug!(
@@ -1829,6 +1899,21 @@ WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
             generation as _,
         )?)
     }
+
+    async fn snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64> {
+        let mut tx = self.inner.pool.begin().await?;
+
+        let (generation, _): (i64,NamespaceId) = sqlx::query_as(
+            "UPDATE partition SET generation = partition.generation + 1 from table_name where partition.id = $1 and table_name.id = partition.table_id RETURNING partition.generation, table_name.namespace_id;",
+        )
+        .bind(partition_id) // $1
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(generation as u64)
+    }
 }
 
 #[async_trait]
@@ -2020,6 +2105,37 @@ WHERE object_store_id = ANY($1);
         .map_err(Error::from)
     }
 
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
+        // Use two arrays instead of tuples, because sqlx doesn't implement tuple encoding and if we implement it
+        // ourselves, PostgreSQL rejects this with: "input of anonymous composite types is not implemented".
+        let (p_ids, os_ids): (Vec<_>, Vec<_>) = ids.into_iter().unzip();
+
+        sqlx::query(
+            r#"
+SELECT partition_id, object_store_id
+FROM parquet_file
+WHERE (partition_id, object_store_id) IN (
+    SELECT a, b
+    FROM (SELECT unnest($1) AS a, unnest($2) AS b) sub
+);
+                "#,
+        )
+        .bind(p_ids) // $1
+        .bind(os_ids) // $2
+        .map(|pgr| {
+            (
+                pgr.get::<PartitionId, _>("partition_id"),
+                pgr.get::<ObjectStoreId, _>("object_store_id"),
+            )
+        })
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(Error::from)
+    }
+
     async fn create_upgrade_delete(
         &mut self,
         partition_id: PartitionId,
@@ -2106,6 +2222,38 @@ WHERE object_store_id = ANY($1);
         )
         .fetch_all(&mut self.inner)
         .await?)
+    }
+
+    async fn list_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Vec<ParquetFile>> {
+        let deleted_predicate = match deleted {
+            SoftDeletedRows::ExcludeDeleted => "to_delete IS NULL",
+            SoftDeletedRows::OnlyDeleted => "to_delete IS NOT NULL",
+            SoftDeletedRows::AllRows => "1=1",
+        };
+        sqlx::query_as::<_, ParquetFile>(
+            format!(
+                r#"
+SELECT
+    id, namespace_id, table_id, partition_id, partition_hash_id,
+    object_store_id, min_time, max_time, to_delete, file_size_bytes,
+    row_count, compaction_level, created_at, column_set,
+    max_l0_created_at, source
+FROM parquet_file
+WHERE
+    namespace_id = $1
+AND
+    {deleted_predicate}"#
+            )
+            .as_str(),
+        )
+        .bind(namespace_id)
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(Error::from)
     }
 }
 
@@ -2210,9 +2358,7 @@ RETURNING
                 descr: e.to_string(),
             }
         } else {
-            Error::External {
-                source: Arc::new(e),
-            }
+            e.into()
         }
     })?;
 
@@ -2381,7 +2527,7 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) async fn setup_db_no_migration() -> PostgresCatalog {
-        setup_db_no_migration_with_app_name("test").await
+        setup_db_no_migration_with_app_name("postgres").await
     }
 
     pub(crate) async fn setup_db_no_migration_with_app_name(
@@ -3463,5 +3609,295 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                 assert!(system_now.second().abs_diff(t2.second()) <= 1);
             }
         );
+    }
+
+    // Catch cases where code may have evolved to be incompatible with existing database records
+    // by manually inserting records that have historically been valid but are no longer possible
+    // to create via the Rust interfaces.
+    #[tokio::test]
+    async fn can_select_all_historically_valid_records() {
+        maybe_skip_integration!();
+        maybe_start_logging();
+
+        let postgres = setup_db().await;
+        let pool = postgres.pool.clone();
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut repos = postgres.repositories();
+
+        // Insert valid namespaces, varying whether optional values are set or not.
+        //
+        // # Warnings
+        //
+        // These tests ensure we don't break production by changing the code such that
+        // it's incompatible with existing data!
+        //
+        // DO NOT: remove or edit the inserted values
+        // UNLESS those values are truly now impossible to occur in production databases.
+        //
+        // DO:
+        // - Add more columns and associated values, if more columns are added to the database
+        // - Add more rows to cover different variations
+        sqlx::query(
+            r#"
+INSERT INTO namespace
+    (
+        name, max_tables, max_columns_per_table, retention_period_ns, deleted_at,
+        partition_template, router_version, generation
+    )
+VALUES
+    (
+        'my_namespace_no_optionals', DEFAULT, DEFAULT, DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT, DEFAULT
+    ),
+    (
+        'my_namespace_all_optionals', 100, 100, 1000000000, 1733165295000000000,
+        '{"parts":[{"timeFormat":"%Y"},{"tagValue":"a"}]}', 1, 2
+    );
+    "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let namespaces = repos
+            .namespaces()
+            .list(SoftDeletedRows::AllRows)
+            .await
+            .expect(
+                "Selecting historically valid namespaces should succeed. If this fails, \
+                 something is likely wrong with the `sqlx::FromRow` impl for `Namespace`. \
+                 Do not edit the INSERT statements unless the production database has been \
+                 migrated to make historical records like these impossible!",
+            );
+        assert_eq!(namespaces.len(), 2);
+
+        // Insert valid tables, varying whether optional values are set or not.
+        //
+        // # Warnings
+        //
+        // These tests ensure we don't break production by changing the code such that
+        // it's incompatible with existing data!
+        //
+        // DO NOT: remove or edit the inserted values
+        // UNLESS those values are truly now impossible to occur in production databases.
+        //
+        // DO:
+        // - Add more columns and associated values, if more columns are added to the database
+        // - Add more rows to cover different variations
+        sqlx::query(
+            r#"
+INSERT INTO table_name
+    (
+        name, namespace_id, partition_template, generation
+    )
+VALUES
+    (
+        'my_table_no_optionals', 1, DEFAULT, DEFAULT
+    ),
+    (
+        'my_table_all_optionals', 1, '{"parts":[{"timeFormat":"%Y"},{"tagValue":"a"}]}', 3
+    );
+    "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tables = repos.tables().list().await.expect(
+            "Selecting historically valid tables should succeed. If this fails, \
+             something is likely wrong with the `sqlx::FromRow` impl for `Table`. \
+             Do not edit the INSERT statements unless the production database has been \
+             migrated to make historical records like these impossible!",
+        );
+        assert_eq!(tables.len(), 2);
+
+        // Insert valid columns, covering all `ColumnType`s.
+        //
+        // # Warnings
+        //
+        // These tests ensure we don't break production by changing the code such that
+        // it's incompatible with existing data!
+        //
+        // DO NOT: remove or edit the inserted values
+        // UNLESS those values are truly now impossible to occur in production databases.
+        //
+        // DO:
+        // - Add more columns and associated values, if more columns are added to the database
+        // - Add more rows to cover different variations
+        sqlx::query(
+            r#"
+INSERT INTO column_name
+    (name, table_id, column_type)
+VALUES
+    ('my_column_i64', 1, 1),
+    ('my_column_u64', 1, 2),
+    ('my_column_f64', 1, 3),
+    ('my_column_bool', 1, 4),
+    ('my_column_string', 1, 5),
+    ('my_column_time', 1, 6),
+    ('my_column_tag', 1, 7),
+    ('my_column_time', 2, 6);
+    "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let columns = repos.columns().list().await.expect(
+            "Selecting historically valid tables should succeed. If this fails, \
+             something is likely wrong with the `sqlx::FromRow` impl for `Column` or `ColumnType. \
+             Do not edit the INSERT statements unless the production database has been \
+             migrated to make historical records like these impossible!",
+        );
+        assert_eq!(columns.len(), 8);
+
+        // Insert valid partitions, varying whether optional values are set or not.
+        //
+        // # Warnings
+        //
+        // These tests ensure we don't break production by changing the code such that
+        // it's incompatible with existing data!
+        //
+        // DO NOT: remove or edit the inserted values
+        // UNLESS those values are truly now impossible to occur in production databases.
+        //
+        // DO:
+        // - Add more columns and associated values, if more columns are added to the database
+        // - Add more rows to cover different variations
+        sqlx::query(
+            r#"
+INSERT INTO partition
+    (
+        partition_key, table_id, sort_key_ids, to_delete, new_file_at,
+        hash_id, sort_key,
+        generation, cold_compact_at, created_at
+    )
+VALUES
+    (
+        'my_partition_no_optionals', 1, '{}', DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT, DEFAULT
+    ),
+    (
+        'my_partition_all_optionals', 1, '{1, 2}', 1733165295000000000, 1733165295000000000,
+        '\xb18bbe985a4be50cd1219839b80f368e5a9518002d752e68a169c9414580da7c', '{"region", "time"}',
+        4, 1733165295000000000, 1733165295000000000
+    );
+    "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let partitions = repos.partitions().most_recent_n(100).await.expect(
+            "Selecting historically valid partitions should succeed. If this fails, \
+             something is likely wrong with the `sqlx::FromRow` impl for `Partition`. \
+             Do not edit the INSERT statements unless the production database has been \
+             migrated to make historical records like these impossible!",
+        );
+        assert_eq!(partitions.len(), 2);
+
+        // Insert valid parquet files, varying whether optional values are set or not and covering
+        // all `CompactionLevel`s and `ParquetFileSource`s.
+        //
+        // # Warnings
+        //
+        // These tests ensure we don't break production by changing the code such that
+        // it's incompatible with existing data!
+        //
+        // DO NOT: remove or edit the inserted values
+        // UNLESS those values are truly now impossible to occur in production databases.
+        //
+        // DO:
+        // - Add more columns and associated values, if more columns are added to the database
+        // - Add more rows to cover different variations
+        sqlx::query(
+            r#"
+INSERT INTO parquet_file
+    (
+        namespace_id, table_id, partition_id, object_store_id, column_set, min_time,
+        max_time, created_at, to_delete, row_count, file_size_bytes,
+        max_l0_created_at, partition_hash_id,
+        compaction_level, source
+    )
+VALUES
+    (
+        1, 1, 1, '2d3fa65b-9ced-0469-24ee-9e45a4b1c178', '{}', 1733165295000000000,
+        1733165295000000000, 1733165295000000000, DEFAULT, DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT
+    ),
+    (
+        1, 1, 1, '3d3fa65b-9ced-0469-24ee-9e45a4b1c178', '{1}', 1733165295000000000,
+        1733165295000000000, 1733165295000000000, 1733165295000000000, 9000, 1024,
+        1733165295000000000, '\xb18bbe985a4be50cd1219839b80f368e5a9518002d752e68a169c9414580da7c',
+        0, 1
+    ),
+    (
+        1, 1, 1, '4d3fa65b-9ced-0469-24ee-9e45a4b1c178', '{}', 1733165295000000000,
+        1733165295000000000, 1733165295000000000, DEFAULT, DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT,
+        1, DEFAULT
+    ),
+    (
+        1, 1, 1, '5d3fa65b-9ced-0469-24ee-9e45a4b1c178', '{}', 1733165295000000000,
+        1733165295000000000, 1733165295000000000, DEFAULT, DEFAULT, DEFAULT,
+        DEFAULT, DEFAULT,
+        2, DEFAULT
+    );
+    "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let parquet_files = repos
+            .parquet_files()
+            .list_by_table_id(TableId::new(1), None)
+            .await
+            .expect(
+                "Selecting historically valid parquet_files should succeed. If this fails, \
+                 something is likely wrong with the `sqlx::FromRow` impl for `ParquetFile`. \
+                 Do not edit the INSERT statements unless the production database has been \
+                 migrated to make historical records like these impossible!",
+            );
+        assert_eq!(parquet_files.len(), 4);
+
+        // Insert valid skipped compactions, varying whether optional values are set or not.
+        //
+        // # Warnings
+        //
+        // These tests ensure we don't break production by changing the code such that
+        // it's incompatible with existing data!
+        //
+        // DO NOT: remove or edit the inserted values
+        // UNLESS those values are truly now impossible to occur in production databases.
+        //
+        // DO:
+        // - Add more columns and associated values, if more columns are added to the database
+        // - Add more rows to cover different variations
+        sqlx::query(
+            r#"
+INSERT INTO skipped_compactions
+    (
+        partition_id, reason, skipped_at, estimated_bytes, limit_bytes, num_files, limit_num_files,
+        limit_num_files_first_in_partition
+    )
+VALUES
+    (
+        1, 'no optionals', 1733165295000000000, 0, 0, 0, 0,
+        0
+    ),
+    (
+        2, 'all optionals', 1733165295000000000, 2048, 4096, 10, 11,
+        12
+    );
+    "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let skipped_compactions = repos.partitions().list_skipped_compactions().await.expect(
+            "Selecting historically valid skipped_compactions should succeed. If this fails, \
+             something is likely wrong with the `sqlx::FromRow` impl for `SkippedCompaction`. \
+             Do not edit the INSERT statements unless the production database has been \
+             migrated to make historical records like these impossible!",
+        );
+        assert_eq!(skipped_compactions.len(), 2);
     }
 }

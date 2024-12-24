@@ -24,7 +24,6 @@ use std::{
     time::Duration,
 };
 
-use crate::grpc::client;
 use crate::grpc::test_server::TestGrpcServer;
 use crate::{
     constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
@@ -32,9 +31,13 @@ use crate::{
         CasFailure, Catalog, Error, ParquetFileRepoExt, PartitionRepoExt, RepoCollection,
         SoftDeletedRows,
     },
-    test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
+    test_helpers::{
+        arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table, create_and_get_file,
+        delete_file,
+    },
     util::{list_schemas, validate_or_insert_schema},
 };
+use crate::{grpc::client, test_helpers::setup_table_and_partition};
 
 pub(crate) async fn test_catalog<R, F>(clean_state: R)
 where
@@ -47,13 +50,14 @@ where
     test_column(clean_state().await).await;
     test_partition(clean_state().await).await;
     test_parquet_file(clean_state().await).await;
-    test_parquet_file_active_as_of(clean_state().await).await;
     test_parquet_file_delete_broken(clean_state().await).await;
     test_update_to_compaction_level_1(clean_state().await).await;
     test_list_by_partiton_not_to_delete(clean_state().await).await;
     test_list_schemas(clean_state().await).await;
     test_list_schemas_soft_deleted_rows(clean_state().await).await;
     test_delete_namespace(clean_state().await).await;
+    test_table_storage(clean_state().await).await;
+    test_namespace_storage(clean_state().await).await;
 
     let catalog = clean_state().await;
     test_namespace(Arc::clone(&catalog)).await;
@@ -289,12 +293,99 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     {
         let deleted_id = repos.namespaces().soft_delete(namespace.id).await.unwrap();
         assert_eq!(namespace.id, deleted_id);
+
+        // Ensure that the namespace version was advanced by deletion
+        let previous_router_version = namespace.router_version;
+        let deleted_ns = repos
+            .namespaces()
+            .get_by_id(deleted_id, SoftDeletedRows::AllRows)
+            .await
+            .unwrap()
+            .expect("deleted ns must still be in catalog");
+        assert_eq!(
+            previous_router_version.get() + 1,
+            deleted_ns.router_version.get(),
+            "namespace version did not increment monotonically"
+        );
     }
     // Try to delete a non-existent namespace
     assert_matches!(
         repos.namespaces().soft_delete(NamespaceId::new(42)).await,
         Err(Error::NotFound { .. })
     );
+}
+
+async fn test_namespace_storage(catalog: Arc<dyn Catalog>) {
+    let mut repos = catalog.repositories();
+    let namespace = arbitrary_namespace(&mut *repos, "namespace_with_storage").await;
+
+    match catalog.name() {
+        "grpc_client" => {
+            repos
+                .namespaces()
+                .get_storage_by_id(namespace.id)
+                .await
+                .expect_err("get namespace with storage should error with unimplemented");
+        }
+        _ => {
+            // "sqlite" | "memory" | "postgres" | "cache"
+            repos
+                .namespaces()
+                .get_storage_by_id(namespace.id)
+                .await
+                .expect("get namespace with storage should succeed");
+        }
+    }
+
+    let table = arbitrary_table(&mut *repos, "test_table", &namespace).await;
+
+    let partition = repos
+        .partitions()
+        .create_or_get("one".into(), table.id)
+        .await
+        .unwrap();
+
+    let file_1 = create_and_get_file(&mut *repos, &namespace, &table, &partition).await;
+    let file_2 = create_and_get_file(&mut *repos, &namespace, &table, &partition).await;
+
+    // Namespace size should be the sum of file_1 and file_2 size
+    let expected_size = file_1.file_size_bytes + file_2.file_size_bytes;
+    if catalog.name() != "grpc_client" {
+        // "sqlite" | "memory" | "postgres" | "cache"
+        let namespace_with_storage = repos
+            .namespaces()
+            .get_storage_by_id(namespace.id)
+            .await
+            .expect("get namespace with storage should succeed")
+            .unwrap();
+        assert_eq!(namespace_with_storage.size_bytes, expected_size);
+    }
+
+    // Delete file_1
+    repos
+        .parquet_files()
+        .create_upgrade_delete(
+            file_1.partition_id,
+            &[file_1.object_store_id],
+            &[],
+            &[],
+            CompactionLevel::Initial,
+        )
+        .await
+        .unwrap();
+
+    // Namespace size should be the size of file_2
+    let expected_size = file_2.file_size_bytes;
+    if catalog.name() != "grpc_client" {
+        // "sqlite" | "memory" | "postgres" | "cache"
+        let namespace_with_storage = repos
+            .namespaces()
+            .get_storage_by_id(namespace.id)
+            .await
+            .expect("get with storage should succeed")
+            .unwrap();
+        assert_eq!(namespace_with_storage.size_bytes, expected_size);
+    }
 }
 
 async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
@@ -390,13 +481,41 @@ async fn test_namespace_soft_deletion(catalog: Arc<dyn Catalog>) {
     assert_gt(s2.generation(), s1.generation());
     validate_root_snapshot(repos.as_mut(), &s2).await;
 
-    // Mark "deleted-ns" as soft-deleted.
+    // Mark "deleted-ns" as soft-deleted, ensuring the version is
+    // advanced.
+    let initial_router_version = deleted_ns.router_version;
     repos.namespaces().soft_delete(deleted_ns.id).await.unwrap();
+    {
+        let deleted_ns = repos
+            .namespaces()
+            .get_by_id(deleted_ns.id, SoftDeletedRows::OnlyDeleted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial_router_version.get() + 1,
+            deleted_ns.router_version.get(),
+            "namespace version did not increment monotonically"
+        )
+    }
 
-    // Which should be idempotent (ignoring the timestamp change - when
-    // changing this to "soft delete" it was idempotent, so I am preserving
-    // that).
+    // Which should be mostly idempotent from a client's point of view (when
+    // changing this to "soft delete" it was idempotent, this must be
+    // preserved, even if the deletion timestamp and version are updated).
     repos.namespaces().soft_delete(deleted_ns.id).await.unwrap();
+    {
+        let deleted_ns = repos
+            .namespaces()
+            .get_by_id(deleted_ns.id, SoftDeletedRows::OnlyDeleted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial_router_version.get() + 2,
+            deleted_ns.router_version.get(),
+            "namespace version did not increment monotonically"
+        )
+    }
 
     let s3 = repos.root().snapshot().await.unwrap();
     assert_ge(s3.generation(), s2.generation());
@@ -813,6 +932,135 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .soft_delete(namespace2.id)
         .await
         .expect("delete namespace should succeed");
+}
+
+async fn test_table_storage(catalog: Arc<dyn Catalog>) {
+    let mut repos = catalog.repositories();
+    let namespace = arbitrary_namespace(&mut *repos, "namespace_storage_test").await;
+
+    // Set up a table and its partition
+    let (table_1, partition_1) =
+        setup_table_and_partition(&mut *repos, "test_table", &namespace).await;
+    assert_eq!(table_1.namespace_id, namespace.id);
+
+    // Table size should be zero since there is no file in the table
+    let expected_size = 0;
+    match catalog.name() {
+        "grpc_client" => {
+            // Get a list of tables
+            repos
+                .tables()
+                .list_storage_by_namespace_id(table_1.namespace_id)
+                .await
+                .expect_err("list table with storage should error with unimplemented error");
+
+            // Get a table
+            repos
+                .tables()
+                .get_storage_by_id(table_1.id)
+                .await
+                .expect_err("get table with storage should error with unimplemented error");
+        }
+        _ => {
+            // "sqlite" | "memory" | "postgres" | "cache"
+            assert_table_size(&mut *repos, &table_1, expected_size, None).await;
+        }
+    }
+
+    if catalog.name() == "grpc_client" {
+        // No longer need to test the following for the "grpc_client" catalog
+        return;
+    }
+
+    // The folllowing will be tested in "sqlite" | "memory" | "postgres" | "cache" catalogs
+
+    // Create two files
+    let table_1_file_1 = create_and_get_file(&mut *repos, &namespace, &table_1, &partition_1).await;
+    let table_1_file_2 = create_and_get_file(&mut *repos, &namespace, &table_1, &partition_1).await;
+
+    // Table size should be the sum of the two files
+    let expected_size = table_1_file_1.file_size_bytes + table_1_file_2.file_size_bytes;
+    assert_table_size(&mut *repos, &table_1, expected_size, None).await;
+
+    // Delete a file
+    delete_file(&mut *repos, &table_1_file_1).await;
+
+    // Table size should be the size of another file
+    let expected_size = table_1_file_2.file_size_bytes;
+    assert_table_size(&mut *repos, &table_1, expected_size, None).await;
+
+    // Set up another table and its partition
+    let (table_2, partition_2) =
+        setup_table_and_partition(&mut *repos, "table_name_2", &namespace).await;
+
+    // Create one file in table_2
+    let table_2_file = create_and_get_file(&mut *repos, &namespace, &table_2, &partition_2).await;
+
+    // The expected sizes for two tables are:
+    let expected_table_1_size = table_1_file_2.file_size_bytes; // only file 2 is left in this table
+    let expected_table_2_size = table_2_file.file_size_bytes;
+    assert_table_size(
+        &mut *repos,
+        &table_1,
+        expected_table_1_size,
+        Some((&table_2, expected_table_2_size)),
+    )
+    .await;
+
+    /// This function is used to check the size of tables
+    /// when there is one or two tables in the list.
+    async fn assert_table_size(
+        repos: &mut dyn RepoCollection,
+        table_1: &data_types::Table,
+        expected_size_1: i64,
+        table_2_and_size: Option<(&data_types::Table, i64)>,
+    ) {
+        // Get a list of tables
+        let table_list = repos
+            .tables()
+            .list_storage_by_namespace_id(table_1.namespace_id)
+            .await
+            .expect("list table with storage should succeed");
+
+        match table_2_and_size {
+            None => {
+                assert_eq!(table_list.len(), 1);
+                assert_eq!(table_list[0].size_bytes, expected_size_1);
+
+                // Get table_1
+                let table_with_storage = repos
+                    .tables()
+                    .get_storage_by_id(table_1.id)
+                    .await
+                    .expect("get table with storage should succeed")
+                    .unwrap();
+                assert_eq!(table_with_storage.size_bytes, expected_size_1);
+            }
+            Some((table_2, expected_size_2)) => {
+                assert_eq!(table_list.len(), 2);
+                assert_eq!(table_list[0].size_bytes, expected_size_1);
+                assert_eq!(table_list[1].size_bytes, expected_size_2);
+
+                // Get table_1
+                let table_with_storage = repos
+                    .tables()
+                    .get_storage_by_id(table_1.id)
+                    .await
+                    .expect("get table with storage should succeed")
+                    .unwrap();
+                assert_eq!(table_with_storage.size_bytes, expected_size_1);
+
+                // Get table_2
+                let table_with_storage = repos
+                    .tables()
+                    .get_storage_by_id(table_2.id)
+                    .await
+                    .expect("get table with storage should succeed")
+                    .unwrap();
+                assert_eq!(table_with_storage.size_bytes, expected_size_2);
+            }
+        }
+    }
 }
 
 async fn test_column(catalog: Arc<dyn Catalog>) {
@@ -1650,6 +1898,18 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         assert_eq!(parquet_file, *got);
     });
 
+    let files_by_namespace_id = repos
+        .parquet_files()
+        .list_by_namespace_id(
+            parquet_file_params.namespace_id,
+            SoftDeletedRows::ExcludeDeleted,
+        )
+        .await
+        .unwrap();
+    assert_matches!(files_by_namespace_id.as_slice(), [got] => {
+        assert_eq!(parquet_file, *got);
+    });
+
     for (level, expected) in [
         (CompactionLevel::Initial, 1),
         (CompactionLevel::FileNonOverlapped, 0),
@@ -2136,9 +2396,15 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         object_store_id: ObjectStoreId::new(),
         ..f6_params
     };
+    let f8_params = ParquetFileParams {
+        object_store_id: ObjectStoreId::new(),
+        partition_id: partition.id,
+        ..f7_params.clone()
+    };
     let f1_uuid = f1.object_store_id;
     let f6_uuid = f6_params.object_store_id;
     let f5_uuid = f5.object_store_id;
+    let f8_uuid = f8_params.object_store_id;
 
     let cud = repos
         .parquet_files()
@@ -2151,8 +2417,21 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         )
         .await
         .unwrap();
-
     assert_eq!(cud.len(), 1);
+
+    let cud = repos
+        .parquet_files()
+        .create_upgrade_delete(
+            f8_params.partition_id,
+            &[],
+            &[],
+            &[f8_params.clone()],
+            CompactionLevel::Final,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cud.len(), 1);
+
     let f5_delete = repos
         .parquet_files()
         .get_by_object_store_id(f5_uuid)
@@ -2225,6 +2504,28 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap();
     let mut expected = vec![f1_uuid, f7_uuid];
+    present.sort();
+    expected.sort();
+    assert_eq!(present, expected);
+
+    // test exists_by_partition_and_object_store_id_batch returns parquet files by object store id
+    let mut present = repos
+        .parquet_files()
+        .exists_by_partition_and_object_store_id_batch(vec![
+            (partition2.id, f1_uuid),
+            // wrong partition
+            (partition.id, f6_uuid),
+            (partition2.id, f7_uuid),
+            (partition.id, f8_uuid),
+            (partition.id, does_not_exist),
+        ])
+        .await
+        .unwrap();
+    let mut expected = vec![
+        (partition2.id, f1_uuid),
+        (partition2.id, f7_uuid),
+        (partition.id, f8_uuid),
+    ];
     present.sort();
     expected.sort();
     assert_eq!(present, expected);
@@ -2416,187 +2717,6 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         max_l0_created_ats,
         (0..MAX_PARQUET_L0_FILES_PER_PARTITION).collect::<Vec<_>>()
     );
-}
-
-async fn test_parquet_file_active_as_of(catalog: Arc<dyn Catalog>) {
-    let mut repos = catalog.repositories();
-
-    let namespace = arbitrary_namespace(&mut *repos, "namespace_parquet_file_active_as_of").await;
-
-    let table = arbitrary_table(&mut *repos, "test_table", &namespace).await;
-    // Two partitions in the same table
-    let partition1 = repos
-        .partitions()
-        .create_or_get("one".into(), table.id)
-        .await
-        .unwrap();
-    let partition2 = repos
-        .partitions()
-        .create_or_get("two".into(), table.id)
-        .await
-        .unwrap();
-
-    // Another table and partition in the same namespace
-    let other_table = arbitrary_table(&mut *repos, "other", &namespace).await;
-    let other_partition = repos
-        .partitions()
-        .create_or_get("one".into(), other_table.id)
-        .await
-        .unwrap();
-
-    // An entirely different namespace
-    let another_namespace = arbitrary_namespace(&mut *repos, "another_active_as_of").await;
-    let another_table = arbitrary_table(&mut *repos, "another_table", &another_namespace).await;
-    let another_partition = repos
-        .partitions()
-        .create_or_get("one".into(), another_table.id)
-        .await
-        .unwrap();
-
-    // Setup of this test, where N is the start time of the test and the additional time added
-    // isn't the real value, just some amount after the initial time:
-    //
-    // | Time | N       | N+1     | N+2     | N+3     | N+4     | N+5     | N+6     | N+7     |
-    // |------|---------|---------|---------|---------|---------|---------|---------|---------|
-    // | PF A | Created | Deleted |         |         |         |         |         |         |
-    // | PF B |         |         | Created |         |         |         |         |         |
-    // | PF C |         |         |         | Created |         |         | Deleted |         |
-    // | PF D |         |         |         |         | Created | Deleted |         |         |
-    // | PF E |         |         |         |         |         |         |         | Created |
-    //
-    // After all of the Parquet file records are created, calling `active_as_of` with the
-    // `as_of` parameter set to between N+3 and N+4 should cover all possibilities:
-    //
-    // - PF A was created and deleted before `as_of` and should NOT be returned.
-    // - PF B was created before `as_of` and never deleted and SHOULD be returned.
-    // - PF C was created before `as_of` and deleted after `as_of` and SHOULD be returned.
-    // - PF D was created and deleted after `as_of` and should NOT be returned.
-    // - PF E was created after `as_of` and never deleted and should NOT be returned.
-
-    let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition1);
-    let obj_store_a = parquet_file_params.object_store_id;
-    repos
-        .parquet_files()
-        .create(parquet_file_params.clone())
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    repos
-        .parquet_files()
-        .create_upgrade_delete(
-            partition1.id,
-            &[obj_store_a],
-            &[],
-            &[],
-            CompactionLevel::Initial,
-        )
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let obj_store_b = ObjectStoreId::new();
-    repos
-        .parquet_files()
-        .create(ParquetFileParams {
-            object_store_id: obj_store_b,
-            partition_id: partition2.id,
-            ..parquet_file_params.clone()
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let obj_store_c = ObjectStoreId::new();
-    repos
-        .parquet_files()
-        .create(ParquetFileParams {
-            object_store_id: obj_store_c,
-            namespace_id: another_namespace.id,
-            table_id: another_table.id,
-            partition_id: another_partition.id,
-            ..parquet_file_params.clone()
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let as_of = catalog.time_provider().now();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let obj_store_d = ObjectStoreId::new();
-    repos
-        .parquet_files()
-        .create(ParquetFileParams {
-            object_store_id: obj_store_d,
-            table_id: other_table.id,
-            partition_id: other_partition.id,
-            ..parquet_file_params.clone()
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    repos
-        .parquet_files()
-        .create_upgrade_delete(
-            other_partition.id,
-            &[obj_store_d],
-            &[],
-            &[],
-            CompactionLevel::Initial,
-        )
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    repos
-        .parquet_files()
-        .create_upgrade_delete(
-            another_partition.id,
-            &[obj_store_c],
-            &[],
-            &[],
-            CompactionLevel::Initial,
-        )
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    repos
-        .parquet_files()
-        .create(ParquetFileParams {
-            object_store_id: ObjectStoreId::new(),
-            ..parquet_file_params.clone()
-        })
-        .await
-        .unwrap();
-
-    let active_as_of = repos
-        .parquet_files()
-        .active_as_of(as_of.into())
-        .await
-        .unwrap();
-    assert_eq!(
-        active_as_of.len(),
-        2,
-        "{active_as_of:#?}\n{}, {}\nas_of = {}",
-        obj_store_b,
-        obj_store_c,
-        Timestamp::from(as_of).get()
-    );
-
-    let active_as_of_ids: Vec<_> = active_as_of.iter().map(|a| a.object_store_id).collect();
-    assert!(active_as_of_ids.contains(&obj_store_b));
-    assert!(active_as_of_ids.contains(&obj_store_c));
 }
 
 async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
@@ -3218,10 +3338,14 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
             .await
             .expect("get namespace should succeed")
             .map(|mut v| {
-                // The only change after soft-deletion should be the deleted_at
-                // field being set - this block normalises that field, so that
+                // The only changes after soft-deletion should be:
+                //  * deleted_at field being set
+                //  * router_version advancing
+                //
+                // This block normalises these fields, so that
                 // the before/after can be asserted as equal.
                 v.deleted_at = None;
+                v.router_version = Default::default();
                 v
             })
             .expect("should see soft-deleted row"),

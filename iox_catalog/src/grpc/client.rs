@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use client_util::tower::SetRequestHeadersService;
 use data_types::snapshot::namespace::NamespaceSnapshot;
 use data_types::snapshot::root::RootSnapshot;
+use data_types::{NamespaceWithStorage, TableWithStorage};
 use futures::TryStreamExt;
 use http::HeaderName;
 use observability_deps::tracing::{debug, info, warn};
@@ -38,11 +39,13 @@ use trace_http::metrics::{MetricFamily, RequestMetrics};
 use trace_http::tower::TraceService;
 
 use super::serialization::{
-    convert_status, deserialize_column, deserialize_namespace, deserialize_object_store_id,
+    deserialize_column, deserialize_namespace, deserialize_object_store_id,
     deserialize_parquet_file, deserialize_partition, deserialize_skipped_compaction,
     deserialize_sort_key_ids, deserialize_table, deserialize_timestamp, serialize_column_type,
-    serialize_object_store_id, serialize_parquet_file_params, serialize_soft_deleted_rows,
-    serialize_sort_key_ids, ContextExt, RequiredExt,
+    serialize_object_store_id, serialize_parquet_file_params, serialize_sort_key_ids,
+};
+use crate::util_serialization::{
+    convert_status, serialize_soft_deleted_rows, ContextExt, RequiredExt,
 };
 
 type InstrumentedChannel = TraceService<Channel>;
@@ -149,7 +152,8 @@ pub struct GrpcCatalogClient {
 }
 
 impl GrpcCatalogClient {
-    const NAME: &'static str = "grpc_client";
+    /// The [name](Catalog::name) of this catalog type.
+    pub const NAME: &'static str = "grpc_client";
 
     /// Create builder for new client.
     pub fn builder(
@@ -442,6 +446,15 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
+    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+        // The storage API is intentionally not exposed to this client to avoid confusion.
+        // The storage API is mainly for admin view via the Granite Admin UI or influxctl,
+        // and not for any IOx internal communications.
+        Err(Error::NotImplemented {
+            descr: "list_storage".to_owned(),
+        })
+    }
+
     async fn get_by_id(
         &mut self,
         id: NamespaceId,
@@ -576,6 +589,18 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         let snapshot = NamespaceSnapshot::decode(ns, resp.generation)?;
         Ok(snapshot)
     }
+
+    async fn get_storage_by_id(
+        &mut self,
+        _id: NamespaceId,
+    ) -> Result<Option<NamespaceWithStorage>> {
+        // The storage API is intentionally not exposed to this client to avoid confusion.
+        // The storage API is mainly for admin view via the Granite Admin UI or influxctl,
+        // and not for any IOx internal communications.
+        Err(Error::NotImplemented {
+            descr: "namespace_get_storage_by_id".to_owned(),
+        })
+    }
 }
 
 #[async_trait]
@@ -609,6 +634,15 @@ impl TableRepo for GrpcCatalogClientRepos {
             })
             .await?;
         Ok(resp.table.map(deserialize_table).transpose()?)
+    }
+
+    async fn get_storage_by_id(&mut self, _table_id: TableId) -> Result<Option<TableWithStorage>> {
+        // The storage API is intentionally not exposed to this client to avoid confusion.
+        // The storage API is mainly for admin view via the Granite Admin UI or influxctl,
+        // and not for any IOx internal communications.
+        Err(Error::NotImplemented {
+            descr: "table_get_storage_by_id".to_owned(),
+        })
     }
 
     async fn get_by_namespace_and_name(
@@ -646,6 +680,18 @@ impl TableRepo for GrpcCatalogClientRepos {
         .into_iter()
         .map(|res| Ok(deserialize_table(res.table.required().ctx("table")?)?))
         .collect()
+    }
+
+    async fn list_storage_by_namespace_id(
+        &mut self,
+        _namespace_id: NamespaceId,
+    ) -> Result<Vec<TableWithStorage>> {
+        // The storage API is intentionally not exposed to this client to avoid confusion.
+        // The storage API is mainly for admin view via the Granite Admin UI or influxctl,
+        // and not for any IOx internal communications.
+        Err(Error::NotImplemented {
+            descr: "list_storage_by_namespace_id".to_owned(),
+        })
     }
 
     async fn list(&mut self) -> Result<Vec<Table>> {
@@ -1144,6 +1190,13 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         let partition = resp.partition.required().ctx("partition")?;
         Ok(PartitionSnapshot::decode(partition, resp.generation))
     }
+
+    async fn snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64> {
+        (self as &mut dyn PartitionRepo)
+            .snapshot(partition_id)
+            .await
+            .map(|snapshot| snapshot.generation())
+    }
 }
 
 #[async_trait]
@@ -1320,6 +1373,40 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
+        let p = futures::stream::iter(ids.into_iter().map(|(partition_id, object_store_id)| {
+            proto::ParquetFileExistsByPartitionAndObjectStoreIdBatchRequest {
+                object_store_id: Some(serialize_object_store_id(object_store_id)),
+                partition_id: partition_id.get(),
+            }
+        }));
+
+        self.retry(
+            "parquet_file_exists_by_partition_and_object_store_id_batch",
+            p,
+            |data, mut client: ServiceClient| async move {
+                buffer_stream_response(
+                    client
+                        .parquet_file_exists_by_partition_and_object_store_id_batch(data)
+                        .await,
+                )
+                .await
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|res| {
+            let partition_id = PartitionId::new(res.partition_id);
+            let object_store_id =
+                deserialize_object_store_id(res.object_store_id.required().ctx("object_store_id")?);
+            Ok((partition_id, object_store_id))
+        })
+        .collect()
+    }
+
     async fn create_upgrade_delete(
         &mut self,
         partition_id: PartitionId,
@@ -1387,6 +1474,33 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
             p,
             |data, mut client| async move {
                 buffer_stream_response(client.parquet_file_list_by_table_id(data).await).await
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|res| {
+            Ok(deserialize_parquet_file(
+                res.file.required().ctx("parquet_file")?,
+            )?)
+        })
+        .collect()
+    }
+
+    async fn list_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Vec<ParquetFile>> {
+        let p = proto::ParquetFileListByNamespaceIdRequest {
+            namespace_id: namespace_id.get(),
+            deleted: serialize_soft_deleted_rows(deleted),
+        };
+
+        self.retry(
+            "parquet_file_list_by_namespace_id",
+            p,
+            |data, mut client| async move {
+                buffer_stream_response(client.parquet_file_list_by_namespace_id(data).await).await
             },
         )
         .await?

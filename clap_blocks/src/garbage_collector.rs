@@ -157,8 +157,9 @@ pub struct GarbageCollectorConfig {
     )]
     pub retention_sleep_interval_minutes: u64,
 
-    /// Read replica catalog connection string to be used for querying for catalog backup lists of
-    /// Parquet files, to avoid adding load to the primary read/write catalog.
+    /// Read replica catalog connection string to be used for querying for namespace names, table
+    /// names, and the current time to use when creating catalog file backup lists, to avoid adding
+    /// load to the primary read/write catalog.
     ///
     /// If not specified, defaults to the value specified for
     /// `--catalog-dsn`/`INFLUXDB_IOX_CATALOG_DSN`, which is usually the primary catalog.
@@ -280,15 +281,6 @@ pub struct GarbageCollectorConfig {
         env = "INFLUXDB_IOX_KEEP_DAILY_CATALOG_BACKUP_FILE_LISTS"
     )]
     pub keep_daily_catalog_backup_file_lists: CutoffDuration,
-
-    /// Temporary flag enabling use of pg_dump initiated by the garbage collector
-    #[clap(
-        hide = true,
-        long = "enable-pg-dump",
-        default_value = "false",
-        env = "INFLUXDB_IOX_ENABLE_PG_DUMP"
-    )]
-    pub enable_pg_dump: bool,
 
     /// DSN that's direct to postgres for use with pg_dump
     /// If there is no catalog service, this will match the other DSN, but when the catalog service

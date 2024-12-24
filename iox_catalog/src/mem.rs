@@ -22,9 +22,10 @@ use data_types::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
     },
     Column, ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace,
-    NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId,
-    ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId, PartitionId,
-    PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
+    NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage,
+    ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId,
+    PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, TableWithStorage,
+    Timestamp,
 };
 use data_types::{
     snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot},
@@ -283,6 +284,40 @@ impl NamespaceRepo for MemTxn {
             .collect())
     }
 
+    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+        let stage = self.collections.lock();
+
+        let namespaces_with_storage = stage
+            .namespaces
+            .iter()
+            .map(|n| {
+                let namespace_size_bytes = stage
+                    .parquet_files
+                    .iter()
+                    .filter(|f| f.namespace_id == n.id && f.to_delete.is_none())
+                    .map(|f| f.file_size_bytes)
+                    .sum();
+                let table_count = stage
+                    .tables
+                    .iter()
+                    .filter(|t| t.namespace_id == n.id)
+                    .count() as i64;
+                NamespaceWithStorage {
+                    id: n.value.id,
+                    name: n.value.name.clone(),
+                    retention_period_ns: n.value.retention_period_ns,
+                    max_tables: n.value.max_tables,
+                    max_columns_per_table: n.value.max_columns_per_table,
+                    partition_template: n.value.partition_template.clone(),
+                    size_bytes: namespace_size_bytes,
+                    table_count,
+                }
+            })
+            .collect();
+
+        Ok(namespaces_with_storage)
+    }
+
     async fn get_by_id(
         &mut self,
         id: NamespaceId,
@@ -320,6 +355,7 @@ impl NamespaceRepo for MemTxn {
         match stage.namespaces.iter_mut().find(|n| n.id == id) {
             Some(n) => {
                 n.deleted_at = Some(Timestamp::from(timestamp));
+                update_namespace_router_version(n);
                 Ok(n.id)
             }
             None => Err(Error::NotFound {
@@ -409,6 +445,36 @@ impl NamespaceRepo for MemTxn {
     async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
         namespace_snapshot_by_name(self, name).await
     }
+
+    async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>> {
+        let stage = self.collections.lock();
+
+        let namespace_size_bytes = stage
+            .parquet_files
+            .iter()
+            .filter(|f| f.namespace_id == id && f.to_delete.is_none())
+            .map(|f| f.file_size_bytes)
+            .sum();
+        let table_count = stage.tables.iter().filter(|t| t.namespace_id == id).count() as i64;
+
+        let namespace_with_storage =
+            stage
+                .namespaces
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| NamespaceWithStorage {
+                    id: n.value.id,
+                    name: n.value.name.clone(),
+                    retention_period_ns: n.value.retention_period_ns,
+                    max_tables: n.value.max_tables,
+                    max_columns_per_table: n.value.max_columns_per_table,
+                    partition_template: n.value.partition_template.clone(),
+                    size_bytes: namespace_size_bytes,
+                    table_count,
+                });
+
+        Ok(namespace_with_storage)
+    }
 }
 
 #[async_trait]
@@ -495,6 +561,32 @@ impl TableRepo for MemTxn {
         Ok(tables.find(|t| t.id == table_id).map(|v| v.value.clone()))
     }
 
+    async fn get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>> {
+        let stage = self.collections.lock();
+
+        let table_size_bytes: i64 = stage
+            .parquet_files
+            .iter()
+            .filter(|f| f.table_id == table_id && f.to_delete.is_none())
+            .map(|v| v.file_size_bytes)
+            .sum();
+
+        let table_with_storage =
+            stage
+                .tables
+                .iter()
+                .find(|t| t.id == table_id)
+                .map(|v| TableWithStorage {
+                    id: v.value.id,
+                    name: v.value.name.clone(),
+                    namespace_id: v.value.namespace_id,
+                    partition_template: v.value.partition_template.clone(),
+                    size_bytes: table_size_bytes,
+                });
+
+        Ok(table_with_storage)
+    }
+
     async fn get_by_namespace_and_name(
         &mut self,
         namespace_id: NamespaceId,
@@ -514,6 +606,38 @@ impl TableRepo for MemTxn {
         let filtered = tables.filter(|t| t.namespace_id == namespace_id);
         let tables: Vec<_> = filtered.map(|v| v.value.clone()).collect();
         Ok(tables)
+    }
+
+    async fn list_storage_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<TableWithStorage>> {
+        let stage = self.collections.lock();
+
+        let mut table_sizes: HashMap<TableId, i64> = HashMap::new();
+        stage
+            .parquet_files
+            .iter()
+            .filter(|f| f.namespace_id == namespace_id && f.to_delete.is_none())
+            .for_each(|f| {
+                let entry = table_sizes.entry(f.table_id).or_insert(0);
+                *entry += f.file_size_bytes;
+            });
+
+        let tables_with_storage = stage
+            .tables
+            .iter()
+            .filter(|t| t.namespace_id == namespace_id)
+            .map(|v| TableWithStorage {
+                id: v.value.id,
+                name: v.value.name.clone(),
+                namespace_id: v.value.namespace_id,
+                partition_template: v.value.partition_template.clone(),
+                size_bytes: *table_sizes.get(&v.value.id).unwrap_or(&0),
+            })
+            .collect();
+
+        Ok(tables_with_storage)
     }
 
     async fn list(&mut self) -> Result<Vec<Table>> {
@@ -1021,6 +1145,21 @@ impl PartitionRepo for MemTxn {
             generation,
         )?)
     }
+
+    async fn snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64> {
+        let mut guard = self.collections.lock();
+        let generation = {
+            let search = guard.partitions.iter_mut().find(|x| x.id == partition_id);
+            let partition = search.ok_or_else(|| Error::NotFound {
+                descr: format!("Partition {partition_id} not found"),
+            })?;
+
+            let generation = partition.generation;
+            partition.generation += 1;
+            generation
+        };
+        Ok(generation)
+    }
 }
 
 #[async_trait]
@@ -1135,6 +1274,20 @@ impl ParquetFileRepo for MemTxn {
             .collect())
     }
 
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
+        let stage = self.collections.lock();
+
+        Ok(stage
+            .parquet_files
+            .iter()
+            .filter(|f| ids.contains(&(f.partition_id, f.object_store_id)))
+            .map(|f| (f.partition_id, f.object_store_id))
+            .collect())
+    }
+
     async fn create_upgrade_delete(
         &mut self,
         partition_id: PartitionId,
@@ -1191,6 +1344,26 @@ impl ParquetFileRepo for MemTxn {
             .filter(|pf| match compaction_level {
                 Some(level) => pf.table_id == table_id && pf.compaction_level == level,
                 None => pf.table_id == table_id,
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Vec<ParquetFile>> {
+        Ok(self
+            .collections
+            .lock()
+            .parquet_files
+            .iter()
+            .filter(|f| f.namespace_id == namespace_id)
+            .filter(|f| match deleted {
+                SoftDeletedRows::AllRows => true,
+                SoftDeletedRows::ExcludeDeleted => f.to_delete.is_none(),
+                SoftDeletedRows::OnlyDeleted => f.to_delete.is_some(),
             })
             .cloned()
             .collect())

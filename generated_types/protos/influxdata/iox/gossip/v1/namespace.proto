@@ -13,6 +13,8 @@ message NamespaceMessage {
     NamespaceCreated namespace_created = 1;
     // An existing namespace was updated.
     NamespaceUpdated namespace_updated = 2;
+    // A namespace was soft deleted. 
+    NamespaceSoftDeleted namespace_soft_deleted = 3;
   }
 
   // Wall-clock time when this consistency probe was enqueued for broadcast
@@ -77,4 +79,14 @@ message NamespaceUpdated {
   // A snapshot of the monotonically increasing counter which tracks the version
   // of this namespace's non-schema properties. 
   int64 router_version = 6;
+}
+
+// The sending peer observed a soft deletion for the contained namespace.
+message NamespaceSoftDeleted {
+  // Namespace ID
+  int64 id = 1;
+
+  // A snapshot of the monotonically increasing counter which tracks the version
+  // of this namespace's non-schema properties.
+  int64 router_version = 2;
 }

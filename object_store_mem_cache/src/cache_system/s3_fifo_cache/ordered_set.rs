@@ -76,16 +76,16 @@ where
     ///
     /// If there are only tombstones at the start of the set, this may be in `O(n)` though. The good thing is that the
     /// tombstoes will be gone afterwards, so that will be a one-time clean-up.
-    pub(crate) fn pop_front(&mut self) {
+    pub(crate) fn pop_front(&mut self) -> Option<T> {
         loop {
             if self.set.is_empty() {
-                break;
+                return None;
             }
 
             match self.set.shift_remove_index(0).expect("should exist") {
                 Entry::Data(o) => {
                     self.memory_size -= o.size();
-                    break;
+                    return Some(o);
                 }
                 Entry::Tombstone(_) => {
                     self.n_tombstones -= 1;

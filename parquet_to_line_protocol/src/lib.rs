@@ -7,6 +7,7 @@ use workspace_hack as _;
 
 use datafusion::{
     arrow::datatypes::SchemaRef as ArrowSchemaRef,
+    config::TableOptions,
     datasource::{
         file_format::{parquet::ParquetFormat, FileFormat},
         listing::PartitionedFile,
@@ -20,7 +21,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 use datafusion_util::config::{
-    iox_session_config, register_iox_object_store, table_parquet_options,
+    iox_file_formats, iox_session_config, register_iox_object_store, table_parquet_options,
 };
 use futures::{stream::BoxStream, StreamExt};
 use object_store::{
@@ -204,10 +205,22 @@ impl ParquetFileReader {
             .with_config(session_config)
             .with_runtime_env(runtime)
             .with_default_features()
+            .with_file_formats(iox_file_formats())
+            .with_table_options(TableOptions {
+                parquet: table_parquet_options(),
+                ..Default::default()
+            })
             .build();
 
         // Keep metadata so we can find the measurement name
-        let format = ParquetFormat::new().with_skip_metadata(false);
+        let format = ParquetFormat::new()
+            .with_skip_metadata(false)
+            // TODO: tech debt.
+            // If we try using our unified `table_parquet_options()` in the fileformat it fails:
+            // `Error converting parquet: Can not find IOx metadata in parquet metadata. Could not find IOX:metadata`
+            // .with_options(table_parquet_options());
+            // Refer to https://github.com/influxdata/influxdb_iox/issues/13106
+            .with_force_view_types(false);
 
         // Use datafusion parquet reader to read the metadata from the
         // file.

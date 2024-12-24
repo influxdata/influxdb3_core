@@ -8,9 +8,9 @@ use data_types::{
         table::TableSnapshot,
     },
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
-    ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
-    TableId, Timestamp,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
+    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
+    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
 };
 use iox_time::{AsyncTimeProvider, TimeProvider};
 use snafu::Snafu;
@@ -39,14 +39,15 @@ impl<T> std::fmt::Display for CasFailure<T> {
     }
 }
 
+/// Errors returned to the caller of catalog. All variants other than `Unhandled` may be something
+/// the caller can address; an `Unhandled` error likely indiciates a bug in some component called
+/// by the catalog.
 #[derive(Clone, Debug, Snafu)]
 #[allow(missing_docs)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("unhandled external error: {source}"))]
-    External {
-        source: Arc<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("unhandled: {source}"))]
+    Unhandled { source: UnhandledError },
 
     #[snafu(display("already exists: {descr}"))]
     AlreadyExists { descr: String },
@@ -64,11 +65,61 @@ pub enum Error {
     NotImplemented { descr: String },
 }
 
+/// Errors the catalog can't handle that get logged and propagated to the caller.
+#[derive(Clone, Debug, Snafu)]
+#[allow(missing_docs)]
+pub enum UnhandledError {
+    #[snafu(display("sqlx error: {source}"))]
+    Sqlx { source: Arc<sqlx::Error> },
+
+    #[snafu(display("prost decode error: {source}"))]
+    ProstDecode {
+        source: generated_types::prost::DecodeError,
+    },
+
+    #[snafu(display("gRPC serialization error: {source}"))]
+    GrpcSerialization {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("gRPC request error: {source}"))]
+    GrpcRequest {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("snapshot error: {source}"))]
+    CatalogServiceSnapshot {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("quorum error: {source}"))]
+    Quorum {
+        source: Arc<catalog_cache::api::quorum::Error>,
+    },
+
+    #[snafu(display("cache handler error: {source}"))]
+    CacheHandler {
+        source: Arc<catalog_cache::api::quorum::Error>,
+    },
+
+    #[snafu(display("cache loader error: {source}"))]
+    CacheLoader {
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<UnhandledError> for Error {
+    fn from(source: UnhandledError) -> Self {
+        Self::Unhandled { source }
+    }
+}
+
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
-        Self::External {
+        UnhandledError::Sqlx {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
@@ -80,49 +131,52 @@ impl From<sqlx::migrate::MigrateError> for Error {
 
 impl From<data_types::snapshot::partition::Error> for Error {
     fn from(e: data_types::snapshot::partition::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<data_types::snapshot::table::Error> for Error {
     fn from(e: data_types::snapshot::table::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<data_types::snapshot::namespace::Error> for Error {
     fn from(e: data_types::snapshot::namespace::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<data_types::snapshot::root::Error> for Error {
     fn from(e: data_types::snapshot::root::Error) -> Self {
-        Self::External {
+        UnhandledError::CatalogServiceSnapshot {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<catalog_cache::api::quorum::Error> for Error {
     fn from(e: catalog_cache::api::quorum::Error) -> Self {
-        Self::External {
+        UnhandledError::Quorum {
             source: Arc::new(e),
         }
+        .into()
     }
 }
 
 impl From<generated_types::prost::DecodeError> for Error {
     fn from(e: generated_types::prost::DecodeError) -> Self {
-        Self::External {
-            source: Arc::new(e),
-        }
+        UnhandledError::ProstDecode { source: e }.into()
     }
 }
 
@@ -298,6 +352,11 @@ pub trait NamespaceRepo: Send + Sync {
     /// List all namespaces.
     async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
 
+    /// List all namespaces with storage
+    // TODO: Add pagination and sorting
+    // https://github.com/influxdata/influxdb_iox/issues/12775
+    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>>;
+
     /// Gets the namespace by its ID.
     async fn get_by_id(
         &mut self,
@@ -334,6 +393,9 @@ pub trait NamespaceRepo: Send + Sync {
 
     /// Obtain a namespace snapshot by name
     async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot>;
+
+    /// Gets the namespace with storage information by its ID.
+    async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>>;
 }
 
 /// Fallback logic for [`NamespaceRepo::snapshot_by_name`]
@@ -368,6 +430,9 @@ pub trait TableRepo: Send + Sync {
     /// get table by ID
     async fn get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
 
+    /// get table with storage information by ID
+    async fn get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>>;
+
     /// get table by namespace ID and name
     async fn get_by_namespace_and_name(
         &mut self,
@@ -377,6 +442,14 @@ pub trait TableRepo: Send + Sync {
 
     /// Lists all tables in the catalog for the given namespace id.
     async fn list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Table>>;
+
+    /// List all tables with storage in the catalog for the given namespace id.
+    // TODO: Add pagination and sorting
+    // https://github.com/influxdata/influxdb_iox/issues/12775
+    async fn list_storage_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<TableWithStorage>>;
 
     /// List all tables.
     async fn list(&mut self) -> Result<Vec<Table>>;
@@ -555,6 +628,11 @@ pub trait PartitionRepo: Send + Sync {
 
     /// Obtain a partition snapshot
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
+
+    /// Obtain a partition snapshot generation number. If possible, this
+    /// method will return the generation number using a lighter-weight
+    /// implementation that would be required for a full snapshot.
+    async fn snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64>;
 }
 
 /// Extension trait for [`ParquetFileRepo`]
@@ -659,6 +737,7 @@ pub trait ParquetFileRepo: Send + Sync {
 
     /// List Parquet files that are active as of the specified timestamp. Active means the file was
     /// created before the specified time, and was not deleted before the specified time.
+    #[deprecated]
     async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
 
     /// Return the parquet file with the given object store id
@@ -673,6 +752,12 @@ pub trait ParquetFileRepo: Send + Sync {
         &mut self,
         object_store_ids: Vec<ObjectStoreId>,
     ) -> Result<Vec<ObjectStoreId>>;
+
+    /// Test a batch of parquet files exist by partition and object store IDs
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
 
     /// Commit deletions, upgrades and creations in a single transaction.
     ///
@@ -692,5 +777,13 @@ pub trait ParquetFileRepo: Send + Sync {
         &mut self,
         table_id: TableId,
         compaction_level: Option<CompactionLevel>,
+    ) -> Result<Vec<ParquetFile>>;
+
+    /// List parquet files for a particular Namespace (via [`NamespaceId`]) and
+    /// deletion status
+    async fn list_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+        deleted: SoftDeletedRows,
     ) -> Result<Vec<ParquetFile>>;
 }

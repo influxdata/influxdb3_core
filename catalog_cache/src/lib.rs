@@ -95,8 +95,10 @@ impl CacheKey {
 /// A value stored in [`CatalogCache`](local::CatalogCache)
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CacheValue {
-    /// The data stored for this cache
-    data: Bytes,
+    /// The data stored for this cache value. If `None`, the cache value
+    /// is considered deleted and needs to be refreshed from the backing
+    /// store.
+    data: Option<Bytes>,
     /// The generation of this cache data
     generation: u64,
     /// The optional etag
@@ -107,7 +109,17 @@ impl CacheValue {
     /// Create a new [`CacheValue`] with the provided `data` and `generation`
     pub fn new(data: Bytes, generation: u64) -> Self {
         Self {
-            data,
+            data: Some(data),
+            generation,
+            etag: None,
+        }
+    }
+
+    /// Create a new [`CacheValue`] with no data and the provided
+    /// `generation`.
+    pub fn new_empty(generation: u64) -> Self {
+        Self {
+            data: None,
             generation,
             etag: None,
         }
@@ -128,8 +140,14 @@ impl CacheValue {
 
     /// The data stored for this cache
     #[inline]
-    pub fn data(&self) -> &Bytes {
-        &self.data
+    pub fn data(&self) -> Option<&Bytes> {
+        self.data.as_ref()
+    }
+
+    /// The size of the data stored for this cache value.
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.as_ref().map_or(0, |d| d.len())
     }
 
     /// The generation of this cache data

@@ -29,7 +29,7 @@ siphasher = "1.0"
 sha2 = { version = "0.10", default-features = false }
 snafu = "0.8"
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid"] }
-thiserror = "2.0.3"
+thiserror = "2.0.7"
 uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

@@ -13,7 +13,6 @@ use data_types::{
     ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, PartitionKey,
     SortKeyIds, TableId, TableSchema,
 };
-use error_reporting::DisplaySourceChain;
 use iox_time::Time;
 use std::time::Duration;
 use std::{
@@ -22,24 +21,6 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
-
-/// Converts the catalog error to tonic status
-pub(crate) fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Status {
-    use crate::interface::Error;
-
-    match e {
-        Error::External { source } => {
-            // walk cause chain to display full details
-            // see https://github.com/influxdata/influxdb_iox/issues/12373
-            tonic::Status::internal(DisplaySourceChain::new(source).to_string())
-        }
-        Error::AlreadyExists { descr } => tonic::Status::already_exists(descr),
-        Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
-        Error::NotFound { descr } => tonic::Status::not_found(descr),
-        Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
-        Error::NotImplemented { descr } => tonic::Status::unimplemented(descr),
-    }
-}
 
 /// Gets the name and schema for the provided namespace ID, including all tables
 /// and columns.

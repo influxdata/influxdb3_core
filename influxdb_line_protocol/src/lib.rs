@@ -89,10 +89,8 @@ use nom::{
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
 use std::{
-    borrow::Cow,
     char,
     cmp::Ordering,
-    collections::{btree_map::Entry, BTreeMap},
     fmt,
     hash::{Hash, Hasher},
     ops::Deref,
@@ -305,74 +303,6 @@ impl Display for Series<'_> {
     }
 }
 
-impl<'a> Series<'a> {
-    pub fn generate_base(self) -> Result<Cow<'a, str>> {
-        match (!self.is_escaped(), self.is_sorted_and_unique()) {
-            (true, true) => Ok(self.raw_input.into()),
-            (_, true) => Ok(self.generate_base_with_escaping().into()),
-            (_, _) => self
-                .generate_base_with_escaping_sorting_deduplicating()
-                .map(Into::into),
-        }
-    }
-
-    fn generate_base_with_escaping(self) -> String {
-        let mut series_base = self.measurement.to_string();
-        for (tag_key, tag_value) in self.tag_set.unwrap_or_default() {
-            use std::fmt::Write;
-            write!(&mut series_base, ",{tag_key}={tag_value}").expect("Could not append string");
-        }
-        series_base
-    }
-
-    fn generate_base_with_escaping_sorting_deduplicating(self) -> Result<String> {
-        let mut unique_sorted_tag_set = BTreeMap::new();
-        for (tag_key, tag_value) in self.tag_set.unwrap_or_default() {
-            match unique_sorted_tag_set.entry(tag_key) {
-                Entry::Vacant(e) => {
-                    e.insert(tag_value);
-                }
-                Entry::Occupied(e) => {
-                    let (tag_key, _) = e.remove_entry();
-                    return DuplicateTagSnafu {
-                        tag_key: tag_key.to_string(),
-                    }
-                    .fail();
-                }
-            }
-        }
-
-        let mut series_base = self.measurement.to_string();
-        for (tag_key, tag_value) in unique_sorted_tag_set {
-            use std::fmt::Write;
-            write!(&mut series_base, ",{tag_key}={tag_value}").expect("Could not append string");
-        }
-
-        Ok(series_base)
-    }
-
-    fn is_escaped(&self) -> bool {
-        self.measurement.is_escaped() || {
-            match &self.tag_set {
-                None => false,
-                Some(tag_set) => tag_set
-                    .iter()
-                    .any(|(tag_key, tag_value)| tag_key.is_escaped() || tag_value.is_escaped()),
-            }
-        }
-    }
-
-    fn is_sorted_and_unique(&self) -> bool {
-        match &self.tag_set {
-            None => true,
-            Some(tag_set) => {
-                let mut i = tag_set.iter().zip(tag_set.iter().skip(1));
-                i.all(|((last_tag_key, _), (this_tag_key, _))| last_tag_key < this_tag_key)
-            }
-        }
-    }
-}
-
 pub type Measurement<'a> = EscapedStr<'a>;
 
 /// The [field] keys and values that appear in the line of line protocol.
@@ -455,13 +385,6 @@ impl<'a> EscapedStr<'a> {
             0 => EscapedStr::SingleSlice(""),
             1 => EscapedStr::SingleSlice(v[0]),
             _ => EscapedStr::CopiedValue(v.join("")),
-        }
-    }
-
-    fn is_escaped(&self) -> bool {
-        match self {
-            EscapedStr::SingleSlice(_) => false,
-            EscapedStr::CopiedValue(_) => true,
         }
     }
 
@@ -1225,7 +1148,6 @@ mod test {
         // Demonstrate how strings without any escapes are handled.
         let es = EscapedStr::from("Foo");
         assert_eq!(es, "Foo");
-        assert!(!es.is_escaped(), "There are no escaped values");
         assert!(!es.ends_with('F'));
         assert!(!es.ends_with('z'));
         assert!(!es.ends_with("zz"));
@@ -1241,7 +1163,6 @@ mod test {
         let (remaining, es) = measurement("Foo\\aBar").unwrap();
         assert!(remaining.is_empty());
         assert_eq!(es, EscapedStr::from_slices(&["Foo", "\\", "a", "Bar"]));
-        assert!(es.is_escaped());
 
         // Test `ends_with` across boundaries
         assert!(es.ends_with("Bar"));
@@ -1262,11 +1183,9 @@ mod test {
     fn optionally_escaped_strs_are_equal_and_hash_the_same() {
         let (_remaining, field_name_without_escaping) = field_key("foo,bar").unwrap();
         assert!(field_name_without_escaping == "foo,bar");
-        assert!(!field_name_without_escaping.is_escaped());
 
         let (_remaining, field_name_with_escaping) = field_key("foo\\,bar").unwrap();
         assert!(field_name_with_escaping == "foo,bar");
-        assert!(field_name_with_escaping.is_escaped());
 
         assert_eq!(field_name_without_escaping, field_name_with_escaping);
         assert_eq!(
@@ -1829,31 +1748,6 @@ mod test {
         assert_eq!(vals[0].series.tag_set.as_ref().unwrap()[1].1, "2");
 
         assert_eq!(vals[0].field_set[0].0, "value");
-    }
-
-    #[test]
-    fn parse_tag_set_unsorted() {
-        let input = "foo,tag2=2,tag1=1";
-        let (remaining, series) = series(input).unwrap();
-
-        assert!(remaining.is_empty());
-        assert_eq!(series.generate_base().unwrap(), "foo,tag1=1,tag2=2");
-    }
-
-    #[test]
-    fn parse_tag_set_duplicate_tags() {
-        let input = "foo,tag=1,tag=2";
-        let (remaining, series) = series(input).unwrap();
-
-        assert!(remaining.is_empty());
-        let err = series
-            .generate_base()
-            .expect_err("Parsing duplicate tags should fail");
-
-        assert_eq!(
-            err.to_string(),
-            r#"Must not contain duplicate tags, but "tag" was repeated"#
-        );
     }
 
     #[test]

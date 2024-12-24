@@ -93,7 +93,7 @@ impl DiskSpaceMetrics {
 
         // Load the disk stats once, and refresh them later.
         let mut disks = Disks::new();
-        disks.refresh_list();
+        disks.refresh(true);
 
         // Resolve the mount point once.
         // The directory path may be `/path/to/dir` and the mount point is `/`.

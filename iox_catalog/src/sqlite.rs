@@ -25,9 +25,9 @@ use data_types::{
     },
     Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt,
     MaxTables, Namespace, NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride,
-    NamespaceVersion, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams,
-    ParquetFileSource, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, Timestamp,
+    NamespaceVersion, NamespaceWithStorage, ObjectStoreId, ParquetFile, ParquetFileId,
+    ParquetFileParams, ParquetFileSource, Partition, PartitionHashId, PartitionId, PartitionKey,
+    SkippedCompaction, SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
 };
 use futures::StreamExt;
 use iox_time::{SystemProvider, Time, TimeProvider};
@@ -238,17 +238,9 @@ impl RepoCollection for SqliteTxn {
 
 async fn sqlite_get_time(pool: &Pool<Sqlite>) -> Result<iox_time::Time, Error> {
     // Sqlite's timestamp precision is limited to milliseconds; but we convert to microseconds to use `Time::from_timestamp_micros()`
-    let res = sqlx::query(r#"SELECT CAST((SELECT (unixepoch('subsec') * 1000000)) AS INT)"#)
+    let row = sqlx::query(r#"SELECT CAST((SELECT (unixepoch('subsec') * 1000000)) AS INT)"#)
         .fetch_one(pool)
-        .await;
-    let row = match res {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(Error::External {
-                source: Arc::new(e),
-            })
-        }
-    };
+        .await?;
     Ok(Time::from_timestamp_micros(row.get(0)).expect("Failed to get `Time` from `SqliteRow`"))
 }
 
@@ -315,9 +307,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
                     descr: e.to_string(),
                 }
             } else {
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             }
         })?;
 
@@ -338,6 +328,28 @@ WHERE {v};
             .as_str(),
         )
         .fetch_all(self.inner.get_mut())
+        .await?;
+
+        Ok(rec)
+    }
+
+    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+        let rec = sqlx::query_as::<_, NamespaceWithStorage>(r#"
+SELECT
+	n.id,
+	n.name,
+	n.retention_period_ns,
+	n.max_tables,
+	n.max_columns_per_table,
+	n.partition_template,
+	COALESCE(CAST(SUM(f.file_size_bytes) AS BIGINT), CAST(0 AS BIGINT)) AS size_bytes,
+	COUNT(DISTINCT t.id) AS table_count
+FROM namespace n
+LEFT JOIN table_name t ON n.id = t.namespace_id
+LEFT JOIN parquet_file f ON n.id = f.namespace_id
+WHERE f.to_delete IS NULL
+GROUP BY f.namespace_id, n.name, retention_period_ns, max_tables, max_columns_per_table, partition_template;
+        "#).fetch_all(self.inner.get_mut())
         .await?;
 
         Ok(rec)
@@ -408,7 +420,11 @@ WHERE name=$1 AND {v};
 
         // note that there is a uniqueness constraint on the name column in the DB
         let rec = sqlx::query_as::<_, NamespaceId>(
-            r#"UPDATE namespace SET deleted_at=$1 WHERE id = $2 RETURNING id;"#,
+            r#"
+UPDATE namespace
+SET deleted_at=$1, router_version = router_version + 1
+WHERE id = $2
+RETURNING id;"#,
         )
         .bind(flagged_at) // $1
         .bind(id) // $2
@@ -419,9 +435,7 @@ WHERE name=$1 AND {v};
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(id)
@@ -450,9 +464,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(namespace)
@@ -481,9 +493,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(namespace)
@@ -512,9 +522,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
-            _ => Error::External {
-                source: Arc::new(e),
-            },
+            _ => e.into(),
         })?;
 
         Ok(namespace)
@@ -558,6 +566,33 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
     async fn snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot> {
         namespace_snapshot_by_name(self, name).await
+    }
+
+    async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>> {
+        let rec = sqlx::query_as::<_, NamespaceWithStorage>(
+            r#"
+SELECT n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_table, n.deleted_at,
+       n.partition_template, n.router_version,
+       COALESCE(CAST(SUM(f.file_size_bytes) AS BIGINT), CAST(0 AS BIGINT)) as size_bytes,
+       COUNT(DISTINCT t.id) as table_count
+FROM namespace n
+LEFT JOIN table_name t on n.id = t.namespace_id
+LEFT JOIN parquet_file f ON n.id = f.namespace_id AND f.to_delete IS NULL
+WHERE n.id = $1
+GROUP BY n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_table, n.partition_template;
+            "#,
+        )
+        .bind(id) // $1
+        .fetch_one(self.inner.get_mut())
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let namespace_with_storage = rec?;
+
+        Ok(Some(namespace_with_storage))
     }
 }
 
@@ -603,7 +638,7 @@ RETURNING *;
             if is_fk_violation(&e) {
                 Error::NotFound { descr: e.to_string() }
             } else {
-                Error::External { source: Arc::new(e) }
+                e.into()
             }
         }})?;
 
@@ -673,9 +708,7 @@ RETURNING *;
                         descr: e.to_string(),
                     }
                 } else {
-                    Error::External {
-                        source: Arc::new(e),
-                    }
+                    e.into()
                 }
             }
         })?;
@@ -717,6 +750,34 @@ WHERE id = $1;
         Ok(Some(table))
     }
 
+    async fn get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>> {
+        let rec = sqlx::query_as::<_, TableWithStorage>(
+            r#"
+SELECT
+  t.id AS id,
+  t.name,
+  t.namespace_id,
+  t.partition_template,
+  COALESCE(CAST(SUM(f.file_size_bytes) AS BIGINT), CAST(0 AS BIGINT)) AS size_bytes
+FROM table_name t
+LEFT JOIN parquet_file f ON t.id = f.table_id AND f.to_delete IS NULL
+WHERE t.id = $1
+GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
+            "#,
+        )
+        .bind(table_id) // $1
+        .fetch_one(self.inner.get_mut())
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let table_with_storage = rec?;
+
+        Ok(Some(table_with_storage))
+    }
+
     async fn get_by_namespace_and_name(
         &mut self,
         namespace_id: NamespaceId,
@@ -752,6 +813,31 @@ WHERE namespace_id = $1;
             "#,
         )
         .bind(namespace_id)
+        .fetch_all(self.inner.get_mut())
+        .await?;
+
+        Ok(rec)
+    }
+
+    async fn list_storage_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<TableWithStorage>> {
+        let rec = sqlx::query_as::<_, TableWithStorage>(
+            r#"
+SELECT
+	t.id AS id,
+  t.name,
+  t.namespace_id,
+  t.partition_template,
+  COALESCE(CAST(SUM(f.file_size_bytes) AS BIGINT), CAST(0 AS BIGINT)) AS size_bytes
+FROM table_name t
+LEFT JOIN parquet_file f ON t.id = f.table_id AND f.to_delete IS NULL
+WHERE t.namespace_id = $1
+GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
+            "#,
+        )
+        .bind(namespace_id) // $1
         .fetch_all(self.inner.get_mut())
         .await?;
 
@@ -905,9 +991,7 @@ RETURNING *;
                     descr: e.to_string(),
                 }
             } else {
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             }
         })?;
 
@@ -994,9 +1078,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                     descr: e.to_string(),
                 }
             } else {
-                Error::External {
-                    source: Arc::new(e),
-                }
+                e.into()
             }
         })?;
 
@@ -1117,11 +1199,7 @@ RETURNING id, hash_id, table_id, partition_key, sort_key_ids, new_file_at, cold_
                     partition.sort_key_ids().cloned().unwrap_or_default(),
                 ));
             }
-            Err(e) => {
-                return Err(CasFailure::QueryError(Error::External {
-                    source: Arc::new(e),
-                }))
-            }
+            Err(e) => return Err(CasFailure::QueryError(e.into())),
         };
 
         debug!(?partition_id, "partition sort key cas successful");
@@ -1414,6 +1492,22 @@ WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
             generation as _,
         )?)
     }
+
+    async fn snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64> {
+        let rec = sqlx::query(
+            "UPDATE partition SET generation = generation + 1 where id = $1 RETURNING generation;",
+        )
+        .bind(partition_id) // $1
+        .fetch_one(self.inner.get_mut())
+        .await;
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Err(Error::NotFound {
+                descr: format!("partition: {partition_id}"),
+            });
+        }
+        let row = rec?;
+        Ok(row.get("generation"))
+    }
 }
 
 fn from_column_set(v: &ColumnSet) -> Json<Vec<i64>> {
@@ -1636,6 +1730,37 @@ WHERE object_store_id IN ({v});",
         .map_err(Error::from)
     }
 
+    async fn exists_by_partition_and_object_store_id_batch(
+        &mut self,
+        ids: Vec<(PartitionId, ObjectStoreId)>,
+    ) -> Result<Vec<(PartitionId, ObjectStoreId)>> {
+        let in_value = ids
+            .into_iter()
+            // use a sqlite blob literal
+            .map(|(p_id, os_id)| format!("({}, X'{}')", p_id.get(), os_id.get_uuid().simple()))
+            .collect::<Vec<String>>()
+            .join(",");
+
+        sqlx::query(&format!(
+            "
+SELECT partition_id, object_store_id
+FROM parquet_file
+WHERE (partition_id, object_store_id) IN ({v});",
+            v = in_value
+        ))
+        .map(|slr: SqliteRow| {
+            (
+                slr.get::<PartitionId, _>("partition_id"),
+                slr.get::<ObjectStoreId, _>("object_store_id"),
+            )
+        })
+        // limitation of sqlx: will not bind arrays
+        // https://github.com/launchbadge/sqlx/blob/main/FAQ.md#how-can-i-do-a-select--where-foo-in--query
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map_err(Error::from)
+    }
+
     async fn create_upgrade_delete(
         &mut self,
         partition_id: PartitionId,
@@ -1738,6 +1863,41 @@ WHERE object_store_id IN ({v});",
                     .expect("ParquetFilePod FromRow derive works")
                     .into()
             })
+            .collect())
+    }
+
+    async fn list_by_namespace_id(
+        &mut self,
+        namespace_id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Vec<ParquetFile>> {
+        let deleted_predicate = match deleted {
+            SoftDeletedRows::ExcludeDeleted => "to_delete IS NULL",
+            SoftDeletedRows::OnlyDeleted => "to_delete IS NOT NULL",
+            SoftDeletedRows::AllRows => "1=1",
+        };
+        let sql = format!(
+            r#"
+SELECT
+    id, namespace_id, table_id, partition_id, partition_hash_id,
+    object_store_id, min_time, max_time, to_delete, file_size_bytes,
+    row_count, compaction_level, created_at, column_set,
+    max_l0_created_at, source
+FROM parquet_file
+WHERE
+    namespace_id = $1
+AND
+    {deleted_predicate};
+    "#
+        );
+
+        let query = sqlx::query_as::<_, ParquetFilePod>(sql.as_str()).bind(namespace_id);
+
+        Ok(query
+            .fetch_all(self.inner.get_mut())
+            .await?
+            .into_iter()
+            .map(Into::into)
             .collect())
     }
 }
@@ -1849,9 +2009,7 @@ RETURNING
                 descr: e.to_string(),
             }
         } else {
-            Error::External {
-                source: Arc::new(e),
-            }
+            e.into()
         }
     })?;
 
