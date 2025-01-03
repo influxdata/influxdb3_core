@@ -1,31 +1,20 @@
-use std::{num::NonZeroUsize, ops::Range, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
-use iox_time::TimeProvider;
 use metric::U64Counter;
 use object_store::{
     path::Path, AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult,
     GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
     PutOptions, PutPayload, PutResult, Result,
 };
-use tokio::runtime::Handle;
 
 use crate::cache_system::{s3_fifo_cache::S3FifoCache, Cache};
 use crate::{
     attributes::ATTR_CACHE_STATE,
     cache_system::{
-        hook::{
-            chain::HookChain, level_trigger::LevelTrigger, limit::MemoryLimiter,
-            observer::ObserverHook,
-        },
-        hook_limited::HookLimitedCache,
-        reactor::{
-            reaction::ReactionExt,
-            trigger::{ticker, TriggerExt},
-            Reactor,
-        },
+        hook::{chain::HookChain, observer::ObserverHook},
         CacheState, HasSize,
     },
     object_store_helpers::{any_options_set, dyn_error_to_object_store_error},
@@ -89,27 +78,6 @@ impl HitMetrics {
 }
 
 /// Parameters for [`MemCacheObjectStore`].
-///
-/// # Garbage Collection
-/// A garbage collection removes all entries that were NOT used since the last garbage collection run or that are marked
-/// as "failed" (e.g. due to an non-recoverable upstream error).
-///
-/// Garbage collection is triggered by the following:
-///
-/// - **regular GC:** A timer that triggers the collection in regular intervals [`gc_interval`](Self::gc_interval)).
-/// - **memory pressure:** At >=75% of the [`memory_limit`](Self::memory_limit) we trigger the collection for every new
-///   entry. To avoid overly aggressive eviction, this trigger is throttled so it should be at least
-///   [`memory_pressure_throttle`](Self::memory_pressure_throttle) apart. In most cases, this should bring the memory
-///   consumption back to normal.
-/// - **nearly OOM:** If we are at >=90% of the [`memory_limit`](Self::memory_limit), every new entry will trigger a
-///   garbage collection. New entries are still added to cache. The garbage collection is NOT throttled though to bring
-///   us back to normal as quickly as possible.
-/// - **OOM:** At the [`memory_limit`](Self::memory_limit), every new entry will trigger the collection but will also be
-///   rejected (i.e. it is NOT stored) to avoid overusing our memory budget. This does NOT result in an error for the
-///   user, but in potential service degration.
-///
-///
-/// [`MemoryLimitError`]: crate::MemoryLimitError
 #[derive(Debug)]
 pub struct MemCacheObjectStoreParams<'a> {
     /// Underlying, uncached object store.
@@ -118,37 +86,13 @@ pub struct MemCacheObjectStoreParams<'a> {
     /// Memory limit in bytes.
     pub memory_limit: NonZeroUsize,
 
-    /// After an memory pressure event triggered an emergency GC (= garbage collect) run, how how should we wait until the next
-    /// run?
-    ///
-    /// If there is another memory pressure event during the cooldown period, new elements will NOT be cached.
-    pub memory_pressure_throttle: Duration,
-
-    /// How often should the GC (= garbage collector) remove unused elements and elements that failed.
-    pub gc_interval: Duration,
-
-    /// Time provider.
-    pub time_provider: Arc<dyn TimeProvider>,
-
     /// Metric registry for metrics.
     pub metrics: &'a metric::Registry,
 
-    /// Tokio runtime handle for the background task that drives the GC (= garbage collector).
-    pub handle: &'a Handle,
-
-    /// Should we use the new S3-FIFO implementation?
-    ///
-    /// The implementation promises to be a better, more robust eviction policy.
-    pub use_s3fifo: bool,
-
     /// The relative size (in percentage) of the "small" S3-FIFO queue.
-    ///
-    /// Only relevant if [`use_s3fifo`](Self::use_s3fifo) is set.
     pub s3fifo_main_threshold: usize,
 
     /// Size of S3-FIFO ghost set in bytes.
-    ///
-    /// Only relevant if [`use_s3fifo`](Self::use_s3fifo) is set.
     pub s3_fifo_ghost_memory_limit: NonZeroUsize,
 }
 
@@ -158,84 +102,27 @@ impl MemCacheObjectStoreParams<'_> {
         let Self {
             inner,
             memory_limit,
-            memory_pressure_throttle,
-            gc_interval,
-            time_provider,
             metrics,
-            handle,
-            use_s3fifo,
             s3fifo_main_threshold,
             s3_fifo_ghost_memory_limit,
         } = self;
 
-        let (cache, reactor) = if use_s3fifo {
-            let cache = Arc::new(S3FifoCache::new(
-                memory_limit.get(),
-                s3_fifo_ghost_memory_limit.get(),
-                s3fifo_main_threshold as f64 / 100.0,
-                Arc::new(HookChain::new([Arc::new(ObserverHook::new(
-                    CACHE_NAME,
-                    metrics,
-                    Some(memory_limit.get() as u64),
-                )) as _])),
+        let cache = Arc::new(S3FifoCache::new(
+            memory_limit.get(),
+            s3_fifo_ghost_memory_limit.get(),
+            s3fifo_main_threshold as f64 / 100.0,
+            Arc::new(HookChain::new([Arc::new(ObserverHook::new(
+                CACHE_NAME,
                 metrics,
-            ));
-
-            (cache as Arc<dyn Cache<Path, CacheValue>>, None)
-        } else {
-            let memory_limiter = MemoryLimiter::new(memory_limit);
-            let oom_notify = memory_limiter.oom();
-
-            let level_trigger_nearly_oom =
-                LevelTrigger::new((memory_limit.get() as f64 * 0.9).floor() as usize);
-            let nearly_oom_notify = level_trigger_nearly_oom.level_reached();
-
-            let level_trigger_pressure =
-                LevelTrigger::new((memory_limit.get() as f64 * 0.75).floor() as usize);
-            let pressure_notify = level_trigger_pressure.level_reached();
-
-            let cache = Arc::new(HookLimitedCache::new(Arc::new(HookChain::new([
-                Arc::new(memory_limiter) as _,
-                Arc::new(level_trigger_nearly_oom) as _,
-                Arc::new(level_trigger_pressure) as _,
-                Arc::new(ObserverHook::new(
-                    CACHE_NAME,
-                    metrics,
-                    Some(memory_limit.get() as u64),
-                )) as _,
-            ]))));
-
-            let cache_captured = Arc::downgrade(&cache);
-            let reactor = Reactor::new(
-                [
-                    oom_notify.boxed().observe(CACHE_NAME, "oom", metrics),
-                    nearly_oom_notify
-                        .boxed()
-                        .observe(CACHE_NAME, "nearly_oom", metrics),
-                    pressure_notify
-                        .boxed()
-                        .throttle(
-                            memory_pressure_throttle,
-                            Arc::clone(&time_provider),
-                            CACHE_NAME,
-                            "memory_pressure",
-                            metrics,
-                        )
-                        .observe(CACHE_NAME, "memory_pressure", metrics),
-                    ticker(gc_interval).observe(CACHE_NAME, "gc", metrics),
-                ],
-                cache_captured.observe(CACHE_NAME, metrics, Arc::clone(&time_provider)),
-                handle,
-            );
-
-            (cache as Arc<dyn Cache<Path, CacheValue>>, Some(reactor))
-        };
+                Some(memory_limit.get() as u64),
+            )) as _])),
+            metrics,
+        ));
 
         MemCacheObjectStore {
             store: inner,
             hit_metrics: HitMetrics::new(metrics),
             cache,
-            reactor,
         }
     }
 }
@@ -245,14 +132,6 @@ pub struct MemCacheObjectStore {
     store: Arc<DynObjectStore>,
     hit_metrics: HitMetrics,
     cache: Arc<dyn Cache<Path, CacheValue>>,
-
-    /// Reactor that drives background tasks like garbage collection.
-    ///
-    /// Is is NOT used for the S3-FIFO implementation.
-    ///
-    /// Marked as dead code because we need to keep the task around but don't actively access it.
-    #[allow(dead_code)]
-    reactor: Option<Reactor>,
 }
 
 impl MemCacheObjectStore {
@@ -436,7 +315,6 @@ impl ObjectStore for MemCacheObjectStore {
 #[cfg(test)]
 mod tests {
     use futures::FutureExt;
-    use iox_time::{MockProvider, Time};
     use object_store::memory::InMemory;
 
     use crate::{gen_store_tests, object_store_cache_tests::Setup};
@@ -449,22 +327,16 @@ mod tests {
     }
 
     impl Setup for TestSetup {
-        fn new(use_s3fifo: bool) -> futures::future::BoxFuture<'static, Self> {
+        fn new() -> futures::future::BoxFuture<'static, Self> {
             async move {
                 let inner = Arc::new(InMemory::new());
-                let time_provider = Arc::new(MockProvider::new(Time::MIN));
 
                 let store = Arc::new(
                     MemCacheObjectStoreParams {
                         inner: Arc::clone(&inner) as _,
                         memory_limit: NonZeroUsize::MAX,
                         s3_fifo_ghost_memory_limit: NonZeroUsize::MAX,
-                        memory_pressure_throttle: Duration::from_secs(1),
-                        gc_interval: Duration::from_secs(1),
-                        time_provider: Arc::clone(&time_provider) as _,
                         metrics: &metric::Registry::new(),
-                        handle: &Handle::current(),
-                        use_s3fifo,
                         s3fifo_main_threshold: 25,
                     }
                     .build(),
@@ -484,6 +356,5 @@ mod tests {
         }
     }
 
-    gen_store_tests!(TestSetup, false);
-    gen_store_tests!(TestSetup, true);
+    gen_store_tests!(TestSetup);
 }

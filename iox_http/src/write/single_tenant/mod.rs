@@ -439,11 +439,38 @@ mod tests {
     );
 
     test_parse_v1!(
-        with_precision,
+        with_precision_s,
+        query_string = "?db=bananas&rp=ageless&precision=s",
+        want = Ok(WriteParams{ namespace, precision }) => {
+            assert_eq!(namespace.as_str(), "bananas/ageless");
+            assert_matches!(precision, Precision::Second);
+        }
+    );
+
+    test_parse_v1!(
+        with_precision_ms,
         query_string = "?db=bananas&rp=ageless&precision=ms",
         want = Ok(WriteParams{ namespace, precision }) => {
             assert_eq!(namespace.as_str(), "bananas/ageless");
             assert_matches!(precision, Precision::Millisecond);
+        }
+    );
+
+    test_parse_v1!(
+        with_precision_u,
+        query_string = "?db=bananas&rp=ageless&precision=u",
+        want = Ok(WriteParams{ namespace, precision }) => {
+            assert_eq!(namespace.as_str(), "bananas/ageless");
+            assert_matches!(precision, Precision::Microsecond);
+        }
+    );
+
+    test_parse_v1!(
+        with_precision_n,
+        query_string = "?db=bananas&rp=ageless&precision=n",
+        want = Ok(WriteParams{ namespace, precision }) => {
+            assert_eq!(namespace.as_str(), "bananas/ageless");
+            assert_matches!(precision, Precision::Nanosecond);
         }
     );
 
@@ -591,7 +618,19 @@ mod tests {
     );
 
     test_parse_v2!(
-        with_precision,
+        with_precision_s,
+        query_string = "?bucket=bananas&precision=s",
+        want = Ok(WriteParams {
+            namespace,
+            precision
+        }) => {
+            assert_eq!(namespace.as_str(), "bananas");
+            assert_matches!(precision, Precision::Second);
+        }
+    );
+
+    test_parse_v2!(
+        with_precision_ms,
         query_string = "?bucket=bananas&precision=ms",
         want = Ok(WriteParams {
             namespace,
@@ -599,6 +638,30 @@ mod tests {
         }) => {
             assert_eq!(namespace.as_str(), "bananas");
             assert_matches!(precision, Precision::Millisecond);
+        }
+    );
+
+    test_parse_v2!(
+        with_precision_us,
+        query_string = "?bucket=bananas&precision=us",
+        want = Ok(WriteParams {
+            namespace,
+            precision
+        }) => {
+            assert_eq!(namespace.as_str(), "bananas");
+            assert_matches!(precision, Precision::Microsecond);
+        }
+    );
+
+    test_parse_v2!(
+        with_precision_ns,
+        query_string = "?bucket=bananas&precision=ns",
+        want = Ok(WriteParams {
+            namespace,
+            precision
+        }) => {
+            assert_eq!(namespace.as_str(), "bananas");
+            assert_matches!(precision, Precision::Nanosecond);
         }
     );
 }

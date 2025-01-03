@@ -10,6 +10,9 @@ use parquet::{arrow::ARROW_SCHEMA_META_KEY, file::metadata::KeyValue};
 /// (Refer: <https://github.com/apache/arrow-rs/blob/2905ce6796cad396241fc50164970dbf1237440a/parquet/src/arrow/schema/mod.rs#L178-L193>)
 ///
 /// See <https://github.com/apache/arrow-rs/issues/6177> for discussion
+///
+/// TODO: Replace with upstream call when
+/// <https://github.com/apache/arrow-rs/pull/6916> is available
 fn encode_arrow_schema(schema: &SchemaRef) -> String {
     let options = arrow_ipc::writer::IpcWriteOptions::default();
     let data_gen = arrow_ipc::writer::IpcDataGenerator::default();

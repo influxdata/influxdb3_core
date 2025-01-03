@@ -239,15 +239,6 @@ pub struct QuerierConfig {
     )]
     pub object_store_cache_endpoints: Option<Vec<Endpoint>>,
 
-    /// Enable the S3Fifo Cache for In Mem Object Store/Metadata Caches
-    #[clap(
-        long = "use-s3fifo-cache",
-        env = "INFLUXDB_IOX_USE_S3FIFO_CACHE",
-        default_value = "true",
-        action
-    )]
-    pub use_s3fifo_cache: bool,
-
     /// The threshold for moving items from the small queue to main queue
     /// in S3Fifo. Expressed as a percentage (ie 10 for 10%)
     ///
@@ -269,6 +260,16 @@ pub struct QuerierConfig {
         action
     )]
     pub s3_fifo_ghost_memory_limit: NonZeroUsize,
+
+    /// Observe file access patterns with the given coalesce value.
+    ///
+    /// See <https://github.com/influxdata/influxdb_iox/issues/13063>.
+    #[clap(
+        long = "observer-file-access",
+        env = "INFLUXDB_IOX_OBSERVE_FILE_ACCESS",
+        action
+    )]
+    pub observe_file_access: Option<usize>,
 }
 
 fn parse_datafusion_config(

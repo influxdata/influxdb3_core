@@ -14,9 +14,9 @@ pub enum Precision {
     Second,
     #[serde(alias = "ms")]
     Millisecond,
-    #[serde(alias = "us")]
+    #[serde(alias = "us", alias = "u")]
     Microsecond,
-    #[serde(alias = "ns")]
+    #[serde(alias = "ns", alias = "n")]
     #[default]
     Nanosecond,
 }

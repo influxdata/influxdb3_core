@@ -23,6 +23,7 @@ arrow_util = { path = "../arrow_util" }
 async-trait = "0.1"
 bytes = "1.9"
 chrono = { version = "0.4", default-features = false }
+dashmap = "6.1.0"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
@@ -50,9 +51,10 @@ uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-rand = "0.8"
 criterion = { version = "0.5", default-features = false, features = ["rayon"]}
 insta = { version = "1", features = ["yaml"] }
+proptest = { workspace = true }
+rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 test_helpers = { path = "../test_helpers" }
 

@@ -31,7 +31,7 @@
 //! [shared futures]: futures::future::Shared
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::future::{BoxFuture, Shared};
+use futures::future::BoxFuture;
 use std::{fmt::Debug, hash::Hash};
 
 use std::sync::Arc;
@@ -107,7 +107,6 @@ where
     }
 }
 
-type CacheFut<V> = Shared<BoxFuture<'static, ArcResult<V>>>;
 type CacheFn<K, V> = Box<dyn FnOnce(&K) -> BoxFuture<'static, Result<V, DynError>> + Send>;
 
 #[async_trait]
@@ -151,7 +150,6 @@ pub enum CacheState {
 }
 
 pub mod hook;
-pub mod hook_limited;
 pub mod reactor;
 pub mod s3_fifo_cache;
 pub mod utils;

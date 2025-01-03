@@ -35,6 +35,7 @@ pub mod chunk_statistics;
 pub mod config;
 pub mod exec;
 pub mod extension;
+pub mod file_access_observer;
 pub mod frontend;
 pub mod ingester;
 pub mod logical_optimizer;
