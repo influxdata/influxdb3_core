@@ -17,10 +17,8 @@ use tokio::sync::Barrier;
 use crate::cache_system::{
     hook::{
         test_utils::{TestHook, TestHookRecord},
-        EvictResult, HookDecision,
+        EvictResult,
     },
-    hook_limited::HookLimitedCache,
-    s3_fifo_cache::S3FifoCache,
     utils::str_err,
     Cache, CacheState, HasSize,
 };
@@ -196,11 +194,11 @@ where
     }
 }
 
-pub(crate) async fn test_happy_path(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_happy_path(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let test_size = 1001;
-    let test_size_hook = test_size + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_hook = test_size + S3_FIFO_EXTRA_SIZE;
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
@@ -235,27 +233,9 @@ pub(crate) async fn test_happy_path(setup: TestSetup, use_s3fifo: bool) {
             TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
-
-    if !use_s3fifo {
-        cache.prune();
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
-                TestHookRecord::Evict(
-                    0,
-                    "k1",
-                    EvictResult::Fetched {
-                        size: test_size_hook
-                    }
-                )
-            ]
-        );
-    }
 }
 
-pub(crate) async fn test_panic_loader(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_panic_loader(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let barrier = Arc::new(Barrier::new(2));
@@ -276,43 +256,20 @@ pub(crate) async fn test_panic_loader(setup: TestSetup, use_s3fifo: bool) {
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "panic: foo");
 
-    if use_s3fifo {
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed)
-            ]
-        );
+    assert_eq!(
+        observer.records(),
+        vec![
+            TestHookRecord::Insert(0, "k1"),
+            TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned())),
+            TestHookRecord::Evict(0, "k1", EvictResult::Failed)
+        ]
+    );
 
-        // data gone
-        assert!(cache.get(&"k1").is_none());
-    } else {
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned()))
-            ]
-        );
-
-        cache.prune();
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("panic: foo".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed)
-            ]
-        );
-
-        // data gone
-        assert!(cache.get(&"k1").is_none());
-    }
+    // data gone
+    assert!(cache.get(&"k1").is_none());
 }
 
-pub(crate) async fn test_error_path_loader(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_error_path_loader(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let barrier = Arc::new(Barrier::new(2));
@@ -333,64 +290,6 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup, use_s3fifo: bool) {
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "my error");
 
-    if use_s3fifo {
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("my error".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed),
-            ]
-        );
-
-        // data gone
-        assert!(cache.get(&"k1").is_none());
-    } else {
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("my error".to_owned()))
-            ]
-        );
-
-        cache.prune();
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("my error".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed)
-            ]
-        );
-
-        // data gone
-        assert!(cache.get(&"k1").is_none());
-    }
-}
-
-#[tokio::test]
-async fn test_error_path_loader_and_evict_by_observer() {
-    let TestSetup { cache, observer } = TestSetup::get_hook_limited();
-
-    observer.mock_next_fetch(HookDecision::Evict);
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_captured = Arc::clone(&barrier);
-    let k1 = Arc::new("k1");
-    let mut fut = std::pin::pin!(cache.get_or_fetch(
-        &k1,
-        Box::new(|_k| async move {
-            barrier_captured.wait().await;
-            Err(str_err("my error"))
-        }
-        .boxed())
-    ));
-    fut.assert_pending().await;
-    assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
-
-    let ((res, state), _) = tokio::join!(fut, barrier.wait());
-    assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.unwrap_err().to_string(), "my error");
     assert_eq!(
         observer.records(),
         vec![
@@ -400,34 +299,15 @@ async fn test_error_path_loader_and_evict_by_observer() {
         ]
     );
 
-    // entry is gone
-    let (_res, state) = cache
-        .get_or_fetch(
-            &k1,
-            Box::new(|_k| async move { Ok(TestValue(1002)) }.boxed()),
-        )
-        .await;
-    assert_eq!(state, CacheState::NewEntry);
-
-    // pruning still works
-    cache.prune();
-    assert_eq!(
-        observer.records(),
-        vec![
-            TestHookRecord::Insert(0, "k1"),
-            TestHookRecord::Fetched(0, "k1", Err("my error".to_owned())),
-            TestHookRecord::Evict(0, "k1", EvictResult::Failed),
-            TestHookRecord::Insert(1, "k1"),
-            TestHookRecord::Fetched(1, "k1", Ok(1002)),
-        ]
-    );
+    // data gone
+    assert!(cache.get(&"k1").is_none());
 }
 
-pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let test_size = 1001;
-    let test_size_hook = test_size + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_hook = test_size + S3_FIFO_EXTRA_SIZE;
 
     let k1 = Arc::new("k1");
     let (res, state) = cache
@@ -472,31 +352,13 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup, use_s3fifo: bool)
             TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
-
-    if !use_s3fifo {
-        cache.prune();
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
-                TestHookRecord::Evict(
-                    0,
-                    "k1",
-                    EvictResult::Fetched {
-                        size: test_size_hook
-                    }
-                )
-            ]
-        );
-    }
 }
 
-pub(crate) async fn test_already_loading(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_already_loading(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let test_size_1 = 1001;
-    let test_size_1_hook = test_size_1 + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_1_hook = test_size_1 + S3_FIFO_EXTRA_SIZE;
     let test_size_2 = 1002;
 
     let barrier = Arc::new(Barrier::new(2));
@@ -536,7 +398,7 @@ pub(crate) async fn test_already_loading(setup: TestSetup, use_s3fifo: bool) {
     );
 }
 
-pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup, _use_s3fifo: bool) {
+pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
     let TestSetup { cache, observer: _ } = setup;
 
     let barrier = Arc::new(Barrier::new(2));
@@ -566,7 +428,7 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup, _use_s3fifo: 
 }
 
 /// Ensure that we don't wake every single consumer for every single IO interaction.
-pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup, _use_s3fifo: bool) {
+pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     const N_IO_STEPS: usize = 10;
@@ -614,7 +476,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup, _use_s3fi
 }
 
 /// Ensure that we don't wake every single consumer for every single IO interaction.
-pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup, _use_s3fifo: bool) {
+pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     const N_IO_STEPS: usize = 10;
@@ -724,11 +586,11 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
     rt_2.shutdown_timeout(Duration::from_secs(1));
 }
 
-pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_get_ok(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let test_size = 1001;
-    let test_size_hook = test_size + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_hook = test_size + S3_FIFO_EXTRA_SIZE;
 
     // entry does NOT exist yet
     let k1 = Arc::new("k1");
@@ -798,44 +660,9 @@ pub(crate) async fn test_get_ok(setup: TestSetup, use_s3fifo: bool) {
             TestHookRecord::Fetched(0, "k1", Ok(test_size_hook))
         ]
     );
-
-    if !use_s3fifo {
-        cache.prune();
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
-                TestHookRecord::Evict(
-                    0,
-                    "k1",
-                    EvictResult::Fetched {
-                        size: test_size_hook
-                    }
-                )
-            ]
-        );
-
-        // data gone
-        assert!(cache.get(&k1).is_none());
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Ok(test_size_hook)),
-                TestHookRecord::Evict(
-                    0,
-                    "k1",
-                    EvictResult::Fetched {
-                        size: test_size_hook
-                    }
-                )
-            ]
-        );
-    }
 }
 
-pub(crate) async fn test_get_err(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_get_err(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     // entry does NOT exist yet
@@ -864,68 +691,26 @@ pub(crate) async fn test_get_err(setup: TestSetup, use_s3fifo: bool) {
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(fut_res.unwrap_err().to_string(), "err");
 
-    if use_s3fifo {
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("err".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed),
-            ]
-        );
+    assert_eq!(
+        observer.records(),
+        vec![
+            TestHookRecord::Insert(0, "k1"),
+            TestHookRecord::Fetched(0, "k1", Err("err".to_owned())),
+            TestHookRecord::Evict(0, "k1", EvictResult::Failed),
+        ]
+    );
 
-        // data gone
-        assert!(cache.get(&k1).is_none());
-    } else {
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("err".to_owned()))
-            ]
-        );
-
-        // data ready and loaded
-        assert_eq!(cache.get(&k1).unwrap().unwrap_err().to_string(), "err");
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("err".to_owned()))
-            ]
-        );
-
-        // errors/failed entries are NOT kept alive
-        cache.prune();
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("err".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed)
-            ]
-        );
-
-        // data gone
-        assert!(cache.get(&k1).is_none());
-        assert_eq!(
-            observer.records(),
-            vec![
-                TestHookRecord::Insert(0, "k1"),
-                TestHookRecord::Fetched(0, "k1", Err("err".to_owned())),
-                TestHookRecord::Evict(0, "k1", EvictResult::Failed)
-            ]
-        );
-    }
+    // data gone
+    assert!(cache.get(&k1).is_none());
 }
 
-pub(crate) async fn test_hook_gen(setup: TestSetup, use_s3fifo: bool) {
+pub(crate) async fn test_hook_gen(setup: TestSetup) {
     let TestSetup { cache, observer } = setup;
 
     let test_size_1 = 1001;
     let test_size_2 = 1002;
-    let test_size_1_hook = test_size_1 + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
-    let test_size_2_hook = test_size_2 + usize::from(use_s3fifo) * S3_FIFO_EXTRA_SIZE;
+    let test_size_1_hook = test_size_1 + S3_FIFO_EXTRA_SIZE;
+    let test_size_2_hook = test_size_2 + S3_FIFO_EXTRA_SIZE;
 
     let k1 = Arc::new("k1");
     let k2 = Arc::new("k2");
@@ -964,30 +749,6 @@ pub(crate) struct TestSetup {
     pub(crate) observer: Arc<TestHook<&'static str>>,
 }
 
-impl TestSetup {
-    pub(crate) fn get_hook_limited() -> Self {
-        let observer = Arc::new(TestHook::default());
-        Self {
-            cache: Arc::new(HookLimitedCache::new(Arc::clone(&observer) as _)),
-            observer,
-        }
-    }
-
-    pub(crate) fn get_s3fifo() -> Self {
-        let observer = Arc::new(TestHook::default());
-        Self {
-            cache: Arc::new(S3FifoCache::new(
-                10_000,
-                10_000,
-                0.25,
-                Arc::clone(&observer) as _,
-                &metric::Registry::new(),
-            )),
-            observer,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TestValue(pub(crate) usize);
 
@@ -999,29 +760,23 @@ impl HasSize for TestValue {
 
 #[macro_export]
 macro_rules! gen_cache_tests_impl {
-        ($s3fifo:expr, [$($test:ident,)+ $(,)?] $(,)?) => {
-            paste::paste! {
-                $(
-                    #[tokio::test]
-                    async fn [<$test _s3fifo _$s3fifo>]() {
-                        let setup = if $s3fifo {
-                            $crate::cache_system::test_utils::TestSetup::get_s3fifo()
-                        } else {
-                            $crate::cache_system::test_utils::TestSetup::get_hook_limited()
-                        };
-                        $crate::cache_system::test_utils::$test(setup, $s3fifo).await;
-                    }
-                )+
-            }
+        ($setup_fn:ident, [$($test:ident,)+ $(,)?] $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $test() {
+                    let setup = $setup_fn();
+                    $crate::cache_system::test_utils::$test(setup).await;
+                }
+            )+
         };
     }
 
 pub(crate) use gen_cache_tests_impl;
 
 macro_rules! gen_cache_tests {
-    ($s3fifo:expr) => {
+    ($setup_fn:ident) => {
         $crate::cache_system::test_utils::gen_cache_tests_impl!(
-            $s3fifo,
+            $setup_fn,
             [
                 test_happy_path,
                 test_panic_loader,

@@ -6,6 +6,8 @@ use datafusion::{
 };
 use meta_data_cache::MetaIndexCache;
 
+use crate::file_access_observer::FileAccessObserver;
+
 /// IOx-specific config extension prefix.
 pub const IOX_CONFIG_PREFIX: &str = "iox";
 
@@ -155,7 +157,10 @@ pub const IOX_CACHE_PREFIX: &str = "iox_meta_cache";
 #[derive(Debug, Clone)]
 pub struct IoxCacheExt {
     /// metadata cache
-    pub meta_cache: Arc<MetaIndexCache>,
+    pub meta_cache: Option<Arc<MetaIndexCache>>,
+
+    /// file access observer
+    pub file_access_observer: Option<Arc<FileAccessObserver>>,
 }
 
 impl ExtensionOptions for IoxCacheExt {

@@ -36,7 +36,7 @@ siphasher = "1.0"
 snafu = "0.8"
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "sqlite"] }
 sqlx-hotswap-pool = { path = "../sqlx-hotswap-pool" }
-thiserror = "2.0.7"
+thiserror = "2.0.9"
 tokio = { version = "1.42", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
 tonic = { workspace = true }
 trace = { path = "../trace" }

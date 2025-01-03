@@ -15,7 +15,7 @@ iox_query_params = { path = "../iox_query_params/" }
 nom = { version = "7", default-features = false, features = ["std"] }
 num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = "0.2"
-thiserror = "2.0.7"
+thiserror = "2.0.9"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order

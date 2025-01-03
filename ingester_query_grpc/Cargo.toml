@@ -15,7 +15,7 @@ base64 = "0.22"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
-flatbuffers = "24.3.25"
+flatbuffers = "24.12.23"
 pbjson = { workspace = true }
 predicate = { path = "../predicate" }
 prost = { workspace = true }

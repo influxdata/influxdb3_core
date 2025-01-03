@@ -11,7 +11,7 @@ pub trait Setup: Send {
     ///
     /// You may assume that the resulting object is kept around for the entire test. This may be helpful to keep file
     /// handles etc. around.
-    fn new(use_s3fifo: bool) -> BoxFuture<'static, Self>;
+    fn new() -> BoxFuture<'static, Self>;
 
     /// Get inner/underlying, uncached store.
     ///
@@ -24,11 +24,11 @@ pub trait Setup: Send {
     fn outer(&self) -> &Arc<DynObjectStore>;
 }
 
-pub async fn test_etag<S>(use_s3fifo: bool)
+pub async fn test_etag<S>()
 where
     S: Setup,
 {
-    let setup = S::new(use_s3fifo).await;
+    let setup = S::new().await;
 
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
@@ -77,11 +77,11 @@ where
     assert_ne!(etag_a1, etag_b1);
 }
 
-pub async fn test_found<S>(use_s3fifo: bool)
+pub async fn test_found<S>()
 where
     S: Setup,
 {
-    let setup = S::new(use_s3fifo).await;
+    let setup = S::new().await;
 
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
@@ -117,11 +117,11 @@ where
     assert_eq!(data_b.as_ref(), b"bar");
 }
 
-pub async fn test_not_found<S>(use_s3fifo: bool)
+pub async fn test_not_found<S>()
 where
     S: Setup,
 {
-    let setup = S::new(use_s3fifo).await;
+    let setup = S::new().await;
 
     let location = Path::parse("x").unwrap();
 
@@ -132,11 +132,11 @@ where
     );
 }
 
-pub async fn test_reads_cached<S>(use_s3fifo: bool)
+pub async fn test_reads_cached<S>()
 where
     S: Setup,
 {
-    let setup = S::new(use_s3fifo).await;
+    let setup = S::new().await;
 
     let location = Path::parse("x").unwrap();
 
@@ -168,11 +168,11 @@ where
     assert_eq!(data_1, data_2);
 }
 
-pub async fn test_writes_rejected<S>(use_s3fifo: bool)
+pub async fn test_writes_rejected<S>()
 where
     S: Setup,
 {
-    let setup = S::new(use_s3fifo).await;
+    let setup = S::new().await;
 
     let location = Path::parse("x").unwrap();
 
@@ -189,15 +189,13 @@ where
 
 #[macro_export]
 macro_rules! gen_store_tests_impl {
-        ($setup:ident, $s3fifo:expr, [$($test:ident,)+ $(,)?] $(,)?) => {
-            paste::paste! {
-                $(
-                    #[tokio::test]
-                    async fn [<$test _s3fifo _$s3fifo>](){
-                        $crate::object_store_cache_tests::$test::<$setup>($s3fifo).await;
-                    }
-                )+
-            }
+        ($setup:ident, [$($test:ident,)+ $(,)?] $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $test(){
+                    $crate::object_store_cache_tests::$test::<$setup>().await;
+                }
+            )+
         };
     }
 
@@ -220,7 +218,7 @@ pub use gen_store_tests_impl;
 /// }
 ///
 /// impl Setup for TestSetup {
-///     fn new(_: bool) -> BoxFuture<'static, Self> {
+///     fn new() -> BoxFuture<'static, Self> {
 ///         todo!()
 ///     }
 ///
@@ -233,14 +231,13 @@ pub use gen_store_tests_impl;
 ///     }
 /// }
 ///
-/// gen_store_tests!(TestSetup, false);
+/// gen_store_tests!(TestSetup);
 /// ```
 #[macro_export]
 macro_rules! gen_store_tests {
-    ($setup:ident, $s3fifo:expr) => {
+    ($setup:ident) => {
         $crate::object_store_cache_tests::gen_store_tests_impl!(
             $setup,
-            $s3fifo,
             [
                 test_etag,
                 test_found,

@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_runtime_shutdown() {
-        runtime_shutdown(TestSetup::get_hook_limited());
+        runtime_shutdown(setup());
     }
 
     #[tokio::test]
@@ -309,5 +309,19 @@ mod tests {
         );
     }
 
-    gen_cache_tests!(true);
+    gen_cache_tests!(setup);
+
+    fn setup() -> TestSetup {
+        let observer = Arc::new(TestHook::default());
+        TestSetup {
+            cache: Arc::new(S3FifoCache::new(
+                10_000,
+                10_000,
+                0.25,
+                Arc::clone(&observer) as _,
+                &metric::Registry::new(),
+            )),
+            observer,
+        }
+    }
 }
