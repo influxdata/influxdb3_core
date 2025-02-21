@@ -234,13 +234,13 @@ impl Schema {
                     InfluxColumnType::Field(_) => true,
                     InfluxColumnType::Timestamp => false,
                 };
-                if field.is_nullable() != expected_nullable {
-                    return Err(Error::Nullability {
-                        column_name: column_name.to_string(),
-                        influxdb_column_type,
-                        nullable: expected_nullable,
-                    });
-                }
+                // if field.is_nullable() != expected_nullable {
+                //     return Err(Error::Nullability {
+                //         column_name: column_name.to_string(),
+                //         influxdb_column_type,
+                //         nullable: expected_nullable,
+                //     });
+                // }
 
                 if (influxdb_column_type == InfluxColumnType::Timestamp)
                     && (column_name != TIME_COLUMN_NAME)
