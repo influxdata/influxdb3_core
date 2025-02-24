@@ -175,6 +175,8 @@ const COLUMN_METADATA_KEY: &str = "iox::column::type";
 const SERIES_KEY_METADATA_KEY: &str = "iox::series::key";
 #[cfg(feature = "v3")]
 const SERIES_KEY_METADATA_SEPARATOR: &str = "/";
+#[cfg(feature = "v3")]
+const COMPACTION_OCCURRING: &str = "compaction";
 
 impl Schema {
     /// Create a new Schema wrapper over the schema
@@ -223,9 +225,10 @@ impl Schema {
                         .is_some_and(|sk| sk.contains(&column_name.as_str())),
                     influxdb_column_type,
                 ) {
-                    (true, _) => false,
-                    (false, InfluxColumnType::Tag) => true,
+                    // If compaction is occuring we allow it to be nullable
+                    (true, _) => inner.metadata().get(COMPACTION_OCCURRING).is_some(),
                     (false, InfluxColumnType::Field(_)) => true,
+                    (false, InfluxColumnType::Tag) => true,
                     (false, InfluxColumnType::Timestamp) => false,
                 };
                 #[cfg(not(feature = "v3"))]
