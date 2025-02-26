@@ -164,18 +164,6 @@ impl SchemaBuilder {
         // enforce non-nullable based on series key membership
         #[cfg(feature = "v3")]
         if let Some(sk) = self.series_key.as_ref() {
-            self.fields = self
-                .fields
-                .drain(..)
-                .map(|(f, t)| {
-                    if sk.contains(f.name()) {
-                        (f.with_nullable(false), t)
-                    } else {
-                        (f, t)
-                    }
-                })
-                .collect();
-
             if sk
                 .iter()
                 .any(|k| self.fields.iter().all(|(f, _)| f.name() != k))
