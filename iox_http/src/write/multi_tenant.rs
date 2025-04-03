@@ -8,8 +8,8 @@ use data_types::{NamespaceName, OrgBucketMappingError};
 use hyper::{Body, Request};
 
 use super::{
-    v2::{V2WriteParseError, WriteParamsV2},
     WriteParams, WriteParseError, WriteRequestUnifier,
+    v2::{V2WriteParseError, WriteParamsV2},
 };
 
 /// Request parsing errors when operating in "single tenant" mode.

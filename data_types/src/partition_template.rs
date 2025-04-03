@@ -141,7 +141,7 @@
 //! parts:
 //!
 //!   * `time` - The time column has special meaning and is covered by strftime
-//!              formatters ([`TAG_VALUE_KEY_TIME`])
+//!     formatters ([`TAG_VALUE_KEY_TIME`])
 //!
 //! ### Examples
 //!
@@ -183,10 +183,10 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use chrono::{format::StrftimeItems, DateTime, Days, Months, Utc};
+use chrono::{DateTime, Days, Months, Utc, format::StrftimeItems};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use murmur3::murmur3_32;
-use percent_encoding::{percent_decode_str, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str};
 use schema::TIME_COLUMN_NAME;
 use thiserror::Error;
 
@@ -194,7 +194,6 @@ use crate::{MismatchedNumPartsError, PartitionKey, PartitionKeyBuilder};
 
 /// Reasons a user-specified partition template isn't valid.
 #[derive(Debug, Error)]
-#[allow(missing_copy_implementations)]
 pub enum ValidationError {
     /// The partition template didn't define any parts.
     #[error("Custom partition template must have at least one part")]
@@ -582,7 +581,7 @@ impl TablePartitionTemplateOverride {
     }
 
     /// Returns the number of parts in this template.
-    #[allow(clippy::len_without_is_empty)] // Senseless - there must always be >0 parts.
+    #[expect(clippy::len_without_is_empty)] // Senseless - there must always be >0 parts.
     pub fn len(&self) -> usize {
         self.parts().count()
     }
@@ -692,16 +691,32 @@ impl TryFrom<Option<proto::PartitionTemplate>> for TablePartitionTemplateOverrid
     }
 }
 
+impl TryFrom<proto::PartitionTemplate> for TablePartitionTemplateOverride {
+    type Error = ValidationError;
+
+    /// An existing namepsace pulled from the catalog may contain a valid, but since
+    /// disallowed partition template.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template specified is invalid.
+    fn try_from(partition_template: proto::PartitionTemplate) -> Result<Self, Self::Error> {
+        Ok(Self(Some(serialization::Wrapper::try_from(
+            partition_template,
+        )?)))
+    }
+}
+
 /// This manages the serialization/deserialization of the `proto::PartitionTemplate` type to and
 /// from the database through `sqlx` for the `NamespacePartitionTemplateOverride` and
 /// `TablePartitionTemplateOverride` types. It's an internal implementation detail to minimize code
 /// duplication.
 mod serialization {
     use super::{
-        TemplatePart, ValidationError, ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
-        PARTITION_BY_DAY_PROTO, TAG_VALUE_KEY_TIME,
+        ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_BY_DAY_PROTO,
+        TAG_VALUE_KEY_TIME, TemplatePart, ValidationError,
     };
-    use chrono::{format::StrftimeItems, Utc};
+    use chrono::{Utc, format::StrftimeItems};
     use generated_types::influxdata::iox::partition_template::v1 as proto;
     use std::{collections::HashSet, fmt::Write, sync::Arc};
 
@@ -1040,7 +1055,7 @@ impl<'t> ColumnValuesBuilder<'t> {
     }
 
     /// Get the number of [`TemplatePart`]s used to create this builder.
-    #[allow(clippy::len_without_is_empty)] // there must always be >0 parts.
+    #[expect(clippy::len_without_is_empty)] // there must always be >0 parts.
     pub fn len(&self) -> usize {
         self.parts.len()
     }
@@ -1216,7 +1231,12 @@ pub struct TimeFormatColumnValueState<'t> {
 }
 
 impl<'t> TimeFormatColumnValueState<'t> {
-    fn try_new(format: &'t str) -> Option<Self> {
+    /// Construct a new [`TimeFormatColumnValueState`] from a formatted time string slice.
+    ///
+    /// A formatted time string slice may look like:
+    /// - '%Y-%m-%d'
+    /// - '%Y-%m'
+    pub fn try_new(format: &'t str) -> Option<Self> {
         let parsed_format = StrftimeItems::new(format).collect::<Vec<_>>();
         let partition_duration = PartitionDuration::from_format_items(parsed_format.iter())?;
         Some(Self {
@@ -1225,8 +1245,13 @@ impl<'t> TimeFormatColumnValueState<'t> {
         })
     }
 
+    /// Return a reference to the [`PartitionDuration`].
+    pub fn partition_duration(&self) -> &PartitionDuration {
+        &self.partition_duration
+    }
+
     fn parse_part_time_format(&self, value: &'t str) -> Option<ColumnValue<'t>> {
-        use chrono::format::{parse, Parsed};
+        use chrono::format::{Parsed, parse};
         let Self {
             parsed_format,
             partition_duration,
@@ -1284,7 +1309,7 @@ impl PartitionDuration {
             match item {
                 // ignore these
                 Item::Literal(_) | Item::OwnedLiteral(_) | Item::Space(_) | Item::OwnedSpace(_) => {
-                    continue
+                    continue;
                 }
                 // break out on error
                 Item::Error => return None,

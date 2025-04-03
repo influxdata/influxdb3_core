@@ -1,23 +1,28 @@
 //! A Postgres backed implementation of the Catalog
 
-use crate::constants::MAX_PARTITION_SELECTED_ONCE_FOR_DELETE;
-use crate::interface::{namespace_snapshot_by_name, PartitionRepoExt, RootRepo};
-use crate::metrics::{CatalogMetrics, GetTimeMetric};
-use crate::util::should_delete_partition;
 use crate::{
     constants::{
-        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
-        MAX_PARQUET_L0_FILES_PER_PARTITION,
+        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION, MAX_PARQUET_L0_FILES_PER_PARTITION,
+        MAX_PARTITION_SELECTED_ONCE_FOR_DELETE,
     },
     interface::{
-        AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
-        PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
+        AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo,
+        NamespaceSorting, Paginated, PaginationOptions, ParquetFileRepo, PartitionRepo,
+        PartitionRepoExt, RepoCollection, Result, RootRepo, SoftDeletedRows, TableRepo,
+        TableSorting, namespace_snapshot_by_name,
     },
+    metrics::{CatalogMetrics, GetTimeMetric},
     migrate::IOxMigrator,
+    util::should_delete_partition,
 };
 use async_trait::async_trait;
 
 use data_types::{
+    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables, Namespace,
+    NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceVersion,
+    NamespaceWithStorage, ObjectStoreId, ParquetFile, ParquetFileParams, Partition,
+    PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId,
+    TableWithStorage, Timestamp,
     partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
     },
@@ -25,11 +30,6 @@ use data_types::{
         namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
         table::TableSnapshot,
     },
-    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables, Namespace,
-    NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceVersion,
-    NamespaceWithStorage, ObjectStoreId, ParquetFile, ParquetFileParams, Partition,
-    PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId,
-    TableWithStorage, Timestamp,
 };
 use futures::StreamExt;
 use iox_time::{SystemProvider, Time, TimeProvider};
@@ -38,9 +38,10 @@ use observability_deps::tracing::{debug, info, warn};
 use parking_lot::{RwLock, RwLockWriteGuard};
 use snafu::prelude::*;
 use sqlx::{
-    postgres::{PgConnectOptions, PgPoolOptions},
     Acquire, ConnectOptions, Executor, Postgres, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
 };
+use sqlx::{Transaction, query::QueryAs};
 use sqlx_hotswap_pool::HotSwapPool;
 use std::{
     borrow::Cow,
@@ -48,10 +49,10 @@ use std::{
     env,
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
 use trace::ctx::SpanContext;
@@ -179,7 +180,7 @@ pub struct PostgresTxn {
     inner: PostgresTxnInner,
 
     // keep around in the background
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     refresh_task: Arc<JoinSet<()>>,
 
     time_provider: Arc<dyn TimeProvider>,
@@ -193,7 +194,6 @@ struct PostgresTxnInner {
 impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
     type Database = Postgres;
 
-    #[allow(clippy::type_complexity)]
     fn fetch_many<'e, 'q, E>(
         self,
         query: E,
@@ -259,6 +259,10 @@ impl<'c> Executor<'c> for &'c mut PostgresTxnInner {
 
 #[async_trait]
 impl Catalog for PostgresCatalog {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<(), Error> {
         // We need to create the schema if we're going to set it as the first item of the
         // search_path otherwise when we run the sqlx migration scripts for the first time, sqlx
@@ -842,9 +846,22 @@ WHERE {v};
         Ok(rec)
     }
 
-    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
-        let rec = sqlx::query_as::<_, NamespaceWithStorage>(
-            r#"
+    async fn list_storage(
+        &mut self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
+        let sort_expr = match sorting {
+            None => "".to_string(),
+            Some(sorting) => sorting.as_sql_order_by(Some("n")),
+        };
+        let page_expr = match pagination {
+            None => "".to_string(),
+            Some(pagination) => pagination.as_sql_limit_offset(),
+        };
+        let namespaces = sqlx::query_as::<_, NamespaceWithStorage>(
+            format!(
+                r#"
 SELECT
 	n.id,
 	n.name,
@@ -856,13 +873,33 @@ SELECT
 	COUNT(DISTINCT t.id) AS table_count
 FROM namespace n
 LEFT JOIN table_name t ON n.id = t.namespace_id
-LEFT JOIN parquet_file f ON n.id = f.namespace_id
+LEFT JOIN partition p ON t.id = p.table_id
+LEFT JOIN parquet_file f ON p.id = f.partition_id
 WHERE f.to_delete IS NULL
-GROUP BY f.namespace_id, n.name, retention_period_ns, max_tables, max_columns_per_table, partition_template;
-            "#,
-        ).fetch_all(&mut self.inner).await?;
+GROUP BY n.id, n.name, retention_period_ns, max_tables, max_columns_per_table, n.partition_template
+{sort_expr}
+{page_expr};
+            "#
+            )
+            .as_str(),
+        )
+        .fetch_all(&mut self.inner)
+        .await?;
 
-        Ok(rec)
+        let total_matching_namespaces = sqlx::query_scalar::<_, i64>(
+            r#"
+SELECT COUNT(*)
+FROM namespace;
+        "#,
+        )
+        .fetch_one(&mut self.inner)
+        .await?;
+
+        Ok(Paginated::new_from_options(
+            namespaces,
+            total_matching_namespaces,
+            pagination,
+        ))
     }
 
     async fn get_by_id(
@@ -895,22 +932,14 @@ WHERE id=$1 AND {v};
         Ok(Some(namespace))
     }
 
-    async fn get_by_name(
-        &mut self,
-        name: &str,
-        deleted: SoftDeletedRows,
-    ) -> Result<Option<Namespace>> {
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>> {
         let rec = sqlx::query_as::<_, Namespace>(
-            format!(
-                r#"
+            r#"
 SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
        partition_template, router_version
 FROM namespace
-WHERE name=$1 AND {v};
+WHERE name=$1 AND deleted_at IS NULL;
                 "#,
-                v = deleted.as_sql_predicate()
-            )
-            .as_str(),
         )
         .bind(name) // $1
         .fetch_one(&mut self.inner)
@@ -925,30 +954,27 @@ WHERE name=$1 AND {v};
         Ok(Some(namespace))
     }
 
-    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<Namespace> {
         let flagged_at = Timestamp::from(self.time_provider.now());
 
         // note that there is a uniqueness constraint on the name column in the DB
-        let rec = sqlx::query_as::<_, NamespaceId>(
+        sqlx::query_as::<_, Namespace>(
             r#"
 UPDATE namespace
 SET deleted_at=$1, router_version = router_version + 1
 WHERE id = $2
-RETURNING id;"#,
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at, partition_template, router_version;"#,
         )
         .bind(flagged_at) // $1
         .bind(id) // $2
         .fetch_one(&mut self.inner)
-        .await;
-
-        let id = rec.map_err(|e| match e {
+        .await
+        .map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::NotFound {
                 descr: id.to_string(),
             },
             _ => e.into(),
-        })?;
-
-        Ok(id)
+        })
     }
 
     async fn update_table_limit(
@@ -1084,8 +1110,9 @@ SELECT n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_tabl
        COUNT(DISTINCT t.id) as table_count
 FROM namespace n
 LEFT JOIN table_name t on n.id = t.namespace_id
-LEFT JOIN parquet_file f ON n.id = f.namespace_id AND f.to_delete IS NULL
-WHERE n.id = $1
+LEFT JOIN partition p on t.id = p.table_id
+LEFT JOIN parquet_file f ON p.id = f.partition_id
+WHERE n.id = $1 and f.to_delete IS NULL
 GROUP BY n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_table, n.partition_template;
             "#,
         )
@@ -1100,6 +1127,50 @@ GROUP BY n.id, n.name, n.retention_period_ns, n.max_tables, n.max_columns_per_ta
         let namespace_with_storage = rec?;
 
         Ok(Some(namespace_with_storage))
+    }
+
+    /// Rename the namespace corresponding to `id`.
+    async fn rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace> {
+        let rec = sqlx::query_as::<_, Namespace>(
+            r#"
+                UPDATE namespace
+                SET name = $2, router_version = router_version + 1
+                WHERE id = $1
+                RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table,
+                    deleted_at, partition_template, router_version
+                "#,
+        )
+        .bind(id) // $1
+        .bind(String::from(new_name)) // $2
+        .fetch_one(&mut self.inner)
+        .await;
+        rec.map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::NotFound {
+                descr: id.to_string(),
+            },
+            _ => e.into(),
+        })
+    }
+
+    async fn undelete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        let rec = sqlx::query_as::<_, Namespace>(
+            r#"
+                UPDATE namespace
+                SET deleted_at = NULL, router_version = router_version + 1
+                WHERE id = $1
+                RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table,
+                    deleted_at, partition_template, router_version
+                "#,
+        )
+        .bind(id) // $1
+        .fetch_one(&mut self.inner)
+        .await;
+        rec.map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::NotFound {
+                descr: id.to_string(),
+            },
+            _ => e.into(),
+        })
     }
 }
 
@@ -1208,6 +1279,7 @@ SELECT
   t.partition_template,
   COALESCE(SUM(f.file_size_bytes)::BIGINT, 0::BIGINT) AS size_bytes
 FROM table_name t
+-- to_delete predicate is in the join because there is an index on parquet_file specifically for this
 LEFT JOIN parquet_file f ON t.id = f.table_id AND f.to_delete IS NULL
 WHERE t.id = $1
 GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
@@ -1270,9 +1342,20 @@ WHERE namespace_id = $1;
     async fn list_storage_by_namespace_id(
         &mut self,
         namespace_id: NamespaceId,
-    ) -> Result<Vec<TableWithStorage>> {
-        let rec = sqlx::query_as::<_, TableWithStorage>(
-            r#"
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>> {
+        let sort_expr = match sorting {
+            None => "".to_string(),
+            Some(sorting) => sorting.as_sql_order_by(Some("t")),
+        };
+        let page_expr = match pagination {
+            None => "".to_string(),
+            Some(pagination) => pagination.as_sql_limit_offset(),
+        };
+        let tables = sqlx::query_as::<_, TableWithStorage>(
+            format!(
+                r#"
 SELECT
 	t.id AS id,
   t.name,
@@ -1280,16 +1363,36 @@ SELECT
   t.partition_template,
   COALESCE(SUM(f.file_size_bytes)::BIGINT, 0::BIGINT) AS size_bytes
 FROM table_name t
+-- to_delete predicate is in the join because there is an index on parquet_file specifically for this
 LEFT JOIN parquet_file f ON t.id = f.table_id AND f.to_delete IS NULL
 WHERE t.namespace_id = $1
-GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
-        "#,
+GROUP BY t.id, t.name, t.namespace_id, t.partition_template
+{sort_expr}
+{page_expr};
+        "#
+            )
+            .as_str(),
         )
         .bind(namespace_id) // $1
         .fetch_all(&mut self.inner)
         .await?;
 
-        Ok(rec)
+        let total_matching_tables = sqlx::query_scalar::<_, i64>(
+            r#"
+SELECT COUNT(*)
+FROM table_name t
+WHERE t.namespace_id = $1;
+        "#,
+        )
+        .bind(namespace_id)
+        .fetch_one(&mut self.inner)
+        .await?;
+
+        Ok(Paginated::new_from_options(
+            tables,
+            total_matching_tables,
+            pagination,
+        ))
     }
 
     async fn list(&mut self) -> Result<Vec<Table>> {
@@ -1341,6 +1444,109 @@ GROUP BY t.id, t.name, t.namespace_id, t.partition_template;
             generation as _,
         )?)
     }
+
+    async fn list_by_iceberg_enabled(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableId>> {
+        Ok(sqlx::query_as::<_, TableId>(
+            "SELECT id FROM table_name WHERE namespace_id = $1 AND iceberg_enabled IS TRUE",
+        )
+        .bind(namespace_id) // $1
+        .fetch_all(&mut self.inner)
+        .await?)
+    }
+
+    async fn enable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let mut tx = self.inner.pool.begin().await?;
+        sqlx::query("UPDATE table_name SET iceberg_enabled = TRUE WHERE id = $1")
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    async fn disable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let mut tx = self.inner.pool.begin().await?;
+
+        sqlx::query("UPDATE table_name SET iceberg_enabled = FALSE WHERE id = $1")
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn soft_delete(&mut self, id: TableId) -> Result<Table> {
+        let now = self.time_provider.now();
+        self.modify_table_and_inc_namespace_version(
+            sqlx::query_as::<_, Table>(
+                "
+    UPDATE table_name SET deleted_at = $1 WHERE id = $2 \
+    RETURNING id, namespace_id, name, partition_template, iceberg_enabled, deleted_at
+    ",
+            )
+            .bind(now.timestamp_nanos())
+            .bind(id),
+        )
+        .await
+    }
+
+    async fn rename(&mut self, id: TableId, new_name: &str) -> Result<Table> {
+        self.modify_table_and_inc_namespace_version(
+            sqlx::query_as::<_, Table>(
+                "
+    UPDATE table_name SET name = $1 WHERE id = $2 \
+    RETURNING id, namespace_id, name, partition_template, iceberg_enabled, deleted_at
+    ",
+            )
+            .bind(new_name)
+            .bind(id),
+        )
+        .await
+    }
+
+    async fn undelete(&mut self, id: TableId) -> Result<Table> {
+        self.modify_table_and_inc_namespace_version(
+            sqlx::query_as::<_, Table>(
+                "
+    UPDATE table_name SET deleted_at = NULL WHERE id = $1 \
+    RETURNING id, namespace_id, name, partition_template, iceberg_enabled, deleted_at
+    ",
+            )
+            .bind(id),
+        )
+        .await
+    }
+}
+
+impl PostgresTxn {
+    async fn modify_table_and_inc_namespace_version<'args, Args>(
+        &mut self,
+        query: QueryAs<'args, Postgres, Table, Args>,
+    ) -> Result<Table>
+    where
+        Args: sqlx::IntoArguments<'args, Postgres> + 'args,
+    {
+        let mut tx = self.inner.pool.begin().await?;
+
+        let table = query.fetch_one(&mut *tx).await.map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::NotFound {
+                descr: "Table with given ID and conditions not found".into(),
+            },
+            e => e.into(),
+        })?;
+
+        sqlx::query("UPDATE namespace SET router_version = router_version + 1 WHERE id = $1")
+            .bind(table.namespace_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(table)
+    }
 }
 
 #[async_trait]
@@ -1383,10 +1589,40 @@ WHERE table_id = $1;
         Ok(rec)
     }
 
-    async fn list(&mut self) -> Result<Vec<Column>> {
-        let rec = sqlx::query_as::<_, Column>("SELECT * FROM column_name;")
-            .fetch_all(&mut self.inner)
-            .await?;
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>> {
+        let rec = match deleted {
+            SoftDeletedRows::AllRows => {
+                sqlx::query_as::<_, Column>("SELECT * FROM column_name;")
+                    .fetch_all(&mut self.inner)
+                    .await?
+            }
+            SoftDeletedRows::ExcludeDeleted => {
+                sqlx::query_as::<_, Column>(
+                    r#"
+SELECT c.* FROM column_name AS c
+INNER JOIN table_name AS t
+  ON c.table_id = t.id
+INNER JOIN namespace AS n
+  ON t.namespace_id = n.id
+WHERE n.deleted_at IS NULL"#,
+                )
+                .fetch_all(&mut self.inner)
+                .await?
+            }
+            SoftDeletedRows::OnlyDeleted => {
+                sqlx::query_as::<_, Column>(
+                    r#"
+SELECT c.* FROM column_name AS c
+INNER JOIN table_name AS t
+  ON c.table_id = t.id
+INNER JOIN namespace AS n
+  ON t.namespace_id = n.id
+WHERE n.deleted_at IS NOT NULL"#,
+                )
+                .fetch_all(&mut self.inner)
+                .await?
+            }
+        };
 
         Ok(rec)
     }
@@ -1809,7 +2045,10 @@ ORDER BY id DESC;"#,
         .map_err(Error::from)
     }
 
-    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+    async fn delete_by_retention(
+        &mut self,
+        partition_cutoff: Duration,
+    ) -> Result<Vec<(TableId, PartitionId)>> {
         let mut tx = self.inner.pool.begin().await?;
 
         let mut stream = sqlx::query_as::<_, (PartitionId, PartitionKey, TableId, i64, TablePartitionTemplateOverride)>(
@@ -1821,12 +2060,13 @@ JOIN namespace on table_name.namespace_id = namespace.id
 WHERE NOT EXISTS (SELECT 1 from parquet_file where partition_id = partition.id)
     AND (
         partition.created_at IS NULL
-        OR partition.created_at < EXTRACT(EPOCH FROM (now() - interval '1 day')) * 1000000000
+        OR partition.created_at < (EXTRACT(EPOCH FROM (now())) - $1) * 1000000000
     )
     AND retention_period_ns IS NOT NULL;
         "#,
         )
-            .fetch(&mut *tx);
+        .bind(partition_cutoff.as_secs() as i64) // $1
+        .fetch(&mut *tx);
 
         let now = self.time_provider.now();
         let mut to_remove = Vec::with_capacity(MAX_PARTITION_SELECTED_ONCE_FOR_DELETE);
@@ -1957,7 +2197,7 @@ WITH parquet_file_ids as (
     SELECT id
     FROM parquet_file
     WHERE to_delete < $1
-    LIMIT $2
+    LIMIT 10000
 )
 DELETE FROM parquet_file
 WHERE id IN (SELECT id FROM parquet_file_ids)
@@ -1965,7 +2205,6 @@ RETURNING object_store_id
              "#,
         )
         .bind(older_than) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
         .fetch_all(&mut self.inner)
         .await?;
 
@@ -1977,33 +2216,64 @@ RETURNING object_store_id
         Ok(deleted)
     }
 
-    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp, limit: u32) -> Result<u64> {
+        let start = Instant::now();
+
+        // Begin a transaction
+        let mut tx: Transaction<'_, sqlx::Postgres> = self.inner.pool.begin().await?;
+
+        // Set enable_seqscan to off for this transaction
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await?;
+        let setup_elapsed = start.elapsed();
+
+        // Execute the delete query within the transaction
         // see https://www.crunchydata.com/blog/simulating-update-or-delete-with-limit-in-postgres-ctes-to-the-rescue
+        let start = Instant::now();
         let deleted = sqlx::query(
             r#"
-WITH parquet_file_ids as (
-    SELECT id
-    FROM parquet_file
-    WHERE to_delete < $1
-    LIMIT $2
-),
-deleted AS (
-    DELETE FROM parquet_file
-    WHERE id IN (SELECT id FROM parquet_file_ids)
-    RETURNING id
-)
-SELECT COUNT(*) FROM deleted;
-             "#,
+            WITH parquet_file_ids AS (
+                SELECT id
+                FROM parquet_file
+                WHERE to_delete < $1
+                LIMIT $2
+            ),
+            deleted AS (
+                DELETE FROM parquet_file
+                WHERE id IN (SELECT id FROM parquet_file_ids)
+                RETURNING id
+            )
+            SELECT COUNT(*) FROM deleted;
+            "#,
         )
         .bind(older_than) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
-        .fetch_one(&mut self.inner)
+        .bind(i64::from(limit)) // $2
+        .fetch_one(&mut *tx)
         .await?;
+        let delete_elapsed = start.elapsed();
 
-        Ok(deleted
+        // Commit the transaction
+        let start = Instant::now();
+        tx.commit().await?;
+        let commit_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        let deleted_count: u64 = deleted
             .get::<i64, _>("count")
             .try_into()
-            .expect("This value should be < 10,000 and > 0"))
+            .expect("This value should be < 10,000 and > 0");
+        let into_elapsed = start.elapsed();
+
+        info!(
+            ?setup_elapsed,
+            ?delete_elapsed,
+            ?commit_elapsed,
+            ?into_elapsed,
+            "delete_old_ids_count"
+        );
+
+        Ok(deleted_count)
     }
 
     async fn list_by_partition_not_to_delete_batch(
@@ -2163,7 +2433,10 @@ WHERE (partition_id, object_store_id) IN (
         for file in create {
             if file.partition_id != partition_id {
                 return Err(Error::Malformed {
-                    descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
+                    descr: format!(
+                        "Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})",
+                        file.partition_id
+                    ),
                 });
             }
             let created_file = create_parquet_file(&mut *tx, partition_id, file).await?;
@@ -2213,6 +2486,8 @@ WHERE (partition_id, object_store_id) IN (
             parquet_file
         WHERE
             table_id = {}
+        AND
+            to_delete IS NULL
         AND
             {}"#,
                 table_id,
@@ -2547,9 +2822,9 @@ pub(crate) mod test_utils {
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
             // not carried past await points
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             (&mut rng)
-                .sample_iter(rand::distributions::Alphanumeric)
+                .sample_iter(rand::distr::Alphanumeric)
                 .filter(|c| c.is_ascii_alphabetic())
                 .take(20)
                 .map(char::from)
@@ -2650,7 +2925,7 @@ mod tests {
         maybe_skip_integration!();
         maybe_start_logging();
 
-        test_migration::<_, _, HotSwapPool<Postgres>>(&MIGRATOR, || async {
+        test_migration::<_, _, HotSwapPool<Postgres>>(&MIGRATOR, async || {
             setup_db_no_migration().await.into_pool()
         })
         .await
@@ -2706,7 +2981,7 @@ ORDER BY trigger_name;
 
         let postgres: Arc<dyn Catalog> = Arc::new(postgres);
 
-        let catalog_reset_fn = || async {
+        let catalog_reset_fn = async || {
             // Clean the schema.
             pool.execute(format!("DROP SCHEMA {schema_name} CASCADE").as_str())
                 .await
@@ -2998,7 +3273,7 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
         let lookup_namespace = repos
             .namespaces()
-            .get_by_name(namespace_name, SoftDeletedRows::ExcludeDeleted)
+            .get_by_name(namespace_name)
             .await
             .unwrap()
             .unwrap();
@@ -3740,7 +4015,7 @@ VALUES
         .execute(&pool)
         .await
         .unwrap();
-        let columns = repos.columns().list().await.expect(
+        let columns = repos.columns().list(SoftDeletedRows::AllRows).await.expect(
             "Selecting historically valid tables should succeed. If this fails, \
              something is likely wrong with the `sqlx::FromRow` impl for `Column` or `ColumnType. \
              Do not edit the INSERT statements unless the production database has been \
@@ -3766,18 +4041,18 @@ VALUES
 INSERT INTO partition
     (
         partition_key, table_id, sort_key_ids, to_delete, new_file_at,
-        hash_id, sort_key,
+        hash_id,
         generation, cold_compact_at, created_at
     )
 VALUES
     (
         'my_partition_no_optionals', 1, '{}', DEFAULT, DEFAULT,
-        DEFAULT, DEFAULT,
+        DEFAULT,
         DEFAULT, DEFAULT, DEFAULT
     ),
     (
         'my_partition_all_optionals', 1, '{1, 2}', 1733165295000000000, 1733165295000000000,
-        '\xb18bbe985a4be50cd1219839b80f368e5a9518002d752e68a169c9414580da7c', '{"region", "time"}',
+        '\xb18bbe985a4be50cd1219839b80f368e5a9518002d752e68a169c9414580da7c',
         4, 1733165295000000000, 1733165295000000000
     );
     "#,
@@ -3848,7 +4123,7 @@ VALUES
         .unwrap();
         let parquet_files = repos
             .parquet_files()
-            .list_by_table_id(TableId::new(1), None)
+            .list_by_namespace_id(NamespaceId::new(1), SoftDeletedRows::AllRows)
             .await
             .expect(
                 "Selecting historically valid parquet_files should succeed. If this fails, \

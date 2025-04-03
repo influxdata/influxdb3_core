@@ -12,7 +12,7 @@ workspace = true
 test_helpers = ["dep:pgtemp"]
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.83"
+async-trait = "0.1.88"
 backoff = { version = "0.1.0", path = "../backoff" }
 base64 = "0.22"
 catalog_cache = { path = "../catalog_cache" }
@@ -34,10 +34,21 @@ ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 siphasher = "1.0"
 snafu = "0.8"
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "sqlite"] }
+sqlx = { workspace = true, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "sqlite",
+] }
 sqlx-hotswap-pool = { path = "../sqlx-hotswap-pool" }
-thiserror = "2.0.9"
-tokio = { version = "1.42", features = ["io-util", "macros", "parking_lot", "rt-multi-thread", "time"] }
+thiserror = "2.0.12"
+tokio = { version = "1.44", features = [
+    "io-util",
+    "macros",
+    "parking_lot",
+    "rt-multi-thread",
+    "time",
+] }
 tonic = { workspace = true }
 trace = { path = "../trace" }
 trace_http = { path = "../trace_http" }
@@ -45,18 +56,21 @@ uuid = "1"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # for test_helpers feature
-pgtemp = { version = "0.5.0", optional = true }
+pgtemp = { version = "0.6.0", optional = true }
 
 [dev-dependencies] # In alphabetical order
 assert_matches = "1.5.0"
-criterion = { version = "0.5.1", default-features = false, features = ["async_tokio"] }
+criterion = { version = "0.5.1", default-features = false, features = [
+    "async_tokio",
+] }
 dotenvy = "0.15.7"
-futures-concurrency = "7.6.2"
+futures-concurrency = "7.6.3"
+futures_test_utils = { path = "../futures_test_utils" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
-pgtemp = "0.5.0"
+pgtemp = "0.6.0"
 pretty_assertions = "1.4.1"
 proptest = { workspace = true }
-rand = "0.8"
+rand = "0.9"
 tempfile = "3"
 test_helpers = { path = "../test_helpers" }
 

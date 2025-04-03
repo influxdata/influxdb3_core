@@ -21,7 +21,7 @@ use std::{fmt::Formatter, iter, mem, num::NonZeroU64, sync::Arc};
 /// DIDs can be compared, hashed and cheaply copied around, just like small integers.
 ///
 /// An i32 is used to match the default for Arrow dictionaries
-#[allow(clippy::upper_case_acronyms)]
+#[expect(clippy::upper_case_acronyms)]
 pub(crate) type DID = i32;
 
 /// An invalid DID used for NULL rows
@@ -58,7 +58,7 @@ macro_rules! split_off_column {
 }
 
 #[derive(Debug, Snafu)]
-#[allow(missing_copy_implementations, missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display(
         "Invalid null mask, expected to be {} bytes but was {}",
@@ -88,7 +88,7 @@ pub struct Column {
 
 /// The data for a column
 #[derive(Debug, Clone)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum ColumnData {
     /// These types contain arrays that contain an element for every logical row
     /// (including nulls).
@@ -857,7 +857,7 @@ mod tests {
     use assert_matches::assert_matches;
     use data_types::IsNan;
     use proptest::prelude::*;
-    use tests::arbitrary::{arbitrary_column, densify, MAX_ROWS};
+    use tests::arbitrary::{MAX_ROWS, arbitrary_column, densify};
 
     use super::*;
 
@@ -868,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::bool_assert_comparison)]
+    #[expect(clippy::bool_assert_comparison)]
     fn test_densify() {
         let input = [None, Some(42), None, None, Some(24)];
 
@@ -935,10 +935,11 @@ mod tests {
         // Before the split
         let batch = RecordBatch::try_new(
             schema.clone().into(),
-            vec![col
-                .clone()
-                .try_into_arrow()
-                .expect("failed to covert column to arrow")],
+            vec![
+                col.clone()
+                    .try_into_arrow()
+                    .expect("failed to covert column to arrow"),
+            ],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -960,10 +961,11 @@ mod tests {
         // After the split, the input column
         let batch = RecordBatch::try_new(
             schema.clone().into(),
-            vec![col
-                .clone()
-                .try_into_arrow()
-                .expect("failed to covert column to arrow")],
+            vec![
+                col.clone()
+                    .try_into_arrow()
+                    .expect("failed to covert column to arrow"),
+            ],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -981,10 +983,11 @@ mod tests {
         // After the split, the split off column
         let batch = RecordBatch::try_new(
             schema.into(),
-            vec![col2
-                .clone()
-                .try_into_arrow()
-                .expect("failed to covert column to arrow")],
+            vec![
+                col2.clone()
+                    .try_into_arrow()
+                    .expect("failed to covert column to arrow"),
+            ],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(

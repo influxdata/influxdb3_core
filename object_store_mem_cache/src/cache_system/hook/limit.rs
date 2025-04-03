@@ -2,16 +2,16 @@
 use std::{
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
-use crate::cache_system::{hook::Hook, DynError};
+use crate::cache_system::{DynError, hook::Hook};
 
 use super::{
-    notify::{Mailbox, Notifier},
     EvictResult, HookDecision,
+    notify::{Mailbox, Notifier},
 };
 
 /// Memory limiter.

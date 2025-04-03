@@ -15,7 +15,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 /// Error for [`PartitionSnapshot`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Error decoding PartitionFile: {source}"))]
     FileDecode {

@@ -1,7 +1,6 @@
 //! Shared InfluxDB IOx API client functionality
 
 #![warn(missing_docs)]
-#![allow(clippy::missing_docs_in_private_items)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;

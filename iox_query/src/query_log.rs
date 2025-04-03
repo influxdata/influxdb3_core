@@ -4,17 +4,22 @@ use crate::exec::IOxSessionContext;
 use crate::memory_pool::Monitor;
 use crate::physical_optimizer::ParquetFileMetrics;
 use data_types::NamespaceId;
-use datafusion::physical_plan::{metrics::MetricValue, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, metrics::MetricValue};
 use iox_query_params::StatementParams;
 use iox_time::{Time, TimeProvider};
+use metric::{
+    DurationHistogram, Metric, MetricObserver, U64Counter, U64Gauge, U64Histogram,
+    U64HistogramOptions,
+};
 use observability_deps::tracing::{info, warn};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    ops::DerefMut,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -133,14 +138,6 @@ pub struct IngesterMetrics {
     pub response_size: u64,
 }
 
-impl std::fmt::Display for IngesterMetrics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IngesterMetrics {{ latency_to_plan = {:?}, latency_to_full_data = {:?}, response_rows = {}, partition_count = {}, response_size = {} }}",
-            self.latency_to_plan, self.latency_to_full_data, self.response_rows, self.partition_count, self.response_size
-        )
-    }
-}
-
 /// State of a [`QueryLogEntry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLogEntryState {
@@ -174,14 +171,13 @@ pub struct QueryLogEntryState {
     /// Number of parquet files processed by the query.
     pub parquet_files: Option<u64>,
 
-    /// Duration it took to acquire a semaphore permit, relative to [`issue_time`](Self::issue_time).
+    /// Duration it took to acquire a semaphore permit.
     pub permit_duration: Option<Duration>,
 
-    /// Duration it took to plan the query, relative to [`issue_time`](Self::issue_time) + [`permit_duration`](Self::permit_duration).
+    /// Duration it took to plan the query.
     pub plan_duration: Option<Duration>,
 
-    /// Duration it took to execute the query, relative to [`issue_time`](Self::issue_time) +
-    /// [`permit_duration`](Self::permit_duration) + [`plan_duration`](Self::plan_duration).
+    /// Duration it took to execute the query.
     pub execute_duration: Option<Duration>,
 
     /// Duration from [`issue_time`](Self::issue_time) til the query ended somehow.
@@ -213,6 +209,119 @@ pub struct QueryLogEntryState {
     pub deduplicated_partitions: Option<u64>,
 }
 
+/// Unpack an option of a struct into a individual members.
+///
+/// # Example
+/// ```
+/// # use iox_query::optional_struct;
+/// struct S {
+///     a: u8,
+///     b: String,
+/// }
+///
+/// let s_some: Option<S> = Some(S {
+///     a: 1,
+///     b: "foo".to_owned(),
+/// });
+///
+/// optional_struct! {
+///     S {
+///         a,
+///         b,
+///     } = s_some
+/// };
+///
+/// assert_eq!(
+///     format!("{a:?}"),
+///     "Some(1)",
+/// );
+/// assert_eq!(
+///     format!("{b:?}"),
+///     "Some(\"foo\")",
+/// );
+/// ```
+///
+/// This however will fail to compile because you forgot a field:
+///
+/// ```compile_fail
+/// # use iox_query::optional_struct;
+/// struct S {
+///     a: u8,
+///     b: String,
+/// }
+///
+/// let s_some: Option<S> = Some(S {
+///     a: 1,
+///     b: "foo".to_owned(),
+/// });
+///
+/// optional_struct! {
+///     S {
+///         a,
+///         // b is missing
+///     } = s_some
+/// };
+/// ```
+#[macro_export]
+macro_rules! optional_struct {
+    ($sname:ident {$($fname:ident),*$(,)?} = $s:ident) => {
+        let ($($fname),*) = match $s {
+            Some($sname {$($fname),*}) => ($(Some($fname)),*),
+            None => Default::default(),
+        };
+    }
+}
+
+/// Write `variable` to `metric` (using [`RecordMetricByRef`]) if it is `Some` but was previously `None`.
+macro_rules! record_metric_if_now_set {
+    ($variable:ident, $prev_state:ident, $metric:ident) => {
+        if let (Some(variable), None) = ($variable, $prev_state.and_then(|s| s.$variable.as_ref()))
+        {
+            $metric.$variable.record_ref(variable);
+        }
+    };
+}
+
+/// Helper trait for [`record_metric_if_now_set`].
+trait RecordMetricByRef<V> {
+    fn record_ref(&self, v: &V);
+}
+
+impl RecordMetricByRef<u64> for U64Histogram {
+    fn record_ref(&self, v: &u64) {
+        self.record(*v);
+    }
+}
+
+impl RecordMetricByRef<i64> for U64Histogram {
+    fn record_ref(&self, v: &i64) {
+        self.record(*v as u64);
+    }
+}
+
+impl RecordMetricByRef<Duration> for DurationHistogram {
+    fn record_ref(&self, v: &Duration) {
+        self.record(*v);
+    }
+}
+
+impl RecordMetricByRef<IngesterMetrics> for MetricsIngesterMetrics {
+    fn record_ref(&self, v: &IngesterMetrics) {
+        let IngesterMetrics {
+            latency_to_plan,
+            latency_to_full_data,
+            response_rows,
+            partition_count,
+            response_size,
+        } = v;
+        self.latency_to_plan.record(*latency_to_plan);
+        self.latency_to_full_data.record(*latency_to_full_data);
+        self.response_rows.record(*response_rows);
+        self.partition_count.record(*partition_count);
+        self.response_size.record(*response_size);
+    }
+}
+
 /// Information about a single query that was executed
 #[derive(Debug)]
 pub struct QueryLogEntry {
@@ -226,13 +335,34 @@ impl QueryLogEntry {
         Arc::clone(&self.state.lock())
     }
 
-    fn set(&self, state: QueryLogEntryState) {
-        *self.state.lock() = Arc::new(state);
+    /// Sets new state and call [`emit`](Self::emit).
+    fn set_and_emit(&self, state: QueryLogEntryState, metrics: &Metrics) {
+        let mut state = Arc::new(state);
+        std::mem::swap(self.state.lock().deref_mut(), &mut state);
+        self.emit(metrics, Some(state));
+    }
+
+    /// Emit entry to various systems.
+    ///
+    /// You should usually call [`set_and_emit`](Self::set_and_emit), but directly calling this method is OK for new
+    /// entries (in which case the previous state is `None`).
+    fn emit(&self, metrics: &Metrics, prev_state: Option<Arc<QueryLogEntryState>>) {
+        let state = self.state();
+
+        // sanity-check
+        if let Some(prev_state) = &prev_state {
+            assert_ne!(
+                state.phase, prev_state.phase,
+                "must NOT emit the same phase twice!",
+            );
+        }
+
+        Self::emit_log(&state);
+        Self::emit_metrics(metrics, &state, prev_state.as_deref());
     }
 
     /// Log entry.
-    fn log(&self) {
-        let state = self.state();
+    fn emit_log(state: &QueryLogEntryState) {
         let QueryLogEntryState {
             id,
             namespace_id,
@@ -256,7 +386,17 @@ impl QueryLogEntry {
             ingester_metrics,
             deduplicated_parquet_files,
             deduplicated_partitions,
-        } = state.as_ref();
+        } = state;
+
+        optional_struct!(
+            IngesterMetrics {
+                latency_to_plan,
+                latency_to_full_data,
+                response_rows,
+                partition_count,
+                response_size,
+            } = ingester_metrics
+        );
 
         info!(
             when=phase.name(),
@@ -278,12 +418,68 @@ impl QueryLogEntry {
             end2end_duration_secs=end2end_duration.map(|d| d.as_secs_f64()),
             compute_duration_secs=compute_duration.map(|d| d.as_secs_f64()),
             max_memory=max_memory,
-            ingester_metrics=ingester_metrics.map(observability_deps::tracing::field::display),
+            ingester_metrics.latency_to_plan_secs=latency_to_plan.map(|d| d.as_secs_f64()),
+            ingester_metrics.latency_to_full_data_secs=latency_to_full_data.map(|d| d.as_secs_f64()),
+            ingester_metrics.response_rows=response_rows,
+            ingester_metrics.partition_count=partition_count,
+            ingester_metrics.response_size=response_size,
             success=success,
             running=running,
             cancelled=(*phase == QueryPhase::Cancel),
             "query",
         )
+    }
+
+    /// Emit entry to metrics.
+    ///
+    /// This only emits attributes that have changed from the previous state.
+    fn emit_metrics(
+        metrics: &Metrics,
+        state: &QueryLogEntryState,
+        prev_state: Option<&QueryLogEntryState>,
+    ) {
+        let QueryLogEntryState {
+            id: _,
+            namespace_id: _,
+            namespace_name: _,
+            query_type: _,
+            query_text: _,
+            query_params: _,
+            trace_id: _,
+            issue_time: _,
+            partitions,
+            parquet_files,
+            permit_duration,
+            plan_duration,
+            execute_duration,
+            end2end_duration,
+            compute_duration,
+            max_memory,
+            success: _,
+            running: _,
+            phase,
+            ingester_metrics,
+            deduplicated_parquet_files,
+            deduplicated_partitions,
+        } = state;
+
+        metrics.phase_entered.get(*phase).inc(1);
+        metrics.phase_current.get(*phase).inc(1);
+        if let Some(prev_state) = prev_state {
+            metrics.phase_current.get(prev_state.phase).dec(1);
+        }
+
+        record_metric_if_now_set!(partitions, prev_state, metrics);
+        record_metric_if_now_set!(parquet_files, prev_state, metrics);
+        record_metric_if_now_set!(permit_duration, prev_state, metrics);
+        record_metric_if_now_set!(plan_duration, prev_state, metrics);
+        record_metric_if_now_set!(execute_duration, prev_state, metrics);
+        record_metric_if_now_set!(end2end_duration, prev_state, metrics);
+        record_metric_if_now_set!(compute_duration, prev_state, metrics);
+        record_metric_if_now_set!(max_memory, prev_state, metrics);
+        record_metric_if_now_set!(ingester_metrics, prev_state, metrics);
+        record_metric_if_now_set!(deduplicated_parquet_files, prev_state, metrics);
+        record_metric_if_now_set!(deduplicated_partitions, prev_state, metrics);
     }
 }
 
@@ -307,19 +503,30 @@ pub struct QueryLog {
     max_size: usize,
     evicted: AtomicUsize,
     time_provider: Arc<dyn TimeProvider>,
+    metrics: Arc<Metrics>,
     id_gen: IDGen,
 }
 
 impl QueryLog {
     /// Create a new QueryLog that can hold at most `size` items.
     /// When the `size+1` item is added, item `0` is evicted.
-    pub fn new(max_size: usize, time_provider: Arc<dyn TimeProvider>) -> Self {
-        Self::new_with_id_gen(max_size, time_provider, Box::new(Uuid::new_v4))
+    pub fn new(
+        max_size: usize,
+        time_provider: Arc<dyn TimeProvider>,
+        metric_registry: &metric::Registry,
+    ) -> Self {
+        Self::new_with_id_gen(
+            max_size,
+            time_provider,
+            metric_registry,
+            Box::new(Uuid::new_v4),
+        )
     }
 
     pub fn new_with_id_gen(
         max_size: usize,
         time_provider: Arc<dyn TimeProvider>,
+        metric_registry: &metric::Registry,
         id_gen: IDGen,
     ) -> Self {
         Self {
@@ -327,6 +534,7 @@ impl QueryLog {
             max_size,
             evicted: AtomicUsize::new(0),
             time_provider,
+            metrics: Arc::new(Metrics::new(metric_registry)),
             id_gen,
         }
     }
@@ -366,11 +574,12 @@ impl QueryLog {
                 deduplicated_partitions: Default::default(),
             })),
         });
-        entry.log();
+        entry.emit(&self.metrics, None);
 
         let token = QueryCompletedToken {
             entry: Some(Arc::clone(&entry)),
             time_provider: Arc::clone(&self.time_provider),
+            metrics: Arc::clone(&self.metrics),
             state: Default::default(),
         };
 
@@ -476,7 +685,7 @@ impl State for StatePermit {
 /// a `QueryNamespace`. It is used to trigger side-effects (such as query timing)
 /// on query completion.
 #[derive(Debug)]
-#[allow(private_bounds)]
+#[expect(private_bounds)]
 pub struct QueryCompletedToken<S>
 where
     S: State,
@@ -489,11 +698,14 @@ where
     /// Time provider
     time_provider: Arc<dyn TimeProvider>,
 
+    /// Metrics
+    metrics: Arc<Metrics>,
+
     /// Current state.
     state: S,
 }
 
-#[allow(private_bounds)]
+#[expect(private_bounds)]
 impl<S> QueryCompletedToken<S>
 where
     S: State,
@@ -528,6 +740,25 @@ where
             state.ingester_metrics = Some(collect_ingester_metrics(plan.as_ref()));
         }
     }
+
+    /// Called when a terminal/final state ([fail](QueryPhase::Fail), [success](QueryPhase::Success),
+    /// [cancel](QueryPhase::Cancel)) occurred. The query will NOT be used anymore afterwards.
+    fn done(&self, entry: Arc<QueryLogEntry>, mut state: QueryLogEntryState) {
+        if state.phase != QueryPhase::Fail && state.execute_duration.is_none() {
+            state.phase = QueryPhase::Cancel;
+
+            if state.permit_duration.is_some() {
+                // started computation, collect partial stats
+                self.collect_execution_data(&mut state);
+            }
+        }
+
+        let now = self.time_provider.now();
+        set_relative(state.issue_time, now, &mut state.end2end_duration);
+        state.running = false;
+
+        entry.set_and_emit(state, &self.metrics);
+    }
 }
 
 impl QueryCompletedToken<StateReceived> {
@@ -555,12 +786,12 @@ impl QueryCompletedToken<StateReceived> {
             Some(u64::try_from(deduplicated_parquet_files).expect("Is this computer 128-bit??"));
         state.deduplicated_partitions =
             Some(u64::try_from(deduplicated_partitions).expect("Is this computer 128-bit??"));
-        entry.set(state);
-        entry.log();
+        entry.set_and_emit(state, &self.metrics);
 
         QueryCompletedToken {
             entry: Some(entry),
             time_provider: Arc::clone(&self.time_provider),
+            metrics: Arc::clone(&self.metrics),
             state: StatePlanned {
                 plan,
                 memory_monitor: Arc::clone(ctx.memory_monitor()),
@@ -569,12 +800,12 @@ impl QueryCompletedToken<StateReceived> {
     }
 
     /// Record that this query failed during planning.
-    pub fn fail(self) {
-        let entry = self.entry.as_ref().expect("valid state");
+    pub fn fail(mut self) {
+        let entry = self.entry.take().expect("valid state");
         let mut state = entry.state().as_ref().clone();
         self.set_time(&mut state);
         state.phase = QueryPhase::Fail;
-        entry.set(state);
+        self.done(entry, state);
     }
 
     fn set_time(&self, state: &mut QueryLogEntryState) {
@@ -596,12 +827,12 @@ impl QueryCompletedToken<StatePlanned> {
             set_relative(origin, now, &mut state.permit_duration);
         }
         state.phase = QueryPhase::Permit;
-        entry.set(state);
-        entry.log();
+        entry.set_and_emit(state, &self.metrics);
 
         QueryCompletedToken {
             entry: Some(entry),
             time_provider: Arc::clone(&self.time_provider),
+            metrics: Arc::clone(&self.metrics),
             state: StatePermit {
                 plan: Arc::clone(&self.state.plan),
                 memory_monitor: Arc::clone(&self.state.memory_monitor),
@@ -612,8 +843,8 @@ impl QueryCompletedToken<StatePlanned> {
 
 impl QueryCompletedToken<StatePermit> {
     /// Record that this query completed successfully
-    pub fn success(self) {
-        let entry = self.entry.as_ref().expect("valid state");
+    pub fn success(mut self) {
+        let entry = self.entry.take().expect("valid state");
         let mut state = entry.state().as_ref().clone();
 
         state.success = true;
@@ -623,8 +854,8 @@ impl QueryCompletedToken<StatePermit> {
     }
 
     /// Record that the query finished execution with an error.
-    pub fn fail(self) {
-        let entry = self.entry.as_ref().expect("valid state");
+    pub fn fail(mut self) {
+        let entry = self.entry.take().expect("valid state");
         let mut state = entry.state().as_ref().clone();
 
         state.phase = QueryPhase::Fail;
@@ -632,7 +863,7 @@ impl QueryCompletedToken<StatePermit> {
         self.finish(entry, state)
     }
 
-    fn finish(&self, entry: &Arc<QueryLogEntry>, mut state: QueryLogEntryState) {
+    fn finish(&self, entry: Arc<QueryLogEntry>, mut state: QueryLogEntryState) {
         if let (Some(permit_duration), Some(plan_duration)) =
             (state.permit_duration, state.plan_duration)
         {
@@ -642,7 +873,7 @@ impl QueryCompletedToken<StatePermit> {
         }
 
         self.collect_execution_data(&mut state);
-        entry.set(state);
+        self.done(entry, state);
     }
 }
 
@@ -652,23 +883,8 @@ where
 {
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            let mut state = entry.state().as_ref().clone();
-
-            if state.phase != QueryPhase::Fail && state.execute_duration.is_none() {
-                state.phase = QueryPhase::Cancel;
-
-                if state.permit_duration.is_some() {
-                    // started computation, collect partial stats
-                    self.collect_execution_data(&mut state);
-                }
-            }
-
-            let now = self.time_provider.now();
-            set_relative(state.issue_time, now, &mut state.end2end_duration);
-            state.running = false;
-
-            entry.set(state);
-            entry.log();
+            let state = entry.state().as_ref().clone();
+            self.done(entry, state);
         }
     }
 }
@@ -815,20 +1031,248 @@ fn collect_ingester_metrics(plan: &dyn ExecutionPlan) -> IngesterMetrics {
 
 #[derive(Debug)]
 pub struct PermitAndToken {
-    #[allow(dead_code)]
     pub permit: InstrumentedAsyncOwnedSemaphorePermit,
     pub query_completed_token: QueryCompletedToken<StatePermit>,
+}
+
+/// A metric keyed by [`QueryPhase`].
+#[derive(Debug)]
+struct PhaseMetric<T>
+where
+    T: MetricObserver<Recorder = T>,
+{
+    received: T,
+    planned: T,
+    permit: T,
+    cancel: T,
+    success: T,
+    fail: T,
+}
+
+impl<T> PhaseMetric<T>
+where
+    T: MetricObserver<Recorder = T>,
+{
+    fn new(metric: Metric<T>) -> Self {
+        Self {
+            received: metric.recorder(&[("phase", "received")]),
+            planned: metric.recorder(&[("phase", "planned")]),
+            permit: metric.recorder(&[("phase", "permit")]),
+            cancel: metric.recorder(&[("phase", "cancel")]),
+            success: metric.recorder(&[("phase", "success")]),
+            fail: metric.recorder(&[("phase", "fail")]),
+        }
+    }
+
+    fn get(&self, phase: QueryPhase) -> &T {
+        match phase {
+            QueryPhase::Received => &self.received,
+            QueryPhase::Planned => &self.planned,
+            QueryPhase::Permit => &self.permit,
+            QueryPhase::Cancel => &self.cancel,
+            QueryPhase::Success => &self.success,
+            QueryPhase::Fail => &self.fail,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Metrics {
+    phase_entered: PhaseMetric<U64Counter>,
+    phase_current: PhaseMetric<U64Gauge>,
+    partitions: U64Histogram,
+    parquet_files: U64Histogram,
+    permit_duration: DurationHistogram,
+    plan_duration: DurationHistogram,
+    execute_duration: DurationHistogram,
+    end2end_duration: DurationHistogram,
+    compute_duration: DurationHistogram,
+    max_memory: U64Histogram,
+    ingester_metrics: MetricsIngesterMetrics,
+    deduplicated_parquet_files: U64Histogram,
+    deduplicated_partitions: U64Histogram,
+}
+
+impl Metrics {
+    fn new(registry: &metric::Registry) -> Self {
+        Self {
+            phase_entered: PhaseMetric::new(registry.register_metric(
+                "influxdb_iox_query_log_phase_entered",
+                "Number of queries that entered the given phase",
+            )),
+            phase_current: PhaseMetric::new(registry.register_metric(
+                "influxdb_iox_query_log_phase_current",
+                "Number of queries that currently in the given phase",
+            )),
+            partitions: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_partitions",
+                    "Number of partitions processed by the query",
+                    || U64HistogramOptions::new([0, 1, 10, 100, 1_000, 10_000, u64::MAX]),
+                )
+                .recorder([]),
+            parquet_files: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_parquet_files",
+                    "Number of parquet files processed by the query",
+                    || U64HistogramOptions::new([0, 1, 10, 100, 1_000, 10_000, u64::MAX]),
+                )
+                .recorder([]),
+            permit_duration: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_permit_duration",
+                    "Duration it took to acquire a semaphore permit",
+                )
+                .recorder([]),
+            plan_duration: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_plan_duration",
+                    "Duration it took to plan the query",
+                )
+                .recorder([]),
+            execute_duration: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_execute_duration",
+                    "Duration it took to execute the query",
+                )
+                .recorder([]),
+            end2end_duration: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_end2end_duration",
+                    "Duration from `issue_time` til the query ended somehow",
+                )
+                .recorder([]),
+            compute_duration: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_compute_duration",
+                    "CPU duration spend for computation",
+                )
+                .recorder([]),
+            max_memory: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_max_memory",
+                    "Peak memory allocated for processing the query",
+                    || {
+                        U64HistogramOptions::new([
+                            // bytes
+                            0,
+                            1,
+                            10,
+                            100,
+                            // kilobytes
+                            1_000,
+                            10_000,
+                            100_000,
+                            // megabytes
+                            1_000_000,
+                            10_000_000,
+                            100_000_000,
+                            // gigabytes
+                            1_000_000_000,
+                            10_000_000_000,
+                            100_000_000_000,
+                            // inf
+                            u64::MAX,
+                        ])
+                    },
+                )
+                .recorder([]),
+            ingester_metrics: MetricsIngesterMetrics::new(registry),
+            deduplicated_parquet_files: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_deduplicated_parquet_files",
+                    "The number of files that are held under a `DeduplicateExec`",
+                    || U64HistogramOptions::new([0, 1, 10, 100, 1_000, 10_000, u64::MAX]),
+                )
+                .recorder([]),
+            deduplicated_partitions: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_deduplicated_partitions",
+                    "The number of partitions that are held under a `DeduplicateExec`",
+                    || U64HistogramOptions::new([0, 1, 10, 100, 1_000, 10_000, u64::MAX]),
+                )
+                .recorder([]),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MetricsIngesterMetrics {
+    latency_to_plan: DurationHistogram,
+    latency_to_full_data: DurationHistogram,
+    response_rows: U64Histogram,
+    partition_count: U64Histogram,
+    response_size: U64Histogram,
+}
+
+impl MetricsIngesterMetrics {
+    fn new(registry: &metric::Registry) -> Self {
+        Self {
+            latency_to_plan: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_ingester_latency_to_plan",
+                    "when the querier has enough information from all ingesters so that it can proceed with query planning",
+                )
+                .recorder([]),
+            latency_to_full_data: registry
+                .register_metric::<DurationHistogram>(
+                    "influxdb_iox_query_log_ingester_latency_to_full_data",
+                    "measured from the initial request, when the querier has all the data from all ingesters",
+                )
+                .recorder([]),
+            response_rows: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_ingester_response_rows",
+                    "ingester response rows",
+                    || U64HistogramOptions::new([0, 1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, u64::MAX]),
+                )
+                .recorder([]),
+            partition_count: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_ingester_partition_count",
+                    "ingester partition count",
+                    || U64HistogramOptions::new([0, 1, 10, 100, 1_000, 10_000, 100_000, u64::MAX]),
+                )
+                .recorder([]),
+            response_size: registry
+                .register_metric_with_options::<U64Histogram, _>(
+                    "influxdb_iox_query_log_ingester_response_size",
+                    "ingester record batch size in bytes",
+                    || U64HistogramOptions::new([
+                        // bytes
+                        0,
+                        1,
+                        10,
+                        100,
+                        // kilobytes
+                        1_000,
+                        10_000,
+                        100_000,
+                        // megabytes
+                        1_000_000,
+                        10_000_000,
+                        100_000_000,
+                        // gigabytes
+                        1_000_000_000,
+                        // inf
+                        u64::MAX,
+                    ]),
+                )
+                .recorder([]),
+        }
+    }
 }
 
 #[cfg(test)]
 mod test_super {
     use datafusion::error::DataFusionError;
     use iox_query_params::params;
+    use itertools::Itertools;
     use std::sync::atomic::AtomicU64;
 
     use datafusion::physical_plan::{
-        metrics::{MetricValue, MetricsSet},
         DisplayAs, Metric,
+        metrics::{MetricValue, MetricsSet},
     };
     use iox_time::MockProvider;
     use test_helpers::tracing::TracingCapture;
@@ -841,6 +1285,7 @@ mod test_super {
 
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -848,6 +1293,256 @@ mod test_super {
 
         let expected = start_state;
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 0
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 0
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0
+        influxdb_iox_query_log_end2end_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 0
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 0
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 1
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_plan_duration_seconds_sum 0
+        influxdb_iox_query_log_plan_duration_seconds_count 0
+        "##);
 
         time_provider.inc(Duration::from_millis(1));
         let ctx = IOxSessionContext::with_testing();
@@ -863,6 +1558,256 @@ mod test_super {
             ..expected
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0
+        influxdb_iox_query_log_end2end_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 1
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
         time_provider.inc(Duration::from_millis(10));
         let token = token.permit();
@@ -873,6 +1818,256 @@ mod test_super {
             ..expected
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0
+        influxdb_iox_query_log_end2end_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_permit_duration_seconds_sum 0.01
+        influxdb_iox_query_log_permit_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 1
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
         time_provider.inc(Duration::from_millis(100));
         token.success();
@@ -889,16 +2084,265 @@ mod test_super {
             ..expected
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_compute_duration_seconds_sum 1.337
+        influxdb_iox_query_log_compute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.111
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_execute_duration_seconds_sum 0.1
+        influxdb_iox_query_log_execute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 1
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 1
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 1
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 1
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 1
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_permit_duration_seconds_sum 0.01
+        influxdb_iox_query_log_permit_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 1
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 1
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = true; running = false; cancelled = false;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics.latency_to_plan_secs = 0.0; ingester_metrics.latency_to_full_data_secs = 0.0; ingester_metrics.response_rows = 0; ingester_metrics.partition_count = 0; ingester_metrics.response_size = 0; success = true; running = false; cancelled = false;
+        "#);
     }
 
     #[test]
@@ -917,6 +2361,7 @@ mod test_super {
         );
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -924,6 +2369,256 @@ mod test_super {
 
         let expected = start_state;
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 0
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 0
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0
+        influxdb_iox_query_log_end2end_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 0
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 0
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 1
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_plan_duration_seconds_sum 0
+        influxdb_iox_query_log_plan_duration_seconds_count 0
+        "##);
 
         time_provider.inc(Duration::from_millis(1));
         let ctx = IOxSessionContext::with_testing();
@@ -940,6 +2635,256 @@ mod test_super {
             ..expected
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0
+        influxdb_iox_query_log_end2end_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 1
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
         time_provider.inc(Duration::from_millis(10));
         let token = token.permit();
@@ -950,6 +2895,256 @@ mod test_super {
             ..expected
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0
+        influxdb_iox_query_log_end2end_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_permit_duration_seconds_sum 0.01
+        influxdb_iox_query_log_permit_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 1
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
         time_provider.inc(Duration::from_millis(100));
         token.success();
@@ -966,16 +3161,265 @@ mod test_super {
             ..expected
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_compute_duration_seconds_sum 1.337
+        influxdb_iox_query_log_compute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.111
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_execute_duration_seconds_sum 0.1
+        influxdb_iox_query_log_execute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 1
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 1
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 1
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 1
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 1
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_permit_duration_seconds_sum 0.01
+        influxdb_iox_query_log_permit_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 1
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 1
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = true; running = false; cancelled = false;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "success"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT $a;; query_params = Params { "a" => TRUE, }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics.latency_to_plan_secs = 0.0; ingester_metrics.latency_to_full_data_secs = 0.0; ingester_metrics.response_rows = 0; ingester_metrics.partition_count = 0; ingester_metrics.response_size = 0; success = true; running = false; cancelled = false;
+        "#);
     }
 
     #[test]
@@ -984,6 +3428,7 @@ mod test_super {
 
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -1000,14 +3445,263 @@ mod test_super {
             ..start_state
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 0
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 0
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.001
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 0
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 0
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 1
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; end2end_duration_secs = 0.001; success = false; running = false; cancelled = false;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; plan_duration_secs = 0.001; end2end_duration_secs = 0.001; success = false; running = false; cancelled = false;
+        "#);
     }
 
     #[test]
@@ -1016,6 +3710,7 @@ mod test_super {
 
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -1046,16 +3741,265 @@ mod test_super {
             ..start_state
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_compute_duration_seconds_sum 1.337
+        influxdb_iox_query_log_compute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.111
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_execute_duration_seconds_sum 0.1
+        influxdb_iox_query_log_execute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 1
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 1
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 1
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 1
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 1
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_permit_duration_seconds_sum 0.01
+        influxdb_iox_query_log_permit_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 0
+        influxdb_iox_query_log_phase_current{phase="fail"} 1
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = false; running = false; cancelled = false;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "fail"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; execute_duration_secs = 0.1; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics.latency_to_plan_secs = 0.0; ingester_metrics.latency_to_full_data_secs = 0.0; ingester_metrics.response_rows = 0; ingester_metrics.partition_count = 0; ingester_metrics.response_size = 0; success = false; running = false; cancelled = false;
+        "#);
     }
 
     #[test]
@@ -1064,6 +4008,7 @@ mod test_super {
 
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -1079,14 +4024,263 @@ mod test_super {
             ..start_state
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 0
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 0
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.001
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 0
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 0
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 0
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10"} 0
+        influxdb_iox_query_log_partitions_bucket{le="100"} 0
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 0
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 0
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 0
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 1
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_plan_duration_seconds_sum 0
+        influxdb_iox_query_log_plan_duration_seconds_count 0
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; end2end_duration_secs = 0.001; success = false; running = false; cancelled = true;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; end2end_duration_secs = 0.001; success = false; running = false; cancelled = true;
+        "#);
     }
 
     #[test]
@@ -1095,6 +4289,7 @@ mod test_super {
 
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -1118,15 +4313,264 @@ mod test_super {
             ..start_state
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_compute_duration_seconds_sum 0
+        influxdb_iox_query_log_compute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.011
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 0
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 0
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 0
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 0
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 0
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 0
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 0
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_permit_duration_seconds_sum 0
+        influxdb_iox_query_log_permit_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 1
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; end2end_duration_secs = 0.011; success = false; running = false; cancelled = true;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; end2end_duration_secs = 0.011; success = false; running = false; cancelled = true;
+        "#);
     }
 
     #[test]
@@ -1135,6 +4579,7 @@ mod test_super {
 
         let Test {
             time_provider,
+            metric_registry,
             token,
             entry,
             start_state,
@@ -1165,20 +4610,270 @@ mod test_super {
             ..start_state
         };
         assert_eq!(entry.state().as_ref(), &expected,);
+        insta::assert_snapshot!(
+            format_metrics(&metric_registry),
+            @r##"
+        # HELP influxdb_iox_query_log_compute_duration_seconds CPU duration spend for computation
+        # TYPE influxdb_iox_query_log_compute_duration_seconds histogram
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_compute_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_compute_duration_seconds_sum 1.337
+        influxdb_iox_query_log_compute_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_deduplicated_parquet_files The number of files that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_parquet_files histogram
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_parquet_files_sum 0
+        influxdb_iox_query_log_deduplicated_parquet_files_count 1
+        # HELP influxdb_iox_query_log_deduplicated_partitions The number of partitions that are held under a `DeduplicateExec`
+        # TYPE influxdb_iox_query_log_deduplicated_partitions histogram
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_deduplicated_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_deduplicated_partitions_sum 0
+        influxdb_iox_query_log_deduplicated_partitions_count 1
+        # HELP influxdb_iox_query_log_end2end_duration_seconds Duration from `issue_time` til the query ended somehow
+        # TYPE influxdb_iox_query_log_end2end_duration_seconds histogram
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_end2end_duration_seconds_sum 0.111
+        influxdb_iox_query_log_end2end_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_execute_duration_seconds Duration it took to execute the query
+        # TYPE influxdb_iox_query_log_execute_duration_seconds histogram
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.01"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.025"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.05"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.25"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="0.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="1"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="2.5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="5"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="10"} 0
+        influxdb_iox_query_log_execute_duration_seconds_bucket{le="inf"} 0
+        influxdb_iox_query_log_execute_duration_seconds_sum 0
+        influxdb_iox_query_log_execute_duration_seconds_count 0
+        # HELP influxdb_iox_query_log_ingester_latency_to_full_data_seconds measured from the initial request, when the querier has all the data from all ingesters
+        # TYPE influxdb_iox_query_log_ingester_latency_to_full_data_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_full_data_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_latency_to_plan_seconds when the querier has enough information from all ingesters so that it can proceed with query planning
+        # TYPE influxdb_iox_query_log_ingester_latency_to_plan_seconds histogram
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_sum 0
+        influxdb_iox_query_log_ingester_latency_to_plan_seconds_count 1
+        # HELP influxdb_iox_query_log_ingester_partition_count ingester partition count
+        # TYPE influxdb_iox_query_log_ingester_partition_count histogram
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_partition_count_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_partition_count_sum 0
+        influxdb_iox_query_log_ingester_partition_count_count 1
+        # HELP influxdb_iox_query_log_ingester_response_rows ingester response rows
+        # TYPE influxdb_iox_query_log_ingester_response_rows histogram
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_rows_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_rows_sum 0
+        influxdb_iox_query_log_ingester_response_rows_count 1
+        # HELP influxdb_iox_query_log_ingester_response_size ingester record batch size in bytes
+        # TYPE influxdb_iox_query_log_ingester_response_size histogram
+        influxdb_iox_query_log_ingester_response_size_bucket{le="0"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="10000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="100000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_ingester_response_size_bucket{le="inf"} 1
+        influxdb_iox_query_log_ingester_response_size_sum 0
+        influxdb_iox_query_log_ingester_response_size_count 1
+        # HELP influxdb_iox_query_log_max_memory Peak memory allocated for processing the query
+        # TYPE influxdb_iox_query_log_max_memory histogram
+        influxdb_iox_query_log_max_memory_bucket{le="0"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="1000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="10000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="100000000000"} 1
+        influxdb_iox_query_log_max_memory_bucket{le="inf"} 1
+        influxdb_iox_query_log_max_memory_sum 0
+        influxdb_iox_query_log_max_memory_count 1
+        # HELP influxdb_iox_query_log_parquet_files Number of parquet files processed by the query
+        # TYPE influxdb_iox_query_log_parquet_files histogram
+        influxdb_iox_query_log_parquet_files_bucket{le="0"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="100"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="1000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="10000"} 1
+        influxdb_iox_query_log_parquet_files_bucket{le="inf"} 1
+        influxdb_iox_query_log_parquet_files_sum 0
+        influxdb_iox_query_log_parquet_files_count 1
+        # HELP influxdb_iox_query_log_partitions Number of partitions processed by the query
+        # TYPE influxdb_iox_query_log_partitions histogram
+        influxdb_iox_query_log_partitions_bucket{le="0"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10"} 1
+        influxdb_iox_query_log_partitions_bucket{le="100"} 1
+        influxdb_iox_query_log_partitions_bucket{le="1000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="10000"} 1
+        influxdb_iox_query_log_partitions_bucket{le="inf"} 1
+        influxdb_iox_query_log_partitions_sum 0
+        influxdb_iox_query_log_partitions_count 1
+        # HELP influxdb_iox_query_log_permit_duration_seconds Duration it took to acquire a semaphore permit
+        # TYPE influxdb_iox_query_log_permit_duration_seconds histogram
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.001"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.0025"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.005"} 0
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_permit_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_permit_duration_seconds_sum 0.01
+        influxdb_iox_query_log_permit_duration_seconds_count 1
+        # HELP influxdb_iox_query_log_phase_current Number of queries that currently in the given phase
+        # TYPE influxdb_iox_query_log_phase_current gauge
+        influxdb_iox_query_log_phase_current{phase="cancel"} 1
+        influxdb_iox_query_log_phase_current{phase="fail"} 0
+        influxdb_iox_query_log_phase_current{phase="permit"} 0
+        influxdb_iox_query_log_phase_current{phase="planned"} 0
+        influxdb_iox_query_log_phase_current{phase="received"} 0
+        influxdb_iox_query_log_phase_current{phase="success"} 0
+        # HELP influxdb_iox_query_log_phase_entered_total Number of queries that entered the given phase
+        # TYPE influxdb_iox_query_log_phase_entered_total counter
+        influxdb_iox_query_log_phase_entered_total{phase="cancel"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="fail"} 0
+        influxdb_iox_query_log_phase_entered_total{phase="permit"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="planned"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="received"} 1
+        influxdb_iox_query_log_phase_entered_total{phase="success"} 0
+        # HELP influxdb_iox_query_log_plan_duration_seconds Duration it took to plan the query
+        # TYPE influxdb_iox_query_log_plan_duration_seconds histogram
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.001"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.0025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.005"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.01"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.025"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.05"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.25"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="0.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="1"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="2.5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="5"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="10"} 1
+        influxdb_iox_query_log_plan_duration_seconds_bucket{le="inf"} 1
+        influxdb_iox_query_log_plan_duration_seconds_sum 0.001
+        influxdb_iox_query_log_plan_duration_seconds_count 1
+        "##);
 
-        assert_logs(
-            capture,
-            [
-                r#"level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;"#,
-                r#"level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics = IngesterMetrics { latency_to_plan = 0ns, latency_to_full_data = 0ns, response_rows = 0, partition_count = 0, response_size = 0 }; success = false; running = false; cancelled = true;"#,
-            ],
-        );
+        insta::assert_snapshot!(
+            format_logs(capture),
+            @r#"
+        level = INFO; message = query; when = "received"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "planned"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "permit"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; success = false; running = true; cancelled = false;
+        level = INFO; message = query; when = "cancel"; id = 00000000-0000-0000-0000-000000000001; namespace_id = 1; namespace_name = "ns"; query_type = "sql"; query_text = SELECT 1; query_params = Params { }; issue_time = 1970-01-01T00:00:00.100+00:00; partitions = 0; parquet_files = 0; deduplicated_partitions = 0; deduplicated_parquet_files = 0; plan_duration_secs = 0.001; permit_duration_secs = 0.01; end2end_duration_secs = 0.111; compute_duration_secs = 1.337; max_memory = 0; ingester_metrics.latency_to_plan_secs = 0.0; ingester_metrics.latency_to_full_data_secs = 0.0; ingester_metrics.response_rows = 0; ingester_metrics.partition_count = 0; ingester_metrics.response_size = 0; success = false; running = false; cancelled = true;
+        "#);
     }
 
     struct Test {
         time_provider: Arc<MockProvider>,
+        metric_registry: metric::Registry,
         token: QueryCompletedToken<StateReceived>,
         entry: Arc<QueryLogEntry>,
         start_state: QueryLogEntryState,
@@ -1195,10 +4890,12 @@ mod test_super {
         ) -> Self {
             let time_provider =
                 Arc::new(MockProvider::new(Time::from_timestamp_millis(100).unwrap()));
+            let metric_registry = metric::Registry::new();
             let id_counter = AtomicU64::new(1);
             let log = QueryLog::new_with_id_gen(
                 1_000,
                 Arc::clone(&time_provider) as _,
+                &metric_registry,
                 Box::new(move || Uuid::from_u128(id_counter.fetch_add(1, Ordering::SeqCst) as _)),
             );
 
@@ -1240,6 +4937,7 @@ mod test_super {
 
             Self {
                 time_provider,
+                metric_registry,
                 token,
                 entry,
                 start_state,
@@ -1329,19 +5027,19 @@ mod test_super {
         }
     }
 
-    #[track_caller]
-    fn assert_logs<const N: usize>(capture: TracingCapture, expected: [&str; N]) {
+    fn format_logs(capture: TracingCapture) -> String {
         let logs = capture.to_string();
-        let actual = logs
-            .split('\n')
+        logs.split('\n')
             .map(|s| s.trim())
             .filter(|s| s.starts_with("level = INFO;"))
-            .collect::<Vec<_>>();
-        assert!(
-            actual == expected,
-            "Actual:\n{}\n\nExpected:\n{}",
-            actual.join("\n"),
-            expected.join("\n")
-        );
+            .map(|s| s.to_owned())
+            .join("\n")
+    }
+
+    fn format_metrics(registry: &metric::Registry) -> String {
+        let mut out = Vec::<u8>::new();
+        let mut reporter = metric_exporters::PrometheusTextEncoder::new(&mut out);
+        registry.report(&mut reporter);
+        String::from_utf8(out).expect("valid utf8")
     }
 }

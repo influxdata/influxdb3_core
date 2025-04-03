@@ -14,8 +14,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Buf;
@@ -27,9 +27,9 @@ use tower::{Layer, Service};
 
 use observability_deps::tracing::{debug, error};
 use trace::span::{SpanEvent, SpanStatus};
-use trace::{span::SpanRecorder, TraceCollector};
+use trace::{TraceCollector, span::SpanRecorder};
 
-use crate::classify::{classify_headers, classify_response, Classification};
+use crate::classify::{Classification, classify_headers, classify_response};
 use crate::ctx::{RequestLogContext, RequestLogContextExt, TraceHeaderParser};
 use crate::metrics::{MetricsRecorder, RequestMetrics};
 use crate::query_variant::QueryVariantExt;

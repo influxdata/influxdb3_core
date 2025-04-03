@@ -1,13 +1,15 @@
 //! This module implements an in-memory implementation of the iox_catalog interface. It can be
 //! used for testing or for an IOx designed to run without catalog persistence.
 
-use crate::interface::namespace_snapshot_by_name;
+use crate::interface::{
+    CatalogStorage, NamespaceSorting, Paginated, PaginationOptions, TableSorting,
+    namespace_snapshot_by_name,
+};
 use crate::metrics::GetTimeMetric;
 use crate::util::should_delete_partition;
 use crate::{
     constants::{
-        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
-        MAX_PARQUET_L0_FILES_PER_PARTITION,
+        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION, MAX_PARQUET_L0_FILES_PER_PARTITION,
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
@@ -18,18 +20,18 @@ use crate::{
 use async_trait::async_trait;
 use data_types::snapshot::{root::RootSnapshot, table::TableSnapshot};
 use data_types::{
-    partition_template::{
-        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
-    },
     Column, ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace,
     NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage,
     ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId,
     PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, TableWithStorage,
     Timestamp,
+    partition_template::{
+        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
+    },
 };
 use data_types::{
-    snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot},
     NamespaceVersion,
+    snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot},
 };
 use iox_time::TimeProvider;
 use parking_lot::Mutex;
@@ -42,8 +44,6 @@ use std::{
     time::Duration,
 };
 use trace::ctx::SpanContext;
-
-const ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// In-memory catalog that implements the `RepoCollection` and individual repo traits from
 /// the catalog interface.
@@ -156,7 +156,48 @@ pub struct MemTxn {
 }
 
 #[async_trait]
+impl CatalogStorage for crate::mem::MemCatalog {
+    async fn get_namespace_with_storage(
+        &self,
+        id: NamespaceId,
+    ) -> Result<Option<NamespaceWithStorage>> {
+        self.repositories().namespaces().get_storage_by_id(id).await
+    }
+
+    async fn get_namespaces_with_storage(
+        &self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
+        self.repositories()
+            .namespaces()
+            .list_storage(sorting, pagination)
+            .await
+    }
+
+    async fn get_table_with_storage(&self, id: TableId) -> Result<Option<TableWithStorage>> {
+        self.repositories().tables().get_storage_by_id(id).await
+    }
+
+    async fn get_tables_with_storage(
+        &self,
+        namespace_id: NamespaceId,
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>> {
+        self.repositories()
+            .tables()
+            .list_storage_by_namespace_id(namespace_id, sorting, pagination)
+            .await
+    }
+}
+
+#[async_trait]
 impl Catalog for MemCatalog {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -284,10 +325,14 @@ impl NamespaceRepo for MemTxn {
             .collect())
     }
 
-    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+    async fn list_storage(
+        &mut self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
         let stage = self.collections.lock();
 
-        let namespaces_with_storage = stage
+        let mut namespaces_with_storage: Vec<NamespaceWithStorage> = stage
             .namespaces
             .iter()
             .map(|n| {
@@ -315,6 +360,15 @@ impl NamespaceRepo for MemTxn {
             })
             .collect();
 
+        crate::sorting::sort_namespaces(&mut namespaces_with_storage, sorting);
+
+        let pagination = pagination.unwrap_or_default();
+        let namespaces_with_storage = crate::pagination::paginate(
+            namespaces_with_storage,
+            pagination.page_number,
+            pagination.page_size,
+        );
+
         Ok(namespaces_with_storage)
     }
 
@@ -332,14 +386,11 @@ impl NamespaceRepo for MemTxn {
         Ok(res)
     }
 
-    async fn get_by_name(
-        &mut self,
-        name: &str,
-        deleted: SoftDeletedRows,
-    ) -> Result<Option<Namespace>> {
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>> {
         let stage = self.collections.lock();
 
-        let res = filter_namespace_soft_delete(&stage.namespaces, deleted)
+        // always exclude deleted namespaces when querying by name
+        let res = filter_namespace_soft_delete(&stage.namespaces, SoftDeletedRows::ExcludeDeleted)
             .find(|n| n.name == name)
             .map(|x| x.value.clone());
 
@@ -348,7 +399,7 @@ impl NamespaceRepo for MemTxn {
 
     // performs a cascading delete of all things attached to the namespace, then deletes the
     // namespace
-    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<Namespace> {
         let mut stage = self.collections.lock();
         let timestamp = self.time_provider.now();
         // get namespace by name
@@ -356,7 +407,7 @@ impl NamespaceRepo for MemTxn {
             Some(n) => {
                 n.deleted_at = Some(Timestamp::from(timestamp));
                 update_namespace_router_version(n);
-                Ok(n.id)
+                Ok((**n).clone())
             }
             None => Err(Error::NotFound {
                 descr: id.to_string(),
@@ -475,6 +526,38 @@ impl NamespaceRepo for MemTxn {
 
         Ok(namespace_with_storage)
     }
+
+    /// Rename the namespace corresponding to `id`.
+    async fn rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace> {
+        let mut stage = self.collections.lock();
+        let ns = &mut (stage
+            .namespaces
+            .iter_mut()
+            .find(|n| n.id == id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!("namespace: {id}"),
+            })?
+            .value);
+
+        ns.name = new_name.into();
+        ns.router_version = NamespaceVersion::new(ns.router_version.get() + 1);
+        Ok(ns.clone())
+    }
+
+    async fn undelete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        let mut stage = self.collections.lock();
+        let ns = &mut (stage
+            .namespaces
+            .iter_mut()
+            .find(|n| n.id == id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!("namespace: {id}"),
+            })?
+            .value);
+        ns.deleted_at = None;
+        ns.router_version = NamespaceVersion::new(ns.router_version.get() + 1);
+        Ok(ns.clone())
+    }
 }
 
 #[async_trait]
@@ -526,7 +609,7 @@ impl TableRepo for MemTxn {
                 Some(_t) => {
                     return Err(Error::AlreadyExists {
                         descr: format!("table '{name}' in namespace {namespace_id}"),
-                    })
+                    });
                 }
                 None => {
                     let table = Table {
@@ -534,6 +617,8 @@ impl TableRepo for MemTxn {
                         namespace_id,
                         name: name.to_string(),
                         partition_template,
+                        iceberg_enabled: false,
+                        deleted_at: None,
                     };
                     stage.tables.push(table.into());
                     stage.tables.last().unwrap().value.clone()
@@ -611,7 +696,9 @@ impl TableRepo for MemTxn {
     async fn list_storage_by_namespace_id(
         &mut self,
         namespace_id: NamespaceId,
-    ) -> Result<Vec<TableWithStorage>> {
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>> {
         let stage = self.collections.lock();
 
         let mut table_sizes: HashMap<TableId, i64> = HashMap::new();
@@ -624,7 +711,7 @@ impl TableRepo for MemTxn {
                 *entry += f.file_size_bytes;
             });
 
-        let tables_with_storage = stage
+        let mut tables_with_storage: Vec<TableWithStorage> = stage
             .tables
             .iter()
             .filter(|t| t.namespace_id == namespace_id)
@@ -636,6 +723,15 @@ impl TableRepo for MemTxn {
                 size_bytes: *table_sizes.get(&v.value.id).unwrap_or(&0),
             })
             .collect();
+
+        crate::sorting::sort_tables(&mut tables_with_storage, sorting);
+
+        let pagination = pagination.unwrap_or_default();
+        let tables_with_storage = crate::pagination::paginate(
+            tables_with_storage,
+            pagination.page_number,
+            pagination.page_size,
+        );
 
         Ok(tables_with_storage)
     }
@@ -677,6 +773,87 @@ impl TableRepo for MemTxn {
         Ok(TableSnapshot::encode(
             table, partitions, columns, generation,
         )?)
+    }
+
+    async fn list_by_iceberg_enabled(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableId>> {
+        let stage = self.collections.lock();
+        Ok(stage
+            .tables
+            .iter()
+            .filter(|t| t.value.iceberg_enabled && t.namespace_id == namespace_id)
+            .map(|t| t.value.id)
+            .collect())
+    }
+
+    async fn enable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let mut stage = self.collections.lock();
+        for table in &mut stage.tables {
+            if table.id == table_id {
+                table.iceberg_enabled = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn disable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let mut stage = self.collections.lock();
+        for table in &mut stage.tables {
+            if table.id == table_id {
+                table.iceberg_enabled = false;
+            }
+        }
+        Ok(())
+    }
+
+    async fn soft_delete(&mut self, id: TableId) -> Result<Table> {
+        let now = self.time_provider.now();
+        self.find_and_modify_table(id, |table| table.deleted_at = Some(Timestamp::from(now)))
+            .await
+    }
+
+    async fn rename(&mut self, id: TableId, new_name: &str) -> Result<Table> {
+        self.find_and_modify_table(id, |table| table.name = new_name.to_owned())
+            .await
+    }
+
+    async fn undelete(&mut self, id: TableId) -> Result<Table> {
+        self.find_and_modify_table(id, |table| table.deleted_at = None)
+            .await
+    }
+}
+
+impl MemTxn {
+    async fn find_and_modify_table(
+        &mut self,
+        id: TableId,
+        modify: impl FnOnce(&mut Table),
+    ) -> Result<Table> {
+        let mut stage = self.collections.lock();
+
+        let table = stage
+            .tables
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!("No table with id {id} found"),
+            })?;
+
+        modify(&mut *table);
+        let ret_table = (**table).clone();
+
+        let namespace = stage
+            .namespaces
+            .iter_mut()
+            .find(|ns| ns.id == ret_table.namespace_id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!(
+                    "Could not find table's namespace (with id {})",
+                    ret_table.namespace_id
+                ),
+            })?;
+        namespace.router_version = NamespaceVersion::new(namespace.router_version.get() + 1);
+
+        Ok(ret_table)
     }
 }
 
@@ -772,9 +949,25 @@ impl ColumnRepo for MemTxn {
         Ok(columns)
     }
 
-    async fn list(&mut self) -> Result<Vec<Column>> {
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>> {
         let stage = self.collections.lock();
-        Ok(stage.columns.clone())
+
+        let namespaces = filter_namespace_soft_delete(&stage.namespaces, deleted);
+        let namespace_ids: Vec<_> = namespaces.into_iter().map(|x| x.id).collect();
+
+        let table_ids: Vec<_> = stage
+            .tables
+            .iter()
+            .filter(|t| namespace_ids.contains(&t.namespace_id))
+            .map(|t| t.id)
+            .collect();
+
+        Ok(stage
+            .columns
+            .iter()
+            .filter(|c| table_ids.contains(&c.table_id))
+            .cloned()
+            .collect())
     }
 }
 
@@ -1057,7 +1250,10 @@ impl PartitionRepo for MemTxn {
         Ok(old_style)
     }
 
-    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+    async fn delete_by_retention(
+        &mut self,
+        partition_cutoff: Duration,
+    ) -> Result<Vec<(TableId, PartitionId)>> {
         let mut stage = self.collections.lock();
 
         let now = self.time_provider.now();
@@ -1073,7 +1269,7 @@ impl PartitionRepo for MemTxn {
             .map(|x| (x.id, (x.namespace_id, x.partition_template.clone())))
             .collect();
 
-        let older_than = (self.time_provider.now() - ONE_DAY).into();
+        let older_than = (self.time_provider.now() - partition_cutoff).into();
 
         let mut candidates: HashMap<_, _> = stage
             .partitions
@@ -1207,10 +1403,35 @@ impl ParquetFileRepo for MemTxn {
 
         let delete = delete
             .into_iter()
-            .take(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE as usize)
+            // An old default - this method should not really be called due to it being deprecated
+            // in favor of `delete_old_ids_count` so we don't need to worry about changing this
+            // anymore
+            .take(10_000)
             .map(|f| f.object_store_id)
             .collect();
         Ok(delete)
+    }
+
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp, limit: u32) -> Result<u64> {
+        let mut stage = self.collections.lock();
+
+        let (delete, keep): (Vec<_>, Vec<_>) = stage.parquet_files.iter().cloned().partition(
+            |f| matches!(f.to_delete, Some(marked_deleted) if marked_deleted < older_than),
+        );
+
+        stage.parquet_files = keep;
+
+        let to_remove = (limit as usize).min(delete.len());
+        let to_keep = delete.len() - to_remove;
+
+        // We need to re-insert those that we decided to not actually delete.
+        for file in delete.into_iter().rev().take(to_keep) {
+            stage.parquet_files.insert(0, file);
+        }
+
+        Ok(to_remove
+            .try_into()
+            .expect("128-bit computers don't exist yet"))
     }
 
     async fn list_by_partition_not_to_delete_batch(
@@ -1319,7 +1540,10 @@ impl ParquetFileRepo for MemTxn {
         for file in create {
             if file.partition_id != partition_id {
                 return Err(Error::Malformed {
-                    descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
+                    descr: format!(
+                        "Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})",
+                        file.partition_id
+                    ),
                 });
             }
             let res = create_parquet_file(&mut stage, marked_at, file.clone())?;
@@ -1345,6 +1569,7 @@ impl ParquetFileRepo for MemTxn {
                 Some(level) => pf.table_id == table_id && pf.compaction_level == level,
                 None => pf.table_id == table_id,
             })
+            .filter(|pf| pf.to_delete.is_none())
             .cloned()
             .collect())
     }
@@ -1555,7 +1780,7 @@ fn flag_for_delete(
         _ => {
             return Err(Error::NotFound {
                 descr: format!("parquet file {id} not found for delete"),
-            })
+            });
         }
     }
 
@@ -1607,18 +1832,21 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_catalog() {
+    fn setup_catalogue() -> MemCatalog {
         let metrics = Arc::new(metric::Registry::default());
         let time_provider = Arc::new(SystemProvider::new());
 
-        let mem_catalog = MemCatalog::new(metrics, time_provider);
+        MemCatalog::new(metrics, time_provider)
+    }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_catalog() {
+        let mem_catalog = setup_catalogue();
         let collections = Arc::clone(&mem_catalog.collections);
 
         let catalog: Arc<dyn Catalog> = Arc::new(mem_catalog);
 
-        let catalog_reset_fn = || async {
+        let catalog_reset_fn = async || {
             let mut stage = collections.lock();
             stage.clear_all();
 

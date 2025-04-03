@@ -2,19 +2,24 @@
 
 use async_trait::async_trait;
 use data_types::{
+    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
+    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
+    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     snapshot::{
         namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
         table::TableSnapshot,
     },
-    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
-    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
 };
 use iox_time::{AsyncTimeProvider, TimeProvider};
 use snafu::Snafu;
-use std::collections::HashSet;
+use std::{
+    any::Any,
+    collections::HashSet,
+    num::{NonZero, NonZeroUsize},
+    time::Duration,
+};
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use trace::ctx::SpanContext;
 
@@ -43,7 +48,7 @@ impl<T> std::fmt::Display for CasFailure<T> {
 /// the caller can address; an `Unhandled` error likely indiciates a bug in some component called
 /// by the catalog.
 #[derive(Clone, Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("unhandled: {source}"))]
@@ -67,7 +72,7 @@ pub enum Error {
 
 /// Errors the catalog can't handle that get logged and propagated to the caller.
 #[derive(Clone, Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum UnhandledError {
     #[snafu(display("sqlx error: {source}"))]
     Sqlx { source: Arc<sqlx::Error> },
@@ -165,6 +170,15 @@ impl From<data_types::snapshot::root::Error> for Error {
     }
 }
 
+impl From<data_types::ProtoV1AnyWithStorageError> for Error {
+    fn from(e: data_types::ProtoV1AnyWithStorageError) -> Self {
+        UnhandledError::GrpcSerialization {
+            source: Arc::new(e),
+        }
+        .into()
+    }
+}
+
 impl From<catalog_cache::api::quorum::Error> for Error {
     fn from(e: catalog_cache::api::quorum::Error) -> Self {
         UnhandledError::Quorum {
@@ -230,9 +244,401 @@ impl SoftDeletedRows {
     }
 }
 
+/// Possible ways that namespaces can be sorted. Used in the API.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NamespaceSortField {
+    /// Sort by the namespace ID
+    Id = 1,
+    /// Sort by the namespace name
+    Name = 2,
+    /// Sort by the namespace retention period
+    RetentionPeriod = 3,
+    /// Sort by total size of all non-deleted files in the namespace
+    Storage = 4,
+    /// Sort by the number of tables in the namespace
+    TableCount = 5,
+}
+
+impl Default for NamespaceSortField {
+    fn default() -> Self {
+        Self::Id
+    }
+}
+
+impl NamespaceSortField {
+    /// Convert NamespaceSortField to SQL ORDER BY clause
+    pub(crate) fn as_sql_column(&self, namespace_table_alias: Option<&str>) -> String {
+        let namespace_table_alias_dot = namespace_table_alias.map(|alias| format!("{}.", alias));
+        match self {
+            Self::Id => format!("{}id", namespace_table_alias_dot.unwrap_or_default()),
+            Self::Name => format!("{}name", namespace_table_alias_dot.unwrap_or_default()),
+            Self::RetentionPeriod => format!(
+                "{}retention_period_ns",
+                namespace_table_alias_dot.unwrap_or_default()
+            ),
+            // size_bytes is a computed field, so we do not use the alias
+            Self::Storage => "size_bytes".to_string(),
+            // table_count is a computed field, so we do not use the alias
+            Self::TableCount => "table_count".to_string(),
+        }
+    }
+}
+
+impl TryFrom<Option<i32>> for NamespaceSortField {
+    type Error = Error;
+    fn try_from(v: Option<i32>) -> Result<Self, Error> {
+        match v {
+            Some(v) => Self::try_from(v),
+            None => Err(Error::Malformed {
+                descr: "missing sort field: will map to unsorted behavior".to_string(),
+            }),
+        }
+    }
+}
+
+impl From<NamespaceSortField> for i32 {
+    fn from(val: NamespaceSortField) -> Self {
+        val as Self
+    }
+}
+
+impl TryFrom<i32> for NamespaceSortField {
+    type Error = Error;
+    fn try_from(v: i32) -> Result<Self, Error> {
+        Ok(match v {
+            v if v == Self::Id as i32 => Self::Id,
+            v if v == Self::Name as i32 => Self::Name,
+            v if v == Self::RetentionPeriod as i32 => Self::RetentionPeriod,
+            v if v == Self::Storage as i32 => Self::Storage,
+            v if v == Self::TableCount as i32 => Self::TableCount,
+            _ => {
+                return Err(Error::Malformed {
+                    descr: "invalid sort field".to_string(),
+                });
+            }
+        })
+    }
+}
+
+/// Possible directions for sorting
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortDirection {
+    /// Sort ascending (default)
+    Ascending = 1,
+    /// Sort descending
+    Descending = 2,
+}
+
+impl Default for SortDirection {
+    fn default() -> Self {
+        Self::Ascending
+    }
+}
+
+impl std::fmt::Display for SortDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ascending => write!(f, "ASC"),
+            Self::Descending => write!(f, "DESC"),
+        }
+    }
+}
+
+impl From<SortDirection> for i32 {
+    fn from(val: SortDirection) -> Self {
+        val as Self
+    }
+}
+
+impl TryFrom<i32> for SortDirection {
+    type Error = Error;
+    fn try_from(v: i32) -> Result<Self, Error> {
+        Ok(match v {
+            v if v == Self::Ascending as i32 => Self::Ascending,
+            v if v == Self::Descending as i32 => Self::Descending,
+            _ => {
+                return Err(Error::Malformed {
+                    descr: "invalid sort direction".to_string(),
+                });
+            }
+        })
+    }
+}
+
+/// A struct to hold paginated data. It is important to maintain information about the total number
+/// of items in the unpaged data set and the total number of pages. This is useful for clients to know
+/// when constructing front-end pagination controls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Paginated<T> {
+    /// The data for the current page
+    pub items: Vec<T>,
+    /// The total number of items in the unpaged data set
+    pub total: i64,
+    /// The total number of pages
+    pub pages: i64,
+}
+
+impl<T> Paginated<T> {
+    /// Create a new instance of [`Paginated`]
+    pub fn new(items: Vec<T>, total: i64, pages: i64) -> Self {
+        Self {
+            items,
+            total,
+            pages,
+        }
+    }
+
+    /// Create a new instance of [`Paginated`] from a (paged) vector of items, the (unpaged) total
+    /// number of items, and an optional [`PaginationOptions`].
+    /// If a [`PaginationOptions`] is not provided, the default options will be used.
+    pub fn new_from_options(items: Vec<T>, total: i64, options: Option<PaginationOptions>) -> Self {
+        let options = options.unwrap_or_default();
+        let pages = (total as usize).div_ceil(options.page_size.get()) as i64;
+        Self::new(items, total, pages)
+    }
+}
+
+/// A struct to hold pagination information.
+#[derive(Debug, Clone, Copy)]
+pub struct PaginationOptions {
+    /// Page number to fetch
+    pub page_number: NonZeroUsize,
+    /// Number of items per page
+    pub page_size: NonZeroUsize,
+}
+
+impl Default for PaginationOptions {
+    fn default() -> Self {
+        Self {
+            page_number: NonZero::new(1usize).unwrap(),
+            page_size: NonZero::new(25usize).unwrap(),
+        }
+    }
+}
+
+impl From<Option<(i32, i32)>> for PaginationOptions {
+    fn from(v: Option<(i32, i32)>) -> Self {
+        match v {
+            Some(v) => Self::from(v),
+            None => Self::default(),
+        }
+    }
+}
+
+impl From<(Option<i32>, Option<i32>)> for PaginationOptions {
+    fn from((page_number, page_size): (Option<i32>, Option<i32>)) -> Self {
+        let page_number = page_number.unwrap_or_default();
+        let page_size = page_size.unwrap_or_default();
+        Self::from((page_number, page_size))
+    }
+}
+
+impl From<(i32, i32)> for PaginationOptions {
+    fn from((page_number, page_size): (i32, i32)) -> Self {
+        let mut v = Self::default();
+        // it is safe to unwrap from NonZero because we are sure that n > 0
+        if page_number > 0 {
+            v.page_number = NonZero::new(page_number as usize).unwrap();
+        }
+        if page_size > 0 {
+            v.page_size = NonZero::new(page_size as usize).unwrap();
+        }
+        v
+    }
+}
+
+impl PaginationOptions {
+    /// Convert PaginationOptions to SQL LIMIT clause
+    pub(crate) fn as_sql_limit_offset(&self) -> String {
+        format!(
+            "LIMIT {} OFFSET {}",
+            self.page_size.get(),
+            (self.page_number.get() - 1) * self.page_size.get()
+        )
+    }
+}
+
+/// A struct to hold sorting information for namespaces.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NamespaceSorting {
+    /// Field to sort by
+    pub field: NamespaceSortField,
+    /// Direction to sort in
+    pub direction: SortDirection,
+}
+
+impl From<Option<(i32, i32)>> for NamespaceSorting {
+    fn from(v: Option<(i32, i32)>) -> Self {
+        match v {
+            Some(v) => Self::from(v),
+            None => Self::default(),
+        }
+    }
+}
+
+impl From<(Option<i32>, Option<i32>)> for NamespaceSorting {
+    fn from((field, direction): (Option<i32>, Option<i32>)) -> Self {
+        let field = field.unwrap_or_default();
+        let direction = direction.unwrap_or_default();
+        Self::from((field, direction))
+    }
+}
+
+impl From<(i32, i32)> for NamespaceSorting {
+    fn from((field, direction): (i32, i32)) -> Self {
+        Self {
+            field: NamespaceSortField::try_from(field).unwrap_or_default(),
+            direction: SortDirection::try_from(direction).unwrap_or_default(),
+        }
+    }
+}
+
+impl NamespaceSorting {
+    /// Convert NamespaceSorting to SQL ORDER BY clause
+    pub(crate) fn as_sql_order_by(&self, namespace_table_alias: Option<&str>) -> String {
+        let field = self.field.as_sql_column(namespace_table_alias);
+        format!("ORDER BY {} {}", field, self.direction)
+    }
+}
+
+/// Possible ways that tables can be sorted. Used in the API.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TableSortField {
+    /// Sort by the table name
+    Name = 1,
+    /// Sort by total size of all non-deleted files in the table
+    Storage = 2,
+}
+
+impl Default for TableSortField {
+    fn default() -> Self {
+        Self::Name
+    }
+}
+
+impl TableSortField {
+    /// Convert TableSortField to SQL ORDER BY clause
+    pub(crate) fn as_sql_column(&self, table_alias: Option<&str>) -> String {
+        let table_alias_dot = table_alias.map(|alias| format!("{}.", alias));
+        match self {
+            Self::Name => format!("{}name", table_alias_dot.unwrap_or_default()),
+            // size_bytes is a computed field, so we do not use the alias
+            Self::Storage => "size_bytes".to_string(),
+        }
+    }
+}
+
+impl TryFrom<Option<i32>> for TableSortField {
+    type Error = Error;
+    fn try_from(v: Option<i32>) -> Result<Self, Error> {
+        match v {
+            Some(v) => Self::try_from(v),
+            None => Err(Error::Malformed {
+                descr: "missing sort field: will map to unsorted behavior".to_string(),
+            }),
+        }
+    }
+}
+
+impl From<TableSortField> for i32 {
+    fn from(val: TableSortField) -> Self {
+        val as Self
+    }
+}
+
+impl TryFrom<i32> for TableSortField {
+    type Error = Error;
+    fn try_from(v: i32) -> Result<Self, Error> {
+        Ok(match v {
+            v if v == Self::Name as i32 => Self::Name,
+            v if v == Self::Storage as i32 => Self::Storage,
+            v => {
+                return Err(Error::Malformed {
+                    descr: format!("invalid sort field: {v}").to_string(),
+                });
+            }
+        })
+    }
+}
+
+/// A struct to hold sorting information for namespaces.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TableSorting {
+    /// Field to sort by
+    pub field: TableSortField,
+    /// Direction to sort in
+    pub direction: SortDirection,
+}
+
+impl From<Option<(i32, i32)>> for TableSorting {
+    fn from(v: Option<(i32, i32)>) -> Self {
+        match v {
+            Some(v) => Self::from(v),
+            None => Self::default(),
+        }
+    }
+}
+
+impl From<(Option<i32>, Option<i32>)> for TableSorting {
+    fn from((field, direction): (Option<i32>, Option<i32>)) -> Self {
+        let field = field.unwrap_or_default();
+        let direction = direction.unwrap_or_default();
+        Self::from((field, direction))
+    }
+}
+
+impl From<(i32, i32)> for TableSorting {
+    fn from((field, direction): (i32, i32)) -> Self {
+        Self {
+            field: TableSortField::try_from(field).unwrap_or_default(),
+            direction: SortDirection::try_from(direction).unwrap_or_default(),
+        }
+    }
+}
+
+impl TableSorting {
+    /// Convert TableSorting to SQL ORDER BY clause
+    pub(crate) fn as_sql_order_by(&self, table_alias: Option<&str>) -> String {
+        let field = self.field.as_sql_column(table_alias);
+        format!("ORDER BY {} {}", field, self.direction)
+    }
+}
+
+/// Methods for working with the catalog storage API.
+#[async_trait]
+pub trait CatalogStorage: Send + Sync + Debug {
+    /// Get a namespace with storage information by [`NamespaceId`].
+    async fn get_namespace_with_storage(
+        &self,
+        id: NamespaceId,
+    ) -> Result<Option<NamespaceWithStorage>>;
+
+    /// Get all namespaces with storage information.
+    /// `sorting` is optional and can be used to sort the results.
+    async fn get_namespaces_with_storage(
+        &self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>>;
+
+    /// Get a table with storage information by [`TableId`].
+    async fn get_table_with_storage(&self, id: TableId) -> Result<Option<TableWithStorage>>;
+
+    /// Get all tables with storage information in a given namespace by [`NamespaceId`].
+    async fn get_tables_with_storage(
+        &self,
+        namespace_id: NamespaceId,
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>>;
+}
+
 /// Methods for working with the catalog.
 #[async_trait]
-pub trait Catalog: Send + Sync + Debug {
+pub trait Catalog: Send + Sync + Debug + Any {
+    /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
+
     /// Setup catalog for usage and apply possible migrations.
     async fn setup(&self) -> Result<(), Error>;
 
@@ -353,9 +759,11 @@ pub trait NamespaceRepo: Send + Sync {
     async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
 
     /// List all namespaces with storage
-    // TODO: Add pagination and sorting
-    // https://github.com/influxdata/influxdb_iox/issues/12775
-    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>>;
+    async fn list_storage(
+        &mut self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>>;
 
     /// Gets the namespace by its ID.
     async fn get_by_id(
@@ -364,15 +772,11 @@ pub trait NamespaceRepo: Send + Sync {
         deleted: SoftDeletedRows,
     ) -> Result<Option<Namespace>>;
 
-    /// Gets the namespace by its unique name.
-    async fn get_by_name(
-        &mut self,
-        name: &str,
-        deleted: SoftDeletedRows,
-    ) -> Result<Option<Namespace>>;
+    /// Gets an active namespace by its unique name. This will not consider any soft-deleted namespaces.
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>>;
 
     /// Soft-delete a namespace by ID.
-    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId>;
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<Namespace>;
 
     /// Update the limit on the number of tables that can exist per namespace.
     async fn update_table_limit(
@@ -396,6 +800,14 @@ pub trait NamespaceRepo: Send + Sync {
 
     /// Gets the namespace with storage information by its ID.
     async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>>;
+
+    /// Rename the namespace corresponding to `id`.
+    async fn rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace>;
+
+    /// Undelete the soft deleted namespace corresponding to `id`.
+    ///
+    /// There must be no active, undeleted namespace using the target's name.
+    async fn undelete(&mut self, id: NamespaceId) -> Result<Namespace>;
 }
 
 /// Fallback logic for [`NamespaceRepo::snapshot_by_name`]
@@ -407,7 +819,7 @@ pub(crate) async fn namespace_snapshot_by_name(
     name: &str,
 ) -> Result<NamespaceSnapshot> {
     let ns = repo
-        .get_by_name(name, SoftDeletedRows::ExcludeDeleted)
+        .get_by_name(name)
         .await?
         .ok_or_else(|| Error::NotFound {
             descr: name.to_string(),
@@ -444,18 +856,50 @@ pub trait TableRepo: Send + Sync {
     async fn list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Table>>;
 
     /// List all tables with storage in the catalog for the given namespace id.
-    // TODO: Add pagination and sorting
-    // https://github.com/influxdata/influxdb_iox/issues/12775
     async fn list_storage_by_namespace_id(
         &mut self,
         namespace_id: NamespaceId,
-    ) -> Result<Vec<TableWithStorage>>;
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>>;
 
     /// List all tables.
     async fn list(&mut self) -> Result<Vec<Table>>;
 
     /// Obtain a table snapshot
     async fn snapshot(&mut self, table_id: TableId) -> Result<TableSnapshot>;
+
+    /// List all tables which have iceberg enabled for the given namespace.
+    async fn list_by_iceberg_enabled(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableId>>;
+
+    /// Enable iceberg exporting for the specified table.
+    ///
+    /// NOTE: this does not provision the necessary infrastructure to handle
+    /// exports, this resides with the platform team.
+    ///
+    /// Enabling iceberg here means that the exporter can be aware of
+    /// which tables are expected to be exported.
+    async fn enable_iceberg(&mut self, table_id: TableId) -> Result<()>;
+
+    /// Disable iceberg exporting for the specified table.
+    ///
+    /// This means that the exporter will no longer consider this table within
+    /// its next export run.
+    async fn disable_iceberg(&mut self, table_id: TableId) -> Result<()>;
+
+    /// Soft delete the table corresponding to `id` - this returns a `Table`
+    /// to allow the public API to return the "deleted_at" field without a
+    /// follow-up query.
+    async fn soft_delete(&mut self, id: TableId) -> Result<Table>;
+
+    /// Rename the table corresponding to `id`.
+    async fn rename(&mut self, id: TableId, new_name: &str) -> Result<Table>;
+
+    /// Undelete the soft deleted table corresponding to `id`.
+    ///
+    /// There must be no active, undeleted table using the target's name
+    /// in the namespace the target belongs to.
+    async fn undelete(&mut self, id: TableId) -> Result<Table>;
 }
 
 /// Functions for working with columns in the catalog
@@ -492,8 +936,8 @@ pub trait ColumnRepo: Send + Sync {
     /// List all columns for the given table ID.
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Column>>;
 
-    /// List all columns.
-    async fn list(&mut self) -> Result<Vec<Column>>;
+    /// List columns based on their deleted status.
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>>;
 }
 
 /// Extension trait for [`ParquetFileRepo`]
@@ -556,7 +1000,7 @@ pub trait PartitionRepo: Send + Sync {
 
     /// Record an instance of a partition being selected for compaction but compaction was not
     /// completed for the specified reason.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn record_skipped_compaction(
         &mut self,
         partition_id: PartitionId,
@@ -612,19 +1056,22 @@ pub trait PartitionRepo: Send + Sync {
         cold_compact_at: Timestamp,
     ) -> Result<()>;
 
-    /// Return all partitions that do not have deterministic hash IDs in the catalog. Used in
+    /// Return all partitions that do not have hash IDs in the catalog. Used in
     /// the ingester's `OldPartitionBloomFilter` to determine whether a catalog query is necessary.
     /// Can be removed when all partitions have hash IDs and support for old-style partitions is no
     /// longer needed.
     async fn list_old_style(&mut self) -> Result<Vec<Partition>>;
 
     /// Delete empty partitions more than a day outside the retention interval (as determined by
-    /// their partition key) that were created at least 24 hours ago (to avoid immediately deleting
-    /// backfill partitions added via bulk ingest).
+    /// their partition key) that were created at least `partition_cutoff` ago (to avoid
+    /// immediately deleting backfill partitions added via bulk ingest).
     ///
     /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
     /// changes. The caller MAY call this method again if the result was NOT empty.
-    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>>;
+    async fn delete_by_retention(
+        &mut self,
+        partition_cutoff: Duration,
+    ) -> Result<Vec<(TableId, PartitionId)>>;
 
     /// Obtain a partition snapshot
     async fn snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
@@ -710,18 +1157,16 @@ pub trait ParquetFileRepo: Send + Sync {
     ///
     /// This deletion is limited to a certain (backend-specific) number of files to avoid overlarge
     /// changes. The caller MAY call this method again if the result was NOT empty.
+    #[deprecated(
+        note = "use delete_old_ids_count instead - it performs better and has more customization"
+    )]
     async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
 
     /// This does the same thing as calling `self.delete_old_ids_only` and then counting the
     /// result, but is implemented as a separate method to allow for some performance optimizations
     /// where possible (e.g. in the postgres catalog, we can avoid allocating the intermediate Vec)
-    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
-        self.delete_old_ids_only(older_than).await.map(|v| {
-            v.len()
-                .try_into()
-                .expect("128-bit computers don't exist yet")
-        })
-    }
+    /// and allows for configuration of the maximum amount of files to delete at a time.
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp, limit: u32) -> Result<u64>;
 
     /// List parquet files for given partitions that are NOT marked as
     /// [`to_delete`](ParquetFile::to_delete).
@@ -773,6 +1218,9 @@ pub trait ParquetFileRepo: Send + Sync {
 
     /// List parquet files for a particular table (via [`TableId`]) and
     /// optionally at a specific [`CompactionLevel`].
+    ///
+    /// NOTE: implementations of this interface implicitly produce files
+    /// that are NOT marked for deletion.
     async fn list_by_table_id(
         &mut self,
         table_id: TableId,

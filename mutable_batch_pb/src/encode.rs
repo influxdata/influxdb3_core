@@ -1,14 +1,14 @@
 //! Code to encode [`MutableBatch`] as pbdata protobuf
 
-use arrow_util::bitset::{iter_set_positions, BitSet};
+use arrow_util::bitset::{BitSet, iter_set_positions};
 use dml::DmlWrite;
 use generated_types::influxdata::pbdata::v1::column::SemanticType;
 use generated_types::influxdata::pbdata::v1::{
-    column::Values as PbValues, Column as PbColumn, DatabaseBatch, InternedStrings, PackedStrings,
-    TableBatch,
+    Column as PbColumn, DatabaseBatch, InternedStrings, PackedStrings, TableBatch,
+    column::Values as PbValues,
 };
-use mutable_batch::column::{Column, ColumnData};
 use mutable_batch::MutableBatch;
+use mutable_batch::column::{Column, ColumnData};
 use schema::InfluxColumnType;
 
 /// Convert a [`DmlWrite`] to a [`DatabaseBatch`]

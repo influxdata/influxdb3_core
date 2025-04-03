@@ -3,7 +3,7 @@ use std::sync::Arc;
 use metric::{U64Counter, U64Gauge};
 use observability_deps::tracing::debug;
 
-use crate::cache_system::{hook::Hook, DynError};
+use crate::cache_system::{DynError, hook::Hook};
 
 use super::{EvictResult, HookDecision};
 
@@ -17,7 +17,7 @@ pub struct ObserverHook {
     evict_fetched_elements: U64Counter,
     evict_fetched_bytes: U64Counter,
     evict_failed_elements: U64Counter,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     limit_bytes: Option<U64Gauge>,
 }
 
@@ -88,20 +88,20 @@ impl<K> Hook<K> for ObserverHook
 where
     K: std::fmt::Debug,
 {
-    fn insert(&self, gen: u64, k: &Arc<K>) {
-        debug!(gen, ?k, "insert");
+    fn insert(&self, generation: u64, k: &Arc<K>) {
+        debug!(generation, ?k, "insert");
         self.inserted_elements.inc(1);
     }
 
-    fn fetched(&self, gen: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, generation: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
         match res {
             Ok(size_bytes) => {
-                debug!(gen, ?k, size_bytes, "fetched successfully");
+                debug!(generation, ?k, size_bytes, "fetched successfully");
                 self.fetched_ok_elements.inc(1);
                 self.fetched_ok_bytes.inc(size_bytes as u64);
             }
             Err(e) => {
-                debug!(gen, ?k, %e, "failed to fetch");
+                debug!(generation, ?k, %e, "failed to fetch");
                 self.fetched_err_elements.inc(1);
             }
         }
@@ -109,20 +109,25 @@ where
         HookDecision::default()
     }
 
-    fn evict(&self, gen: u64, k: &Arc<K>, res: EvictResult) {
+    fn evict(&self, generation: u64, k: &Arc<K>, res: EvictResult) {
         match res {
             EvictResult::Unfetched => {
-                debug!(gen, ?k, "evict element that was never fetched");
+                debug!(generation, ?k, "evict element that was never fetched");
                 self.evict_unfetched_elements.inc(1);
             }
             EvictResult::Fetched { size } => {
-                debug!(gen, ?k, size_bytes = size, "evict element that was fetched");
+                debug!(
+                    generation,
+                    ?k,
+                    size_bytes = size,
+                    "evict element that was fetched"
+                );
                 self.evict_fetched_elements.inc(1);
                 self.evict_fetched_bytes.inc(size as u64);
             }
             EvictResult::Failed => {
                 debug!(
-                    gen,
+                    generation,
                     ?k,
                     "evict element that could not be fetched due to error"
                 );

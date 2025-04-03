@@ -120,6 +120,26 @@ impl<T> ContextExt<T> for Result<T, Error> {
     }
 }
 
+pub(crate) fn is_upstream_error(e: &tonic::Status) -> bool {
+    matches!(
+        e.code(),
+        // timeout & abort cases
+        tonic::Code::Aborted
+            | tonic::Code::Cancelled
+            | tonic::Code::DeadlineExceeded
+
+            // server side not online
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Unavailable
+
+            // connection errors classify as "unknown"
+            | tonic::Code::Unknown
+
+            // internal errors on the server side
+            | tonic::Code::Internal
+    )
+}
+
 pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
     use crate::interface::Error;
 

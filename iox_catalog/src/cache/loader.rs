@@ -1,7 +1,7 @@
 use futures::future::Shared;
-use futures::{ready, FutureExt};
-use hashbrown::hash_map::Entry;
+use futures::{FutureExt, ready};
 use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use parking_lot::Mutex;
 use snafu::Snafu;
 use std::future::Future;

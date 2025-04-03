@@ -1,8 +1,8 @@
 use std::{
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -85,8 +85,7 @@ impl Stream for Notifier {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
-
-    use crate::cache_system::test_utils::{AssertPendingFutureExt, WithTimeoutFutureExt};
+    use futures_test_utils::AssertFutureExt;
 
     use super::*;
 
@@ -102,7 +101,7 @@ mod tests {
         next_fut.assert_pending().await;
 
         drop(mailbox);
-        assert!(next_fut.with_timeout().await.is_none());
+        assert!(next_fut.poll_timeout().await.is_none());
     }
 
     #[tokio::test]
@@ -111,13 +110,13 @@ mod tests {
         mailbox.notify();
 
         let mut notifier = mailbox.notifier();
-        notifier.next().with_timeout().await.unwrap();
+        notifier.next().poll_timeout().await.unwrap();
 
         let mut next_fut = notifier.next();
         next_fut.assert_pending().await;
 
         mailbox.notify();
-        next_fut.with_timeout().await.unwrap();
+        next_fut.poll_timeout().await.unwrap();
     }
 
     #[tokio::test]
@@ -128,10 +127,10 @@ mod tests {
         next_fut.assert_pending().await;
 
         mailbox.notify();
-        next_fut.with_timeout().await.unwrap();
+        next_fut.poll_timeout().await.unwrap();
 
         mailbox.notify();
-        notifier.next().with_timeout().await.unwrap();
+        notifier.next().poll_timeout().await.unwrap();
     }
 
     #[tokio::test]
@@ -143,7 +142,7 @@ mod tests {
         mailbox.notify();
         mailbox.notify();
 
-        notifier.next().with_timeout().await.unwrap();
+        notifier.next().poll_timeout().await.unwrap();
         notifier.next().assert_pending().await;
     }
 }

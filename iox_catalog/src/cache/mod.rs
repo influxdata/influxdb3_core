@@ -5,9 +5,6 @@ mod handler;
 mod loader;
 mod snapshot;
 
-#[cfg(test)]
-mod test_utils;
-
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -20,15 +17,15 @@ use async_trait::async_trait;
 use backoff::BackoffConfig;
 use catalog_cache::api::quorum::QuorumCatalogCache;
 use data_types::{
+    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
+    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
+    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     snapshot::{
         namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
         table::TableSnapshot,
     },
-    Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
-    NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage, ObjectStoreId,
-    ParquetFile, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    SortKeyIds, Table, TableId, TableWithStorage, Timestamp,
 };
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
 use iox_time::TimeProvider;
@@ -36,8 +33,9 @@ use trace::ctx::SpanContext;
 
 use crate::constants::MAX_PARQUET_L0_FILES_PER_PARTITION;
 use crate::interface::{
-    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-    RepoCollection, Result, RootRepo, SoftDeletedRows, TableRepo,
+    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, NamespaceSorting, Paginated,
+    PaginationOptions, ParquetFileRepo, PartitionRepo, RepoCollection, Result, RootRepo,
+    SoftDeletedRows, TableRepo, TableSorting,
 };
 use crate::metrics::CatalogMetrics;
 
@@ -162,6 +160,10 @@ impl CachingCatalog {
 
 #[async_trait]
 impl Catalog for CachingCatalog {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -325,65 +327,15 @@ impl NamespaceRepo for Repos {
         self.backing.namespaces().list(deleted).await
     }
 
-    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
-        let root = self.root.get(RootKey).await?;
-
-        let mut namespaces_with_storage: Vec<NamespaceWithStorage> = Vec::new();
-
-        for ns in root.namespaces() {
-            let ns = ns?;
-            let ns_snapshot = match self.namespaces.get(ns.id()).await {
-                Ok(ns_s) => ns_s,
-                Err(Error::NotFound { .. }) => {
-                    // This error indicates that a namespace exists in the root snapshot
-                    // but not in the namespace snapshot. In general, this should not happen.
-                    // However, it might occur if a namespace is deleted, and the namespace snapshot
-                    // is updated to remove the namespace, but the root snapshot has not
-                    // been updated, leaving the namespace still present in the root snapshot.
-                    // In this case, do not calculate the storage information for this namespace.
-                    // Instead, skip to the next iteration of the loop.
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            if ns_snapshot.deleted_at().is_some() {
-                // If the namespace is deleted, no need to calculate the storage information.
-                // Instead, skip to the next namespace
-                continue;
-            }
-
-            let n = ns_snapshot.namespace()?;
-
-            // read-through: not latency sensitive
-            let namespace_size_bytes = self
-                .backing
-                .parquet_files()
-                .list_by_namespace_id(n.id, SoftDeletedRows::ExcludeDeleted)
-                .await?
-                .iter()
-                .map(|f| f.file_size_bytes)
-                .sum();
-            let table_count = self
-                .backing
-                .tables()
-                .list_by_namespace_id(n.id)
-                .await?
-                .len() as i64;
-
-            namespaces_with_storage.push(NamespaceWithStorage {
-                id: n.id,
-                name: n.name.clone(),
-                retention_period_ns: n.retention_period_ns,
-                max_tables: n.max_tables,
-                max_columns_per_table: n.max_columns_per_table,
-                partition_template: n.partition_template.clone(),
-                size_bytes: namespace_size_bytes,
-                table_count,
-            })
-        }
-
-        Ok(namespaces_with_storage)
+    async fn list_storage(
+        &mut self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
+        self.backing
+            .namespaces()
+            .list_storage(sorting, pagination)
+            .await
     }
 
     async fn get_by_id(
@@ -398,36 +350,23 @@ impl NamespaceRepo for Repos {
         }
     }
 
-    async fn get_by_name(
-        &mut self,
-        name: &str,
-        deleted: SoftDeletedRows,
-    ) -> Result<Option<Namespace>> {
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>> {
         let root = self.root.get(RootKey).await?;
-        let n = match root.lookup_namespace_by_name(name)? {
-            Some(n) => n,
-            None => {
-                return Ok(None);
-            }
-        };
-
-        Ok(filter_namespace(
-            self.namespaces.get(n.id()).await?.namespace()?,
-            deleted,
-        ))
+        if let Some(ns) = root.lookup_namespace_by_name(name)? {
+            Ok(Some(self.namespaces.get(ns.id()).await?.namespace()?))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
-        let deleted_id = self
-            .backing
-            .namespaces()
-            .soft_delete(id)
-            .with_refresh(self.namespaces.refresh(id))
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        let deleted_ns = self
+            .await_op_refreshing_ns_and_root(|namespaces| namespaces.soft_delete(id), id)
             .await?;
 
-        assert_eq!(id, deleted_id);
+        assert_eq!(id, deleted_ns.id);
 
-        Ok(id)
+        Ok(deleted_ns)
     }
 
     async fn update_table_limit(
@@ -502,6 +441,23 @@ impl NamespaceRepo for Repos {
             Err(Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Rename the namespace corresponding to `id`.
+    async fn rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace> {
+        let ns = self
+            .await_op_refreshing_ns_and_root(|namespaces| namespaces.rename(id, new_name), id)
+            .await?;
+        assert_eq!(ns.id, id);
+        Ok(ns)
+    }
+
+    async fn undelete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        let ns = self
+            .await_op_refreshing_ns_and_root(|namespaces| namespaces.undelete(id), id)
+            .await?;
+        assert_eq!(ns.id, id);
+        Ok(ns)
     }
 }
 
@@ -626,58 +582,13 @@ impl TableRepo for Repos {
     async fn list_storage_by_namespace_id(
         &mut self,
         namespace_id: NamespaceId,
-    ) -> Result<Vec<TableWithStorage>> {
-        let namespace_snapshot = match self.namespaces.get(namespace_id).await {
-            Ok(ns) => ns,
-            Err(Error::NotFound { .. }) => return Ok(vec![]),
-            Err(e) => return Err(e),
-        };
-
-        if namespace_snapshot.deleted_at().is_some() {
-            return Ok(vec![]);
-        }
-
-        let mut tables_with_storage: Vec<TableWithStorage> = Vec::new();
-
-        for table in namespace_snapshot.tables() {
-            let table = table?;
-            let table_snapshot = match self.tables.get(table.id()).await {
-                Ok(ts) => ts,
-                Err(Error::NotFound { .. }) => {
-                    // This error indicates that a table exists in the namespace snapshot
-                    // but not in the table snapshot. In general, this should not happen.
-                    // However, it might occur if a table is deleted, and the table snapshot
-                    // is updated to remove the table, but the namespace snapshot has not
-                    // been updated, leaving the table still present in the namespace snapshot.
-                    // In this case, do not calculate the size for this table.
-                    // Instead, skip to the next iteration of the loop.
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            let mut table_size: i64 = 0;
-            for partition_snapshot in table_snapshot.partitions() {
-                for file in self.partitions.get(partition_snapshot?.id()).await?.files() {
-                    let file = file?;
-                    if file.to_delete.is_none() {
-                        table_size += file.file_size_bytes;
-                    }
-                }
-            }
-
-            let t = table_snapshot.table()?;
-
-            tables_with_storage.push(TableWithStorage {
-                id: t.id,
-                name: t.name.clone(),
-                namespace_id: t.namespace_id,
-                partition_template: t.partition_template.clone(),
-                size_bytes: table_size,
-            });
-        }
-
-        Ok(tables_with_storage)
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>> {
+        self.backing
+            .tables()
+            .list_storage_by_namespace_id(namespace_id, sorting, pagination)
+            .await
     }
 
     async fn list(&mut self) -> Result<Vec<Table>> {
@@ -687,6 +598,85 @@ impl TableRepo for Repos {
 
     async fn snapshot(&mut self, table_id: TableId) -> Result<TableSnapshot> {
         self.tables.get(table_id).await
+    }
+
+    async fn list_by_iceberg_enabled(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableId>> {
+        Ok(
+            <Self as TableRepo>::list_by_namespace_id(self, namespace_id)
+                .await?
+                .into_iter()
+                .filter(|table| table.iceberg_enabled)
+                .map(|table| table.id)
+                .collect(),
+        )
+    }
+
+    async fn enable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        self.backing
+            .tables()
+            .enable_iceberg(table_id)
+            .with_refresh(self.tables.refresh(table_id))
+            .await
+    }
+
+    async fn disable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        self.backing
+            .tables()
+            .disable_iceberg(table_id)
+            .with_refresh(self.tables.refresh(table_id))
+            .await
+    }
+
+    async fn soft_delete(&mut self, id: TableId) -> Result<Table> {
+        self.await_op_refreshing_table_and_ns(|tables| tables.soft_delete(id), id)
+            .await
+    }
+
+    async fn rename(&mut self, id: TableId, new_name: &str) -> Result<Table> {
+        self.await_op_refreshing_table_and_ns(|tables| tables.rename(id, new_name), id)
+            .await
+    }
+
+    async fn undelete(&mut self, id: TableId) -> Result<Table> {
+        self.await_op_refreshing_table_and_ns(|tables| tables.undelete(id), id)
+            .await
+    }
+}
+
+impl Repos {
+    async fn await_op_refreshing_table_and_ns<'s, F, Fut>(
+        &'s mut self,
+        op: F,
+        id: TableId,
+    ) -> Result<Table>
+    where
+        F: FnOnce(&'s mut dyn TableRepo) -> Fut,
+        Fut: Future<Output = Result<Table>> + 's,
+    {
+        match op(self.backing.tables())
+            .with_refresh(self.tables.refresh(id))
+            .await
+        {
+            Ok(table) => {
+                self.namespaces.refresh(table.namespace_id).await?;
+                Ok(table)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    async fn await_op_refreshing_ns_and_root<'s, F, Fut>(
+        &'s mut self,
+        op: F,
+        id: NamespaceId,
+    ) -> Result<Namespace>
+    where
+        F: FnOnce(&'s mut dyn NamespaceRepo) -> Fut,
+        Fut: Future<Output = Result<Namespace>> + 's,
+    {
+        op(self.backing.namespaces())
+            .with_refresh(self.namespaces.refresh(id))
+            .with_refresh(self.root.refresh(RootKey))
+            .await
     }
 }
 
@@ -773,9 +763,10 @@ impl ColumnRepo for Repos {
         Ok(table.columns().collect::<Result<_, _>>()?)
     }
 
-    async fn list(&mut self) -> Result<Vec<Column>> {
-        // Read-through: should we retain this method?
-        self.backing.columns().list().await
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>> {
+        // Read-through:
+        // This method is used by the routers once on startup.
+        self.backing.columns().list(deleted).await
     }
 }
 
@@ -892,7 +883,6 @@ impl PartitionRepo for Repos {
         Ok(res)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn record_skipped_compaction(
         &mut self,
         partition_id: PartitionId,
@@ -1015,8 +1005,15 @@ impl PartitionRepo for Repos {
         self.backing.partitions().list_old_style().await
     }
 
-    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
-        let res = self.backing.partitions().delete_by_retention().await?;
+    async fn delete_by_retention(
+        &mut self,
+        partition_cutoff: Duration,
+    ) -> Result<Vec<(TableId, PartitionId)>> {
+        let res = self
+            .backing
+            .partitions()
+            .delete_by_retention(partition_cutoff)
+            .await?;
 
         let affected_tables: HashSet<_> = res.iter().map(|(t, _)| *t).collect();
 
@@ -1104,6 +1101,7 @@ impl ParquetFileRepo for Repos {
         Ok(res)
     }
 
+    #[expect(deprecated)]
     async fn delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>> {
         // deleted files are NOT part of the snapshot, so this bypasses the cache
         self.backing
@@ -1112,10 +1110,10 @@ impl ParquetFileRepo for Repos {
             .await
     }
 
-    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp, limit: u32) -> Result<u64> {
         self.backing
             .parquet_files()
-            .delete_old_ids_count(older_than)
+            .delete_old_ids_count(older_than, limit)
             .await
     }
 
@@ -1163,7 +1161,7 @@ impl ParquetFileRepo for Repos {
         Ok(files)
     }
 
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>> {
         // read-through: this is used by the GC, so this is not overall latency-critical
         self.backing.parquet_files().active_as_of(as_of).await
@@ -1406,9 +1404,8 @@ trait RefreshExt {
 
 impl<F, T, E> RefreshExt for F
 where
-    F: Future<Output = Result<T, E>> + Send,
-    T: Send,
-    E: ShouldRefresh + Send,
+    F: Future<Output = Result<T, E>>,
+    E: ShouldRefresh,
 {
     type Out = T;
     type Err = E;
@@ -1441,25 +1438,26 @@ mod tests {
         cache::snapshot::Snapshot as _,
         mem::MemCatalog,
         test_helpers::{
-            arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table,
-            catalog_from_backing_and_times, CatalogAndCache, TestCatalog,
+            CatalogAndCache, TestCatalog, arbitrary_namespace,
+            arbitrary_namespace_with_retention_policy, arbitrary_parquet_file_params,
+            arbitrary_table, catalog_from_backing_and_times,
         },
     };
 
     use std::{
         fmt::Debug,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
     };
 
     use catalog_cache::{CacheKey, CacheValue};
+    use futures_test_utils::AssertFutureExt;
     use generated_types::{influxdata::iox::catalog_cache::v1 as proto, prost::Message};
     use iox_time::{MockProvider, SystemProvider, Time};
     use metric::{Attributes, DurationHistogram, Metric};
     use test_helpers::maybe_start_logging;
-    use test_utils::AssertPendingExt;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
@@ -1861,7 +1859,7 @@ mod tests {
         batch_delay: Duration,
     ) -> CatalogAndCache {
         catalog_from_backing_and_times(
-            MemCatalog::new(Arc::default(), Arc::clone(&time_provider)),
+            Arc::new(MemCatalog::new(Arc::default(), Arc::clone(&time_provider))),
             time_provider,
             batch_delay,
         )
@@ -1914,5 +1912,436 @@ mod tests {
             .fetch();
 
         assert_eq!(actual.sample_count(), expected);
+    }
+
+    #[tokio::test]
+    async fn namespace_soft_delete_interaction_with_tables() {
+        maybe_start_logging();
+
+        let time_provider = Arc::new(SystemProvider::new());
+        let backing = Arc::new(MemCatalog::new(
+            Default::default(),
+            Arc::clone(&time_provider) as _,
+        ));
+        let mut backing_repos = backing.repositories();
+        let namespace = arbitrary_namespace(&mut *backing_repos, "ns").await;
+        let table = arbitrary_table(&mut *backing_repos, "t", &namespace).await;
+
+        let (catalog, _cache) = catalog_from_backing_and_times(
+            Arc::clone(&backing) as _,
+            Arc::clone(&time_provider) as _,
+            Duration::ZERO,
+        );
+        let mut repos = catalog.repositories();
+
+        let active_ns_snapshot = repos.namespaces().snapshot(namespace.id).await.unwrap();
+        assert!(active_ns_snapshot.deleted_at().is_none());
+        repos.tables().snapshot(table.id).await.unwrap();
+
+        repos.namespaces().soft_delete(namespace.id).await.unwrap();
+
+        let maybe_table_by_id = repos.tables().get_by_id(table.id).await.unwrap();
+        let maybe_table_by_namespace_and_name = repos
+            .tables()
+            .get_by_namespace_and_name(namespace.id, "t")
+            .await
+            .unwrap();
+        assert_eq!(maybe_table_by_id, maybe_table_by_namespace_and_name);
+    }
+
+    /// This method's behavior is important to get correct because otherwise the garbage collector
+    /// could delete active Parquet files. This method MUST always return a record that exists in
+    /// the backing catalog; if the garbage collector doesn't find a record for a particular file,
+    /// it will delete that file.
+    ///
+    /// However, it is acceptable if this method returns a record that ISN'T in the backing
+    /// catalog: the garbage collector won't delete the Parquet file as soon as it could, but once
+    /// the file falls out of the cache, it will get cleaned up correctly. Letting a file remain
+    /// longer than strictly necessary is acceptable use of storage space, and in fact is required
+    /// because records in the cache could be used in queries so the files must exist.
+    ///
+    /// The aspects that make up different situations under test here include:
+    ///
+    /// - Whether a partition record is in the cache
+    ///   - If the partition record is in the cache, whether the Parquet file record is in the
+    ///     partition's snapshot (Parquet files are only cached as part of the `partition`
+    ///     snapshots. If the Parquet file record is present, it will always be active; the
+    ///     cache does not store records for Parquet files marked as deleted)
+    /// - Whether a partition record is in the backing catalog
+    ///   - If the partition record is in the backing catalog, whether a Parquet file record is in
+    ///     the backing catalog (there would be a foreign key error if a Parquet file record
+    ///     existed but its partition record did not)
+    ///     - If the Parquet file record is in the catalog, whether it's marked `to_delete` or not
+    ///
+    /// A truth table of all the cases and resulting return value:
+    ///
+    /// | Partition in cache? | PF in cache? | Partition in backing? | PF in backing? | PF active? | PF returned? |
+    /// |---------------------|--------------|-----------------------|----------------|------------|--------------|
+    /// | ✅                  | ✅           | ✅                    | ✅             | ✅         | ✅           |
+    /// | ✅                  | ✅           | ✅                    | ✅             | ❌         | ✅           |
+    /// | ✅                  | ✅           | ✅                    | ❌             | n/a        | ✅           |
+    /// | ✅                  | ✅           | ❌                    | n/a            | n/a        | ✅           |
+    /// | ✅                  | ❌           | ✅                    | ✅             | ✅         | ✅           |
+    /// | ✅                  | ❌           | ✅                    | ✅             | ❌         | ✅           |
+    /// | ✅                  | ❌           | ✅                    | ❌             | n/a        | ❌           |
+    /// | ✅                  | ❌           | ❌                    | n/a            | n/a        | ❌           |
+    /// | ❌                  | n/a          | ✅                    | ✅             | ✅         | ✅           |
+    /// | ❌                  | n/a          | ✅                    | ✅             | ❌         | ✅           |
+    /// | ❌                  | n/a          | ✅                    | ❌             | n/a        | ❌           |
+    /// | ❌                  | n/a          | ❌                    | n/a            | n/a        | ❌           |
+    ///
+    /// Overall, the Parquet file should be returned if it's present in either the cache or the
+    /// backing catalog.
+    mod test_exists_by_partition_and_object_store_id_batch {
+        use super::*;
+
+        mod partition_in_cache {
+            use super::*;
+            const PARTITION_IN_CACHE: bool = true;
+
+            mod parquet_file_in_cache {
+                use super::*;
+                const PARQUET_FILE_IN_CACHE: bool = true;
+
+                #[tokio::test]
+                async fn partition_and_active_parquet_file_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: true,
+                        parquet_file_in_backing: true,
+                        parquet_file_active: true,
+                        returned: true,
+                    }
+                    .run()
+                    .await;
+                }
+
+                #[tokio::test]
+                async fn partition_and_inactive_parquet_file_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: true,
+                        parquet_file_in_backing: true,
+                        parquet_file_active: false,
+                        returned: true,
+                    }
+                    .run()
+                    .await;
+                }
+
+                #[tokio::test]
+                async fn partition_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: true,
+                        parquet_file_in_backing: false,
+                        parquet_file_active: false,
+                        returned: true,
+                    }
+                    .run()
+                    .await;
+                }
+
+                #[tokio::test]
+                async fn nothing_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: false,
+                        parquet_file_in_backing: false,
+                        parquet_file_active: false,
+                        returned: true,
+                    }
+                    .run()
+                    .await;
+                }
+            }
+
+            mod parquet_file_not_in_cache {
+                use super::*;
+                const PARQUET_FILE_IN_CACHE: bool = false;
+
+                #[tokio::test]
+                async fn partition_and_active_parquet_file_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: true,
+                        parquet_file_in_backing: true,
+                        parquet_file_active: true,
+                        returned: true,
+                    }
+                    .run()
+                    .await;
+                }
+
+                #[tokio::test]
+                async fn partition_and_inactive_parquet_file_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: true,
+                        parquet_file_in_backing: true,
+                        parquet_file_active: false,
+                        returned: true,
+                    }
+                    .run()
+                    .await;
+                }
+
+                #[tokio::test]
+                async fn partition_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: true,
+                        parquet_file_in_backing: false,
+                        parquet_file_active: false,
+                        returned: false,
+                    }
+                    .run()
+                    .await;
+                }
+
+                #[tokio::test]
+                async fn nothing_in_backing() {
+                    Situation {
+                        partition_in_cache: PARTITION_IN_CACHE,
+                        parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                        partition_in_backing: false,
+                        parquet_file_in_backing: false,
+                        parquet_file_active: false,
+                        returned: false,
+                    }
+                    .run()
+                    .await;
+                }
+            }
+        }
+
+        mod partition_not_in_cache {
+            use super::*;
+            const PARTITION_IN_CACHE: bool = false;
+            // If the partition isn't in the cache, the Parquet file can't be either because
+            // Parquet files are part of the cache's `ParquetSnapshot`.
+            const PARQUET_FILE_IN_CACHE: bool = false;
+
+            #[tokio::test]
+            async fn partition_and_active_parquet_file_in_backing() {
+                Situation {
+                    partition_in_cache: PARTITION_IN_CACHE,
+                    parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                    partition_in_backing: true,
+                    parquet_file_in_backing: true,
+                    parquet_file_active: true,
+                    returned: true,
+                }
+                .run()
+                .await;
+            }
+
+            #[tokio::test]
+            async fn partition_and_inactive_parquet_file_in_backing() {
+                Situation {
+                    partition_in_cache: PARTITION_IN_CACHE,
+                    parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                    partition_in_backing: true,
+                    parquet_file_in_backing: true,
+                    parquet_file_active: false,
+                    returned: true,
+                }
+                .run()
+                .await;
+            }
+
+            #[tokio::test]
+            async fn partition_in_backing() {
+                Situation {
+                    partition_in_cache: PARTITION_IN_CACHE,
+                    parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                    partition_in_backing: true,
+                    parquet_file_in_backing: false,
+                    parquet_file_active: false,
+                    returned: false,
+                }
+                .run()
+                .await;
+            }
+
+            #[tokio::test]
+            async fn nothing_in_backing() {
+                Situation {
+                    partition_in_cache: PARTITION_IN_CACHE,
+                    parquet_file_in_cache: PARQUET_FILE_IN_CACHE,
+                    partition_in_backing: false,
+                    parquet_file_in_backing: false,
+                    parquet_file_active: false,
+                    returned: false,
+                }
+                .run()
+                .await;
+            }
+        }
+
+        #[derive(Debug, Copy, Clone)]
+        struct Situation {
+            partition_in_cache: bool,
+            parquet_file_in_cache: bool,
+            partition_in_backing: bool,
+            parquet_file_in_backing: bool,
+            parquet_file_active: bool,
+            returned: bool,
+        }
+
+        impl Situation {
+            async fn run(&self) {
+                maybe_start_logging();
+
+                // Unconditional backing catalog setup
+                let time_provider = Arc::new(SystemProvider::new());
+                let backing = Arc::new(MemCatalog::new(
+                    Default::default(),
+                    Arc::clone(&time_provider) as _,
+                ));
+                let mut backing_repos = backing.repositories();
+                // Set a very short retention so we can delete the partition from the backing
+                // catalog if we need to
+                let namespace =
+                    arbitrary_namespace_with_retention_policy(&mut *backing_repos, "ns", 1).await;
+                let table = arbitrary_table(&mut *backing_repos, "t", &namespace).await;
+                // Definitely outside retention
+                let partition_key = PartitionKey::from("2024-01-01");
+
+                // Unconditional catalog cache setup
+                let (catalog, _cache) = catalog_from_backing_and_times(
+                    Arc::clone(&backing) as _,
+                    Arc::clone(&time_provider) as _,
+                    Duration::ZERO,
+                );
+                let mut repos = catalog.repositories();
+
+                let partition = if self.partition_in_cache || self.partition_in_backing {
+                    // If the partition record is in the cache, then it has to at least be in the
+                    // backing catalog temporarily
+                    repos
+                        .partitions()
+                        .create_or_get(partition_key.clone(), table.id)
+                        .await
+                        .unwrap()
+                } else {
+                    // But if the partition record is in neither the cache nor the backing catalog,
+                    // it doesn't have to be real
+                    Partition::new_catalog_only(
+                        PartitionId::new(999),
+                        None,
+                        table.id,
+                        partition_key.clone(),
+                        Default::default(),
+                        None,
+                        None,
+                        None,
+                    )
+                };
+
+                let object_store_id = if self.parquet_file_in_cache || self.parquet_file_in_backing
+                {
+                    // If the Parquet file record is in the cache, then it has to at least be in
+                    // the backing catalog temporarily
+                    let parquet_file_params =
+                        arbitrary_parquet_file_params(&namespace, &table, &partition);
+                    let object_store_id = parquet_file_params.object_store_id;
+                    backing_repos
+                        .parquet_files()
+                        .create_upgrade_delete(
+                            partition.id,
+                            &[],
+                            &[],
+                            &[parquet_file_params],
+                            CompactionLevel::Initial,
+                        )
+                        .await
+                        .unwrap();
+
+                    // Now that the Parquet file is in the backing catalog, if it's supposed to be
+                    // in the cache too, refresh the cache to pick it up
+                    if self.parquet_file_in_cache {
+                        catalog
+                            .inner
+                            .partitions
+                            .repos()
+                            .refresh(partition.id)
+                            .await
+                            .unwrap();
+                    }
+
+                    // If the Parquet file isn't active or should be deleted from the catalog, mark
+                    // it as `to_delete`
+                    if !self.parquet_file_active || !self.parquet_file_in_backing {
+                        backing_repos
+                            .parquet_files()
+                            .create_upgrade_delete(
+                                partition.id,
+                                &[object_store_id],
+                                &[],
+                                &[],
+                                CompactionLevel::Initial,
+                            )
+                            .await
+                            .unwrap();
+                    }
+
+                    if !self.parquet_file_in_backing {
+                        backing_repos
+                            .parquet_files()
+                            .delete_old_ids_count(time_provider.now().into(), u32::MAX)
+                            .await
+                            .unwrap();
+                    }
+
+                    object_store_id
+                } else {
+                    // But if the Parquet file record is in neither the cache nor the backing
+                    // catalog, it doesn't have to be real
+                    ObjectStoreId::new()
+                };
+
+                // If the partition is in neither the cache nor the backing, it wasn't created
+                // above and we don't need to delete it. If it should be in the backing but not in
+                // the cache, delete it from the cache.
+                if !self.partition_in_cache && self.partition_in_backing {
+                    catalog
+                        .inner
+                        .partitions
+                        .repos()
+                        .delete(partition.id)
+                        .await
+                        .unwrap();
+                }
+
+                if !self.partition_in_backing {
+                    backing_repos
+                        .partitions()
+                        .delete_by_retention(Duration::from_secs(0))
+                        .await
+                        .unwrap();
+                }
+
+                let input = vec![(partition.id, object_store_id)];
+                let result = repos
+                    .parquet_files()
+                    .exists_by_partition_and_object_store_id_batch(input.clone())
+                    .await
+                    .unwrap();
+
+                if self.returned {
+                    assert_eq!(input, result);
+                } else {
+                    assert!(result.is_empty(), "Expected empty, got {result:#?}");
+                }
+            }
+        }
     }
 }

@@ -19,7 +19,7 @@ use tokio::{
 };
 
 /// Tokio watchdog config.
-#[allow(missing_debug_implementations)]
+#[expect(missing_debug_implementations)]
 pub struct WatchdogConfig<'a> {
     handle: &'a Handle,
     metric_registry: &'a Registry,

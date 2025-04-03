@@ -9,13 +9,13 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use indexmap::IndexSet;
-use schema::{sort::SortKeyBuilder, TIME_COLUMN_NAME};
+use schema::{TIME_COLUMN_NAME, sort::SortKeyBuilder};
 
 use crate::{
-    physical_optimizer::chunk_extraction::extract_chunks,
-    provider::{chunks_to_physical_nodes, DeduplicateExec},
-    util::arrow_sort_key_exprs,
     CHUNK_ORDER_COLUMN_NAME,
+    physical_optimizer::chunk_extraction::extract_chunks,
+    provider::{DeduplicateExec, chunks_to_physical_nodes},
+    util::arrow_sort_key_exprs,
 };
 
 /// Determine sort key order of [`DeduplicateExec`].
@@ -168,15 +168,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use schema::{sort::SortKey, SchemaBuilder, TIME_COLUMN_NAME};
+    use schema::{SchemaBuilder, TIME_COLUMN_NAME, sort::SortKey};
 
     use crate::{
+        QueryChunk,
         physical_optimizer::{
             dedup::test_util::{chunk, dedup_plan, dedup_plan_with_chunk_order_col},
             test_util::OptimizationTest,
         },
         test::TestChunk,
-        QueryChunk,
     };
 
     use super::*;

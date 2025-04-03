@@ -4,6 +4,7 @@ use self::generated_types::{table_service_client::TableServiceClient, *};
 use crate::connection::Connection;
 use crate::error::Error;
 use ::generated_types::google::OptionalField;
+use ::generated_types::influxdata::iox::Target;
 
 /// Re-export generated_types
 pub mod generated_types {
@@ -28,13 +29,14 @@ impl Client {
     }
 
     /// Fetch the list of tables in the given namespace
-    pub async fn get_tables(&mut self, namespace_name: &str) -> Result<Vec<Table>, Error> {
+    pub async fn get_tables(
+        &mut self,
+        namespace: impl Into<Target> + Send,
+    ) -> Result<Vec<Table>, Error> {
         Ok(self
             .inner
             .get_tables(GetTablesRequest {
-                target: Some(get_tables_request::Target::NamespaceName(
-                    namespace_name.to_string(),
-                )),
+                target: Some(namespace.into().into()),
             })
             .await?
             .into_inner()
@@ -44,13 +46,13 @@ impl Client {
     /// Get a  table in the given namespace
     pub async fn get_table(
         &mut self,
-        namespace_name: &str,
+        namespace: impl Into<Target> + Send,
         table_name: &str,
     ) -> Result<Table, Error> {
         Ok(self
             .inner
             .get_table(GetTableRequest {
-                namespace_name: namespace_name.to_string(),
+                namespace_target: Some(namespace.into().into()),
                 table_name: table_name.to_string(),
             })
             .await?

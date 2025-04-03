@@ -1,5 +1,5 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -12,7 +12,7 @@ use data_types::{
     PartitionId, PartitionKey, TableId, Timestamp, TransitionPartitionId,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion_util::{unbounded_memory_pool, MemoryStream};
+use datafusion_util::{MemoryStream, unbounded_memory_pool};
 use iox_time::Time;
 use object_store::DynObjectStore;
 use parquet_file::{
@@ -21,8 +21,8 @@ use parquet_file::{
     storage::{ParquetStorage, StorageId, UploadError},
 };
 use schema::{
-    builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME,
-    TIME_DATA_TIMEZONE,
+    InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME, TIME_DATA_TIMEZONE,
+    builder::SchemaBuilder, sort::SortKey,
 };
 
 #[tokio::test]
@@ -392,7 +392,7 @@ async fn test_derive_parquet_file_params() {
     let table_id = TableId::new(3);
     let partition_key = PartitionKey::from("potato");
     let partition_hash_id = PartitionHashId::new(table_id, &partition_key);
-    let partition_id = TransitionPartitionId::Deterministic(partition_hash_id.clone());
+    let partition_id = TransitionPartitionId::Hash(partition_hash_id.clone());
 
     let meta = IoxMetadata {
         object_store_id: ObjectStoreId::new(),
@@ -480,6 +480,6 @@ fn to_timestamp_array(timestamps: &[i64]) -> ArrayRef {
 }
 
 fn null_string_array(num: usize) -> ArrayRef {
-    let array: StringArray = std::iter::repeat(None as Option<&str>).take(num).collect();
+    let array: StringArray = std::iter::repeat_n(None::<&str>, num).collect();
     Arc::new(array)
 }

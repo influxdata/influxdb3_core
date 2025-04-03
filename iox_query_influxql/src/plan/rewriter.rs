@@ -1,14 +1,14 @@
 use crate::error;
 use crate::plan::expr_type_evaluator::TypeEvaluator;
 use crate::plan::field::{field_by_name, field_name};
-use crate::plan::field_mapper::{field_and_dimensions, FieldTypeMap};
+use crate::plan::field_mapper::{FieldTypeMap, field_and_dimensions};
 use crate::plan::ir::{DataSource, Field, Interval, Select, SelectQuery, TagSet};
 use crate::plan::var_ref::{influx_type_to_var_ref_data_type, var_ref_data_type_to_influx_type};
-use crate::plan::{util, SchemaProvider};
+use crate::plan::{SchemaProvider, util};
 use datafusion::common::{DataFusionError, Result};
 use influxdb_influxql_parser::common::{MeasurementName, QualifiedMeasurementName, WhereClause};
 use influxdb_influxql_parser::expression::walk::{
-    walk_expr, walk_expr_mut, walk_expression_mut, ExpressionMut,
+    ExpressionMut, walk_expr, walk_expr_mut, walk_expression_mut,
 };
 use influxdb_influxql_parser::expression::{
     AsVarRefExpr, Call, Expr, VarRef, VarRefDataType, WildcardType,
@@ -21,7 +21,7 @@ use influxdb_influxql_parser::select::{
     SelectStatement,
 };
 use influxdb_influxql_parser::time_range::{
-    duration_expr_to_nanoseconds, split_cond, ReduceContext, TimeRange,
+    ReduceContext, TimeRange, duration_expr_to_nanoseconds, split_cond,
 };
 use influxdb_influxql_parser::timestamp::Timestamp;
 use itertools::Itertools;
@@ -254,7 +254,7 @@ impl RewriteSelect {
 
                     // Attempt to rewrite all variable (column) references with their concrete types,
                     // if one hasn't been specified.
-                    Expr::VarRef(ref mut v) => {
+                    Expr::VarRef(v) => {
                         v.data_type = match tv.eval_var_ref(v) {
                             Ok(v) => v,
                             Err(e) => ControlFlow::Break(e)?,
@@ -426,7 +426,7 @@ impl RewriteSelect {
                 ExpressionMut::Arithmetic(e) => walk_expr_mut(e, &mut |e| match e {
                     // Attempt to rewrite all variable (column) references with their concrete types,
                     // if one hasn't been specified.
-                    Expr::VarRef(ref mut v) => {
+                    Expr::VarRef(v) => {
                         v.data_type = match tv.eval_var_ref(v) {
                             Ok(v) => v,
                             Err(e) => ControlFlow::Break(e)?,
@@ -714,9 +714,9 @@ fn fields_expand_wildcards(
             Expr::Wildcard(wct) => {
                 let filter: fn(&&VarRef) -> bool = match wct {
                     None => |_| true,
-                    Some(WildcardType::Tag) => |v| v.data_type.map_or(false, |dt| dt.is_tag_type()),
+                    Some(WildcardType::Tag) => |v| v.data_type.is_some_and(|dt| dt.is_tag_type()),
                     Some(WildcardType::Field) => {
-                        |v| v.data_type.map_or(false, |dt| dt.is_field_type())
+                        |v| v.data_type.is_some_and(|dt| dt.is_field_type())
                     }
                 };
 
@@ -1017,12 +1017,12 @@ impl FieldChecker {
                     Some(FillClause::None) => {
                         return error::query(
                             "FILL(none) must be used with an aggregate or selector function",
-                        )
+                        );
                     }
                     Some(FillClause::Linear) => {
                         return error::query(
                             "FILL(linear) must be used with an aggregate or selector function",
-                        )
+                        );
                     }
                     _ => {}
                 }
@@ -1034,7 +1034,7 @@ impl FieldChecker {
             2.. if self.has_top_bottom => {
                 return error::query(
                     "selector functions top and bottom cannot be combined with other functions",
-                )
+                );
             }
             _ => {}
         }
@@ -1306,7 +1306,7 @@ impl FieldChecker {
             got => {
                 return error::query(format!(
                     "expected integer as last argument for {name}, got {got:?}"
-                ))
+                ));
             }
         }
 
@@ -1341,13 +1341,13 @@ impl FieldChecker {
 
         match args.get(1) {
             Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
-                return error::query(format!("duration argument must be positive, got {d}"))
+                return error::query(format!("duration argument must be positive, got {d}"));
             }
             None | Some(Expr::Literal(Literal::Duration(_))) => {}
             Some(got) => {
                 return error::query(format!(
                     "second argument to {name} must be a duration, got {got:?}"
-                ))
+                ));
             }
         }
 
@@ -1362,13 +1362,13 @@ impl FieldChecker {
 
         match args.get(1) {
             Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
-                return error::query(format!("duration argument must be positive, got {d}"))
+                return error::query(format!("duration argument must be positive, got {d}"));
             }
             None | Some(Expr::Literal(Literal::Duration(_))) => {}
             Some(got) => {
                 return error::query(format!(
                     "second argument to {name} must be a duration, got {got:?}"
-                ))
+                ));
             }
         }
 
@@ -1422,12 +1422,12 @@ impl FieldChecker {
                 (v, "triple_exponential_derivative") if v < 1 && v != -1 => {
                     return error::query(format!(
                         "{name} hold period must be greater than or equal to 1"
-                    ))
+                    ));
                 }
                 (v, _) if v < 0 && v != -1 => {
                     return error::query(format!(
                         "{name} hold period must be greater than or equal to 0"
-                    ))
+                    ));
                 }
                 _ => {}
             }
@@ -1438,7 +1438,7 @@ impl FieldChecker {
             Some(warmup) => {
                 return error::query(format!(
                     "{name} warmup type must be one of: 'exponential', 'simple', got {warmup}"
-                ))
+                ));
             }
             None => {}
         }
@@ -1491,8 +1491,8 @@ impl FieldChecker {
             Some("none" | "exponential" | "simple") => {}
             Some(warmup) => {
                 return error::query(format!(
-                "{name} warmup type must be one of: 'none', 'exponential' or 'simple', got {warmup}"
-            ))
+                    "{name} warmup type must be one of: 'none', 'exponential' or 'simple', got {warmup}"
+                ));
             }
             None => {}
         }
@@ -1506,13 +1506,13 @@ impl FieldChecker {
 
         match args.get(1) {
             Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
-                return error::query(format!("duration argument must be positive, got {d}"))
+                return error::query(format!("duration argument must be positive, got {d}"));
             }
             None | Some(Expr::Literal(Literal::Duration(_))) => {}
             Some(got) => {
                 return error::query(format!(
                     "second argument to {name} must be a duration, got {got:?}"
-                ))
+                ));
             }
         }
 
@@ -1694,10 +1694,10 @@ mod test {
     use super::Result;
     use crate::plan::ir::{Field, Select};
     use crate::plan::rewriter::{
-        find_table_names, has_wildcards, rewrite_select, rewrite_statement, ProjectionType,
-        SelectStatementInfo,
+        ProjectionType, SelectStatementInfo, find_table_names, has_wildcards, rewrite_select,
+        rewrite_statement,
     };
-    use crate::plan::test_utils::{parse_select, MockSchemaProvider};
+    use crate::plan::test_utils::{MockSchemaProvider, parse_select};
     use assert_matches::assert_matches;
     use datafusion::error::DataFusionError;
     use influxdb_influxql_parser::select::SelectStatement;
@@ -2105,7 +2105,9 @@ mod test {
             // cpu is a Tag
             assert_matches!(q.select.fields[3].data_type, Some(InfluxColumnType::Tag));
 
-            let stmt = parse_select("SELECT field_i64 + field_f64, field_i64 / field_i64, field_u64 / field_i64 FROM all_types");
+            let stmt = parse_select(
+                "SELECT field_i64 + field_f64, field_i64 / field_i64, field_u64 / field_i64 FROM all_types",
+            );
             let q = rewrite_statement(&namespace, &stmt).unwrap();
             // first field is always the time column and thus a Timestamp
             assert_matches!(
@@ -2184,10 +2186,14 @@ mod test {
             );
 
             // Multiple aliases with conflicts
-            let stmt =
-                parse_select("SELECT usage_user as usage_user_1, usage_user, usage_user, usage_user as usage_user_2, usage_user, usage_user_2 FROM cpu");
+            let stmt = parse_select(
+                "SELECT usage_user as usage_user_1, usage_user, usage_user, usage_user as usage_user_2, usage_user, usage_user_2 FROM cpu",
+            );
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
-            assert_eq!(stmt.to_string(), "SELECT time::timestamp AS time, usage_user::float AS usage_user_1, usage_user::float AS usage_user, usage_user::float AS usage_user_3, usage_user::float AS usage_user_2, usage_user::float AS usage_user_4, usage_user_2 AS usage_user_2_1 FROM cpu");
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_user::float AS usage_user_1, usage_user::float AS usage_user, usage_user::float AS usage_user_3, usage_user::float AS usage_user_2, usage_user::float AS usage_user_4, usage_user_2 AS usage_user_2_1 FROM cpu"
+            );
 
             // Only include measurements with at least one field projection
             let stmt = parse_select("SELECT usage_idle FROM cpu, disk");
@@ -2358,7 +2364,9 @@ mod test {
             );
 
             // Resolves recursively through subqueries and aliases
-            let stmt = parse_select("SELECT bytes FROM (SELECT bytes_free AS bytes FROM disk WHERE bytes_free = 3) WHERE bytes > 0");
+            let stmt = parse_select(
+                "SELECT bytes FROM (SELECT bytes_free AS bytes FROM disk WHERE bytes_free = 3) WHERE bytes > 0",
+            );
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
@@ -2422,7 +2430,9 @@ mod test {
             //
 
             // Explicitly adds an upper bound for the time-range for aggregate queries
-            let stmt = parse_select("SELECT mean(usage_idle) FROM cpu WHERE time >= '2022-04-09T12:13:14Z' GROUP BY TIME(30s)");
+            let stmt = parse_select(
+                "SELECT mean(usage_idle) FROM cpu WHERE time >= '2022-04-09T12:13:14Z' GROUP BY TIME(30s)",
+            );
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
@@ -2430,7 +2440,9 @@ mod test {
             );
 
             // Does not add an upper bound time range if already specified
-            let stmt = parse_select("SELECT mean(usage_idle) FROM cpu WHERE time >= '2022-04-09T12:13:14Z' AND time < '2022-04-10T12:00:00Z' GROUP BY TIME(30s)");
+            let stmt = parse_select(
+                "SELECT mean(usage_idle) FROM cpu WHERE time >= '2022-04-09T12:13:14Z' AND time < '2022-04-10T12:00:00Z' GROUP BY TIME(30s)",
+            );
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),

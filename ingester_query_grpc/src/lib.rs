@@ -4,7 +4,8 @@
 #![expect(
     clippy::derive_partial_eq_without_eq,
     clippy::needless_borrows_for_generic_args,
-    clippy::needless_lifetimes
+    clippy::needless_lifetimes,
+    clippy::allow_attributes
 )]
 
 // Workaround for "unused crate" lint false positives.
@@ -12,7 +13,7 @@ use workspace_hack as _;
 
 use crate::influxdata::iox::ingester::v1 as proto;
 use crate::influxdata::iox::ingester::v2 as proto2;
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use data_types::{
     NamespaceId, PartitionHashId, PartitionId, TableId, TimestampMinMax, TimestampRange,
     TransitionPartitionId,
@@ -39,9 +40,6 @@ pub mod influxdata {
             }
 
             pub mod v2 {
-                // generated code violates a few lints, so opt-out of them
-                #![expect(clippy::future_not_send)]
-
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.ingester.v2.rs"));
                 include!(concat!(
                     env!("OUT_DIR"),
@@ -476,14 +474,12 @@ impl TryFrom<proto2::PartitionIdentifier> for TransitionPartitionId {
             proto2::partition_identifier::PartitionIdentifier::CatalogId(id) => {
                 Self::Catalog(PartitionId::new(id))
             }
-            proto2::partition_identifier::PartitionIdentifier::HashId(id) => {
-                Self::Deterministic(PartitionHashId::try_from(id.as_ref()).map_err(|e| {
-                    FieldViolation {
-                        field: "partition_identifier".to_owned(),
-                        description: e.to_string(),
-                    }
-                })?)
-            }
+            proto2::partition_identifier::PartitionIdentifier::HashId(id) => Self::Hash(
+                PartitionHashId::try_from(id.as_ref()).map_err(|e| FieldViolation {
+                    field: "partition_identifier".to_owned(),
+                    description: e.to_string(),
+                })?,
+            ),
         };
         Ok(id)
     }
@@ -495,7 +491,7 @@ impl From<TransitionPartitionId> for proto2::PartitionIdentifier {
             TransitionPartitionId::Catalog(id) => {
                 proto2::partition_identifier::PartitionIdentifier::CatalogId(id.get())
             }
-            TransitionPartitionId::Deterministic(id) => {
+            TransitionPartitionId::Hash(id) => {
                 proto2::partition_identifier::PartitionIdentifier::HashId(
                     id.as_bytes().to_vec().into(),
                 )

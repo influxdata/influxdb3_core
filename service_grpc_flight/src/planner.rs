@@ -9,9 +9,9 @@ use datafusion::{
 use flightsql::{FlightSQLCommand, FlightSQLPlanner};
 use futures::stream::Peekable;
 use iox_query::{
+    QueryNamespace,
     exec::{IOxSessionContext, QueryLanguage},
     frontend::sql::SqlQueryPlanner,
-    QueryNamespace,
 };
 
 pub(crate) use datafusion::error::{DataFusionError as Error, Result};

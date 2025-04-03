@@ -2,10 +2,10 @@ use arrow::array::{Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::TimeDelta;
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{exec_err, not_impl_err, Result};
+use datafusion::common::{Result, exec_err, not_impl_err};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::scalar::ScalarValue;
-use std::cmp::{max, min, Ordering};
+use std::cmp::{Ordering, max, min};
 use std::ops::{Bound, Range};
 
 use super::{ExpandedValue, GapExpander};
@@ -165,7 +165,7 @@ impl GapExpander for DateBinWallclockGapExpander {
                     Ordering::Less => {
                         return Err(datafusion::error::DataFusionError::Execution(
                             "DATE_BIN_WALLCLOCK_GAPFILL: unexpected time bin value".to_string(),
-                        ))
+                        ));
                     }
                     Ordering::Equal => {
                         pairs.push((

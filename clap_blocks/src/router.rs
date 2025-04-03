@@ -16,7 +16,6 @@ use std::{
 
 /// CLI config for the router using the RPC write path
 #[derive(Debug, Clone, clap::Parser)]
-#[allow(missing_copy_implementations)]
 pub struct RouterConfig {
     /// Gossip config.
     #[clap(flatten)]
@@ -197,15 +196,14 @@ pub struct RouterConfig {
     )]
     pub no_wait_rpc_upstreams: bool,
 
-    /// Enable Admin UI Storage API.
-    ///
-    /// See <https://github.com/influxdata/influxdb_iox/issues/12249>
+    /// Use faster schema warmup
+    /// (may have catalog performance penalties)
     #[clap(
-        long = "router-admin-ui-storage-api-enabled",
-        env = "INFLUXDB_IOX_ROUTER_ADMIN_UI_STORAGE_API_ENABLED",
+        long = "use-deleted-column-pushdown",
+        env = "INFLUXDB_IOX_USE_DELETED_COLUMN_PUSHDOWN",
         default_value = "false"
     )]
-    pub admin_ui_storage_api_enabled: bool,
+    pub use_deleted_column_pushdown: bool,
 }
 
 /// Map a string containing an integer number of seconds into a [`Duration`].

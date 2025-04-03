@@ -1,16 +1,17 @@
 //! Server for the cache HTTP API
 
-use crate::api::list::{v1, v2, ListEntry};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE};
-use crate::local::CatalogCache;
 use crate::CacheValue;
+use crate::api::list::{ListEntry, v1, v2};
+use crate::api::{
+    GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V1, LIST_PROTOCOL_V2, NO_VALUE, RequestPath,
+};
+use crate::local::CatalogCache;
 use futures::ready;
 use hyper::body::HttpBody;
-use hyper::header::{HeaderValue, ToStrError, ETAG, IF_NONE_MATCH};
+use hyper::header::{ACCEPT, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH, ToStrError};
 use hyper::http::request::Parts;
 use hyper::service::Service;
 use hyper::{Body, HeaderMap, Method, Request, Response, StatusCode};
-use reqwest::header::CONTENT_TYPE;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::convert::Infallible;
 use std::future::Future;
@@ -19,7 +20,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
 enum Error {
     #[snafu(display("Http error: {source}"), context(false))]
     Http { source: hyper::http::Error },
@@ -147,19 +147,22 @@ impl CatalogRequestFuture {
                     let iter = self.state.cache.list();
                     let entries = iter.map(|(k, v)| ListEntry::new(k, v)).collect();
 
-                    let response = match self.parts.headers.get(CONTENT_TYPE) {
+                    let response = match self.parts.headers.get(ACCEPT) {
                         Some(x) if x == LIST_PROTOCOL_V2 => {
                             let encoder = v2::ListEncoder::new(entries).with_max_value_size(size);
                             let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
-                            Response::builder().body(Body::wrap_stream(stream))?
+                            Response::builder()
+                                .header(CONTENT_TYPE, &LIST_PROTOCOL_V2)
+                                .body(Body::wrap_stream(stream))?
                         }
                         _ => {
                             let encoder = v1::ListEncoder::new(entries).with_max_value_size(size);
                             let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
-                            Response::builder().body(Body::wrap_stream(stream))?
+                            Response::builder()
+                                .header(CONTENT_TYPE, &LIST_PROTOCOL_V1)
+                                .body(Body::wrap_stream(stream))?
                         }
                     };
-
                     return Ok(response);
                 }
                 _ => StatusCode::METHOD_NOT_ALLOWED,
@@ -282,7 +285,7 @@ impl CatalogCacheServer {
 pub mod test_util {
     use std::{net::SocketAddr, ops::Deref};
 
-    use hyper::{service::make_service_fn, Server};
+    use hyper::{Server, service::make_service_fn};
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 

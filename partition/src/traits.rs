@@ -4,7 +4,7 @@ mod record_batch;
 use thiserror::Error;
 
 /// An error accessing the time column of a batch.
-#[allow(missing_copy_implementations)]
+#[expect(missing_copy_implementations)]
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum TimeColumnError {
     /// The batch did not have a time column.

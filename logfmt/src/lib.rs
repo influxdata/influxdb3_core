@@ -7,14 +7,13 @@ use workspace_hack as _;
 
 use humantime::format_rfc3339_micros;
 use observability_deps::tracing::{
-    self,
+    self, Id, Level, Subscriber,
     field::{Field, Visit},
     subscriber::Interest,
-    Id, Level, Subscriber,
 };
 use std::borrow::Cow;
 use std::{io::Write, time::SystemTime};
-use tracing_subscriber::{fmt::MakeWriter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::{Layer, fmt::MakeWriter, layer::Context, registry::LookupSpan};
 
 /// Implements a `tracing_subscriber::Layer` which generates
 /// [logfmt] formatted log entries, suitable for log ingestion
@@ -50,7 +49,9 @@ where
     ///  use tracing_subscriber::{EnvFilter, prelude::*, self};
     ///
     ///  // setup debug logging level
-    ///  std::env::set_var("RUST_LOG", "debug");
+    ///  unsafe {
+    ///      std::env::set_var("RUST_LOG", "debug");
+    ///  }
     ///
     ///  // setup formatter to write to stderr
     ///  let formatter =
@@ -319,11 +320,7 @@ fn quote_and_escape(value: &'_ str) -> Cow<'_, str> {
 
 // Translate the field name from tracing into the logfmt style
 fn translate_field_name(name: &str) -> &str {
-    if name == "message" {
-        "msg"
-    } else {
-        name
-    }
+    if name == "message" { "msg" } else { name }
 }
 
 #[cfg(test)]
@@ -413,6 +410,11 @@ mod test {
     #[test]
     // https://github.com/influxdata/influxdb_iox/issues/4352
     fn test_uri_quoted() {
-        assert_eq!(quote_and_escape("/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns"), r#""/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns""#);
+        assert_eq!(
+            quote_and_escape(
+                "/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns"
+            ),
+            r#""/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns""#
+        );
     }
 }

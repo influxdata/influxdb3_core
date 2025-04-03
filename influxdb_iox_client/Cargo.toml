@@ -10,29 +10,46 @@ workspace = true
 
 [features]
 default = ["flight", "format"]
-flight = ["arrow", "arrow-flight", "arrow_util"]
-format = ["arrow", "arrow_util"]
+flight = [
+    "arrow",
+    "arrow-flight",
+    "dep:bytes",
+    "dep:iox_query_params",
+    "dep:prost",
+    "dep:rand",
+]
+format = [
+    "arrow",
+    "dep:arrow_util",
+    "dep:comfy-table",
+    "dep:schema",
+    "dep:serde_json",
+]
 
 [dependencies]
 arrow = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true }
 arrow_util = { path = "../arrow_util", optional = true }
-bytes = "1.9"
+bytes = { version = "1.10", optional = true }
 client_util = { path = "../client_util" }
-comfy-table = { version = "7.1", default-features = false}
+comfy-table = { version = "7.1", default-features = false, optional = true }
 futures = "0.3"
 futures-util = { version = "0.3" }
-influxdb-line-protocol = { path = "../influxdb_line_protocol"}
-iox_query_params = { path = "../iox_query_params" }
+influxdb-line-protocol = { path = "../influxdb_line_protocol" }
+iox_query_params = { path = "../iox_query_params", optional = true }
 generated_types = { path = "../generated_types" }
-prost = { workspace = true }
-rand = "0.8.5"
+prost = { workspace = true, optional = true }
+rand = { version = "0.9.0", optional = true }
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
-schema = { path = "../schema" }
-serde_json = "1.0.134"
-tokio = { version = "1.42", features = ["macros", "parking_lot", "rt-multi-thread"] }
+schema = { path = "../schema", optional = true }
+serde_json = { version = "1.0.140", optional = true }
+tokio = { version = "1.44", features = [
+    "macros",
+    "parking_lot",
+    "rt-multi-thread",
+] }
 tokio-stream = "0.1.17"
-thiserror = "2.0.9"
+thiserror = "2.0.12"
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 

@@ -1,19 +1,19 @@
 //! Utils of the tests
 
 use arrow::{
-    compute::{lexsort, SortColumn, SortOptions},
+    compute::{SortColumn, SortOptions, lexsort},
     record_batch::RecordBatch,
 };
 use data_types::{
-    partition_template::TablePartitionTemplateOverride, snapshot::table::TableSnapshot, Column,
-    ColumnSet, ColumnType, ColumnsByName, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt,
-    MaxTables, Namespace, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile,
-    ParquetFileParams, Partition, PartitionId, SortKeyIds, Table, TableSchema, Timestamp,
-    TransitionPartitionId,
+    Column, ColumnSet, ColumnType, ColumnsByName, CompactionLevel, MaxColumnsPerTable,
+    MaxL0CreatedAt, MaxTables, Namespace, NamespaceName, NamespaceSchema, ObjectStoreId,
+    ParquetFile, ParquetFileParams, Partition, PartitionId, SortKeyIds, Table, TableSchema,
+    Timestamp, TransitionPartitionId, partition_template::TablePartitionTemplateOverride,
+    snapshot::table::TableSnapshot,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::metrics::Count;
-use datafusion_util::{unbounded_memory_pool, MemoryStream};
+use datafusion_util::{MemoryStream, unbounded_memory_pool};
 use generated_types::influxdata::iox::partition_template::v1::PartitionTemplate;
 use iox_catalog::{
     interface::{Catalog, ParquetFileRepoExt, PartitionRepoExt, RepoCollection, SoftDeletedRows},
@@ -22,13 +22,14 @@ use iox_catalog::{
     util::{get_schema_by_id, get_table_columns_by_id},
 };
 use iox_query::{
-    exec::{DedicatedExecutor, Executor, ExecutorConfig},
+    exec::{DedicatedExecutor, Executor, ExecutorConfig, PerQueryMemoryPoolConfig},
     provider::RecordBatchDeduplicator,
     util::arrow_sort_key_exprs,
 };
 use iox_time::{MockProvider, Time, TimeProvider};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
-use object_store::{memory::InMemory, DynObjectStore};
+use object_store::{DynObjectStore, memory::InMemory};
+use object_store_size_hinting::ObjectStoreStripSizeHinting;
 use observability_deps::tracing::debug;
 use parquet_file::{
     chunk::ParquetChunk,
@@ -36,8 +37,8 @@ use parquet_file::{
     storage::{ParquetStorage, StorageId},
 };
 use schema::{
-    sort::{adjust_sort_key_columns, compute_sort_key, SortKey},
     Projection, Schema,
+    sort::{SortKey, adjust_sort_key_columns, compute_sort_key},
 };
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
@@ -46,9 +47,9 @@ pub(crate) const TEST_RETENTION_PERIOD_NS: Option<i64> = Some(3_600 * 1_000_000_
 
 /// Catalog for tests
 #[derive(Debug)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub struct TestCatalog {
-    pub catalog: Arc<dyn Catalog>,
+    pub catalog: Arc<MemCatalog>,
     pub metric_registry: Arc<metric::Registry>,
     pub object_store: Arc<DynObjectStore>,
     pub parquet_store: ParquetStorage,
@@ -76,11 +77,17 @@ impl TestCatalog {
     pub fn with_execs(exec: DedicatedExecutor, target_query_partitions: NonZeroUsize) -> Arc<Self> {
         let metric_registry = Arc::new(metric::Registry::new());
         let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0).unwrap()));
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(
+        let catalog = Arc::new(MemCatalog::new(
             Arc::clone(&metric_registry),
             Arc::clone(&time_provider) as _,
         ));
+
         let object_store = Arc::new(InMemory::new());
+        // size hint stripping
+        //
+        // This is a temporary workaround until https://github.com/influxdata/influxdb_iox/issues/13771 is fixed.
+        let object_store = Arc::new(ObjectStoreStripSizeHinting::new(object_store));
+
         let parquet_store =
             ParquetStorage::new(Arc::clone(&object_store) as _, StorageId::from("iox"));
         let exec = Arc::new(Executor::new_with_config_and_executor(
@@ -92,6 +99,8 @@ impl TestCatalog {
                 )]),
                 metric_registry: Arc::clone(&metric_registry),
                 mem_pool_size: 1024 * 1024 * 1024,
+                per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
+                heap_memory_limit: None,
             },
             exec,
         ));
@@ -108,7 +117,7 @@ impl TestCatalog {
 
     /// Return the catalog
     pub fn catalog(&self) -> Arc<dyn Catalog> {
-        Arc::clone(&self.catalog)
+        Arc::clone(&self.catalog) as _
     }
 
     /// Return the catalog's metric registry
@@ -187,7 +196,7 @@ impl TestCatalog {
 
 /// A test namespace
 #[derive(Debug)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub struct TestNamespace {
     pub catalog: Arc<TestCatalog>,
     pub namespace: Namespace,
@@ -275,7 +284,7 @@ impl TestNamespace {
 }
 
 /// A test table of a namespace in the catalog
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug)]
 pub struct TestTable {
     pub catalog: Arc<TestCatalog>,
@@ -293,6 +302,29 @@ impl TestTable {
             .create_or_get(key.into(), self.table.id)
             .await
             .unwrap();
+
+        Arc::new(TestPartition {
+            catalog: Arc::clone(&self.catalog),
+            namespace: Arc::clone(&self.namespace),
+            table: Arc::clone(self),
+            partition,
+        })
+    }
+
+    /// Create a legacy partition for the table that doesn't have a hash ID
+    pub fn create_partition_without_hash_id(self: &Arc<Self>, key: &str) -> Arc<TestPartition> {
+        let partition = Partition::new_catalog_only(
+            PartitionId::new(42),
+            None,
+            self.table.id,
+            key.into(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+
+        self.catalog.catalog.add_partition(partition.clone());
 
         Arc::new(TestPartition {
             catalog: Arc::clone(&self.catalog),
@@ -417,7 +449,6 @@ impl TestTable {
 }
 
 /// A test column.
-#[allow(missing_docs)]
 #[derive(Debug)]
 pub struct TestColumn {
     pub catalog: Arc<TestCatalog>,
@@ -433,7 +464,7 @@ impl TestColumn {
 }
 
 /// A test catalog with specified namespace, table, partition
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug)]
 pub struct TestPartition {
     pub catalog: Arc<TestCatalog>,
@@ -497,6 +528,7 @@ impl TestPartition {
             object_store_id,
             row_count,
             max_l0_created_at,
+            partition_hash_id_override_to_none,
         } = builder;
 
         let record_batch = record_batch.expect("A record batch is required");
@@ -534,12 +566,17 @@ impl TestPartition {
             sort_key: Some(sort_key),
             max_l0_created_at,
         };
+        let partition_id = if partition_hash_id_override_to_none {
+            TransitionPartitionId::Catalog(self.partition.id)
+        } else {
+            self.partition.transition_partition_id()
+        };
         let real_file_size_bytes = create_parquet_file(
             ParquetStorage::new(
                 Arc::clone(&self.catalog.object_store),
                 StorageId::from("iox"),
             ),
-            &self.partition.transition_partition_id(),
+            &partition_id,
             &metadata,
             record_batch.clone(),
         )
@@ -558,6 +595,7 @@ impl TestPartition {
             object_store_id: Some(object_store_id),
             row_count: None, // will be computed from the record batch again
             max_l0_created_at,
+            partition_hash_id_override_to_none,
         }
     }
 
@@ -578,6 +616,7 @@ impl TestPartition {
             object_store_id,
             row_count,
             max_l0_created_at,
+            partition_hash_id_override_to_none,
             ..
         } = builder;
 
@@ -602,11 +641,17 @@ impl TestPartition {
             (row_count.unwrap_or(0), column_set)
         };
 
+        let partition_hash_id = if partition_hash_id_override_to_none {
+            None
+        } else {
+            self.partition.hash_id().cloned()
+        };
+
         let parquet_file_params = ParquetFileParams {
             namespace_id: self.namespace.namespace.id,
             table_id: self.table.table.id,
             partition_id: self.partition.id,
-            partition_hash_id: self.partition.hash_id().cloned(),
+            partition_hash_id,
             object_store_id: object_store_id.unwrap_or_else(ObjectStoreId::new),
             min_time: Timestamp::new(min_time),
             max_time: Timestamp::new(max_time),
@@ -658,7 +703,7 @@ impl TestPartition {
 }
 
 /// A builder for creating parquet files within partitions.
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct TestParquetFileBuilder {
     pub record_batch: Option<RecordBatch>,
@@ -673,6 +718,7 @@ pub struct TestParquetFileBuilder {
     pub object_store_id: Option<ObjectStoreId>,
     pub row_count: Option<usize>,
     pub max_l0_created_at: MaxL0CreatedAt,
+    pub partition_hash_id_override_to_none: bool,
 }
 
 impl Default for TestParquetFileBuilder {
@@ -690,6 +736,7 @@ impl Default for TestParquetFileBuilder {
             object_store_id: None,
             row_count: None,
             max_l0_created_at: MaxL0CreatedAt::NotCompacted,
+            partition_hash_id_override_to_none: false,
         }
     }
 }
@@ -783,6 +830,12 @@ impl TestParquetFileBuilder {
         self.file_size_bytes = Some(file_size_bytes);
         self
     }
+
+    /// Simulate a Parquet file created in the partition before the partition had a hash ID
+    pub fn without_partition_hash_id(mut self) -> Self {
+        self.partition_hash_id_override_to_none = true;
+        self
+    }
 }
 
 async fn update_catalog_sort_key_if_needed<R>(repos: &mut R, id: PartitionId, sort_key: SortKey)
@@ -856,7 +909,7 @@ async fn create_parquet_file(
 }
 
 /// A test parquet file of the catalog
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug)]
 pub struct TestParquetFile {
     pub catalog: Arc<TestCatalog>,

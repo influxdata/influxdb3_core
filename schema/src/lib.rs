@@ -1,7 +1,5 @@
 //! This module contains the schema definition for IOx
 
-#![allow(clippy::clone_on_ref_ptr)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -34,13 +32,13 @@ pub const INFLUXQL_METADATA_KEY: &str = "iox::influxql::group_key::metadata";
 /// The Timezone to use for InfluxDB timezone (should be a constant)
 // TODO: Start Epic Add timezone support to IOx #18154
 // https://github.com/influxdata/idpe/issues/18154
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub fn TIME_DATA_TIMEZONE() -> Option<Arc<str>> {
     None
 }
 
 /// the [`ArrowDataType`] to use for InfluxDB timestamps
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub fn TIME_DATA_TYPE() -> ArrowDataType {
     ArrowDataType::Timestamp(TimeUnit::Nanosecond, TIME_DATA_TIMEZONE())
 }
@@ -65,7 +63,9 @@ pub enum Error {
 
     #[snafu(display(
         "Internal Error: Incompatible metadata type found in schema for column '{}'. Metadata specified {:?} which is incompatible with actual type {:?}",
-        column_name, influxdb_column_type, actual_type
+        column_name,
+        influxdb_column_type,
+        actual_type
     ))]
     IncompatibleMetadata {
         column_name: String,
@@ -74,15 +74,17 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Internal Error: Invalid metadata type found in schema for column '{}'. Metadata specifies {:?} which requires the nullable flag to be set to {}",
+        "Internal Error: Invalid metadata type found in schema for column '{}'. Metadata specifies {:?} which requires the nullable flag to be set to {}, got {}",
         column_name,
         influxdb_column_type,
+        expected,
         nullable,
     ))]
     Nullability {
         column_name: String,
         influxdb_column_type: InfluxColumnType,
         nullable: bool,
+        expected: bool,
     },
 
     #[snafu(display("Column not found '{}'", column_name))]
@@ -186,11 +188,6 @@ impl Schema {
         {
             // All column names must be unique
             let mut field_names = HashSet::with_capacity(inner.fields().len());
-            #[cfg(feature = "v3")]
-            let series_key = inner.metadata.get(SERIES_KEY_METADATA_KEY).map(|s| {
-                s.split(SERIES_KEY_METADATA_SEPARATOR)
-                    .collect::<Vec<&str>>()
-            });
 
             for field in inner.fields() {
                 let column_name = field.name();
@@ -216,29 +213,18 @@ impl Schema {
                     });
                 }
 
-                #[cfg(feature = "v3")]
-                let expected_nullable = match (
-                    series_key
-                        .as_ref()
-                        .is_some_and(|sk| sk.contains(&column_name.as_str())),
-                    influxdb_column_type,
-                ) {
-                    (true, _) => false,
-                    (false, InfluxColumnType::Tag) => true,
-                    (false, InfluxColumnType::Field(_)) => true,
-                    (false, InfluxColumnType::Timestamp) => false,
-                };
-                #[cfg(not(feature = "v3"))]
                 let expected_nullable = match influxdb_column_type {
                     InfluxColumnType::Tag => true,
                     InfluxColumnType::Field(_) => true,
                     InfluxColumnType::Timestamp => false,
                 };
+
                 if field.is_nullable() != expected_nullable {
                     return Err(Error::Nullability {
                         column_name: column_name.to_string(),
                         influxdb_column_type,
-                        nullable: expected_nullable,
+                        nullable: field.is_nullable(),
+                        expected: expected_nullable,
                     });
                 }
 
@@ -1070,7 +1056,7 @@ mod test {
         let res = Schema::try_from_arrow(arrow_schema);
         assert_eq!(
             res.unwrap_err().to_string(),
-            "Internal Error: Invalid metadata type found in schema for column 'tag_col'. Metadata specifies Tag which requires the nullable flag to be set to true"
+            "Internal Error: Invalid metadata type found in schema for column 'tag_col'. Metadata specifies Tag which requires the nullable flag to be set to true, got false"
         );
     }
 
@@ -1088,7 +1074,7 @@ mod test {
         let res = Schema::try_from_arrow(arrow_schema);
         assert_eq!(
             res.unwrap_err().to_string(),
-            "Internal Error: Invalid metadata type found in schema for column 'field_col'. Metadata specifies Field(String) which requires the nullable flag to be set to true"
+            "Internal Error: Invalid metadata type found in schema for column 'field_col'. Metadata specifies Field(String) which requires the nullable flag to be set to true, got false"
         );
     }
 
@@ -1106,7 +1092,7 @@ mod test {
         let res = Schema::try_from_arrow(arrow_schema);
         assert_eq!(
             res.unwrap_err().to_string(),
-            "Internal Error: Invalid metadata type found in schema for column 'time'. Metadata specifies Timestamp which requires the nullable flag to be set to false"
+            "Internal Error: Invalid metadata type found in schema for column 'time'. Metadata specifies Timestamp which requires the nullable flag to be set to false, got true"
         );
     }
 

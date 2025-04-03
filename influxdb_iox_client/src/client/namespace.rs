@@ -1,3 +1,4 @@
+use ::generated_types::influxdata::iox::Target;
 use client_util::connection::GrpcConnection;
 
 use self::generated_types::{namespace_service_client::NamespaceServiceClient, *};
@@ -70,13 +71,13 @@ impl Client {
     /// Negative retention periods are rejected, returning an error.
     pub async fn update_namespace_retention(
         &mut self,
-        namespace: &str,
+        namespace: impl Into<Target> + Send,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace, Error> {
         let response = self
             .inner
             .update_namespace_retention(UpdateNamespaceRetentionRequest {
-                name: namespace.to_string(),
+                target: namespace.into().into(),
                 retention_period_ns,
             })
             .await?;
@@ -92,14 +93,14 @@ impl Client {
     /// Zero-valued limits are rejected, returning an error.
     pub async fn update_namespace_service_protection_limit(
         &mut self,
-        namespace: &str,
+        namespace: impl Into<Target> + Send,
         limit_update: LimitUpdate,
     ) -> Result<Namespace, Error> {
         let response = self
             .inner
             .update_namespace_service_protection_limit(
                 UpdateNamespaceServiceProtectionLimitRequest {
-                    name: namespace.to_string(),
+                    target: namespace.into().into(),
                     limit_update: Some(limit_update),
                 },
             )
@@ -109,10 +110,13 @@ impl Client {
     }
 
     /// Delete a namespace
-    pub async fn delete_namespace(&mut self, namespace: &str) -> Result<(), Error> {
+    pub async fn delete_namespace(
+        &mut self,
+        namespace: impl Into<Target> + Send,
+    ) -> Result<(), Error> {
         self.inner
             .delete_namespace(DeleteNamespaceRequest {
-                name: namespace.to_string(),
+                target: namespace.into().into(),
             })
             .await?;
 

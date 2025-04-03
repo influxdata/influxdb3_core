@@ -9,8 +9,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { version = "1.42", features = ["macros", "time"] }
+tokio = { version = "1.44", features = ["macros", "time"] }
 observability_deps = { path = "../observability_deps" }
-rand = "0.8"
+rand = "0.9"
 snafu = "0.8"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

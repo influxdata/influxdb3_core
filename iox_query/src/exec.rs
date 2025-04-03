@@ -9,10 +9,12 @@ pub mod sleep;
 pub(crate) mod split;
 use datafusion_util::config::register_iox_object_store;
 pub use executor::DedicatedExecutor;
+use jemalloc_stats::AllocationMonitor;
 use metric::Registry;
 use object_store::DynObjectStore;
 use parquet_file::storage::StorageId;
 mod cross_rt_stream;
+use observability_deps::tracing::warn;
 
 use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 
@@ -20,21 +22,77 @@ use datafusion::{
     self,
     execution::{
         disk_manager::DiskManagerConfig,
-        memory_pool::MemoryPool,
-        runtime_env::{RuntimeConfig, RuntimeEnv},
+        memory_pool::{MemoryPool, UnboundedMemoryPool},
+        runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
-    logical_expr::{expr_rewriter::normalize_col, Expr, Extension, LogicalPlan},
+    logical_expr::{Expr, Extension, LogicalPlan, expr_rewriter::normalize_col},
 };
 
 pub use context::{
     IOxSessionConfig, IOxSessionContext, QueryConfig, QueryLanguage, SessionContextIOxExt,
 };
 
-use crate::exec::metrics::DataFusionMemoryPoolMetricsBridge;
+use crate::{
+    exec::metrics::DataFusionMemoryPoolMetricsBridge, memory_pool::AllocationMonitoringMemoryPool,
+};
 
 use self::split::StreamSplitNode;
 
 const TESTING_MEM_POOL_SIZE: usize = 1024 * 1024 * 1024; // 1GB
+const TESTING_PER_QUERY_MEM_POOL_SIZE: usize = 500; // 500 bytes
+const TESTING_MAX_CONCURRENT_QUERIES: usize = 10;
+
+/// Configuration for the per-query memory pool.
+///
+/// This enum defines the configuration for the per-query memory pool in the
+/// querier, which is used to ensure each query has a minimum memory pre-allocated
+/// for them. When the env variable `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES`
+/// is set to a non-zero size, this configuration is `Enabled`. Zero means disabled.
+///
+/// Other IOx components like the ingester, compactor, and catalog do not
+/// require a separate per-query memory pool. So this configuration will be `Disabled`.
+///
+/// There are two fields in `PerQueryMemoryPoolConfig::Enabled`:
+///
+/// ```rs
+/// Enabled {
+///   per_query_mem_pool_size: usize,
+///   max_concurrent_queries: usize,
+/// }
+/// ```
+///
+/// - `per_query_mem_pool_size` is configured by the env variable
+///   `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES`. If it is set to `Some`, the
+///   `PerQueryMemoryPoolConfig::Enabled` will be set.
+/// - `max_concurrent_queries` is configured by the env variable
+///   `INFLUXDB_IOX_MAX_CONCURRENT_QUERIES`. It has a default value, so the configuration
+///   `PerQueryMemoryPoolConfig::Enabled` does not depend on this env variable.
+///
+/// See the documentation for `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES` for more
+/// details.
+#[derive(Debug, Clone, Copy)]
+pub enum PerQueryMemoryPoolConfig {
+    /// In the ingester, compactor, and catalog, a separate per-query memory
+    /// pool is not required for query execution. Therefore, [`PerQueryMemoryPoolConfig`]
+    /// should set to `Disabled`.
+    Disabled,
+
+    /// In the querier, a separate per-query memory pool can be configured on
+    /// top of the central memory pool by enabling it with the following values.
+    Enabled {
+        /// The minimum size of the memory pool pre-reserved for each query, in bytes.
+        ///
+        /// In the querier, this value is configured by `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES`.
+        /// See `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES` for details.
+        per_query_mem_pool_size: usize,
+
+        /// The maximum number of concurrent queries allowed.
+        ///
+        /// In the querier, this value is configured by `INFLUXDB_IOX_MAX_CONCURRENT_QUERIES`.
+        /// It has a default value, ensuring that `max_concurrent_queries` is always set.
+        max_concurrent_queries: usize,
+    },
+}
 
 /// Configuration for an Executor
 #[derive(Debug, Clone)]
@@ -50,6 +108,12 @@ pub struct ExecutorConfig {
 
     /// Memory pool size in bytes.
     pub mem_pool_size: usize,
+
+    /// Configuration for the per-query memory pool.
+    pub per_query_mem_pool_config: PerQueryMemoryPoolConfig,
+
+    /// Optional heap memory limit in bytes.
+    pub heap_memory_limit: Option<usize>,
 }
 
 impl ExecutorConfig {
@@ -59,6 +123,24 @@ impl ExecutorConfig {
             object_stores: HashMap::default(),
             metric_registry: Arc::new(Registry::default()),
             mem_pool_size: TESTING_MEM_POOL_SIZE,
+            per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
+            heap_memory_limit: None,
+        }
+    }
+
+    // Set the executor to use PerQueryMemoryPool in addition to
+    // the central memory pool
+    pub fn testing_with_per_query_memory_pool() -> Self {
+        Self {
+            target_query_partitions: NonZeroUsize::new(1).unwrap(),
+            object_stores: HashMap::default(),
+            metric_registry: Arc::new(Registry::default()),
+            mem_pool_size: TESTING_MEM_POOL_SIZE,
+            per_query_mem_pool_config: PerQueryMemoryPoolConfig::Enabled {
+                per_query_mem_pool_size: TESTING_PER_QUERY_MEM_POOL_SIZE,
+                max_concurrent_queries: TESTING_MAX_CONCURRENT_QUERIES,
+            },
+            heap_memory_limit: None,
         }
     }
 }
@@ -103,6 +185,14 @@ impl Executor {
         Self::new_with_config_and_executor(config, executor)
     }
 
+    /// Get testing executor that runs a on single thread and a low memory bound
+    /// to preserve resources (central memory pool) and a per query memory pool.
+    pub fn new_testing_with_per_query_memory_pool() -> Self {
+        let config = ExecutorConfig::testing_with_per_query_memory_pool();
+        let executor = DedicatedExecutor::new_testing();
+        Self::new_with_config_and_executor(config, executor)
+    }
+
     /// Low-level constructor.
     ///
     /// This is mostly useful if you wanna keep the executor (because they are quite expensive to create) but need a fresh IOx runtime.
@@ -113,11 +203,52 @@ impl Executor {
         config: ExecutorConfig,
         executor: DedicatedExecutor,
     ) -> Self {
-        let runtime_config = RuntimeConfig::new()
-            .with_disk_manager(DiskManagerConfig::Disabled)
-            .with_memory_limit(config.mem_pool_size, 1.0);
+        let central_mem_pool_limit = match config.per_query_mem_pool_config {
+            PerQueryMemoryPoolConfig::Disabled => config.mem_pool_size,
+            PerQueryMemoryPoolConfig::Enabled {
+                per_query_mem_pool_size,
+                max_concurrent_queries,
+            } => {
+                // Set aside a pre-reserved amount of memory for each query
 
-        let runtime = Arc::new(RuntimeEnv::try_new(runtime_config).expect("creating runtime"));
+                // Use `saturating_sub` to prevent underflow.
+                //
+                // If an underflow would occur, `saturating_sub` sets the central
+                // memory pool size to 0. This ensures that the central memory will
+                // trigger an error message due to insufficient memory.
+                config
+                    .mem_pool_size
+                    .saturating_sub(per_query_mem_pool_size * max_concurrent_queries)
+            }
+        };
+
+        let mut builder = RuntimeEnvBuilder::new()
+            .with_disk_manager(DiskManagerConfig::Disabled)
+            .with_memory_limit(central_mem_pool_limit, 1.0);
+
+        if let Some(heap_memory_limit) = config.heap_memory_limit {
+            match AllocationMonitor::try_new(heap_memory_limit) {
+                Ok(monitor) => {
+                    let memory_pool = builder
+                        .memory_pool
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
+                    builder = builder.with_memory_pool(Arc::new(
+                        AllocationMonitoringMemoryPool::new(memory_pool, Arc::new(monitor)),
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        ?e,
+                        "AllocationMonitor creation error, falling back to default memory pool"
+                    );
+                }
+            }
+        }
+
+        let runtime = builder.build_arc().expect("creating runtime");
+
         for (id, store) in &config.object_stores {
             register_iox_object_store(&runtime, id, Arc::clone(store));
         }
@@ -127,7 +258,7 @@ impl Executor {
         let mut created = false;
         let created_captured = &mut created;
         let bridge =
-            DataFusionMemoryPoolMetricsBridge::new(&runtime.memory_pool, config.mem_pool_size);
+            DataFusionMemoryPoolMetricsBridge::new(&runtime.memory_pool, central_mem_pool_limit);
         let bridge_ctor = move || {
             *created_captured = true;
             bridge
@@ -151,8 +282,20 @@ impl Executor {
     ///
     /// Note that this context (and all its clones) will be shut down once `Executor` is dropped.
     pub fn new_session_config(&self) -> IOxSessionConfig {
-        IOxSessionConfig::new(self.executor.clone(), Arc::clone(&self.runtime))
-            .with_target_partitions(self.config.target_query_partitions)
+        let per_query_mem_pool_size = match self.config.per_query_mem_pool_config {
+            PerQueryMemoryPoolConfig::Disabled => 0,
+            PerQueryMemoryPoolConfig::Enabled {
+                per_query_mem_pool_size,
+                ..
+            } => per_query_mem_pool_size,
+        };
+
+        IOxSessionConfig::new(
+            self.executor.clone(),
+            Arc::clone(&self.runtime),
+            per_query_mem_pool_size,
+        )
+        .with_target_partitions(self.config.target_query_partitions)
     }
 
     /// Create a new execution context, suitable for executing a new query or system task
@@ -256,11 +399,13 @@ mod tests {
         error::DataFusionError,
         physical_expr::{EquivalenceProperties, PhysicalSortExpr},
         physical_plan::{
-            expressions::Column, sorts::sort::SortExec, DisplayAs, ExecutionMode, ExecutionPlan,
-            PlanProperties, RecordBatchStream,
+            DisplayAs, ExecutionPlan, PlanProperties, RecordBatchStream,
+            execution_plan::{Boundedness, EmissionType},
+            expressions::Column,
+            sorts::sort::SortExec,
         },
     };
-    use futures::{stream::BoxStream, Stream, StreamExt};
+    use futures::{Stream, StreamExt, stream::BoxStream};
     use metric::{Observation, RawReporter};
 
     use tokio::sync::Barrier;
@@ -288,7 +433,8 @@ mod tests {
             vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("c", &schema).unwrap()),
                 options: Default::default(),
-            }],
+            }]
+            .into(),
             Arc::clone(&test_input) as _,
         ));
         let ctx = exec.new_context();
@@ -299,7 +445,7 @@ mod tests {
         assert_eq!(
             PoolMetrics::read(&exec.config.metric_registry),
             PoolMetrics {
-                reserved: 896,
+                reserved: 800,
                 limit: TESTING_MEM_POOL_SIZE as u64,
             },
         );
@@ -312,6 +458,61 @@ mod tests {
             PoolMetrics {
                 reserved: 0,
                 limit: TESTING_MEM_POOL_SIZE as u64,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_integration_with_per_query_memory_pool() {
+        const TESTING_CENTRAL_MEM_POOL_SIZE: usize = TESTING_MEM_POOL_SIZE
+            - TESTING_PER_QUERY_MEM_POOL_SIZE * TESTING_MAX_CONCURRENT_QUERIES;
+
+        let exec = Executor::new_testing_with_per_query_memory_pool();
+
+        // start w/o any reservation
+        assert_eq!(
+            PoolMetrics::read(&exec.config.metric_registry),
+            PoolMetrics {
+                reserved: 0,
+                limit: TESTING_CENTRAL_MEM_POOL_SIZE as u64,
+            },
+        );
+
+        // block some reservation
+        let test_input = Arc::new(TestExec::default());
+        let schema = test_input.schema();
+        let plan = Arc::new(SortExec::new(
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("c", &schema).unwrap()),
+                options: Default::default(),
+            }]
+            .into(),
+            Arc::clone(&test_input) as _,
+        ));
+        let ctx = exec.new_context();
+        let handle = tokio::spawn(async move {
+            ctx.collect(plan).await.unwrap();
+        });
+        test_input.wait().await;
+        assert_eq!(
+            PoolMetrics::read(&exec.config.metric_registry),
+            PoolMetrics {
+                // The plan needs 800 bytes of memory. The pre-reserved memory for
+                // this query is 500 bytes as defined in TESTING_PER_QUERY_MEM_POOL_SIZE.
+                // So the central memory pool reserved an additional 300 (800 - 500) bytes.
+                reserved: 300,
+                limit: TESTING_CENTRAL_MEM_POOL_SIZE as u64,
+            },
+        );
+        test_input.wait_for_finish().await;
+
+        // end w/o any reservation
+        handle.await.unwrap();
+        assert_eq!(
+            PoolMetrics::read(&exec.config.metric_registry),
+            PoolMetrics {
+                reserved: 0,
+                limit: TESTING_CENTRAL_MEM_POOL_SIZE as u64,
             },
         );
     }
@@ -364,7 +565,12 @@ mod tests {
             let output_partitioning =
                 datafusion::physical_plan::Partitioning::UnknownPartitioning(1);
 
-            PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
+            PlanProperties::new(
+                eq_properties,
+                output_partitioning,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )
         }
     }
 

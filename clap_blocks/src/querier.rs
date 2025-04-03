@@ -1,11 +1,13 @@
 //! Querier-related configs.
 use crate::{
+    gossip::GossipConfig,
     ingester_address::IngesterAddress,
     memory_size::MemorySize,
     object_store::Endpoint,
+    object_store_cache::ObjectStoreCacheMetrics,
     single_tenant::{CONFIG_AUTHZ_ENV_NAME, CONFIG_AUTHZ_FLAG},
 };
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf};
 
 /// CLI config for querier configuration
 #[derive(Debug, Clone, PartialEq, Eq, clap::Parser)]
@@ -55,6 +57,65 @@ pub struct QuerierConfig {
         action
     )]
     pub exec_mem_pool_bytes: MemorySize,
+
+    /// The minimum size of the memory pool pre-reserved for each query, in bytes.
+    ///
+    /// Set to zero to disable.
+    ///
+    /// Can be given as an absolute value, such as 26214400 (25 MB). Currently, a value
+    /// in percentage of the total available memory is not supported.
+    ///
+    /// This configuration controls enabling/disabling per-query memory pool (see graph below),
+    /// which ensures that each query has a dedicated memory pool with minimum memory budget.
+    /// The per-query memory pool is separate from the central memory pool. Most queries will
+    /// run successfully within the 25 MB reservation. This setup maximizes the chances of simple
+    /// queries succeeding while allowing queries that require additional memory to allocate the
+    /// excess from the central memory pool.
+    ///
+    /// This value is used in `PerQueryMemoryPool`, where each query is reserved
+    /// a minimum amount of memory for execution.
+    ///
+    /// The total pre-reserved memory for all queries is calculated as:
+    ///
+    /// `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES * INFLUXDB_IOX_MAX_CONCURRENT_QUERIES`
+    ///
+    /// Given the following configurations:
+    ///   - `INFLUXDB_IOX_EXEC_MEM_POOL_BYTES` = 8GB
+    ///   - `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES` = 25MB
+    ///   - `INFLUXDB_IOX_MAX_CONCURRENT_QUERIES` = 80
+    ///
+    /// The total pre-reserved memory is:
+    ///
+    /// `25 MB/query x 80 queries = 2 GB`
+    ///
+    /// ```text
+    ///    │<---- INFLUXDB_IOX_EXEC_MEM_POOL_BYTES 8 GB ------>│
+    ///    |<-- 2 GB --->||<------------- 6 GB --------------->|
+    ///    ┌─────────────┐┌────────────────────────────────────┐
+    ///    │             ││                                    │
+    ///    │  Per Query  ││           Central                  │
+    ///    │   Memory    ││           Memory                   │
+    ///    │    Pool     ││            Pool                    │
+    ///    │             ││                                    │
+    ///    └──────▲──────┘└──────────────▲─────────────────────┘
+    ///           │                      │
+    ///         1 │                    2 │
+    ///           │                      │
+    ///      Query A  ───────────────────┘
+    /// ```
+    ///
+    /// 1. Query A uses memory from the "PerQueryMemoryPool," which has a
+    ///    fixed reservation per query, e.g. 25 MB.
+    ///
+    /// 2. If the 25 MB reservation is insufficient, Query A will use memory
+    ///    from the "Central Memory Pool."
+    #[clap(
+        long = "exec-per-query-mem-pool-bytes",
+        env = "INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES",
+        default_value = "0",
+        action
+    )]
+    pub exec_per_query_mem_pool_bytes: usize,
 
     /// gRPC address for the router to talk with the ingesters. For
     /// example:
@@ -138,6 +199,10 @@ pub struct QuerierConfig {
         action
     )]
     pub parquet_metadata_mem_cache_bytes: Option<MemorySize>,
+
+    /// Use object store cache metrics.
+    #[clap(flatten)]
+    pub object_store_mem_cache_metrics: ObjectStoreCacheMetrics,
 
     /// Limit the number of concurrent queries.
     #[clap(
@@ -270,6 +335,75 @@ pub struct QuerierConfig {
         action
     )]
     pub observe_file_access: Option<usize>,
+
+    /// Limit to the amount of heap memory that can be allocated by the
+    /// querier before queries will be stopped.
+    #[clap(
+        long = "heap-memory-limit",
+        env = "INFLUXDB_IOX_HEAP_MEMORY_LIMIT",
+        action
+    )]
+    pub heap_memory_limit: Option<MemorySize>,
+
+    /// Chunk object store GET requests into the given byte size.
+    ///
+    /// If racing is active, we race the individual chunks, NOT the entire GET request.
+    #[clap(
+        long = "chunk-object-store-requests",
+        env = "INFLUXDB_IOX_CHUNK_OBJECT_STORE_REQUESTS",
+        action
+    )]
+    pub chunk_object_store_requests: Option<NonZeroUsize>,
+
+    /// If object store chunking is enabled (see
+    /// `--chunk-object-store-requests`/`INFLUXDB_IOX_CHUNK_OBJECT_STORE_REQUESTS`) then this sets the maximum number of
+    /// concurrent tasks that is created from a single GET request.
+    #[clap(
+        long = "chunk-object-store-max-concurrent-tasks-per-request",
+        env = "INFLUXDB_IOX_CHUNK_OBJECT_STORE_MAX_CONCURRENT_TASKS_PER_REQUEST",
+        default_value_t = NonZeroUsize::MAX,
+        action
+    )]
+    pub chunk_object_store_max_concurrent_tasks_per_request: NonZeroUsize,
+
+    /// Number of concurrent object store requests that should race for completion.
+    #[clap(
+        long = "race-object-store-requests",
+        env = "INFLUXDB_IOX_RACE_OBJECT_STORE_REQUESTS",
+        action
+    )]
+    pub race_object_store_requests: Option<NonZeroUsize>,
+
+    /// Maximum number of background tasks that are used to drain losing object store requests.
+    #[clap(
+        long = "race-object-store-max-draining-tasks",
+        env = "INFLUXDB_IOX_RACE_OBJECT_STORE_MAX_DRAINING_TASKS",
+        default_value_t = 100,
+        action
+    )]
+    pub race_object_store_max_draining_tasks: usize,
+
+    /// Disk storage location for query-related caches.
+    ///
+    /// This will mostly hold parquet files for now.
+    ///
+    /// Cache is NOT used if this value is not provided.
+    #[clap(long = "query-cache-dir", env = "INFLUXDB_IOX_QUERY_CACHE_DIR", action)]
+    pub parquet_data_disk_cache_location: Option<PathBuf>,
+
+    /// Whether or not to cache recently persisted parquet files into the
+    /// querier's object store cache.
+    #[clap(
+        long = "query-cache-persisted-parquet-files",
+        env = "INFLUXDB_IOX_QUERY_CACHE_PERSISTED_PARQUET_FILES",
+        default_value = "false"
+    )]
+    pub cache_persisted_parquet_files: bool,
+
+    /// Gossip configuration for the querier. Only used if the querier is
+    /// configured to cache recently persisted parquet files.
+    #[clap(flatten)]
+    pub gossip_config: GossipConfig,
 }
 
 fn parse_datafusion_config(
@@ -401,6 +535,77 @@ mod tests {
         assert_contains!(
             actual,
             "error: invalid value 'foo:bar,baz:1,foo:2' for '--datafusion-config <DATAFUSION_CONFIG>': key 'foo' passed multiple times"
+        );
+    }
+
+    #[test]
+    fn test_object_store_mem_cache_metrics() {
+        let querier = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--object-store-cache-metrics-num-objects",
+            "1000000000",
+            "--object-store-cache-metrics-false-positive-rate",
+            "10",
+        ])
+        .unwrap();
+
+        let ObjectStoreCacheMetrics {
+            number_of_unique_objects,
+            false_positive_rate,
+        } = querier.object_store_mem_cache_metrics;
+
+        assert_eq!(number_of_unique_objects, NonZeroUsize::new(1000000000));
+        assert_eq!(false_positive_rate, NonZeroUsize::new(10));
+    }
+
+    #[test]
+    fn bad_object_store_mem_cache_metrics() {
+        // missing other arg
+        let err = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--object-store-cache-metrics-num-objects",
+            "1000000000",
+        ])
+        .unwrap_err();
+        assert_contains!(
+            err.to_string(),
+            "the following required arguments were not provided:\n  --object-store-cache-metrics-false-positive-rate <FALSE_POSITIVE_RATE>"
+        );
+
+        // missing other arg
+        let err = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--object-store-cache-metrics-false-positive-rate",
+            "10",
+        ])
+        .unwrap_err();
+        assert_contains!(
+            err.to_string(),
+            "the following required arguments were not provided:\n  --object-store-cache-metrics-num-objects <NUMBER_OF_UNIQUE_OBJECTS>"
+        );
+
+        // NaN error
+        let err = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--object-store-cache-metrics-false-positive-rate",
+            "foo",
+        ])
+        .unwrap_err();
+        assert_contains!(
+            err.to_string(),
+            "Should be a valid usize number, instead found 'foo'"
+        );
+
+        // NotPercentage error
+        let err = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--object-store-cache-metrics-false-positive-rate",
+            "112",
+        ])
+        .unwrap_err();
+        assert_contains!(
+            err.to_string(),
+            "Should be a number >0 and <=100, instead found 112"
         );
     }
 }

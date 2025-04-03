@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-bytes = "1.9"
+bytes = "1.10"
 data_types = { path = "../data_types" }
 futures-util = { version = "0.3" }
 generated_types = { path = "../generated_types" }
@@ -19,8 +19,8 @@ parquet_file = { path = "../parquet_file"  }
 object_store = { workspace=true }
 observability_deps = { path = "../observability_deps" }
 schema = { path = "../schema" }
-serde_json = "1.0.134"
-thiserror = "2.0.9"
-tokio = { version = "1.42" }
-tokio-util = { version = "0.7.13", features = ["compat"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+tokio = { version = "1.44" }
+tokio-util = { version = "0.7.14", features = ["compat"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

@@ -1,4 +1,4 @@
-use crate::{error, NUMERICS};
+use crate::{NUMERICS, error};
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, IntervalUnit::MonthDayNano, TimeUnit};
 use datafusion::common::{Result, ScalarValue};
@@ -6,7 +6,7 @@ use datafusion::logical_expr::function::{
     ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
 };
 use datafusion::logical_expr::{
-    PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl, TIMEZONE_WILDCARD,
+    PartitionEvaluator, Signature, TIMEZONE_WILDCARD, TypeSignature, Volatility, WindowUDFImpl,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use observability_deps::tracing::warn;
@@ -161,7 +161,9 @@ fn delta_time(curr: &ScalarValue, prev: &ScalarValue, unit: &ScalarValue) -> Res
     ) = (curr, prev, unit)
     {
         if !tz_curr.eq(tz_prev) {
-            warn!("timezones do not match for the delta_time comparison, however, the scalar nanoseconds should always be in UTC")
+            warn!(
+                "timezones do not match for the delta_time comparison, however, the scalar nanoseconds should always be in UTC"
+            )
         }
         Ok((*curr as f64 - *prev as f64) / unit.nanoseconds as f64)
     } else {

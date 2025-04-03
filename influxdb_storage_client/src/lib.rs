@@ -1,6 +1,5 @@
 //! An InfluxDB gRPC storage API client
 #![warn(missing_docs)]
-#![allow(clippy::missing_docs_in_private_items)]
 
 use measurement_fields_response::MessageField;
 // Workaround for "unused crate" lint false positives.

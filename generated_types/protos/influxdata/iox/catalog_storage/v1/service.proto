@@ -16,7 +16,7 @@ service CatalogStorageService {
 }
 
 enum SortDirection {
-    // Unspecified sort direction.
+    // No sort direction specified.
     SORT_DIRECTION_UNSPECIFIED = 0;
 
     // Ascending order.
@@ -31,7 +31,7 @@ enum SortDirection {
 // ============
 
 enum NamespaceSortField {
-    // Unspecified sort field.
+    // No sort field specified.
     NAMESPACE_SORT_FIELD_UNSPECIFIED = 0;
 
     // Sort by namespace ID.
@@ -52,29 +52,32 @@ enum NamespaceSortField {
 
 // Request to get a list of namespaces with storage.
 message GetNamespacesWithStorageRequest {
-    // Pagination and sorting options can be added later:
-    // https://github.com/influxdata/influxdb_iox/issues/12775
-
     // Field to sort by
-    NamespaceSortField sort_field = 1;
+    optional NamespaceSortField sort_field = 1;
 
     // Direction in which to sort
-    SortDirection sort_direction = 2;
+    optional SortDirection sort_direction = 2;
+
+    // Number of records to include per page
+    optional int32 page_size = 3;
+
+    // Page number to retrieve
+    optional int32 page_number = 4;
 }
 
 // Request to get a specific namespace with storage.
 message GetNamespaceWithStorageRequest {
     // ID of the namespace to get.
-    //
-    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
-    // team and the Product team regarding requests by name vs ID. This might change.
-    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
     int64 id = 1;
 }
 
 // Response containing a list of namespaces with storage.
 message GetNamespacesWithStorageResponse {
     repeated NamespaceWithStorage namespace_with_storage = 1;
+
+    int64 total = 2;
+
+    int64 pages = 3;
 }
 
 // Response containing a specific namespace with storage.
@@ -115,39 +118,50 @@ message NamespaceWithStorage {
 // Table
 // ============
 
+enum TableSortField {
+    // No sort field specified.
+    TABLE_SORT_FIELD_UNSPECIFIED = 0;
+
+    // Sort by table name.
+    TABLE_SORT_FIELD_NAME = 1;
+
+    // Sort by the total size of the table.
+    TABLE_SORT_FIELD_STORAGE = 2;
+}
+
 // Request to get a list of tables with storage in a namespace.
 message GetTablesWithStorageRequest {
     // ID of the namespace for which tables are listed.
-    //
-    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
-    // team and the Product team regarding requests by name vs ID. This might change.
-    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
     int64 namespace_id = 1;
 
-    // Pagination and sorting options can be added later:
-    // https://github.com/influxdata/influxdb_iox/issues/12775
+    // Field to sort by
+    optional TableSortField sort_field = 2;
+
+    // Direction in which to sort
+    optional SortDirection sort_direction = 3;
+
+    // Number of records to include per page
+    optional int32 page_size = 4;
+
+    // Page number to retrieve
+    optional int32 page_number = 5;
 }
 
 // Request to get a specific table with storage.
 message GetTableWithStorageRequest {
-    // ID of the namespace to get table for.
-    //
-    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
-    // team and the Product team regarding requests by name vs ID. This might change.
-    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
-    int64 namespace_id = 1;
-
     // ID of the table to get from namespace.
-    //
-    // Note: As of No 19, 2024, there is an ongoing discussion between the Platform
-    // team and the Product team regarding requests by name vs ID. This might change.
-    // https://docs.google.com/document/d/1czt86K3yOvntl-RmKBIRfd62FOjMti4L0fReH4dEcPQ
-    int64 table_id = 2;
+    int64 table_id = 1;
 }
 
 // Response containing a list of tables with storage.
 message GetTablesWithStorageResponse {
     repeated TableWithStorage table_with_storage = 1;
+
+    // The total number of items in the unpaged data set
+    int64 total = 2;
+
+    // The total number of pages available
+    int64 pages = 3;
 }
 
 // Response containing details of a specific table with storage.

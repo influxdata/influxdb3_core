@@ -46,14 +46,14 @@ message TableUpdated {
   string namespace_name = 2;
   int64 table_id = 3;
   // The namespace ID must be included to allow receivers to process messages
-  // correctly for mutable namespace names. 
+  // correctly for mutable namespace names.
   int64 namespace_id = 5;
 
   // The set of columns in this update.
   repeated Column columns = 4;
 }
 
-// Initialisation of a new table occured.
+// Initialisation of a new table occurred.
 //
 // This is a superset of the merge-able TableUpdated message, containing
 // immutable and large fields that should not be propagated for each column

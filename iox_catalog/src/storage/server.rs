@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::interface::{Catalog, RepoCollection};
-use crate::storage::serialization::{
-    serialize_namespace_with_storage, serialize_table_with_storage,
+use crate::interface::{
+    Catalog, NamespaceSorting, PaginationOptions, RepoCollection, TableSorting,
 };
 use crate::util_serialization::catalog_error_to_status;
 
@@ -12,9 +11,6 @@ use async_trait::async_trait;
 use data_types::{NamespaceId, TableId};
 use generated_types::influxdata::iox::catalog_storage::v1 as proto;
 use tonic::{Request, Response, Status};
-
-use super::serialization::{deserialize_namespace_sort_field, deserialize_sort_direction};
-use super::sorting::sort_namespaces;
 
 /// gRPC server that provides:
 /// - namespace with storage, such as size and table count
@@ -58,21 +54,23 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
     ) -> Result<Response<proto::GetNamespacesWithStorageResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
-        let mut namespace_list = repos
+        let sorting = NamespaceSorting::from((req.sort_field, req.sort_direction));
+        let pagination = PaginationOptions::from((req.page_number, req.page_size));
+
+        let paginated_namespaces = repos
             .namespaces()
-            .list_storage()
+            .list_storage(Some(sorting), Some(pagination))
             .await
             .map_err(catalog_error_to_status)?;
 
-        let sort_field = deserialize_namespace_sort_field(req.sort_field)?;
-        let sort_direction = deserialize_sort_direction(req.sort_direction)?;
-        sort_namespaces(&mut namespace_list, sort_field, sort_direction);
-
         Ok(Response::new(proto::GetNamespacesWithStorageResponse {
-            namespace_with_storage: namespace_list
+            namespace_with_storage: paginated_namespaces
+                .items
                 .into_iter()
-                .map(serialize_namespace_with_storage)
+                .map(From::from)
                 .collect(),
+            total: paginated_namespaces.total,
+            pages: paginated_namespaces.pages,
         }))
     }
 
@@ -89,8 +87,7 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::GetNamespaceWithStorageResponse {
-            namespace_with_storage: maybe_namespace_with_storage
-                .map(serialize_namespace_with_storage),
+            namespace_with_storage: maybe_namespace_with_storage.map(From::from),
         }))
     }
 
@@ -100,17 +97,23 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
     ) -> Result<Response<proto::GetTablesWithStorageResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
-        let table_list = repos
+        let sorting = TableSorting::from((req.sort_field, req.sort_direction));
+        let pagination = PaginationOptions::from((req.page_number, req.page_size));
+
+        let paginated_tables = repos
             .tables()
-            .list_storage_by_namespace_id(NamespaceId::new(req.namespace_id))
+            .list_storage_by_namespace_id(
+                NamespaceId::new(req.namespace_id),
+                Some(sorting),
+                Some(pagination),
+            )
             .await
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::GetTablesWithStorageResponse {
-            table_with_storage: table_list
-                .into_iter()
-                .map(serialize_table_with_storage)
-                .collect(),
+            table_with_storage: paginated_tables.items.into_iter().map(From::from).collect(),
+            total: paginated_tables.total,
+            pages: paginated_tables.pages,
         }))
     }
 
@@ -127,7 +130,7 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::GetTableWithStorageResponse {
-            table_with_storage: maybe_table_with_storage.map(serialize_table_with_storage),
+            table_with_storage: maybe_table_with_storage.map(From::from),
         }))
     }
 }
@@ -147,14 +150,8 @@ mod tests {
     use test_helpers::maybe_start_logging;
     use tonic::Request;
 
-    use crate::storage::{
-        serialization::{
-            serialize_namespace_sort_field, serialize_namespace_with_storage,
-            serialize_sort_direction, serialize_table_with_storage,
-        },
-        server::CatalogStorageServer,
-        sorting::{NamespaceSortField, SortDirection},
-    };
+    use crate::interface::{NamespaceSortField, SortDirection, TableSortField};
+    use crate::storage::server::CatalogStorageServer;
     use crate::test_helpers::{
         arbitrary_namespace, create_and_get_file, delete_file, setup_table_and_partition,
     };
@@ -188,8 +185,10 @@ mod tests {
 
         let response = server
             .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Id),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Id.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
             }))
             .await
             .unwrap()
@@ -208,7 +207,9 @@ mod tests {
         assert_eq!(
             response,
             proto::GetNamespacesWithStorageResponse {
-                namespace_with_storage: vec![expected_namespace_1]
+                namespace_with_storage: vec![expected_namespace_1],
+                total: 1,
+                pages: 1,
             }
         );
 
@@ -224,8 +225,10 @@ mod tests {
         );
         let response = server
             .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Id),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Id.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
             }))
             .await
             .unwrap()
@@ -233,7 +236,9 @@ mod tests {
         assert_eq!(
             response,
             proto::GetNamespacesWithStorageResponse {
-                namespace_with_storage: vec![expected_namespace_1.clone()]
+                namespace_with_storage: vec![expected_namespace_1.clone()],
+                total: 1,
+                pages: 1,
             }
         );
 
@@ -247,8 +252,10 @@ mod tests {
         // Expected two namespaces
         let response = server
             .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Id),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Id.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
             }))
             .await
             .unwrap()
@@ -267,8 +274,10 @@ mod tests {
         );
         let response = server
             .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Storage),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Storage.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
             }))
             .await
             .unwrap()
@@ -280,7 +289,9 @@ mod tests {
                 namespace_with_storage: vec![
                     expected_namespace_2.clone(),
                     expected_namespace_1.clone()
-                ]
+                ],
+                total: 2,
+                pages: 1,
             }
         );
 
@@ -288,8 +299,10 @@ mod tests {
         // Expected namespace_1 to be last because it has the "greater" name alphabetically
         let response = server
             .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Name),
-                sort_direction: serialize_sort_direction(SortDirection::Desc),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Name.into()),
+                sort_direction: Some(SortDirection::Descending.into()),
             }))
             .await
             .unwrap()
@@ -300,7 +313,9 @@ mod tests {
                 namespace_with_storage: vec![
                     expected_namespace_2.clone(),
                     expected_namespace_1.clone()
-                ]
+                ],
+                total: 2,
+                pages: 1,
             }
         );
 
@@ -308,8 +323,10 @@ mod tests {
         // Expected namespace_1 to be first
         let response = server
             .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Name),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Name.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
             }))
             .await
             .unwrap()
@@ -320,7 +337,223 @@ mod tests {
                 namespace_with_storage: vec![
                     expected_namespace_1.clone(),
                     expected_namespace_2.clone()
-                ]
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Provide no sort field
+        // Expected namespace_1 to be first
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![
+                    expected_namespace_1.clone(),
+                    expected_namespace_2.clone()
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by storage, provide no sort direction
+        // Expected namespace_2 to be first (direction default to Asc)
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Storage.into()),
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![
+                    expected_namespace_2.clone(),
+                    expected_namespace_1.clone(),
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Get page 1
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![expected_namespace_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get page 2
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(2),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![expected_namespace_2.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get non-existent page returns an empty list
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(3),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page number reverts to default
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(-1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![expected_namespace_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page size reverts to default
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(1),
+                page_size: Some(-1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespace_with_storage: vec![
+                    expected_namespace_1.clone(),
+                    expected_namespace_2.clone()
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_storage_get_namespace_with_storage() {
+        maybe_start_logging();
+        let namespace_name_1 = "namespace_name_1";
+
+        // Set up catalog, server, and create a namespace
+        let catalog = catalog();
+        let server = CatalogStorageServer::new(Arc::clone(&catalog));
+        let mut repos = catalog.repositories();
+        let namespace_1 = arbitrary_namespace(&mut *repos, namespace_name_1).await;
+
+        // Create two tables, thier partitions, and files in namespace_1
+        let (ns_1_table_1, ns_1_partition_1) =
+            setup_table_and_partition(&mut *repos, "ns_1_table_1", &namespace_1).await;
+        let (ns_1_table_2, ns_1_partition_2) =
+            setup_table_and_partition(&mut *repos, "ns_1_table_2", &namespace_1).await;
+        let ns_1_file_1 =
+            create_and_get_file(&mut *repos, &namespace_1, &ns_1_table_1, &ns_1_partition_1).await;
+        let ns_1_file_2 =
+            create_and_get_file(&mut *repos, &namespace_1, &ns_1_table_2, &ns_1_partition_2).await;
+
+        // Verify the two files are in the same namespace, but different tables
+        assert_eq!(ns_1_file_1.namespace_id, ns_1_file_2.namespace_id);
+        assert_ne!(ns_1_file_1.table_id, ns_1_file_2.table_id);
+
+        let response = server
+            .get_namespace_with_storage(Request::new(proto::GetNamespaceWithStorageRequest {
+                id: ns_1_file_1.namespace_id.get(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Expected file size and table count is the sum of all tables
+        let expected_namespace_1 = create_expected_namespace_with_storage(
+            namespace_name_1,
+            &ns_1_file_1,
+            ns_1_file_1.file_size_bytes + ns_1_file_2.file_size_bytes,
+            2, // expect two tables
+        );
+        assert_eq!(
+            response,
+            proto::GetNamespaceWithStorageResponse {
+                namespace_with_storage: Some(expected_namespace_1),
+            }
+        );
+
+        // Get a non-existent namespace
+        let non_existent_namespace = server
+            .get_namespace_with_storage(Request::new(proto::GetNamespaceWithStorageRequest {
+                id: 100, // non-existent namespace ID
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            non_existent_namespace,
+            proto::GetNamespaceWithStorageResponse {
+                namespace_with_storage: None,
             }
         );
     }
@@ -365,6 +598,10 @@ mod tests {
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_1_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
             }))
             .await
             .unwrap()
@@ -382,7 +619,9 @@ mod tests {
         assert_eq!(
             response,
             proto::GetTablesWithStorageResponse {
-                table_with_storage: vec![expected_table_1]
+                table_with_storage: vec![expected_table_1],
+                total: 1,
+                pages: 1,
             }
         );
 
@@ -398,6 +637,10 @@ mod tests {
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_1_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
             }))
             .await
             .unwrap()
@@ -405,7 +648,9 @@ mod tests {
         assert_eq!(
             response,
             proto::GetTablesWithStorageResponse {
-                table_with_storage: vec![expected_table_1.clone()]
+                table_with_storage: vec![expected_table_1.clone()],
+                total: 1,
+                pages: 1,
             }
         );
 
@@ -426,6 +671,10 @@ mod tests {
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
             }))
             .await
             .unwrap()
@@ -442,6 +691,10 @@ mod tests {
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
             }))
             .await
             .unwrap()
@@ -449,13 +702,252 @@ mod tests {
         assert_eq!(
             response,
             proto::GetTablesWithStorageResponse {
-                table_with_storage: vec![expected_table_1, expected_table_2]
+                table_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by name desc
+        // Expected table_2 to be first
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Name.into()),
+                sort_direction: Some(SortDirection::Descending.into()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_2.clone(), expected_table_1.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by name asc
+        // Expected table_1 to be first
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Name.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by storage desc
+        // Expected table_1 to be first because it has the greater size
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Storage.into()),
+                sort_direction: Some(SortDirection::Descending.into()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by storage asc
+        // Expected table_2 to be first because it has the smaller size
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Storage.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_2.clone(), expected_table_1.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by storage, provide no sort direction
+        // Expected table_2 to be first (direction default to Asc)
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Storage.into()),
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_2.clone(), expected_table_1.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Provide a sort direction but no sort field
+        // Expect no sorting to have been applied
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: Some(SortDirection::Ascending.into()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Get page 1
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get page 2
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(2),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_2.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get non-existent page returns an empty list
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(3),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page number reverts to default
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(-1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page size reverts to default
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(1),
+                page_size: Some(-1),
+                sort_field: None,
+                sort_direction: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                table_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
             }
         );
     }
 
     #[tokio::test]
-    async fn test_catalog_storage_get_table_storage_by_id() {
+    async fn test_catalog_storage_get_table_with_storage() {
         maybe_start_logging();
         let table_name = "test_table";
 
@@ -480,7 +972,6 @@ mod tests {
         let server = CatalogStorageServer::new(Arc::clone(&catalog));
         let table_with_storage = server
             .get_table_with_storage(Request::new(proto::GetTableWithStorageRequest {
-                namespace_id: file_1.namespace_id.get(),
                 table_id: file_1.table_id.get(),
             }))
             .await
@@ -503,7 +994,6 @@ mod tests {
         // Get a non-existent table
         let non_existent_table = server
             .get_table_with_storage(Request::new(proto::GetTableWithStorageRequest {
-                namespace_id: file_1.namespace_id.get(),
                 table_id: 100, // non-existent table ID
             }))
             .await
@@ -530,7 +1020,7 @@ mod tests {
         expected_size: i64,
         expected_table_count: i64,
     ) -> proto::NamespaceWithStorage {
-        serialize_namespace_with_storage(NamespaceWithStorage {
+        NamespaceWithStorage {
             id: file.namespace_id,
             name: namespace_name.to_string(),
             retention_period_ns: None,
@@ -539,7 +1029,8 @@ mod tests {
             partition_template: NamespacePartitionTemplateOverride::default(),
             size_bytes: expected_size,
             table_count: expected_table_count,
-        })
+        }
+        .into()
     }
 
     // Helper function to create an expected table
@@ -548,12 +1039,13 @@ mod tests {
         file: &data_types::ParquetFile,
         expected_size: i64,
     ) -> proto::TableWithStorage {
-        serialize_table_with_storage(TableWithStorage {
+        TableWithStorage {
             id: file.table_id,
             namespace_id: file.namespace_id,
             name: table_name.to_string(),
             partition_template: TablePartitionTemplateOverride::default(),
             size_bytes: expected_size,
-        })
+        }
+        .into()
     }
 }

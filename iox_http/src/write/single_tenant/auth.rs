@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use authz::{
-    self, extract_token, http::AuthorizationHeaderExtension, Action, Authorizer, Error, Permission,
-    Resource,
+    self, Action, Authorizer, Error, Permission, Resource, Target, extract_token,
+    http::AuthorizationHeaderExtension,
 };
 use data_types::NamespaceName;
 use hyper::{Body, Request};
@@ -23,7 +23,7 @@ pub(crate) async fn authorize(
     .or_else(|| query_param_token.map(|t| t.into_bytes()));
 
     let perms = [Permission::ResourceAction(
-        Resource::Database(namespace.to_string()),
+        Resource::Database(Target::ResourceName(namespace.to_string())),
         Action::Write,
     )];
 
@@ -66,7 +66,7 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use base64::{prelude::BASE64_STANDARD, Engine};
+    use base64::{Engine, prelude::BASE64_STANDARD};
     use hyper::header::HeaderValue;
 
     use super::mock::*;

@@ -1,8 +1,8 @@
 //! CLI config for the router to enable bulk ingest APIs
 
 use ed25519_dalek::{
-    pkcs8::{DecodePrivateKey, DecodePublicKey},
     SigningKey, VerifyingKey,
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
 };
 use humantime::parse_duration;
 use snafu::{ResultExt, Snafu};
@@ -124,7 +124,7 @@ impl TryFrom<&BulkIngestConfig> for Option<BulkIngestKeys> {
 }
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum BulkIngestConfigError {
     #[snafu(display("Could not read signing key from {}: {source}", filename.display()))]
     ReadingSigningKeyFile {

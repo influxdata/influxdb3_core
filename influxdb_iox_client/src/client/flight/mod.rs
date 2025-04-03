@@ -2,7 +2,7 @@
 
 use std::{pin::Pin, task::Poll};
 
-use ::generated_types::influxdata::iox::querier::v1::{read_info::QueryType, ReadInfo};
+use ::generated_types::influxdata::iox::querier::v1::{ReadInfo, read_info::QueryType};
 use futures_util::{Stream, StreamExt};
 use prost::Message;
 use thiserror::Error;
@@ -15,7 +15,7 @@ use arrow::{
 
 use rand::Rng;
 
-use arrow_flight::{decode::FlightRecordBatchStream, error::FlightError, FlightClient, Ticket};
+use arrow_flight::{FlightClient, Ticket, decode::FlightRecordBatchStream, error::FlightError};
 
 use crate::connection::Connection;
 
@@ -308,7 +308,7 @@ impl Client {
     pub async fn handshake(&mut self) -> Result<(), Error> {
         // handshake is an echo server. Send some random bytes and
         // expect the same back.
-        let payload = rand::thread_rng().gen::<[u8; 16]>().to_vec();
+        let payload = rand::rng().random::<[u8; 16]>().to_vec();
 
         let response = self
             .inner

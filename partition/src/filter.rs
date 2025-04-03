@@ -45,25 +45,27 @@ where
     let mut range: Range<usize> = 0..0;
     let mut values = col_data.iter();
 
-    std::iter::from_fn(move || loop {
-        match values.next() {
-            Some(value) if predicate(*value) => {
-                range.end += 1;
-                continue;
+    std::iter::from_fn(move || {
+        loop {
+            match values.next() {
+                Some(value) if predicate(*value) => {
+                    range.end += 1;
+                    continue;
+                }
+                // Either finished or predicate failed
+                _ if range.start != range.end => {
+                    let t = range.clone();
+                    range.end += 1;
+                    range.start = range.end;
+                    return Some(t);
+                }
+                // Predicate failed and start == end
+                Some(_) => {
+                    range.start += 1;
+                    range.end += 1;
+                }
+                None => return None,
             }
-            // Either finished or predicate failed
-            _ if range.start != range.end => {
-                let t = range.clone();
-                range.end += 1;
-                range.start = range.end;
-                return Some(t);
-            }
-            // Predicate failed and start == end
-            Some(_) => {
-                range.start += 1;
-                range.end += 1;
-            }
-            None => return None,
         }
     })
 }
@@ -72,10 +74,11 @@ where
 mod tests {
     use super::*;
     use mutable_batch::writer::Writer;
+    use rand::TryRngCore;
     use rand::prelude::*;
 
     fn make_rng() -> StdRng {
-        let seed = rand::rngs::OsRng.next_u64();
+        let seed = rand::rngs::OsRng.try_next_u64().unwrap();
         println!("Seed: {seed}");
         StdRng::seed_from_u64(seed)
     }

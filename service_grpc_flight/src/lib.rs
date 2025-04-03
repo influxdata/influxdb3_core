@@ -2,8 +2,6 @@
 //! FlightSQL, based on Arrow Flight and gRPC. See [`FlightService`]
 //! for full detail.
 
-#![allow(clippy::clone_on_ref_ptr)]
-
 use keep_alive::KeepAliveStream;
 use planner::Planner;
 use tower_trailer::{HeaderMap, Trailers};
@@ -16,24 +14,24 @@ mod request;
 
 use arrow::error::ArrowError;
 use arrow_flight::{
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use authz::{extract_token, Authorizer};
+use authz::{Authorizer, extract_token};
 use data_types::NamespaceNameError;
 use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use error_reporting::DisplaySourceChain;
 use flightsql::FlightSQLCommand;
-use futures::{ready, stream::BoxStream, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, ready, stream::BoxStream};
 use generated_types::influxdata::iox::querier::v1 as proto;
 use iox_query::{
+    QueryDatabase,
     exec::IOxSessionContext,
     query_log::{PermitAndToken, QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
-    QueryDatabase,
 };
 use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
 use observability_deps::tracing::{debug, info, warn};
@@ -50,8 +48,8 @@ use std::{
     time::Duration,
 };
 use tonic::{
-    metadata::{AsciiMetadataValue, MetadataMap},
     Request, Response, Streaming,
+    metadata::{AsciiMetadataValue, MetadataMap},
 };
 use trace::{ctx::SpanContext, span::SpanExt};
 use trace_http::{
@@ -127,7 +125,6 @@ const IOX_FLIGHT_INGESTER_RESPONSE_BYTES_RESPONSE_TRAILER: &str =
 /// In which interval should the `DoGet` stream send empty messages as keep alive markers?
 const DO_GET_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid ticket. Error: {}", source))]
@@ -232,8 +229,8 @@ impl From<Error> for tonic::Status {
             Error::DatabaseNotFound { .. }
             | Error::InvalidTicket { .. }
             | Error::InvalidHandshake { .. }
-            | Error::Unauthenticated { .. }
-            | Error::PermissionDenied { .. }
+            | Error::Unauthenticated
+            | Error::PermissionDenied
             | Error::InvalidDatabaseName { .. }
             | Error::Query { .. } => {
                 info!(e=%err, %namespace, %query, msg);
@@ -251,7 +248,7 @@ impl From<Error> for tonic::Status {
             | Error::FlightSQL { .. }
             | Error::StreamingFlightSql { .. }
             | Error::AuthzVerification { .. }
-            | Error::NoFlightDescriptor { .. } => {
+            | Error::NoFlightDescriptor => {
                 warn!(e=%err, %namespace, %query, msg);
             }
         };
@@ -672,6 +669,7 @@ impl FlightService {
             %query,
             trace=external_span_ctx.format_jaeger().as_str(),
             variant=query.variant().str(),
+            request_protocol="v3_grpc_flight",
             "DoGet request",
         );
 
@@ -792,7 +790,9 @@ impl Flight for FlightService {
         let perms = match request.query() {
             RunQuery::FlightSQL(cmd) => flightsql_permissions(request.database(), cmd),
             RunQuery::Sql(_) | RunQuery::InfluxQL(_) => vec![authz::Permission::ResourceAction(
-                authz::Resource::Database(request.database().to_string()),
+                authz::Resource::Database(authz::Target::ResourceName(
+                    request.database().to_string(),
+                )),
                 authz::Action::Read,
             )],
         };
@@ -1210,7 +1210,8 @@ fn get_flight_authz(metadata: &MetadataMap) -> Option<Vec<u8>> {
 }
 
 fn flightsql_permissions(namespace_name: &str, cmd: &FlightSQLCommand) -> Vec<authz::Permission> {
-    let resource = authz::Resource::Database(namespace_name.to_string());
+    let resource =
+        authz::Resource::Database(authz::Target::ResourceName(namespace_name.to_string()));
     let action = match cmd {
         FlightSQLCommand::CommandStatementQuery(_) => authz::Action::Read,
         FlightSQLCommand::CommandPreparedStatementQuery(_) => authz::Action::Read,

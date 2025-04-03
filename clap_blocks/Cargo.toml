@@ -15,18 +15,19 @@ ed25519-dalek = { version = "2", features = ["pem"] }
 http = { workspace = true }
 # object store crate uses new version of http crate
 http_1 = { version = "1.1", package = "http" }
-humantime = "2.1.0"
+humantime = "2.2.0"
 iox_catalog = { path = "../iox_catalog" }
 iox_time = { path = "../iox_time" }
 itertools = "0.13.0"
 metric = { path = "../metric" }
 non-empty-string = "0.2.5"
 object_store = { workspace = true }
+object_store_size_hinting = { path = "../object_store_size_hinting" }
 observability_deps = { path = "../observability_deps" }
 paste = "1.0.15"
 snafu = "0.8"
-sysinfo = "0.33.1"
-tokio = { version = "1.42", features = ["rt-multi-thread"] }
+sysinfo = "0.34.0"
+tokio = { version = "1.44", features = ["rt-multi-thread"] }
 trace_exporters = { path = "../trace_exporters" }
 trogging = { path = "../trogging", default-features = false, features = ["clap"] }
 url = "2.5"
@@ -37,12 +38,9 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 version = "0.2"
 
 [dev-dependencies]
-tempfile = "3.15.0"
+tempfile = "3.19.1"
 test_helpers = { path = "../test_helpers" }
 futures = "0.3.31"
 
 [features]
-azure = ["object_store/azure"] # Optional Azure Object store support
-gcp = ["object_store/gcp"] # Optional GCP object store support
-aws = ["object_store/aws"] # Optional AWS / S3 object store support
 jemalloc = [] # Provide jemalloc-specific config options.

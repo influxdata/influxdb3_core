@@ -9,16 +9,22 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-async-trait = "0.1.83"
-bytes = "1.9"
+async-trait = "0.1.88"
+bloom2 = "0.5.1"
+bytes = "1.10"
 futures = "0.3"
 iox_time = { version = "0.1.0", path = "../iox_time" }
 metric = { version = "0.1.0", path = "../metric" }
 object_store = { workspace = true }
-pin-project = "1.1.7"
-tokio = { version = "1.42", features = ["io-util"] }
+pin-project = "1.1.10"
+tokio = { version = "1.44", features = ["io-util"] }
+tracker = { path = "../tracker" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-snafu = "0.8"
-tokio = { version = "1.42", features = ["macros", "io-util"] }
+futures_test_utils = { path = "../futures_test_utils" }
+object_store_mem_cache = { path = "../object_store_mem_cache" }
+object_store_mock = { version = "0.1", path = "../object_store_mock" }
+rust_decimal = "1.37.1"
+tempfile = "3.19.1"
+tokio = { version = "1.44", features = ["macros", "io-util"] }

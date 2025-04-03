@@ -5,7 +5,8 @@
 // amended for InfluxQL.
 
 use crate::impl_tuple_clause;
-use crate::internal::{expect, ParseError, ParseResult};
+use crate::internal::{ParseError, ParseResult, expect};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{is_not, tag, take_till};
 use nom::character::complete::{anychar, char};
@@ -13,7 +14,6 @@ use nom::combinator::{map, value, verify};
 use nom::error::Error;
 use nom::multi::fold_many0;
 use nom::sequence::{delimited, preceded};
-use nom::Parser;
 use std::fmt::{Display, Formatter, Write};
 
 /// Writes `S` to `F`, mapping any characters `FROM` => `TO` their escaped equivalents.
@@ -35,7 +35,7 @@ macro_rules! write_escaped {
 #[macro_export]
 macro_rules! write_quoted_string {
     ($F: expr, $QUOTE: literal, $STRING: expr, $FN: expr $(, $FROM:expr => $TO:expr)+) => {
-        if nom::sequence::terminated($FN, nom::combinator::eof)($STRING).is_ok() {
+        if nom::sequence::terminated($FN, nom::combinator::eof).parse($STRING).is_ok() {
             $F.write_str($STRING)?;
         } else {
             // must be escaped
@@ -76,7 +76,8 @@ pub(crate) fn single_quoted_string(i: &str) -> ParseResult<&str, String> {
         "unterminated string literal",
         verify(is_not("'\\\n"), |s: &str| !s.is_empty()),
         escaped,
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a double-quoted identifier string.
@@ -94,7 +95,8 @@ pub(crate) fn double_quoted_string(i: &str) -> ParseResult<&str, String> {
         "unterminated string literal",
         verify(is_not("\"\\\n"), |s: &str| !s.is_empty()),
         escaped,
-    )(i)
+    )
+    .parse(i)
 }
 
 fn string<'a, T, U, E>(
@@ -102,10 +104,10 @@ fn string<'a, T, U, E>(
     unterminated_message: &'static str,
     literal: T,
     escaped: U,
-) -> impl FnMut(&'a str) -> ParseResult<&'a str, String, E>
+) -> impl Parser<&'a str, Output = String, Error = E>
 where
-    T: Parser<&'a str, &'a str, E>,
-    U: Parser<&'a str, char, E>,
+    T: Parser<&'a str, Output = &'a str, Error = E>,
+    U: Parser<&'a str, Output = char, Error = E>,
     E: ParseError<'a>,
 {
     let fragment = alt((
@@ -198,7 +200,8 @@ pub(crate) fn regex(i: &str) -> ParseResult<&str, Regex> {
             map(tag("\\/"), |_| '/'),
         ),
         Regex,
-    )(i)
+    )
+    .parse(i)
 }
 
 #[cfg(test)]

@@ -59,7 +59,7 @@ impl ServerErrorDetails for PreconditionViolation {
 
 /// The errors returned by this client
 #[derive(Error, Debug)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[error("The operation was cancelled: {0}")]
     Cancelled(ServerError<()>),

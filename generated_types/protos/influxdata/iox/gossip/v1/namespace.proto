@@ -13,7 +13,7 @@ message NamespaceMessage {
     NamespaceCreated namespace_created = 1;
     // An existing namespace was updated.
     NamespaceUpdated namespace_updated = 2;
-    // A namespace was soft deleted. 
+    // A namespace was soft deleted.
     NamespaceSoftDeleted namespace_soft_deleted = 3;
   }
 
@@ -25,7 +25,7 @@ message NamespaceMessage {
   google.protobuf.Timestamp sent_at = 15;
 }
 
-// Initialisation of a new namespace occured in the sending peer.
+// Initialisation of a new namespace occurred in the sending peer.
 //
 // If the receiving peer already knows of this namespace and its tracked version
 // value is greater, this is a no-op.
@@ -44,7 +44,7 @@ message NamespaceCreated {
   // Fields below this line may change over the lifetime of the namespace, and
   // may differ on the receiving node when it receives this message.
   //
-  // If these values differ, the receiving node MUST use the values associated 
+  // If these values differ, the receiving node MUST use the values associated
   // with the greater `router_version` value (between the cached & received
   // values).
   uint64 max_columns_per_table = 4;
@@ -52,7 +52,7 @@ message NamespaceCreated {
   optional int64 retention_period_ns = 6;
 
   // A snapshot of the monotonically increasing counter which tracks the version
-  // of this namespace's non-schema properties. 
+  // of this namespace's non-schema properties.
   int64 router_version = 7;
 }
 
@@ -77,7 +77,7 @@ message NamespaceUpdated {
   int32 max_columns_per_table = 5;
 
   // A snapshot of the monotonically increasing counter which tracks the version
-  // of this namespace's non-schema properties. 
+  // of this namespace's non-schema properties.
   int64 router_version = 6;
 }
 

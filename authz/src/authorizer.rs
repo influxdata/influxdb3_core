@@ -41,17 +41,15 @@ pub trait Authorizer: std::fmt::Debug + Send + Sync {
     /// Test is performed during deployment, with ordering of availability not being guaranteed.
     async fn probe(&self) -> Result<(), Error> {
         Backoff::new(&BackoffConfig::default())
-            .retry_with_backoff("probe iox-authz service", move || {
-                async {
-                    match self.permissions(Some(b"".to_vec()), &[]).await {
-                        // got response from authorizer server
-                        Ok(_)
-                        | Err(Error::Forbidden)
-                        | Err(Error::InvalidToken)
-                        | Err(Error::NoToken) => ControlFlow::Break(Ok(())),
-                        // communication error == Error::Verification
-                        Err(e) => ControlFlow::<_, Error>::Continue(e),
-                    }
+            .retry_with_backoff("probe iox-authz service", async move || {
+                match self.permissions(Some(b"".to_vec()), &[]).await {
+                    // got response from authorizer server
+                    Ok(_)
+                    | Err(Error::Forbidden)
+                    | Err(Error::InvalidToken)
+                    | Err(Error::NoToken) => ControlFlow::Break(Ok(())),
+                    // communication error == Error::Verification
+                    Err(e) => ControlFlow::<_, Error>::Continue(e),
                 }
             })
             .await

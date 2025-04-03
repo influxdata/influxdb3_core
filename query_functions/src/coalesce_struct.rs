@@ -133,7 +133,7 @@ impl ScalarUDFImpl for CoalesceStructUDF {
     }
 
     fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        #[allow(clippy::manual_try_fold)]
+        #[expect(clippy::manual_try_fold)]
         args.iter().enumerate().fold(Ok(None), |accu, (pos, arg)| {
             let Some(accu) = accu? else {return Ok(Some(arg.clone()))};
 
@@ -452,16 +452,18 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_batch("t", rb).unwrap();
         let df = ctx.table("t").await?;
-        let df = df.select(vec![coalesce_struct(
-            vals.iter()
-                .zip(col_names)
-                .map(|(val, col_name)| match val {
-                    ColumnarValue::Array(_) => col(col_name),
-                    ColumnarValue::Scalar(s) => lit(s.clone()),
-                })
-                .collect(),
-        )
-        .alias("out")])?;
+        let df = df.select(vec![
+            coalesce_struct(
+                vals.iter()
+                    .zip(col_names)
+                    .map(|(val, col_name)| match val {
+                        ColumnarValue::Array(_) => col(col_name),
+                        ColumnarValue::Scalar(s) => lit(s.clone()),
+                    })
+                    .collect(),
+            )
+            .alias("out"),
+        ])?;
 
         // execute the query
         let batches: Vec<RecordBatch> = df.collect().await?;

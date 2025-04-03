@@ -5,22 +5,22 @@ pub mod range_predicate;
 mod virtual_function;
 
 use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
-use datafusion::common::{internal_datafusion_err, plan_datafusion_err, plan_err, DFSchema};
-use datafusion::logical_expr::{expr::AggregateFunction, ExprSchemable};
+use datafusion::common::{DFSchema, internal_datafusion_err, plan_datafusion_err, plan_err};
+use datafusion::logical_expr::{ExprSchemable, expr::AggregateFunction};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
     error::{DataFusionError, Result},
     logical_expr::{
+        Aggregate, Extension, LogicalPlan, Projection, ScalarUDF,
         expr::{Alias, ScalarFunction},
         utils::expr_to_columns,
-        Aggregate, Extension, LogicalPlan, Projection, ScalarUDF,
     },
     optimizer::AnalyzerRule,
-    prelude::{col, Column, Expr},
+    prelude::{Column, Expr, col},
 };
-use hashbrown::{hash_map, HashMap};
+use hashbrown::{HashMap, hash_map};
 use query_functions::gapfill::{GapFillWrapper, INTERPOLATE_UDF_NAME, LOCF_UDF_NAME};
 use query_functions::tz::TzUDF;
 use std::{
@@ -224,10 +224,12 @@ fn build_gapfill_node(
     let aggr_expr = new_group_expr.split_off(aggr.group_expr.len());
 
     match (aggr_expr.len(), aggr.aggr_expr.len()) {
-        (f, e) if f != e => return Err(internal_datafusion_err!(
-            "The number of aggregate expressions has gotten lost; expected {e}, found {f}. This is a bug, please report it."
-        )),
-        _ => ()
+        (f, e) if f != e => {
+            return Err(internal_datafusion_err!(
+                "The number of aggregate expressions has gotten lost; expected {e}, found {f}. This is a bug, please report it."
+            ));
+        }
+        _ => (),
     }
 
     // this schema is used for the `FillStrategy::Default` checks below. It also represents the
@@ -279,12 +281,12 @@ fn build_gapfill_node(
 }
 
 fn validate_time_range(range: &Range<Bound<Expr>>) -> Result<()> {
-    let Range { ref start, ref end } = range;
+    let Range { start, end } = range;
     let (start, end) = match (start, end) {
         (Bound::Unbounded, Bound::Unbounded) => {
             return Err(DataFusionError::Plan(
                 "gap-filling query is missing both upper and lower time bounds".to_string(),
-            ))
+            ));
         }
         (Bound::Unbounded, _) => Err(DataFusionError::Plan(
             "gap-filling query is missing lower time bound".to_string(),
@@ -367,7 +369,7 @@ fn replace_date_bin_gapfill(aggr: Aggregate) -> Result<RewriteInfo> {
         _ => {
             return Err(DataFusionError::Plan(
                 "DATE_BIN_GAPFILL specified more than once".to_string(),
-            ))
+            ));
         }
     };
 
@@ -614,7 +616,7 @@ pub fn default_return_value_for_aggr_fn(
     // at all (just labeled differently).
     fn get_aggr_fn(expr: &Expr) -> Option<&AggregateFunction> {
         match expr {
-            Expr::AggregateFunction(ref fun) => Some(fun),
+            Expr::AggregateFunction(fun) => Some(fun),
             Expr::Alias(alias) => get_aggr_fn(&alias.expr),
             _ => None,
         }
@@ -660,9 +662,9 @@ mod test {
     use datafusion::error::Result;
     use datafusion::functions_aggregate::expr_fn::{avg, min};
     use datafusion::logical_expr::builder::table_scan_with_filters;
-    use datafusion::logical_expr::{logical_plan, LogicalPlan, LogicalPlanBuilder};
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, logical_plan};
     use datafusion::optimizer::{Analyzer, AnalyzerRule};
-    use datafusion::prelude::{case, col, lit, Expr};
+    use datafusion::prelude::{Expr, case, col, lit};
     use datafusion_util::lit_timestamptz_nano;
     use query_functions::gapfill::{
         DATE_BIN_GAPFILL_UDF_NAME, INTERPOLATE_UDF_NAME, LOCF_UDF_NAME,
@@ -923,15 +925,17 @@ mod test {
                 "Error during planning: gap-filling query is missing lower time bound",
             ),
             (
-                col("time").gt_eq(col("time2")).and(
-                    col("time").lt(lit_timestamptz_nano(2000))),
+                col("time")
+                    .gt_eq(col("time2"))
+                    .and(col("time").lt(lit_timestamptz_nano(2000))),
                 "Error during planning: lower time bound for gap fill query must evaluate to a scalar",
             ),
             (
-                col("time").gt_eq(lit_timestamptz_nano(2000)).and(
-                    col("time").lt(col("time2"))),
+                col("time")
+                    .gt_eq(lit_timestamptz_nano(2000))
+                    .and(col("time").lt(col("time2"))),
                 "Error during planning: upper time bound for gap fill query must evaluate to a scalar",
-            )
+            ),
         ];
         for c in cases {
             let plan = LogicalPlanBuilder::from(table_scan()?)

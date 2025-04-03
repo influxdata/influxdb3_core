@@ -12,11 +12,11 @@ workspace = true
 [dependencies]
 http = { workspace = true }
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
-thiserror = "2.0.9"
+thiserror = "2.0.12"
 tonic = { workspace = true }
 tower = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-tokio = { version = "1.42", features = ["macros", "parking_lot", "rt-multi-thread"] }
-mockito = { version = "1.6", default-features = false }
+tokio = { version = "1.44", features = ["macros", "parking_lot", "rt-multi-thread"] }
+mockito = { version = "1.7", default-features = false }

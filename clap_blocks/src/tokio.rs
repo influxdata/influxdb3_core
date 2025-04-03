@@ -3,8 +3,8 @@
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -45,7 +45,7 @@ macro_rules! tokio_rt_config {
         paste! {
             #[doc = "CLI config for tokio " $name " runtime."]
             #[derive(Debug, Clone, clap::Parser)]
-            #[allow(missing_copy_implementations)]
+            #[expect(missing_copy_implementations)]
             pub struct [<Tokio $name:camel Config>] {
                 #[doc = "Set the maximum number of " $name " runtime threads to use."]
                 #[doc = ""]
@@ -320,7 +320,7 @@ mod tests {
             TokioIoConfig::parse_from(std::iter::empty::<OsString>())
                 .builder()
                 .unwrap(),
-            || async move {
+            async move || {
                 assert!(is_io_enabled().await);
             },
         );
@@ -328,7 +328,7 @@ mod tests {
             TokioDatafusionConfig::parse_from(std::iter::empty::<OsString>())
                 .builder()
                 .unwrap(),
-            || async move {
+            async || {
                 assert!(!is_io_enabled().await);
             },
         );
@@ -339,7 +339,7 @@ mod tests {
     where
         F: FnOnce() + Send + 'static,
     {
-        assert_runtime_thread_property_async(builder, || async move { f() });
+        assert_runtime_thread_property_async(builder, async move || f());
     }
 
     #[track_caller]

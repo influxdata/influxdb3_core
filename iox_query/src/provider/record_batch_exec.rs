@@ -2,21 +2,22 @@
 
 use crate::ingester::{IngesterChunk, MetricDecoratorStream};
 use crate::statistics::build_statistics_for_chunks;
-use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
+use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
 
 use super::adapter::SchemaAdapterStream;
 use arrow::datatypes::SchemaRef;
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::display::ProjectSchemaDisplay;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::{
     error::DataFusionError,
     execution::context::TaskContext,
     physical_expr::EquivalenceProperties,
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream, Statistics,
         expressions::{Column, PhysicalSortExpr},
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };
@@ -74,7 +75,8 @@ impl RecordBatchesExec {
                     ),
                     options: Default::default(),
                 },
-            ];
+            ]
+            .into();
             EquivalenceProperties::new_with_orderings(Arc::clone(&schema), &[output_ordering])
         } else {
             EquivalenceProperties::new(Arc::clone(&schema))
@@ -114,7 +116,12 @@ impl RecordBatchesExec {
     ) -> PlanProperties {
         let output_partitioning = Partitioning::UnknownPartitioning(chunks.len());
 
-        PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
     }
 }
 

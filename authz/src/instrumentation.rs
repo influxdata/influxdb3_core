@@ -80,11 +80,11 @@ where
 mod test {
     use std::collections::VecDeque;
 
-    use metric::{assert_histogram, Attributes, Registry};
+    use metric::{Attributes, Registry, assert_histogram};
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{Action, Resource};
+    use crate::{Action, Resource, Target};
 
     #[derive(Debug, Default)]
     struct MockAuthorizerState {
@@ -219,7 +219,7 @@ mod test {
     test_authorizer_metric!(
         ok,
         rpc_response = Ok(vec![Permission::ResourceAction(
-            Resource::Database("foo".to_string()),
+            Resource::Database(Target::ResourceName("foo".to_string())),
             Action::Write,
         )]),
         will_pass_auth = true,

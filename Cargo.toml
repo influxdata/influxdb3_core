@@ -79,7 +79,7 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 authors = ["IOx Project Developers"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -89,13 +89,13 @@ arrow-flight = {version = "53.0.0", features = ["flight-sql-experimental"] }
 arrow-ipc = {version = "53.0.0"}
 # Use DataFusion fork
 # See https://github.com/influxdata/arrow-datafusion/pull/49 for contents
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ae0a57b05895ccf4d2febb9c91bbb0956cf7e863" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ae0a57b05895ccf4d2febb9c91bbb0956cf7e863" }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
 hashbrown = {version = "0.14.5"}
 http = {version = "0.2.12"}
 http-body = { version = "0.4.6" }
 hyper = { version = "0.14.31" }
-object_store = {version = "0.11.1"}
+object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
 parquet = {version = "53.0.0", features = ["object_store"] }
 pbjson = {version = "0.6.0"}
 pbjson-build = {version = "0.6.2"}

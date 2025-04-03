@@ -2,11 +2,10 @@
 use std::{fmt, sync::Arc};
 
 use observability_deps::tracing::{
-    self,
+    self, Event,
     field::Field,
     span::{Attributes, Id, Record},
     subscriber::{DefaultGuard, Subscriber},
-    Event,
 };
 use parking_lot::Mutex;
 
@@ -24,7 +23,7 @@ pub struct TracingCapture {
 
 impl TracingCapture {
     /// Create a new TracingCapture object and register it as a subscriber
-    #[allow(clippy::new_without_default)]
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         let logs = Arc::new(Mutex::new(Vec::new()));
 

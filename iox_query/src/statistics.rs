@@ -18,7 +18,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, visit_execution_plan};
 use datafusion::{
     physical_plan::{ColumnStatistics, Statistics as DFStatistics},
     scalar::ScalarValue,
@@ -26,7 +26,7 @@ use datafusion::{
 use observability_deps::tracing::trace;
 
 use crate::provider::{DeduplicateExec, RecordBatchesExec};
-use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
+use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
 
 /// During the initial partition pruning pass (driving statistics from partition
 /// keys), the row count and null count statistics for each partition
@@ -496,10 +496,10 @@ fn projection_includes_pure_columns(projection: &ProjectionExec) -> bool {
 
 /// Return min max of a ColumnStatistics with precise values
 pub fn column_statistics_min_max(
-    column_statistics: &ColumnStatistics,
+    column_statistics: ColumnStatistics,
 ) -> Option<(ScalarValue, ScalarValue)> {
-    match (&column_statistics.min_value, &column_statistics.max_value) {
-        (Precision::Exact(min), Precision::Exact(max)) => Some((min.clone(), max.clone())),
+    match (column_statistics.min_value, column_statistics.max_value) {
+        (Precision::Exact(min), Precision::Exact(max)) => Some((min, max)),
         // the statistics values are absent or imprecise
         _ => None,
     }
@@ -589,7 +589,7 @@ pub fn overlap(value_ranges: &[(ScalarValue, ScalarValue)]) -> Result<bool, Data
 mod test {
     use crate::{
         provider::chunks_to_physical_nodes,
-        test::{format_execution_plan, TestChunk},
+        test::{TestChunk, format_execution_plan},
     };
 
     use super::*;
@@ -1188,7 +1188,7 @@ mod test {
         // Stats for time
         // parquet
         let time_stats = compute_stats_column_min_max(&*plan_pq, "time").unwrap();
-        let min_max = column_statistics_min_max(&time_stats).unwrap();
+        let min_max = column_statistics_min_max(time_stats).unwrap();
         let expected_time_stats = (
             ScalarValue::TimestampNanosecond(Some(10), None),
             ScalarValue::TimestampNanosecond(Some(100), None),
@@ -1196,7 +1196,7 @@ mod test {
         assert_eq!(min_max, expected_time_stats);
         // record batch
         let time_stats = compute_stats_column_min_max(&*plan_rb, "time").unwrap();
-        let min_max = column_statistics_min_max(&time_stats).unwrap();
+        let min_max = column_statistics_min_max(time_stats).unwrap();
         let expected_time_stats = (
             ScalarValue::TimestampNanosecond(Some(20), None),
             ScalarValue::TimestampNanosecond(Some(200), None),
@@ -1206,7 +1206,7 @@ mod test {
         // Stats for tag
         // parquet
         let tag_stats = compute_stats_column_min_max(&*plan_pq, "tag").unwrap();
-        let min_max = column_statistics_min_max(&tag_stats).unwrap();
+        let min_max = column_statistics_min_max(tag_stats).unwrap();
         let expected_tag_stats = (
             ScalarValue::Utf8(Some("MA".to_string())),
             ScalarValue::Utf8(Some("VT".to_string())),
@@ -1214,7 +1214,7 @@ mod test {
         assert_eq!(min_max, expected_tag_stats);
         // record batch
         let tag_stats = compute_stats_column_min_max(&*plan_rb, "tag").unwrap();
-        let min_max = column_statistics_min_max(&tag_stats).unwrap();
+        let min_max = column_statistics_min_max(tag_stats).unwrap();
         let expected_tag_stats = (
             ScalarValue::Utf8(Some("Boston".to_string())),
             ScalarValue::Utf8(Some("DC".to_string())),
@@ -1224,7 +1224,7 @@ mod test {
         // Stats for field
         // parquet
         let float_stats = compute_stats_column_min_max(&*plan_pq, "float_field").unwrap();
-        let min_max = column_statistics_min_max(&float_stats).unwrap();
+        let min_max = column_statistics_min_max(float_stats).unwrap();
         let expected_float_stats = (
             ScalarValue::Float64(Some(10.1)),
             ScalarValue::Float64(Some(100.4)),
@@ -1232,7 +1232,7 @@ mod test {
         assert_eq!(min_max, expected_float_stats);
         // record batch
         let float_stats = compute_stats_column_min_max(&*plan_rb, "float_field").unwrap();
-        let min_max = column_statistics_min_max(&float_stats).unwrap();
+        let min_max = column_statistics_min_max(float_stats).unwrap();
         let expected_float_stats = (
             ScalarValue::Float64(Some(15.6)),
             ScalarValue::Float64(Some(30.0)),
@@ -1242,19 +1242,19 @@ mod test {
         // Stats for int
         // parquet
         let int_stats = compute_stats_column_min_max(&*plan_pq, "int_field").unwrap();
-        let min_max = column_statistics_min_max(&int_stats).unwrap();
+        let min_max = column_statistics_min_max(int_stats).unwrap();
         let expected_int_stats = (ScalarValue::Int64(Some(30)), ScalarValue::Int64(Some(50)));
         assert_eq!(min_max, expected_int_stats);
         // record batch
         let int_stats = compute_stats_column_min_max(&*plan_rb, "int_field").unwrap();
-        let min_max = column_statistics_min_max(&int_stats).unwrap();
+        let min_max = column_statistics_min_max(int_stats).unwrap();
         let expected_int_stats = (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(50)));
         assert_eq!(min_max, expected_int_stats);
 
         // Stats for string
         // parquet
         let string_stats = compute_stats_column_min_max(&*plan_pq, "string_field").unwrap();
-        let min_max = column_statistics_min_max(&string_stats).unwrap();
+        let min_max = column_statistics_min_max(string_stats).unwrap();
         let expected_string_stats = (
             ScalarValue::Utf8(Some("orange".to_string())),
             ScalarValue::Utf8(Some("plum".to_string())),
@@ -1262,7 +1262,7 @@ mod test {
         assert_eq!(min_max, expected_string_stats);
         // record batch
         let string_stats = compute_stats_column_min_max(&*plan_rb, "string_field").unwrap();
-        let min_max = column_statistics_min_max(&string_stats).unwrap();
+        let min_max = column_statistics_min_max(string_stats).unwrap();
         let expected_string_stats = (
             ScalarValue::Utf8(Some("banana".to_string())),
             ScalarValue::Utf8(Some("plum".to_string())),
@@ -1271,12 +1271,12 @@ mod test {
 
         // no tats on parquet
         let tag_no_stats = compute_stats_column_min_max(&*plan_pq, "tag_no_val").unwrap();
-        let min_max = column_statistics_min_max(&tag_no_stats);
+        let min_max = column_statistics_min_max(tag_no_stats);
         assert!(min_max.is_none());
 
         // no stats on record batch
         let field_no_stats = compute_stats_column_min_max(&*plan_rb, "field_no_val").unwrap();
-        let min_max = column_statistics_min_max(&field_no_stats);
+        let min_max = column_statistics_min_max(field_no_stats);
         assert!(min_max.is_none());
     }
 

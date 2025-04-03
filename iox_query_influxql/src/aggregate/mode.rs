@@ -5,21 +5,21 @@ use std::sync::Arc;
 
 use crate::error;
 use arrow::{
-    array::{cast, Array, ArrayRef},
+    array::{Array, ArrayRef, cast},
     datatypes::{DataType, Field},
-};
-use datafusion::{
-    common::plan_err,
-    logical_expr::{
-        function::{AccumulatorArgs, StateFieldsArgs},
-        AggregateUDFImpl,
-    },
 };
 use datafusion::{
     common::Result,
     logical_expr::{Accumulator, Signature, Volatility},
     physical_expr::expressions::format_state_name,
     scalar::ScalarValue,
+};
+use datafusion::{
+    common::plan_err,
+    logical_expr::{
+        AggregateUDFImpl,
+        function::{AccumulatorArgs, StateFieldsArgs},
+    },
 };
 use itertools::Itertools;
 
@@ -120,7 +120,7 @@ impl ModeAccumulator {
         self.point_times.reserve(point_values.len() - null_len);
 
         for idx in 0..point_values.len() {
-            if nulls.map_or(true, |nb| nb.is_valid(idx)) {
+            if nulls.is_none_or(|nb| nb.is_valid(idx)) {
                 let value = ScalarValue::try_from_array(&point_values, idx)?;
                 let time = ScalarValue::try_from_array(&point_times, idx)?;
                 self.point_values.push(value);
@@ -143,8 +143,9 @@ impl ModeAccumulator {
         let point_times = point_times?;
 
         let points = self.point_values.iter().zip(point_times);
-        let mut sorted_points =
-            points.sorted_by(|a, b| a.partial_cmp(b).expect("unstable sorting encountered"));
+        let mut sorted_points = points
+            .sorted_by(|a, b| a.partial_cmp(b).expect("unstable sorting encountered"))
+            .peekable();
 
         let mut curr_freq = 0;
         let mut most_freq = 0;
@@ -154,12 +155,12 @@ impl ModeAccumulator {
         let mut most_time;
 
         // Presets the values from the first point
-        match sorted_points.next() {
+        match sorted_points.peek() {
             Some((value, time)) => {
                 curr_mode = value;
                 most_mode = value;
-                curr_time = time;
-                most_time = time;
+                curr_time = *time;
+                most_time = *time;
             }
             None => return ScalarValue::try_from(&self.data_type), // We have an empty set of points
         }

@@ -11,7 +11,7 @@ pub struct IngesterAddress {
 }
 
 /// Why a specified ingester address might be invalid
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Snafu, Debug)]
 pub enum Error {
     #[snafu(display("{source}"))]
@@ -53,7 +53,7 @@ impl Display for IngesterAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{error::ErrorKind, Parser};
+    use clap::{Parser, error::ErrorKind};
     use std::env;
     use test_helpers::{assert_contains, assert_error};
 
@@ -94,10 +94,12 @@ mod tests {
 
     #[test]
     fn empty_if_not_specified_when_optional() {
-        assert!(QuerierConfig::try_parse_from(["my_binary"])
-            .unwrap()
-            .ingester_addresses
-            .is_empty());
+        assert!(
+            QuerierConfig::try_parse_from(["my_binary"])
+                .unwrap()
+                .ingester_addresses
+                .is_empty()
+        );
     }
 
     fn both_types_valid(args: &[&'static str], expected: &[&'static str]) {
@@ -248,10 +250,16 @@ mod tests {
 
     #[test]
     fn required_and_specified_via_environment_variable() {
-        env::set_var(
-            "NO_CONFLICT_ROUTER_TEST_INFLUXDB_IOX_INGESTER_ADDRESSES",
-            "http://example.com:1234,somescheme://0.0.0.0:1000,127.0.0.1:8080",
-        );
+        // SAFETY: this is not actually necessarily sound. It's just extremely difficult (if not
+        // outright impossible with the guarantees that rust's test harness gives us) to architect
+        // tests to ensure that they are completely single-threaded and that this operation can
+        // actually be sound
+        unsafe {
+            env::set_var(
+                "NO_CONFLICT_ROUTER_TEST_INFLUXDB_IOX_INGESTER_ADDRESSES",
+                "http://example.com:1234,somescheme://0.0.0.0:1000,127.0.0.1:8080",
+            );
+        }
         let args = ["my_binary"];
         let expected = [
             "http://example.com:1234/",
@@ -286,10 +294,16 @@ mod tests {
 
     #[test]
     fn optional_and_specified_via_environment_variable() {
-        env::set_var(
-            "NO_CONFLICT_QUERIER_TEST_INFLUXDB_IOX_INGESTER_ADDRESSES",
-            "http://example.com:1234,somescheme://0.0.0.0:1000,127.0.0.1:8080",
-        );
+        // SAFETY: this is not actually necessarily sound. It's just extremely difficult (if not
+        // outright impossible with the guarantees that rust's test harness gives us) to architect
+        // tests to ensure that they are completely single-threaded and that this operation can
+        // actually be sound
+        unsafe {
+            env::set_var(
+                "NO_CONFLICT_QUERIER_TEST_INFLUXDB_IOX_INGESTER_ADDRESSES",
+                "http://example.com:1234,somescheme://0.0.0.0:1000,127.0.0.1:8080",
+            );
+        }
         let args = ["my_binary"];
         let expected = [
             "http://example.com:1234/",

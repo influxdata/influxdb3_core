@@ -1,22 +1,23 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    provider::{progressive_eval::ProgressiveEvalExec, DeduplicateExec},
+    provider::{DeduplicateExec, progressive_eval::ProgressiveEvalExec},
     statistics::{column_statistics_min_max, compute_stats_column_min_max, overlap},
 };
-use arrow::compute::{rank, SortOptions};
+use arrow::compute::{SortOptions, rank};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
-    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     error::{DataFusionError, Result},
-    physical_expr::PhysicalSortExpr,
+    physical_expr::{LexOrdering, PhysicalSortExpr},
     physical_plan::{
+        ExecutionPlan, ExecutionPlanVisitor,
         expressions::{Column, Literal},
         limit::LocalLimitExec,
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor,
+        visit_execution_plan,
     },
     scalar::ScalarValue,
 };
@@ -38,7 +39,7 @@ pub(crate) fn collect_statistics_min_max(
 
     // If min and max not available, return none
     let mut value_ranges = Vec::with_capacity(col_stats.len());
-    for stats in &col_stats {
+    for stats in col_stats {
         let Some((min, max)) = column_statistics_min_max(stats) else {
             trace!("-------- min_max not available");
             return Ok(None);
@@ -172,17 +173,17 @@ pub(crate) fn all_physical_sort_exprs_on_column(sort_exprs: &[PhysicalSortExpr])
 /// start_position: The start position in the the sort expressions that we want to compare with the sort expressions of the SortExec
 pub(crate) fn all_sort_execs_on_same_sort_exprs_from_starting_position(
     sort_execs: &[&SortExec],
-    sort_exprs: &[PhysicalSortExpr],
+    sort_exprs: &LexOrdering,
     start_position: usize,
 ) -> bool {
-    if sort_exprs.len() < start_position + 1 {
+    if sort_exprs.inner.len() < start_position + 1 {
         return false;
     }
 
-    let sort_exprs = &sort_exprs[start_position..];
+    let sort_exprs = &sort_exprs.inner[start_position..];
     sort_execs
         .iter()
-        .all(|sort_exec| sort_exec.expr() == sort_exprs)
+        .all(|sort_exec| sort_exec.expr().inner == sort_exprs)
 }
 
 /// This struct is mainly used to support the work described in OrderUnionSortedInputsForConstants
@@ -368,7 +369,7 @@ pub(crate) fn split_files_or_add_sort_preserving_merge(
                 // cannot split files, add SortPreservingMerge for multiple input partitions
                 if input.properties().output_partitioning().partition_count() > 1 {
                     let sort_preserving_merge_exec = Arc::new(
-                        SortPreservingMergeExec::new(sort_exprs.to_vec(), Arc::clone(input))
+                        SortPreservingMergeExec::new(sort_exprs.to_vec().into(), Arc::clone(input))
                             .with_fetch(fetch_number),
                     );
                     new_input = Ok(sort_preserving_merge_exec as _)
@@ -394,7 +395,7 @@ pub(crate) fn add_sort_preserving_merge(
             if input.properties().output_partitioning().partition_count() > 1 {
                 // Add SortPreservingMergeExec on top of this input
                 let sort_preserving_merge_exec = Arc::new(
-                    SortPreservingMergeExec::new(sort_exprs.to_vec(), Arc::clone(input))
+                    SortPreservingMergeExec::new(sort_exprs.to_vec().into(), Arc::clone(input))
                         .with_fetch(fetch_number),
                 );
                 Ok(sort_preserving_merge_exec as _)
@@ -568,9 +569,12 @@ pub(crate) fn transform_parquet_exec_single_file_each_group(
                 > 1
         {
             new_plan = Ok(Arc::new(
-                SortExec::new(sort_exec.expr().to_vec(), Arc::clone(sort_exec.input()))
-                    .with_fetch(sort_exec.fetch())
-                    .with_preserve_partitioning(true),
+                SortExec::new(
+                    sort_exec.expr().to_vec().into(),
+                    Arc::clone(sort_exec.input()),
+                )
+                .with_fetch(sort_exec.fetch())
+                .with_preserve_partitioning(true),
             ) as _);
         };
     }

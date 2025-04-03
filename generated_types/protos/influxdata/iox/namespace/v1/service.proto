@@ -39,7 +39,14 @@ message GetNamespacesRequest {}
 
 message GetNamespacesResponse { repeated Namespace namespaces = 1; }
 
-message GetNamespaceRequest { string name = 1; }
+message GetNamespaceRequest {
+  oneof target {
+    // Name of the namespace to get
+    string name = 1 [deprecated = true];
+    // ID of the namespace to get
+    int64 id = 2;
+  }
+}
 
 message GetNamespaceResponse { Namespace namespace = 1; }
 
@@ -63,15 +70,23 @@ message CreateNamespaceRequest {
 message CreateNamespaceResponse { Namespace namespace = 1; }
 
 message DeleteNamespaceRequest {
-  // Name of the namespace to be deleted
-  string name = 1;
+  oneof target {
+    // Name of the namespace to be deleted
+    string name = 1 [deprecated = true];
+    // ID of the namespace to be deleted
+    int64 id = 2;
+  }
 }
 
-message DeleteNamespaceResponse {}
+message DeleteNamespaceResponse { Namespace namespace = 1; }
 
 message UpdateNamespaceRetentionRequest {
-  // Name of the namespace to be set
-  string name = 1;
+  oneof target {
+    // Name of the namespace to be set
+    string name = 1 [deprecated = true];
+    // ID of the namespace to be set
+    int64 id = 3;
+  }
 
   // Retention period in nanoseconds.
   //
@@ -83,8 +98,12 @@ message UpdateNamespaceRetentionRequest {
 message UpdateNamespaceRetentionResponse { Namespace namespace = 1; }
 
 message UpdateNamespaceServiceProtectionLimitRequest {
-  // Namespace to have its service protection limits updated.
-  string name = 1;
+  oneof target {
+    // Name of the namespace to have its service protection limits updated.
+    string name = 1 [deprecated = true];
+    // ID of the namespace to have its service protection limits updated.
+    int64 id = 4;
+  }
 
   // The service protection limit to update.
   oneof limit_update {
@@ -137,8 +156,17 @@ message Namespace {
 
 // Request to get a list of namespaces with storage.
 message GetNamespacesWithStorageRequest {
-  // Pagination and sorting options will be added in follow-up PRs:
-  // https://github.com/influxdata/influxdb_iox/issues/12775
+  // Field to sort by
+  optional influxdata.iox.catalog_storage.v1.NamespaceSortField sort_field = 1;
+
+  // Direction in which to sort
+  optional influxdata.iox.catalog_storage.v1.SortDirection sort_direction = 2;
+
+  // Number of records to include per page
+  optional int32 page_size = 3;
+
+  // Page number to retrieve
+  optional int32 page_number = 4;
 }
 
 // Request to get a specific namespace with storage.
@@ -150,6 +178,12 @@ message GetNamespaceWithStorageRequest {
 // Response containing a list of namespaces with storage.
 message GetNamespacesWithStorageResponse {
   repeated influxdata.iox.catalog_storage.v1.NamespaceWithStorage namespace_with_storage = 1;
+
+  // The total number of items in the unpaged data set
+  int64 total = 2;
+
+  // The total number of pages available
+  int64 pages = 3;
 }
 
 // Response containing a specific namespace with storage.

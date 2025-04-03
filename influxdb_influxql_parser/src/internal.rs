@@ -1,7 +1,7 @@
 //! Internal result and error types used to build InfluxQL parsers
 //!
-use nom::error::{ErrorKind as NomErrorKind, ParseError as NomParseError};
 use nom::Parser;
+use nom::error::{ErrorKind as NomErrorKind, ParseError as NomParseError};
 use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
 
@@ -44,7 +44,7 @@ pub(crate) fn map_fail<'a, O1, O2, E: ParseError<'a>, E2, F, G>(
     mut f: G,
 ) -> impl FnMut(&'a str) -> ParseResult<&'a str, O2, E>
 where
-    F: Parser<&'a str, O1, E>,
+    F: Parser<&'a str, Output = O1, Error = E>,
     G: FnMut(O1) -> Result<O2, E2>,
 {
     move |input| {
@@ -65,7 +65,7 @@ pub(crate) fn map_error<'a, O1, O2, E: ParseError<'a>, E2, F, G>(
     mut f: G,
 ) -> impl FnMut(&'a str) -> ParseResult<&'a str, O2, E>
 where
-    F: Parser<&'a str, O1, E>,
+    F: Parser<&'a str, Output = O1, Error = E>,
     G: FnMut(O1) -> Result<O2, E2>,
 {
     move |input| {
@@ -84,7 +84,7 @@ pub(crate) fn expect<'a, E: ParseError<'a>, F, O>(
     mut f: F,
 ) -> impl FnMut(&'a str) -> ParseResult<&'a str, O, E>
 where
-    F: Parser<&'a str, O, E>,
+    F: Parser<&'a str, Output = O, Error = E>,
 {
     move |i| match f.parse(i) {
         Ok(o) => Ok(o),
@@ -102,7 +102,7 @@ pub(crate) fn verify<'a, O1, O2, E: ParseError<'a>, F, G>(
     is_valid: G,
 ) -> impl FnMut(&'a str) -> ParseResult<&'a str, O1, E>
 where
-    F: Parser<&'a str, O1, E>,
+    F: Parser<&'a str, Output = O1, Error = E>,
     G: Fn(&O2) -> bool,
     O1: Borrow<O2>,
     O2: ?Sized,

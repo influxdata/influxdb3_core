@@ -16,7 +16,7 @@ futures = {version = "0.3"}
 object_store = { workspace = true }
 parquet_file  = { path = "../parquet_file" }
 schema = { path = "../schema" }
-tokio = "1.42"
+tokio = "1.44"
 snafu = "0.8"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

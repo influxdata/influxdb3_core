@@ -9,7 +9,7 @@ use url::{Host, Url};
 use crate::memory_size::MemorySize;
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("host '{host}' is not a prefix of '{prefix}'"))]
     NotAPrefix { host: String, prefix: String },
@@ -93,6 +93,7 @@ pub struct CatalogConfig {
     pub warmup_delay: Duration,
 
     /// Maximum tries that we perform a warmup.
+    /// Set to 0 to disable warmup.
     #[clap(
         long = "catalog-cache-warmup-tries-limit",
         env = "INFLUXDB_IOX_CATALOG_CACHE_WARMUP_TRIES_LIMIT",

@@ -19,6 +19,7 @@ use crate::statement::Statement;
 use crate::string::double_quoted_string;
 use crate::visit_mut::{Recursion, VisitableMut, VisitorMut};
 use crate::{impl_tuple_clause, write_quoted_string};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alphanumeric1, char};
@@ -49,7 +50,7 @@ pub enum BindParameterError {
 
 /// Parse an unquoted InfluxQL bind parameter.
 fn unquoted_parameter(i: &str) -> ParseResult<&str, &str> {
-    recognize(many1_count(alt((alphanumeric1, tag("_")))))(i)
+    recognize(many1_count(alt((alphanumeric1, tag("_"))))).parse(i)
 }
 
 /// A type that represents an InfluxQL bind parameter.
@@ -81,7 +82,8 @@ pub(crate) fn parameter(i: &str) -> ParseResult<&str, BindParameter> {
             map(unquoted_parameter, Into::into),
             map(double_quoted_string, Into::into),
         )),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Convert a [StatementParam] value to an InfluxQL [Literal]

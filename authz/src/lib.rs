@@ -8,7 +8,7 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use generated_types::influxdata::iox::authz::v1::{self as proto};
 
 mod authorizer;
@@ -18,7 +18,7 @@ pub use iox_authorizer::{Error, IoxAuthorizer};
 mod instrumentation;
 pub use instrumentation::AuthorizerInstrumentation;
 mod permission;
-pub use permission::{Action, Permission, Resource};
+pub use permission::{Action, Permission, Resource, Target};
 
 #[cfg(feature = "http")]
 pub mod http;
@@ -36,11 +36,7 @@ pub fn extract_token<T: AsRef<[u8]> + ?Sized>(value: Option<&T>) -> Option<Vec<u
             .to_vec(),
         _ => return None,
     };
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    if token.is_empty() { None } else { Some(token) }
 }
 
 #[cfg(test)]

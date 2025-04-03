@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::{net::TcpListener, task::JoinSet};
-use tonic::transport::{server::TcpIncoming, Server, Uri};
+use tonic::transport::{Server, Uri, server::TcpIncoming};
 
 use crate::interface::Catalog;
 
@@ -14,7 +14,7 @@ use super::server::GrpcCatalogServer;
 #[derive(Debug)]
 pub struct TestGrpcServer {
     addr: SocketAddr,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     task: JoinSet<()>,
 }
 

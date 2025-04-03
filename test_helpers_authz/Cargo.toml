@@ -13,8 +13,8 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # Crates.io dependencies, in alphabetical order
 futures = "0.3"
-rand = "0.8.5"
-tokio = "1.42"
+rand = "0.9.0"
+tokio = "1.44"
 tonic = { workspace = true }
 
 [lints]

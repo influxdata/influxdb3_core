@@ -132,8 +132,8 @@ mod test {
     use std::{
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
@@ -142,30 +142,34 @@ mod test {
     use test_helpers_authz::Authorizer as AuthorizerServer;
     use tokio::{
         net::TcpListener,
-        task::{spawn, JoinHandle},
+        task::{JoinHandle, spawn},
     };
-    use tonic::transport::{server::TcpIncoming, Server};
+    use tonic::transport::{Server, server::TcpIncoming};
 
     use super::*;
-    use crate::{Action, Authorizer, Permission, Resource};
+    use crate::{Action, Authorizer, Permission, Resource, Target};
 
     const NAMESPACE: &str = "bananas";
+    const NAMESPACE_ID: &str = "1234";
 
     macro_rules! test_iox_authorizer {
         (
             $name:ident,
             token_permissions = $token_permissions:expr,
             permissions_required = $permissions_required:expr,
-            want = $want:pat
+            want = $want:pat$(,
+            legacy_tokens = $legacy_tokens:expr$(,)?)?
         ) => {
             paste::paste! {
                 #[tokio::test]
                 async fn [<test_iox_authorizer_ $name>]() {
-                    let mut authz_server = AuthorizerServer::create().await;
+                    let mut authz_server = AuthorizerServer::create()
+                        .await
+                        $(.use_legacy_tokens($legacy_tokens))?;
                     let authz = IoxAuthorizer::connect_lazy(authz_server.addr())
                             .expect("Failed to create IoxAuthorizer client.");
 
-                    let token = authz_server.create_token_for(NAMESPACE, $token_permissions);
+                    let token = authz_server.create_token_for(NAMESPACE, NAMESPACE_ID, $token_permissions);
 
                     let got = authz.permissions(
                         Some(token.as_bytes().to_vec()),
@@ -179,22 +183,73 @@ mod test {
     }
 
     test_iox_authorizer!(
-        ok,
+        ok_legacy,
         token_permissions = &["ACTION_WRITE"],
         permissions_required = &[Permission::ResourceAction(
-            Resource::Database(NAMESPACE.to_string()),
+            Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
             Action::Write,
         )],
+        want = Ok(_),
+        legacy_tokens = true
+    );
+
+    test_iox_authorizer!(
+        insufficient_perms_legacy,
+        token_permissions = &["ACTION_READ"],
+        permissions_required = &[Permission::ResourceAction(
+            Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+            Action::Write,
+        )],
+        want = Err(Error::Forbidden),
+        legacy_tokens = true
+    );
+
+    test_iox_authorizer!(
+        any_of_required_perms_legacy,
+        token_permissions = &["ACTION_WRITE"],
+        permissions_required = &[
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Create,
+            )
+        ],
+        want = Ok(_),
+        legacy_tokens = true
+    );
+
+    test_iox_authorizer!(
+        ok,
+        token_permissions = &["ACTION_WRITE"],
+        permissions_required = &[
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Write,
+            )
+        ],
         want = Ok(_)
     );
 
     test_iox_authorizer!(
         insufficient_perms,
         token_permissions = &["ACTION_READ"],
-        permissions_required = &[Permission::ResourceAction(
-            Resource::Database(NAMESPACE.to_string()),
-            Action::Write,
-        )],
+        permissions_required = &[
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Write,
+            )
+        ],
         want = Err(Error::Forbidden)
     );
 
@@ -202,8 +257,22 @@ mod test {
         any_of_required_perms,
         token_permissions = &["ACTION_WRITE"],
         permissions_required = &[
-            Permission::ResourceAction(Resource::Database(NAMESPACE.to_string()), Action::Write,),
-            Permission::ResourceAction(Resource::Database(NAMESPACE.to_string()), Action::Create,)
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Create,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Create,
+            )
         ],
         want = Ok(_)
     );
@@ -220,7 +289,7 @@ mod test {
             .permissions(
                 Some(invalid_token.to_vec()),
                 &[Permission::ResourceAction(
-                    Resource::Database(NAMESPACE.to_string()),
+                    Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
                     Action::Read,
                 )],
             )

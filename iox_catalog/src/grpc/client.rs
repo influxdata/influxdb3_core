@@ -17,21 +17,21 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use trace::ctx::SpanContext;
 use trace_http::ctx::format_jaeger_trace_context;
 
-use crate::interface::{namespace_snapshot_by_name, RootRepo};
 use crate::interface::{
-    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-    RepoCollection, Result, SoftDeletedRows, TableRepo,
+    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, NamespaceSorting, Paginated,
+    ParquetFileRepo, PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
 };
+use crate::interface::{PaginationOptions, RootRepo, TableSorting, namespace_snapshot_by_name};
 use crate::metrics::CatalogMetrics;
 use backoff::{Backoff, BackoffError};
 use data_types::snapshot::partition::PartitionSnapshot;
 use data_types::{
-    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
-    snapshot::table::TableSnapshot,
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
     ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
     TableId, Timestamp,
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
+    snapshot::table::TableSnapshot,
 };
 use generated_types::influxdata::iox::catalog::v2 as proto;
 use iox_time::TimeProvider;
@@ -45,7 +45,7 @@ use super::serialization::{
     serialize_object_store_id, serialize_parquet_file_params, serialize_sort_key_ids,
 };
 use crate::util_serialization::{
-    convert_status, serialize_soft_deleted_rows, ContextExt, RequiredExt,
+    ContextExt, RequiredExt, convert_status, is_upstream_error, serialize_soft_deleted_rows,
 };
 
 type InstrumentedChannel = TraceService<Channel>;
@@ -176,6 +176,10 @@ impl GrpcCatalogClient {
 
 #[async_trait]
 impl Catalog for GrpcCatalogClient {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -210,7 +214,7 @@ impl Catalog for GrpcCatalogClient {
         let req = proto::GetTimeRequest {};
 
         let resp = client_repos
-            .retry("get_time", req, |data, mut client| async move {
+            .retry("get_time", req, async move |data, mut client| {
                 client.get_time(data).await
             })
             .await?;
@@ -241,26 +245,6 @@ struct GrpcCatalogClientRepos {
 type ServiceClient = proto::catalog_service_client::CatalogServiceClient<
     SetRequestHeadersService<InstrumentedChannel>,
 >;
-
-fn is_upstream_error(e: &tonic::Status) -> bool {
-    matches!(
-        e.code(),
-        // timeout & abort cases
-        tonic::Code::Aborted
-            | tonic::Code::Cancelled
-            | tonic::Code::DeadlineExceeded
-
-            // server side not online
-            | tonic::Code::FailedPrecondition
-            | tonic::Code::Unavailable
-
-            // connection errors classify as "unknown"
-            | tonic::Code::Unknown
-
-            // internal errors on the server side
-            | tonic::Code::Internal
-    )
-}
 
 impl GrpcCatalogClientRepos {
     fn client(&self) -> ServiceClient {
@@ -295,7 +279,7 @@ impl GrpcCatalogClientRepos {
         D: std::fmt::Debug,
     {
         Backoff::new(&Default::default())
-            .retry_with_backoff(operation, || async {
+            .retry_with_backoff(operation, async || {
                 let res = fun_io(upload.clone(), self.client()).await;
                 match res {
                     Ok(r) => {
@@ -364,7 +348,7 @@ impl RootRepo for GrpcCatalogClientRepos {
     async fn snapshot(&mut self) -> Result<RootSnapshot> {
         let req = proto::RootSnapshotRequest {};
         let resp = self
-            .retry("root_snapshot", req, |req, mut client| async move {
+            .retry("root_snapshot", req, async move |req, mut client| {
                 client.root_snapshot(req).await
             })
             .await?;
@@ -397,7 +381,7 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         };
 
         let resp = self
-            .retry("namespace_create", n, |data, mut client| async move {
+            .retry("namespace_create", n, async move |data, mut client| {
                 client.namespace_create(data).await
             })
             .await?;
@@ -418,12 +402,13 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             retention_period_ns,
         };
 
-        let resp = self.retry(
-            "namespace_update_retention_period",
-            n,
-            |data, mut client| async move { client.namespace_update_retention_period(data).await },
-        )
-        .await?;
+        let resp = self
+            .retry(
+                "namespace_update_retention_period",
+                n,
+                async move |data, mut client| client.namespace_update_retention_period(data).await,
+            )
+            .await?;
 
         Ok(deserialize_namespace(
             resp.namespace.required().ctx("namespace")?,
@@ -435,7 +420,7 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             deleted: serialize_soft_deleted_rows(deleted),
         };
 
-        self.retry("namespace_list", n, |data, mut client| async move {
+        self.retry("namespace_list", n, async move |data, mut client| {
             buffer_stream_response(client.namespace_list(data).await).await
         })
         .await?
@@ -446,7 +431,11 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
-    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+    async fn list_storage(
+        &mut self,
+        _sorting: Option<NamespaceSorting>,
+        _pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
         // The storage API is intentionally not exposed to this client to avoid confusion.
         // The storage API is mainly for admin view via the Granite Admin UI or influxctl,
         // and not for any IOx internal communications.
@@ -466,43 +455,55 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
         };
 
         let resp = self
-            .retry("namespace_get_by_id", n, |data, mut client| async move {
+            .retry("namespace_get_by_id", n, async move |data, mut client| {
                 client.namespace_get_by_id(data).await
             })
             .await?;
         Ok(resp.namespace.map(deserialize_namespace).transpose()?)
     }
 
-    async fn get_by_name(
-        &mut self,
-        name: &str,
-        deleted: SoftDeletedRows,
-    ) -> Result<Option<Namespace>> {
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>> {
+        #[expect(deprecated)]
         let n = proto::NamespaceGetByNameRequest {
             name: name.to_owned(),
-            deleted: serialize_soft_deleted_rows(deleted),
+            // This is a deprecated field that is ignored and should eventually be removed. For now
+            // and to avoid compatibility problems with rollout of this change, we use
+            // `SoftDeletedRows::ExcludeDeleted` so that old servers will accept the new client
+            // requests.
+            deleted: Some(proto::SoftDeletedRows::ExcludeDeleted.into()),
         };
 
         let resp = self
-            .retry("namespace_get_by_name", n, |data, mut client| async move {
+            .retry("namespace_get_by_name", n, async move |data, mut client| {
                 client.namespace_get_by_name(data).await
             })
             .await?;
         Ok(resp.namespace.map(deserialize_namespace).transpose()?)
     }
 
-    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
-        use generated_types::influxdata::iox::catalog::v2::namespace_soft_delete_request::Target;
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        use generated_types::influxdata::iox::catalog::v2::{
+            namespace_soft_delete_request::Target, namespace_soft_delete_response::Deleted,
+        };
+
         let n = proto::NamespaceSoftDeleteRequest {
             target: Some(Target::Id(id.get())),
         };
 
         let resp = self
-            .retry("namespace_soft_delete", n, |data, mut client| async move {
+            .retry("namespace_soft_delete", n, async move |data, mut client| {
                 client.namespace_soft_delete(data).await
             })
             .await?;
-        Ok(NamespaceId::new(resp.namespace_id))
+
+        match resp.deleted.required()? {
+            Deleted::NamespaceId(id) => {
+                NamespaceRepo::get_by_id(self, NamespaceId::new(id), SoftDeletedRows::OnlyDeleted)
+                    .await
+                    .map(Option::unwrap)
+            }
+            Deleted::Namespace(ns) => deserialize_namespace(ns).map_err(Into::into),
+        }
     }
 
     async fn update_table_limit(
@@ -520,7 +521,7 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             .retry(
                 "namespace_update_table_limit",
                 n,
-                |data, mut client| async move { client.namespace_update_table_limit(data).await },
+                async move |data, mut client| client.namespace_update_table_limit(data).await,
             )
             .await?;
 
@@ -544,7 +545,7 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             .retry(
                 "namespace_update_column_limit",
                 n,
-                |data, mut client| async move { client.namespace_update_column_limit(data).await },
+                async move |data, mut client| client.namespace_update_column_limit(data).await,
             )
             .await?;
 
@@ -558,7 +559,7 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             namespace_id: namespace_id.get(),
         };
         let resp = self
-            .retry("namespace_snapshot", req, |req, mut client| async move {
+            .retry("namespace_snapshot", req, async move |req, mut client| {
                 client.namespace_snapshot(req).await
             })
             .await?;
@@ -573,7 +574,7 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             name: name.to_string(),
         };
         let r = self
-            .retry("namespace_snapshot", req, |req, mut client| async move {
+            .retry("namespace_snapshot", req, async move |req, mut client| {
                 client.namespace_snapshot_by_name(req).await
             })
             .await;
@@ -601,6 +602,41 @@ impl NamespaceRepo for GrpcCatalogClientRepos {
             descr: "namespace_get_storage_by_id".to_owned(),
         })
     }
+
+    /// Rename the namespace corresponding to `id`.
+    async fn rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace> {
+        let req = proto::NamespaceRenameRequest {
+            id: id.get(),
+            new_name: new_name.into(),
+        };
+
+        let resp = self
+            .retry("namespace_rename", req, async move |data, mut client| {
+                client.namespace_rename(data).await
+            })
+            .await?;
+
+        Ok(deserialize_namespace(
+            resp.namespace.required().ctx("namespace")?,
+        )?)
+    }
+
+    /// Undelete the soft deleted namespace corresponding to `id`.
+    ///
+    /// There must be no active, undeleted namespace using the target's name.
+    async fn undelete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        let req = proto::NamespaceUndeleteRequest { id: id.get() };
+
+        let resp = self
+            .retry("namespace_undelete", req, async move |data, mut client| {
+                client.namespace_undelete(data).await
+            })
+            .await?;
+
+        Ok(deserialize_namespace(
+            resp.namespace.required().ctx("namespace")?,
+        )?)
+    }
 }
 
 #[async_trait]
@@ -618,7 +654,7 @@ impl TableRepo for GrpcCatalogClientRepos {
         };
 
         let resp = self
-            .retry("table_create", t, |data, mut client| async move {
+            .retry("table_create", t, async move |data, mut client| {
                 client.table_create(data).await
             })
             .await?;
@@ -629,7 +665,7 @@ impl TableRepo for GrpcCatalogClientRepos {
         let t = proto::TableGetByIdRequest { id: table_id.get() };
 
         let resp = self
-            .retry("table_get_by_id", t, |data, mut client| async move {
+            .retry("table_get_by_id", t, async move |data, mut client| {
                 client.table_get_by_id(data).await
             })
             .await?;
@@ -655,12 +691,13 @@ impl TableRepo for GrpcCatalogClientRepos {
             name: name.to_owned(),
         };
 
-        let resp = self.retry(
-            "table_get_by_namespace_and_name",
-            t,
-            |data, mut client| async move { client.table_get_by_namespace_and_name(data).await },
-        )
-        .await?;
+        let resp = self
+            .retry(
+                "table_get_by_namespace_and_name",
+                t,
+                async move |data, mut client| client.table_get_by_namespace_and_name(data).await,
+            )
+            .await?;
         Ok(resp.table.map(deserialize_table).transpose()?)
     }
 
@@ -672,7 +709,7 @@ impl TableRepo for GrpcCatalogClientRepos {
         self.retry(
             "table_list_by_namespace_id",
             t,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.table_list_by_namespace_id(data).await).await
             },
         )
@@ -685,7 +722,9 @@ impl TableRepo for GrpcCatalogClientRepos {
     async fn list_storage_by_namespace_id(
         &mut self,
         _namespace_id: NamespaceId,
-    ) -> Result<Vec<TableWithStorage>> {
+        _sorting: Option<TableSorting>,
+        _pagination: Option<PaginationOptions>,
+    ) -> Result<Paginated<TableWithStorage>> {
         // The storage API is intentionally not exposed to this client to avoid confusion.
         // The storage API is mainly for admin view via the Granite Admin UI or influxctl,
         // and not for any IOx internal communications.
@@ -697,7 +736,7 @@ impl TableRepo for GrpcCatalogClientRepos {
     async fn list(&mut self) -> Result<Vec<Table>> {
         let t = proto::TableListRequest {};
 
-        self.retry("table_list", t, |data, mut client| async move {
+        self.retry("table_list", t, async move |data, mut client| {
             buffer_stream_response(client.table_list(data).await).await
         })
         .await?
@@ -712,13 +751,96 @@ impl TableRepo for GrpcCatalogClientRepos {
         };
 
         let resp = self
-            .retry("table_snapshot", t, |data, mut client| async move {
+            .retry("table_snapshot", t, async move |data, mut client| {
                 client.table_snapshot(data).await
             })
             .await?;
 
         let table = resp.table.required().ctx("table")?;
         Ok(TableSnapshot::decode(table, resp.generation))
+    }
+
+    async fn list_by_iceberg_enabled(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableId>> {
+        let t = proto::TableListByIcebergEnabledRequest {
+            namespace_id: namespace_id.get(),
+        };
+
+        self.retry(
+            "list_by_iceberg_enabled",
+            t,
+            |data, mut client| async move {
+                buffer_stream_response(client.table_list_by_iceberg_enabled(data).await).await
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|res| Ok(TableId::new(res.table_id)))
+        .collect()
+    }
+
+    async fn enable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let t = proto::TableEnableIcebergRequest {
+            table_id: table_id.get(),
+        };
+
+        self.retry("enable_iceberg", t, |data, mut client| async move {
+            client.table_enable_iceberg(data).await
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn disable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let t = proto::TableDisableIcebergRequest {
+            table_id: table_id.get(),
+        };
+
+        self.retry("disable_iceberg", t, |data, mut client| async move {
+            client.table_disable_iceberg(data).await
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn soft_delete(&mut self, id: TableId) -> Result<Table> {
+        let req = proto::TableSoftDeleteRequest { table_id: id.get() };
+
+        let resp = self
+            .retry("soft_delete", req, async move |data, mut client| {
+                client.table_soft_delete(data).await
+            })
+            .await?;
+
+        Ok(deserialize_table(resp.table.required().ctx("table")?)?)
+    }
+
+    async fn rename(&mut self, id: TableId, new_name: &str) -> Result<Table> {
+        let req = proto::TableRenameRequest {
+            table_id: id.get(),
+            new_name: new_name.to_owned(),
+        };
+
+        let resp = self
+            .retry("rename", req, async move |data, mut client| {
+                client.table_rename(data).await
+            })
+            .await?;
+
+        Ok(deserialize_table(resp.table.required().ctx("table")?)?)
+    }
+
+    async fn undelete(&mut self, id: TableId) -> Result<Table> {
+        let req = proto::TableUndeleteRequest { table_id: id.get() };
+
+        let resp = self
+            .retry("undelete", req, async move |data, mut client| {
+                client.table_undelete(data).await
+            })
+            .await?;
+
+        Ok(deserialize_table(resp.table.required().ctx("table")?)?)
     }
 }
 
@@ -737,7 +859,7 @@ impl ColumnRepo for GrpcCatalogClientRepos {
         };
 
         let resp = self
-            .retry("column_create_or_get", c, |data, mut client| async move {
+            .retry("column_create_or_get", c, async move |data, mut client| {
                 client.column_create_or_get(data).await
             })
             .await?;
@@ -760,7 +882,7 @@ impl ColumnRepo for GrpcCatalogClientRepos {
         self.retry(
             "column_create_or_get_many_unchecked",
             c,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.column_create_or_get_many_unchecked(data).await).await
             },
         )
@@ -778,7 +900,7 @@ impl ColumnRepo for GrpcCatalogClientRepos {
         self.retry(
             "column_list_by_namespace_id",
             c,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.column_list_by_namespace_id(data).await).await
             },
         )
@@ -796,7 +918,7 @@ impl ColumnRepo for GrpcCatalogClientRepos {
         self.retry(
             "column_list_by_table_id",
             c,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.column_list_by_table_id(data).await).await
             },
         )
@@ -806,10 +928,12 @@ impl ColumnRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
-    async fn list(&mut self) -> Result<Vec<Column>> {
-        let c = proto::ColumnListRequest {};
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>> {
+        let c = proto::ColumnListRequest {
+            deleted: Some(serialize_soft_deleted_rows(deleted)),
+        };
 
-        self.retry("column_list", c, |data, mut client| async move {
+        self.retry("column_list", c, async move |data, mut client| {
             buffer_stream_response(client.column_list(data).await).await
         })
         .await?
@@ -831,7 +955,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
             .retry(
                 "partition_create_or_get",
                 p,
-                |data, mut client| async move { client.partition_create_or_get(data).await },
+                async move |data, mut client| client.partition_create_or_get(data).await,
             )
             .await?;
 
@@ -859,7 +983,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_get_by_id_batch",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.partition_get_by_id_batch(data).await).await
             },
         )
@@ -881,7 +1005,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_list_by_table_id",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.partition_list_by_table_id(data).await).await
             },
         )
@@ -899,7 +1023,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         let p = proto::PartitionListIdsRequest {};
 
         Ok(self
-            .retry("partition_list_ids", p, |data, mut client| async move {
+            .retry("partition_list_ids", p, async move |data, mut client| {
                 buffer_stream_response(client.partition_list_ids(data).await).await
             })
             .await?
@@ -925,9 +1049,11 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         };
 
         let res = self
-            .retry("partition_cas_sort_key", p, |data, mut client| async move {
-                client.partition_cas_sort_key(data).await
-            })
+            .retry(
+                "partition_cas_sort_key",
+                p,
+                async move |data, mut client| client.partition_cas_sort_key(data).await,
+            )
             .await
             .map_err(CasFailure::QueryError)?;
 
@@ -948,7 +1074,6 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn record_skipped_compaction(
         &mut self,
         partition_id: PartitionId,
@@ -972,7 +1097,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_record_skipped_compaction",
             p,
-            |data, mut client| async move { client.partition_record_skipped_compaction(data).await },
+            async move |data, mut client| client.partition_record_skipped_compaction(data).await,
         )
         .await?;
         Ok(())
@@ -989,7 +1114,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_get_in_skipped_compactions",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.partition_get_in_skipped_compactions(data).await)
                     .await
             },
@@ -1012,7 +1137,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_list_skipped_compactions",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.partition_list_skipped_compactions(data).await).await
             },
         )
@@ -1040,7 +1165,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
             .retry(
                 "partition_delete_skipped_compactions",
                 p,
-                |data, mut client| async move {
+                async move |data, mut client| {
                     client.partition_delete_skipped_compactions(data).await
                 },
             )
@@ -1055,7 +1180,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_most_recent_n",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.partition_most_recent_n(data).await).await
             },
         )
@@ -1083,7 +1208,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
             .retry(
                 "partition_new_file_between",
                 p,
-                |data, mut client| async move {
+                async move |data, mut client| {
                     buffer_stream_response(client.partition_new_file_between(data).await).await
                 },
             )
@@ -1107,7 +1232,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
             .retry(
                 "partitions_needing_cold_compact",
                 p,
-                |data, mut client| async move {
+                async move |data, mut client| {
                     buffer_stream_response(client.partition_needing_cold_compact(data).await).await
                 },
             )
@@ -1127,7 +1252,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
             cold_compact_at: cold_compact_at.get(),
         };
 
-        self.retry("update_cold_compact", p, |data, mut client| async move {
+        self.retry("update_cold_compact", p, async move |data, mut client| {
             client.partition_update_cold_compact(data).await
         })
         .await?;
@@ -1140,7 +1265,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         self.retry(
             "partition_list_old_style",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.partition_list_old_style(data).await).await
             },
         )
@@ -1154,14 +1279,19 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
-    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
-        let p = proto::PartitionDeleteByRetentionRequest {};
+    async fn delete_by_retention(
+        &mut self,
+        partition_cutoff: Duration,
+    ) -> Result<Vec<(TableId, PartitionId)>> {
+        let p = proto::PartitionDeleteByRetentionRequest {
+            partition_cutoff_seconds: Some(partition_cutoff.as_secs() as i64),
+        };
 
         let res = self
             .retry(
                 "partition_delete_by_retention",
                 p,
-                |data, mut client| async move {
+                async move |data, mut client| {
                     buffer_stream_response(client.partition_delete_by_retention(data).await).await
                 },
             )
@@ -1183,7 +1313,7 @@ impl PartitionRepo for GrpcCatalogClientRepos {
         };
 
         let resp = self
-            .retry("partition_snapshot", p, |data, mut client| async move {
+            .retry("partition_snapshot", p, async move |data, mut client| {
                 client.partition_snapshot(data).await
             })
             .await?;
@@ -1207,7 +1337,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_flag_for_delete_by_retention",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.parquet_file_flag_for_delete_by_retention(data).await)
                     .await
             },
@@ -1231,7 +1361,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_delete_old_ids_only",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.parquet_file_delete_old_ids_only(data).await).await
             },
         )
@@ -1245,23 +1375,28 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         .collect()
     }
 
-    async fn delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64> {
+    async fn delete_old_ids_count(&mut self, older_than: Timestamp, limit: u32) -> Result<u64> {
         let p = proto::ParquetFileDeleteOldIdsCountRequest {
             older_than: older_than.get(),
+            limit: Some(limit),
         };
 
-        let resp = self.retry(
-            "parquet_file_delete_old_ids_count",
-            p,
-            |data, mut client| async move { client.parquet_file_delete_old_ids_count(data).await },
-        ).await;
+        let resp = self
+            .retry(
+                "parquet_file_delete_old_ids_count",
+                p,
+                async move |data, mut client| client.parquet_file_delete_old_ids_count(data).await,
+            )
+            .await;
 
         match resp {
             Ok(resp) => Ok(resp.num_deleted),
             // If we get an Unimplemented error, that means that the `delete_old_ids_count` method
             // hasn't been rolled out to the remote end yet, so we have to fallback to calling the
             // `delete_old_ids_only` method and counting its vec
-            Err(Error::NotImplemented { descr: _ }) => {
+            Err(Error::NotImplemented { descr: _ }) =>
+            {
+                #[expect(deprecated)]
                 self.delete_old_ids_only(older_than).await.map(|v| {
                     v.len()
                         .try_into()
@@ -1285,7 +1420,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_list_by_partition_not_to_delete_batch",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(
                     client
                         .parquet_file_list_by_partition_not_to_delete_batch(data)
@@ -1310,7 +1445,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_active_as_of",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.parquet_file_active_as_of(data).await).await
             },
         )
@@ -1332,12 +1467,18 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
             object_store_id: Some(serialize_object_store_id(object_store_id)),
         };
 
-        let maybe_file = self.retry(
-            "parquet_file_get_by_object_store_id",
-            p,
-            |data, mut client| async move { client.parquet_file_get_by_object_store_id(data).await })
+        let maybe_file = self
+            .retry(
+                "parquet_file_get_by_object_store_id",
+                p,
+                async move |data, mut client| {
+                    client.parquet_file_get_by_object_store_id(data).await
+                },
+            )
             .await?
-            .parquet_file.map(deserialize_parquet_file).transpose()?;
+            .parquet_file
+            .map(deserialize_parquet_file)
+            .transpose()?;
         Ok(maybe_file)
     }
 
@@ -1354,7 +1495,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_exists_by_object_store_id_batch",
             p,
-            |data, mut client: ServiceClient| async move {
+            async move |data, mut client: ServiceClient| {
                 buffer_stream_response(
                     client
                         .parquet_file_exists_by_object_store_id_batch(data)
@@ -1387,7 +1528,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_exists_by_partition_and_object_store_id_batch",
             p,
-            |data, mut client: ServiceClient| async move {
+            async move |data, mut client: ServiceClient| {
                 buffer_stream_response(
                     client
                         .parquet_file_exists_by_partition_and_object_store_id_batch(data)
@@ -1444,7 +1585,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_create_upgrade_delete_full",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.parquet_file_create_upgrade_delete_full(data).await)
                     .await
             },
@@ -1472,7 +1613,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_list_by_table_id",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.parquet_file_list_by_table_id(data).await).await
             },
         )
@@ -1499,7 +1640,7 @@ impl ParquetFileRepo for GrpcCatalogClientRepos {
         self.retry(
             "parquet_file_list_by_namespace_id",
             p,
-            |data, mut client| async move {
+            async move |data, mut client| {
                 buffer_stream_response(client.parquet_file_list_by_namespace_id(data).await).await
             },
         )

@@ -3,11 +3,11 @@
 //! AKA it is a Mock
 
 use crate::{
+    Extension, QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace,
+    QueryText,
     exec::{Executor, IOxSessionContext, QueryConfig},
     provider::ProviderBuilder,
     query_log::{QueryLog, QueryLogEntries, StateReceived},
-    Extension, QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace,
-    QueryText,
 };
 use arrow::array::{BooleanArray, Float64Array};
 use arrow::datatypes::SchemaRef;
@@ -30,7 +30,7 @@ use datafusion::{
     logical_expr::LogicalPlan,
 };
 use datafusion::{
-    datasource::{object_store::ObjectStoreUrl, TableProvider, TableType},
+    datasource::{TableProvider, TableType, object_store::ObjectStoreUrl},
     physical_plan::{ColumnStatistics, Statistics as DataFusionStatistics},
     scalar::ScalarValue,
 };
@@ -38,11 +38,11 @@ use datafusion_util::{config::DEFAULT_SCHEMA, option_to_precision, timestamptz_n
 use iox_query_params::StatementParams;
 use iox_time::SystemProvider;
 use itertools::Itertools;
-use object_store::{path::Path, ObjectMeta};
+use object_store::{ObjectMeta, path::Path};
 use parking_lot::Mutex;
 use parquet_file::storage::ParquetExecInput;
 use schema::{
-    builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey, Schema, TIME_COLUMN_NAME,
+    Schema, TIME_COLUMN_NAME, builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey,
 };
 use std::{
     any::Any,
@@ -209,7 +209,7 @@ impl QueryNamespace for TestDatabase {
         query_text: QueryText,
         query_params: StatementParams,
     ) -> QueryCompletedToken<StateReceived> {
-        QueryLog::new(0, Arc::new(SystemProvider::new())).push(
+        QueryLog::new(0, Arc::new(SystemProvider::new()), &metric::Registry::new()).push(
             NamespaceId::new(1),
             Arc::from("ns"),
             query_type,
@@ -539,10 +539,8 @@ impl TestChunk {
     }
 
     pub fn with_partition(mut self, id: i64) -> Self {
-        self.partition_id = TransitionPartitionId::deterministic(
-            TableId::new(id),
-            &PartitionKey::from("arbitrary"),
-        );
+        self.partition_id =
+            TransitionPartitionId::hash(TableId::new(id), &PartitionKey::from("arbitrary"));
         self
     }
 

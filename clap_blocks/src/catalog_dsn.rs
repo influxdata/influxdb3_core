@@ -14,12 +14,16 @@ use snafu::{ResultExt, Snafu};
 use std::{sync::Arc, time::Duration};
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
-    #[snafu(display("Unknown Catalog DSN {dsn}. Expected a string like 'postgresql://postgres@localhost:5432/postgres' or 'sqlite:///tmp/catalog.sqlite'"))]
+    #[snafu(display(
+        "Unknown Catalog DSN {dsn}. Expected a string like 'postgresql://postgres@localhost:5432/postgres' or 'sqlite:///tmp/catalog.sqlite'"
+    ))]
     UnknownCatalogDsn { dsn: String },
 
-    #[snafu(display("Catalog DSN not specified. Expected a string like 'postgresql://postgres@localhost:5432/postgres' or 'sqlite:///tmp/catalog.sqlite'"))]
+    #[snafu(display(
+        "Catalog DSN not specified. Expected a string like 'postgresql://postgres@localhost:5432/postgres' or 'sqlite:///tmp/catalog.sqlite'"
+    ))]
     DsnNotSpecified {},
 
     #[snafu(display("Invalid URI: {source}"))]
@@ -151,6 +155,15 @@ pub struct CatalogDsnConfig {
         default_value = "104857600",  // 100 MB
     )]
     pub grpc_max_decoded_message_size: usize,
+
+    /// Override app name resported to the catalog.
+    ///
+    /// This should ONLY be used for debugging!
+    #[clap(
+        long = "unsafe-catalog-override-app-name",
+        env = "INFLUXDB_IOX_UNSAFE_CATALOG_OVERRIDE_APP_NAME"
+    )]
+    pub unsafe_override_app_name: Option<String>,
 }
 
 impl CatalogDsnConfig {
@@ -186,6 +199,8 @@ impl CatalogDsnConfig {
         time_provider: Arc<dyn TimeProvider>,
         traces_jaeger_trace_context_header_name: String,
     ) -> Result<Arc<dyn Catalog>, Error> {
+        let app_name = self.unsafe_override_app_name.as_deref().unwrap_or(app_name);
+
         if dsn.starts_with("postgres") || dsn.starts_with("dsn-file://") {
             // do not log entire postgres dsn as it may contain credentials
             info!(postgres_schema_name=%self.postgres_schema_name, "Catalog: Postgres");
@@ -237,6 +252,23 @@ impl CatalogDsnConfig {
                 .max_decoded_message_size(self.grpc_max_decoded_message_size)
                 .build();
             Ok(Arc::new(grpc))
+        } else {
+            Err(Error::UnknownCatalogDsn {
+                dsn: dsn.to_string(),
+            })
+        }
+    }
+
+    /// Get a list of endpoints from the DSN if the DSN points to HTTP(s) endpoints.
+    pub fn get_endpoints(&self) -> Result<Vec<http::Uri>, Error> {
+        let Some(dsn) = self.dsn.as_ref() else {
+            return Err(Error::DsnNotSpecified {});
+        };
+        if dsn.starts_with("http://") || dsn.starts_with("https://") {
+            dsn.split(';')
+                .map(|x| x.parse())
+                .collect::<Result<_, _>>()
+                .context(InvalidUriSnafu)
         } else {
             Err(Error::UnknownCatalogDsn {
                 dsn: dsn.to_string(),

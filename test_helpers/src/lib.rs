@@ -75,18 +75,20 @@ static LOG_SETUP: Once = Once::new();
 ///
 /// Hint: Try running your test with `--no-capture` if you don't see expected logs.
 ///
-/// This is likely useful only when debugging a single tests or when running
-/// with `--test-threads=1` , otherwise outputs will be interleaved because
-/// test execution is multi-threaded.
-pub fn start_logging() {
+/// # Safety
+///
+/// * If `true` is passed in for `force_dbg`, this function is only sound to use in a
+///   single-threaded environment.
+pub unsafe fn start_logging(force_dbg: bool) {
     use tracing_log::LogTracer;
-    use tracing_subscriber::{filter::EnvFilter, FmtSubscriber};
+    use tracing_subscriber::{FmtSubscriber, filter::EnvFilter};
 
     // ensure the global has been initialized
     LOG_SETUP.call_once(|| {
         // honor any existing RUST_LOG level
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "debug");
+        if force_dbg {
+            // SAFETY: Upheld by caller
+            unsafe { std::env::set_var("RUST_LOG", "debug") }
         }
 
         LogTracer::init().expect("Cannot init log->trace integration");
@@ -112,7 +114,8 @@ pub fn start_logging() {
 /// been set previously, does nothing
 pub fn maybe_start_logging() {
     if std::env::var("RUST_LOG").is_ok() {
-        start_logging()
+        // SAFETY: We aren't passing in `true`, so there are no safety concerns
+        unsafe { start_logging(false) }
     }
 }
 

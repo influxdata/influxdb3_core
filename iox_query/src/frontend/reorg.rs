@@ -6,10 +6,10 @@ use data_types::TableId;
 use datafusion::{logical_expr::LogicalPlan, prelude::col};
 use datafusion_util::lit_timestamptz_nano;
 use observability_deps::tracing::debug;
-use schema::{sort::SortKey, Schema, TIME_COLUMN_NAME};
+use schema::{Schema, TIME_COLUMN_NAME, sort::SortKey};
 
 use crate::{
-    exec::make_stream_split, provider::ProviderBuilder, util::logical_sort_key_exprs, QueryChunk,
+    QueryChunk, exec::make_stream_split, provider::ProviderBuilder, util::logical_sort_key_exprs,
 };
 use snafu::{ResultExt, Snafu};
 
@@ -244,7 +244,7 @@ mod test {
 
     use crate::{
         exec::Executor,
-        test::{format_execution_plan, raw_data, TestChunk},
+        test::{TestChunk, format_execution_plan, raw_data},
     };
 
     use super::*;
@@ -433,13 +433,13 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_execution_plan(&physical_plan),
             @r#"
-        - " SortPreservingMergeExec: [tag1@2 ASC,time@3 ASC]"
+        - " SortPreservingMergeExec: [tag1@2 ASC, time@3 ASC]"
         - "   UnionExec"
-        - "     SortExec: expr=[tag1@2 ASC,time@3 ASC], preserve_partitioning=[false]"
+        - "     SortExec: expr=[tag1@2 ASC, time@3 ASC], preserve_partitioning=[false]"
         - "       RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
         - "     ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
         - "       DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
-        - "         SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "         SortExec: expr=[tag1@2 ASC, time@3 ASC, __chunk_order@4 ASC], preserve_partitioning=[false]"
         - "           RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
         "#
         );
@@ -507,14 +507,14 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_execution_plan(&physical_plan),
             @r#"
-        - " SortPreservingMergeExec: [tag1@2 DESC,time@3 ASC NULLS LAST]"
+        - " SortPreservingMergeExec: [tag1@2 DESC, time@3 ASC NULLS LAST]"
         - "   UnionExec"
-        - "     SortExec: expr=[tag1@2 DESC,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+        - "     SortExec: expr=[tag1@2 DESC, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
         - "       RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
-        - "     SortExec: expr=[tag1@2 DESC,time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+        - "     SortExec: expr=[tag1@2 DESC, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
         - "       ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
         - "         DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
-        - "           SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "           SortExec: expr=[tag1@2 ASC, time@3 ASC, __chunk_order@4 ASC], preserve_partitioning=[false]"
         - "             RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
         "#
         );
@@ -585,14 +585,14 @@ mod test {
             format_execution_plan(&physical_plan),
             @r#"
         - " StreamSplitExec"
-        - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST, tag1@2 ASC]"
         - "     UnionExec"
-        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST, tag1@2 ASC], preserve_partitioning=[false]"
         - "         RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
-        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST, tag1@2 ASC], preserve_partitioning=[false]"
         - "         ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
         - "           DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
-        - "             SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "             SortExec: expr=[tag1@2 ASC, time@3 ASC, __chunk_order@4 ASC], preserve_partitioning=[false]"
         - "               RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
         "#
         );
@@ -675,14 +675,14 @@ mod test {
             format_execution_plan(&physical_plan),
             @r#"
         - " StreamSplitExec"
-        - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST, tag1@2 ASC]"
         - "     UnionExec"
-        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST, tag1@2 ASC], preserve_partitioning=[false]"
         - "         RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time]"
-        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC], preserve_partitioning=[false]"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST, tag1@2 ASC], preserve_partitioning=[false]"
         - "         ProjectionExec: expr=[field_int@0 as field_int, field_int2@1 as field_int2, tag1@2 as tag1, time@3 as time]"
         - "           DeduplicateExec: [tag1@2 ASC,time@3 ASC]"
-        - "             SortExec: expr=[tag1@2 ASC,time@3 ASC,__chunk_order@4 ASC], preserve_partitioning=[false]"
+        - "             SortExec: expr=[tag1@2 ASC, time@3 ASC, __chunk_order@4 ASC], preserve_partitioning=[false]"
         - "               RecordBatchesExec: chunks=1, projection=[field_int, field_int2, tag1, time, __chunk_order]"
         "#
         );

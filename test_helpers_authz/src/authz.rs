@@ -1,12 +1,12 @@
 use futures::FutureExt;
 use generated_types::influxdata::iox::authz::v1::{
+    AuthorizeRequest, AuthorizeResponse, Permission, ResourceActionPermission,
     iox_authorizer_service_server::{IoxAuthorizerService, IoxAuthorizerServiceServer},
     permission::PermissionOneOf,
-    resource_action_permission::{Action, ResourceType},
-    AuthorizeRequest, AuthorizeResponse, Permission, ResourceActionPermission,
+    resource_action_permission::{Action, ResourceType, Target},
 };
 use observability_deps::tracing::{error, info};
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{Rng, distr::Alphanumeric, rng};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -15,9 +15,9 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::oneshot,
-    task::{spawn, JoinHandle},
+    task::{JoinHandle, spawn},
 };
-use tonic::transport::{server::TcpIncoming, Server};
+use tonic::transport::{Server, server::TcpIncoming};
 
 #[derive(Debug)]
 pub struct Authorizer {
@@ -25,6 +25,10 @@ pub struct Authorizer {
     addr: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<(), tonic::transport::Error>>,
+    // Whether to use new or old token format
+    // true - use name-only token format (legacy)
+    // false - use name-and-id token format
+    legacy_token_mode: bool,
 }
 
 impl Authorizer {
@@ -49,7 +53,16 @@ impl Authorizer {
             addr,
             stop: Some(stop),
             handle,
+            legacy_token_mode: false,
         }
+    }
+
+    /// Whether to use new or old token format
+    /// true - use name-only token format (legacy)
+    /// false - use name-and-id token format
+    pub fn use_legacy_tokens(mut self, legacy_tokens: bool) -> Self {
+        self.legacy_token_mode = legacy_tokens;
+        self
     }
 
     pub async fn close(mut self) {
@@ -74,23 +87,38 @@ impl Authorizer {
     ///  - `"ACTION_WRITE"`
     ///  - `"ACTION_CREATE"`
     ///  - `"ACTION_DELETE"`
-    pub fn create_token_for(&mut self, namespace_name: &str, actions: &[&str]) -> String {
+    pub fn create_token_for(
+        &mut self,
+        namespace_name: &str,
+        namespace_id: &str,
+        actions: &[&str],
+    ) -> String {
         let perms = actions
             .iter()
             .filter_map(|a| Action::from_str_name(a))
-            .map(|a| Permission {
-                permission_one_of: Some(PermissionOneOf::ResourceAction(
-                    ResourceActionPermission {
-                        resource_type: ResourceType::Database.into(),
-                        resource_id: Some(namespace_name.to_string()),
-                        action: a.into(),
-                    },
-                )),
+            .flat_map(|a| {
+                let targets = if self.legacy_token_mode {
+                    vec![Target::ResourceName(namespace_name.to_string())]
+                } else {
+                    vec![
+                        Target::ResourceName(namespace_name.to_string()),
+                        Target::ResourceId(namespace_id.to_string()),
+                    ]
+                };
+                targets.into_iter().map(move |t| Permission {
+                    permission_one_of: Some(PermissionOneOf::ResourceAction(
+                        ResourceActionPermission {
+                            resource_type: ResourceType::Database.into(),
+                            target: Some(t),
+                            action: a.into(),
+                        },
+                    )),
+                })
             })
             .collect();
         let token = format!(
-            "{namespace_name}_{}",
-            thread_rng()
+            "{namespace_name}_{namespace_id}_{}",
+            rng()
                 .sample_iter(&Alphanumeric)
                 .take(5)
                 .map(char::from)

@@ -20,7 +20,7 @@ use arrow::{
 };
 use bytes::Bytes;
 use flatbuffers::InvalidFlatbuffer;
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 use crate::influxdata::iox::ingester::v2 as proto2;
 

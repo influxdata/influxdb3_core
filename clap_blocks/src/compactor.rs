@@ -199,8 +199,7 @@ mod tests {
     fn default_compactor_has_parallel_writes_with_1_rowgroup() {
         let config = CompactorConfig::try_parse_from(["my_binary"]).unwrap();
         assert_eq!(
-            config.parquet_write_parallelism.num_row_groups_in_parallel,
-            1,
+            config.parquet_write_parallelism.num_row_groups_in_parallel, 1,
             "by default should have parallelized writes, even without additional user-provided settings"
         );
     }
