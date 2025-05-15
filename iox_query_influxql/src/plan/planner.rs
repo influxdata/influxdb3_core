@@ -6,17 +6,17 @@ use crate::aggregate::{MODE, PERCENTILE, SPREAD};
 use crate::error;
 use crate::plan::ir::{DataSource, Field, Interval, Select, SelectQuery};
 use crate::plan::planner::select::{
-    fields_to_exprs_no_nulls, make_tag_key_column_meta, plan_with_sort, ProjectionInfo, Selector,
-    SelectorWindowOrderBy,
+    ProjectionInfo, Selector, SelectorWindowOrderBy, fields_to_exprs_no_nulls,
+    make_tag_key_column_meta, plan_with_sort,
 };
 use crate::plan::planner::source_field_names::SourceFieldNamesVisitor;
 use crate::plan::planner_time_range_expression::time_range_to_df_expr;
-use crate::plan::rewriter::{find_table_names, rewrite_statement, ProjectionType};
+use crate::plan::rewriter::{ProjectionType, find_table_names, rewrite_statement};
 use crate::plan::udf::{
     cumulative_sum, derivative, difference, elapsed, find_window_udfs, moving_average,
     non_negative_derivative, non_negative_difference,
 };
-use crate::plan::util::{binary_operator_to_df_operator, rebase_expr, IQLSchema};
+use crate::plan::util::{IQLSchema, binary_operator_to_df_operator, rebase_expr};
 use crate::plan::var_ref::var_ref_data_type_to_data_type;
 use crate::plan::{planner_rewrite_expression, udf};
 use crate::window::{
@@ -31,7 +31,7 @@ use arrow::datatypes::{DataType, Field as ArrowField, Int32Type, Schema as Arrow
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, ToDFSchema};
-use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::datetime::date_bin::DateBinFunc;
 use datafusion::functions::{core::expr_ext::FieldAccessor, expr_fn::now};
@@ -41,26 +41,26 @@ use datafusion::functions_aggregate::{
 };
 use datafusion::functions_array::expr_fn::make_array;
 use datafusion::functions_window::row_number::row_number_udwf;
+use datafusion::logical_expr::SortExpr;
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::normalize_col;
-use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::logical_plan::Analyze;
+use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::utils::{disjunction, expr_as_column_expr, find_aggregate_exprs};
-use datafusion::logical_expr::SortExpr;
 use datafusion::logical_expr::{
-    binary_expr, col, expr, expr::WindowFunction, lit, AggregateUDF, Between, Distinct,
-    EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
-    Operator, PlanType, Projection, ScalarUDF, TableSource, ToStringifiedPlan, Union, WindowFrame,
-    WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
+    AggregateUDF, Between, Distinct, EmptyRelation, Explain, Expr, ExprSchemable, Extension,
+    LogicalPlan, LogicalPlanBuilder, Operator, PlanType, Projection, ScalarUDF, TableSource,
+    ToStringifiedPlan, Union, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowFunctionDefinition, binary_expr, col, expr, expr::WindowFunction, lit,
 };
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{cast, lit_timestamp_nano, when, Column, ExprFunctionExt};
+use datafusion::prelude::{Column, ExprFunctionExt, cast, lit_timestamp_nano, when};
 use datafusion::sql::TableReference;
-use datafusion_util::{lit_dict, AsExpr};
+use datafusion_util::{AsExpr, lit_dict};
 use generated_types::influxdata::iox::querier::v1::InfluxQlMetadata;
 use influxdb_influxql_parser::common::{LimitClause, OffsetClause, OrderByClause};
 use influxdb_influxql_parser::explain::{ExplainOption, ExplainStatement};
-use influxdb_influxql_parser::expression::walk::{walk_expr, walk_expression, Expression};
+use influxdb_influxql_parser::expression::walk::{Expression, walk_expr, walk_expression};
 use influxdb_influxql_parser::expression::{
     Binary, Call, ConditionalBinary, ConditionalExpression, ConditionalOperator, VarRef,
     VarRefDataType,
@@ -68,7 +68,7 @@ use influxdb_influxql_parser::expression::{
 use influxdb_influxql_parser::functions::{
     is_aggregate_function, is_now_function, is_scalar_math_function,
 };
-use influxdb_influxql_parser::parameter::{replace_bind_params_with_values, BindParameterError};
+use influxdb_influxql_parser::parameter::{BindParameterError, replace_bind_params_with_values};
 use influxdb_influxql_parser::select::{FillClause, GroupByClause};
 use influxdb_influxql_parser::show_field_keys::ShowFieldKeysStatement;
 use influxdb_influxql_parser::show_measurements::{
@@ -78,7 +78,7 @@ use influxdb_influxql_parser::show_retention_policies::ShowRetentionPoliciesStat
 use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
 use influxdb_influxql_parser::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
 use influxdb_influxql_parser::simple_from_clause::ShowFromClause;
-use influxdb_influxql_parser::time_range::{split_cond, ReduceContext, TimeRange};
+use influxdb_influxql_parser::time_range::{ReduceContext, TimeRange, split_cond};
 use influxdb_influxql_parser::timestamp::Timestamp;
 use influxdb_influxql_parser::visit::Visitable;
 use influxdb_influxql_parser::{
@@ -91,23 +91,23 @@ use influxdb_influxql_parser::{
 use iox_query::analyzer::default_return_value_for_aggr_fn;
 use iox_query::analyzer::range_predicate::find_time_range;
 use iox_query::config::{IoxConfigExt, MetadataCutoff};
-use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use iox_query::exec::IOxSessionContext;
+use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use iox_query_params::StatementParams;
 use itertools::Itertools;
 use observability_deps::tracing::debug;
-use query_functions::date_bin_wallclock::expr_fn::date_bin_wallclock;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
+use query_functions::date_bin_wallclock::expr_fn::date_bin_wallclock;
 use query_functions::{
     clean_non_meta_escapes,
     selectors::{selector_first, selector_last, selector_max, selector_min},
     tz::TZ_UDF,
 };
 use schema::{
-    InfluxColumnType, InfluxFieldType, Schema, INFLUXQL_MEASUREMENT_COLUMN_NAME,
-    INFLUXQL_METADATA_KEY, TIME_DATA_TIMEZONE,
+    INFLUXQL_MEASUREMENT_COLUMN_NAME, INFLUXQL_METADATA_KEY, InfluxColumnType, InfluxFieldType,
+    Schema, TIME_DATA_TIMEZONE,
 };
-use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fmt::Debug;
 use std::iter;
 use std::ops::{Bound, ControlFlow, Deref, Range};
@@ -164,7 +164,6 @@ enum ExprScope {
 
 /// State used to inform the planner, which is derived for the
 /// root `SELECT` and subqueries.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 struct Context<'a> {
     /// The name of the table used as the data source for the current query.
@@ -250,7 +249,6 @@ impl<'a> Context<'a> {
     }
 
     /// Return a [`SortExpr`] expression for the `time` column.
-    #[allow(dead_code)]
     fn time_sort_expr(&self) -> SortExpr {
         self.time_alias.as_expr().sort(
             match self.order_by {
@@ -264,7 +262,7 @@ impl<'a> Context<'a> {
     /// Returns true if the current context has an extended
     /// time range to provide leading data for window functions
     /// to produce the result for the first window.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn has_extended_time_range(&self) -> bool {
         self.extra_intervals > 0 && self.interval.is_some()
     }
@@ -397,7 +395,6 @@ impl<'a> Context<'a> {
     /// [6]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/select.go#L268-L267
     /// [7]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/select.go#L286-L290
     /// [8]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/select.go#L295
-    #[allow(dead_code)]
     fn extended_time_range(&self) -> TimeRange {
         // As described in the function docs, extra_intervals is either
         // 1 or 0 to match InfluxQL OG behaviour.
@@ -490,7 +487,7 @@ impl<'a> Context<'a> {
     }
 }
 
-#[allow(missing_debug_implementations)]
+#[expect(missing_debug_implementations)]
 /// InfluxQL query planner
 pub struct InfluxQLToLogicalPlan<'a> {
     s: &'a dyn SchemaProvider,
@@ -1111,13 +1108,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 (idx, field_key, plan)
             }
             (_, Selector::Sample { field_key: _, n: _ }) => {
-                return error::not_implemented("sample selector function")
+                return error::not_implemented("sample selector function");
             }
 
             (_, s) => {
                 return error::internal(format!(
                     "unsupported selector function for ProjectionSelector {s}"
-                ))
+                ));
             }
         };
 
@@ -1168,7 +1165,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 (_, s) => {
                     return error::internal(format!(
                         "ProjectionTopBottomSelector used with unexpected selector function: {s}"
-                    ))
+                    ));
                 }
             };
 
@@ -1342,7 +1339,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         return error::internal(format!(
                             "internal: expected 1 selector expression, got {}",
                             aggr_exprs.len()
-                        ))
+                        ));
                     }
                 };
 
@@ -1777,7 +1774,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     ///   the `input` plan and sort the `output` plan.
     /// - `projection_tag_set`: Additional tag columns that should be used to sort the `output`
     ///   plan.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn limit(
         &self,
         input: LogicalPlan,
@@ -1824,19 +1821,21 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 fields_to_exprs_no_nulls(input.schema(), group_by_tag_set).collect::<Vec<_>>()
             };
 
-            let window_func_exprs = vec![Expr::WindowFunction(WindowFunction::new(
-                WindowFunctionDefinition::WindowUDF(row_number_udwf()),
-                vec![],
-            ))
-            .partition_by(partition_by)
-            .order_by(order_by)
-            .window_frame(WindowFrame::new_bounds(
-                WindowFrameUnits::Rows,
-                WindowFrameBound::Preceding(ScalarValue::Null),
-                WindowFrameBound::CurrentRow,
-            ))
-            .build()?
-            .alias(IOX_ROW_ALIAS)];
+            let window_func_exprs = vec![
+                Expr::WindowFunction(WindowFunction::new(
+                    WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+                    vec![],
+                ))
+                .partition_by(partition_by)
+                .order_by(order_by)
+                .window_frame(WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(ScalarValue::Null),
+                    WindowFrameBound::CurrentRow,
+                ))
+                .build()?
+                .alias(IOX_ROW_ALIAS),
+            ];
 
             // Prepare new projection.
             let proj_exprs = input
@@ -2368,7 +2367,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         _ => {
                             return error::query(
                                 "moving_average expects number for second argument",
-                            )
+                            );
                         }
                     },
                 ));
@@ -2453,6 +2452,20 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 ))
             })?;
 
+        /// Ensure that any literal parameter is a Float64, otherwise
+        /// type coercion might choose to coerce to a Float32 instead.
+        fn f64_lit(e: Expr) -> Expr {
+            match e {
+                Expr::Literal(ScalarValue::Int64(v)) => {
+                    Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))
+                }
+                Expr::Literal(ScalarValue::UInt64(v)) => {
+                    Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))
+                }
+                e => e,
+            }
+        }
+
         match call.name.as_str() {
             // log function
             //
@@ -2464,12 +2477,27 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             // https://github.com/apache/datafusion/blob/5d4468579481b36e53333c62bfd2440af1de1155/datafusion/functions/src/math/log.rs#L90
             "log" => {
                 if args.len() != 2 {
-                    error::query("invalid number of arguments for log, expected 2, got 1")
+                    error::query(format!(
+                        "invalid number of arguments for log, expected 2, got {}",
+                        args.len()
+                    ))
                 } else {
-                    let arg1 = args.pop().unwrap();
+                    let arg1 = f64_lit(args.pop().unwrap());
                     let arg0 = args.pop().unwrap();
                     // reverse args
                     Ok(datafusion::prelude::log(arg1, arg0))
+                }
+            }
+            "atan2" => {
+                if args.len() != 2 {
+                    error::query(format!(
+                        "invalid number of arguments for atan2, expected 2, got {}",
+                        args.len()
+                    ))
+                } else {
+                    let arg1 = f64_lit(args.pop().unwrap());
+                    let arg0 = f64_lit(args.pop().unwrap());
+                    Ok(datafusion::prelude::atan2(arg0, arg1))
                 }
             }
             _ => Ok(Expr::ScalarFunction(ScalarFunction { func, args })),
@@ -3702,9 +3730,9 @@ fn filter_window_nulls(plan: LogicalPlan) -> Result<LogicalPlan> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use crate::plan::test_utils::{parse_select, MockSchemaProvider};
+    use crate::plan::test_utils::{MockSchemaProvider, parse_select};
     use influxdb_influxql_parser::parse_statements;
     use insta::assert_snapshot;
     use schema::SchemaBuilder;
@@ -3843,7 +3871,10 @@ mod test {
             ]
         );
 
-        let got = find_var_refs(&sp, "SELECT non_existent, usage_idle FROM (SELECT cpu as non_existent, usage_idle FROM cpu) GROUP BY cpu");
+        let got = find_var_refs(
+            &sp,
+            "SELECT non_existent, usage_idle FROM (SELECT cpu as non_existent, usage_idle FROM cpu) GROUP BY cpu",
+        );
         assert_eq!(
             &got,
             &[
@@ -5233,12 +5264,27 @@ mod test {
         #[test]
         fn test_scalar_functions() {
             // LOG requires two arguments, and first argument is field
-            assert_snapshot!(plan("SELECT LOG(usage_idle, 8) FROM cpu"), @r###"
+            assert_snapshot!(plan("SELECT LOG(usage_idle, 8) FROM cpu"), @r#"
             Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
-              Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, log(Int64(8), cpu.usage_idle) AS log [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
+              Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, cpu.time AS time, log(Float64(8), cpu.usage_idle) AS log [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
                 Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                   TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
-            "###);
+            "#);
+
+            // LOG should coerce Int64 to Float64.
+            assert_snapshot!(plan("SELECT LOG(i64_field, 8) FROM all_types"), @r#"
+            Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
+              Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, log(Float64(8), all_types.i64_field) AS log [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
+                Filter: all_types.i64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), u64_field:UInt64;N]
+            "#);
+            // LOG should coerce UInt64 to Float64.
+            assert_snapshot!(plan("SELECT LOG(u64_field, 8) FROM all_types"), @r#"
+            Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
+              Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, log(Float64(8), all_types.u64_field) AS log [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), log:Float64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), u64_field:UInt64;N]
+            "#);
 
             // Fallible
 
@@ -5414,7 +5460,17 @@ mod test {
             split condition
             caused by
             Error during planning: invalid time comparison operator: !=
-            "###)
+            "###);
+
+            // invalid timestamp
+            // regression test for https://github.com/influxdata/influxdb_iox/issues/13535
+            assert_snapshot!(plan("SELECT foo, f64_field FROM data where time >= '0001-01-01T00:00:00Z' and time < '0001-01-01T00:00:00Z'"), @r"
+            rewriting statement
+            caused by
+            split condition
+            caused by
+            Error during planning: timestamp out of range: 0001-01-01 00:00:00 +00:00
+            ");
         }
 
         #[test]
@@ -6325,12 +6381,24 @@ mod test {
                 Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                   TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
             "###);
-            assert_snapshot!(plan("SELECT foo, atan2(f64_field, 2) FROM data"), @r###"
+            assert_snapshot!(plan("SELECT foo, atan2(f64_field, 2) FROM data"), @r#"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
-              Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, atan2(data.f64_field, Int64(2)) AS atan2 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
+              Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, atan2(data.f64_field, Float64(2)) AS atan2 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
                 Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                   TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
-            "###);
+            "#);
+            assert_snapshot!(plan("SELECT foo, atan2(i64_field, 2) FROM data"), @r#"
+            Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
+              Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, atan2(data.i64_field, Float64(2)) AS atan2 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, atan2:Float64;N]
+                Filter: data.i64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
+                  TableScan: data [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
+            "#);
+            assert_snapshot!(plan("SELECT tag0, atan2(u64_field, 2) FROM all_types"), @r#"
+            Sort: time ASC NULLS LAST, tag0 ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), tag0:Dictionary(Int32, Utf8);N, atan2:Float64;N]
+              Projection: Dictionary(Int32, Utf8("all_types")) AS iox::measurement, all_types.time AS time, all_types.tag0 AS tag0, atan2(all_types.u64_field, Float64(2)) AS atan2 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), tag0:Dictionary(Int32, Utf8);N, atan2:Float64;N]
+                Filter: all_types.u64_field IS NOT NULL [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), u64_field:UInt64;N]
+                  TableScan: all_types [bool_field:Boolean;N, f64_field:Float64;N, i64_field:Int64;N, str_field:Utf8;N, tag0:Dictionary(Int32, Utf8);N, tag1:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), u64_field:UInt64;N]
+            "#);
             assert_snapshot!(plan("SELECT foo, f64_field + 0.5 FROM data"), @r###"
             Sort: time ASC NULLS LAST, foo ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]
               Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, data.time AS time, data.foo AS foo, data.f64_field + Float64(0.5) AS f64_field [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None), foo:Dictionary(Int32, Utf8);N, f64_field:Float64;N]

@@ -4,19 +4,18 @@
 #![expect(
     clippy::derive_partial_eq_without_eq,
     clippy::needless_borrows_for_generic_args,
-    clippy::needless_lifetimes
+    clippy::needless_lifetimes,
+    clippy::allow_attributes
 )]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+pub use tonic;
+
 use crate::influxdata::iox::ingester::v1 as proto;
-use crate::influxdata::iox::ingester::v2 as proto2;
-use base64::{prelude::BASE64_STANDARD, Engine};
-use data_types::{
-    NamespaceId, PartitionHashId, PartitionId, TableId, TimestampMinMax, TimestampRange,
-    TransitionPartitionId,
-};
+use base64::{Engine, prelude::BASE64_STANDARD};
+use data_types::{NamespaceId, TableId, TimestampMinMax, TimestampRange};
 use datafusion::{common::DataFusionError, prelude::Expr};
 use datafusion_proto::bytes::Serializeable;
 use predicate::{Predicate, ValueExpr};
@@ -37,22 +36,9 @@ pub mod influxdata {
                     "/influxdata.iox.ingester.v1.serde.rs"
                 ));
             }
-
-            pub mod v2 {
-                // generated code violates a few lints, so opt-out of them
-                #![expect(clippy::future_not_send)]
-
-                include!(concat!(env!("OUT_DIR"), "/influxdata.iox.ingester.v2.rs"));
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/influxdata.iox.ingester.v2.serde.rs"
-                ));
-            }
         }
     }
 }
-
-pub mod arrow_serde;
 
 /// Error returned if a request field has an invalid value. Includes
 /// machinery to add parent field names for context -- thus it will
@@ -223,59 +209,6 @@ impl IngesterQueryRequest2 {
     }
 }
 
-impl TryFrom<proto2::QueryRequest> for IngesterQueryRequest2 {
-    type Error = FieldViolation;
-
-    fn try_from(proto: proto2::QueryRequest) -> Result<Self, Self::Error> {
-        let proto2::QueryRequest {
-            namespace_id,
-            table_id,
-            columns,
-            filters,
-            t_min,
-            t_max,
-        } = proto;
-
-        let namespace_id = NamespaceId::new(namespace_id);
-        let table_id = TableId::new(table_id);
-        let filters = filters
-            .map(TryInto::try_into)
-            .transpose()?
-            .unwrap_or_default();
-
-        Ok(Self::new(
-            namespace_id,
-            table_id,
-            columns,
-            filters,
-            TimestampMinMax::new(t_min, t_max),
-        ))
-    }
-}
-
-impl TryFrom<IngesterQueryRequest2> for proto2::QueryRequest {
-    type Error = FieldViolation;
-
-    fn try_from(query: IngesterQueryRequest2) -> Result<Self, Self::Error> {
-        let IngesterQueryRequest2 {
-            namespace_id,
-            table_id,
-            columns,
-            filters,
-            t_min_max,
-        } = query;
-
-        Ok(Self {
-            namespace_id: namespace_id.get(),
-            table_id: table_id.get(),
-            columns,
-            filters: Some(filters.try_into()?),
-            t_min: t_min_max.min,
-            t_max: t_min_max.max,
-        })
-    }
-}
-
 impl TryFrom<Predicate> for proto::Predicate {
     type Error = FieldViolation;
 
@@ -379,41 +312,6 @@ impl TryFrom<ValueExpr> for proto::ValueExpr {
     }
 }
 
-impl TryFrom<Vec<Expr>> for proto2::Filters {
-    type Error = FieldViolation;
-
-    fn try_from(filters: Vec<Expr>) -> Result<Self, Self::Error> {
-        let exprs = filters
-            .iter()
-            .enumerate()
-            .map(|(i, expr)| {
-                expr.to_bytes()
-                    .map_err(|e| expr_to_bytes_violation(i.to_string(), e).scope("expr"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(Self { exprs })
-    }
-}
-
-impl TryFrom<proto2::Filters> for Vec<Expr> {
-    type Error = FieldViolation;
-
-    fn try_from(proto: proto2::Filters) -> Result<Self, Self::Error> {
-        let proto2::Filters { exprs } = proto;
-
-        let exprs = exprs
-            .into_iter()
-            .map(|bytes| {
-                Expr::from_bytes_with_registry(&bytes, query_functions::registry())
-                    .map_err(|e| expr_from_bytes_violation("exprs", e))
-            })
-            .collect::<Result<Self, _>>()?;
-
-        Ok(exprs)
-    }
-}
-
 #[derive(Debug, Snafu, Copy, Clone)]
 pub enum EncodeProtoPredicateFromBase64Error {
     #[snafu(display("Cannot encode protobuf: {source}"))]
@@ -426,15 +324,6 @@ pub fn encode_proto_predicate_as_base64(
 ) -> Result<String, EncodeProtoPredicateFromBase64Error> {
     let mut buf = vec![];
     predicate.encode(&mut buf).context(ProtobufEncodeSnafu)?;
-    Ok(BASE64_STANDARD.encode(&buf))
-}
-
-/// Encodes [`proto2::Filters`] as base64.
-pub fn encode_proto2_filters_as_base64(
-    filters: &proto2::Filters,
-) -> Result<String, EncodeProtoPredicateFromBase64Error> {
-    let mut buf = vec![];
-    filters.encode(&mut buf).context(ProtobufEncodeSnafu)?;
     Ok(BASE64_STANDARD.encode(&buf))
 }
 
@@ -455,65 +344,12 @@ pub fn decode_proto_predicate_from_base64(
     proto::Predicate::decode(predicate_binary.as_slice()).context(ProtobufDecodeSnafu)
 }
 
-/// Decodes [`proto2::Filters`] from base64 string.
-pub fn decode_proto2_filters_from_base64(
-    s: &str,
-) -> Result<proto2::Filters, DecodeProtoPredicateFromBase64Error> {
-    let predicate_binary = BASE64_STANDARD.decode(s).context(Base64DecodeSnafu)?;
-    proto2::Filters::decode(predicate_binary.as_slice()).context(ProtobufDecodeSnafu)
-}
-
-impl TryFrom<proto2::PartitionIdentifier> for TransitionPartitionId {
-    type Error = FieldViolation;
-
-    fn try_from(value: proto2::PartitionIdentifier) -> Result<Self, Self::Error> {
-        let proto2::PartitionIdentifier {
-            partition_identifier,
-        } = value;
-        let id =
-            partition_identifier.ok_or_else(|| FieldViolation::required("partition_identifier"))?;
-        let id = match id {
-            proto2::partition_identifier::PartitionIdentifier::CatalogId(id) => {
-                Self::Catalog(PartitionId::new(id))
-            }
-            proto2::partition_identifier::PartitionIdentifier::HashId(id) => {
-                Self::Deterministic(PartitionHashId::try_from(id.as_ref()).map_err(|e| {
-                    FieldViolation {
-                        field: "partition_identifier".to_owned(),
-                        description: e.to_string(),
-                    }
-                })?)
-            }
-        };
-        Ok(id)
-    }
-}
-
-impl From<TransitionPartitionId> for proto2::PartitionIdentifier {
-    fn from(id: TransitionPartitionId) -> Self {
-        let id = match id {
-            TransitionPartitionId::Catalog(id) => {
-                proto2::partition_identifier::PartitionIdentifier::CatalogId(id.get())
-            }
-            TransitionPartitionId::Deterministic(id) => {
-                proto2::partition_identifier::PartitionIdentifier::HashId(
-                    id.as_bytes().to_vec().into(),
-                )
-            }
-        };
-        Self {
-            partition_identifier: Some(id),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::collections::BTreeSet;
 
     use super::*;
-    use datafusion::logical_expr::{LogicalPlan, Projection};
-    use datafusion::{logical_expr::LogicalPlanBuilder, prelude::*};
+    use datafusion::prelude::*;
 
     #[test]
     fn query_round_trip() {
@@ -537,23 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn query2_round_trip() {
-        let rust_query = IngesterQueryRequest2::new(
-            NamespaceId::new(42),
-            TableId::new(1337),
-            vec!["usage".into(), "time".into()],
-            vec![col("foo").eq(lit(1i64))],
-            TimestampMinMax::new(1000, 2000),
-        );
-
-        let proto_query: proto2::QueryRequest = rust_query.clone().try_into().unwrap();
-
-        let rust_query_converted: IngesterQueryRequest2 = proto_query.try_into().unwrap();
-
-        assert_eq!(rust_query, rust_query_converted);
-    }
-
-    #[test]
     fn predicate_proto_base64_roundtrip() {
         let predicate = Predicate {
             field_columns: Some(BTreeSet::from([String::from("foo"), String::from("bar")])),
@@ -568,57 +387,5 @@ mod tests {
         let base64 = encode_proto_predicate_as_base64(&predicate).unwrap();
         let predicate2 = decode_proto_predicate_from_base64(&base64).unwrap();
         assert_eq!(predicate, predicate2);
-    }
-
-    #[tokio::test]
-    async fn udf_deserialization() {
-        // parse from sql, such that we are testing against the corresponding datafusion logical plan
-        let sql = "select date_bin('1 hour', timestamp '2000-05-05 12:10:00Z', timestamp '2000-05-05 12:00:00Z') = timestamp '2000-05-05 12:00:00Z'";
-        let ctx = SessionContext::default();
-
-        let df = ctx.sql(sql).await.expect("sql should parse");
-        let expr = if let LogicalPlan::Projection(Projection { expr, .. }) = df.logical_plan() {
-            expr.to_owned()
-        } else {
-            unreachable!("should not have failed to parse expression");
-        };
-
-        let filters = proto2::Filters::try_from(expr.clone()).expect("should serialize filter");
-        let filters: Vec<Expr> = filters.try_into().expect("should deserialize filter");
-        assert_eq!(expr.first().unwrap(), filters.first().unwrap());
-
-        let predicate = Predicate::default().with_exprs(expr);
-        let predicate2: proto::Predicate = predicate
-            .clone()
-            .try_into()
-            .expect("should serialize predicate");
-        let predicate2: Predicate = predicate2.try_into().expect("should deserialize predicate");
-        assert_eq!(predicate, predicate2);
-    }
-
-    #[test]
-    fn filters_proto2_base64_roundtrip() {
-        let filters = vec![col("col").eq(lit(1i64))];
-        let filters_1: proto2::Filters = filters.try_into().unwrap();
-
-        let base64_1 = encode_proto2_filters_as_base64(&filters_1).unwrap();
-        let filters_2 = decode_proto2_filters_from_base64(&base64_1).unwrap();
-        let base64_2 = encode_proto2_filters_as_base64(&filters_2).unwrap();
-
-        assert_eq!(filters_1, filters_2);
-        assert_eq!(base64_1, base64_2);
-    }
-
-    #[test]
-    fn filters_not_serializable_error() {
-        let subquery = Arc::new(LogicalPlanBuilder::empty(true).build().unwrap());
-        let filters = vec![
-            col("col").eq(lit(1i64)),
-            exists(subquery),
-            col("col").eq(lit(1i64)),
-        ];
-
-        let err = proto2::Filters::try_from(filters).unwrap_err();
-        assert_eq!(err.field, "expr.1",)
     }
 }

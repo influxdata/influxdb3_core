@@ -16,9 +16,9 @@ futures = "0.3"
 iox_time = { path = "../iox_time" }
 observability_deps = { path = "../observability_deps" }
 snafu = "0.8"
-socket2 = "0.5.8"
+socket2 = "0.5.9"
 thrift = { version = "0.17.0" }
-tokio = { version = "1.42", features = ["macros", "parking_lot", "rt", "sync"] }
+tokio = { version = "1.45", features = ["macros", "parking_lot", "rt", "sync"] }
 trace = { path = "../trace" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

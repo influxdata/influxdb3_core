@@ -9,8 +9,8 @@ use std::{
 
 use datafusion::error::DataFusionError;
 use executor::DedicatedExecutor;
-use futures::{future::BoxFuture, ready, FutureExt, Stream, StreamExt};
-use tokio::sync::mpsc::{channel, Sender};
+use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, ready};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// [`Stream`] that is calculated by one tokio runtime but can safely be pulled from another w/o stalling (esp. when the
@@ -333,7 +333,7 @@ mod tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let barrier_captured = Arc::clone(&barrier);
 
-        let mut stream = CrossRtStream::<u8>::new_with_tx(|tx| async move {
+        let mut stream = CrossRtStream::<u8>::new_with_tx(async move |tx| {
             tx.send(1).await.ok();
             drop(tx);
             barrier_captured.wait().await;

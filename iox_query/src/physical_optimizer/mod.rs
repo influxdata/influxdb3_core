@@ -27,7 +27,7 @@ mod dedup;
 mod limits;
 mod predicate_pushdown;
 mod projection_pushdown;
-mod sort;
+pub(crate) mod sort;
 mod union;
 
 #[cfg(test)]

@@ -28,13 +28,13 @@ trace_http = { path = "../trace_http" }
 # Crates.io dependencies, in alphabetical order
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
-bytes = "1.9"
+bytes = "1.10"
 futures = "0.3"
 prost = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.134"
+serde_json = "1.0.140"
 snafu = "0.8"
-tokio = { version = "1.42", features = [
+tokio = { version = "1.45", features = [
     "macros",
     "net",
     "parking_lot",
@@ -43,7 +43,6 @@ tokio = { version = "1.42", features = [
     "sync",
     "time",
 ] }
-tonic = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

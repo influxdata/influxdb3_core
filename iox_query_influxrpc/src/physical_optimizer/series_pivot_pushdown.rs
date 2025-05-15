@@ -1,11 +1,11 @@
 use crate::exec::SeriesPivotExec;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 
 /// Optimizer rule that pushes the SeriesPivotExec operation to be as
@@ -85,7 +85,7 @@ mod tests {
     use datafusion::physical_expr::expressions::{Column, Literal};
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::values::ValuesExec;
-    use datafusion::physical_plan::{displayable, PhysicalExpr};
+    use datafusion::physical_plan::{PhysicalExpr, displayable};
     use datafusion::scalar::ScalarValue;
     use insta::assert_snapshot;
     use schema::{TIME_DATA_TIMEZONE, TIME_DATA_TYPE};

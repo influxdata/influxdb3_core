@@ -7,10 +7,10 @@
 use criterion as _;
 use workspace_hack as _;
 
-use hashbrown::{hash_map::Entry, HashMap, HashSet};
-use influxdb_line_protocol::{parse_lines, FieldValue, ParsedLine};
-use mutable_batch::writer::{ColumnInsertValidator, Writer};
+use hashbrown::{HashMap, HashSet, hash_map::Entry};
+use influxdb_line_protocol::{FieldValue, ParsedLine, parse_lines};
 use mutable_batch::MutableBatch;
+use mutable_batch::writer::{ColumnInsertValidator, Writer};
 use snafu::{ResultExt, Snafu};
 
 /// A limit on the number of errors to return from a partial LP write.
@@ -18,7 +18,7 @@ const MAXIMUM_RETURNED_ERRORS: usize = 100;
 
 /// Error type for a conversion attempt on a set of line protocol lines
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display(
         "errors encountered on line(s):\n{}",
@@ -32,7 +32,7 @@ pub enum Error {
 
 /// Errors which occur independently per line
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum LineError {
     #[snafu(display("error parsing line {} (1-based): {}", line, source))]
     LineProtocol {
@@ -199,7 +199,6 @@ pub fn lines_to_batches(lines: &str, default_time: i64) -> Result<HashMap<String
 
 /// An error applying an already-parsed line protocol line ([`ParsedLine`]) to a
 /// [`MutableBatch`].
-#[allow(missing_copy_implementations)]
 #[derive(Debug, Snafu)]
 pub enum LineWriteError {
     /// A transparent error wrapper over the underling mutable batch error.

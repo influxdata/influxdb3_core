@@ -152,7 +152,7 @@ pub struct InstrumentedRawLock<R: Sized> {
 unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for InstrumentedRawLock<R> {
     // A “non-constant” const item is a legacy way to supply an initialized value to downstream
     // static items. Can hopefully be replaced with `const fn new() -> Self` at some point.
-    #[allow(clippy::declare_interior_mutable_const)]
+    #[expect(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self {
         inner: R::INIT,
         metrics: None,
@@ -196,7 +196,7 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
     /// This method may only be called if a shared lock is held in the current context.
     #[inline]
     unsafe fn unlock_shared(&self) {
-        self.inner.unlock_shared()
+        unsafe { self.inner.unlock_shared() }
     }
 
     /// Acquires an exclusive lock, blocking the current thread until it is able to do so.
@@ -236,7 +236,7 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
     /// This method may only be called if an exclusive lock is held in the current context.
     #[inline]
     unsafe fn unlock_exclusive(&self) {
-        self.inner.unlock_exclusive()
+        unsafe { self.inner.unlock_exclusive() }
     }
 
     /// Checks if this `RwLock` is currently locked in any way.
@@ -286,29 +286,29 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
     }
 
     unsafe fn unlock_upgradable(&self) {
-        self.inner.unlock_upgradable()
+        unsafe { self.inner.unlock_upgradable() }
     }
 
     unsafe fn upgrade(&self) {
         match &self.metrics {
             Some(shared) => {
                 // Early return if possible - Instant::now is not necessarily cheap
-                if self.try_upgrade() {
+                if unsafe { self.try_upgrade() } {
                     return;
                 }
 
                 let now = std::time::Instant::now();
-                self.inner.upgrade();
+                unsafe { self.inner.upgrade() };
                 let elapsed = now.elapsed();
                 shared.upgrade_count.inc(1);
                 shared.upgrade_wait.inc(elapsed);
             }
-            None => self.inner.upgrade(),
+            None => unsafe { self.inner.upgrade() },
         }
     }
 
     unsafe fn try_upgrade(&self) -> bool {
-        let ret = self.inner.try_upgrade();
+        let ret = unsafe { self.inner.try_upgrade() };
         if let Some(shared) = &self.metrics {
             if ret {
                 shared.upgrade_count.inc(1);
@@ -328,7 +328,7 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
 unsafe impl<R: lock_api::RawMutex + Sized> lock_api::RawMutex for InstrumentedRawLock<R> {
     // A “non-constant” const item is a legacy way to supply an initialized value to downstream
     // static items. Can hopefully be replaced with `const fn new() -> Self` at some point.
-    #[allow(clippy::declare_interior_mutable_const)]
+    #[expect(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self {
         inner: R::INIT,
         metrics: None,
@@ -365,16 +365,12 @@ unsafe impl<R: lock_api::RawMutex + Sized> lock_api::RawMutex for InstrumentedRa
     }
 
     unsafe fn unlock(&self) {
-        self.inner.unlock()
+        unsafe { self.inner.unlock() }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Clippy isn't recognizing the explicit drops; none of these locks are actually being held
-    // across await points. See <https://github.com/rust-lang/rust-clippy/issues/6446>
-    #![allow(clippy::await_holding_lock)]
-
     use super::*;
     use std::time::Duration;
 

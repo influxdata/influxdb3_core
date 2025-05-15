@@ -3,30 +3,30 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-basic-select-statement
 
 use crate::common::{
-    limit_clause, offset_clause, order_by_clause, qualified_measurement_name, where_clause, ws0,
-    ws1, LimitClause, OffsetClause, OrderByClause, ParseError, Parser, QualifiedMeasurementName,
-    WhereClause, ZeroOrMore,
+    LimitClause, OffsetClause, OrderByClause, ParseError, Parser, QualifiedMeasurementName,
+    WhereClause, ZeroOrMore, limit_clause, offset_clause, order_by_clause,
+    qualified_measurement_name, where_clause, ws0, ws1,
 };
 use crate::expression::arithmetic::Expr::Wildcard;
 use crate::expression::arithmetic::{
-    arithmetic, call_expression, var_ref, ArithmeticParsers, Expr, WildcardType,
+    ArithmeticParsers, Expr, WildcardType, arithmetic, call_expression, var_ref,
 };
 use crate::expression::{Call, VarRef};
 use crate::functions::is_now_function;
-use crate::identifier::{identifier, Identifier};
+use crate::identifier::{Identifier, identifier};
 use crate::impl_tuple_clause;
-use crate::internal::{expect, map_fail, verify, ParseResult};
+use crate::internal::{ParseResult, expect, map_fail, verify};
 use crate::keywords::keyword;
-use crate::literal::{duration, literal, number, unsigned_integer, Literal, Number};
+use crate::literal::{Literal, Number, duration, literal, number, unsigned_integer};
 use crate::parameter::parameter;
 use crate::select::MeasurementSelection::Subquery;
-use crate::string::{regex, single_quoted_string, Regex};
+use crate::string::{Regex, regex, single_quoted_string};
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{map, opt, value};
-use nom::sequence::{delimited, pair, preceded, tuple};
-use nom::Offset;
+use nom::sequence::{delimited, pair, preceded};
+use nom::{Offset, Parser as _};
 use std::fmt;
 use std::fmt::{Display, Formatter, Write};
 use std::str::FromStr;
@@ -144,7 +144,7 @@ pub(crate) fn select_statement(i: &str) -> ParseResult<&str, SelectStatement> {
             series_offset,
             timezone,
         ),
-    ) = tuple((
+    ) = (
         keyword("SELECT"),
         ws0,
         field_list,
@@ -158,7 +158,8 @@ pub(crate) fn select_statement(i: &str) -> ParseResult<&str, SelectStatement> {
         opt(preceded(ws0, slimit_clause)),
         opt(preceded(ws0, soffset_clause)),
         opt(preceded(ws0, timezone_clause)),
-    ))(i)?;
+    )
+        .parse(i)?;
 
     Ok((
         remaining,
@@ -191,8 +192,8 @@ pub enum MeasurementSelection {
 impl Display for MeasurementSelection {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Name(ref name) => fmt::Display::fmt(name, f),
-            Self::Subquery(ref subquery) => write!(f, "({subquery})"),
+            Self::Name(name) => fmt::Display::fmt(name, f),
+            Self::Subquery(subquery) => write!(f, "({subquery})"),
         }
     }
 }
@@ -209,7 +210,8 @@ impl Parser for MeasurementSelection {
                 ),
                 |s| Subquery(Box::new(s)),
             ),
-        ))(i)
+        ))
+        .parse(i)
     }
 }
 
@@ -235,7 +237,8 @@ fn from_clause(i: &str) -> ParseResult<&str, FromMeasurementClause> {
         FromMeasurementClause::separated_list1(
             "invalid FROM clause, expected identifier, regular expression or subquery",
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents the collection of dimensions for a `GROUP BY` clause.
@@ -295,7 +298,8 @@ impl ArithmeticParsers for TimeCallIntervalArgument {
                 )),
                 Expr::Literal,
             ),
-        )(i)
+        )
+        .parse(i)
     }
 }
 
@@ -332,7 +336,8 @@ impl ArithmeticParsers for TimeCallOffsetArgument {
                 map(duration, |v| Expr::Literal(Literal::Duration(v))),
                 map(single_quoted_string, |v| Expr::Literal(Literal::String(v))),
             )),
-        )(i)
+        )
+        .parse(i)
     }
 }
 
@@ -396,7 +401,8 @@ impl Parser for Dimension {
                     _ => unreachable!(),
                 })
             }),
-        ))(i)
+        ))
+        .parse(i)
     }
 }
 
@@ -423,7 +429,8 @@ fn time_call_expression(i: &str) -> ParseResult<&str, Dimension> {
             ),
         ),
         |(interval, offset)| Dimension::Time(TimeDimension { interval, offset }),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a `GROUP BY` clause.
@@ -433,16 +440,17 @@ fn time_call_expression(i: &str) -> ParseResult<&str, Dimension> {
 /// ```
 fn group_by_clause(i: &str) -> ParseResult<&str, GroupByClause> {
     preceded(
-        tuple((
+        (
             keyword("GROUP"),
             ws1,
             expect("invalid GROUP BY clause, expected BY", keyword("BY")),
             ws1,
-        )),
+        ),
         GroupByClause::separated_list1(
             "invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression",
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents a `FILL` clause, and specifies all possible cases of the argument to the `FILL` clause.
@@ -520,7 +528,8 @@ impl Parser for Field {
                 )),
             ),
             |(expr, alias)| Self { expr, alias },
-        )(i)
+        )
+        .parse(i)
     }
 }
 
@@ -552,7 +561,7 @@ pub fn parse_field(input: &str) -> Result<Field, ParseError> {
                 message: message.into(),
                 pos: input.offset(pos),
                 details: None,
-            })
+            });
         }
         // any other error indicates an invalid expression
         Err(_) => {
@@ -560,7 +569,7 @@ pub fn parse_field(input: &str) -> Result<Field, ParseError> {
                 message: "invalid field expression".into(),
                 pos: input.offset(i),
                 details: None,
-            })
+            });
         }
     };
 
@@ -602,7 +611,8 @@ fn wildcard(i: &str) -> ParseResult<&str, Option<WildcardType>> {
                 )),
             ),
         )),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents the field projection list of a `SELECT` statement.
@@ -654,7 +664,8 @@ impl ArithmeticParsers for FieldExpression {
                 // A bind parameter
                 map(parameter, Expr::BindParameter),
             )),
-        )(i)
+        )
+        .parse(i)
     }
 }
 
@@ -694,7 +705,8 @@ fn fill_clause(i: &str) -> ParseResult<&str, FillClause> {
             ),
             preceded(ws0, char(')')),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents the value for a `SLIMIT` clause.
@@ -721,7 +733,8 @@ fn slimit_clause(i: &str) -> ParseResult<&str, SLimitClause> {
             "invalid SLIMIT clause, expected unsigned integer",
             map(unsigned_integer, SLimitClause),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents the value for a `SOFFSET` clause.
@@ -748,7 +761,8 @@ fn soffset_clause(i: &str) -> ParseResult<&str, SOffsetClause> {
             "invalid SLIMIT clause, expected unsigned integer",
             map(unsigned_integer, SOffsetClause),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents an IANA time zone parsed from the `TZ` clause.
@@ -812,7 +826,8 @@ fn timezone_clause(i: &str) -> ParseResult<&str, TimeZoneClause> {
             ),
             preceded(ws0, char(')')),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 #[cfg(test)]

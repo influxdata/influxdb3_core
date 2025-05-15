@@ -4,8 +4,7 @@ use crate::socket_addr::SocketAddr;
 use std::str::FromStr;
 
 /// Configuration parameters for the cluster gossip communication mechanism.
-#[derive(Debug, Clone, clap::Parser)]
-#[allow(missing_copy_implementations)]
+#[derive(Debug, Clone, Eq, PartialEq, clap::Parser)]
 pub struct GossipConfig {
     /// A comma-delimited set of seed gossip peer addresses.
     ///

@@ -10,7 +10,7 @@ use futures_concurrency::future::Join;
 use tokio::sync::Barrier;
 
 use criterion::{
-    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion, Throughput,
+    BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime,
 };
 use data_types::{Namespace, Partition, PartitionKey, Table};
 use iox_catalog::{

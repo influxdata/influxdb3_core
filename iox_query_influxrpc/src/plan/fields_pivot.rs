@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DFSchemaRef, DataFusionError, Result, ToDFSchema};
-use datafusion::logical_expr::{expr_vec_fmt, Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore, expr_vec_fmt};
 use datafusion_util::{AsExpr, ThenWithOpt};
 use schema::Schema as IoxSchema;
 use std::cmp::Ordering;

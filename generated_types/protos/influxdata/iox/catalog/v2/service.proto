@@ -23,6 +23,8 @@ service CatalogService {
   rpc NamespaceUpdateColumnLimit(NamespaceUpdateColumnLimitRequest) returns (NamespaceUpdateColumnLimitResponse);
   rpc NamespaceSnapshot(NamespaceSnapshotRequest) returns (NamespaceSnapshotResponse);
   rpc NamespaceSnapshotByName(NamespaceSnapshotByNameRequest) returns (NamespaceSnapshotByNameResponse);
+  rpc NamespaceRename(NamespaceRenameRequest) returns (NamespaceRenameResponse);
+  rpc NamespaceUndelete(NamespaceUndeleteRequest) returns (NamespaceUndeleteResponse);
 
   rpc TableCreate(TableCreateRequest) returns (TableCreateResponse);
   rpc TableGetById(TableGetByIdRequest) returns (TableGetByIdResponse);
@@ -30,6 +32,12 @@ service CatalogService {
   rpc TableListByNamespaceId(TableListByNamespaceIdRequest) returns (stream TableListByNamespaceIdResponse);
   rpc TableList(TableListRequest) returns (stream TableListResponse);
   rpc TableSnapshot(TableSnapshotRequest) returns (TableSnapshotResponse);
+  rpc TableListByIcebergEnabled(TableListByIcebergEnabledRequest) returns (stream TableListByIcebergEnabledResponse);
+  rpc TableEnableIceberg(TableEnableIcebergRequest) returns (TableEnableIcebergResponse);
+  rpc TableDisableIceberg(TableDisableIcebergRequest) returns (TableDisableIcebergResponse);
+  rpc TableSoftDelete(TableSoftDeleteRequest) returns (TableSoftDeleteResponse);
+  rpc TableRename(TableRenameRequest) returns (TableRenameResponse);
+  rpc TableUndelete(TableUndeleteRequest) returns (TableUndeleteResponse);
 
   rpc ColumnCreateOrGet(ColumnCreateOrGetRequest) returns (ColumnCreateOrGetResponse);
   rpc ColumnCreateOrGetManyUnchecked(ColumnCreateOrGetManyUncheckedRequest) returns (stream ColumnCreateOrGetManyUncheckedResponse);
@@ -130,7 +138,9 @@ message NamespaceGetByIdResponse {
 
 message NamespaceGetByNameRequest {
   string name = 1;
-  SoftDeletedRows deleted = 2;
+  // Deprecated and ignored.
+  // Behaves as if always set to SOFT_DELETED_ROWS_EXCLUDE_DELETED
+  optional SoftDeletedRows deleted = 2 [deprecated = true];
 }
 
 message NamespaceGetByNameResponse {
@@ -147,7 +157,13 @@ message NamespaceSoftDeleteRequest {
 }
 
 message NamespaceSoftDeleteResponse {
-  int64 namespace_id = 1;
+  oneof deleted {
+    // this previously only returned the id, but now we need more data about
+    // the namespace and would like to avoid a second grpc call
+    int64 namespace_id = 1 [deprecated = true];
+
+    Namespace namespace = 2;
+  }
 }
 
 message NamespaceUpdateTableLimitRequest {
@@ -195,6 +211,23 @@ message NamespaceSnapshotResponse {
 message NamespaceSnapshotByNameResponse {
   catalog_cache.v1.Namespace namespace = 1;
   uint64 generation = 2;
+}
+
+message NamespaceRenameRequest {
+  int64 id = 1;
+  string new_name = 2;
+}
+
+message NamespaceRenameResponse {
+  Namespace namespace = 1;
+}
+
+message NamespaceUndeleteRequest {
+  int64 id = 1;
+}
+
+message NamespaceUndeleteResponse {
+  Namespace namespace = 1;
 }
 
 message TableCreateRequest {
@@ -247,6 +280,51 @@ message TableSnapshotResponse {
   uint64 generation = 2;
 }
 
+message TableListByIcebergEnabledResponse {
+  int64 table_id = 1;
+}
+
+message TableListByIcebergEnabledRequest {
+  int64 namespace_id = 2;
+}
+
+message TableEnableIcebergRequest {
+  int64 table_id = 1;
+}
+
+message TableEnableIcebergResponse {}
+
+message TableDisableIcebergRequest {
+  int64 table_id = 1;
+}
+
+message TableDisableIcebergResponse {}
+
+message TableSoftDeleteRequest {
+  int64 table_id = 1;
+}
+
+message TableSoftDeleteResponse {
+  Table table = 1;
+}
+
+message TableRenameRequest {
+  int64 table_id = 1;
+  string new_name = 2;
+}
+
+message TableRenameResponse {
+  Table table = 1;
+}
+
+message TableUndeleteRequest {
+  int64 table_id = 1;
+}
+
+message TableUndeleteResponse {
+  Table table = 1;
+}
+
 message ColumnCreateOrGetRequest {
   string name = 1;
   int64 table_id = 2;
@@ -282,7 +360,9 @@ message ColumnListByTableIdResponse {
   Column column = 1;
 }
 
-message ColumnListRequest {}
+message ColumnListRequest {
+  optional SoftDeletedRows deleted = 1;
+}
 
 message ColumnListResponse {
   Column column = 1;
@@ -413,7 +493,9 @@ message PartitionListOldStyleResponse {
   Partition partition = 1;
 }
 
-message PartitionDeleteByRetentionRequest {}
+message PartitionDeleteByRetentionRequest {
+  optional int64 partition_cutoff_seconds = 1;
+}
 
 message PartitionDeleteByRetentionResponse {
   int64 table_id = 1;
@@ -449,10 +531,12 @@ message ParquetFileDeleteOldIdsOnlyResponse {
 
 message ParquetFileDeleteOldIdsCountRequest {
   int64 older_than = 1;
+  optional uint32 limit = 2;
 }
 
 message ParquetFileDeleteOldIdsCountResponse {
   uint64 num_deleted = 1;
+  optional int64 oldest_deleted = 2;
 }
 
 message ParquetFileListByPartitionNotToDeleteBatchRequest {
@@ -575,6 +659,8 @@ message Table {
   int64 namespace_id = 2;
   string name = 3;
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 4;
+  bool iceberg_enabled = 5;
+  optional int64 deleted_at = 6;
 }
 
 message Column {

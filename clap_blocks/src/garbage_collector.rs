@@ -1,8 +1,10 @@
 //! Garbage Collector configuration
 use clap::Parser;
 use humantime::{format_duration, parse_duration};
-use snafu::{ensure, ResultExt, Snafu};
-use std::{fmt::Debug, time::Duration};
+use snafu::{ResultExt, Snafu, ensure};
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::{fmt::Debug, num::NonZeroUsize, time::Duration};
 
 /// The minimum viable cutoff period (3 hours) for the object store, bulk ingest, and parquet
 /// files expiry that the garbage collector should be configured to use.
@@ -14,7 +16,7 @@ use std::{fmt::Debug, time::Duration};
 /// it occurs.
 const MINIMUM_CUTOFF_PERIOD: Duration = Duration::from_secs(3600 * 3);
 
-/// A duration guaranteed to be at least `MINUMUM_CUTOFF_PERIOD` (3 hours) long, to guard against
+/// A duration guaranteed to be at least `MINIMUM_CUTOFF_PERIOD` (3 hours) long, to guard against
 /// durations being too short and causing race conditions or unexpected garbage collection.
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub struct CutoffDuration {
@@ -44,7 +46,7 @@ impl CutoffDuration {
 }
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum CutoffDurationError {
     #[snafu(display(
         "Cutoff cannot be less than three hours, was specified as {}",
@@ -100,7 +102,7 @@ pub struct GarbageCollectorConfig {
     )]
     pub objectstore_sleep_interval_minutes: u64,
 
-    /// Number of milliseconds to sleep between listing consecutive chunks of objecstore files.
+    /// Number of milliseconds to sleep between listing consecutive chunks of objectstore files.
     /// Object store listing is processed in batches; this is the sleep between batches.
     /// Defaults to 1000 milliseconds.
     #[clap(
@@ -148,7 +150,7 @@ pub struct GarbageCollectorConfig {
     /// Defaults to 35 minutes to reduce incidence of it running at the same time as the parquet
     /// file deleter.
     ///
-    /// If the Garbage Collecter cannot keep up with retention at this call frequency, it
+    /// If the Garbage Collector cannot keep up with retention at this call frequency, it
     /// will reduce the interval (potentially down to 1m) until it can keep up.
     #[clap(
         long,
@@ -207,29 +209,101 @@ pub struct GarbageCollectorConfig {
     )]
     pub enable_object_store_deletion: bool,
 
-    /// Feature flag enabling the creation of catalog backup data snapshots. Off by default; hidden
-    /// so that no one turns this on out of curiosity by reading the docs; config setting for ease
-    /// of enabling/disabling in tests.
+    /// Feature flag enabling the creation of catalog backup data snapshots. On by default.
     #[clap(
-        hide = true,
+        default_value = "true",
         long = "create-catalog-backup-data-snapshot-files",
         env = "INFLUXDB_IOX_CREATE_CATALOG_BACKUP_DATA_SNAPSHOT_FILES"
     )]
     pub create_catalog_backup_data_snapshot_files: bool,
 
-    /// Feature flag enabling the use of catalog backup data snapshots for the purpose of deciding
-    /// which object store files should be kept or deleted. Off by default; hidden so that no one
-    /// turns it on out of curiosity by reading the docs.
+    /// Flag controlling the frequency of creation of catalog backup data snapshots.
+    /// Ignored if INFLUXDB_IOX_CREATE_CATALOG_BACKUP_DATA_SNAPSHOT_FILES is false.
+    /// This defaults to 1 hour, creating a DS every hour.  Note that code and comments
+    /// refer to these data snapshots as "hourly" snapshots, and the first DS created
+    /// each calendar day (UTC) is considered the "daily" DS.
+    /// But this variable lets us create the "hourly" DS at a frequency other than hourly.
+    /// If the specified frequency is shorter than the time required to create the DS,
+    /// the ticker will skip the creation of the DS until the next tick.
+    #[clap(
+        default_value = "1h",
+        long = "create-catalog-backup-interval",
+        env = "INFLUXDB_IOX_CREATE_CATALOG_BACKUP_INTERVAL",
+        value_parser = humantime::parse_duration
+    )]
+    pub create_catalog_backup_interval: Duration,
+
+    /// Feature flag enabling the syncing of catalog backup data snapshots and their referenced parquet files.
+    /// If enabled, the secondary/backup S3 bucket must also be configured.
+    /// Off by default & hidden until the feature is ready for use.
+    #[clap(
+        default_value = "false",
+        hide = true,
+        long = "sync-catalog-backup-data-snapshot-files",
+        env = "INFLUXDB_IOX_SYNC_CATALOG_BACKUP_DATA_SNAPSHOT_FILES"
+    )]
+    pub sync_catalog_backup_data_snapshot_files: bool,
+
+    /// Enable high concurrency during the syncing of data snapshot parquet files.
+    /// This many tables may be processed concurrently and each table may copy up to
+    /// this many files concurrently - but the total number of files copied concurrently
+    /// is limited to this number (whether they be on behalf of 1 table or many).
+    /// This high limit only applies when server side copy is available.
+    /// This value will be limited to a max of 10 when server side copy is not available.
+    #[clap(
+        long,
+        default_value = "100",
+        long = "sync-catalog-backup-concurrency",
+        env = "INFLUXDB_IOX_SYNC_CATALOG_BACKUP_CONCURRENCY"
+    )]
+    pub sync_catalog_backup_concurrency: NonZeroUsize,
+
+    /// Enable server side sync of DS.
+    /// This is for testing until server side sync is reliably working.
+    /// Off by default & hidden until the feature is ready for use.
+    /// ignored unless INFLUXDB_IOX_SYNC_CATALOG_BACKUP_DATA_SNAPSHOT_FILES is true.
+    #[clap(
+        default_value = "false",
+        hide = true,
+        long = "sync-catalog-backup-server-side-sync",
+        env = "INFLUXDB_IOX_SYNC_CATALOG_BACKUP_SERVER_SIDE_SYNC"
+    )]
+    pub sync_catalog_backup_server_side_sync: bool,
+
+    /// The S3 bucket to use for the catalog backup data snapshot files.
+    /// If this is not specified, and INFLUXDB_IOX_SYNC_CATALOG_BACKUP_DATA_SNAPSHOT_FILES
+    /// is true, the secondary bucket name will be assumed to be the main bucket name with
+    /// `-backup` appended to it.
+    #[clap(
+        long = "sync-data-snapshot-bucket",
+        env = "INFLUXDB_IOX_DATA_SNAPSHOT_BUCKET"
+    )]
+    pub snapshot_bucket: Option<String>,
+
+    /// Feature flag enabling the consideration of catalog backup data snapshots when deciding
+    /// which object store files should be kept or deleted. On by default.
     ///
     /// Independent from `create_catalog_backup_data_snapshot_files` so that an environment can
     /// continue to create the backup files without making deletion decisions based on the contents
     /// of the files if the decision logic is incorrect.
+    ///
+    /// Warning: If this is set to false, DS are ignored when deleting S3 objects, meaning the
+    /// objects required by data snapshots will NOT be preserved.
     #[clap(
-        hide = true,
+        default_value = "true",
         long = "delete-using-catalog-backup-data-snapshot-files",
         env = "INFLUXDB_IOX_DELETE_USING_CATALOG_BACKUP_DATA_SNAPSHOT_FILES"
     )]
     pub delete_using_catalog_backup_data_snapshot_files: bool,
+
+    /// The maximum number of bloom filter files that can be read concurrently from Data Snapshots
+    /// applies during startup and when rebuilding the bloom filter at runtime.
+    #[clap(
+        long = "bloom-filter-read-concurrency",
+        env = "INFLUXDB_IOX_BLOOM_FILTER_READ_CONCURRENCY",
+        default_value = "10"
+    )]
+    pub bloom_filter_read_concurrency: NonZeroUsize,
 
     /// How long to keep hourly catalog backup file list snapshots, other than the snapshot taken
     /// at midnight UTC (which is considered the "daily" snapshot).
@@ -240,7 +314,7 @@ pub struct GarbageCollectorConfig {
     ///
     /// The interpretation of this value is that we should always keep an hourly snapshot of at least this
     /// age, to maintain the ability to restore to snapshots back to this age.  Snapshots become eligible
-    /// for deleation at 1h past this configured value, ensuring we have hourly snapshots for at least the
+    /// for deletion at 1h past this configured value, ensuring we have hourly snapshots for at least the
     /// configured 'keep'.
     /// When set to 30d, the oldest hourly snapshot will be between 30 days and 30 days 1 hour old.
     ///
@@ -265,7 +339,7 @@ pub struct GarbageCollectorConfig {
     ///
     /// The interpretation of this value is that we should always keep a daily snapshot of at least this
     /// age, to maintain the ability to restore to snapshots back to this age.  Snapshots become eligible
-    /// for deleation at 1d past this configured value, ensuring we have daily snapshots for at least the
+    /// for deletion at 1d past this configured value, ensuring we have daily snapshots for at least the
     /// configured 'keep'.
     /// When set to 90d, the oldest snapshot will be between 90 and 91 days old.
     ///
@@ -293,7 +367,86 @@ pub struct GarbageCollectorConfig {
         action
     )]
     pub direct_dsn: Option<String>,
+
+    /// See [`DeletionLimits`] documentation
+    #[clap(flatten)]
+    pub deletion_limits: DeletionLimits,
+
+    /// Optional configuration to change where the pg_dump file is stored.
+    /// This is useful for catalogs that are so large, they exceed the node's local storage.
+    #[clap(
+        long = "pg-dump-file-path",
+        env = "INFLUXDB_IOX_PG_DUMP_FILE_PATH",
+        action
+    )]
+    pub pg_dump_file_path: Option<PathBuf>,
+
+    /// Optional configuration to throttle the rate of the pg_dump command.
+    /// Default is unthrottled.
+    /// If pg_dumps cause RDS load spikes that scale up your RDS instance ($$),
+    /// this can be used to flatten the spikes. The necessary rate to flatten the
+    /// spike can vary widely depending on the size of the catalog.  If you don't
+    /// know what rate start with, you probably should NOT copy the rate from an
+    /// unrelated cluster. Here's a way to get a starting throttle that should be
+    /// impactful but not overly extreme:
+    ///     Download the dump from objectstore
+    ///     Unzip it to get the inflated dump size
+    ///     Compute a MB/s rate that would transfer the file in 10m.
+    /// For a better starting rate, look up the actual dump time from the logs and
+    /// compute a rate to transfer the file noticeably slower (e.g. 2x or 4x the original
+    /// transfer time).  Once you have a rate that is noticeably flattening the spike,
+    /// tune it up or down as desired.
+    #[clap(long = "pg-dump-mbs", env = "INFLUXDB_IOX_PG_DUMP_MBS", action)]
+    pub pg_dump_mbs: Option<NonZeroU32>,
 }
+
+/// Configures how `garbage_collector::parquetfile::Deleter::perform` works, specifically in
+/// determining what the limits are for how many parquet files can be deleted at once.
+#[derive(Parser, Debug, Clone, Copy)]
+pub struct DeletionLimits {
+    /// Maximum number of files touched by `ParquetFileRepo::delete_old_ids_only` (in the iox_catalog crate)
+    /// at a time when the Garbage Collector is starting. If we hit this limit in a single query, we start
+    /// growing this limit by [`field@Self::grow_rate`] until we hit [`field@Self::final_limit`].
+    ///
+    /// If `final_limit` is higher than `initial_limit`, the deleter will still initially delete
+    /// with a limit of `initial_limit`, but whenever a backlog is detected, it will delete with a
+    /// limit of `final_limit` until the backlog is no longer detected. This is almost never what
+    /// one would want to do, but it doesn't technically break anything, so we won't e.g. hide this
+    /// struct behind a constructor which checks that these values are valid with respect to each
+    /// other.
+    #[clap(
+        long = "initial-parquet-file-deletion-limit",
+        env = "INFLUXDB_IOX_INITIAL_PARQUET_FILE_DELETION_LIMIT",
+        default_value_t = ARBITRARY_DELETION_LIMITS.initial_limit
+    )]
+    pub initial_limit: u32,
+
+    /// Maximum number of files touched by `ParquetFileRepo::delete_old_ids_only` (in the
+    /// iox_catalog crate) at a time. See [`field@Self::initial_limit`] for more details.
+    #[clap(
+        long = "final-parquet-file-deletion-limit",
+        env = "INFLUXDB_IOX_FINAL_PARQUET_FILE_DELETION_LIMIT",
+        default_value_t = ARBITRARY_DELETION_LIMITS.final_limit
+    )]
+    pub final_limit: u32,
+
+    /// The Rate at which the limit of {the number of parquet files deleted in one transaction} is
+    /// grown. Related to [`field@Self::initial_limit`] and [`field@Self::final_limit`]
+    #[clap(
+        long = "parquet-file-deletion-grow-rate",
+        env = "INFLUXDB_IOX_PARQUET_FILE_DELETION_GROW_RATE",
+        default_value_t = ARBITRARY_DELETION_LIMITS.grow_rate,
+    )]
+    pub grow_rate: u32,
+}
+
+/// A configuration for deletion limits that's somewhat based on {previous defaults which worked
+/// somewhat well} and vibes.
+pub const ARBITRARY_DELETION_LIMITS: DeletionLimits = DeletionLimits {
+    initial_limit: 10_000,
+    final_limit: 160_000,
+    grow_rate: 2,
+};
 
 impl GarbageCollectorConfig {
     /// Returns the parquet_file sleep interval

@@ -3,15 +3,15 @@ use std::{
     fmt::{Debug, Formatter},
     hash::Hash,
     sync::{
-        atomic::{AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicU8, Ordering},
     },
 };
 use tracker::{LockMetrics, Mutex};
 
 use crate::cache_system::{
-    hook::{EvictResult, Hook},
     HasSize,
+    hook::{EvictResult, Hook},
 };
 
 use super::{fifo::Fifo, ordered_set::OrderedSet};
@@ -24,7 +24,7 @@ where
 {
     key: Arc<K>,
     value: Arc<V>,
-    gen: u64,
+    generation: u64,
     freq: AtomicU8,
 }
 
@@ -46,7 +46,7 @@ where
         let Self {
             key,
             value,
-            gen: _,
+            generation: _,
             freq: _,
         } = self;
         key.size() + value.size()
@@ -122,7 +122,7 @@ where
     ///
     /// Does NOT block read methods like [`get`](Self::get), [`len`](Self::len), and [`is_empty`](Self::is_empty),
     /// except for short-lived internal locks within [`DashMap`].
-    pub fn get_or_put(&self, key: Arc<K>, value: Arc<V>, gen: u64) -> CacheEntry<K, V> {
+    pub fn get_or_put(&self, key: Arc<K>, value: Arc<V>, generation: u64) -> CacheEntry<K, V> {
         // Lock the state BEFORE checking `self.entries`. We won't prevent concurrent reads with it but we prevent that
         // concurrent writes could check `entries`, find the key absent and then double-insert the data into the locked state.
         let mut guard = self.locked_state.lock();
@@ -133,7 +133,9 @@ where
                 .freq
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| Some(3.min(f + 1)))
                 .unwrap(); // Safe unwrap since we are always returning Some in fetch_update
-            self.config.hook.evict(gen, &key, EvictResult::Unfetched);
+            self.config
+                .hook
+                .evict(generation, &key, EvictResult::Unfetched);
             let entry = Arc::clone(&entry);
 
             // drop guard before we drop key & value so that the work to
@@ -148,11 +150,13 @@ where
         let entry = Arc::new(S3FifoEntry {
             key,
             value,
-            gen,
+            generation,
             freq: 0.into(),
         });
 
-        self.config.hook.fetched(gen, &entry.key, Ok(entry.size()));
+        self.config
+            .hook
+            .fetched(generation, &entry.key, Ok(entry.size()));
         self.entries
             .insert(Arc::clone(&entry.key), Arc::clone(&entry));
         let evicted = if guard.ghost.remove(&entry.key) {
@@ -336,7 +340,7 @@ where
                 self.insert_ghost(Arc::clone(&tail.key), config, evicted_keys);
                 config
                     .hook
-                    .evict(tail.gen, &tail.key, EvictResult::Fetched { size });
+                    .evict(tail.generation, &tail.key, EvictResult::Fetched { size });
                 evicted_entries.push(tail);
                 break;
             }
@@ -376,7 +380,7 @@ where
                 entries.remove(&tail.key);
                 config
                     .hook
-                    .evict(tail.gen, &tail.key, EvictResult::Fetched { size });
+                    .evict(tail.generation, &tail.key, EvictResult::Fetched { size });
                 evicted_entries.push(tail);
                 break;
             }

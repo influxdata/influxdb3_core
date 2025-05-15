@@ -14,11 +14,11 @@ use std::{num::NonZeroUsize, ops::Range};
 
 use arrow::{array::UInt64Array, compute::take, error::ArrowError, record_batch::RecordBatch};
 use data_types::{
-    partition_template::{
-        TablePartitionTemplateOverride, TemplatePart, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
-        PARTITION_KEY_DELIMITER,
-    },
     PartitionKey,
+    partition_template::{
+        MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_KEY_DELIMITER, TablePartitionTemplateOverride,
+        TemplatePart,
+    },
 };
 use hashbrown::HashMap;
 use mutable_batch::{MutableBatch, WritePayload};
@@ -28,7 +28,6 @@ use self::template::Template;
 pub use self::traits::{Batch, PartitioningColumn, TimeColumnError};
 
 /// An error generating a partition key for a row.
-#[allow(missing_copy_implementations)]
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum PartitionKeyError {
     /// The partition template defines a [`Template::TimeFormat`] part, but the
@@ -157,40 +156,41 @@ where
 {
     let mut last: Option<I::Item> = None;
     let mut range: Range<usize> = 0..0;
-    std::iter::from_fn(move || loop {
-        match (iterator.next(), last.take()) {
-            // The iterator yeilds a NULL/identical value and there is a prior value
-            (Some(None), Some(v)) => {
-                range.end += 1;
-                last = Some(v);
-            }
-            // The iterator yeilds a value, and the last value matches
-            (Some(cur), Some(next)) => match cur == next {
-                true => {
+    std::iter::from_fn(move || {
+        loop {
+            match (iterator.next(), last.take()) {
+                // The iterator yeilds a NULL/identical value and there is a prior value
+                (Some(None), Some(v)) => {
                     range.end += 1;
-                    last = Some(next);
+                    last = Some(v);
                 }
-                false => {
-                    let t = range.clone();
-                    range.start = range.end;
+                // The iterator yeilds a value, and the last value matches
+                (Some(cur), Some(next)) => match cur == next {
+                    true => {
+                        range.end += 1;
+                        last = Some(next);
+                    }
+                    false => {
+                        let t = range.clone();
+                        range.start = range.end;
+                        range.end += 1;
+                        last = Some(cur);
+                        return Some((next.unwrap(), t));
+                    }
+                },
+                // There is no last value
+                (Some(cur), None) => {
                     range.end += 1;
                     last = Some(cur);
-                    return Some((next.unwrap(), t));
                 }
-            },
-            // There is no last value
-            (Some(cur), None) => {
-                range.end += 1;
-                last = Some(cur);
+                (None, Some(next)) => return Some((next.unwrap(), range.clone())),
+                (None, None) => return None,
             }
-            (None, Some(next)) => return Some((next.unwrap(), range.clone())),
-            (None, None) => return None,
         }
     })
 }
 
 /// An error partitioning a batch.
-#[allow(missing_copy_implementations)]
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum PartitionWriteError {
     /// An error deriving the partition key from the partition key template.
@@ -224,7 +224,7 @@ where
 
         // This `allow` can be removed when this issue is fixed and released:
         // <https://github.com/rust-lang/rust-clippy/issues/11086>
-        #[allow(clippy::single_range_in_vec_init)]
+        #[expect(clippy::single_range_in_vec_init)]
         Ok(Self {
             batch,
             ranges: vec![0..batch.num_rows()],
@@ -383,15 +383,16 @@ mod tests {
     use super::*;
 
     use assert_matches::assert_matches;
-    use chrono::{format::StrftimeItems, DateTime, Datelike, Days, TimeZone, Utc};
-    use data_types::partition_template::{test_table_partition_override, ColumnValue};
-    use mutable_batch::{writer::Writer, MutableBatch};
+    use chrono::{DateTime, Datelike, Days, TimeZone, Utc, format::StrftimeItems};
+    use data_types::partition_template::{ColumnValue, test_table_partition_override};
+    use mutable_batch::{MutableBatch, writer::Writer};
     use proptest::{prelude::*, prop_compose, proptest, strategy::Strategy};
+    use rand::TryRngCore;
     use rand::prelude::*;
     use schema::{Projection, TIME_COLUMN_NAME};
 
     fn make_rng() -> StdRng {
-        let seed = rand::rngs::OsRng.next_u64();
+        let seed = rand::rngs::OsRng.try_next_u64().unwrap();
         println!("Seed: {seed}");
         StdRng::seed_from_u64(seed)
     }
@@ -524,7 +525,7 @@ mod tests {
 
         let hydrated: Vec<_> = rle
             .iter()
-            .flat_map(|(v, r)| std::iter::repeat(*v).take(r.end - r.start))
+            .flat_map(|(v, r)| std::iter::repeat_n(*v, r.end - r.start))
             .collect();
 
         assert_eq!(original, hydrated)
@@ -702,13 +703,15 @@ mod tests {
             .unwrap();
         assert_eq!(filter_to_platanos1970_batch.num_rows(), 3);
 
-        assert!(PartitionWrite::filter_to_partition(
-            &batch,
-            &table_partition_template,
-            &PartitionKey::from("1970-01-01 00:00:00|not-a-matching-partition-key"),
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            PartitionWrite::filter_to_partition(
+                &batch,
+                &table_partition_template,
+                &PartitionKey::from("1970-01-01 00:00:00|not-a-matching-partition-key"),
+            )
+            .unwrap()
+            .is_none()
+        );
 
         let initial_record_batch = batch.clone().try_into_arrow(Projection::All).unwrap();
         let filter_record_batch_to_platanos1970 = PartitionWrite::filter_to_partition(
@@ -1334,9 +1337,7 @@ mod tests {
     )]
     fn test_too_many_parts() {
         let template = test_table_partition_override(
-            std::iter::repeat(TemplatePart::TagValue("bananas"))
-                .take(9)
-                .collect(),
+            std::iter::repeat_n(TemplatePart::TagValue("bananas"), 9).collect(),
         );
 
         let _ = partition_batch(&MutableBatch::new(), &template);

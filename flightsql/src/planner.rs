@@ -9,6 +9,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
+    FlightData, IpcMessage, SchemaAsIpc,
     decode::FlightRecordBatchStream,
     sql::{
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, Any,
@@ -17,7 +18,6 @@ use arrow_flight::{
         CommandGetTables, CommandGetXdbcTypeInfo, CommandStatementQuery,
         DoPutPreparedStatementResult,
     },
-    FlightData, IpcMessage, SchemaAsIpc,
 };
 use arrow_util::flight::prepare_schema_for_flight;
 use bytes::Bytes;
@@ -26,15 +26,14 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
-use futures::{stream::Peekable, TryStreamExt};
-use iox_query::{exec::IOxSessionContext, QueryNamespace};
-
+use futures::{TryStreamExt, stream::Peekable};
+use generated_types::Streaming;
+use iox_query::{QueryNamespace, exec::IOxSessionContext};
 use observability_deps::tracing::debug;
 use prost::Message;
 use snafu::OptionExt;
-use tonic::Streaming;
 
-use crate::{error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data, Error};
+use crate::{Error, error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data};
 use crate::{FlightSQLCommand, PreparedStatementHandle};
 
 /// Logic for creating plans for various Flight messages against a query database
@@ -501,7 +500,15 @@ async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Resu
         // "virtual" catalog in DataFusion and thus is not reported
         // directly via the table providers
         // We ensure this list is kept in sync with tests
-        let table_names = vec!["columns", "df_settings", "tables", "views", "schemata"];
+        let table_names = vec![
+            "columns",
+            "df_settings",
+            "parameters",
+            "routines",
+            "tables",
+            "views",
+            "schemata",
+        ];
         for table_name in table_names {
             let schema_name = "information_schema";
             let table_ref = TableReference::full(catalog_name.clone(), schema_name, table_name);

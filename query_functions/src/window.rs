@@ -116,7 +116,7 @@ fn window_bounds_udf(args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> 
         ColumnarValue::Scalar(v) => {
             return Err(DataFusionError::NotImplemented(format!(
                 "window_bounds against scalar arguments ({v:?}) not yet implemented"
-            )))
+            )));
         }
         ColumnarValue::Array(arr) => arr,
     };

@@ -4,11 +4,11 @@ use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as generated;
 use siphasher::sip::SipHasher24;
 
-use snafu::{ensure, Snafu};
+use snafu::{Snafu, ensure};
 
 /// Error for [`HashBuckets`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs, missing_copy_implementations)]
+#[expect(missing_docs, missing_copy_implementations)]
 pub enum Error {
     #[snafu(display("Bucket length not a power of two"))]
     BucketsNotPower,
@@ -130,20 +130,21 @@ impl HashBucketsEncoder {
         }
     }
 
-    /// Append a new value
+    /// Append a new (key, value) pair
     ///
     /// # Panics
     ///
     /// Panics if this would exceed the capacity provided to new
-    pub fn push(&mut self, v: &[u8]) {
-        self.push_raw(self.hash.hash(v));
+    pub fn push(&mut self, key: &[u8], value: u32) {
+        self.push_raw(self.hash.hash(key), value);
     }
 
     /// Append a new value by hash, returning the bucket index
-    fn push_raw(&mut self, hash: u64) -> usize {
-        assert_ne!(self.len, self.capacity);
+    fn push_raw(&mut self, hash: u64, value: u32) -> usize {
+        assert_ne!(self.len, self.capacity, "hash table capacity exceeded");
         self.len += 1;
-        let entry = self.len;
+        // Note: empty entries are encoded as 0
+        let entry = value + 1;
         let mut idx = (hash as usize) & self.mask;
         loop {
             let s = &mut self.buckets[idx..idx + 4];
@@ -170,18 +171,24 @@ impl HashBucketsEncoder {
 mod tests {
     use super::*;
     use prost::Message;
-    use rand::{thread_rng, Rng};
+    use rand::{Rng, rng};
 
     #[test]
     fn test_collision() {
         let mut builder = HashBucketsEncoder::new(6);
 
-        assert_eq!(builder.push_raw(14), 3);
-        assert_eq!(builder.push_raw(297), 10);
-        assert_eq!(builder.push_raw(43), 11); // Hashes to occupied bucket 10
-        assert_eq!(builder.push_raw(60), 15);
-        assert_eq!(builder.push_raw(124), 0); // Hashes to occupied bucket 15
-        assert_eq!(builder.push_raw(0), 1); // Hashes to occupied bucket 0
+        let mut counter = 0;
+        assert_eq!(builder.push_raw(14, counter), 3);
+        counter += 1;
+        assert_eq!(builder.push_raw(297, counter), 10);
+        counter += 1;
+        assert_eq!(builder.push_raw(43, counter), 11); // Hashes to occupied bucket 10
+        counter += 1;
+        assert_eq!(builder.push_raw(60, counter), 15);
+        counter += 1;
+        assert_eq!(builder.push_raw(124, counter), 0); // Hashes to occupied bucket 15
+        counter += 1;
+        assert_eq!(builder.push_raw(0, counter), 1); // Hashes to occupied bucket 0
 
         let buckets = builder.finish();
 
@@ -205,8 +212,8 @@ mod tests {
     fn test_basic() {
         let data = ["a", "", "bongos", "cupcakes", "bananas"];
         let mut builder = HashBucketsEncoder::new(data.len());
-        for s in &data {
-            builder.push(s.as_bytes());
+        for (index, str) in data.iter().enumerate() {
+            builder.push(str.as_bytes(), index as u32);
         }
         let buckets = builder.finish();
 
@@ -215,21 +222,71 @@ mod tests {
         assert!(contains("a"));
         assert!(contains(""));
         assert!(contains("bongos"));
+        assert!(contains("cupcakes"));
         assert!(contains("bananas"));
         assert!(!contains("windows"));
+    }
+
+    // test "sparse" indices (ex. when soft-deleted entries are skipped)
+    #[test]
+    fn test_sparse() {
+        let data = ["a", "", "bongos", "cupcakes", "bananas"];
+        let mut builder = HashBucketsEncoder::new(data.len() / 2 + data.len() % 2);
+        for (index, str) in data.iter().enumerate() {
+            if index % 2 == 0 {
+                builder.push(str.as_bytes(), index as u32);
+            }
+        }
+        let buckets = builder.finish();
+        let contains = |s: &str| -> bool { buckets.lookup(s.as_bytes()).any(|idx| data[idx] == s) };
+
+        assert!(contains("a"));
+        assert!(!contains(""));
+        assert!(contains("bongos"));
+        assert!(!contains("cupcakes"));
+        assert!(contains("bananas"));
+        assert!(!contains("windows"));
+    }
+
+    // test max length/capacity behavior
+    #[test]
+    #[should_panic(
+        expected = "assertion `left != right` failed: hash table capacity exceeded\n  left: 3\n right: 3"
+    )]
+    fn test_capacity() {
+        let mut rng = rng();
+        let data: Vec<Vec<u8>> = (0..6)
+            .map(|_| (0..rng.random_range(0..3)).map(|_| rng.random()).collect())
+            .collect();
+        // create hash table with capacity less than input data
+        let mut builder = HashBucketsEncoder::new(data.len() / 2);
+        data.iter()
+            .enumerate()
+            .for_each(|(i, x)| builder.push(x.as_ref(), i as u32));
+    }
+
+    // Edge case: hash bucket representation cannot encode u32::MAX
+    #[test]
+    #[should_panic(expected = "attempt to add with overflow")]
+    fn test_max_bucket_entry() {
+        let mut builder = HashBucketsEncoder::new(1);
+        builder.push("".as_bytes(), u32::MAX);
+        builder.finish();
     }
 
     #[test]
     fn test_deterministic() {
         // It is important that HashBuckets is deterministic for ETag matching to work
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let data: Vec<Vec<u8>> = (0..20)
-            .map(|_| (0..rng.gen_range(0..20)).map(|_| rng.gen()).collect())
+            .map(|_| (0..rng.random_range(0..20)).map(|_| rng.random()).collect())
             .collect();
 
         let build = || {
             let mut builder = HashBucketsEncoder::new(data.len());
-            data.iter().for_each(|x| builder.push(x.as_ref()));
+            data.iter()
+                .enumerate()
+                .for_each(|(i, x)| builder.push(x.as_ref(), i as u32));
             generated::HashBuckets::from(builder.finish()).encode_to_vec()
         };
 

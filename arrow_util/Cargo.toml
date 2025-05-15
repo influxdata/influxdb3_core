@@ -10,7 +10,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
+ahash = { version = "0.8", default-features = false, features = [
+    "runtime-rng",
+] }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 base64 = "0.22"
@@ -28,4 +30,4 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [dev-dependencies]
 datafusion = { workspace = true }
 proptest = { workspace = true }
-rand = "0.8.5"
+rand = "0.9.1"

@@ -1,8 +1,9 @@
 //! Object store cache-related configs.
 
-use std::{path::PathBuf, time::Duration};
+use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use humantime::parse_duration;
+use snafu::Snafu;
 
 /// CLI config for object-store-cache configuration
 #[derive(Debug, Clone, PartialEq, Eq, clap::Parser)]
@@ -33,6 +34,62 @@ pub struct ObjectStoreCacheConfig {
         value_parser = parse_duration
     )]
     pub usage_trigger_backoff: Duration,
+}
+
+#[derive(Debug, Snafu)]
+#[expect(missing_docs)]
+pub enum ParsePercentageError {
+    #[snafu(display("Should be a valid usize number, instead found '{}'", input))]
+    NaN { input: String },
+
+    #[snafu(display("Should be a number >0 and <=100, instead found {}", input))]
+    NotValidPercentage { input: usize },
+}
+
+/// Parse a percentage value between zero and 100.
+fn parse_optional_percentage(s: &str) -> Result<NonZeroUsize, ParsePercentageError> {
+    let should_be_percent: usize =
+        s.to_string()
+            .parse()
+            .map_err(|_| ParsePercentageError::NaN {
+                input: s.to_string(),
+            })?;
+    let percent = NonZeroUsize::new(should_be_percent)
+        .and_then(|num| if num.get() <= 100 { Some(num) } else { None })
+        .ok_or(ParsePercentageError::NotValidPercentage {
+            input: should_be_percent,
+        })?;
+    Ok(percent)
+}
+
+/// CLI config for object store cache metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Parser, Default)]
+pub struct ObjectStoreCacheMetrics {
+    /// Anticipated max number of unique objects
+    /// to have been seen by the cache between rollouts.
+    #[clap(
+        long = "object-store-cache-metrics-num-objects",
+        env = "INFLUXDB_IOX_OBJECT_STORE_CACHE_METRICS_NUM_OBJECTS",
+        required = false,
+        requires = "false_positive_rate",
+        action
+    )]
+    pub number_of_unique_objects: Option<NonZeroUsize>,
+
+    /// Acceptable rate positive rate when determining which objects
+    /// have been previously seen by the cache. Percentage between 0-100.
+    ///
+    /// Used in a calculation for the bloom filter size based upon
+    /// <https://hur.st/bloomfilter>.
+    #[clap(
+        long = "object-store-cache-metrics-false-positive-rate",
+        env = "INFLUXDB_IOX_OBJECT_STORE_CACHE_METRICS_FALSE_POSITIVE_RATE",
+        required = false,
+        requires = "number_of_unique_objects",
+        value_parser = parse_optional_percentage,
+        action
+    )]
+    pub false_positive_rate: Option<NonZeroUsize>,
 }
 
 #[cfg(test)]

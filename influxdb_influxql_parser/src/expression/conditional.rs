@@ -1,12 +1,12 @@
-use crate::common::{ws0, ParseError};
-use crate::expression::arithmetic::{
-    arithmetic, call_expression, var_ref, ArithmeticParsers, Expr,
-};
+use crate::common::{ParseError, ws0};
 use crate::expression::Call;
+use crate::expression::arithmetic::{
+    ArithmeticParsers, Expr, arithmetic, call_expression, var_ref,
+};
 use crate::functions::is_scalar_math_function;
-use crate::internal::{expect, verify, Error as InternalError, ParseResult};
+use crate::internal::{Error as InternalError, ParseResult, expect, verify};
 use crate::keywords::keyword;
-use crate::literal::{literal_no_regex, literal_regex, Literal};
+use crate::literal::{Literal, literal_no_regex, literal_regex};
 use crate::parameter::parameter;
 use crate::select::is_valid_now_call;
 use nom::branch::alt;
@@ -14,8 +14,8 @@ use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{map, value};
 use nom::multi::many0;
-use nom::sequence::{delimited, preceded, tuple};
-use nom::Offset;
+use nom::sequence::{delimited, preceded};
+use nom::{Offset, Parser};
 use std::fmt;
 use std::fmt::{Display, Formatter, Write};
 use std::str::FromStr;
@@ -171,7 +171,8 @@ fn parens(i: &str) -> ParseResult<&str, ConditionalExpression> {
             ConditionalExpression::Grouped(e.into())
         }),
         preceded(ws0, char(')')),
-    )(i)
+    )
+    .parse(i)
 }
 
 fn expr_or_group(i: &str) -> ParseResult<&str, ConditionalExpression> {
@@ -180,13 +181,14 @@ fn expr_or_group(i: &str) -> ParseResult<&str, ConditionalExpression> {
             ConditionalExpression::Expr(Box::new(v))
         }),
         parens,
-    ))(i)
+    ))
+    .parse(i)
 }
 
 /// Parse the conditional regular expression operators `=~` and `!~`.
 fn conditional_regex(i: &str) -> ParseResult<&str, ConditionalExpression> {
     let (input, f1) = expr_or_group(i)?;
-    let (input, exprs) = many0(tuple((
+    let (input, exprs) = many0((
         preceded(
             ws0,
             alt((
@@ -201,14 +203,15 @@ fn conditional_regex(i: &str) -> ParseResult<&str, ConditionalExpression> {
             ),
             From::from,
         ),
-    )))(input)?;
+    ))
+    .parse(input)?;
     Ok((input, reduce_expr(f1, exprs)))
 }
 
 /// Parse conditional operators.
 fn conditional(i: &str) -> ParseResult<&str, ConditionalExpression> {
     let (input, f1) = conditional_regex(i)?;
-    let (input, exprs) = many0(tuple((
+    let (input, exprs) = many0((
         preceded(
             ws0,
             alt((
@@ -223,27 +226,30 @@ fn conditional(i: &str) -> ParseResult<&str, ConditionalExpression> {
             )),
         ),
         expect("invalid conditional expression", conditional_regex),
-    )))(input)?;
+    ))
+    .parse(input)?;
     Ok((input, reduce_expr(f1, exprs)))
 }
 
 /// Parse conjunction operators, such as `AND`.
 fn conjunction(i: &str) -> ParseResult<&str, ConditionalExpression> {
     let (input, f1) = conditional(i)?;
-    let (input, exprs) = many0(tuple((
+    let (input, exprs) = many0((
         value(ConditionalOperator::And, preceded(ws0, keyword("AND"))),
         expect("invalid conditional expression", conditional),
-    )))(input)?;
+    ))
+    .parse(input)?;
     Ok((input, reduce_expr(f1, exprs)))
 }
 
 /// Parse disjunction operator, such as `OR`.
 fn disjunction(i: &str) -> ParseResult<&str, ConditionalExpression> {
     let (input, f1) = conjunction(i)?;
-    let (input, exprs) = many0(tuple((
+    let (input, exprs) = many0((
         value(ConditionalOperator::Or, preceded(ws0, keyword("OR"))),
         expect("invalid conditional expression", conjunction),
-    )))(input)?;
+    ))
+    .parse(input)?;
     Ok((input, reduce_expr(f1, exprs)))
 }
 
@@ -280,7 +286,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
                 message: message.into(),
                 pos: input.offset(pos),
                 details: None,
-            })
+            });
         }
         // any other error indicates an invalid expression
         Err(e) => {
@@ -288,7 +294,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
                 message: "invalid conditional expression".into(),
                 pos: input.offset(i),
                 details: Some(e.to_string()),
-            })
+            });
         }
     };
 
@@ -359,7 +365,8 @@ impl ArithmeticParsers for ConditionalExpression {
                 var_ref,
                 map(parameter, Expr::BindParameter),
             )),
-        )(i)
+        )
+        .parse(i)
     }
 }
 

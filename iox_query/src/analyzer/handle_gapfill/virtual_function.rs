@@ -1,7 +1,7 @@
 use datafusion::{
-    common::tree_node::{TreeNodeRecursion, TreeNodeVisitor},
     common::Result,
-    logical_expr::{expr::ScalarFunction, Expr, ScalarUDF},
+    common::tree_node::{TreeNodeRecursion, TreeNodeVisitor},
+    logical_expr::{Expr, ScalarUDF, expr::ScalarFunction},
 };
 use query_functions::gapfill::{GapFillWrapper, InterpolateUDF, LocfUDF};
 use std::sync::Arc;

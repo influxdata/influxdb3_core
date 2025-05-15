@@ -3,19 +3,28 @@
 use async_trait::async_trait;
 use non_empty_string::NonEmptyString;
 use object_store::{
+    DynObjectStore,
     local::LocalFileSystem,
     memory::InMemory,
     path::Path,
     throttle::{ThrottleConfig, ThrottledStore},
-    DynObjectStore,
 };
+use object_store_size_hinting::ObjectStoreStripSizeHinting;
 use observability_deps::tracing::{info, warn};
 use snafu::{ResultExt, Snafu};
-use std::{convert::Infallible, fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible, fs, num::NonZeroUsize, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
+};
 use url::Url;
 
+use aws_config::{BehaviorVersion, load_defaults};
+use aws_sdk_s3::client::Client as S3Client;
+use aws_sdk_s3::config::Builder as S3ConfigBuilder;
+use aws_sdk_s3::config::Region;
+use aws_sdk_sts::config::ProvideCredentials;
+
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum ParseError {
     #[snafu(display("Unable to create database directory {:?}: {}", path, source))]
     CreatingDatabaseDirectory {
@@ -152,13 +161,13 @@ macro_rules! object_store_config_inner {
                 ///
                 /// * memory (default): Effectively no object persistence.
                 /// * memorythrottled: Like `memory` but with latency and throughput that somewhat resamble a cloud
-                ///    object store. Useful for testing and benchmarking.
+                ///   object store. Useful for testing and benchmarking.
                 /// * file: Stores objects in the local filesystem. Must also set `--data-dir`.
                 /// * s3: Amazon S3. Must also set `--bucket`, `--aws-access-key-id`, `--aws-secret-access-key`, and
-                ///    possibly `--aws-default-region`.
+                ///   possibly `--aws-default-region`.
                 /// * google: Google Cloud Storage. Must also set `--bucket` and `--google-service-account`.
                 /// * azure: Microsoft Azure blob storage. Must also set `--bucket`, `--azure-storage-account`,
-                ///    and `--azure-storage-access-key`.
+                ///   and `--azure-storage-access-key`.
                 #[clap(
                     value_enum,
                     id = gen_name!($prefix, "object-store"),
@@ -357,7 +366,7 @@ macro_rules! object_store_config_inner {
                     id = gen_name!($prefix, "object-store-connection-limit"),
                     long = gen_name!($prefix, "object-store-connection-limit"),
                     env = gen_env!($prefix, "OBJECT_STORE_CONNECTION_LIMIT"),
-                    default_value = "16",
+                    default_value = "1024",
                     action
                 )]
                 pub object_store_connection_limit: NonZeroUsize,
@@ -419,6 +428,32 @@ macro_rules! object_store_config_inner {
                 )]
                 pub retry_timeout: Option<Duration>,
 
+                /// Set a request timeout
+                ///
+                /// The timeout is applied from when the request starts connecting until the
+                /// response body has finished.
+                ///
+                /// `object_store` default is 30 seconds.
+                #[clap(
+                    id = gen_name!($prefix, "object-store-request-timeout"),
+                    long = gen_name!($prefix, "object-store-request-timeout"),
+                    env = gen_env!($prefix, "OBJECT_STORE_REQUEST_TIMEOUT"),
+                    value_parser = humantime::parse_duration,
+                    action
+                )]
+                pub request_timeout: Option<Duration>,
+
+                /// Set a timeout for only the connect phase of a client.
+                ///
+                /// `object_store` default is 5 seconds.
+                #[clap(
+                    id = gen_name!($prefix, "object-store-connect-timeout"),
+                    long = gen_name!($prefix, "object-store-connect-timeout"),
+                    env = gen_env!($prefix, "OBJECT_STORE_CONNECT_TIMEOUT"),
+                    value_parser = humantime::parse_duration,
+                    action
+                )]
+                pub connect_timeout: Option<Duration>,
 
                 /// Endpoint of an S3 compatible, HTTP/2 enabled object store cache.
                 #[clap(
@@ -455,16 +490,17 @@ macro_rules! object_store_config_inner {
                         database_directory,
                         google_service_account: Default::default(),
                         object_store,
-                        object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
+                        object_store_connection_limit: NonZeroUsize::new(1024).unwrap(),
                         http2_only: Default::default(),
                         http2_max_frame_size: Default::default(),
                         max_retries: Default::default(),
                         retry_timeout: Default::default(),
+                        request_timeout: Default::default(),
+                        connect_timeout: Default::default(),
                         cache_endpoint: Default::default(),
                     }
                 }
 
-                #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
                 fn client_options(&self) -> object_store::ClientOptions {
                     let mut options = object_store::ClientOptions::new();
 
@@ -474,12 +510,17 @@ macro_rules! object_store_config_inner {
                     if let Some(sz) = self.http2_max_frame_size {
                         options = options.with_http2_max_frame_size(sz);
                     }
+                    if let Some(t) = self.request_timeout {
+                        options = options.with_timeout(t);
+                    }
+                    if let Some(t) = self.connect_timeout {
+                        options = options.with_connect_timeout(t);
+                    }
 
                     options
                 }
 
-                #[cfg(feature = "gcp")]
-                fn new_gcs(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_gcs(&self, bucket_override: Option<String>) -> Result<Arc<DynObjectStore>, ParseError> {
                     use object_store::gcp::GoogleCloudStorageBuilder;
                     use object_store::limit::LimitStore;
 
@@ -487,7 +528,9 @@ macro_rules! object_store_config_inner {
 
                     let mut builder = GoogleCloudStorageBuilder::new().with_client_options(self.client_options()).with_retry(self.retry_config());
 
-                    if let Some(bucket) = &self.bucket {
+                    if let Some(bucket) = bucket_override {
+                        builder = builder.with_bucket_name(bucket);
+                    } else if let Some(bucket) = &self.bucket {
                         builder = builder.with_bucket_name(bucket);
                     }
                     if let Some(account) = &self.google_service_account {
@@ -500,13 +543,7 @@ macro_rules! object_store_config_inner {
                     )))
                 }
 
-                #[cfg(not(feature = "gcp"))]
-                fn new_gcs(&self) -> Result<Arc<DynObjectStore>, ParseError> {
-                    panic!("GCS support not enabled, recompile with the gcp feature enabled")
-                }
-
-                #[cfg(feature = "aws")]
-                fn new_s3(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_s3(&self, bucket_override: Option<String>) -> Result<Arc<DynObjectStore>, ParseError> {
                     use object_store::limit::LimitStore;
 
                     info!(
@@ -517,12 +554,11 @@ macro_rules! object_store_config_inner {
                     );
 
                     Ok(Arc::new(LimitStore::new(
-                        self.build_s3()?,
+                        self.build_s3(bucket_override)?,
                         self.object_store_connection_limit.get(),
                     )))
                 }
 
-                #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
                 fn retry_config(&self) -> object_store::RetryConfig {
                     let mut retry_config = object_store::RetryConfig::default();
 
@@ -540,8 +576,7 @@ macro_rules! object_store_config_inner {
                 /// If further configuration of S3 is needed beyond what this module provides, use this function
                 /// to create an [`object_store::aws::AmazonS3Builder`] and further customize, then call `.build()`
                 /// directly.
-                #[cfg(feature = "aws")]
-                pub fn s3_builder(&self) -> object_store::aws::AmazonS3Builder {
+                pub fn s3_builder(&self, bucket_override: Option<String>) -> object_store::aws::AmazonS3Builder {
                     use object_store::aws::AmazonS3Builder;
 
                     let mut builder = AmazonS3Builder::new()
@@ -552,7 +587,9 @@ macro_rules! object_store_config_inner {
                         .with_skip_signature(self.aws_skip_signature)
                         .with_imdsv1_fallback();
 
-                    if let Some(bucket) = &self.bucket {
+                    if let Some(bucket) = bucket_override {
+                        builder = builder.with_bucket_name(bucket);
+                    } else if let Some(bucket) = &self.bucket {
                         builder = builder.with_bucket_name(bucket);
                     }
                     if let Some(key_id) = &self.aws_access_key_id {
@@ -571,20 +608,13 @@ macro_rules! object_store_config_inner {
                     builder
                 }
 
-                #[cfg(feature = "aws")]
-                fn build_s3(&self) -> Result<object_store::aws::AmazonS3, ParseError> {
-                    let builder = self.s3_builder();
+                fn build_s3(&self, bucket_override: Option<String>) -> Result<object_store::aws::AmazonS3, ParseError> {
+                    let builder = self.s3_builder(bucket_override);
 
                     builder.build().context(InvalidS3ConfigSnafu)
                 }
 
-                #[cfg(not(feature = "aws"))]
-                fn new_s3(&self) -> Result<Arc<DynObjectStore>, ParseError> {
-                    panic!("S3 support not enabled, recompile with the aws feature enabled")
-                }
-
-                #[cfg(feature = "azure")]
-                fn new_azure(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_azure(&self, bucket_override: Option<String>) -> Result<Arc<DynObjectStore>, ParseError> {
                     use object_store::azure::MicrosoftAzureBuilder;
                     use object_store::limit::LimitStore;
 
@@ -593,7 +623,9 @@ macro_rules! object_store_config_inner {
 
                     let mut builder = MicrosoftAzureBuilder::new().with_client_options(self.client_options());
 
-                    if let Some(bucket) = &self.bucket {
+                    if let Some(bucket) = bucket_override {
+                        builder = builder.with_container_name(bucket);
+                    } else if let Some(bucket) = &self.bucket {
                         builder = builder.with_container_name(bucket);
                     }
                     if let Some(account) = &self.azure_storage_account {
@@ -609,13 +641,7 @@ macro_rules! object_store_config_inner {
                     )))
                 }
 
-                #[cfg(not(feature = "azure"))]
-                fn new_azure(&self) -> Result<Arc<DynObjectStore>, ParseError> {
-                    panic!("Azure blob storage support not enabled, recompile with the azure feature enabled")
-                }
-
                 /// Build cache store.
-                #[cfg(feature = "aws")]
                 pub fn make_cache_store(
                     &self
                 ) -> Result<Option<Arc<DynObjectStore>>, ParseError> {
@@ -623,7 +649,7 @@ macro_rules! object_store_config_inner {
                         return Ok(None);
                     };
 
-                    let store = object_store::aws::AmazonS3Builder::new()
+                    let store = Arc::new(object_store::aws::AmazonS3Builder::new()
                         // bucket name is ignored by our cache server
                         .with_bucket_name(self.bucket.as_deref().unwrap_or("dummy"))
                         .with_client_options(
@@ -641,24 +667,23 @@ macro_rules! object_store_config_inner {
                         })
                         .with_skip_signature(true)
                         .build()
-                        .context(InvalidS3ConfigSnafu)?;
+                        .context(InvalidS3ConfigSnafu)?);
 
-                    Ok(Some(Arc::new(store)))
+                    // size hint stripping
+                    //
+                    // This is a temporary workaround until https://github.com/influxdata/influxdb_iox/issues/13771 is fixed.
+                    let store = Arc::new(ObjectStoreStripSizeHinting::new(store));
+
+                    Ok(Some(store))
                 }
 
-                /// Build cache store.
-                #[cfg(not(feature = "aws"))]
-                pub fn make_cache_store(
-                    &self
-                ) -> Result<Option<Arc<DynObjectStore>>, ParseError> {
-                    match &self.cache_endpoint {
-                        Some(_) => panic!("Cache support not enabled, recompile with the aws feature enabled"),
-                        None => Ok(None),
-                    }
-                }
-
-                /// Create config-dependant object store.
+                /// Create config-dependent object store.
                 pub fn make_object_store(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                    self.make_object_store_custom_bucket(None)
+                }
+
+                /// Make a config-dependent object store with an optional bucket override.
+                pub fn make_object_store_custom_bucket(&self, bucket_override: Option<String>) -> Result<Arc<DynObjectStore>, ParseError> {
                     if let Some(data_dir) = &self.database_directory {
                         if !matches!(&self.object_store, Some(ObjectStoreType::File)) {
                             warn!(?data_dir, object_store_type=?self.object_store,
@@ -666,7 +691,7 @@ macro_rules! object_store_config_inner {
                         }
                     }
 
-                    let remote_store: Arc<DynObjectStore> = match &self.object_store {
+                    let object_store: Arc<DynObjectStore> = match &self.object_store {
                         None => return Err(ParseError::UnspecifiedObjectStore),
                         Some(ObjectStoreType::Memory) => {
                             info!(object_store_type = "Memory", "Object Store");
@@ -693,13 +718,64 @@ macro_rules! object_store_config_inner {
                             Arc::new(ThrottledStore::new(InMemory::new(), config))
                         }
 
-                        Some(ObjectStoreType::Google) => self.new_gcs()?,
-                        Some(ObjectStoreType::S3) => self.new_s3()?,
-                        Some(ObjectStoreType::Azure) => self.new_azure()?,
+                        Some(ObjectStoreType::Google) => self.new_gcs(bucket_override)?,
+                        Some(ObjectStoreType::S3) => self.new_s3(bucket_override)?,
+                        Some(ObjectStoreType::Azure) => self.new_azure(bucket_override)?,
                         Some(ObjectStoreType::File) => self.new_local_file_system()?,
                     };
 
-                    Ok(remote_store)
+                    // size hint stripping
+                    //
+                    // This is a temporary workaround until https://github.com/influxdata/influxdb_iox/issues/13771 is fixed.
+                    let object_store = Arc::new(ObjectStoreStripSizeHinting::new(object_store));
+
+                    Ok(object_store)
+                }
+
+                /// Return a closure to build an S3 client.
+                /// This function returns a function that return an S3 client (actually a future that when waited
+                /// on returns an S3 client).  To do this, capture and clone whatever is necessary so the returned
+                /// function can be called later to build clients.
+                pub fn s3_client_builder(
+                    &self,
+                ) -> Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<S3Client, String>> + Send>> + Send + Sync> {
+                    let aws_default_region = self.aws_default_region.clone();
+                    let aws_endpoint = self.aws_endpoint.clone();
+
+                    Arc::new(move || {
+                        let aws_default_region = aws_default_region.clone();
+                        let aws_endpoint = aws_endpoint.clone();
+                        Box::pin(async move {
+                            // Load AWS configuration
+                            let config = load_defaults(BehaviorVersion::latest()).await;
+
+                            // Extract credentials
+                            let credentials = if let Some(provider) = config.credentials_provider() {
+                                match provider.provide_credentials().await {
+                                    Ok(credentials) => credentials,
+                                    Err(e) => return Err(format!("Failed to authenticate: {:?}", e)),
+                                }
+                            } else {
+                                return Err("No credentials provider found in the configuration.".to_string());
+                            };
+
+                            // Create the S3 config builder
+                            let mut config_builder = S3ConfigBuilder::new()
+                                .region(Region::new(aws_default_region))
+                                .credentials_provider(credentials);
+
+                            // Add optional endpoint if provided
+                            if let Some(endpoint) = aws_endpoint {
+                                config_builder = config_builder.endpoint_url(endpoint.to_string());
+                            }
+
+                            // Build the S3 client
+                            let config = config_builder
+                                .behavior_version(BehaviorVersion::v2025_01_17())
+                                .build();
+                            Ok(S3Client::from_conf(config))
+                        })
+                    })
                 }
 
                 fn new_local_file_system(&self) -> Result<Arc<LocalFileSystem>, ParseError> {
@@ -768,24 +844,11 @@ impl ObjectStoreType {
 /// The `object_store::signer::Signer` trait is implemented for AWS and local file systems, so when
 /// the AWS feature is enabled and the configured object store is S3 or the local file system,
 /// return a signer.
-#[cfg(feature = "aws")]
 pub fn make_presigned_url_signer(
     config: &ObjectStoreConfig,
 ) -> Result<Option<Arc<dyn object_store::signer::Signer>>, ParseError> {
     match &config.object_store {
-        Some(ObjectStoreType::S3) => Ok(Some(Arc::new(config.build_s3()?))),
-        Some(ObjectStoreType::File) => Ok(Some(Arc::new(LocalUploadSigner::new(config)?))),
-        _ => Ok(None),
-    }
-}
-
-/// The `object_store::signer::Signer` trait is implemented for AWS and local file systems, so if
-/// the AWS feature isn't enabled, only return a signer for local file systems.
-#[cfg(not(feature = "aws"))]
-pub fn make_presigned_url_signer(
-    config: &ObjectStoreConfig,
-) -> Result<Option<Arc<dyn object_store::signer::Signer>>, ParseError> {
-    match &config.object_store {
+        Some(ObjectStoreType::S3) => Ok(Some(Arc::new(config.build_s3(None)?))),
         Some(ObjectStoreType::File) => Ok(Some(Arc::new(LocalUploadSigner::new(config)?))),
         _ => Ok(None),
     }
@@ -828,7 +891,7 @@ impl object_store::signer::Signer for LocalUploadSigner {
 }
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum CheckError {
     #[snafu(display("Cannot read from object store: {}", source))]
     CannotReadObjectStore { source: object_store::Error },
@@ -851,14 +914,23 @@ mod tests {
 
     impl StoreConfigs {
         pub(crate) fn make_object_store(&self) -> Result<Arc<dyn ObjectStore>, ParseError> {
-            self.object_store_inner()
+            self.object_store_inner(None)
+        }
+        pub(crate) fn make_object_store_custom_bucket(
+            &self,
+            bucket_override: Option<String>,
+        ) -> Result<Arc<dyn ObjectStore>, ParseError> {
+            self.object_store_inner(bucket_override)
         }
 
-        fn object_store_inner(&self) -> Result<Arc<dyn ObjectStore>, ParseError> {
+        fn object_store_inner(
+            &self,
+            bucket_override: Option<String>,
+        ) -> Result<Arc<dyn ObjectStore>, ParseError> {
             match self {
-                Self::Base(o) => o.make_object_store(),
-                Self::Source(o) => o.make_object_store(),
-                Self::Sink(o) => o.make_object_store(),
+                Self::Base(o) => o.make_object_store_custom_bucket(bucket_override),
+                Self::Source(o) => o.make_object_store_custom_bucket(bucket_override),
+                Self::Sink(o) => o.make_object_store_custom_bucket(bucket_override),
             }
         }
     }
@@ -897,7 +969,7 @@ mod tests {
         ];
         for config in configs {
             let object_store = config.make_object_store().unwrap();
-            assert_eq!(&object_store.to_string(), "InMemory")
+            assert_eq!(&object_store.to_string(), "strip_size_hinting(InMemory)")
         }
     }
 
@@ -910,7 +982,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "aws")]
     fn valid_s3_config() {
         let configs = vec![
             StoreConfigs::Base(
@@ -961,20 +1032,76 @@ mod tests {
             let object_store = config.make_object_store().unwrap();
             assert_eq!(
                 &object_store.to_string(),
-                "LimitStore(16, AmazonS3(mybucket))"
+                "strip_size_hinting(LimitStore(1024, AmazonS3(mybucket)))"
             )
         }
     }
 
     #[test]
-    #[cfg(feature = "aws")]
+    fn s3_config_bucket_override() {
+        let configs = vec![
+            StoreConfigs::Base(
+                ObjectStoreConfig::try_parse_from([
+                    "server",
+                    "--object-store",
+                    "s3",
+                    "--bucket",
+                    "mybucket",
+                    "--aws-access-key-id",
+                    "NotARealAWSAccessKey",
+                    "--aws-secret-access-key",
+                    "NotARealAWSSecretAccessKey",
+                ])
+                .unwrap(),
+            ),
+            StoreConfigs::Source(
+                SourceObjectStoreConfig::try_parse_from([
+                    "server",
+                    "--source-object-store",
+                    "s3",
+                    "--source-bucket",
+                    "mybucket",
+                    "--source-aws-access-key-id",
+                    "NotARealAWSAccessKey",
+                    "--source-aws-secret-access-key",
+                    "NotARealAWSSecretAccessKey",
+                ])
+                .unwrap(),
+            ),
+            StoreConfigs::Sink(
+                SinkObjectStoreConfig::try_parse_from([
+                    "server",
+                    "--sink-object-store",
+                    "s3",
+                    "--sink-bucket",
+                    "mybucket",
+                    "--sink-aws-access-key-id",
+                    "NotARealAWSAccessKey",
+                    "--sink-aws-secret-access-key",
+                    "NotARealAWSSecretAccessKey",
+                ])
+                .unwrap(),
+            ),
+        ];
+
+        for config in configs {
+            let object_store = config
+                .make_object_store_custom_bucket(Some("my_other_bucket".to_string()))
+                .unwrap();
+            assert_eq!(
+                &object_store.to_string(),
+                "strip_size_hinting(LimitStore(1024, AmazonS3(my_other_bucket)))"
+            )
+        }
+    }
+
+    #[test]
     fn valid_s3_endpoint_url() {
         ObjectStoreConfig::try_parse_from(["server", "--aws-endpoint", "http://whatever.com"])
             .expect("must successfully parse config with absolute AWS endpoint URL");
     }
 
     #[test]
-    #[cfg(feature = "aws")]
     fn invalid_s3_endpoint_url_fails_clap_parsing() {
         let result =
             ObjectStoreConfig::try_parse_from(["server", "--aws-endpoint", "whatever.com"]);
@@ -994,7 +1121,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "aws")]
     fn s3_config_missing_params() {
         let mut config =
             ObjectStoreConfig::try_parse_from(["server", "--object-store", "s3"]).unwrap();
@@ -1011,7 +1137,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "aws")]
     fn valid_s3_url_signer() {
         let config = ObjectStoreConfig::try_parse_from([
             "server",
@@ -1038,7 +1163,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "aws")]
     fn s3_url_signer_config_missing_params() {
         let mut config =
             ObjectStoreConfig::try_parse_from(["server", "--object-store", "s3"]).unwrap();
@@ -1055,7 +1179,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gcp")]
     fn valid_google_config() {
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -1108,13 +1231,72 @@ mod tests {
             let object_store = config.make_object_store().unwrap();
             assert_eq!(
                 &object_store.to_string(),
-                "LimitStore(16, GoogleCloudStorage(mybucket))"
+                "strip_size_hinting(LimitStore(1024, GoogleCloudStorage(mybucket)))"
             )
         }
     }
 
     #[test]
-    #[cfg(feature = "gcp")]
+    fn google_config_bucket_override() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().expect("tempfile should be created");
+        const FAKE_KEY: &str = r#"{"private_key": "private_key", "private_key_id": "private_key_id", "client_email":"client_email", "disable_oauth":true}"#;
+        writeln!(file, "{FAKE_KEY}").unwrap();
+        let path = file.path().to_str().expect("file path should exist");
+
+        let configs = vec![
+            StoreConfigs::Base(
+                ObjectStoreConfig::try_parse_from([
+                    "server",
+                    "--object-store",
+                    "google",
+                    "--bucket",
+                    "mybucket",
+                    "--google-service-account",
+                    path,
+                ])
+                .unwrap(),
+            ),
+            StoreConfigs::Source(
+                SourceObjectStoreConfig::try_parse_from([
+                    "server",
+                    "--source-object-store",
+                    "google",
+                    "--source-bucket",
+                    "mybucket",
+                    "--source-google-service-account",
+                    path,
+                ])
+                .unwrap(),
+            ),
+            StoreConfigs::Sink(
+                SinkObjectStoreConfig::try_parse_from([
+                    "server",
+                    "--sink-object-store",
+                    "google",
+                    "--sink-bucket",
+                    "mybucket",
+                    "--sink-google-service-account",
+                    path,
+                ])
+                .unwrap(),
+            ),
+        ];
+
+        for config in configs {
+            let object_store = config
+                .make_object_store_custom_bucket(Some("my_other_bucket".to_string()))
+                .unwrap();
+            assert_eq!(
+                &object_store.to_string(),
+                "strip_size_hinting(LimitStore(1024, GoogleCloudStorage(my_other_bucket)))"
+            )
+        }
+    }
+
+    #[test]
     fn google_config_missing_params() {
         let mut config =
             ObjectStoreConfig::try_parse_from(["server", "--object-store", "google"]).unwrap();
@@ -1131,7 +1313,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "azure")]
     fn valid_azure_config() {
         let config = ObjectStoreConfig::try_parse_from([
             "server",
@@ -1147,11 +1328,37 @@ mod tests {
         .unwrap();
 
         let object_store = config.make_object_store().unwrap();
-        assert_eq!(&object_store.to_string(), "LimitStore(16, MicrosoftAzure { account: NotARealStorageAccount, container: mybucket })")
+        assert_eq!(
+            &object_store.to_string(),
+            "strip_size_hinting(LimitStore(1024, MicrosoftAzure { account: NotARealStorageAccount, container: mybucket }))"
+        )
     }
 
     #[test]
-    #[cfg(feature = "azure")]
+    fn azure_config_bucket_override() {
+        let config = ObjectStoreConfig::try_parse_from([
+            "server",
+            "--object-store",
+            "azure",
+            "--bucket",
+            "mybucket",
+            "--azure-storage-account",
+            "NotARealStorageAccount",
+            "--azure-storage-access-key",
+            "Zm9vYmFy", // base64 encoded "foobar"
+        ])
+        .unwrap();
+
+        let object_store = config
+            .make_object_store_custom_bucket(Some("my_other_bucket".to_string()))
+            .unwrap();
+        assert_eq!(
+            &object_store.to_string(),
+            "strip_size_hinting(LimitStore(1024, MicrosoftAzure { account: NotARealStorageAccount, container: my_other_bucket }))"
+        )
+    }
+
+    #[test]
     fn azure_config_missing_params() {
         let mut config =
             ObjectStoreConfig::try_parse_from(["server", "--object-store", "azure"]).unwrap();
@@ -1183,7 +1390,7 @@ mod tests {
 
         let object_store = config.make_object_store().unwrap().to_string();
         assert!(
-            object_store.starts_with("LocalFileSystem"),
+            object_store.starts_with("strip_size_hinting(LocalFileSystem"),
             "{}",
             object_store
         )
@@ -1194,7 +1401,13 @@ mod tests {
         // this test tests for failure to configure the object store because of data-dir configuration missing
         // if the INFLUXDB_IOX_DB_DIR env variable is set, the test fails because the configuration is
         // actually present.
-        env::remove_var("INFLUXDB_IOX_DB_DIR");
+        // SAFETY: this is not actually necessarily sound. It's just extremely difficult (if not
+        // outright impossible with the guarantees that rust's test harness gives us) to architect
+        // tests to ensure that they are completely single-threaded and that this operation can
+        // actually be sound
+        unsafe {
+            env::remove_var("INFLUXDB_IOX_DB_DIR");
+        }
 
         let configs = vec![
             StoreConfigs::Base(

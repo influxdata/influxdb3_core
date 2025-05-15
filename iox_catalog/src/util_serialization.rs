@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use error_reporting::DisplaySourceChain;
-use generated_types::influxdata::iox::catalog::v2 as proto;
+use generated_types::{Code, Status, influxdata::iox::catalog::v2 as proto};
 
 use crate::interface::{SoftDeletedRows, UnhandledError};
 
@@ -66,7 +66,7 @@ impl From<Error> for crate::interface::Error {
     }
 }
 
-impl From<Error> for tonic::Status {
+impl From<Error> for Status {
     fn from(e: Error) -> Self {
         Self::invalid_argument(e.to_string())
     }
@@ -120,28 +120,48 @@ impl<T> ContextExt<T> for Result<T, Error> {
     }
 }
 
-pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
+pub(crate) fn is_upstream_error(e: &Status) -> bool {
+    matches!(
+        e.code(),
+        // timeout & abort cases
+        Code::Aborted
+            | Code::Cancelled
+            | Code::DeadlineExceeded
+
+            // server side not online
+            | Code::FailedPrecondition
+            | Code::Unavailable
+
+            // connection errors classify as "unknown"
+            | Code::Unknown
+
+            // internal errors on the server side
+            | Code::Internal
+    )
+}
+
+pub(crate) fn convert_status(status: Status) -> crate::interface::Error {
     use crate::interface::Error;
 
     match status.code() {
-        tonic::Code::Internal => UnhandledError::GrpcRequest {
+        Code::Internal => UnhandledError::GrpcRequest {
             source: Box::<dyn std::error::Error + Send + Sync>::from(status.message().to_owned())
                 .into(),
         }
         .into(),
-        tonic::Code::AlreadyExists => Error::AlreadyExists {
+        Code::AlreadyExists => Error::AlreadyExists {
             descr: status.message().to_owned(),
         },
-        tonic::Code::ResourceExhausted => Error::LimitExceeded {
+        Code::ResourceExhausted => Error::LimitExceeded {
             descr: status.message().to_owned(),
         },
-        tonic::Code::NotFound => Error::NotFound {
+        Code::NotFound => Error::NotFound {
             descr: status.message().to_owned(),
         },
-        tonic::Code::InvalidArgument => Error::Malformed {
+        Code::InvalidArgument => Error::Malformed {
             descr: status.message().to_owned(),
         },
-        tonic::Code::Unimplemented => Error::NotImplemented {
+        Code::Unimplemented => Error::NotImplemented {
             descr: status.message().to_owned(),
         },
         _ => UnhandledError::GrpcRequest {
@@ -152,20 +172,20 @@ pub(crate) fn convert_status(status: tonic::Status) -> crate::interface::Error {
 }
 
 /// Converts the catalog error to tonic status
-pub fn catalog_error_to_status(e: crate::interface::Error) -> tonic::Status {
+pub fn catalog_error_to_status(e: crate::interface::Error) -> Status {
     use crate::interface::Error;
 
     match e {
         Error::Unhandled { source } => {
             // walk cause chain to display full details
             // see https://github.com/influxdata/influxdb_iox/issues/12373
-            tonic::Status::internal(DisplaySourceChain::new(source).to_string())
+            Status::internal(DisplaySourceChain::new(source).to_string())
         }
-        Error::AlreadyExists { descr } => tonic::Status::already_exists(descr),
-        Error::LimitExceeded { descr } => tonic::Status::resource_exhausted(descr),
-        Error::NotFound { descr } => tonic::Status::not_found(descr),
-        Error::Malformed { descr } => tonic::Status::invalid_argument(descr),
-        Error::NotImplemented { descr } => tonic::Status::unimplemented(descr),
+        Error::AlreadyExists { descr } => Status::already_exists(descr),
+        Error::LimitExceeded { descr } => Status::resource_exhausted(descr),
+        Error::NotFound { descr } => Status::not_found(descr),
+        Error::Malformed { descr } => Status::invalid_argument(descr),
+        Error::NotImplemented { descr } => Status::unimplemented(descr),
     }
 }
 

@@ -21,29 +21,30 @@ workspace = true
 arrow = { workspace = true }
 arrow_util = { path = "../arrow_util" }
 async-trait = "0.1"
-bytes = "1.9"
+bytes = "1.10"
 chrono = { version = "0.4", default-features = false }
-dashmap = "6.1.0"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
-executor = { path = "../executor"}
+executor = { path = "../executor" }
 futures = "0.3"
 hashbrown = { workspace = true }
-indexmap = { version = "2.7", features = ["std"] }
+indexmap = { version = "2.9", features = ["std"] }
 itertools = "0.13.0"
 iox_query_params = { path = "../iox_query_params" }
 iox_time = { path = "../iox_time" }
+jemalloc_stats = { path = "../jemalloc_stats" }
 meta_data_cache = { path = "../meta_data_cache" }
 metric = { path = "../metric" }
 object_store = { workspace = true }
+object_store_size_hinting = { path = "../object_store_size_hinting" }
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 parquet_file = { path = "../parquet_file" }
-query_functions = { path = "../query_functions"}
+query_functions = { path = "../query_functions" }
 schema = { path = "../schema" }
 snafu = "0.8"
-tokio = { version = "1.42", features = ["macros", "parking_lot"] }
+tokio = { version = "1.45", features = ["macros", "parking_lot"] }
 tokio-stream = "0.1"
 trace = { path = "../trace" }
 tracker = { path = "../tracker" }
@@ -51,10 +52,10 @@ uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-criterion = { version = "0.5", default-features = false, features = ["rayon"]}
+criterion = { version = "0.5", default-features = false, features = ["rayon"] }
 insta = { version = "1", features = ["yaml"] }
-proptest = { workspace = true }
-rand = "0.8"
+metric_exporters = { path = "../metric_exporters" }
+rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 test_helpers = { path = "../test_helpers" }
 

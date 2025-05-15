@@ -1,7 +1,4 @@
 #![warn(missing_docs)]
-// `clippy::use_self` is deliberately excluded from the lints this crate uses.
-// See <https://github.com/rust-lang/rust-clippy/issues/6902>.
-#![allow(clippy::use_self)]
 
 //! # influxdb2_client
 //!

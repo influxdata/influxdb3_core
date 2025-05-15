@@ -1,5 +1,3 @@
-#![allow(clippy::clone_on_ref_ptr)]
-
 //! This module contains various DataFusion utility functions.
 //!
 //! Almost everything for manipulating DataFusion `Expr`s IOx should be in DataFusion already
@@ -29,12 +27,12 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, ToDFSchema};
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::utils::inspect_expr_pre;
-use datafusion::logical_expr::{expr::Sort, SortExpr};
+use datafusion::logical_expr::{SortExpr, expr::Sort};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
-use datafusion::physical_plan::{collect, EmptyRecordBatchStream, ExecutionPlan};
-use datafusion::prelude::{lit, Column, Expr, SessionContext};
+use datafusion::physical_plan::{EmptyRecordBatchStream, ExecutionPlan, collect};
+use datafusion::prelude::{Column, Expr, SessionContext, lit};
 use datafusion::{
     arrow::{
         datatypes::{Schema, SchemaRef},
@@ -225,7 +223,7 @@ pub struct AdapterStream<T> {
     inner: T,
 
     /// Optional join handles of underlying tasks.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     task: Arc<WatchedTask>,
 }
 
@@ -502,8 +500,9 @@ mod tests {
             Some(tz) => format!("Some(\"{tz}\")"),
             None => "None".into(),
         };
-        let expected_string =
-            format!("TimestampNanosecond(101, {expected_timezone}) <= time AND time < TimestampNanosecond(202, {expected_timezone})");
+        let expected_string = format!(
+            "TimestampNanosecond(101, {expected_timezone}) <= time AND time < TimestampNanosecond(202, {expected_timezone})"
+        );
         let actual_string = format!("{ts_predicate_expr}");
 
         assert_eq!(actual_string, expected_string);
@@ -517,7 +516,7 @@ mod tests {
             Field::new("bar", DataType::Utf8, true),
         ]));
 
-        assert_eq!(schema, nullable_schema(schema.clone()))
+        assert_eq!(schema, nullable_schema(Arc::clone(&schema)))
     }
 
     #[test]

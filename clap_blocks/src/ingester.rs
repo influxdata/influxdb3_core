@@ -6,7 +6,6 @@ use crate::{gossip::GossipConfig, memory_size::MemorySize};
 
 /// CLI config for the ingester using the RPC write path
 #[derive(Debug, Clone, clap::Parser)]
-#[allow(missing_copy_implementations)]
 pub struct IngesterConfig {
     /// Gossip config.
     #[clap(flatten)]

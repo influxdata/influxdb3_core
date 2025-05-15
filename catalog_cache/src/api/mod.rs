@@ -23,6 +23,9 @@ static GENERATION_NOT_MATCH: HeaderName =
 /// on read.
 static NO_VALUE: HeaderName = HeaderName::from_static("x-influx-no-value");
 
+/// Value of Accept header for v1 list protocol
+static LIST_PROTOCOL_V1: HeaderValue = HeaderValue::from_static("application/x-list-v1");
+
 /// Value of Accept header for v2 list protocol
 static LIST_PROTOCOL_V2: HeaderValue = HeaderValue::from_static("application/x-list-v2");
 
@@ -96,10 +99,10 @@ impl std::fmt::Display for RequestPath {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::RequestPath;
     use crate::api::client::Error;
     use crate::api::list::ListEntry;
     use crate::api::server::test_util::TestCacheServer;
-    use crate::api::RequestPath;
     use crate::{CacheKey, CacheValue};
     use bytes::Bytes;
     use futures::TryStreamExt;

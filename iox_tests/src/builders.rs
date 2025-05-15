@@ -197,6 +197,8 @@ impl TableBuilder {
                 namespace_id: NamespaceId::new(0),
                 name: "table".to_string(),
                 partition_template: Default::default(),
+                iceberg_enabled: false,
+                deleted_at: None,
             },
         }
     }

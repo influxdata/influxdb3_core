@@ -15,15 +15,15 @@ use async_trait::async_trait;
 use auth::authorize;
 use authz::{self, Authorizer};
 use data_types::{NamespaceName, NamespaceNameError};
-use hyper::{Body, Request};
+use iox_http_util::Request;
 use thiserror::Error;
 
 use crate::write::v1::V1_NAMESPACE_RP_SEPARATOR;
 
 use super::{
+    WriteParams, WriteParseError, WriteRequestUnifier,
     v1::{RetentionPolicy, V1WriteParseError, WriteParamsV1},
     v2::{V2WriteParseError, WriteParamsV2},
-    WriteParams, WriteParseError, WriteRequestUnifier,
 };
 
 /// Request parsing errors when operating in "single tenant" mode.
@@ -68,7 +68,7 @@ impl From<&SingleTenantExtractError> for hyper::StatusCode {
                 V2WriteParseError::NoQueryParams | V2WriteParseError::DecodeFail(_),
             ) => Self::BAD_REQUEST,
             SingleTenantExtractError::Authorizer(e) => match e {
-                authz::Error::Forbidden => Self::FORBIDDEN,
+                authz::Error::Forbidden { .. } => Self::FORBIDDEN,
                 authz::Error::NoToken => Self::UNAUTHORIZED,
                 _ => Self::FORBIDDEN,
             },
@@ -104,18 +104,18 @@ impl SingleTenantRequestUnifier {
 
 #[async_trait]
 impl WriteRequestUnifier for SingleTenantRequestUnifier {
-    async fn parse_v1(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+    async fn parse_v1(&self, req: &Request) -> Result<WriteParams, WriteParseError> {
         Ok(parse_v1(req, &self.authz).await?)
     }
 
-    async fn parse_v2(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+    async fn parse_v2(&self, req: &Request) -> Result<WriteParams, WriteParseError> {
         Ok(parse_v2(req, &self.authz).await?)
     }
 }
 
 // Parse a V1 write request for single tenant mode.
 async fn parse_v1(
-    req: &Request<Body>,
+    req: &Request,
     authz: &Arc<dyn Authorizer>,
 ) -> Result<WriteParams, SingleTenantExtractError> {
     // Extract the write parameters.
@@ -144,7 +144,7 @@ async fn parse_v1(
 
 // Parse a V2 write request for single tenant mode.
 async fn parse_v2(
-    req: &Request<Body>,
+    req: &Request,
     authz: &Arc<dyn Authorizer>,
 ) -> Result<WriteParams, SingleTenantExtractError> {
     let write_params = WriteParamsV2::try_from(req)?;
@@ -172,8 +172,9 @@ async fn parse_v2(
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use authz::{http::AuthorizationHeaderExtension, Permission};
+    use authz::{Authorization, Permission, http::AuthorizationHeaderExtension};
     use hyper::header::HeaderValue;
+    use iox_http_util::{RequestBuilder, empty_request_body};
     use parking_lot::Mutex;
 
     use crate::write::Precision;
@@ -192,13 +193,13 @@ mod tests {
 
         #[async_trait]
         impl Authorizer for MockCountingAuthorizer {
-            async fn permissions(
+            async fn authorize(
                 &self,
                 _token: Option<Vec<u8>>,
                 perms: &[Permission],
-            ) -> Result<Vec<Permission>, authz::Error> {
+            ) -> Result<Authorization, authz::Error> {
                 *self.calls_counter.lock() += 1;
-                Ok(perms.to_vec())
+                Ok(Authorization::new(None, perms.to_vec()))
             }
         }
         let counter = Arc::new(Mutex::new(0));
@@ -207,13 +208,13 @@ mod tests {
         });
         let unifier = SingleTenantRequestUnifier::new(authz);
 
-        let request = Request::builder()
+        let request = RequestBuilder::new()
             .uri("https://foo?db=bananas")
             .method("POST")
             .extension(AuthorizationHeaderExtension::new(Some(
                 HeaderValue::from_str(format!("Token {MOCK_AUTH_VALID_TOKEN}").as_str()).unwrap(),
             )))
-            .body(Body::from(""))
+            .body(empty_request_body())
             .unwrap();
 
         assert!(unifier.parse_v1(&request).await.is_ok());
@@ -224,12 +225,12 @@ mod tests {
     async fn test_query_param_token() {
         let authz = Arc::new(MockAuthorizer::default());
         let unifier = SingleTenantRequestUnifier::new(authz);
-        let request = Request::builder()
+        let request = RequestBuilder::new()
             .uri(format!(
                 "https://itsallbroken.com/write?db=bananas&p={MOCK_AUTH_VALID_TOKEN}"
             ))
             .method("POST")
-            .body(Body::from(""))
+            .body(empty_request_body())
             .unwrap();
 
         assert!(unifier.parse_v1(&request).await.is_ok());
@@ -248,13 +249,13 @@ mod tests {
                     let unifier = SingleTenantRequestUnifier::new(authz);
 
                     let query = $query_string;
-                    let request = Request::builder()
+                    let request = RequestBuilder::new()
                         .uri(format!("https://itsallbroken.com/ignored{query}"))
                         .method("POST")
                         .extension(AuthorizationHeaderExtension::new(Some(
                             HeaderValue::from_str(format!("Token {MOCK_AUTH_VALID_TOKEN}").as_str()).unwrap(),
                         )))
-                        .body(Body::from(""))
+                        .body(empty_request_body())
                         .unwrap();
 
                     let got = unifier.parse_v1(&request).await;
@@ -487,13 +488,13 @@ mod tests {
                     let unifier = SingleTenantRequestUnifier::new(authz);
 
                     let query = $query_string;
-                    let request = Request::builder()
+                    let request = RequestBuilder::new()
                         .uri(format!("https://itsallbroken.com/ignored{query}"))
                         .method("POST")
                         .extension(AuthorizationHeaderExtension::new(Some(
                             HeaderValue::from_str(format!("Token {MOCK_AUTH_VALID_TOKEN}").as_str()).unwrap(),
                         )))
-                        .body(Body::from(""))
+                        .body(empty_request_body())
                         .unwrap();
 
                     let got = unifier.parse_v2(&request).await;
