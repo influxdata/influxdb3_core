@@ -20,23 +20,19 @@ workspace = true
 ### BEGIN HAKARI SECTION
 [dependencies]
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
-arrayvec = { version = "0.7", default-features = false, features = ["std"] }
 arrow = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a", features = ["chrono-tz", "prettyprint"] }
 arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a", features = ["lz4"] }
 base64 = { version = "0.22" }
-bloom2 = { version = "0.5", default-features = false, features = ["serde"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env", "string"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "string", "suggestions", "usage"] }
-crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
-digest = { version = "0.10", features = ["mac", "oid", "std"] }
-either = { version = "1", features = ["serde"] }
-fixedbitset = { version = "0.4" }
-flatbuffers = { version = "24" }
+digest = { version = "0.10", features = ["mac", "std"] }
+either = { version = "1", features = ["serde", "use_std"] }
+fastrand = { version = "2" }
 flate2 = { version = "1" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -46,72 +42,53 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
-getrandom = { version = "0.2", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 hashbrown = { version = "0.14", features = ["raw"] }
-hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", features = ["client", "http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", features = ["http1", "http2", "server"] }
 idna = { version = "1", default-features = false, features = ["compiled_data", "std"] }
 indexmap = { version = "2" }
-itertools = { version = "0.12" }
-libc = { version = "0.2", features = ["extra_traits"] }
-lock_api = { version = "0.4", features = ["arc_lock"] }
+itertools = { version = "0.12", default-features = false, features = ["use_alloc"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
 nom = { version = "7" }
-num-bigint = { version = "0.4", features = ["serde"] }
-num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { version = "0.11", default-features = false, features = ["aws", "azure", "gcp"] }
-parking_lot = { version = "0.12", features = ["arc_lock"] }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.6" }
 phf_shared = { version = "0.11" }
-proptest = { version = "1" }
-prost-594e8ee84c453af0 = { package = "prost", version = "0.13", features = ["prost-derive"] }
-prost-5ef9efb8ec2df382 = { package = "prost", version = "0.12", features = ["prost-derive"] }
+prost = { version = "0.12", features = ["prost-derive"] }
 prost-types = { version = "0.12" }
 rand = { version = "0.8", features = ["small_rng"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["gzip", "http2", "json", "multipart", "rustls-tls", "rustls-tls-native-roots", "stream"] }
-reqwest-a6292c17cd707f01 = { package = "reqwest", version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.10", features = ["oid"] }
-signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
+sha2 = { version = "0.10" }
 similar = { version = "2", features = ["inline"] }
-smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
-snafu = { version = "0.8", features = ["futures"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+snafu = { version = "0.8" }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
+spin = { version = "0.9" }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "sqlite", "tls-rustls", "uuid"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
-strum = { version = "0.26", features = ["derive"] }
-subtle = { version = "2", default-features = false, features = ["i128"] }
 thrift = { version = "0.17" }
-tokio = { version = "1", features = ["full", "test-util", "tracing"] }
-tokio-metrics = { version = "0.4" }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tokio-util = { version = "0.7", features = ["codec", "compat", "io"] }
 tower = { version = "0.4", features = ["balance", "buffer", "limit", "timeout", "util"] }
 tracing = { version = "0.1", features = ["log", "max_level_trace", "release_max_level_trace"] }
 tracing-core = { version = "0.1" }
 tracing-log = { version = "0.2" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2" }
-uuid = { version = "1", features = ["serde", "v4", "v7"] }
-zerocopy = { version = "0.7", features = ["derive", "simd"] }
-zeroize = { version = "1", features = ["derive", "std"] }
-zstd = { version = "0.13" }
-zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
-zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
@@ -121,9 +98,9 @@ bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
-digest = { version = "0.10", features = ["mac", "oid", "std"] }
-either = { version = "1", features = ["serde"] }
-fixedbitset = { version = "0.4" }
+digest = { version = "0.10", features = ["mac", "std"] }
+either = { version = "1", features = ["serde", "use_std"] }
+fastrand = { version = "2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
@@ -132,120 +109,102 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
-getrandom = { version = "0.2", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 hashbrown = { version = "0.14", features = ["raw"] }
 idna = { version = "1", default-features = false, features = ["compiled_data", "std"] }
 indexmap = { version = "2" }
-itertools = { version = "0.12" }
-lock_api = { version = "0.4", features = ["arc_lock"] }
+itertools = { version = "0.12", default-features = false, features = ["use_alloc"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
 nom = { version = "7" }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
-parking_lot = { version = "0.12", features = ["arc_lock"] }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.6" }
 phf_shared = { version = "0.11" }
-prost-5ef9efb8ec2df382 = { package = "prost", version = "0.12", features = ["prost-derive"] }
+prost = { version = "0.12", features = ["prost-derive"] }
 prost-types = { version = "0.12" }
 rand = { version = "0.8", features = ["small_rng"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "unicode"] }
 regex-syntax = { version = "0.8" }
 ring = { version = "0.17", features = ["std"] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.10", features = ["oid"] }
-smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
+sha2 = { version = "0.10" }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+spin = { version = "0.9" }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-macros = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring", "derive", "json", "macros", "migrate", "postgres", "sqlite", "uuid"] }
 sqlx-macros-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring", "derive", "json", "macros", "migrate", "postgres", "sqlite", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
-subtle = { version = "2", default-features = false, features = ["i128"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-tokio = { version = "1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log", "max_level_trace", "release_max_level_trace"] }
 tracing-core = { version = "0.1" }
 url = { version = "2" }
-uuid = { version = "1", features = ["serde", "v4", "v7"] }
-zerocopy = { version = "0.7", features = ["derive", "simd"] }
-zeroize = { version = "1", features = ["derive", "std"] }
+uuid = { version = "1", features = ["v4"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
-async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.29", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
-spin = { version = "0.9" }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
-xz2 = { version = "0.1", default-features = false, features = ["static"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto"] }
+libc = { version = "0.2" }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-libc = { version = "0.2", features = ["extra_traits"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-spin = { version = "0.9" }
 
 [target.x86_64-apple-darwin.dependencies]
-async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.29", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
-spin = { version = "0.9" }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
-xz2 = { version = "0.1", default-features = false, features = ["static"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto"] }
+libc = { version = "0.2" }
 
 [target.x86_64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-libc = { version = "0.2", features = ["extra_traits"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-spin = { version = "0.9" }
 
 [target.aarch64-apple-darwin.dependencies]
-async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-nix = { version = "0.29", default-features = false, features = ["fs", "ioctl", "poll", "signal", "socket", "term"] }
-spin = { version = "0.9" }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
-xz2 = { version = "0.1", default-features = false, features = ["static"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto"] }
+libc = { version = "0.2" }
 
 [target.aarch64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-libc = { version = "0.2", features = ["extra_traits"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-spin = { version = "0.9" }
 
 [target.x86_64-pc-windows-msvc.dependencies]
-async-compression = { version = "0.4", default-features = false, features = ["bzip2", "futures-io", "gzip", "tokio", "xz", "zstd"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-spin = { version = "0.9" }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
-winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "minwinbase", "minwindef", "ntsecapi", "processenv", "profileapi", "windef", "winioctl", "winnt"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
-windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse"] }
+hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", default-features = false, features = ["client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto"] }
+winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "minwinbase", "ntsecapi", "processenv", "windef", "winioctl"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Registry", "Win32_System_Time", "Win32_UI_Shell"] }
-xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
-spin = { version = "0.9" }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
-windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Registry", "Win32_System_Time", "Win32_UI_Shell"] }
 
 ### END HAKARI SECTION
