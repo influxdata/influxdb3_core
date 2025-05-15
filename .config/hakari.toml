@@ -36,7 +36,6 @@ workspace-members = [
     # depend on workspace
     "influxdb-line-protocol",
     "influxdb2_client",
-    "iox_data_generator",
     "mutable_batch_tests",
 ]
 third-party = [
