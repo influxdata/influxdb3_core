@@ -75,7 +75,7 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 authors = ["IOx Project Developers"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -84,9 +84,10 @@ arrow-buffer = {version = "53.0.0"}
 arrow-flight = {version = "53.0.0", features = ["flight-sql-experimental"] }
 arrow-ipc = {version = "53.0.0"}
 # Use DataFusion fork
-# See https://github.com/influxdata/arrow-datafusion/pull/49 for contents
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ae0a57b05895ccf4d2febb9c91bbb0956cf7e863" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ae0a57b05895ccf4d2febb9c91bbb0956cf7e863" }
+# See https://github.com/influxdata/arrow-datafusion/pull/53 for contents
+# plus additional patches from https://github.com/influxdata/arrow-datafusion/pull/58
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
 hashbrown = {version = "0.14.5"}
 http = {version = "0.2.12"}
 http-body = { version = "0.4.6" }
@@ -196,3 +197,4 @@ arrow-string = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae1
 arrow-ord = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
 arrow-flight = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
 parquet = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
+object_store = { git = "https://github.com/influxdata/arrow-rs.git", rev = "c946cd81fa12e6588a3be33be08e3d8e9a2770e7" }
