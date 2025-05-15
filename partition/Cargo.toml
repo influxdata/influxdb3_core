@@ -10,7 +10,8 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-chrono = { version = "0.4", default-features = false }
+# Locked because of https://github.com/apache/arrow-rs/issues/7196
+chrono = { version = "= 0.4.39", default-features = false }
 data_types = { path = "../data_types" }
 hashbrown = { workspace = true }
 mutable_batch = { path = "../mutable_batch" }
