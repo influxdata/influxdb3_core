@@ -11,9 +11,6 @@ members = [
     "executor",
     "flightsql",
     "generated_types",
-    "grpc-binary-logger-proto",
-    "grpc-binary-logger-test-proto",
-    "grpc-binary-logger",
     "import_export",
     "influxdb_influxql_parser",
     "influxdb_iox_client",
@@ -60,7 +57,6 @@ members = [
     "tracker",
     "trogging",
     "workspace-hack",
-    "versioned_file_store",
 ]
 
 resolver = "2"
