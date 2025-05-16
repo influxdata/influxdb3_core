@@ -11,5 +11,4 @@ workspace = true
 [dependencies]
 generated_types = { path = "../generated_types" }
 observability_deps = { path = "../observability_deps" }
-tonic =  { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

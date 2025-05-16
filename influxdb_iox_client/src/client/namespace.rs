@@ -1,3 +1,4 @@
+use ::generated_types::influxdata::iox::Target;
 use client_util::connection::GrpcConnection;
 
 use self::generated_types::{namespace_service_client::NamespaceServiceClient, *};
@@ -8,6 +9,7 @@ use ::generated_types::google::OptionalField;
 /// Re-export generated_types
 pub mod generated_types {
     pub use generated_types::influxdata::iox::{
+        common::v1::SoftDeleted,
         namespace::v1::{update_namespace_service_protection_limit_request::LimitUpdate, *},
         partition_template::v1::{template_part::*, *},
     };
@@ -27,9 +29,14 @@ impl Client {
         }
     }
 
-    /// Get the available namespaces
+    /// Get the list of active namespaces
     pub async fn get_namespaces(&mut self) -> Result<Vec<Namespace>, Error> {
-        let response = self.inner.get_namespaces(GetNamespacesRequest {}).await?;
+        let response = self
+            .inner
+            .get_namespaces(GetNamespacesRequest {
+                deleted: Some(SoftDeleted::OnlyActive.into()),
+            })
+            .await?;
 
         Ok(response.into_inner().namespaces)
     }
@@ -70,13 +77,13 @@ impl Client {
     /// Negative retention periods are rejected, returning an error.
     pub async fn update_namespace_retention(
         &mut self,
-        namespace: &str,
+        namespace: impl Into<Target> + Send,
         retention_period_ns: Option<i64>,
     ) -> Result<Namespace, Error> {
         let response = self
             .inner
             .update_namespace_retention(UpdateNamespaceRetentionRequest {
-                name: namespace.to_string(),
+                target: namespace.into().into(),
                 retention_period_ns,
             })
             .await?;
@@ -92,14 +99,14 @@ impl Client {
     /// Zero-valued limits are rejected, returning an error.
     pub async fn update_namespace_service_protection_limit(
         &mut self,
-        namespace: &str,
+        namespace: impl Into<Target> + Send,
         limit_update: LimitUpdate,
     ) -> Result<Namespace, Error> {
         let response = self
             .inner
             .update_namespace_service_protection_limit(
                 UpdateNamespaceServiceProtectionLimitRequest {
-                    name: namespace.to_string(),
+                    target: namespace.into().into(),
                     limit_update: Some(limit_update),
                 },
             )
@@ -109,13 +116,32 @@ impl Client {
     }
 
     /// Delete a namespace
-    pub async fn delete_namespace(&mut self, namespace: &str) -> Result<(), Error> {
+    pub async fn delete_namespace(
+        &mut self,
+        namespace: impl Into<Target> + Send,
+    ) -> Result<(), Error> {
         self.inner
             .delete_namespace(DeleteNamespaceRequest {
-                name: namespace.to_string(),
+                target: namespace.into().into(),
             })
             .await?;
 
         Ok(())
+    }
+
+    /// Rename a namespace
+    pub async fn update_namespace_name(
+        &mut self,
+        namespace_id: impl Into<i64> + Send,
+        new_name: impl Into<String> + Send,
+    ) -> Result<Namespace, Error> {
+        let response = self
+            .inner
+            .update_namespace_name(UpdateNamespaceNameRequest {
+                id: namespace_id.into(),
+                new_name: new_name.into(),
+            })
+            .await?;
+        Ok(response.into_inner().namespace.unwrap_field("namespace")?)
     }
 }

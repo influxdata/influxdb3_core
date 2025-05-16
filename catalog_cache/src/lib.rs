@@ -46,7 +46,12 @@
 #![warn(missing_docs)]
 
 use std::sync::Arc;
+
 // Workaround for "unused crate" lint false positives.
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use data_types as _;
 use workspace_hack as _;
 
 use bytes::Bytes;
@@ -108,6 +113,11 @@ pub struct CacheValue {
 impl CacheValue {
     /// Create a new [`CacheValue`] with the provided `data` and `generation`
     pub fn new(data: Bytes, generation: u64) -> Self {
+        // HACK: `Bytes` is a view-based type and may reference and underlying larger buffer. Maybe that causes
+        //        https://github.com/influxdata/influxdb_iox/issues/13765 . So we "unshare" the buffer by
+        //        round-tripping it through an owned type.
+        let data = Bytes::from(data.to_vec());
+
         Self {
             data: Some(data),
             generation,

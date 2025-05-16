@@ -1,6 +1,6 @@
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion::error::Result as DataFusionResult;
-use datafusion::prelude::{lit, Expr};
+use datafusion::prelude::{Expr, lit};
 
 use crate::ValueExpr;
 

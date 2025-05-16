@@ -5,7 +5,7 @@ use futures_util::TryStreamExt;
 use influxdb_iox_client::{
     catalog::{
         self,
-        generated_types::{partition_identifier, ParquetFile, Partition, PartitionIdentifier},
+        generated_types::{ParquetFile, Partition, PartitionIdentifier, partition_identifier},
     },
     connection::Connection,
     store::{
@@ -16,13 +16,19 @@ use influxdb_iox_client::{
     },
     table,
 };
+use object_store::{
+    DynObjectStore,
+    buffered::BufWriter,
+    local::LocalFileSystem,
+    path::{Path, PathPart},
+};
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 use tokio::{
-    fs::{self, File, OpenOptions},
+    fs,
     io::{self, AsyncWriteExt},
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -56,6 +62,70 @@ pub enum ExportError {
 
 type Result<T, E = ExportError> = std::result::Result<T, E>;
 
+/// Location where data will be exported to. This can be thought of as
+/// the directory where files will be written, but may be a object store
+/// with a path prefix.
+#[derive(Debug, Clone)]
+pub struct Output {
+    object_store: Arc<DynObjectStore>,
+    path: Path,
+}
+
+impl Output {
+    /// Create a new output with the specified object store and path.
+    pub fn new(object_store: Arc<DynObjectStore>, path: Path) -> Self {
+        Self { object_store, path }
+    }
+
+    pub async fn from_filesystem_path(
+        path: impl AsRef<std::path::Path> + Send + Sync,
+    ) -> Result<Self> {
+        fs::create_dir_all(&path).await?;
+        let object_store = LocalFileSystem::new_with_prefix(path)?;
+        Ok(Self {
+            object_store: Arc::new(object_store),
+            path: Path::default(),
+        })
+    }
+
+    /// Returns a new output with a child path.
+    pub fn child<'a>(&self, child: impl Into<PathPart<'a>>) -> Self {
+        Self {
+            object_store: Arc::clone(&self.object_store),
+            path: self.path.child(child),
+        }
+    }
+
+    /// Open a buffered writer to the specified filename.
+    pub fn writer(&self, filename: impl AsRef<str>) -> BufWriter {
+        BufWriter::new(
+            Arc::clone(&self.object_store),
+            self.path.child(filename.as_ref()),
+        )
+    }
+
+    /// writes the contents of a string to a file, overwriting the previous contents, if any
+    pub async fn write_string(
+        &self,
+        filename: impl AsRef<str>,
+        contents: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        let mut w = self.writer(filename);
+        w.write_all(contents.as_ref()).await?;
+        w.shutdown().await?;
+        Ok(())
+    }
+
+    /// Get the size of a file in the output directory.
+    pub async fn size(&self, filename: impl AsRef<str>) -> Result<usize> {
+        let metadata = self
+            .object_store
+            .head(&self.path.child(filename.as_ref()))
+            .await?;
+        Ok(metadata.size)
+    }
+}
+
 enum DesiredFiles {
     /// Export files which are current
     AllCurrent,
@@ -87,6 +157,32 @@ impl RemoteExporter {
         }
     }
 
+    /// Exports all the tables in `namespace`. Each table is exported to
+    /// a new subdirectory of the output location with the name of the
+    /// table.
+    pub async fn export_namespace(
+        &mut self,
+        output: &Output,
+        namespace_name: String,
+    ) -> Result<()> {
+        let tables = self.table_client.get_tables(&namespace_name).await?;
+        for table in tables {
+            let output = output.child(table.name.clone());
+            println!("exporting table {}...", &table.name);
+            self.export_table(
+                &output,
+                namespace_name.clone(),
+                table.name,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// Exports all data and metadata for `table_name` in
     /// `namespace` to local files.
     ///
@@ -102,19 +198,16 @@ impl RemoteExporter {
     /// files within the table.
     pub async fn export_table(
         &mut self,
-        output_directory: Option<PathBuf>,
+        output: &Output,
         namespace_name: String,
         table_name: String,
         partition_id: Option<i64>,
         file_uuids: Option<Vec<String>>,
         include_deleted: bool,
     ) -> Result<()> {
-        let output_directory = output_directory.unwrap_or_else(|| PathBuf::from(&table_name));
-        fs::create_dir_all(&output_directory).await?;
-
         // Export the metadata for the table.
         let (namespace_id, table_id) = self
-            .export_table_metadata(&output_directory, &table_name, &namespace_name)
+            .export_table_metadata(output, &table_name, &namespace_name)
             .await?;
 
         // Determine which files are sought.
@@ -163,7 +256,7 @@ impl RemoteExporter {
         };
 
         self.export_files(
-            output_directory,
+            output,
             desired_files,
             namespace_name,
             namespace_id,
@@ -188,7 +281,7 @@ impl RemoteExporter {
     ///    partition
     async fn export_table_metadata(
         &mut self,
-        output_directory: &Path,
+        output: &Output,
         table_name: &str,
         namespace_name: &str,
     ) -> Result<(NamespaceId, data_types::TableId)> {
@@ -199,9 +292,9 @@ impl RemoteExporter {
             .await?;
         let table_id = table.id;
         let table_json = serde_json::to_string_pretty(&table)?;
-        let filename = format!("table.{table_id}.json");
-        let file_path = output_directory.join(&filename);
-        write_string_to_file(&table_json, &file_path).await?;
+        output
+            .write_string(format!("table.{table_id}.json"), &table_json)
+            .await?;
 
         // write partition metadata for the table
         let partitions = self
@@ -212,9 +305,9 @@ impl RemoteExporter {
         for partition in partitions {
             let partition_id = to_partition_id(partition.identifier.as_ref());
             let partition_json = serde_json::to_string_pretty(&partition)?;
-            let filename = format!("partition.{partition_id}.json");
-            let file_path = output_directory.join(&filename);
-            write_string_to_file(&partition_json, &file_path).await?;
+            output
+                .write_string(format!("partition.{partition_id}.json"), &partition_json)
+                .await?;
         }
 
         let columns = self
@@ -222,9 +315,9 @@ impl RemoteExporter {
             .get_columns_by_table_id(table_id)
             .await?;
         let table_columns_json = serde_json::to_string_pretty(&columns)?;
-        let filename = format!("columns.{table_id}.json");
-        let file_path = output_directory.join(&filename);
-        write_string_to_file(&table_columns_json, &file_path).await?;
+        output
+            .write_string(format!("columns.{table_id}.json"), &table_columns_json)
+            .await?;
 
         Ok((
             NamespaceId::new(table.namespace_id),
@@ -290,10 +383,10 @@ impl RemoteExporter {
     }
 
     /// Export based upon the [`DesiredFiles`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn export_files(
         &mut self,
-        output_directory: PathBuf,
+        output: &Output,
         desired_files: DesiredFiles,
         namespace_name: String,
         namespace_id: NamespaceId,
@@ -310,13 +403,8 @@ impl RemoteExporter {
                 println!("found {total_num_files} current Parquet files, exporting...");
 
                 for (index, parquet_file) in files.into_iter().enumerate() {
-                    self.export_parquet_file(
-                        &output_directory,
-                        index,
-                        total_num_files,
-                        &parquet_file,
-                    )
-                    .await?;
+                    self.export_parquet_file(output, index, total_num_files, &parquet_file)
+                        .await?;
                 }
             }
             DesiredFiles::SubsetCurrent(files) => {
@@ -324,20 +412,15 @@ impl RemoteExporter {
                 println!("found {total_num_files} current Parquet files, exporting...");
 
                 for (index, parquet_file) in files.into_iter().enumerate() {
-                    self.export_parquet_file(
-                        &output_directory,
-                        index,
-                        total_num_files,
-                        &parquet_file,
-                    )
-                    .await?;
+                    self.export_parquet_file(output, index, total_num_files, &parquet_file)
+                        .await?;
                 }
             }
             DesiredFiles::AllExisting => {
                 println!("exporting all existing Parquet files (total count unknown)...");
 
                 self.export_existing_objects_at_path(
-                    &output_directory,
+                    output,
                     None,
                     namespace_id,
                     table_id,
@@ -350,7 +433,7 @@ impl RemoteExporter {
                 println!("found {total_num_files} Parquet files, exporting...");
 
                 self.export_existing_objects_at_path(
-                    &output_directory,
+                    output,
                     Some(files),
                     namespace_id,
                     table_id,
@@ -371,7 +454,7 @@ impl RemoteExporter {
     /// Performs a catalog request (within the object store grpc service), per file.
     async fn export_parquet_file(
         &mut self,
-        output_directory: &Path,
+        output: &Output,
         index: usize,
         num_parquet_files: usize,
         parquet_file: &ParquetFile,
@@ -382,18 +465,17 @@ impl RemoteExporter {
         // copy out the metadata as pbjson encoded data always (to
         // ensure we have the most up to date version)
         {
-            let filename = format!("{uuid}.parquet.json");
-            let file_path = output_directory.join(&filename);
             let json = serde_json::to_string_pretty(&parquet_file)?;
-            write_string_to_file(&json, &file_path).await?;
+            output
+                .write_string(format!("{uuid}.parquet.json"), &json)
+                .await?;
         }
 
         let filename = format!("{uuid}.parquet");
-        let file_path = output_directory.join(&filename);
-
-        if fs::metadata(&file_path)
+        if output
+            .size(&filename)
             .await
-            .map_or(false, |metadata| metadata.len() == file_size_bytes)
+            .is_ok_and(|size| (size as u64) == file_size_bytes)
         {
             println!(
                 "skipping file {} of {num_parquet_files} ({filename} already exists with expected file size)",
@@ -416,8 +498,10 @@ impl RemoteExporter {
                     .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
                     .into_async_read()
                     .compat();
-                let mut file = File::create(&file_path).await?;
-                io::copy(&mut response, &mut file).await?;
+
+                let mut writer = output.writer(filename);
+                io::copy(&mut response, &mut writer).await?;
+                writer.shutdown().await?;
             }
         }
 
@@ -431,7 +515,7 @@ impl RemoteExporter {
     /// Exports if existing in the object store path, which catalog requests.
     async fn export_existing_objects_at_path(
         &mut self,
-        output_directory: &Path,
+        output: &Output,
         filenames: Option<HashSet<String>>,
         namespace_id: NamespaceId,
         table_id: TableId,
@@ -476,10 +560,7 @@ impl RemoteExporter {
                 .await?;
 
         let mut index = 1;
-        while let Ok(Some(filename)) = existing_objects_exporter
-            .export_next(output_directory)
-            .await
-        {
+        while let Ok(Some(filename)) = existing_objects_exporter.export_next(output).await {
             println!("downloaded file {} ({filename})...", index);
             index += 1;
         }
@@ -501,7 +582,7 @@ fn to_partition_id(partition_identifier: Option<&PartitionIdentifier>) -> Transi
         .and_then(|pi| pi.id.as_ref())
         .expect("Catalog service should send the partition identifier")
     {
-        partition_identifier::Id::HashId(bytes) => TransitionPartitionId::Deterministic(
+        partition_identifier::Id::HashId(bytes) => TransitionPartitionId::Hash(
             PartitionHashId::try_from(&bytes[..])
                 .expect("Catalog service should send valid hash_id bytes"),
         ),
@@ -511,7 +592,7 @@ fn to_partition_id(partition_identifier: Option<&PartitionIdentifier>) -> Transi
     }
 }
 
-fn to_store_path(file: &ParquetFile) -> Result<object_store::path::Path> {
+fn to_store_path(file: &ParquetFile) -> Result<Path> {
     let ParquetFile {
         namespace_id,
         table_id,
@@ -524,7 +605,7 @@ fn to_store_path(file: &ParquetFile) -> Result<object_store::path::Path> {
         .try_into()
         .map_err(|e: PartitionHashIdError| ExportError::Internal(e.to_string()))?;
 
-    Ok(object_store::path::Path::from_iter([
+    Ok(Path::from_iter([
         &format!("{}", namespace_id),
         &format!("{}", table_id),
         TransitionPartitionId::from_parts(PartitionId::new(*partition_id), Some(partition_hash_id))
@@ -532,20 +613,6 @@ fn to_store_path(file: &ParquetFile) -> Result<object_store::path::Path> {
             .as_str(),
         &format!("{}.parquet", object_store_id),
     ]))
-}
-
-/// writes the contents of a string to a file, overwriting the previous contents, if any
-async fn write_string_to_file(contents: &str, path: &Path) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(path)
-        .await?;
-
-    file.write_all(contents.as_bytes()).await?;
-
-    Ok(())
 }
 
 /// Export existing objects from a given store prefix.
@@ -591,7 +658,7 @@ impl ExportExistingObjects {
     /// Export next object, if available
     async fn export_next(
         &mut self,
-        output_directory: &Path,
+        output: &Output,
     ) -> Result<Option<String /* filename */>, ExportError> {
         if self
             .objects_wanted
@@ -606,7 +673,7 @@ impl ExportExistingObjects {
             location, version, ..
         })) = self.objects_available.pop()
         {
-            let available_path = object_store::path::Path::parse(&location)?;
+            let available_path = Path::parse(&location)?;
             let available_filename = available_path
                 .filename()
                 .expect("path should have filename");
@@ -626,9 +693,9 @@ impl ExportExistingObjects {
                     .into_async_read()
                     .compat();
 
-                let file_path = output_directory.join(available_filename);
-                let mut file = File::create(&file_path).await?;
-                io::copy(&mut reader, &mut file).await?;
+                let mut writer = output.writer(available_filename);
+                io::copy(&mut reader, &mut writer).await?;
+                writer.shutdown().await?;
 
                 return Ok(Some(available_filename.to_string()));
             } else {

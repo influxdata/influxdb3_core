@@ -18,7 +18,7 @@ use datafusion::{
     datasource::file_format::parquet::statistics_from_parquet_meta_calc,
     error::DataFusionError,
     execution::context::ExecutionProps,
-    logical_expr::{utils::conjunction, Expr},
+    logical_expr::{Expr, utils::conjunction},
     parquet::{arrow::async_reader::AsyncFileReader, file::metadata::ParquetMetaData},
     physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
     scalar::ScalarValue,
@@ -27,7 +27,7 @@ use datafusion_util::create_physical_expr_from_schema;
 use futures::FutureExt;
 use metric::U64Counter;
 use object_store_mem_cache::cache_system::{
-    hook::observer::ObserverHook, s3_fifo_cache::S3FifoCache, Cache, DynError, HasSize,
+    Cache, DynError, HasSize, hook::observer::ObserverHook, s3_fifo_cache::S3FifoCache,
 };
 
 const CACHE_NAME: &str = "parquet_metadata";
@@ -405,7 +405,7 @@ impl HasSize for FileMetas {
             col_metas,
         } = self;
         let mut size = parquet_metadata.memory_size();
-        if let Some(ref col_metas) = col_metas {
+        if let Some(col_metas) = col_metas {
             size += col_metas
                 .iter()
                 .map(|col| {
@@ -628,7 +628,7 @@ mod tests {
     use arrow_util::assert_batches_eq;
     use bytes::Bytes;
     use datafusion::{
-        common::{stats::Precision, ColumnStatistics, Statistics},
+        common::{ColumnStatistics, Statistics, stats::Precision},
         parquet::{
             errors::ParquetError,
             file::metadata::FileMetaData,

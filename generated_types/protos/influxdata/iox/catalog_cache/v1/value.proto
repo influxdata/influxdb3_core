@@ -12,7 +12,8 @@ import "google/protobuf/wrappers.proto";
 // See data_types::snapshot::list::MessageList
 message MessageList {
   // Int32 offsets denoting slices into values
-  // See https://arrow.apache.org/docs/format/Columnar.html#variable-size-list-layout
+  // See
+  // https://arrow.apache.org/docs/format/Columnar.html#variable-size-list-layout
   bytes offsets = 1;
   // Raw value data
   bytes values = 2;
@@ -27,9 +28,7 @@ message SipHash24 {
 // See data_types::snapshot::hash::HashBuckets
 message HashBuckets {
   bytes buckets = 1;
-  oneof hash_function {
-    SipHash24 sip_hash_24 = 2;
-  }
+  oneof hash_function { SipHash24 sip_hash_24 = 2; }
 }
 
 // A packed bitmask
@@ -74,19 +73,20 @@ message Partition {
   optional int64 new_file_at = 10;
 
   // Skipped compaction registered for this partition.
-  influxdata.iox.skipped_compaction.v1.SkippedCompaction skipped_compaction = 11;
+  influxdata.iox.skipped_compaction.v1.SkippedCompaction skipped_compaction =
+      11;
 
   // The time of the last cold compaction
   optional int64 cold_compact_at = 12;
 
-  // The time this partition was created, or `None` if this partition was created before this field
-  // existed
+  // The time this partition was created, or `None` if this partition was
+  // created before this field existed
   optional int64 created_at = 13;
 }
 
 enum ParquetFileSource {
-    PARQUET_FILE_SOURCE_UNSPECIFIED = 0;
-    PARQUET_FILE_SOURCE_BULK_INGEST = 1;
+  PARQUET_FILE_SOURCE_UNSPECIFIED = 0;
+  PARQUET_FILE_SOURCE_BULK_INGEST = 1;
 }
 
 message PartitionFile {
@@ -122,6 +122,17 @@ message PartitionFile {
 
   // Which component created this parquet file
   ParquetFileSource source = 11;
+
+  // Present and true if this parquet file's object store path uses the partition's numeric ID
+  // (as opposed to the partition's hash ID, which is what most files use).
+  // Exists to enable file-by-file transition to always using the partition's hash ID.
+  //
+  // The current code always sets this value when encoding. This value's absence indicates the
+  // protobuf was cached before the code adding this field was deployed. In that case, the code
+  // will fall back to the behavior the catalog cache exhibited previously, which was looking at
+  // the partition to know which ID to use and assuming all Parquet files in a partition were
+  // addressed with the same ID.
+  optional bool use_numeric_partition_id = 12;
 }
 
 message Table {
@@ -142,6 +153,12 @@ message Table {
 
   // The name of the table
   bytes table_name = 6;
+
+  // Whether this table is enabled for an iceberg export.
+  bool iceberg_enabled = 7;
+
+  // The time, in nanoseconds from epoch, when this table was marked for delete.
+  optional int64 deleted_at = 8;
 }
 
 message TablePartition {
@@ -173,7 +190,8 @@ message Namespace {
   // The name of this table.
   bytes name = 4;
 
-  // The retention period in ns. None represents infinite duration (i.e. never drop data).
+  // The retention period in ns. None represents infinite duration (i.e. never
+  // drop data).
   optional int64 retention_period_ns = 5;
 
   // The maximum number of tables that can exist in this namespace
@@ -185,11 +203,12 @@ message Namespace {
   // When this namespace was marked for deletion.
   optional int64 deleted_at = 8;
 
-  // The partition template to use for new tables in this namespace either created implicitly or
-  // created without specifying a partition template.
+  // The partition template to use for new tables in this namespace either
+  // created implicitly or created without specifying a partition template.
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 9;
 
-  // The router-managed version associated with this instance of the namespace data object.
+  // The router-managed version associated with this instance of the namespace
+  // data object.
   int64 router_version = 10;
 }
 
@@ -198,6 +217,8 @@ message NamespaceTable {
   int64 id = 1;
   // The name of this table
   bytes name = 2;
+  // When this table was marked for deletion.
+  optional int64 deleted_at = 3;
 }
 
 message Root {
@@ -213,6 +234,8 @@ message RootNamespace {
   int64 id = 1;
   // The name of this namespace
   bytes name = 2;
+  // When this namespace was marked for deletion.
+  optional int64 deleted_at = 3;
 }
 
 message ListEntry {

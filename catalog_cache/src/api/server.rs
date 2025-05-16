@@ -1,16 +1,21 @@
 //! Server for the cache HTTP API
 
-use crate::api::list::{v1, v2, ListEntry};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE};
-use crate::local::CatalogCache;
 use crate::CacheValue;
+use crate::api::list::{ListEntry, v1, v2};
+use crate::api::{
+    GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V1, LIST_PROTOCOL_V2, NO_VALUE, RequestPath,
+};
+use crate::local::CatalogCache;
 use futures::ready;
 use hyper::body::HttpBody;
-use hyper::header::{HeaderValue, ToStrError, ETAG, IF_NONE_MATCH};
+use hyper::header::{ACCEPT, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH, ToStrError};
 use hyper::http::request::Parts;
 use hyper::service::Service;
-use hyper::{Body, HeaderMap, Method, Request, Response, StatusCode};
-use reqwest::header::CONTENT_TYPE;
+use hyper::{HeaderMap, Method, StatusCode};
+use iox_http_util::{
+    Request, RequestBody, Response, ResponseBuilder, bytes_to_response_body, empty_response_body,
+    stream_results_to_response_body,
+};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::convert::Infallible;
 use std::future::Future;
@@ -19,7 +24,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
 enum Error {
     #[snafu(display("Http error: {source}"), context(false))]
     Http { source: hyper::http::Error },
@@ -51,8 +55,8 @@ enum Error {
 
 impl Error {
     /// Convert an error into a [`Response`]
-    fn response(self) -> Response<Body> {
-        let mut response = Response::new(Body::from(self.to_string()));
+    fn response(self) -> Response {
+        let mut response = Response::new(bytes_to_response_body(self.to_string()));
         *response.status_mut() = match &self {
             Self::Http { .. } | Self::Hyper { .. } | Self::Local { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -78,8 +82,8 @@ struct ServiceState {
     cache: Arc<CatalogCache>,
 }
 
-impl Service<Request<Body>> for CatalogCacheService {
-    type Response = Response<Body>;
+impl Service<Request> for CatalogCacheService {
+    type Response = Response;
 
     type Error = Infallible;
     type Future = CatalogRequestFuture;
@@ -88,7 +92,7 @@ impl Service<Request<Body>> for CatalogCacheService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request) -> Self::Future {
         let (parts, body) = req.into_parts();
         CatalogRequestFuture {
             parts,
@@ -103,7 +107,7 @@ impl Service<Request<Body>> for CatalogCacheService {
 #[derive(Debug)]
 pub struct CatalogRequestFuture {
     /// The request body
-    body: Body,
+    body: RequestBody,
     /// The request parts
     parts: Parts,
     /// The in-progress body
@@ -115,7 +119,7 @@ pub struct CatalogRequestFuture {
 }
 
 impl Future for CatalogRequestFuture {
-    type Output = Result<Response<Body>, Infallible>;
+    type Output = Result<Response, Infallible>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let r = loop {
@@ -133,7 +137,7 @@ impl Future for CatalogRequestFuture {
 }
 
 impl CatalogRequestFuture {
-    fn call(&mut self) -> Result<Response<Body>, Error> {
+    fn call(&mut self) -> Result<Response, Error> {
         let body = std::mem::take(&mut self.buffer);
 
         let status = match RequestPath::parse(self.parts.uri.path()) {
@@ -147,19 +151,22 @@ impl CatalogRequestFuture {
                     let iter = self.state.cache.list();
                     let entries = iter.map(|(k, v)| ListEntry::new(k, v)).collect();
 
-                    let response = match self.parts.headers.get(CONTENT_TYPE) {
+                    let response = match self.parts.headers.get(ACCEPT) {
                         Some(x) if x == LIST_PROTOCOL_V2 => {
                             let encoder = v2::ListEncoder::new(entries).with_max_value_size(size);
                             let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
-                            Response::builder().body(Body::wrap_stream(stream))?
+                            ResponseBuilder::new()
+                                .header(CONTENT_TYPE, &LIST_PROTOCOL_V2)
+                                .body(stream_results_to_response_body(stream))?
                         }
                         _ => {
                             let encoder = v1::ListEncoder::new(entries).with_max_value_size(size);
                             let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
-                            Response::builder().body(Body::wrap_stream(stream))?
+                            ResponseBuilder::new()
+                                .header(CONTENT_TYPE, &LIST_PROTOCOL_V1)
+                                .body(stream_results_to_response_body(stream))?
                         }
                     };
-
                     return Ok(response);
                 }
                 _ => StatusCode::METHOD_NOT_ALLOWED,
@@ -167,16 +174,19 @@ impl CatalogRequestFuture {
             Some(RequestPath::Resource(key)) => match self.parts.method {
                 Method::GET => match self.state.cache.get(key) {
                     Some(value) => {
-                        let mut builder = Response::builder().header(&GENERATION, value.generation);
+                        let mut builder =
+                            ResponseBuilder::new().header(&GENERATION, value.generation);
                         if let Some(x) = &value.etag {
                             builder = builder.header(ETAG, x.as_ref())
                         }
 
                         return Ok(match check_preconditions(&value, &self.parts.headers)? {
-                            Some(s) => builder.status(s).body(Body::empty())?,
+                            Some(s) => builder.status(s).body(empty_response_body())?,
                             None => match value.data {
-                                Some(bytes) => builder.body(bytes.into())?,
-                                None => builder.header(&NO_VALUE, "true").body(Body::empty())?,
+                                Some(bytes) => builder.body(bytes_to_response_body(bytes))?,
+                                None => builder
+                                    .header(&NO_VALUE, "true")
+                                    .body(empty_response_body())?,
                             },
                         });
                     }
@@ -217,7 +227,7 @@ impl CatalogRequestFuture {
             None => StatusCode::NOT_FOUND,
         };
 
-        let mut response = Response::new(Body::empty());
+        let mut response = Response::new(empty_response_body());
         *response.status_mut() = status;
         Ok(response)
     }
@@ -282,7 +292,7 @@ impl CatalogCacheServer {
 pub mod test_util {
     use std::{net::SocketAddr, ops::Deref};
 
-    use hyper::{service::make_service_fn, Server};
+    use hyper::{Server, service::make_service_fn};
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 

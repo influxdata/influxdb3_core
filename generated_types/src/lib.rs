@@ -3,11 +3,11 @@
 // control over.
 #![expect(
     clippy::derive_partial_eq_without_eq,
-    clippy::future_not_send,
     clippy::large_enum_variant,
     clippy::needless_borrows_for_generic_args,
     clippy::needless_lifetimes,
     clippy::use_self,
+    clippy::allow_attributes,
     missing_copy_implementations
 )]
 
@@ -21,6 +21,13 @@ use prost_types::FileDescriptorProto;
 // Re-export prost for users of proto types.
 pub use prost;
 pub use prost_types::FileDescriptorSet;
+
+// Re-export commonly-used Tonic types
+pub use tonic::{
+    self, Code, IntoRequest, Request, Response, Status, Streaming, async_trait,
+    codegen::{StdError, http},
+    metadata, transport,
+};
 
 /// This module imports the generated protobuf code into a Rust module
 /// hierarchy that matches the namespace hierarchy of the protobuf
@@ -163,6 +170,16 @@ pub mod influxdata {
                 include!(concat!(
                     env!("OUT_DIR"),
                     "/influxdata.iox.column_type.v1.serde.rs"
+                ));
+            }
+        }
+
+        pub mod common {
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/influxdata.iox.common.v1.rs"));
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/influxdata.iox.common.v1.serde.rs"
                 ));
             }
         }
@@ -356,6 +373,136 @@ pub mod influxdata {
                 include!(concat!(env!("OUT_DIR"), "/influxdata.iox.wal.v1.serde.rs"));
             }
         }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        /// A selector enum for querying a router or catalog entity (currently either a namespace or table)
+        /// via some searchable property.
+        pub enum Target {
+            /// Selects a namespace or table by its name.
+            ///
+            /// For active (non-deleted) entities, names are guaranteed to be unique within a
+            /// given scope (ex. all active tables within a namespace have a unique name)
+            Name(String),
+            /// Selects a namespace or table by its unique ID.
+            ///
+            /// This ID is unique across all active and deleted entities of the same type.
+            Id(i64),
+        }
+
+        impl core::fmt::Display for Target {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::Id(id) => {
+                        id.fmt(f)?;
+                        write!(f, " (ID)")
+                    }
+                    Self::Name(name) => {
+                        name.fmt(f)?;
+                        write!(f, " (name)")
+                    }
+                }
+            }
+        }
+
+        impl From<i64> for Target {
+            fn from(value: i64) -> Self {
+                Self::Id(value)
+            }
+        }
+
+        impl From<String> for Target {
+            fn from(value: String) -> Self {
+                Self::Name(value)
+            }
+        }
+
+        impl<'a> From<&'a String> for Target {
+            fn from(value: &'a String) -> Self {
+                Self::Name(value.into())
+            }
+        }
+
+        impl<'a> From<&'a str> for Target {
+            fn from(value: &'a str) -> Self {
+                Self::Name(value.into())
+            }
+        }
+
+        macro_rules! target_from_impls {
+            ($proto_type:ty) => {
+                target_from_impls!($proto_type, Name, Id);
+            };
+            ($proto_type:ty, $name_variant:ident, $id_variant:ident) => {
+                impl From<$proto_type> for Target {
+                    fn from(value: $proto_type) -> Self {
+                        use $proto_type::*;
+                        match value {
+                            $name_variant(name) => Self::Name(name.into()),
+                            $id_variant(id) => Self::Id(id),
+                        }
+                    }
+                }
+                impl From<Target> for $proto_type {
+                    fn from(value: Target) -> Self {
+                        match value {
+                            Target::Name(name) => Self::$name_variant(name.into()),
+                            Target::Id(id) => Self::$id_variant(id),
+                        }
+                    }
+                }
+                impl<'a> From<Target> for Option<$proto_type> {
+                    fn from(value: Target) -> Self {
+                        Some(value.into())
+                    }
+                }
+            };
+        }
+
+        target_from_impls!(
+            table::v1::get_tables_request::Target,
+            NamespaceName,
+            NamespaceId
+        );
+        target_from_impls!(
+            table::v1::get_table_request::NamespaceTarget,
+            NamespaceName,
+            NamespaceId
+        );
+        target_from_impls!(
+            table::v1::get_table_request::TableTarget,
+            TableName,
+            TableId
+        );
+        target_from_impls!(
+            table::v1::create_table_request::NamespaceTarget,
+            NamespaceName,
+            NamespaceId
+        );
+        target_from_impls!(namespace::v1::get_namespace_request::Target);
+        target_from_impls!(namespace::v1::delete_namespace_request::Target);
+        target_from_impls!(namespace::v1::update_namespace_retention_request::Target);
+        target_from_impls!(
+            namespace::v1::update_namespace_service_protection_limit_request::Target
+        );
+        target_from_impls!(catalog::v2::namespace_update_retention_period_request::Target);
+        target_from_impls!(catalog::v2::namespace_soft_delete_request::Target);
+        target_from_impls!(catalog::v2::namespace_update_table_limit_request::Target);
+        target_from_impls!(catalog::v2::namespace_update_column_limit_request::Target);
+        target_from_impls!(
+            bulk_ingest::v1::upsert_sort_key_request::NamespaceTarget,
+            NamespaceName,
+            NamespaceId
+        );
+        target_from_impls!(
+            bulk_ingest::v1::new_parquet_metadata_request::NamespaceTarget,
+            NamespaceName,
+            NamespaceId
+        );
+        target_from_impls!(
+            schema::v1::upsert_schema_request::NamespaceTarget,
+            NamespaceName,
+            NamespaceId
+        );
     }
 
     pub mod pbdata {

@@ -2,19 +2,14 @@
 
 use std::sync::Arc;
 
-use crate::interface::{Catalog, RepoCollection};
-use crate::storage::serialization::{
-    serialize_namespace_with_storage, serialize_table_with_storage,
+use crate::interface::{
+    Catalog, NamespaceSorting, PaginationOptions, RepoCollection, SoftDeletedRows, TableSorting,
 };
 use crate::util_serialization::catalog_error_to_status;
 
 use async_trait::async_trait;
 use data_types::{NamespaceId, TableId};
-use generated_types::influxdata::iox::catalog_storage::v1 as proto;
-use tonic::{Request, Response, Status};
-
-use super::serialization::{deserialize_namespace_sort_field, deserialize_sort_direction};
-use super::sorting::sort_namespaces;
+use generated_types::{Request, Response, Status, influxdata::iox::catalog_storage::v1 as proto};
 
 /// gRPC server that provides:
 /// - namespace with storage, such as size and table count
@@ -58,21 +53,24 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
     ) -> Result<Response<proto::GetNamespacesWithStorageResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
-        let mut namespace_list = repos
+        let sorting = NamespaceSorting::from((req.sort_field, req.sort_direction));
+        let pagination = PaginationOptions::from((req.page_number, req.page_size));
+        let deleted = SoftDeletedRows::from(req.deleted);
+
+        let paginated_namespaces = repos
             .namespaces()
-            .list_storage()
+            .list_storage(Some(sorting), Some(pagination), deleted)
             .await
             .map_err(catalog_error_to_status)?;
 
-        let sort_field = deserialize_namespace_sort_field(req.sort_field)?;
-        let sort_direction = deserialize_sort_direction(req.sort_direction)?;
-        sort_namespaces(&mut namespace_list, sort_field, sort_direction);
-
         Ok(Response::new(proto::GetNamespacesWithStorageResponse {
-            namespace_with_storage: namespace_list
+            namespaces_with_storage: paginated_namespaces
+                .items
                 .into_iter()
-                .map(serialize_namespace_with_storage)
+                .map(From::from)
                 .collect(),
+            total: paginated_namespaces.total,
+            pages: paginated_namespaces.pages,
         }))
     }
 
@@ -84,13 +82,12 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
 
         let maybe_namespace_with_storage = repos
             .namespaces()
-            .get_storage_by_id(NamespaceId::new(req.id))
+            .get_storage_by_id(NamespaceId::new(req.id), SoftDeletedRows::from(req.deleted))
             .await
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::GetNamespaceWithStorageResponse {
-            namespace_with_storage: maybe_namespace_with_storage
-                .map(serialize_namespace_with_storage),
+            namespace_with_storage: maybe_namespace_with_storage.map(From::from),
         }))
     }
 
@@ -100,17 +97,25 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
     ) -> Result<Response<proto::GetTablesWithStorageResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
-        let table_list = repos
+        let sorting = TableSorting::from((req.sort_field, req.sort_direction));
+        let pagination = PaginationOptions::from((req.page_number, req.page_size));
+        let deleted = SoftDeletedRows::from(req.deleted);
+
+        let paginated_tables = repos
             .tables()
-            .list_storage_by_namespace_id(NamespaceId::new(req.namespace_id))
+            .list_storage_by_namespace_id(
+                NamespaceId::new(req.namespace_id),
+                Some(sorting),
+                Some(pagination),
+                deleted,
+            )
             .await
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::GetTablesWithStorageResponse {
-            table_with_storage: table_list
-                .into_iter()
-                .map(serialize_table_with_storage)
-                .collect(),
+            tables_with_storage: paginated_tables.items.into_iter().map(From::from).collect(),
+            total: paginated_tables.total,
+            pages: paginated_tables.pages,
         }))
     }
 
@@ -122,12 +127,15 @@ impl proto::catalog_storage_service_server::CatalogStorageService for CatalogSto
 
         let maybe_table_with_storage = repos
             .tables()
-            .get_storage_by_id(TableId::new(req.table_id))
+            .get_storage_by_id(
+                TableId::new(req.table_id),
+                SoftDeletedRows::from(req.deleted),
+            )
             .await
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::GetTableWithStorageResponse {
-            table_with_storage: maybe_table_with_storage.map(serialize_table_with_storage),
+            table_with_storage: maybe_table_with_storage.map(From::from),
         }))
     }
 }
@@ -139,22 +147,21 @@ mod tests {
     use data_types::partition_template::{
         NamespacePartitionTemplateOverride, TablePartitionTemplateOverride,
     };
-    use data_types::{MaxColumnsPerTable, MaxTables, NamespaceWithStorage, TableWithStorage};
-    use generated_types::influxdata::iox::catalog_storage::v1::{
-        self as proto, catalog_storage_service_server::CatalogStorageService,
+    use data_types::{
+        MaxColumnsPerTable, MaxTables, NamespaceWithStorage, TableWithStorage, Timestamp,
+    };
+    use generated_types::influxdata::iox::common::v1::SoftDeleted;
+    use generated_types::{
+        Request,
+        influxdata::iox::catalog_storage::v1::{
+            self as proto, catalog_storage_service_server::CatalogStorageService,
+        },
     };
     use iox_time::SystemProvider;
     use test_helpers::maybe_start_logging;
-    use tonic::Request;
 
-    use crate::storage::{
-        serialization::{
-            serialize_namespace_sort_field, serialize_namespace_with_storage,
-            serialize_sort_direction, serialize_table_with_storage,
-        },
-        server::CatalogStorageServer,
-        sorting::{NamespaceSortField, SortDirection},
-    };
+    use crate::interface::{NamespaceSortField, SortDirection, TableSortField};
+    use crate::storage::server::CatalogStorageServer;
     use crate::test_helpers::{
         arbitrary_namespace, create_and_get_file, delete_file, setup_table_and_partition,
     };
@@ -165,6 +172,7 @@ mod tests {
         maybe_start_logging();
         let namespace_name_1 = "namespace_name_1";
         let namespace_name_2 = "namespace_name_2";
+        let internal_name_1 = "_influx_test";
 
         // Set up catalog, server, and create a namespace
         let catalog = catalog();
@@ -172,7 +180,394 @@ mod tests {
         let mut repos = catalog.repositories();
         let namespace_1 = arbitrary_namespace(&mut *repos, namespace_name_1).await;
 
-        // Create two tables, thier partitions, and files in namespace_1
+        // Create two tables, their partitions, and files in namespace_1
+        let (ns_1_table_1, ns_1_partition_1) =
+            setup_table_and_partition(&mut *repos, "ns_1_table_1", &namespace_1).await;
+        let (ns_1_table_2, ns_1_partition_2) =
+            setup_table_and_partition(&mut *repos, "ns_1_table_2", &namespace_1).await;
+        let ns_1_file_1 =
+            create_and_get_file(&mut *repos, &namespace_1, &ns_1_table_1, &ns_1_partition_1).await;
+        let ns_1_file_2 =
+            create_and_get_file(&mut *repos, &namespace_1, &ns_1_table_2, &ns_1_partition_2).await;
+
+        // Verify the two files are in the same namespace, but different tables
+        assert_eq!(ns_1_file_1.namespace_id, ns_1_file_2.namespace_id);
+        assert_ne!(ns_1_file_1.table_id, ns_1_file_2.table_id);
+
+        // Create internal table to show they aren't returned
+        arbitrary_namespace(&mut *repos, internal_name_1).await;
+
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Id.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Expected one namespace
+        assert_eq!(response.namespaces_with_storage.len(), 1);
+
+        // Expected file size and table count is the sum of all tables
+        let expected_namespace_1 = create_expected_namespace_with_storage(
+            namespace_name_1,
+            &ns_1_file_1,
+            ns_1_file_1.file_size_bytes + ns_1_file_2.file_size_bytes,
+            2, // expect two tables
+            None,
+        );
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![expected_namespace_1],
+                total: 1,
+                pages: 1,
+            }
+        );
+
+        // Delete a file
+        delete_file(&mut *repos, &ns_1_file_1).await;
+
+        // Expected namespace size is the size of the file_2
+        let expected_namespace_1 = create_expected_namespace_with_storage(
+            namespace_name_1,
+            &ns_1_file_2,
+            ns_1_file_2.file_size_bytes,
+            2, // still expect two tables, even though one of the table has 0 size
+            None,
+        );
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Id.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![expected_namespace_1.clone()],
+                total: 1,
+                pages: 1,
+            }
+        );
+
+        // Create another namespace, and its table, partition, and file
+        let namespace_2 = arbitrary_namespace(&mut *repos, namespace_name_2).await;
+        let (ns_2_table_1, ns_2_partition) =
+            setup_table_and_partition(&mut *repos, "ns_2_table_1", &namespace_2).await;
+        let ns_2_file =
+            create_and_get_file(&mut *repos, &namespace_2, &ns_2_table_1, &ns_2_partition).await;
+
+        // Expected two namespaces
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Id.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.namespaces_with_storage.len(), 2);
+
+        // Delete a file in namespace_2
+        delete_file(&mut *repos, &ns_2_file).await;
+
+        // Expected two namespaces and namespace_2 has size 0
+        let expected_namespace_2 = create_expected_namespace_with_storage(
+            namespace_name_2,
+            &ns_2_file,
+            0, // expect no size
+            1, // expect one table even though no files are in this tables
+            None,
+        );
+
+        // Sort by name desc
+        // Expected namespace_1 to be last because it has the "greater" name alphabetically
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Name.into()),
+                sort_direction: Some(SortDirection::Descending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![
+                    expected_namespace_2.clone(),
+                    expected_namespace_1.clone()
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by name asc
+        // Expected namespace_1 to be first
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: Some(NamespaceSortField::Name.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![
+                    expected_namespace_1.clone(),
+                    expected_namespace_2.clone()
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Provide no sort field
+        // Expected namespace_1 to be first
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![
+                    expected_namespace_1.clone(),
+                    expected_namespace_2.clone()
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Get page 1
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![expected_namespace_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get page 2
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(2),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![expected_namespace_2.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get non-existent page returns an empty list
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(3),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page number reverts to default
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(-1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![expected_namespace_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page size reverts to default
+        let response = server
+            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                page_number: Some(1),
+                page_size: Some(-1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetNamespacesWithStorageResponse {
+                namespaces_with_storage: vec![
+                    expected_namespace_1.clone(),
+                    expected_namespace_2.clone()
+                ],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Delete namespace_2
+        let deleted_namespace_2 = repos
+            .namespaces()
+            .soft_delete(data_types::NamespaceId::new(expected_namespace_2.id))
+            .await
+            .unwrap();
+        let expected_namespace_2_deleted = create_expected_namespace_with_storage(
+            namespace_name_2,
+            &ns_2_file,
+            0, // expect no size
+            1, // expect one table even though no files are in this tables
+            deleted_namespace_2.deleted_at,
+        );
+
+        // Helper function to test deletion status
+        async fn assert_deletion_status(
+            server: &CatalogStorageServer,
+            expected_namespaces: Vec<proto::NamespaceWithStorage>,
+            expected_total: i64,
+            expected_pages: i64,
+            deleted: Option<SoftDeleted>,
+        ) {
+            let response = server
+                .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
+                    page_number: None,
+                    page_size: None,
+                    sort_field: None,
+                    sort_direction: None,
+                    deleted: deleted.map(Into::into),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response,
+                proto::GetNamespacesWithStorageResponse {
+                    namespaces_with_storage: expected_namespaces,
+                    total: expected_total,
+                    pages: expected_pages,
+                }
+            );
+        }
+
+        // When deletion status is not set, expect only namespace_1 in the list
+        assert_deletion_status(&server, vec![expected_namespace_1.clone()], 1, 1, None).await;
+
+        // When deletion status is set to show all, expect both namespace_1 and namespace_2 in the list
+        assert_deletion_status(
+            &server,
+            vec![
+                expected_namespace_1.clone(),
+                expected_namespace_2_deleted.clone(),
+            ],
+            2,
+            1,
+            Some(SoftDeleted::ListAll),
+        )
+        .await;
+
+        // When deletion status is set to show only active, expect only namespace_1 in the list
+        assert_deletion_status(
+            &server,
+            vec![expected_namespace_1.clone()],
+            1,
+            1,
+            Some(SoftDeleted::OnlyActive),
+        )
+        .await;
+
+        // When deletion status is set to show only deleted, expect only namespace_2 in the list
+        assert_deletion_status(
+            &server,
+            vec![expected_namespace_2_deleted.clone()],
+            1,
+            1,
+            Some(SoftDeleted::OnlyDeleted),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_catalog_storage_get_namespace_with_storage() {
+        maybe_start_logging();
+        let namespace_name_1 = "namespace_name_1";
+
+        // Set up catalog, server, and create a namespace
+        let catalog = catalog();
+        let server = CatalogStorageServer::new(Arc::clone(&catalog));
+        let mut repos = catalog.repositories();
+        let namespace_1 = arbitrary_namespace(&mut *repos, namespace_name_1).await;
+
+        // Create two tables, their partitions, and files in namespace_1
         let (ns_1_table_1, ns_1_partition_1) =
             setup_table_and_partition(&mut *repos, "ns_1_table_1", &namespace_1).await;
         let (ns_1_table_2, ns_1_partition_2) =
@@ -187,16 +582,13 @@ mod tests {
         assert_ne!(ns_1_file_1.table_id, ns_1_file_2.table_id);
 
         let response = server
-            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Id),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+            .get_namespace_with_storage(Request::new(proto::GetNamespaceWithStorageRequest {
+                id: ns_1_file_1.namespace_id.get(),
+                deleted: None,
             }))
             .await
             .unwrap()
             .into_inner();
-
-        // Expected one namespace
-        assert_eq!(response.namespace_with_storage.len(), 1);
 
         // Expected file size and table count is the sum of all tables
         let expected_namespace_1 = create_expected_namespace_with_storage(
@@ -204,123 +596,28 @@ mod tests {
             &ns_1_file_1,
             ns_1_file_1.file_size_bytes + ns_1_file_2.file_size_bytes,
             2, // expect two tables
+            None,
         );
         assert_eq!(
             response,
-            proto::GetNamespacesWithStorageResponse {
-                namespace_with_storage: vec![expected_namespace_1]
+            proto::GetNamespaceWithStorageResponse {
+                namespace_with_storage: Some(expected_namespace_1),
             }
         );
 
-        // Delete a file
-        delete_file(&mut *repos, &ns_1_file_1).await;
-
-        // Expected namespace size is the size of the file_2
-        let expected_namespace_1 = create_expected_namespace_with_storage(
-            namespace_name_1,
-            &ns_1_file_2,
-            ns_1_file_2.file_size_bytes,
-            2, // still expect two tables, even though one of the table has 0 size
-        );
-        let response = server
-            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Id),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
+        // Get a non-existent namespace
+        let non_existent_namespace = server
+            .get_namespace_with_storage(Request::new(proto::GetNamespaceWithStorageRequest {
+                id: 100, // non-existent namespace ID
+                deleted: None,
             }))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(
-            response,
-            proto::GetNamespacesWithStorageResponse {
-                namespace_with_storage: vec![expected_namespace_1.clone()]
-            }
-        );
-
-        // Create another namespace, and its table, partition, and file
-        let namespace_2 = arbitrary_namespace(&mut *repos, namespace_name_2).await;
-        let (ns_2_table_1, ns_2_partition) =
-            setup_table_and_partition(&mut *repos, "ns_2_table_1", &namespace_2).await;
-        let ns_2_file =
-            create_and_get_file(&mut *repos, &namespace_2, &ns_2_table_1, &ns_2_partition).await;
-
-        // Expected two namespaces
-        let response = server
-            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Id),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(response.namespace_with_storage.len(), 2);
-
-        // Delete a file in namespace_2
-        delete_file(&mut *repos, &ns_2_file).await;
-
-        // Expected two namespaces and namespace_2 has size 0
-        let expected_namespace_2 = create_expected_namespace_with_storage(
-            namespace_name_2,
-            &ns_2_file,
-            0, // expect no size
-            1, // expect one table even though no files are in this tables
-        );
-        let response = server
-            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Storage),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            response,
-            proto::GetNamespacesWithStorageResponse {
-                // namespace_2 should be first because it has size 0
-                namespace_with_storage: vec![
-                    expected_namespace_2.clone(),
-                    expected_namespace_1.clone()
-                ]
-            }
-        );
-
-        // Sort by name desc
-        // Expected namespace_1 to be last because it has the "greater" name alphabetically
-        let response = server
-            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Name),
-                sort_direction: serialize_sort_direction(SortDirection::Desc),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            response,
-            proto::GetNamespacesWithStorageResponse {
-                namespace_with_storage: vec![
-                    expected_namespace_2.clone(),
-                    expected_namespace_1.clone()
-                ]
-            }
-        );
-
-        // Sort by name asc
-        // Expected namespace_1 to be first
-        let response = server
-            .get_namespaces_with_storage(Request::new(proto::GetNamespacesWithStorageRequest {
-                sort_field: serialize_namespace_sort_field(NamespaceSortField::Name),
-                sort_direction: serialize_sort_direction(SortDirection::Asc),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            response,
-            proto::GetNamespacesWithStorageResponse {
-                namespace_with_storage: vec![
-                    expected_namespace_1.clone(),
-                    expected_namespace_2.clone()
-                ]
+            non_existent_namespace,
+            proto::GetNamespaceWithStorageResponse {
+                namespace_with_storage: None,
             }
         );
     }
@@ -365,24 +662,32 @@ mod tests {
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_1_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
             }))
             .await
             .unwrap()
             .into_inner();
 
         // Expected one table
-        assert_eq!(response.table_with_storage.len(), 1);
+        assert_eq!(response.tables_with_storage.len(), 1);
 
         // Expected file size is the sum of all files
         let expected_table_1 = create_expected_table_with_storage(
             table_name_1,
             &table_1_file_1,
             table_1_file_1.file_size_bytes + table_1_file_2.file_size_bytes,
+            None,
         );
         assert_eq!(
             response,
             proto::GetTablesWithStorageResponse {
-                table_with_storage: vec![expected_table_1]
+                tables_with_storage: vec![expected_table_1],
+                total: 1,
+                pages: 1,
             }
         );
 
@@ -394,10 +699,16 @@ mod tests {
             table_name_1,
             &table_1_file_1,
             table_1_file_2.file_size_bytes,
+            None,
         );
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_1_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
             }))
             .await
             .unwrap()
@@ -405,7 +716,9 @@ mod tests {
         assert_eq!(
             response,
             proto::GetTablesWithStorageResponse {
-                table_with_storage: vec![expected_table_1.clone()]
+                tables_with_storage: vec![expected_table_1.clone()],
+                total: 1,
+                pages: 1,
             }
         );
 
@@ -426,22 +739,33 @@ mod tests {
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
             }))
             .await
             .unwrap()
             .into_inner();
 
         // Expected two tables
-        assert_eq!(response.table_with_storage.len(), 2);
+        assert_eq!(response.tables_with_storage.len(), 2);
 
         // Delete a file in table2
         delete_file(&mut *repos, &table_2_file_1).await;
 
         // Expected two tables and table2 has size 0
-        let expected_table_2 = create_expected_table_with_storage(table_name_2, &table_2_file_1, 0);
+        let expected_table_2 =
+            create_expected_table_with_storage(table_name_2, &table_2_file_1, 0, None);
         let response = server
             .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
                 namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
             }))
             .await
             .unwrap()
@@ -449,13 +773,278 @@ mod tests {
         assert_eq!(
             response,
             proto::GetTablesWithStorageResponse {
-                table_with_storage: vec![expected_table_1, expected_table_2]
+                tables_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
             }
         );
+
+        // Sort by name desc
+        // Expected table_2 to be first
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Name.into()),
+                sort_direction: Some(SortDirection::Descending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_2.clone(), expected_table_1.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Sort by name asc
+        // Expected table_1 to be first
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: Some(TableSortField::Name.into()),
+                sort_direction: Some(SortDirection::Ascending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Provide a sort direction but no sort field
+        // Expect no sorting to have been applied
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: None,
+                page_size: None,
+                sort_field: None,
+                sort_direction: Some(SortDirection::Ascending.into()),
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Get page 1
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get page 2
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(2),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_2.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Get non-existent page returns an empty list
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(3),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page number reverts to default
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(-1),
+                page_size: Some(1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_1.clone()],
+                total: 2,
+                pages: 2,
+            }
+        );
+
+        // Negative page size reverts to default
+        let response = server
+            .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                namespace_id: table_2_file_1.namespace_id.get(),
+                page_number: Some(1),
+                page_size: Some(-1),
+                sort_field: None,
+                sort_direction: None,
+                deleted: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response,
+            proto::GetTablesWithStorageResponse {
+                tables_with_storage: vec![expected_table_1.clone(), expected_table_2.clone()],
+                total: 2,
+                pages: 1,
+            }
+        );
+
+        // Delete table_2
+        let deleted_table_2 = repos.tables().soft_delete(test_table_2.id).await.unwrap();
+        let expected_table_2_deleted = create_expected_table_with_storage(
+            table_name_2,
+            &table_2_file_1,
+            0, // expect no size
+            deleted_table_2.deleted_at,
+        );
+
+        // Helper function to test deletion status
+        async fn assert_deletion_status(
+            server: &CatalogStorageServer,
+            namespace_id: i64,
+            expected_tables: Vec<proto::TableWithStorage>,
+            expected_total: i64,
+            expected_pages: i64,
+            deleted: Option<SoftDeleted>,
+        ) {
+            let response = server
+                .get_tables_with_storage(Request::new(proto::GetTablesWithStorageRequest {
+                    namespace_id,
+                    page_number: None,
+                    page_size: None,
+                    sort_field: None,
+                    sort_direction: None,
+                    deleted: deleted.map(Into::into),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response,
+                proto::GetTablesWithStorageResponse {
+                    tables_with_storage: expected_tables,
+                    total: expected_total,
+                    pages: expected_pages,
+                }
+            );
+        }
+
+        // When deletion status is not set, expect only table_1 in the list
+        assert_deletion_status(
+            &server,
+            table_1_file_1.namespace_id.get(),
+            vec![expected_table_1.clone()],
+            1,
+            1,
+            None,
+        )
+        .await;
+
+        // When deletion status is set to show all, expect both table_1 and table_2 in the list
+        assert_deletion_status(
+            &server,
+            table_1_file_1.namespace_id.get(),
+            vec![expected_table_1.clone(), expected_table_2_deleted.clone()],
+            2,
+            1,
+            Some(SoftDeleted::ListAll),
+        )
+        .await;
+
+        // When deletion status is set to show only active, expect only table_1 in the list
+        assert_deletion_status(
+            &server,
+            table_1_file_1.namespace_id.get(),
+            vec![expected_table_1.clone()],
+            1,
+            1,
+            Some(SoftDeleted::OnlyActive),
+        )
+        .await;
+
+        // When deletion status is set to show only deleted, expect only table_2 in the list
+        assert_deletion_status(
+            &server,
+            table_1_file_1.namespace_id.get(),
+            vec![expected_table_2_deleted.clone()],
+            1,
+            1,
+            Some(SoftDeleted::OnlyDeleted),
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn test_catalog_storage_get_table_storage_by_id() {
+    async fn test_catalog_storage_get_table_with_storage() {
         maybe_start_logging();
         let table_name = "test_table";
 
@@ -480,8 +1069,8 @@ mod tests {
         let server = CatalogStorageServer::new(Arc::clone(&catalog));
         let table_with_storage = server
             .get_table_with_storage(Request::new(proto::GetTableWithStorageRequest {
-                namespace_id: file_1.namespace_id.get(),
                 table_id: file_1.table_id.get(),
+                deleted: None,
             }))
             .await
             .unwrap()
@@ -492,6 +1081,7 @@ mod tests {
             table_name,
             &file_1,
             file_1.file_size_bytes + file_2.file_size_bytes,
+            None,
         );
         assert_eq!(
             table_with_storage,
@@ -503,8 +1093,8 @@ mod tests {
         // Get a non-existent table
         let non_existent_table = server
             .get_table_with_storage(Request::new(proto::GetTableWithStorageRequest {
-                namespace_id: file_1.namespace_id.get(),
                 table_id: 100, // non-existent table ID
+                deleted: None,
             }))
             .await
             .unwrap()
@@ -529,8 +1119,9 @@ mod tests {
         file: &data_types::ParquetFile,
         expected_size: i64,
         expected_table_count: i64,
+        deleted_at: Option<Timestamp>,
     ) -> proto::NamespaceWithStorage {
-        serialize_namespace_with_storage(NamespaceWithStorage {
+        NamespaceWithStorage {
             id: file.namespace_id,
             name: namespace_name.to_string(),
             retention_period_ns: None,
@@ -539,7 +1130,9 @@ mod tests {
             partition_template: NamespacePartitionTemplateOverride::default(),
             size_bytes: expected_size,
             table_count: expected_table_count,
-        })
+            deleted_at,
+        }
+        .into()
     }
 
     // Helper function to create an expected table
@@ -547,13 +1140,17 @@ mod tests {
         table_name: &str,
         file: &data_types::ParquetFile,
         expected_size: i64,
+        deleted_at: Option<Timestamp>,
     ) -> proto::TableWithStorage {
-        serialize_table_with_storage(TableWithStorage {
+        TableWithStorage {
             id: file.table_id,
             namespace_id: file.namespace_id,
             name: table_name.to_string(),
             partition_template: TablePartitionTemplateOverride::default(),
             size_bytes: expected_size,
-        })
+            deleted_at,
+            column_count: 0,
+        }
+        .into()
     }
 }

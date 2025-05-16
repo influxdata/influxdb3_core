@@ -157,6 +157,14 @@ impl<'a> std::convert::TryFrom<&'a str> for NamespaceName<'a> {
     }
 }
 
+impl<'a> std::convert::TryFrom<&'a String> for NamespaceName<'a> {
+    type Error = NamespaceNameError;
+
+    fn try_from(v: &'a String) -> Result<Self, Self::Error> {
+        Self::new(v)
+    }
+}
+
 impl std::convert::TryFrom<String> for NamespaceName<'_> {
     type Error = NamespaceNameError;
 
@@ -291,37 +299,55 @@ mod tests {
     #[test]
     fn test_bad_chars_null() {
         let got = NamespaceName::new("example\x00").unwrap_err();
-        assert_eq!(got.to_string() , "namespace name 'example\x00' contains invalid character, character number 7 is not whitelisted");
+        assert_eq!(
+            got.to_string(),
+            "namespace name 'example\x00' contains invalid character, character number 7 is not whitelisted"
+        );
     }
 
     #[test]
     fn test_bad_chars_high_control() {
         let got = NamespaceName::new("\u{007f}example").unwrap_err();
-        assert_eq!(got.to_string() , "namespace name '\u{007f}example' contains invalid character, character number 0 is not whitelisted");
+        assert_eq!(
+            got.to_string(),
+            "namespace name '\u{007f}example' contains invalid character, character number 0 is not whitelisted"
+        );
     }
 
     #[test]
     fn test_bad_chars_tab() {
         let got = NamespaceName::new("example\tdb").unwrap_err();
-        assert_eq!(got.to_string() , "namespace name 'example\tdb' contains invalid character, character number 7 is not whitelisted");
+        assert_eq!(
+            got.to_string(),
+            "namespace name 'example\tdb' contains invalid character, character number 7 is not whitelisted"
+        );
     }
 
     #[test]
     fn test_bad_chars_newline() {
         let got = NamespaceName::new("my_example\ndb").unwrap_err();
-        assert_eq!(got.to_string() , "namespace name 'my_example\ndb' contains invalid character, character number 10 is not whitelisted");
+        assert_eq!(
+            got.to_string(),
+            "namespace name 'my_example\ndb' contains invalid character, character number 10 is not whitelisted"
+        );
     }
 
     #[test]
     fn test_bad_chars_whitespace() {
         let got = NamespaceName::new("my_example db").unwrap_err();
-        assert_eq!(got.to_string() , "namespace name 'my_example db' contains invalid character, character number 10 is not whitelisted");
+        assert_eq!(
+            got.to_string(),
+            "namespace name 'my_example db' contains invalid character, character number 10 is not whitelisted"
+        );
     }
 
     #[test]
     fn test_bad_chars_single_quote() {
         let got = NamespaceName::new("my_example'db").unwrap_err();
-        assert_eq!(got.to_string() , "namespace name 'my_example\'db' contains invalid character, character number 10 is not whitelisted");
+        assert_eq!(
+            got.to_string(),
+            "namespace name 'my_example\'db' contains invalid character, character number 10 is not whitelisted"
+        );
     }
 
     #[test]

@@ -563,17 +563,18 @@ impl Schema {
         use InfluxColumnType::*;
         let mut primary_keys: Vec<_> = self
             .iter()
-            .filter_map(|(column_type, field)| match column_type {
-                Tag => Some((Tag, field)),
+            .enumerate()
+            .filter_map(|(idx, (column_type, field))| match column_type {
+                Tag => Some((Tag, field, idx)),
                 Field(_) => None,
-                Timestamp => Some((Timestamp, field)),
+                Timestamp => Some((Timestamp, field, idx)),
             })
             .collect();
 
         // Now, sort lexographically (but put timestamp last)
-        primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
+        primary_keys.sort_by(|(a_column_type, _a, a_idx), (b_column_type, _b, b_idx)| {
             match (a_column_type, b_column_type) {
-                (Tag, Tag) => a.name().cmp(b.name()),
+                (Tag, Tag) => a_idx.cmp(b_idx),
                 (Timestamp, Tag) => Ordering::Greater,
                 (Tag, Timestamp) => Ordering::Less,
                 (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
@@ -584,7 +585,7 @@ impl Schema {
         // Take just the names
         primary_keys
             .into_iter()
-            .map(|(_column_type, field)| field.name().as_str())
+            .map(|(_column_type, field, _idx)| field.name().as_str())
             .collect()
     }
 
@@ -1405,6 +1406,24 @@ mod test {
             res.unwrap_err().to_string(),
             "Column not found 'unknown_field'"
         );
+    }
+
+    #[cfg(not(feature = "v3"))]
+    #[test]
+    fn test_primary_key() {
+        let schema = SchemaBuilder::new()
+            .influx_field("field1", String)
+            .tag("tag3")
+            .influx_field("field2", String)
+            .timestamp()
+            .influx_field("field3", String)
+            .tag("tag1")
+            .influx_field("field4", String)
+            .measurement("the_measurement")
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.primary_key(), vec!["tag3", "tag1", "time"]);
     }
 
     #[test]

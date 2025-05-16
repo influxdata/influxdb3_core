@@ -18,7 +18,7 @@ pub use http::HeaderMap;
 
 /// Layer that installs [`Trailers`] as a [request extension](Request::extensions).
 #[derive(Debug, Clone, Default)]
-#[allow(missing_copy_implementations)]
+#[expect(missing_copy_implementations)]
 pub struct TrailerLayer;
 
 impl<S> Layer<S> for TrailerLayer {

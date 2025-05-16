@@ -1,10 +1,10 @@
 use std::borrow::Cow;
-use std::num::{NonZeroU128, NonZeroU64};
+use std::num::{NonZeroU64, NonZeroU128};
 use std::sync::Arc;
 
 use rand::Rng;
 
-use crate::{span::Span, TraceCollector};
+use crate::{TraceCollector, span::Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceId(pub NonZeroU128);
@@ -27,9 +27,9 @@ impl SpanId {
         Some(Self(NonZeroU64::new(val)?))
     }
 
-    pub fn gen() -> Self {
+    pub fn rand() -> Self {
         // Should this be a UUID?
-        Self(rand::thread_rng().gen())
+        Self(rand::rng().random())
     }
 
     pub fn get(self) -> u64 {
@@ -69,9 +69,9 @@ impl SpanContext {
 
     /// Same as [`new`](Self::new), but with an optional collector.
     pub fn new_with_optional_collector(collector: Option<Arc<dyn TraceCollector>>) -> Self {
-        let mut rng = rand::thread_rng();
-        let trace_id: u128 = rng.gen_range(1..u128::MAX);
-        let span_id: u64 = rng.gen_range(1..u64::MAX);
+        let mut rng = rand::rng();
+        let trace_id: u128 = rng.random_range(1..u128::MAX);
+        let span_id: u64 = rng.random_range(1..u64::MAX);
 
         Self {
             trace_id: TraceId(NonZeroU128::new(trace_id).unwrap()),
@@ -87,7 +87,7 @@ impl SpanContext {
     pub fn child(&self, name: impl Into<Cow<'static, str>>) -> Span {
         let ctx = Self {
             trace_id: self.trace_id,
-            span_id: SpanId::gen(),
+            span_id: SpanId::rand(),
             collector: self.collector.clone(),
             links: Vec::with_capacity(0),
             parent_span_id: Some(self.span_id),

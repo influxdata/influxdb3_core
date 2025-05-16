@@ -1,6 +1,6 @@
 use crate::{MetricKind, MetricObserver, Observation};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A monotonic counter.
 ///
@@ -48,7 +48,7 @@ macro_rules! assert_counter {
         $(value = $value:expr,)*
     ) => {
         // Default to an empty set of attributes if not specified.
-        #[allow(unused)]
+        #[expect(unused)]
         let mut attr = None;
         $(attr = Some($attr);)*
         let attr = attr.unwrap_or_else(|| metric::Attributes::from(&[]));

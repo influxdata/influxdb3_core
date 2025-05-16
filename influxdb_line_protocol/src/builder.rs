@@ -329,7 +329,7 @@ impl FieldValue for u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{parse_lines, FieldSet, ParsedLine};
+    use crate::{FieldSet, ParsedLine, parse_lines};
 
     use super::*;
 

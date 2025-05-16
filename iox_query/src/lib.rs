@@ -1,5 +1,5 @@
 //! Contains the IOx query engine
-#![allow(unreachable_pub)]
+#![expect(unreachable_pub)]
 
 use arrow::{
     datatypes::{DataType, Field, SchemaRef},
@@ -18,7 +18,7 @@ use futures::TryStreamExt;
 use iox_query_params::StatementParams;
 use parquet_file::storage::ParquetExecInput;
 use query_log::{QueryCompletedToken, QueryText, StateReceived};
-use schema::{sort::SortKey, Projection, Schema};
+use schema::{Projection, Schema, sort::SortKey};
 use std::{
     any::Any,
     fmt::Debug,
@@ -35,7 +35,6 @@ pub mod chunk_statistics;
 pub mod config;
 pub mod exec;
 pub mod extension;
-pub mod file_access_observer;
 pub mod frontend;
 pub mod ingester;
 pub mod logical_optimizer;
@@ -129,6 +128,7 @@ pub trait QueryNamespace: Debug + Send + Sync {
         query_type: &'static str,
         query_text: QueryText,
         query_params: StatementParams,
+        auth_id: Option<String>,
     ) -> QueryCompletedToken<StateReceived>;
 
     /// Returns a new execution context suitable for running queries

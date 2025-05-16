@@ -47,7 +47,8 @@ impl FieldsPivotExec {
         PlanProperties::new(
             equivalence_properties,
             output_partitioning,
-            input.execution_mode(),
+            input.pipeline_behavior(),
+            input.boundedness(),
         )
     }
 
@@ -159,9 +160,9 @@ impl ExecutionPlan for FieldsPivotExec {
     }
 
     fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
-        vec![Some(LexRequirement::new(vec![self
-            .physical_sort_requirement
-            .clone()]))]
+        vec![Some(LexRequirement::new(vec![
+            self.physical_sort_requirement.clone(),
+        ]))]
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

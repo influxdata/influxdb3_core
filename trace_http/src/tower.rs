@@ -14,8 +14,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Buf;
@@ -27,12 +27,21 @@ use tower::{Layer, Service};
 
 use observability_deps::tracing::{debug, error};
 use trace::span::{SpanEvent, SpanStatus};
-use trace::{span::SpanRecorder, TraceCollector};
+use trace::{TraceCollector, span::SpanRecorder};
 
-use crate::classify::{classify_headers, classify_response, Classification};
+use crate::classify::{Classification, classify_headers, classify_response};
 use crate::ctx::{RequestLogContext, RequestLogContextExt, TraceHeaderParser};
 use crate::metrics::{MetricsRecorder, RequestMetrics};
 use crate::query_variant::QueryVariantExt;
+
+/// ServiceProtocol is used to denote what protocol is being handled by the `Service`.
+/// This is used as part of the algorithm for determining when
+/// a request has fully completed rather than been aborted by the client.
+#[derive(Debug, Clone, Copy)]
+pub enum ServiceProtocol {
+    Http,
+    Grpc,
+}
 
 /// `TraceLayer` implements `tower::Layer` and can be used to decorate a
 /// `tower::Service` to collect information about requests flowing through it
@@ -49,6 +58,7 @@ pub struct TraceLayer {
     metrics: Arc<RequestMetrics>,
     collector: Option<Arc<dyn TraceCollector>>,
     name: Arc<str>,
+    service_protocol: ServiceProtocol,
 }
 
 impl TraceLayer {
@@ -58,12 +68,14 @@ impl TraceLayer {
         metrics: Arc<RequestMetrics>,
         collector: Option<Arc<dyn TraceCollector>>,
         name: &str,
+        service_protocol: ServiceProtocol,
     ) -> Self {
         Self {
             trace_header_parser,
             metrics,
             collector,
             name: name.into(),
+            service_protocol,
         }
     }
 }
@@ -78,6 +90,7 @@ impl<S> Layer<S> for TraceLayer {
             metrics: Arc::clone(&self.metrics),
             trace_header_parser: Some(self.trace_header_parser.clone()),
             name: Arc::clone(&self.name),
+            service_protocol: self.service_protocol,
         }
     }
 }
@@ -90,6 +103,7 @@ pub struct TraceService<S> {
     collector: Option<Arc<dyn TraceCollector>>,
     metrics: Arc<RequestMetrics>,
     name: Arc<str>,
+    service_protocol: ServiceProtocol,
 }
 
 impl<S> TraceService<S> {
@@ -99,6 +113,7 @@ impl<S> TraceService<S> {
         metrics: Arc<RequestMetrics>,
         collector: Option<Arc<dyn TraceCollector>>,
         name: &str,
+        service_protocol: ServiceProtocol,
     ) -> Self {
         Self {
             service,
@@ -106,6 +121,7 @@ impl<S> TraceService<S> {
             metrics,
             collector,
             name: name.into(),
+            service_protocol,
         }
     }
 }
@@ -163,6 +179,7 @@ where
             metrics_recorder,
             span_recorder: SpanRecorder::new(span),
             was_ready: false,
+            protocol: self.service_protocol,
             inner: self.service.call(request),
         }
     }
@@ -177,6 +194,7 @@ pub struct TracedFuture<F> {
     span_recorder: SpanRecorder,
     metrics_recorder: Option<MetricsRecorder>,
     was_ready: bool,
+    protocol: ServiceProtocol,
     #[pin]
     inner: F,
 }
@@ -247,6 +265,7 @@ where
                     span_recorder,
                     was_done_data: AtomicBool::new(false),
                     was_ready_trailers: AtomicBool::new(false),
+                    protocol: *projected.protocol,
                     inner: body,
                     metrics_recorder,
                 })))
@@ -265,6 +284,7 @@ pub struct TracedBody<B> {
     metrics_recorder: MetricsRecorder,
     was_done_data: AtomicBool,
     was_ready_trailers: AtomicBool,
+    protocol: ServiceProtocol,
     #[pin]
     inner: B,
 }
@@ -299,54 +319,40 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
         let maybe_result = ready!(self.as_mut().project().inner.poll_data(cx));
-        let result = match maybe_result {
-            Some(result) => result,
-            None => {
-                self.as_mut()
-                    .project()
-                    .was_done_data
-                    .store(true, Ordering::SeqCst);
-                return Poll::Ready(None);
+
+        match maybe_result {
+            Some(Ok(body)) => {
+                self.handle_data(&body);
+                Poll::Ready(Some(Ok(body)))
             }
-        };
+            Some(Err(e)) => {
+                self.handle_error();
+                Poll::Ready(Some(Err(e)))
+            }
+            None => {
+                let projected = self.as_mut().project();
+                match projected.protocol {
+                    ServiceProtocol::Http => {
+                        // Hyper v0.14.31 does not ever poll the trailers for HTTP 1 connections.
+                        // As a result, we need to record an `ok` metric here to prevent all
+                        // HTTP 1 requests from being considered as `aborted`.
+                        projected
+                            .metrics_recorder
+                            .set_classification(Classification::Ok);
 
-        let projected = self.as_mut().project();
-        let span_recorder = projected.span_recorder;
-        let metrics_recorder = projected.metrics_recorder;
-
-        match &result {
-            Ok(body) => {
-                let size = body.remaining() as i64;
-                metrics_recorder.add_response_body_size(size as u64);
-
-                match projected.inner.is_end_stream() {
-                    true => {
-                        metrics_recorder.set_classification(Classification::Ok);
-
-                        let mut evt = SpanEvent::new("returned body data and no trailers");
-                        evt.set_metadata("size", size);
-                        span_recorder.event(evt);
-                        span_recorder.status(SpanStatus::Ok);
-
-                        projected.was_done_data.store(true, Ordering::SeqCst);
                         projected.was_ready_trailers.store(true, Ordering::SeqCst);
                     }
-                    false => {
-                        let mut evt = SpanEvent::new("returned body data");
-                        evt.set_metadata("size", size);
-                        span_recorder.event(evt);
+                    ServiceProtocol::Grpc => {
+                        // Do nothing for Grpc, we need trailers to be polled
+                        // before we can be certain the response has been fully consumed.
                     }
                 }
-            }
-            Err(_) => {
-                metrics_recorder.set_classification(Classification::ServerErr);
-                span_recorder.error("error getting body");
+
                 projected.was_done_data.store(true, Ordering::SeqCst);
-                projected.was_ready_trailers.store(true, Ordering::SeqCst);
+
+                Poll::Ready(None)
             }
         }
-
-        Poll::Ready(Some(result))
     }
 
     fn poll_trailers(
@@ -356,25 +362,17 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
         let result: Result<Option<http::header::HeaderMap>, Self::Error> =
             ready!(self.as_mut().project().inner.poll_trailers(cx));
 
-        let projected = self.as_mut().project();
-
-        projected.was_done_data.store(true, Ordering::SeqCst);
-        projected.was_ready_trailers.store(true, Ordering::SeqCst);
-
-        let span_recorder = projected.span_recorder;
-        let metrics_recorder = projected.metrics_recorder;
         match &result {
-            Ok(headers) => match classify_headers(headers.as_ref()) {
-                (_, Classification::Ok) => {
-                    metrics_recorder.set_classification(Classification::Ok);
-                    span_recorder.ok("returned trailers")
-                }
-                (error, c) => {
-                    metrics_recorder.set_classification(c);
-                    span_recorder.error(error)
-                }
-            },
+            Ok(headers) => self.handle_trailers(headers.as_ref()),
             Err(_) => {
+                let projected = self.as_mut().project();
+
+                projected.was_done_data.store(true, Ordering::SeqCst);
+                projected.was_ready_trailers.store(true, Ordering::SeqCst);
+
+                let span_recorder = projected.span_recorder;
+                let metrics_recorder = projected.metrics_recorder;
+
                 metrics_recorder.set_classification(Classification::ServerErr);
                 span_recorder.error("error getting trailers")
             }
@@ -394,5 +392,67 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+impl<B: http_body::Body> TracedBody<B> {
+    fn handle_data(mut self: Pin<&mut Self>, body: &B::Data) {
+        let projected = self.as_mut().project();
+        let span_recorder = projected.span_recorder;
+        let metrics_recorder = projected.metrics_recorder;
+
+        let size = body.remaining() as i64;
+        metrics_recorder.add_response_body_size(size as u64);
+
+        match projected.inner.is_end_stream() {
+            true => {
+                metrics_recorder.set_classification(Classification::Ok);
+
+                let mut evt = SpanEvent::new("returned body data and no trailers");
+                evt.set_metadata("size", size);
+                span_recorder.event(evt);
+                span_recorder.status(SpanStatus::Ok);
+
+                projected.was_done_data.store(true, Ordering::SeqCst);
+                projected.was_ready_trailers.store(true, Ordering::SeqCst);
+            }
+            false => {
+                let mut evt = SpanEvent::new("returned body data");
+                evt.set_metadata("size", size);
+                span_recorder.event(evt);
+            }
+        }
+    }
+
+    fn handle_trailers(mut self: Pin<&mut Self>, headers: Option<&http::header::HeaderMap>) {
+        let projected = self.as_mut().project();
+
+        projected.was_done_data.store(true, Ordering::SeqCst);
+        projected.was_ready_trailers.store(true, Ordering::SeqCst);
+
+        let span_recorder = projected.span_recorder;
+        let metrics_recorder = projected.metrics_recorder;
+
+        match classify_headers(headers) {
+            (_, Classification::Ok) => {
+                metrics_recorder.set_classification(Classification::Ok);
+                span_recorder.ok("returned trailers")
+            }
+            (error, c) => {
+                metrics_recorder.set_classification(c);
+                span_recorder.error(error)
+            }
+        }
+    }
+
+    fn handle_error(mut self: Pin<&mut Self>) {
+        let projected = self.as_mut().project();
+        let span_recorder = projected.span_recorder;
+        let metrics_recorder = projected.metrics_recorder;
+
+        metrics_recorder.set_classification(Classification::ServerErr);
+        span_recorder.error("error getting body");
+        projected.was_done_data.store(true, Ordering::SeqCst);
+        projected.was_ready_trailers.store(true, Ordering::SeqCst);
     }
 }

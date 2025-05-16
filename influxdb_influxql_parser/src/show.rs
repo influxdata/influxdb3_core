@@ -3,9 +3,9 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/
 
 use crate::common::ws1;
-use crate::identifier::{identifier, Identifier};
+use crate::identifier::{Identifier, identifier};
 use crate::impl_tuple_clause;
-use crate::internal::{expect, ParseResult};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
 use crate::show_field_keys::show_field_keys;
 use crate::show_measurements::show_measurements;
@@ -13,17 +13,21 @@ use crate::show_retention_policies::show_retention_policies;
 use crate::show_tag_keys::show_tag_keys;
 use crate::show_tag_values::show_tag_values;
 use crate::statement::Statement;
+use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::{map, value};
 use nom::sequence::{pair, preceded};
 use std::fmt::{Display, Formatter};
+
+const INVALID_SHOW_STATEMENT_ERROR: &str = "invalid SHOW statement, expected DATABASES, \
+    FIELD KEYS, MEASUREMENTS, TAG KEYS, TAG VALUES, or RETENTION POLICIES following SHOW";
 
 /// Parse a SHOW statement.
 pub(crate) fn show_statement(i: &str) -> ParseResult<&str, Statement> {
     preceded(
         pair(keyword("SHOW"), ws1),
         expect(
-            "invalid SHOW statement, expected DATABASES, FIELD, MEASUREMENTS, TAG, or RETENTION following SHOW",
+            INVALID_SHOW_STATEMENT_ERROR,
             alt((
                 // SHOW DATABASES
                 map(show_databases, |s| Statement::ShowDatabases(Box::new(s))),
@@ -41,7 +45,8 @@ pub(crate) fn show_statement(i: &str) -> ParseResult<&str, Statement> {
                 show_tag,
             )),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents a `SHOW DATABASES` statement.
@@ -56,7 +61,7 @@ impl Display for ShowDatabasesStatement {
 
 /// Parse a `SHOW DATABASES` statement.
 fn show_databases(i: &str) -> ParseResult<&str, ShowDatabasesStatement> {
-    value(ShowDatabasesStatement, keyword("DATABASES"))(i)
+    value(ShowDatabasesStatement, keyword("DATABASES")).parse(i)
 }
 
 /// Represents an `ON` clause for the case where the database is a single [`Identifier`].
@@ -91,7 +96,8 @@ pub(crate) fn on_clause(i: &str) -> ParseResult<&str, OnClause> {
             "invalid ON clause, expected identifier",
             map(identifier, OnClause),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a `SHOW TAG (KEYS|VALUES)` statement.
@@ -105,7 +111,8 @@ fn show_tag(i: &str) -> ParseResult<&str, Statement> {
                 map(show_tag_values, |s| Statement::ShowTagValues(Box::new(s))),
             )),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 #[cfg(test)]
@@ -143,9 +150,13 @@ mod test {
         );
 
         // Unsupported SHOW
+
+        assert_expect_error!(show_statement("SHOW FOO"), INVALID_SHOW_STATEMENT_ERROR);
+        assert_expect_error!(show_statement("SHOW FIELD"), INVALID_SHOW_STATEMENT_ERROR);
+        assert_expect_error!(show_statement("SHOW TAG"), INVALID_SHOW_STATEMENT_ERROR);
         assert_expect_error!(
-            show_statement("SHOW FOO"),
-            "invalid SHOW statement, expected DATABASES, FIELD, MEASUREMENTS, TAG, or RETENTION following SHOW"
+            show_statement("SHOW RETENTION"),
+            INVALID_SHOW_STATEMENT_ERROR
         );
     }
 

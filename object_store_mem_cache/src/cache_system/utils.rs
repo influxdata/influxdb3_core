@@ -1,7 +1,7 @@
 //! A few helpers to build cache-related code.
 use std::{
     future::Future,
-    panic::{resume_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, resume_unwind},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -178,11 +178,10 @@ mod tests {
 
     use futures::FutureExt as _;
     use futures_concurrency::future::FutureExt as _;
+    use futures_test_utils::{AssertFutureExt, FutureObserver};
     use tokio::sync::Barrier;
 
-    use crate::cache_system::test_utils::{
-        assert_converge_eq, AssertPendingFutureExt, FutureObserver, WithTimeoutFutureExt,
-    };
+    use crate::cache_system::test_utils::assert_converge_eq;
 
     use super::*;
 
@@ -196,7 +195,7 @@ mod tests {
         });
 
         // this would timeout if the task is just an ordinary future
-        barrier.wait().with_timeout().await;
+        barrier.wait().boxed().poll_timeout().await;
     }
 
     #[tokio::test]
@@ -236,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::async_yields_async)]
+    #[expect(clippy::async_yields_async)]
     fn test_tokio_task_runtime_shutdown() {
         let rt_1 = tokio::runtime::Builder::new_current_thread()
             .enable_time()

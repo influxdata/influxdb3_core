@@ -1,8 +1,10 @@
 //! gRPC server implementation.
 
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
+use super::serialization::serialize_timestamp;
 use crate::{
+    constants::PARTITION_DELETION_CUTOFF,
     grpc::serialization::{
         deserialize_column_type, deserialize_object_store_id, deserialize_parquet_file_params,
         deserialize_sort_key_ids, serialize_column, serialize_namespace, serialize_object_store_id,
@@ -11,25 +13,25 @@ use crate::{
     },
     interface::{CasFailure, Catalog, RepoCollection},
     util_serialization::{
-        catalog_error_to_status, deserialize_soft_deleted_rows, ContextExt, ConvertExt,
-        ConvertOptExt, RequiredExt,
+        ContextExt, ConvertExt, ConvertOptExt, RequiredExt, catalog_error_to_status,
+        deserialize_soft_deleted_rows,
     },
 };
 use async_trait::async_trait;
 use data_types::{
-    NamespaceId, NamespaceServiceProtectionLimitsOverride, PartitionId, PartitionKey, TableId,
-    Timestamp,
+    NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, PartitionId,
+    PartitionKey, TableId, Timestamp,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use generated_types::influxdata::iox::catalog::v2::{
-    self as proto, ParquetFileDeleteOldIdsCountRequest, ParquetFileDeleteOldIdsCountResponse,
-    PartitionDeleteByRetentionRequest,
+use generated_types::{
+    Request, Response, Status, Streaming,
+    influxdata::iox::catalog::v2::{
+        self as proto, ParquetFileDeleteOldIdsCountRequest, ParquetFileDeleteOldIdsCountResponse,
+        PartitionDeleteByRetentionRequest,
+    },
 };
-use tonic::{Request, Response, Status};
 
-use super::serialization::serialize_timestamp;
-
-type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
+type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 /// gRPC server.
 #[derive(Debug)]
@@ -55,9 +57,10 @@ impl GrpcCatalogServer {
     fn preprocess_request<T>(&self, req: Request<T>) -> (Box<dyn RepoCollection>, T) {
         let mut repos = self.catalog.repositories();
 
-        repos.set_span_context(req.extensions().get().cloned());
+        let (_, mut extensions, inner) = req.into_parts();
+        repos.set_span_context(extensions.remove());
 
-        (repos, req.into_inner())
+        (repos, inner)
     }
 }
 
@@ -67,6 +70,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     type TableListByNamespaceIdStream = TonicStream<proto::TableListByNamespaceIdResponse>;
     type TableListStream = TonicStream<proto::TableListResponse>;
+    type TableListByIcebergEnabledStream = TonicStream<proto::TableListByIcebergEnabledResponse>;
 
     type ColumnCreateOrGetManyUncheckedStream =
         TonicStream<proto::ColumnCreateOrGetManyUncheckedResponse>;
@@ -126,7 +130,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_create(
         &self,
         request: Request<proto::NamespaceCreateRequest>,
-    ) -> Result<Response<proto::NamespaceCreateResponse>, tonic::Status> {
+    ) -> Result<Response<proto::NamespaceCreateResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let ns = repos
@@ -146,7 +150,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
                                 .convert_opt()
                                 .ctx("max_columns_per_table")?,
                         };
-                        Ok(l) as Result<_, tonic::Status>
+                        Ok(l) as Result<_, Status>
                     })
                     .transpose()?,
             )
@@ -163,7 +167,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_update_retention_period(
         &self,
         request: Request<proto::NamespaceUpdateRetentionPeriodRequest>,
-    ) -> Result<Response<proto::NamespaceUpdateRetentionPeriodResponse>, tonic::Status> {
+    ) -> Result<Response<proto::NamespaceUpdateRetentionPeriodResponse>, Status> {
         use proto::namespace_update_retention_period_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
@@ -171,10 +175,10 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
+                    .get_by_name(&name)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .ok_or(Status::not_found(name.to_string()))?
                     .id
             }
             Target::Id(id) => NamespaceId::new(id),
@@ -198,7 +202,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_list(
         &self,
         request: Request<proto::NamespaceListRequest>,
-    ) -> Result<Response<Self::NamespaceListStream>, tonic::Status> {
+    ) -> Result<Response<Self::NamespaceListStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let deleted = deserialize_soft_deleted_rows(req.deleted)?;
@@ -224,7 +228,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_get_by_id(
         &self,
         request: Request<proto::NamespaceGetByIdRequest>,
-    ) -> Result<Response<proto::NamespaceGetByIdResponse>, tonic::Status> {
+    ) -> Result<Response<proto::NamespaceGetByIdResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let deleted = deserialize_soft_deleted_rows(req.deleted)?;
@@ -245,14 +249,12 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_get_by_name(
         &self,
         request: Request<proto::NamespaceGetByNameRequest>,
-    ) -> Result<Response<proto::NamespaceGetByNameResponse>, tonic::Status> {
+    ) -> Result<Response<proto::NamespaceGetByNameResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
-
-        let deleted = deserialize_soft_deleted_rows(req.deleted)?;
 
         let maybe_ns = repos
             .namespaces()
-            .get_by_name(&req.name, deleted)
+            .get_by_name(&req.name)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -266,38 +268,40 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_soft_delete(
         &self,
         request: Request<proto::NamespaceSoftDeleteRequest>,
-    ) -> Result<Response<proto::NamespaceSoftDeleteResponse>, tonic::Status> {
-        use proto::namespace_soft_delete_request::Target;
+    ) -> Result<Response<proto::NamespaceSoftDeleteResponse>, Status> {
+        use proto::{
+            namespace_soft_delete_request::Target, namespace_soft_delete_response::Deleted,
+        };
         let (mut repos, req) = self.preprocess_request(request);
 
         let id = match req.target.required()? {
             Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
+                    .get_by_name(&name)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .ok_or(Status::not_found(name.to_string()))?
                     .id
             }
             Target::Id(v) => NamespaceId::new(v),
         };
 
-        let id = repos
+        let ns = repos
             .namespaces()
             .soft_delete(id)
             .await
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::NamespaceSoftDeleteResponse {
-            namespace_id: id.get(),
+            deleted: Some(Deleted::Namespace(serialize_namespace(ns))),
         }))
     }
 
     async fn namespace_update_table_limit(
         &self,
         request: Request<proto::NamespaceUpdateTableLimitRequest>,
-    ) -> Result<Response<proto::NamespaceUpdateTableLimitResponse>, tonic::Status> {
+    ) -> Result<Response<proto::NamespaceUpdateTableLimitResponse>, Status> {
         use proto::namespace_update_table_limit_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
@@ -305,10 +309,10 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
+                    .get_by_name(&name)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .ok_or(Status::not_found(name.to_string()))?
                     .id
             }
             Target::Id(id) => NamespaceId::new(id),
@@ -330,7 +334,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn namespace_update_column_limit(
         &self,
         request: Request<proto::NamespaceUpdateColumnLimitRequest>,
-    ) -> Result<Response<proto::NamespaceUpdateColumnLimitResponse>, tonic::Status> {
+    ) -> Result<Response<proto::NamespaceUpdateColumnLimitResponse>, Status> {
         use proto::namespace_update_column_limit_request::Target;
         let (mut repos, req) = self.preprocess_request(request);
 
@@ -338,10 +342,10 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
             Target::Name(name) => {
                 repos
                     .namespaces()
-                    .get_by_name(&name, crate::interface::SoftDeletedRows::ExcludeDeleted)
+                    .get_by_name(&name)
                     .await
                     .map_err(catalog_error_to_status)?
-                    .ok_or(tonic::Status::not_found(name.to_string()))?
+                    .ok_or(Status::not_found(name.to_string()))?
                     .id
             }
             Target::Id(id) => NamespaceId::new(id),
@@ -395,10 +399,48 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         }))
     }
 
+    async fn namespace_rename(
+        &self,
+        request: Request<proto::NamespaceRenameRequest>,
+    ) -> Result<Response<proto::NamespaceRenameResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+        let new_name = NamespaceName::new(req.new_name)
+            .map_err(|v| Status::invalid_argument(v.to_string()))?;
+        let ns = repos
+            .namespaces()
+            .rename(NamespaceId::new(req.id), new_name)
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        let ns = serialize_namespace(ns);
+
+        Ok(Response::new(proto::NamespaceRenameResponse {
+            namespace: Some(ns),
+        }))
+    }
+
+    async fn namespace_undelete(
+        &self,
+        request: Request<proto::NamespaceUndeleteRequest>,
+    ) -> Result<Response<proto::NamespaceUndeleteResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+        let ns = repos
+            .namespaces()
+            .undelete(NamespaceId::new(req.id))
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        let ns = serialize_namespace(ns);
+
+        Ok(Response::new(proto::NamespaceUndeleteResponse {
+            namespace: Some(ns),
+        }))
+    }
+
     async fn table_create(
         &self,
         request: Request<proto::TableCreateRequest>,
-    ) -> Result<Response<proto::TableCreateResponse>, tonic::Status> {
+    ) -> Result<Response<proto::TableCreateResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let table = repos
@@ -421,7 +463,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn table_get_by_id(
         &self,
         request: Request<proto::TableGetByIdRequest>,
-    ) -> Result<Response<proto::TableGetByIdResponse>, tonic::Status> {
+    ) -> Result<Response<proto::TableGetByIdResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let maybe_table = repos
@@ -438,7 +480,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn table_get_by_namespace_and_name(
         &self,
         request: Request<proto::TableGetByNamespaceAndNameRequest>,
-    ) -> Result<Response<proto::TableGetByNamespaceAndNameResponse>, tonic::Status> {
+    ) -> Result<Response<proto::TableGetByNamespaceAndNameResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let maybe_table = repos
@@ -455,7 +497,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn table_list_by_namespace_id(
         &self,
         request: Request<proto::TableListByNamespaceIdRequest>,
-    ) -> Result<Response<Self::TableListByNamespaceIdStream>, tonic::Status> {
+    ) -> Result<Response<Self::TableListByNamespaceIdStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let table_list = repos
@@ -476,7 +518,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn table_list(
         &self,
         request: Request<proto::TableListRequest>,
-    ) -> Result<Response<Self::TableListStream>, tonic::Status> {
+    ) -> Result<Response<Self::TableListStream>, Status> {
         let (mut repos, _req) = self.preprocess_request(request);
 
         let table_list = repos
@@ -512,10 +554,116 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         }))
     }
 
+    async fn table_list_by_iceberg_enabled(
+        &self,
+        request: Request<proto::TableListByIcebergEnabledRequest>,
+    ) -> Result<Response<Self::TableListByIcebergEnabledStream>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        let tables_with_iceberg = repos
+            .tables()
+            .list_by_iceberg_enabled(NamespaceId::new(req.namespace_id))
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(
+            futures::stream::iter(tables_with_iceberg.into_iter().map(|table_id| {
+                Ok(proto::TableListByIcebergEnabledResponse {
+                    table_id: table_id.get(),
+                })
+            }))
+            .boxed(),
+        ))
+    }
+
+    async fn table_enable_iceberg(
+        &self,
+        request: Request<proto::TableEnableIcebergRequest>,
+    ) -> Result<Response<proto::TableEnableIcebergResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        repos
+            .tables()
+            .enable_iceberg(TableId::new(req.table_id))
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::TableEnableIcebergResponse {}))
+    }
+
+    async fn table_disable_iceberg(
+        &self,
+        request: Request<proto::TableDisableIcebergRequest>,
+    ) -> Result<Response<proto::TableDisableIcebergResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        repos
+            .tables()
+            .disable_iceberg(TableId::new(req.table_id))
+            .await
+            .map_err(catalog_error_to_status)?;
+
+        Ok(Response::new(proto::TableDisableIcebergResponse {}))
+    }
+
+    async fn table_rename(
+        &self,
+        req: Request<proto::TableRenameRequest>,
+    ) -> Result<Response<proto::TableRenameResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(req);
+
+        repos
+            .tables()
+            .rename(TableId::new(req.table_id), &req.new_name)
+            .await
+            .map_err(catalog_error_to_status)
+            .map(|table| {
+                Response::new(proto::TableRenameResponse {
+                    table: Some(serialize_table(table)),
+                })
+            })
+    }
+
+    async fn table_soft_delete(
+        &self,
+        req: Request<proto::TableSoftDeleteRequest>,
+    ) -> Result<Response<proto::TableSoftDeleteResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(req);
+
+        repos
+            .tables()
+            .soft_delete(TableId::new(req.table_id))
+            .await
+            .map_err(catalog_error_to_status)
+            .map(|table| {
+                Response::new(proto::TableSoftDeleteResponse {
+                    table: Some(serialize_table(table)),
+                })
+            })
+    }
+
+    async fn table_undelete(
+        &self,
+        req: Request<proto::TableUndeleteRequest>,
+    ) -> Result<Response<proto::TableUndeleteResponse>, Status> {
+        let (mut repos, req) = self.preprocess_request(req);
+
+        repos
+            .tables()
+            .undelete(TableId::new(req.table_id))
+            .await
+            .map_err(catalog_error_to_status)
+            .map(|table| {
+                Response::new(proto::TableUndeleteResponse {
+                    table: Some(serialize_table(table)),
+                })
+            })
+    }
+
     async fn column_create_or_get(
         &self,
         request: Request<proto::ColumnCreateOrGetRequest>,
-    ) -> Result<Response<proto::ColumnCreateOrGetResponse>, tonic::Status> {
+    ) -> Result<Response<proto::ColumnCreateOrGetResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let column_type = deserialize_column_type(req.column_type)?;
@@ -536,7 +684,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn column_create_or_get_many_unchecked(
         &self,
         request: Request<proto::ColumnCreateOrGetManyUncheckedRequest>,
-    ) -> Result<Response<Self::ColumnCreateOrGetManyUncheckedStream>, tonic::Status> {
+    ) -> Result<Response<Self::ColumnCreateOrGetManyUncheckedStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let columns = req
@@ -546,7 +694,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
                 let t = deserialize_column_type(*t)?;
                 Ok((name.as_str(), t))
             })
-            .collect::<Result<_, tonic::Status>>()?;
+            .collect::<Result<_, Status>>()?;
 
         let column_list = repos
             .columns()
@@ -568,7 +716,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn column_list_by_namespace_id(
         &self,
         request: Request<proto::ColumnListByNamespaceIdRequest>,
-    ) -> Result<Response<Self::ColumnListByNamespaceIdStream>, tonic::Status> {
+    ) -> Result<Response<Self::ColumnListByNamespaceIdStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let column_list = repos
@@ -591,7 +739,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn column_list_by_table_id(
         &self,
         request: Request<proto::ColumnListByTableIdRequest>,
-    ) -> Result<Response<Self::ColumnListByTableIdStream>, tonic::Status> {
+    ) -> Result<Response<Self::ColumnListByTableIdStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let column_list = repos
@@ -614,12 +762,18 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn column_list(
         &self,
         request: Request<proto::ColumnListRequest>,
-    ) -> Result<Response<Self::ColumnListStream>, tonic::Status> {
-        let (mut repos, _req) = self.preprocess_request(request);
+    ) -> Result<Response<Self::ColumnListStream>, Status> {
+        let (mut repos, req) = self.preprocess_request(request);
+
+        // Default an empty request to AllRows for backwards compatibility
+        let deleted = deserialize_soft_deleted_rows(
+            req.deleted
+                .unwrap_or(proto::SoftDeletedRows::AllRows as i32),
+        )?;
 
         let column_list = repos
             .columns()
-            .list()
+            .list(deleted)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -637,7 +791,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_create_or_get(
         &self,
         request: Request<proto::PartitionCreateOrGetRequest>,
-    ) -> Result<Response<proto::PartitionCreateOrGetResponse>, tonic::Status> {
+    ) -> Result<Response<proto::PartitionCreateOrGetResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let partition = repos
@@ -656,7 +810,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_get_by_id_batch(
         &self,
         request: Request<proto::PartitionGetByIdBatchRequest>,
-    ) -> Result<Response<Self::PartitionGetByIdBatchStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionGetByIdBatchStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let partition_ids = req
@@ -685,7 +839,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_list_by_table_id(
         &self,
         request: Request<proto::PartitionListByTableIdRequest>,
-    ) -> Result<Response<Self::PartitionListByTableIdStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionListByTableIdStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let partition_list = repos
@@ -708,7 +862,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_list_ids(
         &self,
         request: Request<proto::PartitionListIdsRequest>,
-    ) -> Result<Response<Self::PartitionListIdsStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionListIdsStream>, Status> {
         let (mut repos, _req) = self.preprocess_request(request);
 
         let id_list = repos
@@ -730,7 +884,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_cas_sort_key(
         &self,
         request: Request<proto::PartitionCasSortKeyRequest>,
-    ) -> Result<Response<proto::PartitionCasSortKeyResponse>, tonic::Status> {
+    ) -> Result<Response<proto::PartitionCasSortKeyResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let res = repos
@@ -762,7 +916,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_record_skipped_compaction(
         &self,
         request: Request<proto::PartitionRecordSkippedCompactionRequest>,
-    ) -> Result<Response<proto::PartitionRecordSkippedCompactionResponse>, tonic::Status> {
+    ) -> Result<Response<proto::PartitionRecordSkippedCompactionResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         repos
@@ -787,7 +941,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_get_in_skipped_compactions(
         &self,
         request: Request<proto::PartitionGetInSkippedCompactionsRequest>,
-    ) -> Result<Response<Self::PartitionGetInSkippedCompactionsStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionGetInSkippedCompactionsStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let partition_ids = req
@@ -816,7 +970,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_list_skipped_compactions(
         &self,
         request: Request<proto::PartitionListSkippedCompactionsRequest>,
-    ) -> Result<Response<Self::PartitionListSkippedCompactionsStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionListSkippedCompactionsStream>, Status> {
         let (mut repos, _req) = self.preprocess_request(request);
 
         let skipped_compaction_list = repos
@@ -839,7 +993,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_delete_skipped_compactions(
         &self,
         request: Request<proto::PartitionDeleteSkippedCompactionsRequest>,
-    ) -> Result<Response<proto::PartitionDeleteSkippedCompactionsResponse>, tonic::Status> {
+    ) -> Result<Response<proto::PartitionDeleteSkippedCompactionsResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let maybe_skipped_compaction = repos
@@ -860,7 +1014,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_most_recent_n(
         &self,
         request: Request<proto::PartitionMostRecentNRequest>,
-    ) -> Result<Response<Self::PartitionMostRecentNStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionMostRecentNStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let partition_list = repos
@@ -883,7 +1037,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_new_file_between(
         &self,
         request: Request<proto::PartitionNewFileBetweenRequest>,
-    ) -> Result<Response<Self::PartitionNewFileBetweenStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionNewFileBetweenStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let id_list = repos
@@ -926,7 +1080,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_needing_cold_compact(
         &self,
         request: Request<proto::PartitionNeedingColdCompactRequest>,
-    ) -> Result<Response<Self::PartitionNeedingColdCompactStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionNeedingColdCompactStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let id_list = repos
@@ -948,7 +1102,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn partition_list_old_style(
         &self,
         request: Request<proto::PartitionListOldStyleRequest>,
-    ) -> Result<Response<Self::PartitionListOldStyleStream>, tonic::Status> {
+    ) -> Result<Response<Self::PartitionListOldStyleStream>, Status> {
         let (mut repos, _req) = self.preprocess_request(request);
 
         let partition_list = repos
@@ -972,11 +1126,20 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
         &self,
         request: Request<PartitionDeleteByRetentionRequest>,
     ) -> Result<Response<Self::PartitionDeleteByRetentionStream>, Status> {
-        let (mut repos, _) = self.preprocess_request(request);
+        let (mut repos, req) = self.preprocess_request(request);
+
+        // Having `partition_cutoff_seconds` be an optional value is to facilitate deployment of
+        // the addition of the `partition_cutoff_seconds` field. After deployment to all clients,
+        // the default value set by `iox_catalog::constants::PARTITION_DELETION_CUTOFF` should
+        // always be sent.
+        let partition_cutoff = req
+            .partition_cutoff_seconds
+            .map(|s| Duration::from_secs(s as u64))
+            .unwrap_or(PARTITION_DELETION_CUTOFF);
 
         let res = repos
             .partitions()
-            .delete_by_retention()
+            .delete_by_retention(partition_cutoff)
             .await
             .map_err(catalog_error_to_status)?;
 
@@ -1012,7 +1175,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_flag_for_delete_by_retention(
         &self,
         request: Request<proto::ParquetFileFlagForDeleteByRetentionRequest>,
-    ) -> Result<Response<Self::ParquetFileFlagForDeleteByRetentionStream>, tonic::Status> {
+    ) -> Result<Response<Self::ParquetFileFlagForDeleteByRetentionStream>, Status> {
         let (mut repos, _req) = self.preprocess_request(request);
 
         let id_list = repos
@@ -1036,9 +1199,10 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_delete_old_ids_only(
         &self,
         request: Request<proto::ParquetFileDeleteOldIdsOnlyRequest>,
-    ) -> Result<Response<Self::ParquetFileDeleteOldIdsOnlyStream>, tonic::Status> {
+    ) -> Result<Response<Self::ParquetFileDeleteOldIdsOnlyStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
+        #[expect(deprecated)]
         let id_list = repos
             .parquet_files()
             .delete_old_ids_only(Timestamp::new(req.older_than))
@@ -1059,25 +1223,34 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_delete_old_ids_count(
         &self,
         request: Request<ParquetFileDeleteOldIdsCountRequest>,
-    ) -> Result<Response<ParquetFileDeleteOldIdsCountResponse>, tonic::Status> {
+    ) -> Result<Response<ParquetFileDeleteOldIdsCountResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
+        let ParquetFileDeleteOldIdsCountRequest { older_than, limit } = req;
 
-        let num_deleted = repos
+        let (num_deleted, oldest_deleted) = repos
             .parquet_files()
-            .delete_old_ids_count(Timestamp::new(req.older_than))
+            .delete_old_ids_count(
+                Timestamp::new(older_than),
+                // At time of writing, this limit should always be `Some(_)`, since that is what we
+                // have written the code in the garbage collector to do. However, we can't make
+                // this a non-optional field because we need to keep the grpc interface
+                // backwards-compatible. So here, if the limit is not specified, we just unwrap to
+                // the limit that we previously were using in this code.
+                limit.unwrap_or(10_000),
+            )
             .await
             .map_err(catalog_error_to_status)?;
 
         Ok(Response::new(proto::ParquetFileDeleteOldIdsCountResponse {
             num_deleted,
+            oldest_deleted: oldest_deleted.map(|ts| ts.get()),
         }))
     }
 
     async fn parquet_file_list_by_partition_not_to_delete_batch(
         &self,
         request: Request<proto::ParquetFileListByPartitionNotToDeleteBatchRequest>,
-    ) -> Result<Response<Self::ParquetFileListByPartitionNotToDeleteBatchStream>, tonic::Status>
-    {
+    ) -> Result<Response<Self::ParquetFileListByPartitionNotToDeleteBatchStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let partition_ids = req
@@ -1106,14 +1279,14 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_active_as_of(
         &self,
         _request: Request<proto::ParquetFileActiveAsOfRequest>,
-    ) -> Result<Response<Self::ParquetFileActiveAsOfStream>, tonic::Status> {
+    ) -> Result<Response<Self::ParquetFileActiveAsOfStream>, Status> {
         Ok(Response::new(futures::stream::empty().boxed()))
     }
 
     async fn parquet_file_get_by_object_store_id(
         &self,
         request: Request<proto::ParquetFileGetByObjectStoreIdRequest>,
-    ) -> Result<Response<proto::ParquetFileGetByObjectStoreIdResponse>, tonic::Status> {
+    ) -> Result<Response<proto::ParquetFileGetByObjectStoreIdResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let maybe_file = repos
@@ -1133,13 +1306,13 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
 
     async fn parquet_file_exists_by_object_store_id_batch(
         &self,
-        request: Request<tonic::Streaming<proto::ParquetFileExistsByObjectStoreIdBatchRequest>>,
-    ) -> Result<Response<Self::ParquetFileExistsByObjectStoreIdBatchStream>, tonic::Status> {
+        request: Request<Streaming<proto::ParquetFileExistsByObjectStoreIdBatchRequest>>,
+    ) -> Result<Response<Self::ParquetFileExistsByObjectStoreIdBatchStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let object_store_ids = req
-            .map_err(|e| tonic::Status::invalid_argument(e.to_string()))
-            .and_then(|req| async move {
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+            .and_then(async move |req| {
                 Ok(deserialize_object_store_id(
                     req.object_store_id.required().ctx("object_store_id")?,
                 ))
@@ -1167,17 +1340,15 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_exists_by_partition_and_object_store_id_batch(
         &self,
         request: Request<
-            tonic::Streaming<proto::ParquetFileExistsByPartitionAndObjectStoreIdBatchRequest>,
+            Streaming<proto::ParquetFileExistsByPartitionAndObjectStoreIdBatchRequest>,
         >,
-    ) -> Result<
-        Response<Self::ParquetFileExistsByPartitionAndObjectStoreIdBatchStream>,
-        tonic::Status,
-    > {
+    ) -> Result<Response<Self::ParquetFileExistsByPartitionAndObjectStoreIdBatchStream>, Status>
+    {
         let (mut repos, req) = self.preprocess_request(request);
 
         let ids = req
-            .map_err(|e| tonic::Status::invalid_argument(e.to_string()))
-            .and_then(|req| async move {
+            .map_err(|e| Status::invalid_argument(e.to_string()))
+            .and_then(async move |req| {
                 let partiton_id = PartitionId::new(req.partition_id);
                 let object_store_id = deserialize_object_store_id(
                     req.object_store_id.required().ctx("object_store_id")?,
@@ -1213,7 +1384,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_create_upgrade_delete(
         &self,
         request: Request<proto::ParquetFileCreateUpgradeDeleteRequest>,
-    ) -> Result<Response<proto::ParquetFileCreateUpgradeDeleteResponse>, tonic::Status> {
+    ) -> Result<Response<proto::ParquetFileCreateUpgradeDeleteResponse>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let delete = req
@@ -1254,7 +1425,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_create_upgrade_delete_full(
         &self,
         request: Request<proto::ParquetFileCreateUpgradeDeleteFullRequest>,
-    ) -> Result<Response<Self::ParquetFileCreateUpgradeDeleteFullStream>, tonic::Status> {
+    ) -> Result<Response<Self::ParquetFileCreateUpgradeDeleteFullStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let delete = req
@@ -1299,7 +1470,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_list_by_table_id(
         &self,
         request: Request<proto::ParquetFileListByTableIdRequest>,
-    ) -> Result<Response<Self::ParquetFileListByTableIdStream>, tonic::Status> {
+    ) -> Result<Response<Self::ParquetFileListByTableIdStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let compaction_level = if let Some(l) = req.compaction_level {
@@ -1333,7 +1504,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn parquet_file_list_by_namespace_id(
         &self,
         request: Request<proto::ParquetFileListByNamespaceIdRequest>,
-    ) -> Result<Response<Self::ParquetFileListByNamespaceIdStream>, tonic::Status> {
+    ) -> Result<Response<Self::ParquetFileListByNamespaceIdStream>, Status> {
         let (mut repos, req) = self.preprocess_request(request);
 
         let deleted = deserialize_soft_deleted_rows(req.deleted)?;
@@ -1356,7 +1527,7 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
     async fn get_time(
         &self,
         _request: Request<proto::GetTimeRequest>,
-    ) -> Result<Response<proto::GetTimeResponse>, tonic::Status> {
+    ) -> Result<Response<proto::GetTimeResponse>, Status> {
         match self.catalog.get_time().await {
             Ok(t) => Ok(Response::new(proto::GetTimeResponse {
                 time: Some(serialize_timestamp(t)),
@@ -1365,5 +1536,29 @@ impl proto::catalog_service_server::CatalogService for GrpcCatalogServer {
                 return Err(catalog_error_to_status(e));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::grpc::server::GrpcCatalogServer;
+    use crate::mem::MemCatalog;
+    use generated_types::{
+        Request,
+        influxdata::iox::catalog::v2::{ColumnListRequest, catalog_service_server::CatalogService},
+    };
+    use iox_time::Time;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_rollout() {
+        // This test demonstrates a scenario that caused us to error when testing the rollout.
+        let metrics = Arc::new(metric::Registry::default());
+        let time_provider = Arc::new(iox_time::MockProvider::new(Time::from_timestamp_nanos(0)));
+        let catalog = Arc::new(MemCatalog::new(metrics, time_provider));
+        let server = GrpcCatalogServer::new(catalog);
+        let req = Request::new(ColumnListRequest { deleted: None });
+        let res = server.column_list(req).await;
+        assert!(res.is_ok());
     }
 }

@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::cache_system::{hook::Hook, DynError};
+use crate::cache_system::{DynError, hook::Hook};
 
 use super::{EvictResult, HookDecision};
 
@@ -94,18 +94,18 @@ impl<K> Hook<K> for TestHook<K>
 where
     K: Clone + Eq + std::fmt::Debug + Send,
 {
-    fn insert(&self, gen: u64, k: &Arc<K>) {
+    fn insert(&self, generation: u64, k: &Arc<K>) {
         let mut state = self.state.lock().unwrap();
 
-        let gen_norm = state.normalize_gen(gen);
+        let gen_norm = state.normalize_gen(generation);
         state
             .records
             .push(TestHookRecord::Insert(gen_norm, k.as_ref().clone()))
     }
 
-    fn fetched(&self, gen: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, generation: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
         let mut state = self.state.lock().unwrap();
-        let gen_norm = state.normalize_gen(gen);
+        let gen_norm = state.normalize_gen(generation);
         state.records.push(TestHookRecord::Fetched(
             gen_norm,
             k.as_ref().clone(),
@@ -114,14 +114,14 @@ where
         state.fetch_results.pop_front().unwrap_or_default()
     }
 
-    fn evict(&self, gen: u64, k: &Arc<K>, res: EvictResult) {
+    fn evict(&self, generation: u64, k: &Arc<K>, res: EvictResult) {
         let mut state = self.state.lock().unwrap();
 
-        let gen_norm = state.normalize_gen(gen);
+        let gen_norm = state.normalize_gen(generation);
         state
             .records
             .push(TestHookRecord::Evict(gen_norm, k.as_ref().clone(), res));
-        state.forget_gen(gen);
+        state.forget_gen(generation);
     }
 }
 

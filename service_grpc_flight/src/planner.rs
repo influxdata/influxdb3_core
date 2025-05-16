@@ -3,21 +3,20 @@ use std::sync::Arc;
 
 use arrow_flight::FlightData;
 use bytes::Bytes;
+pub(crate) use datafusion::error::{DataFusionError as Error, Result};
 use datafusion::{
     arrow::datatypes::SchemaRef, error::DataFusionError, physical_plan::ExecutionPlan,
 };
 use flightsql::{FlightSQLCommand, FlightSQLPlanner};
 use futures::stream::Peekable;
+use generated_types::Streaming;
 use iox_query::{
+    QueryNamespace,
     exec::{IOxSessionContext, QueryLanguage},
     frontend::sql::SqlQueryPlanner,
-    QueryNamespace,
 };
-
-pub(crate) use datafusion::error::{DataFusionError as Error, Result};
 use iox_query_influxql::frontend::planner::InfluxQLQueryPlanner;
 use iox_query_params::StatementParams;
-use tonic::Streaming;
 
 use crate::request::RunQuery;
 

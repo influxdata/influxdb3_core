@@ -1,18 +1,18 @@
 //! Code to decode [`MutableBatch`] from pbdata protobuf
 
-use generated_types::influxdata::pbdata::v1::{
-    column::{SemanticType, Values as PbValues},
-    Column as PbColumn, DatabaseBatch, PackedStrings, TableBatch,
-};
 use generated_types::DecodeError;
+use generated_types::influxdata::pbdata::v1::{
+    Column as PbColumn, DatabaseBatch, PackedStrings, TableBatch,
+    column::{SemanticType, Values as PbValues},
+};
 use hashbrown::{HashMap, HashSet};
-use mutable_batch::{writer::Writer, MutableBatch};
+use mutable_batch::{MutableBatch, writer::Writer};
 use schema::{InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME};
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 /// Error type for line protocol conversion
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("error writing column {}: {}", column, source))]
     Write {

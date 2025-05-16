@@ -13,7 +13,8 @@ mod stream;
 
 use self::stream::GapFillStream;
 use arrow::{compute::SortOptions, datatypes::SchemaRef};
-use datafusion::physical_expr::LexRequirement;
+use datafusion::physical_expr::{LexOrdering, LexRequirement};
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::{
     common::DFSchemaRef,
     error::{DataFusionError, Result},
@@ -22,12 +23,12 @@ use datafusion::{
         memory_pool::MemoryConsumer,
     },
     logical_expr::{LogicalPlan, ScalarUDF, UserDefinedLogicalNodeCore},
-    physical_expr::{EquivalenceProperties, PhysicalSortExpr, PhysicalSortRequirement},
+    physical_expr::{EquivalenceProperties, PhysicalSortExpr},
     physical_plan::{
-        expressions::Column,
-        metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
         Partitioning, PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
+        expressions::Column,
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
     },
     prelude::Expr,
     scalar::ScalarValue,
@@ -137,7 +138,7 @@ impl GapFillParams {
         exprs
     }
 
-    #[allow(clippy::wrong_self_convention)] // follows convention of UserDefinedLogicalNode
+    #[expect(clippy::wrong_self_convention)] // follows convention of UserDefinedLogicalNode
     fn from_template(&self, exprs: &[Expr], aggr_expr: &[Expr]) -> Self {
         let mut e_iter = exprs.iter().cloned();
 
@@ -337,7 +338,7 @@ pub(crate) fn plan_gap_fill(
             return Err(DataFusionError::Internal(format!(
                 "GapFillExec: wrong number of logical inputs; expect 1, found {}",
                 logical_inputs.len()
-            )))
+            )));
         }
     };
 
@@ -347,7 +348,7 @@ pub(crate) fn plan_gap_fill(
             return Err(DataFusionError::Internal(format!(
                 "GapFillExec: wrong number of physical inputs; expected 1, found {}",
                 physical_inputs.len()
-            )))
+            )));
         }
     };
 
@@ -463,7 +464,7 @@ pub struct GapFillExec {
     aggr_expr: Vec<Arc<dyn PhysicalExpr>>,
     // The sort expressions for the required sort order of the input:
     // all of the group exressions, with the time column being last.
-    sort_expr: Vec<PhysicalSortExpr>,
+    sort_expr: LexOrdering,
     // Parameters (besides streaming data) to gap filling
     params: GapFillExecParams,
     /// Metrics reporting behavior during execution.
@@ -514,7 +515,7 @@ impl GapFillExec {
                 .find(|(_i, e)| {
                     e.as_any()
                         .downcast_ref::<Column>()
-                        .map_or(false, |c| c.index() == params.time_column.index())
+                        .is_some_and(|c| c.index() == params.time_column.index())
                 })
                 .map(|(i, _)| i);
 
@@ -527,7 +528,7 @@ impl GapFillExec {
                 ));
             }
 
-            sort_expr
+            sort_expr.into()
         };
 
         let cache = Self::compute_properties(&input);
@@ -549,13 +550,18 @@ impl GapFillExec {
         let eq_properties = match input.properties().output_ordering() {
             None => EquivalenceProperties::new(schema),
             Some(output_ordering) => {
-                EquivalenceProperties::new_with_orderings(schema, &[output_ordering.to_vec()])
+                EquivalenceProperties::new_with_orderings(schema, &[output_ordering.clone()])
             }
         };
 
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
-        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )
     }
 }
 
@@ -589,8 +595,8 @@ impl ExecutionPlan for GapFillExec {
     }
 
     fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
-        vec![Some(PhysicalSortRequirement::from_sort_exprs(
-            &self.sort_expr,
+        vec![Some(LexRequirement::from_lex_ordering(
+            self.sort_expr.clone(),
         ))]
     }
 
@@ -648,6 +654,10 @@ impl ExecutionPlan for GapFillExec {
     fn statistics(&self) -> Result<Statistics> {
         Ok(Statistics::new_unknown(&self.schema()))
     }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
 }
 
 impl DisplayAs for GapFillExec {
@@ -697,7 +707,7 @@ mod test {
         common::DFSchema,
         datasource::empty::EmptyTable,
         error::Result,
-        logical_expr::{logical_plan, ExprSchemable, Extension, UserDefinedLogicalNode},
+        logical_expr::{ExprSchemable, Extension, UserDefinedLogicalNode, logical_plan},
         prelude::{col, lit},
         scalar::ScalarValue,
     };
@@ -936,7 +946,7 @@ mod test {
             @r#"
         - " ProjectionExec: expr=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as minute, concat(Utf8(\"zz\"),temps.loc)@2 as loczz, avg(temps.temp)@3 as avg(temps.temp)]"
         - "   GapFillExec: group_expr=[loc@0, date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1, concat(Utf8(\"zz\"),temps.loc)@2], aggr_expr=[avg(temps.temp)@3], stride=IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
-        - "     SortExec: expr=[loc@0 ASC,concat(Utf8(\"zz\"),temps.loc)@2 ASC,date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC], preserve_partitioning=[false]"
+        - "     SortExec: expr=[loc@0 ASC, concat(Utf8(\"zz\"),temps.loc)@2 ASC, date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC], preserve_partitioning=[false]"
         - "       AggregateExec: mode=Single, gby=[loc@1 as loc, date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[avg(temps.temp)]"
         - "         EmptyExec"
         "#

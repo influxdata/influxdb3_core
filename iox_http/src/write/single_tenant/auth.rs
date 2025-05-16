@@ -3,15 +3,15 @@
 use std::sync::Arc;
 
 use authz::{
-    self, extract_token, http::AuthorizationHeaderExtension, Action, Authorizer, Error, Permission,
-    Resource,
+    self, Action, Authorizer, Error, Permission, Resource, Target, extract_token,
+    http::AuthorizationHeaderExtension,
 };
 use data_types::NamespaceName;
-use hyper::{Body, Request};
+use iox_http_util::Request;
 
 pub(crate) async fn authorize(
     authz: &Arc<dyn Authorizer>,
-    req: &Request<Body>,
+    req: &Request,
     namespace: &NamespaceName<'_>,
     query_param_token: Option<String>,
 ) -> Result<(), Error> {
@@ -23,18 +23,18 @@ pub(crate) async fn authorize(
     .or_else(|| query_param_token.map(|t| t.into_bytes()));
 
     let perms = [Permission::ResourceAction(
-        Resource::Database(namespace.to_string()),
+        Resource::Database(Target::ResourceName(namespace.to_string())),
         Action::Write,
     )];
 
-    authz.permissions(token, &perms).await?;
+    authz.authorize(token, &perms).await?;
     Ok(())
 }
 
 #[cfg(test)]
 pub(crate) mod mock {
     use async_trait::async_trait;
-    use authz::{Authorizer, Permission};
+    use authz::{Authorization, Authorizer, Permission};
 
     pub(crate) const MOCK_AUTH_VALID_TOKEN: &str = "GOOD";
     pub(crate) const MOCK_AUTH_INVALID_TOKEN: &str = "UGLY";
@@ -45,15 +45,20 @@ pub(crate) mod mock {
 
     #[async_trait]
     impl Authorizer for MockAuthorizer {
-        async fn permissions(
+        async fn authorize(
             &self,
             token: Option<Vec<u8>>,
             perms: &[Permission],
-        ) -> Result<Vec<Permission>, authz::Error> {
+        ) -> Result<Authorization, authz::Error> {
             match token {
                 Some(token) => match (&token as &dyn AsRef<[u8]>).as_ref() {
-                    b"GOOD" => Ok(perms.to_vec()),
-                    b"BAD" => Err(authz::Error::Forbidden),
+                    b"GOOD" => Ok(Authorization::new(
+                        Some("GOOD user".to_owned()),
+                        perms.to_vec(),
+                    )),
+                    b"BAD" => Err(authz::Error::Forbidden {
+                        authorization: Authorization::new(Some("BAD user".to_owned()), vec![]),
+                    }),
                     b"UGLY" => Err(authz::Error::verification("test", "test error")),
                     _ => panic!("unexpected token"),
                 },
@@ -66,8 +71,9 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use base64::{prelude::BASE64_STANDARD, Engine};
+    use base64::{Engine, prelude::BASE64_STANDARD};
     use hyper::header::HeaderValue;
+    use iox_http_util::{RequestBuilder, empty_request_body};
 
     use super::mock::*;
     use super::*;
@@ -85,13 +91,13 @@ mod tests {
                     let authz: Arc<dyn Authorizer> = Arc::new(MockAuthorizer::default());
                     let namespace = NamespaceName::new("test").unwrap();
 
-                    let request = Request::builder()
+                    let request = RequestBuilder::new()
                         .uri(format!("https://any.com/ignored"))
                         .method("POST")
                         .extension(AuthorizationHeaderExtension::new(Some(
                             HeaderValue::from_str($header_value).unwrap(),
                         )))
-                        .body(Body::from(""))
+                        .body(empty_request_body())
                         .unwrap();
 
                     let got = authorize(&authz, &request, &namespace, $query_token).await;
@@ -123,7 +129,7 @@ mod tests {
         token_header_forbidden,
         header_value = format!("Token {MOCK_AUTH_NO_PERMS_TOKEN}").as_str(),
         query_param_token = Some("ignore".to_string()),
-        want = Err(authz::Error::Forbidden)
+        want = Err(authz::Error::Forbidden { .. })
     );
 
     test_authorize!(
@@ -193,7 +199,7 @@ mod tests {
         basic_header_forbidden,
         header_value = encode_basic_header(format!("ignore:{MOCK_AUTH_NO_PERMS_TOKEN}")).as_str(),
         query_param_token = Some("ignore".to_string()),
-        want = Err(authz::Error::Forbidden)
+        want = Err(authz::Error::Forbidden { .. })
     );
 
     test_authorize!(
@@ -214,7 +220,7 @@ mod tests {
         query_param_token_forbidden,
         header_value = "",
         query_param_token = Some(MOCK_AUTH_NO_PERMS_TOKEN.to_string()),
-        want = Err(authz::Error::Forbidden)
+        want = Err(authz::Error::Forbidden { .. })
     );
 
     test_authorize!(

@@ -3,16 +3,16 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-measurements
 
 use crate::common::{
-    limit_clause, offset_clause, qualified_measurement_name, where_clause, ws0, ws1, LimitClause,
-    OffsetClause, QualifiedMeasurementName, WhereClause,
+    LimitClause, OffsetClause, QualifiedMeasurementName, WhereClause, limit_clause, offset_clause,
+    qualified_measurement_name, where_clause, ws0, ws1,
 };
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, ParseResult};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::combinator::{map, opt, value};
-use nom::sequence::tuple;
 use nom::sequence::{pair, preceded, terminated};
 use std::fmt;
 use std::fmt::Formatter;
@@ -65,7 +65,8 @@ fn extended_on_clause(i: &str) -> ParseResult<&str, ExtendedOnClause> {
                 ),
             )),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents a `SHOW MEASUREMENTS` statement.
@@ -135,15 +136,15 @@ impl fmt::Display for WithMeasurementClause {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("WITH MEASUREMENT ")?;
         match self {
-            Self::Equals(ref name) => write!(f, "= {name}"),
-            Self::Regex(ref re) => write!(f, "=~ {re}"),
+            Self::Equals(name) => write!(f, "= {name}"),
+            Self::Regex(re) => write!(f, "=~ {re}"),
         }
     }
 }
 
 fn with_measurement_clause(i: &str) -> ParseResult<&str, WithMeasurementClause> {
     preceded(
-        tuple((
+        (
             keyword("WITH"),
             ws1,
             expect(
@@ -151,7 +152,7 @@ fn with_measurement_clause(i: &str) -> ParseResult<&str, WithMeasurementClause> 
                 keyword("MEASUREMENT"),
             ),
             ws0,
-        )),
+        ),
         expect(
             "expected = or =~",
             alt((
@@ -168,7 +169,8 @@ fn with_measurement_clause(i: &str) -> ParseResult<&str, WithMeasurementClause> 
                 ),
             )),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a `SHOW MEASUREMENTS` statement after `SHOW` and any whitespace has been consumed.
@@ -183,14 +185,15 @@ pub(crate) fn show_measurements(i: &str) -> ParseResult<&str, ShowMeasurementsSt
             limit,
             offset,
         ),
-    ) = tuple((
+    ) = (
         keyword("MEASUREMENTS"),
         opt(preceded(ws1, extended_on_clause)),
         opt(preceded(ws1, with_measurement_clause)),
         opt(preceded(ws1, where_clause)),
         opt(preceded(ws1, limit_clause)),
         opt(preceded(ws1, offset_clause)),
-    ))(i)?;
+    )
+        .parse(i)?;
 
     Ok((
         remaining_input,

@@ -44,7 +44,7 @@ mod tests {
         datatypes::SchemaRef,
     };
     use datafusion::{
-        datasource::{provider_as_source, MemTable},
+        datasource::{MemTable, provider_as_source},
         logical_expr::LogicalPlanBuilder,
     };
     use futures::stream::TryStreamExt;

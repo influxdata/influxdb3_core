@@ -10,17 +10,22 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::physical_plan::{
-    metrics::BaselineMetrics, RecordBatchStream, SendableRecordBatchStream,
+    RecordBatchStream, SendableRecordBatchStream, metrics::BaselineMetrics,
 };
 use datafusion::{error::DataFusionError, scalar::ScalarValue};
 use futures::Stream;
 
 /// Schema creation / validation errors.
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Internal error creating SchemaAdapterStream: input field '{}' had type '{:?}' which is different than output field '{}' which had type '{:?}'",
-                    input_field_name, input_field_type, output_field_name, output_field_type,))]
+    #[snafu(display(
+        "Internal error creating SchemaAdapterStream: input field '{}' had type '{:?}' which is different than output field '{}' which had type '{:?}'",
+        input_field_name,
+        input_field_type,
+        output_field_name,
+        output_field_type,
+    ))]
     InternalDataTypeMismatch {
         input_field_name: String,
         input_field_type: DataType,
@@ -28,20 +33,29 @@ pub enum Error {
         output_field_type: DataType,
     },
 
-    #[snafu(display("Internal error creating SchemaAdapterStream: creating virtual value of type '{:?}' which is different than output field '{}' which had type '{:?}'",
-                    field_type, output_field_name, output_field_type,))]
+    #[snafu(display(
+        "Internal error creating SchemaAdapterStream: creating virtual value of type '{:?}' which is different than output field '{}' which had type '{:?}'",
+        field_type,
+        output_field_name,
+        output_field_type,
+    ))]
     InternalDataTypeMismatchForVirtual {
         field_type: DataType,
         output_field_name: String,
         output_field_type: DataType,
     },
 
-    #[snafu(display("Internal error creating SchemaAdapterStream: the field '{}' is specified within the input and as a virtual column, don't know which one to choose",
-                    field_name))]
+    #[snafu(display(
+        "Internal error creating SchemaAdapterStream: the field '{}' is specified within the input and as a virtual column, don't know which one to choose",
+        field_name
+    ))]
     InternalColumnBothInInputAndVirtual { field_name: String },
 
-    #[snafu(display("Internal error creating SchemaAdapterStream: field '{}' had output type '{:?}' and should be a NULL column but the field is flagged as 'not null'",
-                    field_name, output_field_type,))]
+    #[snafu(display(
+        "Internal error creating SchemaAdapterStream: field '{}' had output type '{:?}' and should be a NULL column but the field is flagged as 'not null'",
+        field_name,
+        output_field_type,
+    ))]
     InternalColumnNotNullable {
         field_name: String,
         output_field_type: DataType,
@@ -427,7 +441,10 @@ mod tests {
             BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
-        assert_contains!(res.unwrap_err().to_string(), "input field 'c' had type 'Utf8' which is different than output field 'c' which had type 'Float32'");
+        assert_contains!(
+            res.unwrap_err().to_string(),
+            "input field 'c' had type 'Utf8' which is different than output field 'c' which had type 'Float32'"
+        );
     }
 
     #[tokio::test]
@@ -448,7 +465,10 @@ mod tests {
             BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
-        assert_contains!(res.unwrap_err().to_string(), "creating virtual value of type 'UInt32' which is different than output field 'd' which had type 'UInt8'");
+        assert_contains!(
+            res.unwrap_err().to_string(),
+            "creating virtual value of type 'UInt32' which is different than output field 'd' which had type 'UInt8'"
+        );
     }
 
     #[tokio::test]
@@ -472,7 +492,10 @@ mod tests {
             BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
-        assert_contains!(res.unwrap_err().to_string(), "the field 'a' is specified within the input and as a virtual column, don't know which one to choose");
+        assert_contains!(
+            res.unwrap_err().to_string(),
+            "the field 'a' is specified within the input and as a virtual column, don't know which one to choose"
+        );
     }
 
     #[tokio::test]
@@ -493,7 +516,10 @@ mod tests {
             BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         );
 
-        assert_contains!(res.unwrap_err().to_string(), "field 'd' had output type 'Utf8' and should be a NULL column but the field is flagged as 'not null'");
+        assert_contains!(
+            res.unwrap_err().to_string(),
+            "field 'd' had output type 'Utf8' and should be a NULL column but the field is flagged as 'not null'"
+        );
     }
 
     // input has different column types than desired output

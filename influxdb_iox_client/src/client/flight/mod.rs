@@ -2,20 +2,20 @@
 
 use std::{pin::Pin, task::Poll};
 
-use ::generated_types::influxdata::iox::querier::v1::{read_info::QueryType, ReadInfo};
-use futures_util::{Stream, StreamExt};
-use prost::Message;
-use thiserror::Error;
-use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
-
+use ::generated_types::{
+    Status,
+    influxdata::iox::querier::v1::{ReadInfo, read_info::QueryType},
+    metadata::{MetadataKey, MetadataMap, MetadataValue},
+};
 use arrow::{
     ipc::{self},
     record_batch::RecordBatch,
 };
-
+use arrow_flight::{FlightClient, Ticket, decode::FlightRecordBatchStream, error::FlightError};
+use futures_util::{Stream, StreamExt};
+use prost::Message;
 use rand::Rng;
-
-use arrow_flight::{decode::FlightRecordBatchStream, error::FlightError, FlightClient, Ticket};
+use thiserror::Error;
 
 use crate::connection::Connection;
 
@@ -77,7 +77,7 @@ pub enum Error {
 
 impl Error {
     /// Extracts the underlying tonic status, if any
-    pub fn tonic_status(&self) -> Option<&tonic::Status> {
+    pub fn tonic_status(&self) -> Option<&Status> {
         if let Self::ArrowFlightError(FlightError::Tonic(status)) = self {
             Some(status)
         } else {
@@ -86,8 +86,8 @@ impl Error {
     }
 }
 
-impl From<tonic::Status> for Error {
-    fn from(status: tonic::Status) -> Self {
+impl From<Status> for Error {
+    fn from(status: Status) -> Self {
         Self::ArrowFlightError(status.into())
     }
 }
@@ -308,7 +308,7 @@ impl Client {
     pub async fn handshake(&mut self) -> Result<(), Error> {
         // handshake is an echo server. Send some random bytes and
         // expect the same back.
-        let payload = rand::thread_rng().gen::<[u8; 16]>().to_vec();
+        let payload = rand::rng().random::<[u8; 16]>().to_vec();
 
         let response = self
             .inner

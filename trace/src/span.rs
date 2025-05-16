@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 
-use crate::{ctx::SpanContext, TraceCollector};
+use crate::{TraceCollector, ctx::SpanContext};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum SpanStatus {

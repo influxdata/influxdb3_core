@@ -113,7 +113,7 @@ pub(crate) fn timestamp_min_max(chunk: &dyn QueryChunk) -> Option<TimestampMinMa
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{test::TestChunk, QueryChunk};
+    use crate::{QueryChunk, test::TestChunk};
 
     #[macro_export]
     macro_rules! assert_groups_eq {

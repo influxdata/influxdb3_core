@@ -20,9 +20,12 @@ service BulkIngestService {
 }
 
 message NewParquetMetadataRequest {
-  // Name of the namespace the data will be imported into
-  string namespace_name = 1;
-
+  oneof namespace_target {
+    // Name of the namespace the data will be imported into
+    string namespace_name = 1 [deprecated = true];
+    // ID of the namespace the data will be imported into
+    int64 namespace_id = 6;
+  };
   // Name of the table the data will be imported into
   string table_name = 2;
 
@@ -58,10 +61,14 @@ message NewParquetMetadataResponse {
 }
 
 message UpsertSortKeyRequest {
-  // Name of the namespace in which to upsert the sort key
-  string namespace_name = 1;
+  oneof namespace_target {
+    // Name of the namespace in which to upsert the sort key
+    string namespace_name = 1 [deprecated = true];
+    // ID of the namespace in which to upsert the sort key
+    int64 namespace_id = 5;
+  }
 
-  // Name of the table for which to upsert the sort key
+  // Name of the table in which to upsert the sort key
   string table_name = 2;
 
   // The partition key for which to upsert the sort key

@@ -5,8 +5,8 @@ use std::{
 
 use datafusion::{
     common::{DataFusionError, Result as DataFusionResult},
-    execution::{registry::MemoryFunctionRegistry, FunctionRegistry},
-    logical_expr::{planner::ExprPlanner, AggregateUDF, ScalarUDF, WindowUDF},
+    execution::{FunctionRegistry, registry::MemoryFunctionRegistry},
+    logical_expr::{AggregateUDF, ScalarUDF, WindowUDF, planner::ExprPlanner},
 };
 
 use crate::{date_bin_wallclock, gapfill, regex, sleep, to_timestamp, tz, window};

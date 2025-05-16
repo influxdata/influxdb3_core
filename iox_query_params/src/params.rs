@@ -2,7 +2,7 @@
 //! values that can be supplied as an InfluxDB bind parameter.
 use std::{
     borrow::Cow,
-    collections::{hash_map, HashMap},
+    collections::{HashMap, hash_map},
     ops::Index,
     sync::Arc,
 };
@@ -10,8 +10,8 @@ use std::{
 use arrow::{
     array::{ArrayRef, AsArray},
     datatypes::{
-        DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        DataType, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
     },
     record_batch::RecordBatch,
 };
@@ -23,8 +23,8 @@ use thiserror::Error;
 // remap protobuf types for convenience
 mod proto {
     pub(super) use generated_types::influxdata::iox::querier::v1::{
-        query_param::{NullValue, Value},
         QueryParam,
+        query_param::{NullValue, Value},
     };
 }
 
@@ -573,7 +573,11 @@ impl TryFrom<ArrayRef> for StatementParam {
             });
         }
         fn unsupported_type(type_name: &'static str) -> Result<StatementParam, Error> {
-            Err(Error::Conversion{ msg: format!("Arrow type {type_name} is not supported as query parameter. Expected null, boolean, numeric, or UTF-8 types")})
+            Err(Error::Conversion {
+                msg: format!(
+                    "Arrow type {type_name} is not supported as query parameter. Expected null, boolean, numeric, or UTF-8 types"
+                ),
+            })
         }
         match arr.data_type() {
             DataType::Null => Ok(Self::Null),
@@ -738,7 +742,7 @@ impl<'a> From<Cow<'a, str>> for StatementParam {
 }
 
 #[cfg(test)]
-#[allow(clippy::approx_constant)] // allow 3.14  >:)
+#[expect(clippy::approx_constant)] // allow 3.14  >:)
 mod tests {
     use assert_matches::assert_matches;
     use serde_json::json;

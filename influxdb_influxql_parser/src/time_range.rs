@@ -1,12 +1,12 @@
 //! Process InfluxQL time range expressions
 //!
-use crate::expression::walk::{walk_expression, Expression};
+use crate::expression::walk::{Expression, walk_expression};
 use crate::expression::{
-    lit, Binary, BinaryOperator, ConditionalBinary, ConditionalExpression, Expr, VarRef,
+    Binary, BinaryOperator, ConditionalBinary, ConditionalExpression, Expr, VarRef, lit,
 };
 use crate::functions::is_now_function;
-use crate::literal::{nanos_to_timestamp, Duration, Literal};
-use crate::timestamp::{parse_timestamp, Timestamp};
+use crate::literal::{Duration, Literal, nanos_to_timestamp};
+use crate::timestamp::{Timestamp, parse_timestamp};
 use std::ops::ControlFlow;
 
 /// Result type for operations that return an [`Expr`] and could result in an [`ExprError`].
@@ -255,16 +255,16 @@ pub fn split_cond(
                         Expr::Literal(Literal::Timestamp(ts)) => match ts.timestamp_nanos_opt() {
                             Some(ts) => ts,
                             None => {
-                                return ControlFlow::Break(error::map::internal(
-                                    "timestamp out of range",
-                                ));
+                                return ControlFlow::Break(error::map::expr(format!(
+                                    "timestamp out of range: {ts}",
+                                )));
                             }
                         },
                         expr => {
                             return ControlFlow::Break(error::map::internal(format!(
                                 "expected Timestamp, got: {}",
                                 expr
-                            )))
+                            )));
                         }
                     };
 
@@ -469,28 +469,29 @@ fn reduce_time_expr(ctx: &ReduceContext, expr: &Expr) -> ExprResult {
 
 fn reduce_expr(ctx: &ReduceContext, expr: &Expr) -> ExprResult {
     match expr {
-        Expr::Binary(ref v) => reduce_binary_expr(ctx, v).map_err(map_expr_err(expr)),
-        Expr::Call (call) if is_now_function(call.name.as_str()) => ctx.now.map(lit).ok_or_else(|| error::map::internal("unable to resolve now")),
-        Expr::Call (call) => {
-            error::expr(
-                format!("invalid function call '{}'", call.name),
-            )
-        }
+        Expr::Binary(v) => reduce_binary_expr(ctx, v).map_err(map_expr_err(expr)),
+        Expr::Call(call) if is_now_function(call.name.as_str()) => ctx
+            .now
+            .map(lit)
+            .ok_or_else(|| error::map::internal("unable to resolve now")),
+        Expr::Call(call) => error::expr(format!("invalid function call '{}'", call.name)),
         Expr::Nested(expr) => reduce_expr(ctx, expr),
         Expr::Literal(val) => match val {
-            Literal::Integer(_) |
-            Literal::Float(_) |
-            Literal::String(_) |
-            Literal::Timestamp(_) |
-            Literal::Duration(_) => Ok(Expr::Literal(val.clone())),
+            Literal::Integer(_)
+            | Literal::Float(_)
+            | Literal::String(_)
+            | Literal::Timestamp(_)
+            | Literal::Duration(_) => Ok(Expr::Literal(val.clone())),
             _ => error::expr(format!(
                 "found literal '{val}', expected duration, float, integer, or timestamp string"
             )),
         },
 
-        Expr::VarRef { .. } | Expr::BindParameter(_) | Expr::Wildcard(_) | Expr::Distinct(_) => error::expr(format!(
-            "found symbol '{expr}', expected now() or a literal duration, float, integer and timestamp string"
-        )),
+        Expr::VarRef { .. } | Expr::BindParameter(_) | Expr::Wildcard(_) | Expr::Distinct(_) => {
+            error::expr(format!(
+                "found symbol '{expr}', expected now() or a literal duration, float, integer and timestamp string"
+            ))
+        }
     }
 }
 
@@ -739,8 +740,8 @@ fn map_expr_err(expr: &Expr) -> impl Fn(ExprError) -> ExprError + '_ {
 mod test {
     use crate::expression::ConditionalExpression;
     use crate::time_range::{
-        duration_expr_to_nanoseconds, reduce_time_expr, split_cond, ExprError, ExprResult,
-        ReduceContext, TimeRange,
+        ExprError, ExprResult, ReduceContext, TimeRange, duration_expr_to_nanoseconds,
+        reduce_time_expr, split_cond,
     };
     use crate::timestamp::Timestamp;
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Offset, Utc};
@@ -908,6 +909,7 @@ mod test {
 
         // fallible
         assert_error!(split_exprs("time > '2004-04-09T'"), ExprError::Expression(ref s) if s == "invalid expression \"'2004-04-09T'\": '2004-04-09T' is not a valid timestamp");
+        assert_error!(split_exprs("time > '0001-01-01T00:00:00Z'"), ExprError::Expression(ref s) if s == "timestamp out of range: 0001-01-01 00:00:00 +00:00");
     }
 
     #[test]

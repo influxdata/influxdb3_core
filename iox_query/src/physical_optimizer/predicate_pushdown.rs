@@ -3,14 +3,14 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     error::Result,
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec, union::UnionExec,
-        ExecutionPlan, PhysicalExpr,
+        ExecutionPlan, PhysicalExpr, empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec,
+        union::UnionExec,
     },
 };
 use datafusion_util::config::table_parquet_options;
@@ -104,7 +104,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                                 conjunction(pushdown).expect("not empty"),
                                 Arc::clone(grandchild),
                             )?),
-                            child_dedup.sort_keys().to_vec(),
+                            child_dedup.sort_keys().clone(),
                             child_dedup.use_chunk_order_col(),
                         ));
                         if !no_pushdown.is_empty() {
@@ -144,14 +144,13 @@ fn conjunction(
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::{
-        datasource::object_store::ObjectStoreUrl,
-        datasource::physical_plan::FileScanConfig,
+        datasource::{object_store::ObjectStoreUrl, physical_plan::FileScanConfig},
         logical_expr::Operator,
-        physical_expr::PhysicalSortExpr,
+        physical_expr::LexOrdering,
         physical_plan::{
+            PhysicalExpr,
             expressions::{BinaryExpr, Column, Literal},
             placeholder_row::PlaceholderRowExec,
-            PhysicalExpr, Statistics,
         },
         scalar::ScalarValue,
     };
@@ -166,16 +165,10 @@ mod tests {
         // basically just the same as the test_parquet but with pushdown disabled to ensure the
         // FilterExec is still preserved if so
         let schema = schema();
-        let base_config = FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test://").unwrap(),
-            file_schema: Arc::clone(&schema),
-            file_groups: vec![],
-            statistics: Statistics::new_unknown(&schema),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-        };
+        let base_config = FileScanConfig::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::clone(&schema),
+        );
         let mut table_opts = table_parquet_options();
         table_opts.global.pushdown_filters = false;
         let builder = ParquetExecBuilder::new_with_options(base_config, table_opts)
@@ -188,11 +181,11 @@ mod tests {
             @r#"
         input:
           - " FilterExec: tag1@0 = field@2"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
             - " FilterExec: tag1@0 = field@2"
-            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         "#
         );
     }
@@ -315,16 +308,10 @@ mod tests {
     #[test]
     fn test_parquet() {
         let schema = schema();
-        let base_config = FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test://").unwrap(),
-            file_schema: Arc::clone(&schema),
-            file_groups: vec![],
-            statistics: Statistics::new_unknown(&schema),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-        };
+        let base_config = FileScanConfig::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::clone(&schema),
+        );
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
             .with_predicate(predicate_tag(&schema));
         let plan =
@@ -335,10 +322,10 @@ mod tests {
             @r#"
         input:
           - " FilterExec: tag1@0 = field@2"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
-            - " ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+            - " ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         "#
         );
     }
@@ -452,7 +439,8 @@ mod tests {
         ]))
     }
 
-    fn sort_expr(schema: &SchemaRef) -> Vec<PhysicalSortExpr> {
+    /// Get the sort order defined for these tests.
+    fn sort_expr(schema: &SchemaRef) -> LexOrdering {
         let sort_key = SortKeyBuilder::new()
             .with_col("tag1")
             .with_col("tag2")

@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::{internal_err, DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{LexRequirement, PhysicalSortRequirement};
+use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
@@ -21,7 +21,7 @@ use datafusion::physical_plan::{
     Partitioning, PlanProperties, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
-use futures::{ready, Stream, StreamExt};
+use futures::{Stream, StreamExt, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -105,7 +105,12 @@ impl ProgressiveEvalExec {
         // This node serializes all the data to a single partition
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
-        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )
     }
 }
 
@@ -158,7 +163,8 @@ impl ExecutionPlan for ProgressiveEvalExec {
             .input()
             .properties()
             .output_ordering()
-            .map(PhysicalSortRequirement::from_sort_exprs);
+            .cloned()
+            .map(LexRequirement::from_lex_ordering);
 
         vec![input_ordering]
     }
@@ -297,7 +303,9 @@ impl InputStreams {
         if num_input_streams_to_prefetch > 1 {
             capacity = num_input_streams_to_prefetch - 1;
         } else {
-            warn!("num_input_streams_to_prefetch is {num_input_streams_to_prefetch} and not greater than 1");
+            warn!(
+                "num_input_streams_to_prefetch is {num_input_streams_to_prefetch} and not greater than 1"
+            );
         }
         let mut prefetched_input_streams = Vec::with_capacity(capacity);
 
@@ -343,7 +351,8 @@ impl InputStreams {
             // panic if we have not reached the end of all input streams
             assert!(
                 self.prefetched_input_streams.is_empty(),
-                "Internal error in ProgressiveEvalStream: There should not have input streams left to read",);
+                "Internal error in ProgressiveEvalStream: There should not have input streams left to read",
+            );
 
             self.current_input_stream = None;
         } else {
@@ -567,9 +576,10 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::memory::MemoryExec;
     use datafusion::physical_plan::metrics::{MetricValue, Timestamp};
-    use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
+    use datafusion::physical_plan::{Partitioning, PlanProperties};
     use futures::{Future, FutureExt};
 
     use super::*;
@@ -1795,7 +1805,7 @@ mod tests {
     ///
     /// This might take a while but has a timeout.
     pub async fn assert_strong_count_converges_to_zero<T>(refs: Weak<T>) {
-        #![allow(clippy::future_not_send)]
+        #![expect(clippy::future_not_send)]
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if Weak::strong_count(&refs) == 0 {
@@ -1861,7 +1871,8 @@ mod tests {
             PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(n_partitions),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             )
         }
     }

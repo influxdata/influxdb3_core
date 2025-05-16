@@ -1,7 +1,5 @@
 //! Common methods for RPC service implementations
 
-#![allow(clippy::clone_on_ref_ptr)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
