@@ -1,9 +1,9 @@
 //! The version 1 list protocol using a custom byte encoding
 
-use crate::api::list::{Error, ListEntry, Result, ValueTooLargeSnafu, MAX_VALUE_SIZE};
 use crate::CacheKey;
+use crate::api::list::{Error, ListEntry, MAX_VALUE_SIZE, Result, ValueTooLargeSnafu};
 use bytes::{Buf, Bytes};
-use futures::{stream, Stream};
+use futures::{Stream, stream};
 use reqwest::Response;
 use snafu::ensure;
 
@@ -82,7 +82,7 @@ impl Iterator for ListEncoder {
     }
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 mod Flags {
     /// The value is not included in this response
     ///
@@ -294,7 +294,7 @@ pub fn decode_response(
 ) -> Result<impl Stream<Item = Result<ListEntry>>> {
     let resp = response.error_for_status()?;
     let state = ListStreamState::new(resp, max_value_size);
-    Ok(stream::try_unfold(state, |mut state| async move {
+    Ok(stream::try_unfold(state, async move |mut state| {
         loop {
             if state.current.is_empty() {
                 match state.response.chunk().await? {

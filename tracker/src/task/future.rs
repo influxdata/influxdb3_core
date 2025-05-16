@@ -46,7 +46,7 @@ impl<T: ?Sized> TrackedFutureExt for T where T: TryFuture {}
 /// and provides the early termination functionality used by
 /// `TrackerRegistry::terminate`
 #[pin_project(PinnedDrop)]
-#[allow(missing_debug_implementations)]
+#[expect(missing_debug_implementations)]
 pub struct TrackedFuture<F: TryFuture> {
     #[pin]
     inner: F,

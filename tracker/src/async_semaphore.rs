@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use metric::{Attributes, DurationHistogram, MakeMetricObserver, U64Counter, U64Gauge};
 use pin_project::{pin_project, pinned_drop};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -372,7 +372,7 @@ impl Future for InstrumentedAsyncSemaphoreAcquire<'_> {
 }
 
 #[pinned_drop]
-#[allow(clippy::needless_lifetimes)]
+#[expect(clippy::needless_lifetimes)]
 impl<'a> PinnedDrop for InstrumentedAsyncSemaphoreAcquire<'a> {
     fn drop(self: std::pin::Pin<&mut Self>) {
         let this = self.project();
@@ -405,7 +405,7 @@ pub struct InstrumentedAsyncOwnedSemaphorePermit {
     /// The actual permit.
     ///
     /// This permit is never accessed but we hold it here because dropping it clears the permit.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     inner: OwnedSemaphorePermit,
 
     /// Number of permits that we hold.
@@ -424,7 +424,7 @@ pub struct InstrumentedAsyncOwnedSemaphorePermit {
     /// No direct interaction, will be exported during drop (aka the end of the span will be set).
     ///
     /// This is declared BEFORE [`span_recorder_all`](Self::span_recorder_all) so it is dropped before.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     span_recorder_permit: SpanRecorder,
 
     /// Span recorder for the entire semaphore interaction.
@@ -432,7 +432,7 @@ pub struct InstrumentedAsyncOwnedSemaphorePermit {
     /// No direct interaction, will be exported during drop (aka the end of the span will be set).
     ///
     /// This is declared AFTER [`span_recorder_permit`](Self::span_recorder_permit) so it is dropped after.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     span_recorder_all: SpanRecorder,
 }
 
@@ -454,11 +454,9 @@ impl Drop for InstrumentedAsyncOwnedSemaphorePermit {
 #[derive(Debug)]
 pub struct InstrumentedAsyncSemaphorePermit<'a> {
     /// Use the owned variant so we can use a single implementation.
-    #[allow(dead_code)]
     owned_permit: InstrumentedAsyncOwnedSemaphorePermit,
 
     /// Phantom data to track the livetime.
-    #[allow(dead_code)]
     phantom: PhantomData<&'a ()>,
 }
 
@@ -475,7 +473,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::{pin, sync::Barrier};
-    use trace::{ctx::SpanContext, span::SpanStatus, RingBufferTraceCollector};
+    use trace::{RingBufferTraceCollector, ctx::SpanContext, span::SpanStatus};
 
     use super::*;
 
@@ -773,10 +771,12 @@ mod tests {
         assert_eq!(span_acquire.events.len(), 0);
         assert_eq!(span_acquire.ctx.parent_span_id, Some(span_all.ctx.span_id));
 
-        assert!(!traces
-            .spans()
-            .into_iter()
-            .any(|s| s.name == SPAN_NAME_PERMIT));
+        assert!(
+            !traces
+                .spans()
+                .into_iter()
+                .any(|s| s.name == SPAN_NAME_PERMIT)
+        );
     }
 
     /// Check that a given object implements [`Send`].

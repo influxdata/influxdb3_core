@@ -2,13 +2,13 @@
 //!
 //! [keywords]: https://docs.influxdata.com/influxdb/v1.8/query_language/spec/#keywords
 
-use crate::internal::ParseResult;
+use crate::internal::{Error, ParseResult};
 use nom::{
+    FindToken, Parser,
     bytes::complete::tag_no_case,
     character::complete::alpha1,
     combinator::{fail, verify},
     sequence::terminated,
-    FindToken,
 };
 use std::{
     collections::HashSet,
@@ -24,7 +24,7 @@ fn keyword_follow_char(i: &str) -> ParseResult<&str, ()> {
     if i.is_empty() || b" \n\t;(),=!><+-/*|&^%".find_token(i.bytes().next().unwrap()) {
         Ok((i, ()))
     } else {
-        fail(i)
+        fail().parse(i)
     }
 }
 
@@ -39,7 +39,7 @@ impl PartialEq<Self> for Token<'_> {
                 .0
                 .chars()
                 .zip(other.0.chars())
-                .all(|(l, r)| l.to_ascii_uppercase() == r.to_ascii_uppercase())
+                .all(|(l, r)| l.eq_ignore_ascii_case(&r))
     }
 }
 
@@ -145,14 +145,15 @@ static KEYWORDS: LazyLock<HashSet<Token<'static>>> = LazyLock::new(|| {
 pub(crate) fn sql_keyword(i: &str) -> ParseResult<&str, &str> {
     verify(terminated(alpha1, keyword_follow_char), |tok: &str| {
         KEYWORDS.contains(&Token(tok))
-    })(i)
+    })
+    .parse(i)
 }
 
 /// Recognizes a case-insensitive `keyword`, ensuring it is followed by
 /// a valid separator.
 pub(crate) fn keyword<'a>(
     keyword: &'static str,
-) -> impl FnMut(&'a str) -> ParseResult<&'a str, &'a str> {
+) -> impl Parser<&'a str, Output = &'a str, Error = Error<&'a str>> {
     terminated(tag_no_case(keyword), keyword_follow_char)
 }
 
@@ -259,22 +260,22 @@ mod test {
         let mut or_keyword = keyword("OR");
 
         // Can parse with matching case
-        let (rem, got) = or_keyword("OR").unwrap();
+        let (rem, got) = or_keyword.parse("OR").unwrap();
         assert_eq!(rem, "");
         assert_eq!(got, "OR");
 
         // Not case sensitive
-        let (rem, got) = or_keyword("or").unwrap();
+        let (rem, got) = or_keyword.parse("or").unwrap();
         assert_eq!(rem, "");
         assert_eq!(got, "or");
 
         // Does not consume input that follows a keyword
-        let (rem, got) = or_keyword("or(a AND b)").unwrap();
+        let (rem, got) = or_keyword.parse("or(a AND b)").unwrap();
         assert_eq!(rem, "(a AND b)");
         assert_eq!(got, "or");
 
         // Will fail because keyword `OR` in `ORDER` is not recognized, as is not terminated by a valid character
-        let err = or_keyword("ORDER").unwrap_err();
+        let err = or_keyword.parse("ORDER").unwrap_err();
         assert_matches!(err, nom::Err::Error(crate::internal::Error::Nom(_, kind)) if kind == nom::error::ErrorKind::Fail);
     }
 
@@ -283,7 +284,7 @@ mod test {
         let mut tag_keyword = keyword("TAG");
 
         // followed by EOF
-        let (rem, got) = tag_keyword("tag").unwrap();
+        let (rem, got) = tag_keyword.parse("tag").unwrap();
         assert_eq!(rem, "");
         assert_eq!(got, "tag");
 
@@ -291,21 +292,21 @@ mod test {
         // Test some of the expected characters
         //
 
-        let (rem, got) = tag_keyword("tag!=foo").unwrap();
+        let (rem, got) = tag_keyword.parse("tag!=foo").unwrap();
         assert_eq!(rem, "!=foo");
         assert_eq!(got, "tag");
 
-        let (rem, got) = tag_keyword("tag>foo").unwrap();
+        let (rem, got) = tag_keyword.parse("tag>foo").unwrap();
         assert_eq!(rem, ">foo");
         assert_eq!(got, "tag");
 
-        let (rem, got) = tag_keyword("tag&1 = foo").unwrap();
+        let (rem, got) = tag_keyword.parse("tag&1 = foo").unwrap();
         assert_eq!(rem, "&1 = foo");
         assert_eq!(got, "tag");
 
         // Fallible
 
-        assert_error!(tag_keyword("tag$"), Fail);
+        assert_error!(tag_keyword.parse("tag$"), Fail);
     }
 
     #[test]

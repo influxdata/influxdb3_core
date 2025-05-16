@@ -16,7 +16,7 @@ use datafusion::{
 use futures::Stream;
 use observability_deps::tracing::trace;
 use parking_lot::Mutex;
-use schema::{sort::SortKey, Schema};
+use schema::{Schema, sort::SortKey};
 
 use crate::{QueryChunk, QueryChunkData};
 

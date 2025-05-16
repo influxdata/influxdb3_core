@@ -1,6 +1,6 @@
 use ::generated_types::google::{FieldViolation, OptionalField};
 use client_util::connection::GrpcConnection;
-use futures_util::{stream::BoxStream, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt, stream::BoxStream};
 
 use self::generated_types::{query_log_service_client::QueryLogServiceClient, *};
 use crate::connection::Connection;
@@ -46,7 +46,7 @@ impl Client {
             metadata,
             entries: stream
                 .map_err(Error::from)
-                .and_then(|msg| async move {
+                .and_then(async move |msg| {
                     let get_log_response::Data::Entry(entry) = msg.data.unwrap_field("data")?
                     else {
                         return Err(Error::InvalidResponse(FieldViolation::required(

@@ -106,9 +106,11 @@ where
             namespace: namespace.to_string(),
             payload: MockSharderPayload::DeletePredicate(payload.clone()),
         });
-        vec![guard
-            .shard_return
-            .pop_front()
-            .expect("no shard mock value to return")]
+        vec![
+            guard
+                .shard_return
+                .pop_front()
+                .expect("no shard mock value to return"),
+        ]
     }
 }

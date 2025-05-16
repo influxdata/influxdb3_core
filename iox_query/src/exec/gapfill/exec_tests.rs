@@ -14,7 +14,7 @@ use arrow::{
 use arrow_util::test_util::batches_to_lines;
 use datafusion::{
     error::Result,
-    execution::runtime_env::{RuntimeConfig, RuntimeEnv},
+    execution::runtime_env::RuntimeEnvBuilder,
     functions::datetime::date_bin::DateBinFunc,
     physical_plan::{
         collect,
@@ -1253,7 +1253,6 @@ fn test_gapfill_interpolate_struct_additional_data() {
                 1_125,
                 Some(FillStrategy::LinearInterpolate)
             );
-            println!("🐈 params: {params:#?}");
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
@@ -1478,7 +1477,9 @@ impl TestCase {
         block_on(async {
             let session_ctx = SessionContext::new_with_config_rt(
                 SessionConfig::default().with_batch_size(self.output_batch_size),
-                RuntimeEnv::try_new(RuntimeConfig::default().with_memory_limit(limit, 1.0))?.into(),
+                RuntimeEnvBuilder::new()
+                    .with_memory_limit(limit, 1.0)
+                    .build_arc()?,
             )
             .into();
             let result = Self::execute_with_config(&session_ctx, self.plan()?).await;

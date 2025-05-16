@@ -1,5 +1,5 @@
 use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::{plan_err, DFSchema, DFSchemaRef, Result, ToDFSchema};
+use datafusion::common::{DFSchema, DFSchemaRef, Result, ToDFSchema, plan_err};
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
     AggregateUDF, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Projection,
@@ -20,8 +20,8 @@ pub(crate) use fields_pivot::make_schema as fields_pivot_schema;
 #[cfg(test)]
 pub(crate) use schema_pivot::make_schema_pivot_output_schema as schema_pivot_schema;
 
-use crate::schema::SeriesSchema;
 use crate::STRING_VALUE_COLUMN_NAME;
+use crate::schema::SeriesSchema;
 
 /// The type of aggregation to perform on all fields in a
 /// aggregate_field operation.

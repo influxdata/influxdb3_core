@@ -1,13 +1,16 @@
 //! This module implements an in-memory implementation of the iox_catalog interface. It can be
 //! used for testing or for an IOx designed to run without catalog persistence.
 
-use crate::interface::namespace_snapshot_by_name;
+use crate::interface::{
+    CatalogStorage, NamespaceSorting, Paginated, PaginationOptions, TableSorting,
+    namespace_snapshot_by_name,
+};
 use crate::metrics::GetTimeMetric;
 use crate::util::should_delete_partition;
 use crate::{
     constants::{
-        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
-        MAX_PARQUET_L0_FILES_PER_PARTITION,
+        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION, MAX_PARQUET_L0_FILES_PER_PARTITION,
+        MAX_TABLE_NAME_LENGTH,
     },
     interface::{
         AlreadyExistsSnafu, CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo,
@@ -18,18 +21,18 @@ use crate::{
 use async_trait::async_trait;
 use data_types::snapshot::{root::RootSnapshot, table::TableSnapshot};
 use data_types::{
-    partition_template::{
-        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
-    },
     Column, ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace,
     NamespaceId, NamespaceName, NamespaceServiceProtectionLimitsOverride, NamespaceWithStorage,
     ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionHashId,
     PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table, TableId, TableWithStorage,
     Timestamp,
+    partition_template::{
+        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
+    },
 };
 use data_types::{
-    snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot},
     NamespaceVersion,
+    snapshot::{namespace::NamespaceSnapshot, partition::PartitionSnapshot},
 };
 use iox_time::TimeProvider;
 use parking_lot::Mutex;
@@ -42,8 +45,6 @@ use std::{
     time::Duration,
 };
 use trace::ctx::SpanContext;
-
-const ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// In-memory catalog that implements the `RepoCollection` and individual repo traits from
 /// the catalog interface.
@@ -156,7 +157,61 @@ pub struct MemTxn {
 }
 
 #[async_trait]
+impl CatalogStorage for crate::mem::MemCatalog {
+    async fn get_namespace_with_storage(
+        &self,
+        id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Option<NamespaceWithStorage>> {
+        self.repositories()
+            .namespaces()
+            .get_storage_by_id(id, deleted)
+            .await
+    }
+
+    async fn get_namespaces_with_storage(
+        &self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+        deleted: SoftDeletedRows,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
+        self.repositories()
+            .namespaces()
+            .list_storage(sorting, pagination, deleted)
+            .await
+    }
+
+    async fn get_table_with_storage(
+        &self,
+        id: TableId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Option<TableWithStorage>> {
+        self.repositories()
+            .tables()
+            .get_storage_by_id(id, deleted)
+            .await
+    }
+
+    async fn get_tables_with_storage(
+        &self,
+        namespace_id: NamespaceId,
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+        deleted: SoftDeletedRows,
+    ) -> Result<Paginated<TableWithStorage>> {
+        self.repositories()
+            .tables()
+            .list_storage_by_namespace_id(namespace_id, sorting, pagination, deleted)
+            .await
+    }
+}
+
+#[async_trait]
 impl Catalog for MemCatalog {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -249,7 +304,11 @@ impl NamespaceRepo for MemTxn {
     ) -> Result<Namespace> {
         let mut stage = self.collections.lock();
 
-        if stage.namespaces.iter().any(|n| n.name == name.as_str()) {
+        if stage
+            .namespaces
+            .iter()
+            .any(|n| n.name == name.as_str() && n.deleted_at.is_none())
+        {
             return Err(Error::AlreadyExists {
                 descr: name.to_string(),
             });
@@ -284,38 +343,55 @@ impl NamespaceRepo for MemTxn {
             .collect())
     }
 
-    async fn list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>> {
+    async fn list_storage(
+        &mut self,
+        sorting: Option<NamespaceSorting>,
+        pagination: Option<PaginationOptions>,
+        deleted: SoftDeletedRows,
+    ) -> Result<Paginated<NamespaceWithStorage>> {
         let stage = self.collections.lock();
 
-        let namespaces_with_storage = stage
-            .namespaces
-            .iter()
-            .map(|n| {
-                let namespace_size_bytes = stage
-                    .parquet_files
-                    .iter()
-                    .filter(|f| f.namespace_id == n.id && f.to_delete.is_none())
-                    .map(|f| f.file_size_bytes)
-                    .sum();
-                let table_count = stage
-                    .tables
-                    .iter()
-                    .filter(|t| t.namespace_id == n.id)
-                    .count() as i64;
-                NamespaceWithStorage {
-                    id: n.value.id,
-                    name: n.value.name.clone(),
-                    retention_period_ns: n.value.retention_period_ns,
-                    max_tables: n.value.max_tables,
-                    max_columns_per_table: n.value.max_columns_per_table,
-                    partition_template: n.value.partition_template.clone(),
-                    size_bytes: namespace_size_bytes,
-                    table_count,
-                }
-            })
-            .collect();
+        // filter namespaces without storage size
+        let mut namespaces: Vec<NamespaceWithStorage> =
+            filter_namespace_soft_delete(&stage.namespaces, deleted)
+                .filter(|n| !n.name.starts_with("_influx"))
+                .map(|n| {
+                    let table_count = stage
+                        .tables
+                        .iter()
+                        .filter(|t| t.namespace_id == n.id)
+                        .count() as i64;
+                    NamespaceWithStorage {
+                        id: n.value.id,
+                        name: n.value.name.clone(),
+                        retention_period_ns: n.value.retention_period_ns,
+                        max_tables: n.value.max_tables,
+                        max_columns_per_table: n.value.max_columns_per_table,
+                        partition_template: n.value.partition_template.clone(),
+                        size_bytes: 0, // will be calculated later for paginated namespaces only
+                        table_count,
+                        deleted_at: n.value.deleted_at,
+                    }
+                })
+                .collect();
 
-        Ok(namespaces_with_storage)
+        // sort and paginate
+        crate::sorting::sort_namespaces(&mut namespaces, sorting);
+        let pagination = pagination.unwrap_or_default();
+        let mut paginated_namespaces =
+            crate::pagination::paginate(namespaces, pagination.page_number, pagination.page_size);
+
+        // calculate storage size only for the paginated items
+        paginated_namespaces.items.iter_mut().for_each(|n| {
+            n.size_bytes = stage
+                .parquet_files
+                .iter()
+                .filter(|f| f.namespace_id == n.id && f.to_delete.is_none())
+                .map(|f| f.file_size_bytes)
+                .sum();
+        });
+
+        Ok(paginated_namespaces)
     }
 
     async fn get_by_id(
@@ -332,31 +408,49 @@ impl NamespaceRepo for MemTxn {
         Ok(res)
     }
 
-    async fn get_by_name(
-        &mut self,
-        name: &str,
-        deleted: SoftDeletedRows,
-    ) -> Result<Option<Namespace>> {
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>> {
         let stage = self.collections.lock();
 
-        let res = filter_namespace_soft_delete(&stage.namespaces, deleted)
+        // always exclude deleted namespaces when querying by name
+        let res = filter_namespace_soft_delete(&stage.namespaces, SoftDeletedRows::ExcludeDeleted)
             .find(|n| n.name == name)
             .map(|x| x.value.clone());
 
         Ok(res)
     }
 
-    // performs a cascading delete of all things attached to the namespace, then deletes the
-    // namespace
-    async fn soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId> {
+    async fn soft_delete(&mut self, id: NamespaceId) -> Result<Namespace> {
         let mut stage = self.collections.lock();
+
         let timestamp = self.time_provider.now();
-        // get namespace by name
+
+        // Mock the unique constraint on (name, deleted_at) by determining if
+        // there is a pre-existing tuple with the value to be set.
+        let name = stage
+            .namespaces
+            .iter()
+            .find(|n| n.id == id)
+            .ok_or(Error::NotFound {
+                descr: id.to_string(),
+            })?
+            .name
+            .clone();
+
+        if stage
+            .namespaces
+            .iter()
+            .any(|n| n.name == name && n.deleted_at.is_some_and(|v| v == timestamp.into()))
+        {
+            return Err(Error::LimitExceeded {
+                descr: "there exists a deleted namespace under that name for the current time, please retry".to_string(),
+            });
+        }
+
         match stage.namespaces.iter_mut().find(|n| n.id == id) {
             Some(n) => {
                 n.deleted_at = Some(Timestamp::from(timestamp));
                 update_namespace_router_version(n);
-                Ok(n.id)
+                Ok((**n).clone())
             }
             None => Err(Error::NotFound {
                 descr: id.to_string(),
@@ -446,7 +540,11 @@ impl NamespaceRepo for MemTxn {
         namespace_snapshot_by_name(self, name).await
     }
 
-    async fn get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>> {
+    async fn get_storage_by_id(
+        &mut self,
+        id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Option<NamespaceWithStorage>> {
         let stage = self.collections.lock();
 
         let namespace_size_bytes = stage
@@ -457,23 +555,90 @@ impl NamespaceRepo for MemTxn {
             .sum();
         let table_count = stage.tables.iter().filter(|t| t.namespace_id == id).count() as i64;
 
-        let namespace_with_storage =
-            stage
-                .namespaces
-                .iter()
-                .find(|n| n.id == id)
-                .map(|n| NamespaceWithStorage {
-                    id: n.value.id,
-                    name: n.value.name.clone(),
-                    retention_period_ns: n.value.retention_period_ns,
-                    max_tables: n.value.max_tables,
-                    max_columns_per_table: n.value.max_columns_per_table,
-                    partition_template: n.value.partition_template.clone(),
-                    size_bytes: namespace_size_bytes,
-                    table_count,
-                });
+        let namespace_with_storage = filter_namespace_soft_delete(&stage.namespaces, deleted)
+            .find(|n| n.id == id)
+            .map(|n| NamespaceWithStorage {
+                id: n.value.id,
+                name: n.value.name.clone(),
+                retention_period_ns: n.value.retention_period_ns,
+                max_tables: n.value.max_tables,
+                max_columns_per_table: n.value.max_columns_per_table,
+                partition_template: n.value.partition_template.clone(),
+                size_bytes: namespace_size_bytes,
+                table_count,
+                deleted_at: n.value.deleted_at,
+            });
 
         Ok(namespace_with_storage)
+    }
+
+    /// Rename the namespace corresponding to `id`.
+    async fn rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace> {
+        let mut stage = self.collections.lock();
+
+        // Build a set of the `deleted_at` value for all namespaces which
+        // have the new name (ignoring the target namespace ID), so that the
+        // namespace fetched below can only be renamed if the new value for its
+        // (name, deleted_at) tuple would be unique.
+        let deleted_at_set_for_new_name = stage
+            .namespaces
+            .iter()
+            .filter(|n| n.name == new_name.as_str() && n.id != id)
+            .map(|n| n.deleted_at)
+            .collect::<HashSet<_>>();
+
+        let ns = &mut (stage
+            .namespaces
+            .iter_mut()
+            .find(|n| n.id == id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!("namespace: {id}"),
+            })?
+            .value);
+
+        if deleted_at_set_for_new_name.contains(&ns.deleted_at) {
+            return Err(Error::AlreadyExists {
+                descr: new_name.to_string(),
+            });
+        }
+
+        ns.name = new_name.into();
+        ns.router_version = NamespaceVersion::new(ns.router_version.get() + 1);
+        Ok(ns.clone())
+    }
+
+    async fn undelete(&mut self, id: NamespaceId) -> Result<Namespace> {
+        let mut stage = self.collections.lock();
+
+        // Build a set of names in use by active namespaces (ignoring the target
+        // namespace ID), so that the fetched namespace can only be undeleted if
+        // the new value for its resultant (name, deleted_at) tuple would be
+        // unique.
+        let active_name_set = stage
+            .namespaces
+            .iter()
+            .filter(|n| n.id != id)
+            .map(|n| n.name.clone())
+            .collect::<HashSet<_>>();
+
+        let ns = &mut (stage
+            .namespaces
+            .iter_mut()
+            .find(|n| n.id == id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!("namespace: {id}"),
+            })?
+            .value);
+
+        if active_name_set.contains(&ns.name) {
+            return Err(Error::AlreadyExists {
+                descr: ns.name.clone(),
+            });
+        }
+
+        ns.deleted_at = None;
+        ns.router_version = NamespaceVersion::new(ns.router_version.get() + 1);
+        Ok(ns.clone())
     }
 }
 
@@ -485,6 +650,12 @@ impl TableRepo for MemTxn {
         partition_template: TablePartitionTemplateOverride,
         namespace_id: NamespaceId,
     ) -> Result<Table> {
+        if name.len() > MAX_TABLE_NAME_LENGTH {
+            return Err(Error::LimitExceeded {
+                descr: format!("table name '{name}' exceeds max length of {MAX_TABLE_NAME_LENGTH}"),
+            });
+        }
+
         let mut stage = self.collections.lock();
 
         let table = {
@@ -526,7 +697,7 @@ impl TableRepo for MemTxn {
                 Some(_t) => {
                     return Err(Error::AlreadyExists {
                         descr: format!("table '{name}' in namespace {namespace_id}"),
-                    })
+                    });
                 }
                 None => {
                     let table = Table {
@@ -534,6 +705,8 @@ impl TableRepo for MemTxn {
                         namespace_id,
                         name: name.to_string(),
                         partition_template,
+                        iceberg_enabled: false,
+                        deleted_at: None,
                     };
                     stage.tables.push(table.into());
                     stage.tables.last().unwrap().value.clone()
@@ -561,7 +734,11 @@ impl TableRepo for MemTxn {
         Ok(tables.find(|t| t.id == table_id).map(|v| v.value.clone()))
     }
 
-    async fn get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>> {
+    async fn get_storage_by_id(
+        &mut self,
+        table_id: TableId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Option<TableWithStorage>> {
         let stage = self.collections.lock();
 
         let table_size_bytes: i64 = stage
@@ -571,18 +748,30 @@ impl TableRepo for MemTxn {
             .map(|v| v.file_size_bytes)
             .sum();
 
-        let table_with_storage =
-            stage
-                .tables
-                .iter()
-                .find(|t| t.id == table_id)
-                .map(|v| TableWithStorage {
-                    id: v.value.id,
-                    name: v.value.name.clone(),
-                    namespace_id: v.value.namespace_id,
-                    partition_template: v.value.partition_template.clone(),
-                    size_bytes: table_size_bytes,
-                });
+        let column_count = stage
+            .columns
+            .iter()
+            .filter(|c| c.table_id == table_id)
+            .count() as i64;
+
+        let table_with_storage = stage
+            .tables
+            .iter()
+            .find(|t| t.id == table_id)
+            .filter(|t| match deleted {
+                SoftDeletedRows::AllRows => true,
+                SoftDeletedRows::ExcludeDeleted => t.deleted_at.is_none(),
+                SoftDeletedRows::OnlyDeleted => t.deleted_at.is_some(),
+            })
+            .map(|v| TableWithStorage {
+                id: v.value.id,
+                name: v.value.name.clone(),
+                namespace_id: v.value.namespace_id,
+                partition_template: v.value.partition_template.clone(),
+                size_bytes: table_size_bytes,
+                deleted_at: v.value.deleted_at,
+                column_count,
+            });
 
         Ok(table_with_storage)
     }
@@ -611,33 +800,63 @@ impl TableRepo for MemTxn {
     async fn list_storage_by_namespace_id(
         &mut self,
         namespace_id: NamespaceId,
-    ) -> Result<Vec<TableWithStorage>> {
+        sorting: Option<TableSorting>,
+        pagination: Option<PaginationOptions>,
+        deleted: SoftDeletedRows,
+    ) -> Result<Paginated<TableWithStorage>> {
         let stage = self.collections.lock();
 
-        let mut table_sizes: HashMap<TableId, i64> = HashMap::new();
-        stage
-            .parquet_files
-            .iter()
-            .filter(|f| f.namespace_id == namespace_id && f.to_delete.is_none())
-            .for_each(|f| {
-                let entry = table_sizes.entry(f.table_id).or_insert(0);
-                *entry += f.file_size_bytes;
-            });
-
-        let tables_with_storage = stage
+        // filter tables
+        let mut tables: Vec<Table> = stage
             .tables
             .iter()
             .filter(|t| t.namespace_id == namespace_id)
-            .map(|v| TableWithStorage {
-                id: v.value.id,
-                name: v.value.name.clone(),
-                namespace_id: v.value.namespace_id,
-                partition_template: v.value.partition_template.clone(),
-                size_bytes: *table_sizes.get(&v.value.id).unwrap_or(&0),
+            .filter(|t| match deleted {
+                SoftDeletedRows::AllRows => true,
+                SoftDeletedRows::ExcludeDeleted => t.deleted_at.is_none(),
+                SoftDeletedRows::OnlyDeleted => t.deleted_at.is_some(),
+            })
+            .map(|v| v.value.clone())
+            .collect();
+
+        // sort tables
+        crate::sorting::sort_tables(&mut tables, sorting);
+
+        // paginate
+        let pagination = pagination.unwrap_or_default();
+        let paginated_tables =
+            crate::pagination::paginate(tables, pagination.page_number, pagination.page_size);
+
+        // calculate storage size only for the paginated items
+        let tables_with_storage: Vec<TableWithStorage> = paginated_tables
+            .items
+            .iter()
+            .map(|t| {
+                let size_bytes: i64 = stage
+                    .parquet_files
+                    .iter()
+                    .filter(|f| f.table_id == t.id && f.to_delete.is_none())
+                    .map(|f| f.file_size_bytes)
+                    .sum();
+                let column_count =
+                    stage.columns.iter().filter(|c| c.table_id == t.id).count() as i64;
+                TableWithStorage {
+                    id: t.id,
+                    name: t.name.clone(),
+                    namespace_id: t.namespace_id,
+                    partition_template: t.partition_template.clone(),
+                    size_bytes,
+                    deleted_at: t.deleted_at,
+                    column_count,
+                }
             })
             .collect();
 
-        Ok(tables_with_storage)
+        Ok(Paginated {
+            items: tables_with_storage,
+            total: paginated_tables.total,
+            pages: paginated_tables.pages,
+        })
     }
 
     async fn list(&mut self) -> Result<Vec<Table>> {
@@ -677,6 +896,92 @@ impl TableRepo for MemTxn {
         Ok(TableSnapshot::encode(
             table, partitions, columns, generation,
         )?)
+    }
+
+    async fn list_by_iceberg_enabled(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableId>> {
+        let stage = self.collections.lock();
+        Ok(stage
+            .tables
+            .iter()
+            .filter(|t| t.value.iceberg_enabled && t.namespace_id == namespace_id)
+            .map(|t| t.value.id)
+            .collect())
+    }
+
+    async fn enable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let mut stage = self.collections.lock();
+
+        if let Some(table) = stage.tables.iter_mut().find(|t| t.id == table_id) {
+            table.iceberg_enabled = true;
+            Ok(())
+        } else {
+            Err(Error::NotFound {
+                descr: format!("{table_id}"),
+            })
+        }
+    }
+
+    async fn disable_iceberg(&mut self, table_id: TableId) -> Result<()> {
+        let mut stage = self.collections.lock();
+        if let Some(table) = stage.tables.iter_mut().find(|t| t.id == table_id) {
+            table.iceberg_enabled = false;
+            Ok(())
+        } else {
+            Err(Error::NotFound {
+                descr: format!("{table_id}"),
+            })
+        }
+    }
+
+    async fn soft_delete(&mut self, id: TableId) -> Result<Table> {
+        let now = self.time_provider.now();
+        self.find_and_modify_table(id, |table| table.deleted_at = Some(Timestamp::from(now)))
+            .await
+    }
+
+    async fn rename(&mut self, id: TableId, new_name: &str) -> Result<Table> {
+        self.find_and_modify_table(id, |table| table.name = new_name.to_owned())
+            .await
+    }
+
+    async fn undelete(&mut self, id: TableId) -> Result<Table> {
+        self.find_and_modify_table(id, |table| table.deleted_at = None)
+            .await
+    }
+}
+
+impl MemTxn {
+    async fn find_and_modify_table(
+        &mut self,
+        id: TableId,
+        modify: impl FnOnce(&mut Table),
+    ) -> Result<Table> {
+        let mut stage = self.collections.lock();
+
+        let table = stage
+            .tables
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!("No table with id {id} found"),
+            })?;
+
+        modify(&mut *table);
+        let ret_table = (**table).clone();
+
+        let namespace = stage
+            .namespaces
+            .iter_mut()
+            .find(|ns| ns.id == ret_table.namespace_id)
+            .ok_or_else(|| Error::NotFound {
+                descr: format!(
+                    "Could not find table's namespace (with id {})",
+                    ret_table.namespace_id
+                ),
+            })?;
+        namespace.router_version = NamespaceVersion::new(namespace.router_version.get() + 1);
+
+        Ok(ret_table)
     }
 }
 
@@ -772,9 +1077,25 @@ impl ColumnRepo for MemTxn {
         Ok(columns)
     }
 
-    async fn list(&mut self) -> Result<Vec<Column>> {
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>> {
         let stage = self.collections.lock();
-        Ok(stage.columns.clone())
+
+        let namespaces = filter_namespace_soft_delete(&stage.namespaces, deleted);
+        let namespace_ids: Vec<_> = namespaces.into_iter().map(|x| x.id).collect();
+
+        let table_ids: Vec<_> = stage
+            .tables
+            .iter()
+            .filter(|t| namespace_ids.contains(&t.namespace_id))
+            .map(|t| t.id)
+            .collect();
+
+        Ok(stage
+            .columns
+            .iter()
+            .filter(|c| table_ids.contains(&c.table_id))
+            .cloned()
+            .collect())
     }
 }
 
@@ -1057,7 +1378,10 @@ impl PartitionRepo for MemTxn {
         Ok(old_style)
     }
 
-    async fn delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>> {
+    async fn delete_by_retention(
+        &mut self,
+        partition_cutoff: Duration,
+    ) -> Result<Vec<(TableId, PartitionId)>> {
         let mut stage = self.collections.lock();
 
         let now = self.time_provider.now();
@@ -1073,7 +1397,7 @@ impl PartitionRepo for MemTxn {
             .map(|x| (x.id, (x.namespace_id, x.partition_template.clone())))
             .collect();
 
-        let older_than = (self.time_provider.now() - ONE_DAY).into();
+        let older_than = (self.time_provider.now() - partition_cutoff).into();
 
         let mut candidates: HashMap<_, _> = stage
             .partitions
@@ -1207,10 +1531,47 @@ impl ParquetFileRepo for MemTxn {
 
         let delete = delete
             .into_iter()
-            .take(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE as usize)
+            // An old default - this method should not really be called due to it being deprecated
+            // in favor of `delete_old_ids_count` so we don't need to worry about changing this
+            // anymore
+            .take(10_000)
             .map(|f| f.object_store_id)
             .collect();
         Ok(delete)
+    }
+
+    async fn delete_old_ids_count(
+        &mut self,
+        older_than: Timestamp,
+        limit: u32,
+    ) -> Result<(u64, Option<Timestamp>)> {
+        let mut stage = self.collections.lock();
+
+        let (delete, keep): (Vec<_>, Vec<_>) = stage.parquet_files.iter().cloned().partition(
+            |f| matches!(f.to_delete, Some(marked_deleted) if marked_deleted < older_than),
+        );
+
+        stage.parquet_files = keep;
+
+        let to_remove = (limit as usize).min(delete.len());
+        let to_keep = delete.len() - to_remove;
+
+        let oldest_to_delete = delete
+            .iter()
+            .take(to_remove) // Only consider the files being deleted
+            .filter_map(|f| f.to_delete)
+            .min();
+        // We need to re-insert those that we decided to not actually delete.
+        for file in delete.into_iter().rev().take(to_keep) {
+            stage.parquet_files.insert(0, file);
+        }
+
+        Ok((
+            to_remove
+                .try_into()
+                .expect("128-bit computers don't exist yet"),
+            oldest_to_delete,
+        ))
     }
 
     async fn list_by_partition_not_to_delete_batch(
@@ -1319,7 +1680,10 @@ impl ParquetFileRepo for MemTxn {
         for file in create {
             if file.partition_id != partition_id {
                 return Err(Error::Malformed {
-                    descr: format!("Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})", file.partition_id),
+                    descr: format!(
+                        "Inconsistent ParquetFileParams, expected PartitionId({partition_id}) got PartitionId({})",
+                        file.partition_id
+                    ),
                 });
             }
             let res = create_parquet_file(&mut stage, marked_at, file.clone())?;
@@ -1345,6 +1709,7 @@ impl ParquetFileRepo for MemTxn {
                 Some(level) => pf.table_id == table_id && pf.compaction_level == level,
                 None => pf.table_id == table_id,
             })
+            .filter(|pf| pf.to_delete.is_none())
             .cloned()
             .collect())
     }
@@ -1555,7 +1920,7 @@ fn flag_for_delete(
         _ => {
             return Err(Error::NotFound {
                 descr: format!("parquet file {id} not found for delete"),
-            })
+            });
         }
     }
 
@@ -1607,18 +1972,21 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_catalog() {
+    fn setup_catalogue() -> MemCatalog {
         let metrics = Arc::new(metric::Registry::default());
         let time_provider = Arc::new(SystemProvider::new());
 
-        let mem_catalog = MemCatalog::new(metrics, time_provider);
+        MemCatalog::new(metrics, time_provider)
+    }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_catalog() {
+        let mem_catalog = setup_catalogue();
         let collections = Arc::clone(&mem_catalog.collections);
 
         let catalog: Arc<dyn Catalog> = Arc::new(mem_catalog);
 
-        let catalog_reset_fn = || async {
+        let catalog_reset_fn = async || {
             let mut stage = collections.lock();
             stage.clear_all();
 
@@ -1662,5 +2030,41 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_table_name_length_limit() {
+        let mem_catalog = setup_catalogue();
+        let mut repos = mem_catalog.repositories();
+
+        let namespace_name = "test_namespace";
+        let namespace = repos
+            .namespaces()
+            .create(
+                &namespace_name.try_into().unwrap(),
+                None, // no partition template
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Create a table name that exceeds the maximum length
+        let long_table_name = "a".repeat(MAX_TABLE_NAME_LENGTH + 1);
+
+        // Attempt to create the table and verify it fails with the correct error
+        let result = repos
+            .tables()
+            .create(
+                &long_table_name,
+                TablePartitionTemplateOverride::default(),
+                namespace.id,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::LimitExceeded { descr }) if descr.contains("exceeds max length")
+        ));
     }
 }

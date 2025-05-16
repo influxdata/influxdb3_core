@@ -6,11 +6,12 @@ use std::{
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{parquet::ParquetExecBuilder, FileScanConfig, ParquetExec},
+    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     error::{DataFusionError, Result},
-    physical_expr::{utils::collect_columns, PhysicalSortExpr},
+    physical_expr::{LexOrdering, PhysicalSortExpr, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
+        ExecutionPlan, PhysicalExpr,
         empty::EmptyExec,
         expressions::Column,
         filter::FilterExec,
@@ -18,7 +19,6 @@ use datafusion::{
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        ExecutionPlan, PhysicalExpr,
     },
 };
 use datafusion_util::config::table_parquet_options;
@@ -118,11 +118,11 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             .iter()
             .map(|output_ordering| project_output_ordering(output_ordering, &col_map))
             .collect::<Result<_>>()?;
-        let base_config = FileScanConfig {
-            projection: Some(projection),
-            output_ordering,
-            ..child_parquet.base_config().clone()
-        };
+        let base_config = child_parquet
+            .base_config()
+            .clone()
+            .with_output_ordering(output_ordering)
+            .with_projection(Some(projection));
         let mut builder =
             ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         if let Some(predicate) = child_parquet.predicate() {
@@ -159,7 +159,7 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             |plan, col_map| {
                 Ok(Arc::new(
                     SortExec::new(
-                        reassign_sort_exprs_columns(child_sort.expr(), col_map)?,
+                        reassign_sort_exprs_columns(child_sort.expr(), col_map)?.into(),
                         plan,
                     )
                     .with_preserve_partitioning(child_sort.preserve_partitioning())
@@ -182,7 +182,7 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             Arc::clone(child_sort.input()),
             |plan, col_map| {
                 Ok(Arc::new(SortPreservingMergeExec::new(
-                    reassign_sort_exprs_columns(child_sort.expr(), col_map)?,
+                    reassign_sort_exprs_columns(child_sort.expr(), col_map)?.into(),
                     plan,
                 )))
             },
@@ -220,7 +220,7 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
                 let sort_keys = reassign_sort_exprs_columns(child_dedup.sort_keys(), col_map)?;
                 Ok(Arc::new(DeduplicateExec::new(
                     plan,
-                    sort_keys,
+                    sort_keys.into(),
                     child_dedup.use_chunk_order_col(),
                 )))
             },
@@ -261,11 +261,12 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
 ///
 /// It is sorted on `a,b` but *not* sorted on `b`
 fn project_output_ordering(
-    output_ordering: &[PhysicalSortExpr],
+    output_ordering: &LexOrdering,
     col_map: &HashMap<Column, usize>,
-) -> Result<Vec<PhysicalSortExpr>> {
+) -> Result<LexOrdering> {
     // take longest prefix
     let sort_exprs = output_ordering
+        .inner
         .iter()
         .take_while(|expr| {
             if let Some(col) = expr.expr.as_any().downcast_ref::<Column>() {
@@ -279,7 +280,7 @@ fn project_output_ordering(
         .cloned()
         .collect::<Vec<_>>();
 
-    reassign_sort_exprs_columns(&sort_exprs, col_map)
+    Ok(reassign_sort_exprs_columns(&sort_exprs, col_map)?.into())
 }
 
 /// remap the column references in the expression to the new
@@ -384,6 +385,7 @@ where
         .collect()
 }
 
+/// Take a series of sort_exprs, and remap the projections.
 fn reassign_sort_exprs_columns(
     sort_exprs: &[PhysicalSortExpr],
     col_map: &HashMap<Column, usize>,
@@ -405,6 +407,7 @@ mod tests {
         compute::SortOptions,
         datatypes::{DataType, Field, Schema, SchemaRef},
     };
+    use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::{
         common::JoinType,
         datasource::object_store::ObjectStoreUrl,
@@ -412,16 +415,17 @@ mod tests {
         logical_expr::Operator,
         physical_expr::{EquivalenceProperties, ScalarFunctionExpr},
         physical_plan::{
+            DisplayAs, PhysicalExpr, PlanProperties,
+            execution_plan::{Boundedness, EmissionType},
             expressions::{BinaryExpr, IsNullExpr, Literal},
-            joins::{utils::JoinFilter, HashJoinExec, NestedLoopJoinExec, PartitionMode},
-            DisplayAs, ExecutionMode, PhysicalExpr, PlanProperties, Statistics,
+            joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode, utils::JoinFilter},
         },
         scalar::ScalarValue,
     };
     use serde::Serialize;
 
     use crate::{
-        physical_optimizer::test_util::{assert_unknown_partitioning, OptimizationTest},
+        physical_optimizer::test_util::{OptimizationTest, assert_unknown_partitioning},
         test::TestChunk,
     };
 
@@ -693,15 +697,13 @@ mod tests {
         ]));
         let projection = vec![3, 2, 1];
         let schema_projected = Arc::new(schema.project(&projection).unwrap());
-        let base_config = FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test://").unwrap(),
-            file_schema: Arc::clone(&schema),
-            file_groups: vec![],
-            statistics: Statistics::new_unknown(&schema),
-            projection: Some(projection),
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![vec![
+        let base_config = FileScanConfig::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::clone(&schema),
+        )
+        .with_projection(Some(projection))
+        .with_output_ordering(vec![
+            vec![
                 PhysicalSortExpr {
                     expr: expr_col("tag3", &schema_projected),
                     options: Default::default(),
@@ -714,8 +716,9 @@ mod tests {
                     expr: expr_col("tag2", &schema_projected),
                     options: Default::default(),
                 },
-            ]],
-        };
+            ]
+            .into(),
+        ]);
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
             .with_predicate(expr_string_cmp("tag1", &schema));
         let inner = builder.build();
@@ -736,10 +739,10 @@ mod tests {
             @r#"
         input:
           - " ProjectionExec: expr=[tag2@2 as tag2, tag3@1 as tag3]"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
-            - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=CASE WHEN tag1_null_count@2 = tag1_row_count@3 THEN false ELSE tag1_min@0 <= foo AND foo <= tag1_max@1 END, required_guarantees=[tag1 in (foo)]"
+            - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         "#
         );
 
@@ -939,7 +942,8 @@ mod tests {
                                 descending: true,
                                 ..Default::default()
                             },
-                        }],
+                        }]
+                        .into(),
                         Arc::new(TestExec::new(schema)),
                     )
                     .with_fetch(Some(42)),
@@ -979,7 +983,8 @@ mod tests {
                                 descending: true,
                                 ..Default::default()
                             },
-                        }],
+                        }]
+                        .into(),
                         Arc::new(TestExec::new_with_partitions(schema, 2)),
                     )
                     .with_preserve_partitioning(true)
@@ -1033,7 +1038,8 @@ mod tests {
                             descending: true,
                             ..Default::default()
                         },
-                    }],
+                    }]
+                    .into(),
                     Arc::new(TestExec::new(schema)),
                 )),
             )
@@ -1160,7 +1166,8 @@ mod tests {
                             descending: true,
                             ..Default::default()
                         },
-                    }],
+                    }]
+                    .into(),
                     false,
                 )),
             )
@@ -1215,7 +1222,8 @@ mod tests {
                                 ..Default::default()
                             },
                         },
-                    ],
+                    ]
+                    .into(),
                     false,
                 )),
             )
@@ -1506,16 +1514,10 @@ mod tests {
             Field::new("field1", DataType::UInt64, true),
             Field::new("field2", DataType::UInt64, true),
         ]));
-        let base_config = FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test://").unwrap(),
-            file_schema: Arc::clone(&schema),
-            file_groups: vec![],
-            statistics: Statistics::new_unknown(&schema),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-        };
+        let base_config = FileScanConfig::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::clone(&schema),
+        );
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = builder.build_arc();
         let plan = Arc::new(UnionExec::new(vec![plan]));
@@ -1531,7 +1533,8 @@ mod tests {
                     expr: expr_col("tag2", &plan_schema),
                     options: Default::default(),
                 },
-            ],
+            ]
+            .into(),
             false,
         ));
         let plan =
@@ -1581,7 +1584,7 @@ mod tests {
         ];
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1612,7 +1615,7 @@ mod tests {
         ];
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1641,7 +1644,7 @@ mod tests {
         ];
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1669,7 +1672,7 @@ mod tests {
         ];
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1702,7 +1705,7 @@ mod tests {
         ];
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
             @r#"
         output_ordering:
           - "1"
@@ -1731,7 +1734,7 @@ mod tests {
         ];
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering, projection),
+            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
             @r#"
         output_ordering:
           - tag2@1
@@ -1756,7 +1759,7 @@ mod tests {
     impl ProjectOutputOrdering {
         fn new(
             schema: &Schema,
-            output_ordering: Vec<PhysicalSortExpr>,
+            output_ordering: LexOrdering,
             projection: Vec<&'static str>,
         ) -> Self {
             let col_map = projection
@@ -1774,7 +1777,7 @@ mod tests {
             let projected_ordering = project_output_ordering(&output_ordering, &col_map);
 
             let projected_ordering = match projected_ordering {
-                Ok(projected_ordering) => format_sort_exprs(&projected_ordering),
+                Ok(projected_ordering) => format_sort_exprs(&projected_ordering.inner),
                 Err(e) => vec![e.to_string()],
             };
 
@@ -1794,6 +1797,7 @@ mod tests {
         ]))
     }
 
+    /// Take a series of sort_exprs, and convert to strings.
     fn format_sort_exprs(sort_exprs: &[PhysicalSortExpr]) -> Vec<String> {
         sort_exprs
             .iter()
@@ -1844,7 +1848,12 @@ mod tests {
             let output_partitioning =
                 datafusion::physical_plan::Partitioning::UnknownPartitioning(partitions);
 
-            PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
+            PlanProperties::new(
+                eq_properties,
+                output_partitioning,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )
         }
     }
 

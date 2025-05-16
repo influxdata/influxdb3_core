@@ -2,6 +2,7 @@
 use arrow::error::ArrowError;
 use arrow_flight::error::FlightError;
 use datafusion::error::DataFusionError;
+use datafusion::parquet::errors::ParquetError;
 
 /// Converts a [`DataFusionError`] into the appropriate [`tonic::Code`]
 ///
@@ -60,12 +61,12 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
         DataFusionError::ObjectStore(e) => {
             object_store_error_to_tonic_code(e)
         }
+        DataFusionError::ParquetError(e) => parquet_error_to_tonic_code(e),
         // Map as many as possible back into user visible
         // (non internal) errors and only treat the ones
         // the user likely can't do anything about as internal
         DataFusionError::Configuration(_)
         | DataFusionError::IoError(_)
-        | DataFusionError::ParquetError(_)
         // Substrait errors come from internal code and are unused
         // with DataFusion at the moment
         | DataFusionError::Substrait(_)
@@ -111,6 +112,20 @@ fn arrow_error_to_tonic_code(e: &ArrowError) -> tonic::Code {
     }
 }
 
+/// Translate [`ParquetError`] to [tonic code](tonic::Status).
+///
+/// This is done by traversing the error chain, similar to [`datafusion_error_to_tonic_code`].
+fn parquet_error_to_tonic_code(e: &ParquetError) -> tonic::Code {
+    match e {
+        ParquetError::External(e) => dyn_error_to_tonic_code(e.as_ref()),
+        ParquetError::NYI(_) => tonic::Code::Unimplemented,
+        ParquetError::IndexOutOfBound(_, _) => tonic::Code::OutOfRange,
+        ParquetError::EOF(_) | ParquetError::ArrowError(_) | ParquetError::General(_) => {
+            tonic::Code::Internal
+        }
+    }
+}
+
 fn dyn_error_to_tonic_code(e: &(dyn std::error::Error + Send + Sync + 'static)) -> tonic::Code {
     if let Some(e) = e.downcast_ref::<ArrowError>() {
         arrow_error_to_tonic_code(e)
@@ -122,6 +137,8 @@ fn dyn_error_to_tonic_code(e: &(dyn std::error::Error + Send + Sync + 'static)) 
         flight_error_to_tonic_code(e)
     } else if let Some(e) = e.downcast_ref::<object_store::Error>() {
         object_store_error_to_tonic_code(e)
+    } else if let Some(e) = e.downcast_ref::<ParquetError>() {
+        parquet_error_to_tonic_code(e)
     } else {
         // All other, unclassified cases are signalled as "internal error" to the user since they cannot do
         // anything about it (except for reporting a bug). Note that DataFusion "external" error is only from
@@ -257,6 +274,19 @@ mod test {
                 ))),
             ),
             tonic::Code::Unavailable,
+        );
+        do_transl_test(
+            FlightError::Arrow(ArrowError::ExternalError(Box::new(
+                DataFusionError::ArrowError(
+                    ArrowError::ExternalError(Box::new(ParquetError::External(Box::new(
+                        ArrowError::ComputeError(
+                            "Error evaluating filter predicate: ArrowError(CastError(\"Cannot cast string 'val1' to value of Int64 type\"), None)".to_string(),
+                        ),
+                    )))),
+                    None,
+                ),
+            ))),
+            tonic::Code::InvalidArgument,
         );
 
         // object store errors

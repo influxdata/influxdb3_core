@@ -21,9 +21,9 @@
 mod meta;
 
 use arrow_flight::sql::{
-    metadata::{SqlInfoData, SqlInfoDataBuilder},
     SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity, SqlSupportedTransactions,
     SupportedSqlGrammar,
+    metadata::{SqlInfoData, SqlInfoDataBuilder},
 };
 use meta::{
     SQL_INFO_DATE_TIME_FUNCTIONS, SQL_INFO_NUMERIC_FUNCTIONS, SQL_INFO_SQL_KEYWORDS,
@@ -31,7 +31,7 @@ use meta::{
 };
 use std::sync::LazyLock;
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 static INSTANCE: LazyLock<SqlInfoData> = LazyLock::new(|| {
     // The following are not defined in the [`SqlInfo`], but are
     // documented at

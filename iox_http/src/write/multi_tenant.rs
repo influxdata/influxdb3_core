@@ -5,11 +5,11 @@
 
 use async_trait::async_trait;
 use data_types::{NamespaceName, OrgBucketMappingError};
-use hyper::{Body, Request};
+use iox_http_util::Request;
 
 use super::{
-    v2::{V2WriteParseError, WriteParamsV2},
     WriteParams, WriteParseError, WriteRequestUnifier,
+    v2::{V2WriteParseError, WriteParamsV2},
 };
 
 /// Request parsing errors when operating in "single tenant" mode.
@@ -53,17 +53,17 @@ pub struct MultiTenantRequestUnifier;
 
 #[async_trait]
 impl WriteRequestUnifier for MultiTenantRequestUnifier {
-    async fn parse_v1(&self, _req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+    async fn parse_v1(&self, _req: &Request) -> Result<WriteParams, WriteParseError> {
         Err(WriteParseError::NotImplemented)
     }
 
-    async fn parse_v2(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+    async fn parse_v2(&self, req: &Request) -> Result<WriteParams, WriteParseError> {
         Ok(parse_v2(req)?)
     }
 }
 
 // Parse a V2 write request for multi tenant mode.
-fn parse_v2(req: &Request<Body>) -> Result<WriteParams, MultiTenantExtractError> {
+fn parse_v2(req: &Request) -> Result<WriteParams, MultiTenantExtractError> {
     let write_params = WriteParamsV2::try_from(req)?;
 
     let namespace = NamespaceName::from_org_and_bucket(write_params.org, write_params.bucket)?;
@@ -78,6 +78,7 @@ fn parse_v2(req: &Request<Body>) -> Result<WriteParams, MultiTenantExtractError>
 mod tests {
     use assert_matches::assert_matches;
     use data_types::NamespaceNameError;
+    use iox_http_util::{RequestBuilder, empty_request_body};
 
     use crate::write::Precision;
 
@@ -103,10 +104,10 @@ mod tests {
                     let unifier = MultiTenantRequestUnifier;
 
                     let query = $query_string;
-                    let request = Request::builder()
+                    let request = RequestBuilder::new()
                         .uri(format!("https://itsallbroken.com/ignored{query}"))
                         .method("POST")
-                        .body(Body::from(""))
+                        .body(empty_request_body())
                         .unwrap();
 
                     let got = unifier.parse_v2(&request).await;

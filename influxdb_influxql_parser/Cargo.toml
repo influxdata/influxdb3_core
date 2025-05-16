@@ -9,17 +9,20 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10" }
 iox_query_params = { path = "../iox_query_params/" }
-nom = { version = "7", default-features = false, features = ["std"] }
-num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
+nom = { version = "8", default-features = false, features = ["std"] }
+num-integer = { version = "0.1", default-features = false, features = [
+    "i128",
+    "std",
+] }
 num-traits = "0.2"
-thiserror = "2.0.9"
+thiserror = "2.0.12"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
 assert_matches = "1"
-insta = { version = "1.41.1", features = ["yaml"] }
+insta = { version = "1.43.1", features = ["yaml"] }
 paste = "1.0.15"
 test_helpers = { path = "../test_helpers" }

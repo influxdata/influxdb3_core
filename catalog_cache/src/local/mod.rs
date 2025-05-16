@@ -4,24 +4,28 @@ mod limit;
 
 pub use crate::local::limit::{MemoryLimiter, OomNotify};
 use crate::{CacheEntry, CacheKey, CacheValue};
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use snafu::Snafu;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Error for [`CatalogCache`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs, missing_copy_implementations)]
+#[expect(missing_docs, missing_copy_implementations)]
 pub enum Error {
-    #[snafu(display("Cannot reserve additional {size} bytes for cache containing {current} bytes as would exceed limit of {limit} bytes"))]
+    #[snafu(display(
+        "Cannot reserve additional {size} bytes for cache containing {current} bytes as would exceed limit of {limit} bytes"
+    ))]
     OutOfMemory {
         size: usize,
         current: usize,
         limit: usize,
     },
 
-    #[snafu(display("Cannot reserve additional {size} bytes for cache as request exceeds total memory limit of {limit} bytes"))]
+    #[snafu(display(
+        "Cannot reserve additional {size} bytes for cache as request exceeds total memory limit of {limit} bytes"
+    ))]
     TooLarge { size: usize, limit: usize },
 }
 
@@ -182,7 +186,7 @@ impl CatalogCache {
 
 /// Statistics produced by [cache eviction](CatalogCache::evict_unused).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_copy_implementations)] // may want to extend this later
+#[expect(missing_copy_implementations)] // may want to extend this later
 pub struct EvictionStats {
     /// Number of evicted keys.
     pub count: usize,
@@ -192,7 +196,7 @@ pub struct EvictionStats {
 }
 
 /// Iterator for [`CatalogCache`]
-#[allow(missing_debug_implementations)]
+#[expect(missing_debug_implementations)]
 pub struct CacheIterator<'a>(dashmap::iter::Iter<'a, CacheKey, CacheEntry>);
 
 impl Iterator for CacheIterator<'_> {
@@ -247,9 +251,11 @@ mod tests {
         assert_eq!(cache.get(CacheKey::Table(0)).unwrap(), v1);
 
         // Older generation rejected
-        assert!(!cache
-            .insert(CacheKey::Table(0), CacheValue::new("2".into(), 3))
-            .unwrap());
+        assert!(
+            !cache
+                .insert(CacheKey::Table(0), CacheValue::new("2".into(), 3))
+                .unwrap()
+        );
 
         // Value unchanged
         assert_eq!(cache.get(CacheKey::Table(0)).unwrap(), v1);
@@ -363,7 +369,10 @@ mod tests {
         cache.insert(k2, CacheValue::new(v_100.clone(), 0)).unwrap();
 
         let r = cache.insert(k3, CacheValue::new(v_20.clone(), 0));
-        assert_eq!(r.unwrap_err().to_string(), "Cannot reserve additional 20 bytes for cache containing 200 bytes as would exceed limit of 200 bytes");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "Cannot reserve additional 20 bytes for cache containing 200 bytes as would exceed limit of 200 bytes"
+        );
 
         // Upsert k1 to 20 bytes
         cache.insert(k1, CacheValue::new(v_20.clone(), 1)).unwrap();
@@ -376,13 +385,19 @@ mod tests {
 
         // Cannot increase size of k3 to 100
         let r = cache.insert(k3, CacheValue::new(v_100.clone(), 1));
-        assert_eq!(r.unwrap_err().to_string(), "Cannot reserve additional 80 bytes for cache containing 140 bytes as would exceed limit of 200 bytes");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "Cannot reserve additional 80 bytes for cache containing 140 bytes as would exceed limit of 200 bytes"
+        );
 
         cache.delete(k2).unwrap();
         cache.insert(k3, CacheValue::new(v_100.clone(), 1)).unwrap();
 
         let r = cache.insert(k2, CacheValue::new(v_100.clone(), 1));
-        assert_eq!(r.unwrap_err().to_string(), "Cannot reserve additional 100 bytes for cache containing 120 bytes as would exceed limit of 200 bytes");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "Cannot reserve additional 100 bytes for cache containing 120 bytes as would exceed limit of 200 bytes"
+        );
 
         // Should evict everything apart from k3
         assert_eq!(cache.evict_unused(), EvictionStats { count: 1, size: 20 },);

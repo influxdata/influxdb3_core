@@ -2,8 +2,8 @@ use std::{
     fs::File,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering::SeqCst},
         Arc, LazyLock, Weak,
+        atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
 };

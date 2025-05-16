@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
 use datafusion::common::{Column, DFSchema, DFSchemaRef};
-use datafusion::logical_expr::{lit, Expr, SortExpr};
+use datafusion::logical_expr::{Expr, SortExpr, lit};
 use datafusion::scalar::ScalarValue;
 use generated_types::influxdata::platform::storage::read_response::DataType as StorageDataType;
 use schema::TIME_DATA_TYPE;

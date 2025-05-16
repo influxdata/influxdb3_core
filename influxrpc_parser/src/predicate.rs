@@ -1,8 +1,8 @@
 //! This module has logic to translate a sub-set of DataFusion expressions into
 //! RPC Nodes (predicates).
 use generated_types::{
-    node::Comparison as RPCComparison, node::Logical as RPCLogical, node::Type as RPCType,
-    node::Value as RPCValue, Node as RPCNode, Predicate as RPCPredicate,
+    Node as RPCNode, Predicate as RPCPredicate, node::Comparison as RPCComparison,
+    node::Logical as RPCLogical, node::Type as RPCType, node::Value as RPCValue,
 };
 
 use datafusion::sql::sqlparser::{
@@ -532,12 +532,14 @@ mod test {
         let left_rpc_expr = make_tag_expr("env = 'usa'");
         let right_rpc_expr = RPCNode {
             node_type: RPCType::ParenExpression as i32,
-            children: vec![make_logical_node(
-                make_tag_expr("env = eu"),
-                RPCLogical::And,
-                make_field_expr_str("temp", "=", "on".to_owned()),
-            )
-            .unwrap()],
+            children: vec![
+                make_logical_node(
+                    make_tag_expr("env = eu"),
+                    RPCLogical::And,
+                    make_field_expr_str("temp", "=", "on".to_owned()),
+                )
+                .unwrap(),
+            ],
             value: None,
         };
         let exp_rpc_node =

@@ -1,6 +1,9 @@
 //! `iox_http`
 //!
-//! Core crate for storing shared HTTP functionality for InfluxDB 3.0 API.
+//! Core crate for defining shared HTTP API functionality for services providing HTTP APIs.
+//!
+//! For lower-level, more general HTTP types and functions suitable for use in any HTTP-related
+//! context, see the `iox_http_util` crate.
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;

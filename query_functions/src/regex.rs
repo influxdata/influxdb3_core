@@ -1,7 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow::{
-    array::{as_string_array, ArrayRef, BooleanArray},
+    array::{ArrayRef, BooleanArray, as_string_array},
     datatypes::DataType,
 };
 use datafusion::{
@@ -69,13 +69,13 @@ fn regex_match_expr_impl(matches: bool) -> ScalarFunctionImplementation {
             ColumnarValue::Array(_) => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "regex_match({matches}) with non scalar patterns not yet implemented"
-                )))
+                )));
             }
             ColumnarValue::Scalar(ScalarValue::Utf8(pattern)) => pattern,
             ColumnarValue::Scalar(arg) => {
                 return Err(DataFusionError::Internal(format!(
                     "Expected string pattern to regex match({matches}), got: {arg:?}"
-                )))
+                )));
             }
         };
 
@@ -203,7 +203,7 @@ mod test {
     use datafusion::prelude::SessionContext;
     use datafusion::{
         error::DataFusionError,
-        prelude::{col, lit, Expr},
+        prelude::{Expr, col, lit},
     };
     use std::sync::Arc;
 

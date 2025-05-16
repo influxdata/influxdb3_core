@@ -77,7 +77,7 @@ impl TryFrom<proto::Permission> for Permission {
                 let r = Resource::try_from_proto(
                     proto::resource_action_permission::ResourceType::try_from(ra.resource_type)
                         .map_err(|_| IncompatiblePermissionError {})?,
-                    ra.resource_id,
+                    ra.target,
                 )?;
                 let a = Action::try_from(
                     proto::resource_action_permission::Action::try_from(ra.action)
@@ -96,13 +96,13 @@ impl TryFrom<Permission> for proto::Permission {
     fn try_from(value: Permission) -> Result<Self, Self::Error> {
         match value {
             Permission::ResourceAction(r, a) => {
-                let (rt, ri) = r.try_into_proto()?;
+                let (resource_type, target) = r.try_into_proto()?;
                 let a: proto::resource_action_permission::Action = a.into();
                 Ok(Self {
                     permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
                         proto::ResourceActionPermission {
-                            resource_type: rt as i32,
-                            resource_id: ri,
+                            resource_type: resource_type as i32,
+                            target,
                             action: a as i32,
                         },
                     )),
@@ -113,20 +113,20 @@ impl TryFrom<Permission> for proto::Permission {
 }
 
 /// A resource is the object that a request is trying to access.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resource {
-    /// A database is a named IOx database.
-    Database(String),
+    /// A database resource is a InfluxDB database specified by the given [Target] selector.
+    Database(Target),
 }
 
 impl Resource {
     fn try_from_proto(
-        rt: proto::resource_action_permission::ResourceType,
-        ri: Option<String>,
+        resource_type: proto::resource_action_permission::ResourceType,
+        resource_target: Option<proto::resource_action_permission::Target>,
     ) -> Result<Self, IncompatiblePermissionError> {
-        match (rt, ri) {
-            (proto::resource_action_permission::ResourceType::Database, Some(s)) => {
-                Ok(Self::Database(s))
+        match resource_type {
+            proto::resource_action_permission::ResourceType::Database => {
+                Ok(Self::Database(Target::try_from_proto(resource_target)?))
             }
             _ => Err(IncompatiblePermissionError {}),
         }
@@ -137,16 +137,51 @@ impl Resource {
     ) -> Result<
         (
             proto::resource_action_permission::ResourceType,
-            Option<String>,
+            Option<proto::resource_action_permission::Target>,
         ),
         IncompatiblePermissionError,
     > {
         match self {
-            Self::Database(s) => Ok((
+            Self::Database(target) => Ok((
                 proto::resource_action_permission::ResourceType::Database,
-                Some(s),
+                Some(target.try_into_proto()?),
             )),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A specifier to select which resource a permission is requested for
+pub enum Target {
+    /// Selects a resource by its name.
+    ResourceName(String),
+    /// Selects a resource by its unique identifier
+    ResourceId(String),
+}
+
+impl Target {
+    fn try_from_proto(
+        target: Option<proto::resource_action_permission::Target>,
+    ) -> Result<Self, IncompatiblePermissionError> {
+        target
+            .map(|target| match target {
+                proto::resource_action_permission::Target::ResourceName(name) => {
+                    Self::ResourceName(name)
+                }
+                proto::resource_action_permission::Target::ResourceId(id) => Self::ResourceId(id),
+            })
+            .ok_or(IncompatiblePermissionError {})
+    }
+
+    fn try_into_proto(
+        self,
+    ) -> Result<proto::resource_action_permission::Target, IncompatiblePermissionError> {
+        Ok(match self {
+            Self::ResourceName(name) => {
+                proto::resource_action_permission::Target::ResourceName(name)
+            }
+            Self::ResourceId(id) => proto::resource_action_permission::Target::ResourceId(id),
+        })
     }
 }
 
@@ -208,27 +243,40 @@ mod tests {
 
     #[test]
     fn resource_try_from_proto() {
+        use proto::resource_action_permission as proto;
         assert_eq!(
-            Resource::Database("ns1".into()),
+            Resource::Database(Target::ResourceName("ns1".to_owned())),
             Resource::try_from_proto(
-                proto::resource_action_permission::ResourceType::Database,
-                Some("ns1".into())
+                proto::ResourceType::Database,
+                Some(proto::Target::ResourceName("ns1".to_owned()))
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            Resource::Database(Target::ResourceId("1234".to_owned())),
+            Resource::try_from_proto(
+                proto::ResourceType::Database,
+                Some(proto::Target::ResourceId("1234".to_owned())),
             )
             .unwrap()
         );
         assert_eq!(
             IncompatiblePermissionError {},
+            Resource::try_from_proto(proto::ResourceType::Database, None).unwrap_err()
+        );
+        assert_eq!(
+            IncompatiblePermissionError {},
             Resource::try_from_proto(
-                proto::resource_action_permission::ResourceType::Database,
-                None
+                proto::ResourceType::Unspecified,
+                Some(proto::Target::ResourceName("ns1".to_owned())),
             )
             .unwrap_err()
         );
         assert_eq!(
             IncompatiblePermissionError {},
             Resource::try_from_proto(
-                proto::resource_action_permission::ResourceType::Unspecified,
-                Some("ns1".into())
+                proto::ResourceType::Unspecified,
+                Some(proto::Target::ResourceId("1234".to_owned())),
             )
             .unwrap_err()
         );
@@ -236,24 +284,59 @@ mod tests {
 
     #[test]
     fn resource_try_into_proto() {
+        use proto::resource_action_permission as proto;
         assert_eq!(
             (
-                proto::resource_action_permission::ResourceType::Database,
-                Some("ns1".into())
+                proto::ResourceType::Database,
+                Some(proto::Target::ResourceName("ns1".to_owned()))
             ),
-            Resource::Database("ns1".into()).try_into_proto().unwrap(),
+            Resource::Database(Target::ResourceName("ns1".to_owned()))
+                .try_into_proto()
+                .unwrap(),
+        );
+        assert_eq!(
+            (
+                proto::ResourceType::Database,
+                Some(proto::Target::ResourceId("1234".to_owned()))
+            ),
+            Resource::Database(Target::ResourceId("1234".to_owned()))
+                .try_into_proto()
+                .unwrap(),
         );
     }
 
     #[test]
     fn permission_try_from_proto() {
         assert_eq!(
-            Permission::ResourceAction(Resource::Database("ns2".into()), Action::Create),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName("ns2".to_owned())),
+                Action::Create
+            ),
             Permission::try_from(proto::Permission {
                 permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
                     proto::ResourceActionPermission {
                         resource_type: 1,
-                        resource_id: Some("ns2".into()),
+                        target: Some(proto::resource_action_permission::Target::ResourceName(
+                            "ns2".to_owned()
+                        )),
+                        action: 4,
+                    }
+                ))
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId("1234".to_owned())),
+                Action::Create
+            ),
+            Permission::try_from(proto::Permission {
+                permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
+                    proto::ResourceActionPermission {
+                        resource_type: 1,
+                        target: Some(proto::resource_action_permission::Target::ResourceId(
+                            "1234".to_owned()
+                        )),
                         action: 4,
                     }
                 ))
@@ -266,7 +349,9 @@ mod tests {
                 permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
                     proto::ResourceActionPermission {
                         resource_type: 0,
-                        resource_id: Some("ns2".into()),
+                        target: Some(proto::resource_action_permission::Target::ResourceName(
+                            "ns2".to_owned()
+                        )),
                         action: 4,
                     }
                 ))
@@ -279,7 +364,9 @@ mod tests {
                 permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
                     proto::ResourceActionPermission {
                         resource_type: 1,
-                        resource_id: Some("ns2".into()),
+                        target: Some(proto::resource_action_permission::Target::ResourceName(
+                            "ns2".to_owned()
+                        )),
                         action: 0,
                     }
                 ))
@@ -295,13 +382,34 @@ mod tests {
                 permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
                     proto::ResourceActionPermission {
                         resource_type: 1,
-                        resource_id: Some("ns3".into()),
+                        target: Some(proto::resource_action_permission::Target::ResourceName(
+                            "ns3".to_owned()
+                        )),
                         action: 4,
                     }
                 ))
             },
             proto::Permission::try_from(Permission::ResourceAction(
-                Resource::Database("ns3".into()),
+                Resource::Database(Target::ResourceName("ns3".to_owned())),
+                Action::Create
+            ))
+            .unwrap()
+        );
+
+        assert_eq!(
+            proto::Permission {
+                permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
+                    proto::ResourceActionPermission {
+                        resource_type: 1,
+                        target: Some(proto::resource_action_permission::Target::ResourceId(
+                            "1234".to_owned()
+                        )),
+                        action: 4,
+                    }
+                ))
+            },
+            proto::Permission::try_from(Permission::ResourceAction(
+                Resource::Database(Target::ResourceId("1234".to_owned())),
                 Action::Create
             ))
             .unwrap()

@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 /// Errors returned by namespace parsing
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Invalid namespace '{namespace}': {reason}")]

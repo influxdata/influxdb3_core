@@ -92,6 +92,8 @@ impl RequestMetrics {
             MetricFamily::GrpcServer | MetricFamily::GrpcClient => None,
         };
 
+        let path = path.map(|p| truncate_path(&p, self.max_path_segments));
+
         MutexGuard::map(self.metrics.lock(), |metrics| {
             let key = MetricsKey {
                 path,
@@ -102,7 +104,7 @@ impl RequestMetrics {
                 metrics.raw_entry_mut().from_key(&key).or_insert_with(|| {
                     let mut attributes = Attributes::from([]);
                     if let Some(path) = &key.path {
-                        attributes.insert("path", truncate_path(path, self.max_path_segments));
+                        attributes.insert("path", path.to_string());
                     }
                     if let Some(method) = &key.method {
                         attributes.insert("method", method.to_string());
@@ -112,10 +114,7 @@ impl RequestMetrics {
                     }
                     if let (Some(path), Some(method)) = (&key.path, &key.method) {
                         // help Grafana because you can only repeat a single variable, not a cross-product of the two
-                        attributes.insert(
-                            "method_path",
-                            format!("{} {}", method, truncate_path(path, self.max_path_segments)),
-                        );
+                        attributes.insert("method_path", format!("{} {}", method, path));
                     }
 
                     let metrics =

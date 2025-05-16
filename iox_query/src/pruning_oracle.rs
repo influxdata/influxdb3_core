@@ -1,7 +1,7 @@
 //! Implementations of pruning oracle for Server-side Bucketing.
 
 use data_types::partition_template::{
-    bucket_for_tag_value, TablePartitionTemplateOverride, TemplatePart,
+    TablePartitionTemplateOverride, TemplatePart, bucket_for_tag_value,
 };
 use datafusion::scalar::ScalarValue;
 use std::{collections::HashMap, sync::Arc};
@@ -24,13 +24,15 @@ impl BucketPartitionPruningOracle {
     /// associated with this pruning oracle, if to its knowledge `column`
     /// contains ONLY the provided `values`.
     ///
-    /// The implementation must adhere to the contract specified by [`PruningStatistics::contained()`](https://docs.rs/datafusion/latest/datafusion/physical_optimizer/pruning/trait.PruningStatistics.html#tymethod.contained):
+    /// The implementation must adhere to the contract specified by [`PruningStatistics::contained()`]
     ///
     /// The returned array has one row for each summary, with the following meanings:
     ///
     /// - `true` if the values in `column` ONLY contain values from `values`
     /// - `false` if the values in `column` are NOT ANY of `values`
     /// - `null` if the neither of the above holds or is unknown.
+    ///
+    /// [`PruningStatistics::contained()`]: https://docs.rs/datafusion/latest/datafusion/physical_optimizer/pruning/trait.PruningStatistics.html#tymethod.contained
     pub fn could_contain_values(
         &self,
         column: &datafusion::prelude::Column,
@@ -48,8 +50,11 @@ impl BucketPartitionPruningOracle {
 
         // Could the bucket contain any of the values?
         let may_contain_value = values.iter().any(|v| {
-            let literal_value = extract_tag_value(v);
-            column_bucket_info.may_contain_value(literal_value)
+            // Is it a non-null string literal?
+            match extract_tag_value(v).flatten() {
+                Some(literal_value) => column_bucket_info.may_contain_value(literal_value),
+                None => false,
+            }
         });
 
         if may_contain_value {
@@ -66,23 +71,25 @@ impl BucketPartitionPruningOracle {
     }
 }
 
-/// Returns the underlying string for a tag column, which are encoded as
-/// dictionary literals in DataFusion
-fn extract_tag_value(v: &ScalarValue) -> &str {
-    let ScalarValue::Dictionary(_, value_type) = v else {
-        // If it's not a dictionary, but has been tag-bucket-partitioned.
-        // It likely means tag encoding has changed and this code should
-        // also be updated to keep working.
-        panic!("invalid scalar value type for tag column: {v:?}");
+/// Returns the underlying string for a tag column, if any, for the ScalarValue
+///
+/// * `Some(Some(str))` for non null string literals
+/// * `Some(None)` for null string literals
+/// * `None` for non-string literals
+///
+/// TODO: replace with `ScalarValue::try_as_str()` when it's available in the
+/// Arrow crate.
+///
+/// See: <https://github.com/apache/datafusion/pull/14167>
+fn extract_tag_value(scalar: &ScalarValue) -> Option<Option<&str>> {
+    let v = match scalar {
+        ScalarValue::Utf8(v) => v,
+        ScalarValue::LargeUtf8(v) => v,
+        ScalarValue::Utf8View(v) => v,
+        ScalarValue::Dictionary(_index, v) => return extract_tag_value(v),
+        _ => return None,
     };
-
-    let ScalarValue::Utf8(Some(tag_value)) = value_type.as_ref() else {
-        // If the value type isn't a UTF-8 string and we've got this
-        // far then something is pretty broken.
-        panic!("invalid dictionary scalar value type for tag column: {v:?}");
-    };
-
-    tag_value
+    Some(v.as_ref().map(|v| v.as_str()))
 }
 
 /// A builder for constructing a [`BucketPartitionPruningOracle`].
@@ -186,9 +193,8 @@ impl BucketInfo {
     /// returns false if `tag_value` does not map to this bucket, or if this
     /// partition does not belong to a bucket (i.e. partition key is "!").
     pub fn may_contain_value(&self, tag_value: &str) -> bool {
-        self.id.map_or(false, |id| {
-            id == bucket_for_tag_value(tag_value, self.num_buckets)
-        })
+        self.id
+            .is_some_and(|id| id == bucket_for_tag_value(tag_value, self.num_buckets))
     }
 }
 

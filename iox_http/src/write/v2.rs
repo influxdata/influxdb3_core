@@ -4,7 +4,7 @@
 //! [V2 Write API]:
 //!     https://docs.influxdata.com/influxdb/v2.6/api/#operation/PostWrite
 
-use hyper::Request;
+use iox_http_util::Request;
 use serde::Deserialize;
 
 use super::Precision;
@@ -34,10 +34,10 @@ pub struct WriteParamsV2 {
     pub precision: Precision,
 }
 
-impl<T> TryFrom<&Request<T>> for WriteParamsV2 {
+impl TryFrom<&Request> for WriteParamsV2 {
     type Error = V2WriteParseError;
 
-    fn try_from(req: &Request<T>) -> Result<Self, Self::Error> {
+    fn try_from(req: &Request) -> Result<Self, Self::Error> {
         let query = req.uri().query().ok_or(V2WriteParseError::NoQueryParams)?;
         serde_urlencoded::from_str(query).map_err(Into::into)
     }

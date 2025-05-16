@@ -6,7 +6,7 @@ use snafu::Snafu;
 
 use crate::window;
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -16,7 +16,7 @@ pub enum Error {
     AggregateNotSupported { agg: String },
 }
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -67,7 +67,7 @@ pub enum Aggregate {
 }
 
 /// Represents some duration in time
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum WindowDuration {
     /// Variable sized window,

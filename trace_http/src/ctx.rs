@@ -1,4 +1,4 @@
-use std::num::{NonZeroU128, NonZeroU64, ParseIntError};
+use std::num::{NonZeroU64, NonZeroU128, ParseIntError};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -6,8 +6,8 @@ use http::HeaderMap;
 use observability_deps::tracing::*;
 use snafu::Snafu;
 
-use trace::ctx::{SpanContext, SpanId, TraceId};
 use trace::TraceCollector;
+use trace::ctx::{SpanContext, SpanId, TraceId};
 
 const B3_FLAGS: &str = "X-B3-Flags";
 const B3_SAMPLED_HEADER: &str = "X-B3-Sampled";
@@ -295,7 +295,7 @@ impl RequestLogContext {
 /// stream you're using.
 ///
 /// You may use [`TraceHeaderParser`] to parse the resulting value.
-#[allow(clippy::bool_to_int_with_if)] // if sampled 1 else 0 is clearer than i32::from(sampled) imo
+#[expect(clippy::bool_to_int_with_if)] // if sampled 1 else 0 is clearer than i32::from(sampled) imo
 pub fn format_jaeger_trace_context(span_context: &SpanContext) -> String {
     let flags = if span_context.sampled { 1 } else { 0 };
 
@@ -388,7 +388,8 @@ mod tests {
         headers.insert(B3_SPAN_ID_HEADER, HeaderValue::from_static("not a number"));
 
         assert_eq!(
-            parser.parse(Some(&collector), &headers)
+            parser
+                .parse(Some(&collector), &headers)
                 .unwrap_err()
                 .to_string(),
             "error decoding header 'X-B3-SpanId': value decode error: invalid digit found in string"
@@ -417,7 +418,8 @@ mod tests {
         // Invalid format
         headers.insert(TRACE_HEADER, HeaderValue::from_static("invalid"));
         assert_eq!(
-            parser.parse(Some(&collector), &headers)
+            parser
+                .parse(Some(&collector), &headers)
                 .unwrap_err()
                 .to_string(),
             "error decoding header 'uber-trace-id': Expected \"trace-id:span-id:parent-span-id:flags\""

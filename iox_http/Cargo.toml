@@ -19,6 +19,7 @@ thiserror = "2.0"
 # workspace dependencies in alphabetical order
 authz = { path = "../authz", features = ["http"] }
 data_types = { path = "../data_types" }
+iox_http_util = { path = "../iox_http_util" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

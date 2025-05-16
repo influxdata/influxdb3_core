@@ -1,9 +1,9 @@
+use crate::STRING_VALUE_COLUMN_NAME;
 use crate::error::InfluxRpcError;
 use crate::plan::{
-    fields_pivot_schema, string_value_schema, FieldAggregator, LogicalPlanBuilderExt,
+    FieldAggregator, LogicalPlanBuilderExt, fields_pivot_schema, string_value_schema,
 };
 use crate::schema::SeriesSchema;
-use crate::STRING_VALUE_COLUMN_NAME;
 use arrow::datatypes::{Field, Schema as ArrowSchema};
 use datafusion::{
     catalog::{SchemaProvider, TableProvider},
@@ -15,24 +15,24 @@ use datafusion::{
     functions_aggregate::{
         average::avg_udaf, count::count_udaf, expr_fn::max, min_max::max_udaf, sum::sum_udaf,
     },
-    logical_expr::{col, expr::ScalarFunction, lit, LogicalPlan, LogicalPlanBuilder, Projection},
-    prelude::{when, Column, Expr},
+    logical_expr::{LogicalPlan, LogicalPlanBuilder, Projection, col, expr::ScalarFunction, lit},
+    prelude::{Column, Expr, when},
 };
 use schema::{InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME};
 
 use datafusion_util::{
-    config::{DEFAULT_CATALOG, DEFAULT_SCHEMA},
     AsExpr,
+    config::{DEFAULT_CATALOG, DEFAULT_SCHEMA},
 };
 use hashbrown::HashSet;
 use iox_query::exec::IOxSessionContext;
 use observability_deps::tracing::debug;
 use predicate::{
+    Predicate,
     rpc_predicate::{
-        InfluxRpcPredicate, FIELD_COLUMN_NAME, GROUP_KEY_SPECIAL_START, GROUP_KEY_SPECIAL_STOP,
+        FIELD_COLUMN_NAME, GROUP_KEY_SPECIAL_START, GROUP_KEY_SPECIAL_STOP, InfluxRpcPredicate,
         MEASUREMENT_COLUMN_NAME,
     },
-    Predicate,
 };
 use query_functions::{
     group_by::{Aggregate, WindowDuration},
@@ -40,7 +40,7 @@ use query_functions::{
     selectors::{selector_first, selector_last, selector_max, selector_min},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::iter::repeat;
+use std::iter::repeat_n;
 use std::sync::Arc;
 
 const CONCURRENT_TABLE_JOBS: usize = 10;
@@ -644,8 +644,7 @@ impl InfluxRpcPlanner {
                         field_exprs.clone(),
                         agg,
                     )?,
-                    repeat(&time_expr)
-                        .take(field_exprs.len())
+                    repeat_n(&time_expr, field_exprs.len())
                         .cloned()
                         .collect::<Vec<_>>(),
                     field_exprs,
@@ -692,8 +691,7 @@ impl InfluxRpcPlanner {
             }
             Aggregate::None => (
                 table.filter_null_fields(builder)?,
-                repeat(&time_expr)
-                    .take(field_exprs.len())
+                repeat_n(&time_expr, field_exprs.len())
                     .cloned()
                     .collect::<Vec<_>>(),
                 field_exprs,
@@ -762,8 +760,7 @@ impl InfluxRpcPlanner {
                         field_exprs.clone(),
                         agg,
                     )?,
-                    repeat(&time_expr)
-                        .take(field_exprs.len())
+                    repeat_n(&time_expr, field_exprs.len())
                         .cloned()
                         .collect::<Vec<_>>(),
                     field_exprs,
@@ -811,7 +808,7 @@ impl InfluxRpcPlanner {
             Aggregate::None => {
                 return Err(DataFusionError::Plan(
                     "read_window_aggregate requires an aggregate type".to_string(),
-                ))
+                ));
             }
         };
         builder
@@ -1015,9 +1012,9 @@ mod tests {
     use predicate::Predicate;
 
     use iox_query::{
+        QueryNamespace,
         exec::Executor,
         test::{TestChunk, TestDatabase},
-        QueryNamespace,
     };
     use test_helpers::maybe_start_logging;
 

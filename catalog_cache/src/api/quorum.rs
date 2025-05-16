@@ -4,8 +4,8 @@ use crate::api::client::{CatalogCacheClient, Error as ClientError};
 use crate::local::CatalogCache;
 use crate::{CacheKey, CacheValue};
 use futures::channel::oneshot;
-use futures::future::{select, Either};
-use futures::{pin_mut, StreamExt};
+use futures::future::{Either, select};
+use futures::{StreamExt, pin_mut};
 use observability_deps::tracing::info;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
 /// Error for [`QuorumCatalogCache`]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to communicate with any remote replica: {source}"))]
@@ -234,7 +234,8 @@ impl QuorumCatalogCache {
                 inserted_elements += 1;
                 inserted_bytes += v.len();
 
-                let value = CacheValue::new(v.clone(), first.generation());
+                let value = CacheValue::new(v.clone(), first.generation())
+                    .with_etag_opt(entry.etag().cloned());
                 // In the case that local already has the given version
                 // this will be a no-op
                 self.local.insert(k, value)?;
@@ -269,7 +270,7 @@ impl QuorumCatalogCache {
 
 /// Statistics for [warm-up](QuorumCatalogCache::warm)
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_copy_implementations)] // allow extensions
+#[expect(missing_copy_implementations)] // allow extensions
 pub struct WarmupStats {
     /// Number elements pulled from the first replica.
     ///
@@ -501,11 +502,11 @@ mod tests {
         let quorum = QuorumCatalogCache::new(local, Arc::clone(&replicas));
 
         let k1 = CacheKey::Table(1);
-        let v1 = CacheValue::new("v1".into(), 1);
+        let v1 = CacheValue::new("v1".into(), 1).with_etag("etag1");
         quorum.put(k1, v1.clone()).await.unwrap();
 
         let k2 = CacheKey::Table(2);
-        let v2 = CacheValue::new("v2".into(), 1);
+        let v2 = CacheValue::new("v2".into(), 1).with_etag("etag2");
         quorum.put(k2, v2.clone()).await.unwrap();
 
         // Simulate local restart
@@ -536,7 +537,7 @@ mod tests {
         let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
 
         // Simulate in-progress write
-        let v3 = CacheValue::new("v3".into(), 2);
+        let v3 = CacheValue::new("v3".into(), 2).with_etag("etag3");
         assert!(r1.cache().insert(k2, v3.clone()).unwrap());
 
         // Cannot establish quorum for k1 so should skip over
@@ -570,7 +571,31 @@ mod tests {
         );
         let mut entries: Vec<_> = local.list().collect();
         entries.sort_unstable_by_key(|(k, _)| *k);
-        assert_eq!(entries, vec![(k1, v1), (k2, v3)]);
+        assert_eq!(entries, vec![(k1, v1.clone()), (k2, v3)]);
+
+        // Simulate local restart
+        let local = Arc::new(CatalogCache::default());
+        let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
+
+        // Simulate in-progress write that increments generation but doesn't update payload
+        let v3 = CacheValue::new("v3".into(), 3).with_etag("etag3");
+        assert!(r1.cache().insert(k2, v3.clone()).unwrap());
+
+        // Can establish quorum for k1 despite generation mismatch because etag matches
+        assert_eq!(
+            quorum.warm(None).await.unwrap(),
+            WarmupStats {
+                first_replicate_elements: 2,
+                second_replicate_elements_with_payload: 2,
+                second_replicate_elements_without_payload: 0,
+                second_replicate_bytes: 4,
+                inserted_elements: 2,
+                inserted_bytes: 4,
+            },
+        );
+        let mut entries: Vec<_> = local.list().collect();
+        entries.sort_unstable_by_key(|(k, _)| *k);
+        assert_eq!(entries, vec![(k1, v1.clone()), (k2, v3)]);
 
         // Test cancellation safety
         let k3 = CacheKey::Table(3);

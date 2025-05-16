@@ -7,6 +7,7 @@ use workspace_hack as _;
 
 use observability_deps::tracing::warn;
 use rand::prelude::*;
+use rand::rng;
 use snafu::Snafu;
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use tokio::time::Instant;
 ///
 /// See <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>
 #[derive(Debug, Clone, PartialEq)]
-#[allow(missing_copy_implementations)]
+#[expect(missing_copy_implementations)]
 pub struct BackoffConfig {
     /// Initial backoff.
     pub init_backoff: Duration,
@@ -44,7 +45,7 @@ impl Default for BackoffConfig {
 
 /// Error after giving up retrying.
 #[derive(Debug, Snafu, PartialEq, Eq)]
-#[allow(missing_copy_implementations, missing_docs)]
+#[expect(missing_docs)]
 pub enum BackoffError<E>
 where
     E: std::error::Error + 'static,
@@ -266,8 +267,8 @@ impl Iterator for Backoff {
         let range = self.init_backoff..=(self.next_backoff_secs * self.base);
 
         let rand_backoff = match self.rng.as_mut() {
-            Some(rng) => rng.gen_range(range),
-            None => thread_rng().gen_range(range),
+            Some(rng) => rng.random_range(range),
+            None => rng().random_range(range),
         };
 
         let next_backoff = self.max_backoff_secs.min(rand_backoff);
@@ -278,10 +279,7 @@ impl Iterator for Backoff {
         // This creates the original behavior which returned None if res was somehow negative,
         // not finite, or overflowed Duration as the code originally worked around
         // https://github.com/rust-lang/rust/issues/83400
-        match Duration::try_from_secs_f64(res) {
-            Ok(d) => Some(d),
-            Err(_) => None,
-        }
+        Duration::try_from_secs_f64(res).ok()
     }
 }
 
@@ -309,8 +307,8 @@ mod tests {
     use super::*;
     use rand::rngs::mock::StepRng;
     use std::io::Error;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_backoff() {
@@ -447,7 +445,7 @@ mod tests {
             .retry_some_errors(
                 "test",
                 |_| true,
-                || async {
+                async || {
                     let old_count = count.fetch_add(1, Ordering::SeqCst);
                     if old_count < 2 {
                         Err(Error::from_raw_os_error(3))
@@ -470,7 +468,7 @@ mod tests {
             .retry_some_errors(
                 "test",
                 |_| false,
-                || async {
+                async || {
                     let old_count = count.fetch_add(1, Ordering::SeqCst);
                     if old_count < 1 {
                         Err(Error::from_raw_os_error(1))

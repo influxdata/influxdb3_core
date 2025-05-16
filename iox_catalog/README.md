@@ -1,9 +1,8 @@
 # IOx Catalog
 
 This crate contains the code for the IOx Catalog. This includes the definitions of namespaces,
-their tables, the columns of those tables and their types, what Parquet files are in object storage
-and delete tombstones. There's also some configuration information that the overall distributed
-system uses for operation.
+their tables, the columns of those tables and their types, partitions, and what Parquet files are
+in object storage.
 
 To run this crate's tests you'll need Postgres installed and running locally. You'll also need to
 set the `INFLUXDB_IOX_CATALOG_DSN` environment variable so that sqlx will be able to connect to

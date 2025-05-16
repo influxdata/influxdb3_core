@@ -209,25 +209,31 @@ mod tests {
         //
         // The random iteration order of the hashmap asserts the shard output is
         // not a function of the order of the keys hashed.
-        assert!(mappings
-            .iter()
-            .all(|(&key, &value)| hasher.hash(key) == value));
+        assert!(
+            mappings
+                .iter()
+                .all(|(&key, &value)| hasher.hash(key) == value)
+        );
 
         // Reinitialise the hasher with the same (default) key
         let hasher = JumpHash::new(0..NUM_SHARDS);
 
         // And assert the mappings are the same
-        assert!(mappings
-            .iter()
-            .all(|(&key, &value)| hasher.hash(key) == value));
+        assert!(
+            mappings
+                .iter()
+                .all(|(&key, &value)| hasher.hash(key) == value)
+        );
 
         // Reinitialise the hasher with the a different key
         let hasher = JumpHash::new(0..NUM_SHARDS).with_seed_key(&[42; 16]);
 
         // And assert the mappings are the NOT all same (some may be the same)
-        assert!(!mappings
-            .iter()
-            .all(|(&key, &value)| hasher.hash(key) == value));
+        assert!(
+            !mappings
+                .iter()
+                .all(|(&key, &value)| hasher.hash(key) == value)
+        );
     }
 
     #[test]

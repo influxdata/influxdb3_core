@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::future::{BoxFuture, FutureExt, Shared};
+use object_store_metrics::cache_state::CacheState;
 use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -15,9 +16,9 @@ use std::{
 pub use s3_fifo::{S3Config, S3Fifo};
 
 use super::{
+    ArcResult, Cache, CacheFn, DynError, HasSize,
     hook::{EvictResult, Hook},
     utils::{CatchUnwindDynErrorExt, TokioTask},
-    ArcResult, Cache, CacheFn, CacheState, DynError, HasSize,
 };
 
 mod fifo;
@@ -83,7 +84,7 @@ where
         }
 
         // slow path
-        let gen = self.gen_counter.fetch_add(1, Ordering::Relaxed);
+        let generation = self.gen_counter.fetch_add(1, Ordering::Relaxed);
         let k = Arc::new(k.clone());
         let fut = f(&k);
         let hook_captured = Arc::clone(&self.hook);
@@ -105,7 +106,7 @@ where
             }
 
             // now we can actually inform the hook
-            hook_captured.insert(gen, &k_captured);
+            hook_captured.insert(generation, &k_captured);
 
             // run actual future
             let fetch_res = fut.catch_unwind_dyn_error().await.map(Arc::new);
@@ -114,19 +115,28 @@ where
             match &fetch_res {
                 Ok(v) => {
                     if let Some(cache) = cache_captured.upgrade() {
-                        // Don't involve hook here because the cache is doing that for us correctly, even if the key is
-                        // already stored.
-                        cache.get_or_put(Arc::clone(&k_captured), Arc::clone(v), gen);
+                        // NOTES:
+                        // - Don't involve hook here because the cache is doing that for us correctly, even if the key is
+                        //   already stored.
+                        // - Tell tokio that this is potentially expensive. This is due to the fact that inserting new values
+                        //   may free existing ones and the relevant allocator accounting can be rather pricey.
+                        let k = Arc::clone(&k_captured);
+                        let v = Arc::clone(v);
+                        tokio::task::spawn_blocking(move || {
+                            cache.get_or_put(k, v, generation);
+                        })
+                        .await
+                        .expect("never fails");
                     } else {
                         // notify "fetched" and instantly evict, because underlying cache is gone (during shutdown)
                         let size = v.size();
-                        hook_captured.fetched(gen, &k_captured, Ok(size));
-                        hook_captured.evict(gen, &k_captured, EvictResult::Fetched { size });
+                        hook_captured.fetched(generation, &k_captured, Ok(size));
+                        hook_captured.evict(generation, &k_captured, EvictResult::Fetched { size });
                     }
                 }
                 Err(e) => {
-                    hook_captured.fetched(gen, &k_captured, Err(e));
-                    hook_captured.evict(gen, &k_captured, EvictResult::Failed);
+                    hook_captured.fetched(generation, &k_captured, Err(e));
+                    hook_captured.evict(generation, &k_captured, EvictResult::Failed);
                 }
             }
 
@@ -211,7 +221,7 @@ mod tests {
 
     use crate::cache_system::{
         hook::test_utils::{NoOpHook, TestHook, TestHookRecord},
-        test_utils::{gen_cache_tests, runtime_shutdown, TestSetup, TestValue},
+        test_utils::{TestSetup, TestValue, gen_cache_tests, runtime_shutdown},
     };
 
     #[test]

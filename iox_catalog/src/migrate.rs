@@ -119,9 +119,9 @@ use async_trait::async_trait;
 use observability_deps::tracing::{debug, info, warn};
 use siphasher::sip::SipHasher13;
 use sqlx::{
+    Acquire, Connection, Executor, PgConnection, Postgres, Transaction,
     migrate::{Migrate, MigrateError, Migration, MigrationType, Migrator},
-    query, query_as, query_scalar, Acquire, Connection, Executor, PgConnection, Postgres,
-    Transaction,
+    query, query_as, query_scalar,
 };
 
 /// A single [`IOxMigration`] step.
@@ -560,7 +560,9 @@ fn validate_applied_migrations(
                     // All migrations in `migrator` have been applied
                     // We therefore continue as this should not prevent startup
                     // if there are no local migrations to apply
-                    warn!("found applied migrations not present locally, but all local migrations applied - continuing");
+                    warn!(
+                        "found applied migrations not present locally, but all local migrations applied - continuing"
+                    );
                     return Ok(());
                 }
 
@@ -1285,8 +1287,8 @@ mod tests {
     mod postgres {
         use std::sync::Arc;
 
-        use futures::{stream::FuturesUnordered, StreamExt};
-        use sqlx::{pool::PoolConnection, Postgres};
+        use futures::{StreamExt, stream::FuturesUnordered};
+        use sqlx::{Postgres, pool::PoolConnection};
         use sqlx_hotswap_pool::HotSwapPool;
         use test_helpers::maybe_start_logging;
 

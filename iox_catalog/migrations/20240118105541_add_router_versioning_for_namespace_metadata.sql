@@ -1,3 +1,0 @@
-ALTER TABLE 
-    IF EXISTS namespace 
-    ADD COLUMN IF NOT EXISTS router_version BIGINT NOT NULL DEFAULT 0;

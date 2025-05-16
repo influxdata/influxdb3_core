@@ -1,9 +1,9 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
-use mutable_batch::{writer::Writer, MutableBatch, TimestampSummary};
+use mutable_batch::{MutableBatch, TimestampSummary, writer::Writer};
 use schema::Projection;
 use std::num::NonZeroU64;
 
@@ -191,21 +191,30 @@ fn test_basic() {
         .write_tag("b1", None, vec!["err"].into_iter())
         .unwrap_err()
         .to_string();
-    assert_eq!(err.as_str(), "Unable to insert iox::column_type::tag type into column b1 with type iox::column_type::field::boolean");
+    assert_eq!(
+        err.as_str(),
+        "Unable to insert iox::column_type::tag type into column b1 with type iox::column_type::field::boolean"
+    );
 
     let err = Writer::new(&mut batch, 1)
         .write_i64("f64", None, vec![3].into_iter())
         .unwrap_err()
         .to_string();
 
-    assert_eq!(err.as_str(), "Unable to insert iox::column_type::field::integer type into column f64 with type iox::column_type::field::float");
+    assert_eq!(
+        err.as_str(),
+        "Unable to insert iox::column_type::field::integer type into column f64 with type iox::column_type::field::float"
+    );
 
     let err = Writer::new(&mut batch, 1)
         .write_string("tag3", None, vec!["sd"].into_iter())
         .unwrap_err()
         .to_string();
 
-    assert_eq!(err.as_str(), "Unable to insert iox::column_type::field::string type into column tag3 with type iox::column_type::tag");
+    assert_eq!(
+        err.as_str(),
+        "Unable to insert iox::column_type::field::string type into column tag3 with type iox::column_type::tag"
+    );
 
     let err = Writer::new(&mut batch, 1)
         .write_tag_dict("tag3", None, vec![1].into_iter(), vec!["v1"].into_iter())

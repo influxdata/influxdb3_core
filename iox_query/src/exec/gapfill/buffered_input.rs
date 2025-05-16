@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{as_struct_array, ArrayRef},
+    array::{ArrayRef, as_struct_array},
     datatypes::DataType,
     record_batch::RecordBatch,
     row::{RowConverter, Rows, SortField},
@@ -11,7 +11,7 @@ use arrow::{
 use datafusion::error::{DataFusionError, Result};
 use hashbrown::HashSet;
 
-use super::{params::GapFillParams, FillStrategy};
+use super::{FillStrategy, params::GapFillParams};
 
 /// Encapsulate the logic around how to buffer input records.
 ///
@@ -254,10 +254,9 @@ mod tests {
     fn test_records(batch_size: usize) -> VecDeque<RecordBatch> {
         let records = TestRecords {
             group_cols: vec![
-                std::iter::repeat(Some("a")).take(12).collect(),
-                std::iter::repeat(Some("b"))
-                    .take(6)
-                    .chain(std::iter::repeat(Some("c")).take(6))
+                std::iter::repeat_n(Some("a"), 12).collect(),
+                std::iter::repeat_n(Some("b"), 6)
+                    .chain(std::iter::repeat_n(Some("c"), 6))
                     .collect(),
             ],
             time_col: (0..12).map(|i| Some(1000 + i * 5)).take(12).collect(),
@@ -305,10 +304,9 @@ mod tests {
     fn test_struct_records(batch_size: usize) -> VecDeque<RecordBatch> {
         let records = TestRecords {
             group_cols: vec![
-                std::iter::repeat(Some("a")).take(12).collect(),
-                std::iter::repeat(Some("b"))
-                    .take(6)
-                    .chain(std::iter::repeat(Some("c")).take(6))
+                std::iter::repeat_n(Some("a"), 12).collect(),
+                std::iter::repeat_n(Some("b"), 6)
+                    .chain(std::iter::repeat_n(Some("c"), 6))
                     .collect(),
             ],
             time_col: (0..12).map(|i| Some(1000 + i * 5)).take(12).collect(),

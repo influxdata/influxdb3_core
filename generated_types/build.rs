@@ -23,6 +23,7 @@ fn main() -> Result<()> {
 /// - `influxdata.iox.bulk_ingest.v1.rs`
 /// - `influxdata.iox.catalog.v1.rs`
 /// - `influxdata.iox.catalog_storage.v1.rs`
+/// - `influxdata.iox.common.v1.rs`
 /// - `influxdata.iox.compactor.v1.rs`
 /// - `influxdata.iox.delete.v1.rs`
 /// - `influxdata.iox.ingester.v1.rs`
@@ -44,6 +45,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
     let catalog_v1_path = root.join("influxdata/iox/catalog/v1");
     let catalog_v2_path = root.join("influxdata/iox/catalog/v2");
     let column_type = root.join("influxdata/iox/column_type/v1");
+    let common = root.join("influxdata/iox/common/v1");
     let compactor_path = root.join("influxdata/iox/compactor/v1");
     let delete_path = root.join("influxdata/iox/delete/v1");
     let gossip_path = root.join("influxdata/iox/gossip/v1");
@@ -71,6 +73,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         catalog_v1_path.join("service.proto"),
         catalog_v2_path.join("service.proto"),
         column_type.join("type.proto"),
+        common.join("common.proto"),
         compactor_path.join("service.proto"),
         delete_path.join("service.proto"),
         gossip_path.join("compaction.proto"),

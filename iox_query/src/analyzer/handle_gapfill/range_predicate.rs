@@ -7,14 +7,13 @@ use std::{
 use arrow::datatypes::DataType;
 use datafusion::{
     common::{
-        internal_err,
+        DFSchema, internal_err,
         tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
-        DFSchema,
     },
     error::Result,
     logical_expr::{
-        expr::Alias, utils::split_conjunction, Between, BinaryExpr, Cast, ExprSchemable,
-        LogicalPlan, LogicalPlanBuilder, Operator,
+        Between, BinaryExpr, Cast, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator,
+        expr::Alias, utils::split_conjunction,
     },
     prelude::{Column, Expr},
 };
@@ -45,7 +44,7 @@ impl TreeNodeVisitor<'_> for TimeRangeVisitor {
             LogicalPlan::Projection(p) => {
                 let idx = p.schema.index_of_column(&self.col)?;
                 match unwrap_alias(&p.expr[idx]) {
-                    Expr::Column(ref c) => {
+                    Expr::Column(c) => {
                         self.col = c.clone();
                         Ok(TreeNodeRecursion::Continue)
                     }
@@ -218,7 +217,7 @@ fn invert_time_col_casts(
         _ => {
             return internal_err!(
                 "Expected a time column expression with optional nested timestamp casts or aliases"
-            )
+            );
         }
     })
 }
@@ -248,11 +247,10 @@ mod tests {
     use datafusion::{
         error::Result,
         logical_expr::{
-            cast,
+            Between, LogicalPlan, LogicalPlanBuilder, cast,
             logical_plan::{self, builder::LogicalTableSource},
-            Between, LogicalPlan, LogicalPlanBuilder,
         },
-        prelude::{col, lit, Column, Expr, Partitioning},
+        prelude::{Column, Expr, Partitioning, col, lit},
         scalar::ScalarValue,
         sql::TableReference,
     };

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::display::pretty_format_batches;
 use arrow::{
-    array::{new_null_array, ArrayRef, StringArray},
-    compute::kernels::sort::{lexsort, SortColumn, SortOptions},
+    array::{ArrayRef, StringArray, new_null_array},
+    compute::kernels::sort::{SortColumn, SortOptions, lexsort},
     datatypes::Schema,
     error::ArrowError,
     record_batch::RecordBatch,
@@ -280,6 +280,10 @@ pub struct Normalizer {
     /// If true, results are sorted first
     pub sorted_compare: bool,
 
+    /// If true, tags are sorted first. This is useful for InfluxQL
+    /// queries where the order of tags is not guaranteed.
+    pub sorted_tags: bool,
+
     /// If true, replace UUIDs with static placeholders.
     pub normalized_uuids: bool,
 
@@ -305,6 +309,9 @@ pub struct Normalizer {
     /// Can be removed after <https://github.com/apache/datafusion/issues/12473>
     /// is available which does the normalization in the explain plan itself.
     pub normalized_required_guarantees: bool,
+
+    /// If set, round floats to the specified number of decimal places
+    pub rounded_floats: Option<usize>,
 }
 
 impl Normalizer {

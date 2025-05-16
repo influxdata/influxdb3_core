@@ -3,18 +3,21 @@
 use parking_lot as _;
 #[cfg(test)]
 use regex as _;
+
 use workspace_hack as _;
 
 use humantime::format_rfc3339_micros;
 use observability_deps::tracing::{
-    self,
+    self, Id, Level, Subscriber,
     field::{Field, Visit},
     subscriber::Interest,
-    Id, Level, Subscriber,
 };
 use std::borrow::Cow;
 use std::{io::Write, time::SystemTime};
-use tracing_subscriber::{fmt::MakeWriter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::{Layer, fmt::MakeWriter, layer::Context, registry::LookupSpan};
+use unicode_segmentation::UnicodeSegmentation;
+
+const MAX_FIELD_LENGTH: usize = 8_000; // roughly 8KB, which is half of the total line length allowed
 
 /// Implements a `tracing_subscriber::Layer` which generates
 /// [logfmt] formatted log entries, suitable for log ingestion
@@ -50,7 +53,9 @@ where
     ///  use tracing_subscriber::{EnvFilter, prelude::*, self};
     ///
     ///  // setup debug logging level
-    ///  std::env::set_var("RUST_LOG", "debug");
+    ///  unsafe {
+    ///      std::env::set_var("RUST_LOG", "debug");
+    ///  }
     ///
     ///  // setup formatter to write to stderr
     ///  let formatter =
@@ -145,7 +150,12 @@ impl<W: Write> FieldPrinter<W> {
     }
 
     fn write_span_name(&mut self, value: &str) {
-        write!(self.writer, " span_name=\"{}\"", quote_and_escape(value)).ok();
+        write!(
+            self.writer,
+            " span_name=\"{}\"",
+            quote_escape_truncate(value, MAX_FIELD_LENGTH)
+        )
+        .ok();
     }
 
     fn write_source_info(&mut self, event: &tracing::Event<'_>) {
@@ -157,7 +167,7 @@ impl<W: Write> FieldPrinter<W> {
         write!(
             self.writer,
             " target=\"{}\"",
-            quote_and_escape(metadata.target())
+            quote_escape_truncate(metadata.target(), MAX_FIELD_LENGTH)
         )
         .ok();
 
@@ -231,7 +241,7 @@ impl<W: Write> Visit for FieldPrinter<W> {
             self.writer,
             " {}={}",
             translate_field_name(field.name()),
-            quote_and_escape(value)
+            quote_escape_truncate(value, MAX_FIELD_LENGTH)
         )
         .ok();
     }
@@ -244,7 +254,7 @@ impl<W: Write> Visit for FieldPrinter<W> {
             self.writer,
             " {}={:?}",
             field_name,
-            quote_and_escape(&debug_formatted)
+            quote_escape_truncate(&debug_formatted, MAX_FIELD_LENGTH)
         )
         .ok();
 
@@ -253,7 +263,7 @@ impl<W: Write> Visit for FieldPrinter<W> {
             self.writer,
             " {}.display={}",
             field_name,
-            quote_and_escape(&display_formatted)
+            quote_escape_truncate(&display_formatted, MAX_FIELD_LENGTH)
         )
         .ok();
     }
@@ -265,7 +275,7 @@ impl<W: Write> Visit for FieldPrinter<W> {
             self.writer,
             " {}={}",
             translate_field_name(field.name()),
-            quote_and_escape(&formatted_value)
+            quote_escape_truncate(&formatted_value, MAX_FIELD_LENGTH)
         )
         .ok();
     }
@@ -308,22 +318,75 @@ fn needs_quotes_and_escaping(value: &str) -> bool {
     false
 }
 
+struct GraphemeIndex<'a> {
+    index: usize,
+    grapheme: &'a str,
+}
+
 /// escape any characters in name as needed, otherwise return string as is
-fn quote_and_escape(value: &'_ str) -> Cow<'_, str> {
-    if needs_quotes_and_escaping(value) {
+fn quote_escape_truncate(value: &'_ str, truncate_to: usize) -> Cow<'_, str> {
+    let value = if needs_quotes_and_escaping(value) {
         Cow::Owned(format!("{value:?}"))
     } else {
         Cow::Borrowed(value)
+    };
+
+    if value.len() <= truncate_to {
+        return value;
     }
+
+    let quoted = value.len() > 1 && value.starts_with('"') && value.ends_with('"');
+    let suffix_len = '…'.len_utf8() + if quoted { '"'.len_utf8() } else { 0 };
+    let mut truncate_at = truncate_to - suffix_len;
+
+    // Get initial set of valid grapheme indices
+    let valid_graphemes: Vec<GraphemeIndex<'_>> =
+        UnicodeSegmentation::grapheme_indices(value.as_ref(), true)
+            .map(|x| GraphemeIndex {
+                index: x.0,
+                grapheme: x.1,
+            })
+            .collect();
+
+    // Find the highest index of valid unicode grapheme
+    // that allows us to truncate at the requested limit (or below if necessary).
+    for idx in (0..valid_graphemes.len() - 1).rev() {
+        let current_grapheme_index = valid_graphemes[idx].index;
+        if current_grapheme_index <= truncate_at {
+            truncate_at = current_grapheme_index;
+            break;
+        }
+    }
+
+    // Check for escape sequences and make sure we
+    // do not break half way through an escape.
+    let value_vec = value.as_bytes();
+    let mut escapes = 0;
+    while value_vec[truncate_at - (escapes + 1)] == b'\\' {
+        escapes += 1;
+    }
+    truncate_at -= escapes % 2;
+
+    // Truncate to a valid string and push
+    // a … to signify truncation, and `"` if
+    // needed to stay logfmt valid.
+    let mut new_string: String = valid_graphemes
+        .iter()
+        .map(|x| x.grapheme)
+        .take(truncate_at)
+        .collect();
+
+    new_string.push('…');
+    if quoted {
+        new_string.push('"');
+    }
+
+    Cow::from(new_string)
 }
 
 // Translate the field name from tracing into the logfmt style
 fn translate_field_name(name: &str) -> &str {
-    if name == "message" {
-        "msg"
-    } else {
-        name
-    }
+    if name == "message" { "msg" } else { name }
 }
 
 #[cfg(test)]
@@ -332,87 +395,145 @@ mod test {
 
     #[test]
     fn quote_and_escape_len0() {
-        assert_eq!(quote_and_escape(""), "");
+        assert_eq!(quote_escape_truncate("", MAX_FIELD_LENGTH), "");
     }
 
     #[test]
     fn quote_and_escape_len1() {
-        assert_eq!(quote_and_escape("f"), "f");
+        assert_eq!(quote_escape_truncate("f", MAX_FIELD_LENGTH), "f");
     }
 
     #[test]
     fn quote_and_escape_len2() {
-        assert_eq!(quote_and_escape("fo"), "fo");
+        assert_eq!(quote_escape_truncate("fo", MAX_FIELD_LENGTH), "fo");
     }
 
     #[test]
     fn quote_and_escape_len3() {
-        assert_eq!(quote_and_escape("foo"), "foo");
+        assert_eq!(quote_escape_truncate("foo", MAX_FIELD_LENGTH), "foo");
     }
 
     #[test]
     fn quote_and_escape_len3_1quote_start() {
-        assert_eq!(quote_and_escape("\"foo"), "\"\\\"foo\"");
+        assert_eq!(
+            quote_escape_truncate("\"foo", MAX_FIELD_LENGTH),
+            "\"\\\"foo\""
+        );
     }
 
     #[test]
     fn quote_and_escape_len3_1quote_end() {
-        assert_eq!(quote_and_escape("foo\""), "\"foo\\\"\"");
+        assert_eq!(
+            quote_escape_truncate("foo\"", MAX_FIELD_LENGTH),
+            "\"foo\\\"\""
+        );
     }
 
     #[test]
     fn quote_and_escape_len3_2quote() {
-        assert_eq!(quote_and_escape("\"foo\""), "\"foo\"");
+        assert_eq!(
+            quote_escape_truncate("\"foo\"", MAX_FIELD_LENGTH),
+            "\"foo\""
+        );
     }
 
     #[test]
     fn quote_and_escape_space() {
-        assert_eq!(quote_and_escape("foo bar"), "\"foo bar\"");
+        assert_eq!(
+            quote_escape_truncate("foo bar", MAX_FIELD_LENGTH),
+            "\"foo bar\""
+        );
     }
 
     #[test]
     fn quote_and_escape_space_prequoted() {
-        assert_eq!(quote_and_escape("\"foo bar\""), "\"foo bar\"");
+        assert_eq!(
+            quote_escape_truncate("\"foo bar\"", MAX_FIELD_LENGTH),
+            "\"foo bar\""
+        );
     }
 
     #[test]
     fn quote_and_escape_space_prequoted_but_not_escaped() {
-        assert_eq!(quote_and_escape("\"foo \"bar\""), "\"\\\"foo \\\"bar\\\"\"");
+        assert_eq!(
+            quote_escape_truncate("\"foo \"bar\"", MAX_FIELD_LENGTH),
+            "\"\\\"foo \\\"bar\\\"\""
+        );
     }
 
     #[test]
     fn quote_and_escape_quoted_quotes() {
-        assert_eq!(quote_and_escape("foo:\"bar\""), "\"foo:\\\"bar\\\"\"");
+        assert_eq!(
+            quote_escape_truncate("foo:\"bar\"", MAX_FIELD_LENGTH),
+            "\"foo:\\\"bar\\\"\""
+        );
     }
 
     #[test]
     fn quote_and_escape_nested_1() {
-        assert_eq!(quote_and_escape(r#"a "b" c"#), r#""a \"b\" c""#);
+        assert_eq!(
+            quote_escape_truncate(r#"a "b" c"#, MAX_FIELD_LENGTH),
+            r#""a \"b\" c""#
+        );
     }
 
     #[test]
     fn quote_and_escape_nested_2() {
         assert_eq!(
-            quote_and_escape(r#"a "0 \"1\" 2" c"#),
+            quote_escape_truncate(r#"a "0 \"1\" 2" c"#, MAX_FIELD_LENGTH),
             r#""a \"0 \\\"1\\\" 2\" c""#
         );
     }
 
     #[test]
     fn quote_not_printable() {
-        assert_eq!(quote_and_escape("foo\nbar"), r#""foo\nbar""#);
-        assert_eq!(quote_and_escape("foo\r\nbar"), r#""foo\r\nbar""#);
-        assert_eq!(quote_and_escape("foo\0bar"), r#""foo\0bar""#);
+        assert_eq!(
+            quote_escape_truncate("foo\nbar", MAX_FIELD_LENGTH),
+            r#""foo\nbar""#
+        );
+        assert_eq!(
+            quote_escape_truncate("foo\r\nbar", MAX_FIELD_LENGTH),
+            r#""foo\r\nbar""#
+        );
+        assert_eq!(
+            quote_escape_truncate("foo\0bar", MAX_FIELD_LENGTH),
+            r#""foo\0bar""#
+        );
     }
 
     #[test]
     fn not_quote_unicode_unnecessarily() {
-        assert_eq!(quote_and_escape("mikuličić"), "mikuličić");
+        assert_eq!(
+            quote_escape_truncate("mikuličić", MAX_FIELD_LENGTH),
+            "mikuličić"
+        );
     }
 
     #[test]
     // https://github.com/influxdata/influxdb_iox/issues/4352
     fn test_uri_quoted() {
-        assert_eq!(quote_and_escape("/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns"), r#""/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns""#);
+        assert_eq!(
+            quote_escape_truncate(
+                "/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns",
+                MAX_FIELD_LENGTH
+            ),
+            r#""/api/v2/write?bucket=06fddb4f912a0d7f&org=9df0256628d1f506&orgID=9df0256628d1f506&precision=ns""#
+        );
+    }
+
+    #[test]
+    fn test_truncation() {
+        // The fully escaped string is:
+        // r#""a \"0 \\\"1\\\" 2\" c""#
+        assert_eq!(
+            quote_escape_truncate(r#"a "0 \"1\" 2" c"#, 13),
+            r#""a \"0 \\…""#,
+        );
+        assert_eq!(quote_escape_truncate(r#"a "0 \"1\" 2" c"#, 8), r#""a …""#,);
+
+        // Because č and ć are actually 2 bytes, this looks like 9 but gets truncated
+        assert_eq!(quote_escape_truncate("mikuličić", 10), "mikuli…");
+
+        assert_eq!(quote_escape_truncate("mikuličić", 9), "mikuli…");
     }
 }

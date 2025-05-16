@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_types::NamespaceName;
-use hyper::{Body, Request};
+use iox_http_util::Request;
 use serde::Deserialize;
 
 use super::{multi_tenant::MultiTenantExtractError, single_tenant::SingleTenantExtractError};
@@ -68,11 +68,11 @@ pub enum WriteParseError {
 pub trait WriteRequestUnifier: std::fmt::Debug + Send + Sync {
     /// Perform a unifying parse to produce a [`WriteParams`] from a HTTP [`Request]`,
     /// according to the V1 Write API.
-    async fn parse_v1(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError>;
+    async fn parse_v1(&self, req: &Request) -> Result<WriteParams, WriteParseError>;
 
     /// Perform a unifying parse to produce a [`WriteParams`] from a HTTP [`Request]`,
     /// according to the V2 Write API.
-    async fn parse_v2(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError>;
+    async fn parse_v2(&self, req: &Request) -> Result<WriteParams, WriteParseError>;
 }
 
 #[async_trait]
@@ -80,11 +80,11 @@ impl<T> WriteRequestUnifier for Arc<T>
 where
     T: WriteRequestUnifier,
 {
-    async fn parse_v1(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+    async fn parse_v1(&self, req: &Request) -> Result<WriteParams, WriteParseError> {
         (**self).parse_v1(req).await
     }
 
-    async fn parse_v2(&self, req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+    async fn parse_v2(&self, req: &Request) -> Result<WriteParams, WriteParseError> {
         (**self).parse_v2(req).await
     }
 }

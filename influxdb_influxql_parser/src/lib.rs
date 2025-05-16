@@ -9,10 +9,10 @@ use workspace_hack as _;
 
 use crate::common::{statement_terminator, ws0};
 use crate::internal::Error as InternalError;
-use crate::statement::{statement, Statement};
+use crate::statement::{Statement, statement};
 use common::ParseError;
-use nom::combinator::eof;
 use nom::Offset;
+use nom::combinator::eof;
 
 #[cfg(test)]
 mod test_util;
@@ -81,7 +81,7 @@ pub fn parse_statements(input: &str) -> ParseResult {
                     message: message.into(),
                     pos: input.offset(pos),
                     details: None,
-                })
+                });
             }
             // any other error indicates an invalid statement
             Err(e) => {
@@ -89,7 +89,7 @@ pub fn parse_statements(input: &str) -> ParseResult {
                     message: "invalid InfluxQL statement".to_string(),
                     pos: input.offset(i),
                     details: Some(e.to_string()),
-                })
+                });
             }
         }
     }

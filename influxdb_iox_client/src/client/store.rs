@@ -3,9 +3,9 @@ use self::generated_types::{object_store_service_client::ObjectStoreServiceClien
 use crate::connection::Connection;
 use crate::error::Error;
 
+pub use ::generated_types::Status;
 use client_util::connection::GrpcConnection;
 use futures_util::stream::BoxStream;
-pub use tonic::Status;
 
 /// Re-export generated_types
 pub mod generated_types {

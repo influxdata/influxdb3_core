@@ -5,11 +5,11 @@ use arrow::array::timezone::Tz;
 use arrow::datatypes::{DataType, TimeUnit};
 
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{internal_err, plan_err, ExprSchema};
+use datafusion::common::{ExprSchema, internal_err, plan_err};
 use datafusion::error::Result;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    TIMEZONE_WILDCARD,
+    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
@@ -124,8 +124,8 @@ impl ScalarUDFImpl for TzUDF {
                 },
                 _ => {
                     return plan_err!(
-                    "TZ expects the second argument to be a string defining the desired timezone"
-                )
+                        "TZ expects the second argument to be a string defining the desired timezone"
+                    );
                 }
             },
             _ => return plan_err!("TZ expects one or two arguments"),
@@ -175,7 +175,7 @@ mod tests {
             Some(TODAY),
             None,
         ))];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -192,7 +192,7 @@ mod tests {
             Some(TODAY),
             Some(Arc::from("UTC")),
         ))];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -205,7 +205,7 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("UTC".into()))),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -222,7 +222,7 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("America/New_York".into()))),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -238,7 +238,7 @@ mod tests {
             )),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("America/New_York".into()))),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -255,7 +255,7 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("+05:00".into()))),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -271,7 +271,7 @@ mod tests {
             )),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("+05:00".into()))),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -292,8 +292,8 @@ mod tests {
             ColumnarValue::Array(arr),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("Europe/Brussels".to_owned()))),
         ];
-        // let result = udf.invoke(&args);
-        let result = match udf.invoke(&args).unwrap() {
+        // let result = udf.invoke_batch(&args, args.len());
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Array(array) => as_timestamp_nanosecond_array(&array).unwrap().clone(),
             _ => panic!("Expected scalar value"),
         };
@@ -313,12 +313,14 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("NewYork".into()))),
         ];
-        let result = udf.invoke(&args);
+        let result = udf.invoke_batch(&args, args.len());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TZ requires a valid timezone string, got \"NewYork\""));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TZ requires a valid timezone string, got \"NewYork\"")
+        );
     }
 
     #[test]
@@ -328,7 +330,7 @@ mod tests {
             Some(100),
             None,
         ))];
-        let result = udf.invoke(&args);
+        let result = udf.invoke_batch(&args, args.len());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains(
             "TZ expects a nanosecond timestamp as the first parameter, got Timestamp(Second, None)"
@@ -339,7 +341,7 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampSecond(Some(100), None)),
             ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
         ];
-        let result = udf.invoke(&args);
+        let result = udf.invoke_batch(&args, args.len());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains(
             "TZ expects the second argument to be a string defining the desired timezone"
@@ -352,11 +354,13 @@ mod tests {
         ]));
         let args = vec![ColumnarValue::Array(arr)];
 
-        let result = udf.invoke(&args);
+        let result = udf.invoke_batch(&args, args.len());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TZ expects nanosecond timestamp data, got Int64"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TZ expects nanosecond timestamp data, got Int64")
+        );
     }
 }

@@ -103,7 +103,7 @@ mod test {
     use super::*;
     use arrow::array::{ArrayRef, StringArray};
     use datafusion::{common::assert_contains, execution::memory_pool::GreedyMemoryPool};
-    use rand::{distributions::Standard, rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, distr::StandardUniform, rngs::StdRng};
 
     /// Number of rows to trigger writer flush
     const TEST_MAX_ROW_GROUP_SIZE: usize = 100;
@@ -268,9 +268,9 @@ mod test {
         fn rand_string(&mut self) -> String {
             // sample_iter consumes the random generator so use
             // self.rng to seed one
-            let seed: u64 = self.rng.gen_range(0..u64::MAX);
+            let seed: u64 = self.rng.random_range(0..u64::MAX);
             let rng: StdRng = SeedableRng::seed_from_u64(seed);
-            rng.sample_iter(&Standard)
+            rng.sample_iter(&StandardUniform)
                 .filter_map(|c: u8| {
                     if c.is_ascii_digit() {
                         Some(char::from(c))

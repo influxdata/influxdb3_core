@@ -1,5 +1,6 @@
 use self::generated_types::{schema_service_client::SchemaServiceClient, *};
 use ::generated_types::google::OptionalField;
+use ::generated_types::influxdata::iox::Target;
 use client_util::connection::GrpcConnection;
 
 use crate::connection::Connection;
@@ -45,7 +46,7 @@ impl Client {
     /// after applying the upsert.
     pub async fn upsert_schema(
         &mut self,
-        namespace: &str,
+        namespace: impl Into<Target> + Send,
         table: &str,
         columns: impl Iterator<Item = (&str, ColumnType)> + Send,
     ) -> Result<NamespaceSchema, Error> {
@@ -56,7 +57,7 @@ impl Client {
         let response = self
             .inner
             .upsert_schema(UpsertSchemaRequest {
-                namespace: namespace.to_string(),
+                namespace_target: namespace.into().into(),
                 table: table.to_string(),
                 columns,
             })

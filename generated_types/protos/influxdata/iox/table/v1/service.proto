@@ -4,6 +4,7 @@ option go_package = "github.com/influxdata/iox/table/v1";
 
 import "influxdata/iox/partition_template/v1/template.proto";
 import "influxdata/iox/catalog_storage/v1/service.proto";
+import "influxdata/iox/common/v1/common.proto";
 
 
 service TableService {
@@ -21,14 +22,29 @@ service TableService {
 
   // Create a table in a namespace
   rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
+
+  // Enable iceberg for a table within a namespace.
+  //
+  // NOTE: Enabling iceberg does NOT provision any infrastructure.
+  //
+  // It simply updates a column in the catalog, but means that the iceberg
+  // exporter is aware of the table being configured for an export.
+  rpc EnableIceberg(EnableIcebergRequest) returns (EnableIcebergResponse);
+
+  // Disable iceberg for a table within a namespace.
+  rpc DisableIceberg(DisableIcebergRequest) returns (DisableIcebergResponse);
 }
 
 message CreateTableRequest {
   // Name of the table to be created
   string name = 1;
 
-  // Name of the namespace to create the table in
-  string namespace = 2;
+  oneof namespace_target {
+    // Name of the namespace to create the table in
+    string namespace_name = 2;
+    // ID of the namespace to create the table in
+    int64 namespace_id = 4;
+  }
 
   // Partitioning scheme to use for writes to this table. If not specified, the
   // namespace's partition template will be used.
@@ -54,6 +70,9 @@ message Table {
 
   // The partitioning scheme applied to writes for this table
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 4;
+
+  // Whether this table has iceberg exports enabled.
+  bool iceberg_enabled = 5;
 }
 
 message GetTablesRequest {
@@ -66,11 +85,19 @@ message GetTablesRequest {
 }
 
 message GetTableRequest {
-  // Name of the namespace to  table for.
-  string namespace_name = 1;
+  oneof namespace_target {
+    // Name of the namespace to get a table from.
+    string namespace_name = 1 [deprecated = true];
+    // The unique ID of the namespace to get a table from.
+    int64 namespace_id = 3;
+  }
 
-  // Name of the table to get from namespace
-  string table_name = 2;
+  oneof table_target {
+    // Name of the table to get from namespace
+    string table_name = 2 [deprecated = true];
+    // ID of the table to get from namespace
+    int64 table_id = 4;
+  }
 }
 
 message GetTablesResponse {
@@ -88,25 +115,59 @@ message GetTablesWithStorageRequest {
   // ID of the namespace for which tables are listed.
   int64 namespace_id = 1;
 
-  // Pagination and sorting options will be added in follow-up PRs:
-  // https://github.com/influxdata/influxdb_iox/issues/12775
+  // Field to sort by
+  optional influxdata.iox.catalog_storage.v1.TableSortField sort_field = 2;
+
+  // Direction in which to sort
+  optional influxdata.iox.catalog_storage.v1.SortDirection sort_direction = 3;
+
+  // Number of records to include per page
+  optional int32 page_size = 4;
+
+  // Page number to retrieve
+  optional int32 page_number = 5;
+
+  // Filter by soft-deleted status
+  // If not specified, only the active tables are returned
+  optional influxdata.iox.common.v1.SoftDeleted deleted = 6;
 }
 
 // Request to get a specific table with storage.
 message GetTableWithStorageRequest {
-  // ID of the namespace to get table for.
-  int64 namespace_id = 1;
-
   // ID of the table to get from namespace.
-  int64 table_id = 2;
+  int64 table_id = 1;
+
+  // Filter by soft-deleted status
+  // If not specified, only the active table is returned
+  optional influxdata.iox.common.v1.SoftDeleted deleted = 2;
 }
 
 // Response containing a list of tables with storage.
 message GetTablesWithStorageResponse {
-  repeated influxdata.iox.catalog_storage.v1.TableWithStorage table_with_storage = 1;
+  repeated influxdata.iox.catalog_storage.v1.TableWithStorage tables_with_storage = 1;
+
+  // The total number of items in the unpaged data set
+  int64 total = 2;
+
+  // The total number of pages available
+  int64 pages = 3;
 }
 
 // Response containing details of a specific table with storage.
 message GetTableWithStorageResponse {
   influxdata.iox.catalog_storage.v1.TableWithStorage table_with_storage = 1;
 }
+
+// Request to enable iceberg exports for the given table.
+message EnableIcebergRequest {
+  int64 table_id = 1;
+}
+
+message EnableIcebergResponse {}
+
+// Request to disable iceberg exports for the given table.
+message DisableIcebergRequest {
+  int64 table_id = 1;
+}
+
+message DisableIcebergResponse {}

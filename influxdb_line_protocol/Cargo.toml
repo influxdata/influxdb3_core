@@ -2,7 +2,7 @@
 name = "influxdb-line-protocol"
 version = "1.0.0"
 authors = ["InfluxDB IOx Project Developers"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 description = "InfluxDB line protocol parser and builder."
@@ -18,9 +18,9 @@ repository = "https://github.com/influxdata/influxdb_iox/tree/main/influxdb_line
 # History: https://github.com/influxdata/influxdb_iox/issues/7051
 
 [dependencies] # In alphabetical order
-bytes = "1.9"
-log = "0.4.22"
-nom = { version = "7", default-features = false, features = ["std"] }
+bytes = "1.10"
+log = "0.4.27"
+nom = { version = "8", default-features = false, features = ["std"] }
 smallvec = { workspace = true }
 snafu = "0.8"
 
@@ -31,6 +31,6 @@ test_helpers = { path = "../test_helpers" }
 [features]
 # Support for the v3 Line Protocol Parser, see:
 # https://github.com/influxdata/influxdb/issues/24979
-# 
+#
 # This feature is experimental, and is not enabled by default.
 v3 = []

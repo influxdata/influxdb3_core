@@ -10,10 +10,10 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-    Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics,
 };
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
@@ -129,7 +129,12 @@ impl<T> SystemTableExecutionPlan<T> {
 
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
-        PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
     }
 }
 

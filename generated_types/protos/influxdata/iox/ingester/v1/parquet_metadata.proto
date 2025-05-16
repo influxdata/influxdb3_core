@@ -22,7 +22,7 @@ message IoxMetadata {
   // max_sequence_number was removed
   reserved 13;
   reserved "max_sequence_number";
-  // Was the unique database partition ID. Moving to deterministic hash-based partition IDs
+  // Was the unique database partition ID. Moving to hash-based partition IDs
   // that can be built from the table ID and the partition key, so storing the new partition hash
   // ID here would be redundant.
   reserved 8;

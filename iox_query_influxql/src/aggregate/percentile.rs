@@ -1,10 +1,10 @@
 use crate::error;
-use arrow::array::{as_list_array, Array, ArrayRef, Float64Array, Int64Array};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, as_list_array};
 use arrow::datatypes::{DataType, Field};
-use datafusion::common::{downcast_value, DataFusionError, Result, ScalarValue};
+use datafusion::common::{DataFusionError, Result, ScalarValue, downcast_value};
 use datafusion::logical_expr::function::StateFieldsArgs;
 use datafusion::logical_expr::{
-    function::AccumulatorArgs, Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility,
+    Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility, function::AccumulatorArgs,
 };
 use datafusion::physical_expr::expressions::format_state_name;
 use std::any::Any;
@@ -97,7 +97,7 @@ impl PercentileAccumulator {
         let null_len = nulls.map_or(0, |nb| nb.null_count());
         self.data.reserve(array.len() - null_len);
         for idx in 0..array.len() {
-            if nulls.map_or(true, |nb| nb.is_valid(idx)) {
+            if nulls.is_none_or(|nb| nb.is_valid(idx)) {
                 self.data.push(ScalarValue::try_from_array(&array, idx)?)
             }
         }
@@ -112,7 +112,7 @@ impl PercentileAccumulator {
                 dt => {
                     return error::internal(format!(
                         "invalid data type ({dt}) for PERCENTILE n argument"
-                    ))
+                    ));
                 }
             };
         }

@@ -10,8 +10,8 @@ use std::{
 
 use backoff::{Backoff, BackoffConfig};
 use catalog_cache::{
-    api::quorum::{Error as QuorumError, QuorumCatalogCache},
     CacheKey, CacheValue,
+    api::quorum::{Error as QuorumError, QuorumCatalogCache},
 };
 
 use metric::DurationHistogram;

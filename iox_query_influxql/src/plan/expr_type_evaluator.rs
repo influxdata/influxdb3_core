@@ -1,9 +1,9 @@
 use crate::error;
+use crate::plan::SchemaProvider;
 use crate::plan::field::field_by_name;
 use crate::plan::field_mapper::map_type;
 use crate::plan::ir::DataSource;
 use crate::plan::var_ref::influx_type_to_var_ref_data_type;
-use crate::plan::SchemaProvider;
 use datafusion::common::Result;
 use influxdb_influxql_parser::expression::{
     Binary, BinaryOperator, Call, Expr, VarRef, VarRefDataType,
@@ -263,7 +263,7 @@ impl<'a> TypeEvaluator<'a> {
     ///    called first.
     ///
     ///    🪳Here is the bug, which is that `FunctionTypeMapper::CallType` always returns
-    ///      the type of the first argument:
+    ///    the type of the first argument:
     ///
     ///    See: <https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/functions.go#L98-L99>
     fn eval_scalar(
@@ -329,15 +329,20 @@ impl<'a> TypeEvaluator<'a> {
                 };
 
                 match (arg0, arg1) {
-                    (Some(
-                        VarRefDataType::Float
-                        | VarRefDataType::Integer
-                        | VarRefDataType::Unsigned
-                    ) | None, Some(
-                        VarRefDataType::Float
-                        | VarRefDataType::Integer
-                        | VarRefDataType::Unsigned
-                    ) | None) => Ok(Some(VarRefDataType::Float)),
+                    (
+                        Some(
+                            VarRefDataType::Float
+                            | VarRefDataType::Integer
+                            | VarRefDataType::Unsigned,
+                        )
+                        | None,
+                        Some(
+                            VarRefDataType::Float
+                            | VarRefDataType::Integer
+                            | VarRefDataType::Unsigned,
+                        )
+                        | None,
+                    ) => Ok(Some(VarRefDataType::Float)),
                     (arg0, arg1) if self.call_type_is_strict => error::query(format!(
                         "invalid argument types for {name}: expected a number for both arguments, got ({arg0:?}, {arg1:?})"
                     )),
@@ -444,8 +449,8 @@ mod test {
 
     #[test]
     fn test_binary_data_type() {
-        use influxdb_influxql_parser::expression::BinaryOperator::*;
         use VarRefDataType::{Boolean, Float, Integer, String, Tag, Timestamp, Unsigned};
+        use influxdb_influxql_parser::expression::BinaryOperator::*;
 
         // Boolean ok
         for op in [BitwiseAnd, BitwiseOr, BitwiseXor] {

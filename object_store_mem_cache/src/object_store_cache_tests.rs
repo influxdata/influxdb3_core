@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::future::BoxFuture;
-use object_store::{path::Path, DynObjectStore, Error, PutPayload};
+use object_store::{
+    DynObjectStore, Error, GetResult, GetResultPayload, ObjectMeta, PutPayload, path::Path,
+};
 
 /// Abstract test setup.
 ///
@@ -15,13 +18,30 @@ pub trait Setup: Send {
 
     /// Get inner/underlying, uncached store.
     ///
-    /// This store MUST support writes.
-    fn inner(&self) -> &Arc<DynObjectStore>;
+    /// This store MUST be empty.
+    fn inner(&self) -> &Arc<MockStore>;
 
     /// Get outer, cached store.
     ///
     /// This store MUST reject writes.
     fn outer(&self) -> &Arc<DynObjectStore>;
+}
+
+fn get_result(data: &'static [u8], path: &Path) -> GetResult {
+    GetResult {
+        payload: GetResultPayload::Stream(Box::pin(futures::stream::once(async move {
+            Ok(Bytes::from_static(data))
+        }))),
+        meta: ObjectMeta {
+            location: path.clone(),
+            last_modified: Default::default(),
+            size: data.len(),
+            e_tag: Some(format!("etag-{path}")),
+            version: None,
+        },
+        range: 0..data.len(),
+        attributes: Default::default(),
+    }
 }
 
 pub async fn test_etag<S>()
@@ -33,16 +53,17 @@ where
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
 
-    setup
-        .inner()
-        .put(&location_a, PutPayload::from_static(b"foo"))
-        .await
-        .unwrap();
-    setup
-        .inner()
-        .put(&location_b, PutPayload::from_static(b"bar"))
-        .await
-        .unwrap();
+    Arc::clone(setup.inner())
+        .mock_next(object_store_mock::MockCall::GetOpts {
+            params: (location_a.clone(), Default::default()),
+            barriers: vec![],
+            res: Ok(get_result(b"foo", &location_a)),
+        })
+        .mock_next(object_store_mock::MockCall::GetOpts {
+            params: (location_b.clone(), Default::default()),
+            barriers: vec![],
+            res: Ok(get_result(b"bar", &location_b)),
+        });
 
     let etag_a1 = setup
         .outer()
@@ -86,16 +107,17 @@ where
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
 
-    setup
-        .inner()
-        .put(&location_a, PutPayload::from_static(b"foo"))
-        .await
-        .unwrap();
-    setup
-        .inner()
-        .put(&location_b, PutPayload::from_static(b"bar"))
-        .await
-        .unwrap();
+    Arc::clone(setup.inner())
+        .mock_next(object_store_mock::MockCall::GetOpts {
+            params: (location_a.clone(), Default::default()),
+            barriers: vec![],
+            res: Ok(get_result(b"foo", &location_a)),
+        })
+        .mock_next(object_store_mock::MockCall::GetOpts {
+            params: (location_b.clone(), Default::default()),
+            barriers: vec![],
+            res: Ok(get_result(b"bar", &location_b)),
+        });
 
     let data_a = setup
         .outer()
@@ -125,7 +147,16 @@ where
 
     let location = Path::parse("x").unwrap();
 
-    let err = setup.inner().get(&location).await.unwrap_err();
+    Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
+        params: (location.clone(), Default::default()),
+        barriers: vec![],
+        res: Err(Error::NotFound {
+            path: location.to_string(),
+            source: "foo".to_owned().into(),
+        }),
+    });
+
+    let err = setup.outer().get(&location).await.unwrap_err();
     assert!(
         matches!(err, Error::NotFound { .. }),
         "error should be 'not found' but is: {err}"
@@ -140,11 +171,11 @@ where
 
     let location = Path::parse("x").unwrap();
 
-    setup
-        .inner()
-        .put(&location, PutPayload::from_static(b"foo"))
-        .await
-        .unwrap();
+    Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
+        params: (location.clone(), Default::default()),
+        barriers: vec![],
+        res: Ok(get_result(b"foo", &location)),
+    });
     let res_1 = setup.outer().get(&location).await.unwrap();
     assert_eq!(
         CacheState::try_from(res_1.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
@@ -152,12 +183,6 @@ where
     );
     let data_1 = res_1.bytes().await.unwrap();
     assert_eq!(data_1.as_ref(), b"foo");
-
-    setup
-        .inner()
-        .put(&location, PutPayload::from_static(b"bar"))
-        .await
-        .unwrap();
 
     let res_2 = setup.outer().get(&location).await.unwrap();
     assert_eq!(
@@ -182,9 +207,35 @@ where
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::NotImplemented { .. }),
+        matches!(err, Error::NotImplemented),
         "error should be 'not implemented' but is: {err}"
     );
+}
+
+pub async fn test_size_hinting<S>()
+where
+    S: Setup,
+{
+    let setup = S::new().await;
+
+    let location = Path::parse("x").unwrap();
+    let data = b"foo";
+
+    Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
+        params: (location.clone(), hint_size(data.len()).into()),
+        barriers: vec![],
+        res: Ok(get_result(data, &location)),
+    });
+
+    let data = setup
+        .outer()
+        .get_opts(&location, hint_size(data.len()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(data.as_ref(), data);
 }
 
 #[macro_export]
@@ -212,6 +263,7 @@ pub use gen_store_tests_impl;
 ///     gen_store_tests,
 ///     Setup,
 /// };
+/// use object_store_mock::MockStore;
 ///
 /// struct TestSetup {
 ///     // ...
@@ -222,7 +274,7 @@ pub use gen_store_tests_impl;
 ///         todo!()
 ///     }
 ///
-///     fn inner(&self) -> &Arc<DynObjectStore> {
+///     fn inner(&self) -> &Arc<MockStore> {
 ///         todo!()
 ///     }
 ///
@@ -244,6 +296,7 @@ macro_rules! gen_store_tests {
                 test_not_found,
                 test_reads_cached,
                 test_writes_rejected,
+                test_size_hinting,
             ],
         );
     };
@@ -251,4 +304,6 @@ macro_rules! gen_store_tests {
 
 pub use gen_store_tests;
 
-use crate::{attributes::ATTR_CACHE_STATE, cache_system::CacheState};
+use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_mock::MockStore;
+use object_store_size_hinting::hint_size;

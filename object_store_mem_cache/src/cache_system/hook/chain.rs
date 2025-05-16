@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::cache_system::{hook::Hook, DynError};
+use crate::cache_system::{DynError, hook::Hook};
 
 use super::{EvictResult, HookDecision};
 
@@ -28,25 +28,25 @@ impl<K> std::fmt::Debug for HookChain<K> {
 }
 
 impl<K> Hook<K> for HookChain<K> {
-    fn insert(&self, gen: u64, k: &Arc<K>) {
+    fn insert(&self, generation: u64, k: &Arc<K>) {
         for hook in &self.hooks {
-            hook.insert(gen, k);
+            hook.insert(generation, k);
         }
     }
 
-    fn fetched(&self, gen: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
+    fn fetched(&self, generation: u64, k: &Arc<K>, res: Result<usize, &DynError>) -> HookDecision {
         self.hooks
             .iter()
-            .map(|hook| hook.fetched(gen, k, res))
+            .map(|hook| hook.fetched(generation, k, res))
             .fold::<Option<HookDecision>, _>(None, |a, b| {
                 Some(a.map(|a| a.favor_evict(b)).unwrap_or(b))
             })
             .unwrap_or_default()
     }
 
-    fn evict(&self, gen: u64, k: &Arc<K>, res: EvictResult) {
+    fn evict(&self, generation: u64, k: &Arc<K>, res: EvictResult) {
         for hook in &self.hooks {
-            hook.evict(gen, k, res);
+            hook.evict(generation, k, res);
         }
     }
 }

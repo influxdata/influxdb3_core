@@ -5,7 +5,7 @@ use datafusion::{
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{union::UnionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, union::UnionExec},
 };
 
 /// Optimizer that replaces nested [`UnionExec`]s with a single level.
@@ -29,7 +29,6 @@ use datafusion::{
 pub struct NestedUnion;
 
 impl PhysicalOptimizerRule for NestedUnion {
-    #[allow(clippy::map_clone)]
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,

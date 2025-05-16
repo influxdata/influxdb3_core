@@ -15,14 +15,14 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::memory_pool::MemoryReservation,
     physical_plan::{
+        ExecutionPlan, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
         expressions::Column,
         metrics::{BaselineMetrics, RecordOutput},
-        ExecutionPlan, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
     },
 };
-use futures::{ready, Stream, StreamExt};
+use futures::{Stream, StreamExt, ready};
 
-use super::{algo::GapFiller, buffered_input::BufferedInput, params::GapFillParams, GapFillExec};
+use super::{GapFillExec, algo::GapFiller, buffered_input::BufferedInput, params::GapFillParams};
 
 /// An implementation of a gap-filling operator that uses the [Stream] trait.
 ///
@@ -32,7 +32,6 @@ use super::{algo::GapFiller, buffered_input::BufferedInput, params::GapFillParam
 /// - Extracting arrays for processing by [`GapFiller`]
 /// - Recording metrics
 /// - Sending record batches to next operator (by implementing [`Self::poll_next'])
-#[allow(dead_code)]
 pub(super) struct GapFillStream {
     /// The schema of the input and output.
     schema: SchemaRef,

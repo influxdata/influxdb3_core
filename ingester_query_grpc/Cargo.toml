@@ -9,26 +9,20 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-arrow = { workspace = true }
-bytes = "1.9"
 base64 = "0.22"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
-flatbuffers = "24.12.23"
 pbjson = { workspace = true }
 predicate = { path = "../predicate" }
 prost = { workspace = true }
 query_functions = { path = "../query_functions" }
 serde = { version = "1.0", features = ["derive"] }
 snafu = "0.8"
-tonic = { workspace = true }
+tonic = { version = "0.11.0", features = ["tls", "tls-roots"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [build-dependencies] # In alphabetical order
-tonic-build = { workspace = true }
+tonic-build = { version = "0.11.0" }
 prost-build = { workspace = true }
 pbjson-build = { workspace = true }
-
-[dev-dependencies]
-tokio = "1.42.0"

@@ -21,12 +21,8 @@ fn main() -> Result<()> {
 /// - `influxdata.iox.ingester.v1.rs`
 fn generate_grpc_types(root: &Path) -> Result<()> {
     let ingester_path_v1 = root.join("influxdata/iox/ingester/v1");
-    let ingester_path_v2 = root.join("influxdata/iox/ingester/v2");
 
-    let proto_files = vec![
-        ingester_path_v1.join("query.proto"),
-        ingester_path_v2.join("query.proto"),
-    ];
+    let proto_files = vec![ingester_path_v1.join("query.proto")];
 
     // Tell cargo to recompile if any of these proto files are changed
     for proto_file in &proto_files {
@@ -41,8 +37,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         .extern_path(".google.protobuf", "::pbjson_types")
         .btree_map([
             ".influxdata.iox.ingester.v1.IngesterQueryResponseMetadata.unpersisted_partitions",
-        ])
-        .bytes([".influxdata.iox.ingester.v2"]);
+        ]);
 
     let descriptor_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("proto_descriptor.bin");
     tonic_build::configure()

@@ -83,8 +83,8 @@
 use iox_time::{Time, TimeProvider};
 use std::fmt::Formatter;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use tokio_util::sync::CancellationToken;
@@ -798,12 +798,12 @@ mod tests {
         let (tracker2, registration2) = registry.register(2);
         let (tracker3, registration3) = registry.register(3);
 
-        let async_task = || async move {
+        let async_task = async move || {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Ok::<_, Infallible>(())
         };
 
-        let blocking_task = || async move {
+        let blocking_task = async move || {
             std::thread::sleep(Duration::from_millis(100));
             Ok::<_, Infallible>(())
         };
@@ -1115,7 +1115,10 @@ mod tests {
             cpu_nanos: 33_653_354_646,
             wall_nanos: 456_235_452,
         };
-        assert_eq!(state.to_string(), "TaskStatus(status=complete,total=45,success=40,error=2,cancelled=1,dropped=2,cpu=33.653354646s,wall=0.456235452s)");
+        assert_eq!(
+            state.to_string(),
+            "TaskStatus(status=complete,total=45,success=40,error=2,cancelled=1,dropped=2,cpu=33.653354646s,wall=0.456235452s)"
+        );
     }
 
     fn sorted(mut input: Vec<TaskTracker<i32>>) -> Vec<TaskTracker<i32>> {

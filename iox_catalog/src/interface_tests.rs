@@ -2,20 +2,24 @@
 use ::test_helpers::assert_error;
 use assert_matches::assert_matches;
 use data_types::{
+    Column, ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables,
+    Namespace, NamespaceId, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile,
+    ParquetFileId, ParquetFileParams, ParquetFileSource, Partition, PartitionHashId, PartitionId,
+    PartitionKey, SortKeyIds, Table, TableId, Timestamp,
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     snapshot::{
         namespace::NamespaceSnapshot, partition::PartitionSnapshot, root::RootSnapshot,
         table::TableSnapshot,
     },
-    Column, ColumnId, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxL0CreatedAt, MaxTables,
-    Namespace, NamespaceId, NamespaceName, NamespaceSchema, ObjectStoreId, ParquetFile,
-    ParquetFileId, ParquetFileParams, ParquetFileSource, Partition, PartitionHashId, PartitionId,
-    PartitionKey, SortKeyIds, TableId, Timestamp,
 };
-use futures::{future::try_join_all, stream::FuturesUnordered, Future, StreamExt};
+use futures::{
+    Future, FutureExt, StreamExt,
+    future::{BoxFuture, try_join_all},
+    stream::FuturesUnordered,
+};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use iox_time::{SystemProvider, TimeProvider};
-use metric::{assert_histogram, Attributes, DurationHistogram, Observation, RawReporter};
+use metric::{Attributes, DurationHistogram, Observation, RawReporter, assert_histogram};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
@@ -24,12 +28,12 @@ use std::{
     time::Duration,
 };
 
-use crate::grpc::test_server::TestGrpcServer;
 use crate::{
     constants::MAX_PARQUET_L0_FILES_PER_PARTITION,
+    grpc::test_server::TestGrpcServer,
     interface::{
         CasFailure, Catalog, Error, ParquetFileRepoExt, PartitionRepoExt, RepoCollection,
-        SoftDeletedRows,
+        SoftDeletedRows, TableRepo,
     },
     test_helpers::{
         arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table, create_and_get_file,
@@ -58,6 +62,8 @@ where
     test_delete_namespace(clean_state().await).await;
     test_table_storage(clean_state().await).await;
     test_namespace_storage(clean_state().await).await;
+    test_column_list_with_deleted(clean_state().await).await;
+    test_iceberg_enablement(clean_state().await).await;
 
     let catalog = clean_state().await;
     test_namespace(Arc::clone(&catalog)).await;
@@ -82,9 +88,95 @@ where
     test_two_repos(clean_state().await).await;
     test_partition_create_or_get_idempotent(clean_state().await).await;
     test_namespace_router_version_atomicity(clean_state().await).await;
+    test_root_namespace_cache_refresh(clean_state().await).await;
     test_get_time(clean_state().await).await;
     test_grpc_get_time_with_backed_catalog(clean_state().await).await;
     test_column_create_or_get_many_unchecked(clean_state).await;
+}
+
+async fn test_iceberg_enablement(catalog: Arc<dyn Catalog>) {
+    let mut repos = catalog.repositories();
+
+    let namespace_name = NamespaceName::new("iceberg").unwrap();
+    let namespace = repos
+        .namespaces()
+        .create(&namespace_name, None, None, None)
+        .await
+        .expect("Can create namespace for test");
+
+    let table = repos
+        .tables()
+        .create(
+            "iceberg_table",
+            TablePartitionTemplateOverride::default(),
+            namespace.id,
+        )
+        .await
+        .expect("Can create table for test");
+
+    assert_eq!(
+        repos
+            .tables()
+            .list_by_iceberg_enabled(namespace.id)
+            .await
+            .expect("Listing works")
+            .len(),
+        0,
+        "No iceberg tables have been enabled"
+    );
+
+    repos
+        .tables()
+        .enable_iceberg(table.id)
+        .await
+        .expect("Enabling works for test");
+
+    assert_eq!(
+        repos
+            .tables()
+            .list_by_iceberg_enabled(namespace.id)
+            .await
+            .expect("Listing works")
+            .len(),
+        1,
+        "Expected singular table within test for iceberg enablement"
+    );
+
+    repos
+        .tables()
+        .disable_iceberg(table.id)
+        .await
+        .expect("Disabling works for test");
+
+    assert_eq!(
+        repos
+            .tables()
+            .list_by_iceberg_enabled(namespace.id)
+            .await
+            .expect("Listing works")
+            .len(),
+        0,
+        "Iceberg was disabled, nothing should be returned"
+    );
+
+    assert_matches!(
+        repos
+            .tables()
+            .enable_iceberg(TableId::new(1337))
+            .await
+            .unwrap_err(),
+        crate::interface::Error::NotFound { .. },
+        "Iceberg cannot be enabled for a non-existent table"
+    );
+    assert_matches!(
+        repos
+            .tables()
+            .disable_iceberg(TableId::new(1337))
+            .await
+            .unwrap_err(),
+        crate::interface::Error::NotFound { .. },
+        "Iceberg cannot be disabled for a non-existent table"
+    );
 }
 
 async fn test_setup(catalog: Arc<dyn Catalog>) {
@@ -112,7 +204,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
 
     let lookup_namespace = repos
         .namespaces()
-        .get_by_name(&namespace_name, SoftDeletedRows::ExcludeDeleted)
+        .get_by_name(&namespace_name)
         .await
         .unwrap()
         .unwrap();
@@ -148,7 +240,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
 
     let found = repos
         .namespaces()
-        .get_by_name(&namespace_name, SoftDeletedRows::ExcludeDeleted)
+        .get_by_name(&namespace_name)
         .await
         .unwrap()
         .expect("namespace should be there");
@@ -156,7 +248,7 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
 
     let not_found = repos
         .namespaces()
-        .get_by_name("does_not_exist", SoftDeletedRows::ExcludeDeleted)
+        .get_by_name("does_not_exist")
         .await
         .unwrap();
     assert!(not_found.is_none());
@@ -278,11 +370,51 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
     assert_eq!(namespace5.partition_template, tag_partition_template);
     let lookup_namespace5 = repos
         .namespaces()
-        .get_by_name(&namespace5_name, SoftDeletedRows::ExcludeDeleted)
+        .get_by_name(&namespace5_name)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(namespace5, lookup_namespace5);
+
+    // Create a new namespace to rename
+    let namespace6 = arbitrary_namespace(&mut *repos, "test_namespace6").await;
+    let previous_router_version = namespace6.router_version;
+    assert_eq!(previous_router_version.get(), 0); // Assert the new namespace starts at version 0
+
+    // Rename the namespace
+    let namespace6_new_name =
+        NamespaceName::new("test_namespace6_renamed").expect("new namespace name should be valid");
+    let renamed = repos
+        .namespaces()
+        .rename(namespace6.id, namespace6_new_name.clone())
+        .await
+        .expect("namespace should be renameable");
+    // ensure name is updated
+    assert_eq!(renamed.name, namespace6_new_name.as_str());
+    // ensure router version is incremented after rename
+    assert_eq!(
+        previous_router_version.get() + 1,
+        renamed.router_version.get(),
+        "namespace version did not increment monotonically"
+    );
+
+    // Trying to rename the namespace to a name that is in use must fail.
+    assert_matches!(
+        repos
+            .namespaces()
+            .rename(namespace6.id, namespace5_name.clone())
+            .await,
+        Err(Error::AlreadyExists { .. })
+    );
+    // Version must not be incremented and name must not change.
+    let got = repos
+        .namespaces()
+        .get_by_id(namespace6.id, SoftDeletedRows::AllRows)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.router_version, renamed.router_version);
+    assert_eq!(got.name, renamed.name);
 
     // Remove all created namespaces
     for namespace in repos
@@ -291,14 +423,15 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap()
     {
-        let deleted_id = repos.namespaces().soft_delete(namespace.id).await.unwrap();
-        assert_eq!(namespace.id, deleted_id);
+        let deleted_ns = repos.namespaces().soft_delete(namespace.id).await.unwrap();
+        assert_eq!(namespace.id, deleted_ns.id);
+        assert!(deleted_ns.deleted_at.is_some());
 
         // Ensure that the namespace version was advanced by deletion
         let previous_router_version = namespace.router_version;
         let deleted_ns = repos
             .namespaces()
-            .get_by_id(deleted_id, SoftDeletedRows::AllRows)
+            .get_by_id(deleted_ns.id, SoftDeletedRows::AllRows)
             .await
             .unwrap()
             .expect("deleted ns must still be in catalog");
@@ -313,78 +446,309 @@ async fn test_namespace(catalog: Arc<dyn Catalog>) {
         repos.namespaces().soft_delete(NamespaceId::new(42)).await,
         Err(Error::NotFound { .. })
     );
+
+    // Undelete all deleted namespaces
+    for deleted_namespace in repos
+        .namespaces()
+        .list(SoftDeletedRows::OnlyDeleted)
+        .await
+        .unwrap()
+    {
+        let undeleted_namespace = repos
+            .namespaces()
+            .undelete(deleted_namespace.id)
+            .await
+            .unwrap();
+        assert_eq!(deleted_namespace.id, undeleted_namespace.id);
+        assert_eq!(undeleted_namespace.deleted_at, None);
+        // Ensure that the returned namespace version was advanced by undeletion
+        let previous_router_version = deleted_namespace.router_version;
+        assert_eq!(
+            previous_router_version.get() + 1,
+            undeleted_namespace.router_version.get(),
+            "namespace version did not increment monotonically"
+        );
+        // Ensure the namespace was undeleted
+        let undeleted_namespace = repos
+            .namespaces()
+            .get_by_id(undeleted_namespace.id, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap()
+            .expect("undeleted ns must still be in catalog and active");
+        assert_eq!(
+            previous_router_version.get() + 1,
+            undeleted_namespace.router_version.get(),
+            "namespace version did not increment monotonically"
+        );
+        assert_eq!(
+            repos
+                .namespaces()
+                .undelete(undeleted_namespace.id)
+                .await
+                .expect("Undelete should be idempotent")
+                .deleted_at,
+            None
+        );
+    }
+    // Try to undelete a non-existent namespace
+    assert_matches!(
+        repos.namespaces().undelete(NamespaceId::new(42)).await,
+        Err(Error::NotFound { .. })
+    );
+}
+
+// ensure cache refresh of root namespace when undeleting or renaming when using both by-name and by-id lookup methods.
+// tests each lookup method independently to avoid false positives.
+async fn test_root_namespace_cache_refresh(catalog: Arc<dyn Catalog>) {
+    type Op = for<'a> fn(&'a mut dyn RepoCollection, &'a Namespace) -> BoxFuture<'a, Namespace>;
+    let catalog_ops: Vec<Op> = vec![
+        |repos, ns| {
+            async {
+                let deleted_ns = repos.namespaces().soft_delete(ns.id).await.unwrap();
+                assert_eq!(ns.id, deleted_ns.id);
+                assert!(deleted_ns.deleted_at.is_some());
+                let undeleted_ns = repos.namespaces().undelete(deleted_ns.id).await.unwrap();
+                assert_eq!(deleted_ns.id, undeleted_ns.id);
+                assert_eq!(undeleted_ns.deleted_at, None);
+                undeleted_ns
+            }
+            .boxed()
+        },
+        |repos, ns| {
+            async {
+                let renamed_ns = repos
+                    .namespaces()
+                    .rename(
+                        ns.id,
+                        NamespaceName::new(ns.name.clone() + "_renamed").unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(ns.id, renamed_ns.id);
+                assert_ne!(ns.name, renamed_ns.name);
+                renamed_ns
+            }
+            .boxed()
+        },
+    ];
+    let lookup_ops: Vec<Op> = vec![
+        |repos, ns| {
+            async {
+                repos
+                    .namespaces()
+                    .get_by_id(ns.id, SoftDeletedRows::ExcludeDeleted)
+                    .await
+                    .unwrap()
+                    .expect("undeleted ns must still be in catalog and active")
+            }
+            .boxed()
+        },
+        |repos, ns| {
+            async {
+                repos
+                    .namespaces()
+                    .get_by_name(&ns.name)
+                    .await
+                    .unwrap()
+                    .expect("undeleted ns must still be in catalog and active")
+            }
+            .boxed()
+        },
+    ];
+    let mut repos = catalog.repositories();
+    for (i, catalog_op) in catalog_ops.iter().enumerate() {
+        for (j, lookup_op) in lookup_ops.iter().enumerate() {
+            let ns_name = format!("test_namespace_{i}_{j}");
+            let ns = arbitrary_namespace(&mut *repos, &ns_name).await;
+            let ns = catalog_op(&mut *repos, &ns).await;
+            let fetched_ns = lookup_op(&mut *repos, &ns).await;
+            assert_eq!(ns, fetched_ns);
+        }
+    }
 }
 
 async fn test_namespace_storage(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
-    let namespace = arbitrary_namespace(&mut *repos, "namespace_with_storage").await;
+    let namespace_1 = arbitrary_namespace(&mut *repos, "namespace_1").await;
+    // Create internal namespace to show they are filtered out
+    arbitrary_namespace(&mut *repos, "_influx_test").await;
 
+    // Namespace size should be zero since there is no file in the namespace
+    let expected_size = 0;
     match catalog.name() {
         "grpc_client" => {
+            // Get a list of namespaces
             repos
                 .namespaces()
-                .get_storage_by_id(namespace.id)
+                .list_storage(None, None, SoftDeletedRows::ExcludeDeleted)
+                .await
+                .expect_err("list namespace with storage should error with unimplemented error");
+
+            // Get a namespace
+            repos
+                .namespaces()
+                .get_storage_by_id(namespace_1.id, SoftDeletedRows::ExcludeDeleted)
                 .await
                 .expect_err("get namespace with storage should error with unimplemented");
         }
         _ => {
             // "sqlite" | "memory" | "postgres" | "cache"
-            repos
-                .namespaces()
-                .get_storage_by_id(namespace.id)
-                .await
-                .expect("get namespace with storage should succeed");
+            assert_namespace_size(&mut *repos, &namespace_1, expected_size, None).await;
         }
     }
 
-    let table = arbitrary_table(&mut *repos, "test_table", &namespace).await;
-
-    let partition = repos
-        .partitions()
-        .create_or_get("one".into(), table.id)
-        .await
-        .unwrap();
-
-    let file_1 = create_and_get_file(&mut *repos, &namespace, &table, &partition).await;
-    let file_2 = create_and_get_file(&mut *repos, &namespace, &table, &partition).await;
-
-    // Namespace size should be the sum of file_1 and file_2 size
-    let expected_size = file_1.file_size_bytes + file_2.file_size_bytes;
-    if catalog.name() != "grpc_client" {
-        // "sqlite" | "memory" | "postgres" | "cache"
-        let namespace_with_storage = repos
-            .namespaces()
-            .get_storage_by_id(namespace.id)
-            .await
-            .expect("get namespace with storage should succeed")
-            .unwrap();
-        assert_eq!(namespace_with_storage.size_bytes, expected_size);
+    if catalog.name() == "grpc_client" {
+        // No longer need to test the following for the "grpc_client" catalog
+        return;
     }
+    // The folllowing will be tested in
+    // "sqlite" | "memory" | "postgres" | "cache" catalogs
+
+    // Set up a table and its partition
+    let (ns_1_table, ns_1_partition) =
+        setup_table_and_partition(&mut *repos, "ns_1_table", &namespace_1).await;
+
+    let ns_1_file_1 =
+        create_and_get_file(&mut *repos, &namespace_1, &ns_1_table, &ns_1_partition).await;
+    let ns_1_file_2 =
+        create_and_get_file(&mut *repos, &namespace_1, &ns_1_table, &ns_1_partition).await;
+
+    // Namespace size should be the sum of ns_1_file_1 and ns_1_file_2 size
+    let expected_size = ns_1_file_1.file_size_bytes + ns_1_file_2.file_size_bytes;
+    assert_namespace_size(&mut *repos, &namespace_1, expected_size, None).await;
 
     // Delete file_1
+    delete_file(&mut *repos, &ns_1_file_1).await;
+
+    // Namespace size should be the size of file_2
+    let expected_size = ns_1_file_2.file_size_bytes;
+    assert_namespace_size(&mut *repos, &namespace_1, expected_size, None).await;
+
+    // Create another namespace, with a table, and its partition
+    let namespace_2 = arbitrary_namespace(&mut *repos, "namespace_2").await;
+    let (ns_2_table, ns_2_partiton) =
+        setup_table_and_partition(&mut *repos, "ns_2_table", &namespace_2).await;
+
+    // Create one file in namespace_2 table
+    let ns_2_file_1 =
+        create_and_get_file(&mut *repos, &namespace_2, &ns_2_table, &ns_2_partiton).await;
+
+    // The expected sizes for two namespaces are:
+    let expected_ns_1_size = ns_1_file_2.file_size_bytes; // file_1 was deleted, so only file_2 left
+    let expected_ns_2_size = ns_2_file_1.file_size_bytes;
+    assert_namespace_size(
+        &mut *repos,
+        &namespace_1,
+        expected_ns_1_size,
+        Some((&namespace_2, expected_ns_2_size)),
+    )
+    .await;
+
+    // Delete namespace_2
     repos
-        .parquet_files()
-        .create_upgrade_delete(
-            file_1.partition_id,
-            &[file_1.object_store_id],
-            &[],
-            &[],
-            CompactionLevel::Initial,
-        )
+        .namespaces()
+        .soft_delete(namespace_2.id)
         .await
         .unwrap();
 
-    // Namespace size should be the size of file_2
-    let expected_size = file_2.file_size_bytes;
-    if catalog.name() != "grpc_client" {
-        // "sqlite" | "memory" | "postgres" | "cache"
-        let namespace_with_storage = repos
+    // Expect to have only namespace_1 in the list, so assert the size of only namespace_1
+    assert_namespace_size(&mut *repos, &namespace_1, expected_ns_1_size, None).await;
+
+    {
+        // Test soft-deletion status
+        let test_cases = [
+            (SoftDeletedRows::AllRows, Some(expected_ns_2_size)),
+            (SoftDeletedRows::ExcludeDeleted, None),
+            (SoftDeletedRows::OnlyDeleted, Some(expected_ns_2_size)),
+        ];
+
+        for (soft_deleted_status, expected_result) in test_cases {
+            let ns_with_storage = repos
+                .namespaces()
+                .get_storage_by_id(namespace_2.id, soft_deleted_status)
+                .await
+                .expect("get namespace by id should succeed");
+
+            match expected_result {
+                Some(expected_size) => {
+                    assert!(
+                        ns_with_storage.is_some(),
+                        "Expected Some result with {:?}",
+                        soft_deleted_status
+                    );
+                    assert_eq!(ns_with_storage.unwrap().size_bytes, expected_size);
+                }
+                None => {
+                    assert!(
+                        ns_with_storage.is_none(),
+                        "Expected None result with {:?}",
+                        soft_deleted_status
+                    );
+                }
+            }
+        }
+    }
+
+    // This function is used to check the size of namespaces
+    // when there are one or more namespaces in the list.
+    async fn assert_namespace_size(
+        repos: &mut dyn RepoCollection,
+        namespace_1: &data_types::Namespace,
+        expected_size_1: i64,
+        namespace_2_and_size: Option<(&data_types::Namespace, i64)>,
+    ) {
+        // Get a list of namespaces
+        let paginated_namespaces = repos
             .namespaces()
-            .get_storage_by_id(namespace.id)
+            .list_storage(None, None, SoftDeletedRows::ExcludeDeleted)
             .await
-            .expect("get with storage should succeed")
-            .unwrap();
-        assert_eq!(namespace_with_storage.size_bytes, expected_size);
+            .expect("list namespace with storage should succeed");
+        let namespace_list = paginated_namespaces.items;
+
+        match namespace_2_and_size {
+            None => {
+                // Expecting one namespace in the list
+                assert_eq!(paginated_namespaces.total, 1);
+                assert_eq!(paginated_namespaces.pages, 1);
+                assert_eq!(namespace_list.len(), 1);
+                assert_eq!(namespace_list[0].size_bytes, expected_size_1);
+
+                // Get namespace_1
+                let namespace_with_storage_1 = repos
+                    .namespaces()
+                    .get_storage_by_id(namespace_1.id, SoftDeletedRows::ExcludeDeleted)
+                    .await
+                    .expect("get namespace with storage should succeed")
+                    .unwrap();
+                assert_eq!(namespace_with_storage_1.size_bytes, expected_size_1);
+            }
+            Some((namespace_2, expected_size_2)) => {
+                // Expecting two namespaces in the list
+                assert_eq!(paginated_namespaces.total, 2);
+                assert_eq!(paginated_namespaces.pages, 1);
+                assert_eq!(namespace_list.len(), 2);
+                assert_eq!(namespace_list[0].size_bytes, expected_size_1);
+                assert_eq!(namespace_list[1].size_bytes, expected_size_2);
+
+                // Get namespace_1
+                let namespace_with_storage_1 = repos
+                    .namespaces()
+                    .get_storage_by_id(namespace_1.id, SoftDeletedRows::ExcludeDeleted)
+                    .await
+                    .expect("get namespace with storage should succeed")
+                    .unwrap();
+                assert_eq!(namespace_with_storage_1.size_bytes, expected_size_1);
+
+                // Get namespace_2
+                let namespace_with_storage_2 = repos
+                    .namespaces()
+                    .get_storage_by_id(namespace_2.id, SoftDeletedRows::ExcludeDeleted)
+                    .await
+                    .expect("get namespace with storage should succeed")
+                    .unwrap();
+                assert_eq!(namespace_with_storage_2.size_bytes, expected_size_2);
+            }
+        }
     }
 }
 
@@ -452,7 +816,7 @@ async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
     let namespace = catalog
         .repositories()
         .namespaces()
-        .get_by_name(NAMESPACE_NAME, SoftDeletedRows::AllRows)
+        .get_by_name(NAMESPACE_NAME)
         .await
         .expect("failed to get namespace")
         .expect("namespace doesn't exist");
@@ -468,13 +832,21 @@ async fn test_namespace_router_version_atomicity(catalog: Arc<dyn Catalog>) {
 ///
 /// And assert the expected "soft delete" semantics / correctly filter out
 /// the expected rows for all three states of [`SoftDeletedRows`].
+///
+/// Then, assert that a namespace which re-uses the name of `deleted-ns` can
+/// be created without issue, behaving as a normal active namespace.
+///
+/// The original namespace must not be undeletable while it's name is in use
+/// by the replacement.
 async fn test_namespace_soft_deletion(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
 
     let s1 = repos.root().snapshot().await.unwrap();
     validate_root_snapshot(repos.as_mut(), &s1).await;
 
-    let deleted_ns = arbitrary_namespace(&mut *repos, "deleted-ns").await;
+    const DELETED_NS_NAME: &str = "deleted-ns";
+
+    let deleted_ns = arbitrary_namespace(&mut *repos, DELETED_NS_NAME).await;
     let active_ns = arbitrary_namespace(&mut *repos, "active-ns").await;
 
     let s2 = repos.root().snapshot().await.unwrap();
@@ -601,51 +973,49 @@ async fn test_namespace_soft_deletion(catalog: Arc<dyn Catalog>) {
     // And get by name
     let got = repos
         .namespaces()
-        .get_by_name(&deleted_ns.name, SoftDeletedRows::AllRows)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|v| v.name);
-    assert_string_set_eq(got, ["deleted-ns"]);
-    let got = repos
-        .namespaces()
-        .get_by_name(&deleted_ns.name, SoftDeletedRows::OnlyDeleted)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|v| {
-            assert!(v.deleted_at.is_some());
-            v.name
-        });
-    assert_string_set_eq(got, ["deleted-ns"]);
-    let got = repos
-        .namespaces()
-        .get_by_name(&deleted_ns.name, SoftDeletedRows::ExcludeDeleted)
+        .get_by_name(&deleted_ns.name)
         .await
         .unwrap();
     assert!(got.is_none());
     let got = repos
         .namespaces()
-        .get_by_name(&active_ns.name, SoftDeletedRows::AllRows)
+        .get_by_name(&active_ns.name)
         .await
         .unwrap()
         .into_iter()
         .map(|v| v.name);
     assert_string_set_eq(got, ["active-ns"]);
+
+    // Recreating a namespace with the same name as the deleted namespace must
+    // succeed!
+    let reused_name_ns = arbitrary_namespace(&mut *repos, DELETED_NS_NAME).await;
+    // ...and it must have a different ID.
+    assert_ne!(reused_name_ns.id, deleted_ns.id);
+
+    // Fetching by name must work for the new namespace.
     let got = repos
         .namespaces()
-        .get_by_name(&active_ns.name, SoftDeletedRows::OnlyDeleted)
+        .get_by_name(DELETED_NS_NAME)
         .await
+        .unwrap()
         .unwrap();
-    assert!(got.is_none());
+    assert_eq!(got, reused_name_ns);
+
+    // And it must show up in the list when deletions are excluded
     let got = repos
         .namespaces()
-        .get_by_name(&active_ns.name, SoftDeletedRows::ExcludeDeleted)
+        .list(SoftDeletedRows::ExcludeDeleted)
         .await
         .unwrap()
         .into_iter()
         .map(|v| v.name);
-    assert_string_set_eq(got, ["active-ns"]);
+    assert_string_set_eq(got, [&active_ns.name, DELETED_NS_NAME]);
+
+    // Attempting to undelete the first namespace must fail as its name is occupied.
+    assert_matches!(
+        repos.namespaces().undelete(deleted_ns.id).await,
+        Err(Error::AlreadyExists { .. })
+    );
 }
 
 // Assert the set of strings "a" is equal to the set "b", tolerating
@@ -665,8 +1035,8 @@ where
 
 async fn test_table(catalog: Arc<dyn Catalog>) {
     let mut repos = catalog.repositories();
-    let name = "namespace_table_test";
-    let namespace = arbitrary_namespace(&mut *repos, name).await;
+    const NS_NAME: &str = "namespace_table_test";
+    let namespace = arbitrary_namespace(&mut *repos, NS_NAME).await;
 
     let ts1 = repos.namespaces().snapshot(namespace.id).await.unwrap();
     validate_namespace_snapshot(repos.as_mut(), &ts1).await;
@@ -683,7 +1053,7 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
     validate_namespace_snapshot(repos.as_mut(), &ts2).await;
     assert_gt(ts2.generation(), ts1.generation());
 
-    let ts2_by_name = repos.namespaces().snapshot_by_name(name).await.unwrap();
+    let ts2_by_name = repos.namespaces().snapshot_by_name(NS_NAME).await.unwrap();
     assert_eq!(ts2.namespace().unwrap(), ts2_by_name.namespace().unwrap());
     assert_ge(ts2_by_name.generation(), ts2.generation());
 
@@ -712,12 +1082,14 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
 
     // get by id
     assert_eq!(t, repos.tables().get_by_id(t.id).await.unwrap().unwrap());
-    assert!(repos
-        .tables()
-        .get_by_id(TableId::new(i64::MAX))
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        repos
+            .tables()
+            .get_by_id(TableId::new(i64::MAX))
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let tables = repos
         .tables()
@@ -726,12 +1098,14 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .unwrap();
     assert_eq!(vec![t.clone()], tables);
 
-    assert!(repos
-        .tables()
-        .list_by_namespace_id(NamespaceId::new(i64::MAX))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        repos
+            .tables()
+            .list_by_namespace_id(NamespaceId::new(i64::MAX))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // test we can create a table of the same name in a different namespace
     let namespace2 = arbitrary_namespace(&mut *repos, "two").await;
@@ -932,6 +1306,85 @@ async fn test_table(catalog: Arc<dyn Catalog>) {
         .soft_delete(namespace2.id)
         .await
         .expect("delete namespace should succeed");
+
+    async fn setup_ns_and_table_for_modification(
+        catalog: &dyn Catalog,
+        name_suffix: &'static str,
+        f: impl AsyncFnOnce(Table, &mut dyn TableRepo) -> (Table, i64),
+    ) {
+        let mut repos = catalog.repositories();
+
+        let ns_name = NamespaceName::new(format!("namespace_{name_suffix}")).unwrap();
+        let ns = repos
+            .namespaces()
+            .create(&ns_name, None, None, None)
+            .await
+            .unwrap();
+
+        let table_repo = repos.tables();
+        let table = table_repo
+            .create(&format!("table_{name_suffix}"), Default::default(), ns.id)
+            .await
+            .unwrap();
+        let table_id = table.id;
+
+        let got_table = table_repo.get_by_id(table_id).await.unwrap().unwrap();
+        assert_eq!(got_table, table);
+        let (processed_table, num_modifications) = f(table, table_repo).await;
+
+        assert_eq!(
+            table_repo.get_by_id(table_id).await.unwrap(),
+            Some(processed_table)
+        );
+
+        assert_eq!(
+            repos
+                .namespaces()
+                .get_by_id(ns.id, SoftDeletedRows::AllRows)
+                .await
+                .unwrap()
+                .unwrap()
+                .router_version
+                .get(),
+            ns.router_version.get() + num_modifications
+        );
+    }
+
+    setup_ns_and_table_for_modification(
+        catalog.as_ref(),
+        "soft_delete",
+        async |table, table_repo| {
+            assert_eq!(table.deleted_at, None);
+
+            let table = table_repo.soft_delete(table.id).await.unwrap();
+            assert!(table.deleted_at.is_some());
+            (table, 1)
+        },
+    )
+    .await;
+
+    setup_ns_and_table_for_modification(catalog.as_ref(), "rename", async |table, table_repo| {
+        const NEW_TABLE_NAME: &str = "the_new_table";
+
+        let table = table_repo.rename(table.id, NEW_TABLE_NAME).await.unwrap();
+        assert_eq!(table.name, NEW_TABLE_NAME);
+        (table, 1)
+    })
+    .await;
+
+    setup_ns_and_table_for_modification(catalog.as_ref(), "undelete", async |table, table_repo| {
+        assert_eq!(table.deleted_at, None);
+        assert_eq!(table_repo.undelete(table.id).await.unwrap(), table);
+
+        let new_table = table_repo.soft_delete(table.id).await.unwrap();
+        assert!(new_table.deleted_at.is_some());
+
+        let new_table = table_repo.undelete(table.id).await.unwrap();
+        assert_eq!(new_table.deleted_at, None);
+
+        (new_table, 3)
+    })
+    .await;
 }
 
 async fn test_table_storage(catalog: Arc<dyn Catalog>) {
@@ -940,7 +1393,7 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
 
     // Set up a table and its partition
     let (table_1, partition_1) =
-        setup_table_and_partition(&mut *repos, "test_table", &namespace).await;
+        setup_table_and_partition(&mut *repos, "test_table_1", &namespace).await;
     assert_eq!(table_1.namespace_id, namespace.id);
 
     // Table size should be zero since there is no file in the table
@@ -950,14 +1403,19 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
             // Get a list of tables
             repos
                 .tables()
-                .list_storage_by_namespace_id(table_1.namespace_id)
+                .list_storage_by_namespace_id(
+                    table_1.namespace_id,
+                    None,
+                    None,
+                    SoftDeletedRows::ExcludeDeleted,
+                )
                 .await
                 .expect_err("list table with storage should error with unimplemented error");
 
             // Get a table
             repos
                 .tables()
-                .get_storage_by_id(table_1.id)
+                .get_storage_by_id(table_1.id, SoftDeletedRows::AllRows)
                 .await
                 .expect_err("get table with storage should error with unimplemented error");
         }
@@ -991,7 +1449,7 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
 
     // Set up another table and its partition
     let (table_2, partition_2) =
-        setup_table_and_partition(&mut *repos, "table_name_2", &namespace).await;
+        setup_table_and_partition(&mut *repos, "test_table_2", &namespace).await;
 
     // Create one file in table_2
     let table_2_file = create_and_get_file(&mut *repos, &namespace, &table_2, &partition_2).await;
@@ -1007,6 +1465,52 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
     )
     .await;
 
+    // Delete table_2
+    repos.tables().soft_delete(table_2.id).await.unwrap();
+
+    // Expect to have only table_1 in the list, so assert the size of only table_1
+    assert_table_size(&mut *repos, &table_1, expected_table_1_size, None).await;
+
+    {
+        // Test soft-deletion status
+        let test_cases = [
+            (SoftDeletedRows::AllRows, Some(expected_table_2_size)),
+            (SoftDeletedRows::ExcludeDeleted, None),
+            (SoftDeletedRows::OnlyDeleted, Some(expected_table_2_size)),
+        ];
+
+        for (deleted_rows_filter, expected_result) in test_cases {
+            let table_with_storage = repos
+                .tables()
+                .get_storage_by_id(table_2.id, deleted_rows_filter)
+                .await
+                .expect("get table with storage should succeed");
+
+            match expected_result {
+                Some(expected_size) => {
+                    assert!(
+                        table_with_storage.is_some(),
+                        "Expected Some result with {:?}",
+                        deleted_rows_filter
+                    );
+                    assert_eq!(
+                        table_with_storage.unwrap().size_bytes,
+                        expected_size,
+                        "Size mismatch with {:?}",
+                        deleted_rows_filter
+                    );
+                }
+                None => {
+                    assert!(
+                        table_with_storage.is_none(),
+                        "Expected None result with {:?}",
+                        deleted_rows_filter
+                    );
+                }
+            }
+        }
+    }
+
     /// This function is used to check the size of tables
     /// when there is one or two tables in the list.
     async fn assert_table_size(
@@ -1016,11 +1520,17 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
         table_2_and_size: Option<(&data_types::Table, i64)>,
     ) {
         // Get a list of tables
-        let table_list = repos
+        let paginated_tables = repos
             .tables()
-            .list_storage_by_namespace_id(table_1.namespace_id)
+            .list_storage_by_namespace_id(
+                table_1.namespace_id,
+                None,
+                None,
+                SoftDeletedRows::ExcludeDeleted,
+            )
             .await
             .expect("list table with storage should succeed");
+        let table_list = paginated_tables.items;
 
         match table_2_and_size {
             None => {
@@ -1030,7 +1540,7 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
                 // Get table_1
                 let table_with_storage = repos
                     .tables()
-                    .get_storage_by_id(table_1.id)
+                    .get_storage_by_id(table_1.id, SoftDeletedRows::AllRows)
                     .await
                     .expect("get table with storage should succeed")
                     .unwrap();
@@ -1044,7 +1554,7 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
                 // Get table_1
                 let table_with_storage = repos
                     .tables()
-                    .get_storage_by_id(table_1.id)
+                    .get_storage_by_id(table_1.id, SoftDeletedRows::AllRows)
                     .await
                     .expect("get table with storage should succeed")
                     .unwrap();
@@ -1053,7 +1563,7 @@ async fn test_table_storage(catalog: Arc<dyn Catalog>) {
                 // Get table_2
                 let table_with_storage = repos
                     .tables()
-                    .get_storage_by_id(table_2.id)
+                    .get_storage_by_id(table_2.id, SoftDeletedRows::AllRows)
                     .await
                     .expect("get table with storage should succeed")
                     .unwrap();
@@ -1140,7 +1650,11 @@ async fn test_column(catalog: Arc<dyn Catalog>) {
     assert_gt(ts4.generation(), ts3.generation());
 
     // Listing columns should return all columns in the catalog
-    let list = repos.columns().list().await.unwrap();
+    let list = repos
+        .columns()
+        .list(SoftDeletedRows::AllRows)
+        .await
+        .unwrap();
     want.extend([c3]);
     assert_eq!(list, want);
 
@@ -1189,6 +1703,49 @@ async fn test_column(catalog: Arc<dyn Catalog>) {
         .soft_delete(namespace.id)
         .await
         .expect("delete namespace should succeed");
+}
+
+async fn test_column_list_with_deleted(catalog: Arc<dyn Catalog>) {
+    let mut repos = catalog.repositories();
+    let n1 = arbitrary_namespace(&mut *repos, "n1").await;
+    let n2 = arbitrary_namespace(&mut *repos, "n2").await;
+    let t1 = arbitrary_table(&mut *repos, "t1", &n1).await;
+    let t2 = arbitrary_table(&mut *repos, "t2", &n2).await;
+
+    let c1 = repos
+        .columns()
+        .create_or_get("c1", t1.id, ColumnType::Tag)
+        .await
+        .unwrap();
+
+    let _c2 = repos
+        .columns()
+        .create_or_get("c2", t2.id, ColumnType::Tag)
+        .await
+        .unwrap();
+
+    let columns = repos
+        .columns()
+        .list(SoftDeletedRows::AllRows)
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 2);
+
+    repos.namespaces().soft_delete(n2.id).await.unwrap();
+
+    let columns = repos
+        .columns()
+        .list(SoftDeletedRows::AllRows)
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 2);
+    let columns = repos
+        .columns()
+        .list(SoftDeletedRows::ExcludeDeleted)
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].name, c1.name);
 }
 
 async fn test_partition(catalog: Arc<dyn Catalog>) {
@@ -1253,12 +1810,14 @@ async fn test_partition(catalog: Arc<dyn Catalog>) {
             .unwrap()
     );
     let non_existing_partition_id = PartitionId::new(i64::MAX);
-    assert!(repos
-        .partitions()
-        .get_by_id_batch(&[non_existing_partition_id])
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        repos
+            .partitions()
+            .get_by_id_batch(&[non_existing_partition_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut batch = repos
         .partitions()
         .get_by_id_batch(
@@ -1770,10 +2329,12 @@ async fn validate_namespace_snapshot(repos: &mut dyn RepoCollection, snapshot: &
     assert_eq!(expected.len(), actual.len());
 
     // test table lookup
-    assert!(snapshot
-        .lookup_table_by_name("does_not_exist")
-        .unwrap()
-        .is_none());
+    assert!(
+        snapshot
+            .lookup_table_by_name("does_not_exist")
+            .unwrap()
+            .is_none()
+    );
     for expected in expected {
         let actual = snapshot
             .lookup_table_by_name(&expected.name)
@@ -1799,17 +2360,37 @@ async fn validate_root_snapshot(repos: &mut dyn RepoCollection, snapshot: &RootS
     assert_eq!(expected.len(), actual.len());
 
     // test namespace lookup
-    assert!(snapshot
-        .lookup_namespace_by_name("does_not_exist")
-        .unwrap()
-        .is_none());
-    for expected in expected {
-        let actual = snapshot
-            .lookup_namespace_by_name(&expected.name)
+    assert!(
+        snapshot
+            .lookup_namespace_by_name("does_not_exist")
             .unwrap()
-            .unwrap();
-        assert_eq!(actual.id(), expected.id);
-        assert_eq!(actual.name(), expected.name.as_bytes());
+            .is_none()
+    );
+    for expected in expected {
+        // all entries should be present in the namespaces list
+        assert!(
+            snapshot
+                .namespaces()
+                .filter_map(|ns| ns.ok())
+                .any(|ns| ns.id() == expected.id)
+        );
+        if expected.deleted_at.is_some() {
+            // soft-deleted entries should not be present in the name lookup table
+            assert!(
+                snapshot
+                    .lookup_namespace_by_name(&expected.name)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            // non-deleted entries should be present in the name lookup table
+            let actual = snapshot
+                .lookup_namespace_by_name(&expected.name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.id(), expected.id);
+            assert_eq!(actual.name(), expected.name.as_bytes());
+        }
     }
 }
 
@@ -1968,12 +2549,15 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     let older_than = Timestamp::new(
         (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
     );
-    let deleted = repos
+    let (deleted, oldest_deleted) = repos
         .parquet_files()
-        .delete_old_ids_count(older_than)
+        // the limit here must be greater than 0, but it doesn't matter past that as we assert
+        // below that we must have deleted 0 files.
+        .delete_old_ids_count(older_than, 1)
         .await
         .unwrap();
     assert_eq!(deleted, 0);
+    assert_eq!(oldest_deleted, None);
 
     // test list_all that includes soft-deleted file
     // at this time the file is not soft-deleted yet and will be included in the returned list
@@ -2012,12 +2596,15 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     let before_deleted = Timestamp::new(
         (catalog.time_provider().now() - Duration::from_secs(100)).timestamp_nanos(),
     );
-    let deleted = repos
+    let (deleted, oldest_deleted) = repos
         .parquet_files()
-        .delete_old_ids_count(before_deleted)
+        // the limit here must be greater than 0, but it doesn't matter past that as we assert
+        // below that we must have deleted 0 files.
+        .delete_old_ids_count(before_deleted, 1)
         .await
         .unwrap();
     assert_eq!(deleted, 0);
+    assert_eq!(oldest_deleted, None);
 
     // not hard-deleted yet
     repos
@@ -2028,21 +2615,24 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .unwrap();
 
     // File is deleted if it was marked to be deleted before the specified time
-    let deleted = repos
+    let (deleted, oldest_deleted) = repos
         .parquet_files()
-        .delete_old_ids_count(older_than)
+        .delete_old_ids_count(older_than, 2)
         .await
         .unwrap();
     assert_eq!(deleted, 1);
+    assert!(oldest_deleted.is_some()); // time will vary each time the test is run, but must be Some()
 
     // test list_all that includes soft-deleted file
     // at this time the file is hard deleted -> the returned list is empty
-    assert!(repos
-        .parquet_files()
-        .get_by_object_store_id(parquet_file.object_store_id)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        repos
+            .parquet_files()
+            .get_by_object_store_id(parquet_file.object_store_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // test list
     let files =
@@ -2232,12 +2822,13 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
     let older_than = Timestamp::new(
         (catalog.time_provider().now() + Duration::from_secs(100)).timestamp_nanos(),
     );
-    let ids = repos
+    let (ids, oldest_deleted) = repos
         .parquet_files()
-        .delete_old_ids_count(older_than)
+        .delete_old_ids_count(older_than, 2)
         .await
         .unwrap();
     assert_eq!(ids, 1);
+    assert!(oldest_deleted.is_some()); // time will vary each time the test is run, but must be Some()
 
     let s3 = repos.partitions().snapshot(partition2.id).await.unwrap();
     assert_ge(s3.generation(), s2.generation()); // no new snapshot required, but some backends will generate a new one
@@ -2303,9 +2894,9 @@ async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         .flag_for_delete_by_retention()
         .await
         .unwrap();
-    assert!(ids.len() > 1); // it's also going to flag f1, f2 & f3 because they have low max
-                            // timestamps but i don't want this test to be brittle if those
-                            // values change so i'm not asserting len == 4
+    // it's also going to flag f1, f2 & f3 because they have low max timestamps but i don't want
+    // this test to be brittle if those values change so i'm not asserting len == 4
+    assert!(ids.len() > 1);
     let f4 = repos
         .parquet_files()
         .get_by_object_store_id(f4_params.object_store_id)
@@ -3325,12 +3916,14 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
         .expect("delete namespace should succeed");
     // assert that namespace is soft-deleted, but the table, column, and parquet files are all
     // still there.
-    assert!(repos
-        .namespaces()
-        .get_by_id(namespace_1.id, SoftDeletedRows::ExcludeDeleted)
-        .await
-        .expect("get namespace should succeed")
-        .is_none());
+    assert!(
+        repos
+            .namespaces()
+            .get_by_id(namespace_1.id, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .expect("get namespace should succeed")
+            .is_none()
+    );
     assert_eq!(
         repos
             .namespaces()
@@ -3391,19 +3984,23 @@ async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
 
     // assert that the namespace, table, column, and parquet files for namespace_2 are still
     // there
-    assert!(repos
-        .namespaces()
-        .get_by_id(namespace_2.id, SoftDeletedRows::ExcludeDeleted)
-        .await
-        .expect("get namespace should succeed")
-        .is_some());
+    assert!(
+        repos
+            .namespaces()
+            .get_by_id(namespace_2.id, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .expect("get namespace should succeed")
+            .is_some()
+    );
 
-    assert!(repos
-        .tables()
-        .get_by_id(table_2.id)
-        .await
-        .expect("get table should succeed")
-        .is_some());
+    assert!(
+        repos
+            .tables()
+            .get_by_id(table_2.id)
+            .await
+            .expect("get table should succeed")
+            .is_some()
+    );
     assert_eq!(
         repos
             .columns()
@@ -3495,7 +4092,9 @@ pub(crate) async fn test_partition_retention<PartitionFunc, PartitionFut>(
     let table = arbitrary_table(&mut *repos, "test_partition_retention", &namespace).await;
 
     let mut expected_deleted: Vec<PartitionId> = vec![];
-    let mut expected_retained = vec![];
+    let mut expected_deleted_when_zero_cutoff_specified = vec![];
+    let mut expected_retained_date_based = vec![];
+    let mut expected_retained_non_date_based = vec![];
 
     // Date based partitions
     for (created_at, days_ago, has_parquet_files, retain) in [
@@ -3531,9 +4130,18 @@ pub(crate) async fn test_partition_retention<PartitionFunc, PartitionFut>(
         }
 
         if retain {
-            expected_retained.push(partition.id)
+            // Below, `delete_by_retention` is first called with a partition `created_at` cutoff
+            // duration of 1 day, then `delete_by_retention` is called with a cutoff of 0.
+            // Partitions that have a `created_at` time recorded that's less than 1 day ago (but
+            // are otherwise eligible for deletion) will be retained by the first call but deleted
+            // by the second call.
+            if created_at.is_some() && days_ago > 7 && !has_parquet_files {
+                expected_deleted_when_zero_cutoff_specified.push(partition.id);
+            } else {
+                expected_retained_date_based.push(partition.id);
+            }
         } else {
-            expected_deleted.push(partition.id)
+            expected_deleted.push(partition.id);
         }
     }
 
@@ -3565,12 +4173,27 @@ pub(crate) async fn test_partition_retention<PartitionFunc, PartitionFut>(
         }
 
         // Non-date-based partitions should always be retained.
-        expected_retained.push(partition.id)
+        expected_retained_non_date_based.push(partition.id)
     }
+
+    let mut expected_retained: Vec<_> = expected_deleted_when_zero_cutoff_specified
+        .iter()
+        .copied()
+        .chain(expected_retained_date_based.iter().copied())
+        .chain(expected_retained_non_date_based.iter().copied())
+        .collect();
+    expected_retained.sort();
+
+    let mut expected_retained_when_zero_cutoff_specified: Vec<_> = expected_retained_date_based
+        .iter()
+        .copied()
+        .chain(expected_retained_non_date_based.iter().copied())
+        .collect();
+    expected_retained_when_zero_cutoff_specified.sort();
 
     let mut to_delete_partition_ids: Vec<_> = repos
         .partitions()
-        .delete_by_retention()
+        .delete_by_retention(ONE_DAY)
         .await
         .unwrap()
         .into_iter()
@@ -3584,6 +4207,29 @@ pub(crate) async fn test_partition_retention<PartitionFunc, PartitionFut>(
     remaining_partition_ids.sort();
 
     assert_eq!(remaining_partition_ids, expected_retained);
+
+    let mut to_delete_zero_cutoff_partition_ids: Vec<_> = repos
+        .partitions()
+        .delete_by_retention(Duration::from_secs(0))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_table_id, partition_id)| partition_id)
+        .collect();
+    to_delete_zero_cutoff_partition_ids.sort();
+
+    assert_eq!(
+        to_delete_zero_cutoff_partition_ids,
+        expected_deleted_when_zero_cutoff_specified,
+    );
+
+    let mut remaining_partition_ids = repos.partitions().list_ids().await.unwrap();
+    remaining_partition_ids.sort();
+
+    assert_eq!(
+        remaining_partition_ids,
+        expected_retained_when_zero_cutoff_specified
+    );
 }
 
 /// Upsert a namespace called `namespace_name` and write `lines` to it.
@@ -3609,7 +4255,7 @@ where
         Ok(v) => v,
         Err(Error::AlreadyExists { .. }) => repos
             .namespaces()
-            .get_by_name(namespace_name, SoftDeletedRows::AllRows)
+            .get_by_name(namespace_name)
             .await
             .unwrap()
             .unwrap(),
@@ -3622,11 +4268,18 @@ where
         .map(|(table, batch)| (table.as_str(), batch.iter_column_types()));
     let ns = NamespaceSchema::new_empty_from(&namespace);
 
-    let tables =
+    let valid_tables =
         validate_or_insert_schema(batches, ns.id, &ns.partition_template, &ns.tables, repos)
             .await
             .expect("validate schema failed")
-            .unwrap_or(ns.tables);
+            .unwrap();
+
+    // We don't need to re-merge the tables from `validate_or_insert_schema` with `ns` because
+    // `new_empty_from` creates a namespace without tables, but we do it here anyways, just to be
+    // future-proof.
+    let mut tables = ns.tables.clone();
+    tables.extend(valid_tables);
+
     let schema = NamespaceSchema { tables, ..ns };
 
     (namespace, schema)
@@ -3651,7 +4304,7 @@ async fn test_list_schemas(catalog: Arc<dyn Catalog>) {
     // Otherwise the in-mem catalog deadlocks.... (but not postgres)
     drop(repos);
 
-    let got = list_schemas(&*catalog)
+    let got = list_schemas(&*catalog, false)
         .await
         .expect("should be able to list the schemas")
         .collect::<Vec<_>>();
@@ -3685,7 +4338,7 @@ async fn test_list_schemas_soft_deleted_rows(catalog: Arc<dyn Catalog>) {
     // Otherwise the in-mem catalog deadlocks.... (but not postgres)
     drop(repos);
 
-    let got = list_schemas(&*catalog)
+    let got = list_schemas(&*catalog, false)
         .await
         .expect("should be able to list the schemas")
         .collect::<Vec<_>>();
@@ -3709,11 +4362,7 @@ async fn test_two_repos(catalog: Arc<dyn Catalog>) {
         .await
         .unwrap();
 
-    repo_2
-        .get_by_name(&namespace_name, SoftDeletedRows::AllRows)
-        .await
-        .unwrap()
-        .unwrap();
+    repo_2.get_by_name(&namespace_name).await.unwrap().unwrap();
 }
 
 async fn test_partition_create_or_get_idempotent(catalog: Arc<dyn Catalog>) {

@@ -25,7 +25,7 @@ use hashbrown::HashMap;
 
 use self::interpolate::Segment;
 
-use super::{params::GapFillParams, FillStrategy, GapExpander};
+use super::{FillStrategy, GapExpander, params::GapFillParams};
 
 /// Provides methods to the [`GapFillStream`](super::stream::GapFillStream)
 /// module that fill gaps in buffered input.
@@ -72,17 +72,17 @@ use super::{params::GapFillParams, FillStrategy, GapExpander};
 ///
 /// Buffering at least `output_batch_size + 2` rows ensures that:
 /// - `GapFiller` can produce enough rows to produce a complete output batch, since
-///       every input row will appear in the output.
+///   every input row will appear in the output.
 /// - There is a _context row_ that represents the last input row that got output before
-///       the current output batch. Group column values will be taken from this row
-///       (using the [`take`](take::take) kernel) when we are generating trailing gaps, i.e.,
-///       when all of the input rows have been output for a series in the previous batch,
-///       but there still remains missing rows to produce at the end.
+///   the current output batch. Group column values will be taken from this row
+///   (using the [`take`](take::take) kernel) when we are generating trailing gaps, i.e.,
+///   when all of the input rows have been output for a series in the previous batch,
+///   but there still remains missing rows to produce at the end.
 /// - Having at least one additional _trailing row_ at the end ensures that `GapFiller` can
-///       infer whether there is trailing gaps to produce at the beginning of the
-///       next batch, since it can discover if the last row starts a new series.
+///   infer whether there is trailing gaps to produce at the beginning of the
+///   next batch, since it can discover if the last row starts a new series.
 /// - If there are columns that have a fill strategy of [`LinearInterpolate`], then more
-///       trailing rows may be necessary to find the next non-null value for the column.
+///   trailing rows may be necessary to find the next non-null value for the column.
 ///
 /// [`LinearInterpolate`]: FillStrategy::LinearInterpolate
 #[derive(Debug)]
@@ -794,7 +794,7 @@ impl Cursor {
                     return Err(DataFusionError::Execution(format!(
                         "gap expander produced unexpected type for timestamp: {:?}",
                         ts.data_type()
-                    )))
+                    )));
                 }
             };
             self.next_ts = Bound::Excluded(ts);
@@ -1043,10 +1043,10 @@ mod tests {
     use schema::{InfluxColumnType, TIME_DATA_TIMEZONE};
 
     use crate::exec::gapfill::{
+        FillStrategy,
         algo::{AggrColState, Cursor},
         date_bin_gap_expander::DateBinGapExpander,
         params::GapFillParams,
-        FillStrategy,
     };
 
     #[test]

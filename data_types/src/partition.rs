@@ -9,22 +9,22 @@ use sha2::Digest;
 use std::{fmt::Display, sync::Arc};
 use thiserror::Error;
 
-/// For issue idpe#17476 we introduced a new, deterministic partition identifier.  We never stopped
+/// For issue idpe#17476 we introduced a hash-based partition identifier.  We never stopped
 /// allocating the identifiers in the catalog, and have no plans to stop doing so.  Components that
 /// need to support both can use this type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransitionPartitionId {
     /// The classic, catalog-assigned sequential `PartitionId`.
     Catalog(PartitionId),
-    /// The deterministic, hash-based `PartitionHashId`.
-    Deterministic(PartitionHashId),
+    /// The hash-based `PartitionHashId`.
+    Hash(PartitionHashId),
 }
 
 impl TransitionPartitionId {
     /// Create a [`TransitionPartitionId`] from a [`PartitionId`] and optional [`PartitionHashId`]
     pub fn from_parts(id: PartitionId, hash_id: Option<PartitionHashId>) -> Self {
         match hash_id {
-            Some(x) => Self::Deterministic(x),
+            Some(x) => Self::Hash(x),
             None => Self::Catalog(id),
         }
     }
@@ -33,9 +33,7 @@ impl TransitionPartitionId {
     pub fn size(&self) -> usize {
         match self {
             Self::Catalog(_) => std::mem::size_of::<Self>(),
-            Self::Deterministic(id) => {
-                std::mem::size_of::<Self>() + id.size() - std::mem::size_of_val(id)
-            }
+            Self::Hash(id) => std::mem::size_of::<Self>() + id.size() - std::mem::size_of_val(id),
         }
     }
 }
@@ -54,13 +52,13 @@ where
         let partition_hash_id: Option<PartitionHashId> = row.try_get("partition_hash_id")?;
 
         let transition_partition_id = match (partition_id, partition_hash_id) {
-            (_, Some(hash_id)) => Self::Deterministic(hash_id),
+            (_, Some(hash_id)) => Self::Hash(hash_id),
             (Some(id), _) => Self::Catalog(id),
             (None, None) => {
                 return Err(sqlx::Error::ColumnDecode {
                     index: "partition_id".into(),
                     source: "Both partition_id and partition_hash_id were NULL".into(),
-                })
+                });
             }
         };
 
@@ -78,27 +76,27 @@ impl std::fmt::Display for TransitionPartitionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Catalog(old_partition_id) => write!(f, "{}", old_partition_id.0),
-            Self::Deterministic(partition_hash_id) => write!(f, "{}", partition_hash_id),
+            Self::Hash(partition_hash_id) => write!(f, "{}", partition_hash_id),
         }
     }
 }
 
 impl TransitionPartitionId {
-    /// Create a new `TransitionPartitionId::Deterministic` with the given table
+    /// Create a new `TransitionPartitionId::Hash` with the given table
     /// ID and partition key. Provided to reduce typing and duplication a bit,
     /// and because this variant should be most common now.
     ///
     /// This MUST NOT be used for partitions that are addressed using
     /// classical catalog row IDs, which should use
     /// [`TransitionPartitionId::Catalog`] instead.
-    pub fn deterministic(table_id: TableId, partition_key: &PartitionKey) -> Self {
-        Self::Deterministic(PartitionHashId::new(table_id, partition_key))
+    pub fn hash(table_id: TableId, partition_key: &PartitionKey) -> Self {
+        Self::Hash(PartitionHashId::new(table_id, partition_key))
     }
 
     /// Create a new `TransitionPartitionId` for cases in tests where you need some value but the
     /// value doesn't matter. Public and not test-only so that other crates' tests can use this.
     pub fn arbitrary_for_testing() -> Self {
-        Self::deterministic(TableId::new(0), &PartitionKey::from("arbitrary"))
+        Self::hash(TableId::new(0), &PartitionKey::from("arbitrary"))
     }
 }
 
@@ -124,7 +122,7 @@ impl From<TransitionPartitionId>
             TransitionPartitionId::Catalog(id) => Self {
                 id: Some(proto::partition_identifier::Id::CatalogId(id.get())),
             },
-            TransitionPartitionId::Deterministic(hash) => Self {
+            TransitionPartitionId::Hash(hash) => Self {
                 id: Some(proto::partition_identifier::Id::HashId(
                     hash.as_bytes().to_owned(),
                 )),
@@ -149,14 +147,14 @@ impl TryFrom<generated_types::influxdata::iox::catalog::v1::PartitionIdentifier>
         Ok(match id {
             proto::partition_identifier::Id::CatalogId(v) => Self::Catalog(PartitionId::new(v)),
             proto::partition_identifier::Id::HashId(hash) => {
-                Self::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
+                Self::Hash(PartitionHashId::try_from(hash.as_slice())?)
             }
         })
     }
 }
 
 /// Deserialize a [`TransitionPartitionId`] from a protobuf representation,
-/// with an optional partition_key to enable deterministic ids.
+/// with an optional partition_key to enable hash ids.
 impl
     TryFrom<(
         generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
@@ -190,7 +188,7 @@ impl
                 )
             }
             (proto::partition_identifier::Id::HashId(hash), _) => {
-                Self::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
+                Self::Hash(PartitionHashId::try_from(hash.as_slice())?)
             }
         })
     }
@@ -201,7 +199,7 @@ impl
 #[sqlx(transparent)]
 pub struct PartitionId(i64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl PartitionId {
     pub const fn new(v: i64) -> Self {
         Self(v)
@@ -318,7 +316,9 @@ impl sqlx::Decode<'_, sqlx::Sqlite> for PartitionKey {
 /// if validation fails. [`Self::expected`] will be equal to the number of parts which the template had,
 /// and [`Self::found`] will be equal to the number of fields passed in as the argument `parts`
 #[derive(Debug, Copy, Clone, Error)]
-#[error("Expected {expected} parts in key due to template passed in, found {found}. (Note: this may be due to a provided `part` containing the delimiter, `|`, resulting in the key containing more parts than necessary)")]
+#[error(
+    "Expected {expected} parts in key due to template passed in, found {found}. (Note: this may be due to a provided `part` containing the delimiter, `|`, resulting in the key containing more parts than necessary)"
+)]
 pub struct MismatchedNumPartsError {
     /// The number of parts that the tmpl passed into [`NamespacePartitionTemplateOverride::part_key()`] had
     pub expected: usize,
@@ -429,7 +429,7 @@ impl std::hash::Hash for PartitionHashId {
         // So we implement this the hard way (to avoid some nasty panic paths that are quite expensive within a hash function).
         // Conversion borrowed from https://github.com/rust-lang/rfcs/issues/1833#issuecomment-269509262
         const N_BYTES: usize = u64::BITS as usize / 8;
-        #[allow(clippy::assertions_on_constants)]
+
         const _: () = assert!(PARTITION_HASH_ID_SIZE_BYTES >= N_BYTES);
         let ptr = self.0.as_ptr() as *const [u8; N_BYTES];
         let sub: &[u8; N_BYTES] = unsafe { &*ptr };
@@ -440,7 +440,6 @@ impl std::hash::Hash for PartitionHashId {
 
 /// Reasons bytes specified aren't a valid `PartitionHashId`.
 #[derive(Debug, Error)]
-#[allow(missing_copy_implementations)]
 pub enum PartitionHashIdError {
     /// The bytes specified were not valid
     #[error("Could not interpret bytes as `PartitionHashId`: {data:?}")]
@@ -552,10 +551,6 @@ where
     }
 }
 
-// Clippy was getting this wrong in the upgrade to Rust 1.83.0, the recommendation to remove the 'r
-// so it can be elided resulted in a compiler error. See:
-// https://github.com/influxdata/influxdb_iox/pull/12944
-#[expect(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
 impl<'r, DB: ::sqlx::Database> ::sqlx::Type<DB> for PartitionHashId
 where
     &'r [u8]: ::sqlx::Type<DB>,
@@ -622,7 +617,7 @@ impl Partition {
     /// care of computing the [`PartitionHashId`].
     ///
     /// This is only appropriate to use in the catalog or in tests.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new_catalog_only(
         id: PartitionId,
         hash_id: Option<PartitionHashId>,
@@ -697,7 +692,7 @@ pub(crate) mod tests {
     use assert_matches::assert_matches;
     use proptest::{prelude::*, proptest};
 
-    /// A fixture test asserting the deterministic partition ID generation
+    /// A fixture test asserting the partition hash generation
     /// algorithm outputs a fixed value, preventing accidental changes to the
     /// derived ID.
     ///
@@ -723,7 +718,7 @@ pub(crate) mod tests {
             hash_id in any::<[u8; PARTITION_HASH_ID_SIZE_BYTES]>()
         ) -> TransitionPartitionId {
             match use_hash {
-                true => TransitionPartitionId::Deterministic(PartitionHashId(hash_id.into())),
+                true => TransitionPartitionId::Hash(PartitionHashId(hash_id.into())),
                 false => TransitionPartitionId::Catalog(PartitionId::new(row_id)),
             }
         }

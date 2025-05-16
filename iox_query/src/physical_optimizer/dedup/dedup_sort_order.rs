@@ -9,13 +9,13 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use indexmap::IndexSet;
-use schema::{sort::SortKeyBuilder, TIME_COLUMN_NAME};
+use schema::sort::SortKeyBuilder;
 
 use crate::{
-    physical_optimizer::chunk_extraction::extract_chunks,
-    provider::{chunks_to_physical_nodes, DeduplicateExec},
-    util::arrow_sort_key_exprs,
     CHUNK_ORDER_COLUMN_NAME,
+    physical_optimizer::chunk_extraction::extract_chunks,
+    provider::{DeduplicateExec, chunks_to_physical_nodes},
+    util::arrow_sort_key_exprs,
 };
 
 /// Determine sort key order of [`DeduplicateExec`].
@@ -29,7 +29,8 @@ use crate::{
 /// The produces sort key MUST be the same set of columns as before, i.e. this rule does NOT change the column set, it
 /// only changes the order.
 ///
-/// We assume that the order of the sort key passed to [`DeduplicateExec`] is not relevant for correctness.
+/// The order of the sort key passed to [`DeduplicateExec`] does not affect correctness but will be used as a tie-breaker
+/// whenever the vote-based mechanism does not agree on a single order.
 ///
 /// This optimizer makes no assumption about how the ingester or compaction tier work or how chunks relate to each
 /// other. As a consequence, it does NOT use the partition sort key.
@@ -81,49 +82,51 @@ impl PhysicalOptimizerRule for DedupSortOrder {
                     .collect();
 
                 let mut quorum_sort_key_builder = SortKeyBuilder::default();
-                let mut todo_pk_columns = dedup_exec.sort_columns();
+                let mut todo_pk_columns = dedup_exec.sort_columns_ordered();
                 todo_pk_columns.remove(CHUNK_ORDER_COLUMN_NAME);
                 while !todo_pk_columns.is_empty() {
-                    let candidate_counts = todo_pk_columns.iter().copied().map(|col| {
-                        let count = chunk_sort_keys
-                            .iter()
-                            .filter(|sort_key| {
-                                match sort_key.get_index_of(col) {
-                                    Some(0) => {
-                                        // Column next in sort order from this chunks PoV. This is good.
-                                        true
+                    let mut candidate_counts = todo_pk_columns
+                        .iter()
+                        .map(|(col, existing_ordinal)| {
+                            let count = chunk_sort_keys
+                                .iter()
+                                .filter(|sort_key| {
+                                    match sort_key.get_index_of(*col) {
+                                        Some(0) => {
+                                            // Column next in sort order from this chunks PoV. This is good.
+                                            true
+                                        }
+                                        Some(_) => {
+                                            // Column part of the sort order but we have at least one more column before
+                                            // that. Try to avoid an expensive resort for this chunk.
+                                            false
+                                        }
+                                        None => {
+                                            // Column is not in the sort order of this chunk at all. Hence we can place it
+                                            // everywhere in the quorum sort key w/o having to worry about this particular
+                                            // chunk.
+                                            true
+                                        }
                                     }
-                                    Some(_) => {
-                                        // Column part of the sort order but we have at least one more column before
-                                        // that. Try to avoid an expensive resort for this chunk.
-                                        false
-                                    }
-                                    None => {
-                                        // Column is not in the sort order of this chunk at all. Hence we can place it
-                                        // everywhere in the quorum sort key w/o having to worry about this particular
-                                        // chunk.
-                                        true
-                                    }
-                                }
-                            })
-                            .count();
-                        (col, count)
+                                })
+                                .count();
+                            (*col, count, *existing_ordinal)
+                        })
+                        .collect::<Vec<_>>();
+                    candidate_counts.sort_by_key(|(_col, count, existing_ordinal)| {
+                        (Reverse(*count), *existing_ordinal)
                     });
-                    let candidate_counts = sorted(
-                        candidate_counts
-                            .into_iter()
-                            .map(|(col, count)| (Reverse(count), col == TIME_COLUMN_NAME, col)),
-                    );
-                    let next_key = candidate_counts.first().expect("all TODO cols inserted").2;
+                    let (next_key, _count, _priority_inverse) =
+                        candidate_counts.first().expect("all TODO cols inserted");
 
                     for chunk_sort_key in &mut chunk_sort_keys {
                         chunk_sort_key.shift_remove_full(next_key);
                     }
 
-                    let was_present = todo_pk_columns.remove(next_key);
+                    let was_present = todo_pk_columns.remove(next_key).is_some();
                     assert!(was_present);
 
-                    quorum_sort_key_builder = quorum_sort_key_builder.with_col(next_key);
+                    quorum_sort_key_builder = quorum_sort_key_builder.with_col(*next_key);
                 }
 
                 let quorum_sort_key = quorum_sort_key_builder.build();
@@ -156,27 +159,17 @@ impl PhysicalOptimizerRule for DedupSortOrder {
     }
 }
 
-/// Collect items into a sorted vector.
-fn sorted<T>(it: impl IntoIterator<Item = T>) -> Vec<T>
-where
-    T: Ord,
-{
-    let mut items = it.into_iter().collect::<Vec<T>>();
-    items.sort();
-    items
-}
-
 #[cfg(test)]
 mod tests {
-    use schema::{sort::SortKey, SchemaBuilder, TIME_COLUMN_NAME};
+    use schema::{SchemaBuilder, TIME_COLUMN_NAME, sort::SortKey};
 
     use crate::{
+        QueryChunk,
         physical_optimizer::{
             dedup::test_util::{chunk, dedup_plan, dedup_plan_with_chunk_order_col},
             test_util::OptimizationTest,
         },
         test::TestChunk,
-        QueryChunk,
     };
 
     use super::*;
@@ -618,6 +611,64 @@ mod tests {
             - " DeduplicateExec: [tag2@1 ASC,tag1@0 ASC,time@2 ASC]"
             - "   UnionExec"
             - "     ParquetExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, time]"
+        "#
+        );
+    }
+
+    #[test]
+    fn test_tie_breaker() {
+        let chunk1 = TestChunk::new("table")
+            .with_id(1)
+            .with_tag_column("tag1")
+            .with_tag_column("tag2")
+            .with_time_column()
+            .with_dummy_parquet_file()
+            .with_sort_key(SortKey::from_columns([
+                Arc::from("tag1"),
+                Arc::from("tag2"),
+                Arc::from(TIME_COLUMN_NAME),
+            ]));
+        let chunk2 = TestChunk::new("table")
+            .with_id(2)
+            .with_tag_column("tag1")
+            .with_tag_column("tag3")
+            .with_time_column()
+            .with_dummy_parquet_file()
+            .with_sort_key(SortKey::from_columns([
+                Arc::from("tag1"),
+                Arc::from("tag3"),
+                Arc::from(TIME_COLUMN_NAME),
+            ]));
+        let schema = SchemaBuilder::new()
+            .tag("tag1")
+            .tag("tag3")
+            .tag("tag2")
+            .timestamp()
+            .build()
+            .unwrap();
+        let plan = chunks_to_physical_nodes(
+            &schema.as_arrow(),
+            None,
+            vec![Arc::new(chunk1), Arc::new(chunk2)],
+            2,
+        );
+
+        let sort_key = schema::sort::SortKey::from_columns(["tag1", "tag3", "tag2", "time"]);
+        let sort_exprs = arrow_sort_key_exprs(&sort_key, &plan.schema());
+        let plan = Arc::new(DeduplicateExec::new(plan, sort_exprs, false));
+        let opt = DedupSortOrder;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan, opt),
+            @r#"
+        input:
+          - " DeduplicateExec: [tag1@0 ASC,tag3@1 ASC,tag2@2 ASC,time@3 ASC]"
+          - "   UnionExec"
+          - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag3, tag2, time]"
+        output:
+          Ok:
+            - " DeduplicateExec: [tag1@0 ASC,tag3@1 ASC,tag2@2 ASC,time@3 ASC]"
+            - "   UnionExec"
+            - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag3, tag2, time], output_ordering=[tag1@0 ASC, tag3@1 ASC, tag2@2 ASC, time@3 ASC]"
         "#
         );
     }

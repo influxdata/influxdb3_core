@@ -20,7 +20,7 @@ use arrow::record_batch::RecordBatch;
 use data_types::{ColumnType, StatValues, Statistics};
 use hashbrown::HashMap;
 use iox_time::Time;
-use schema::{builder::SchemaBuilder, Projection, Schema, TIME_COLUMN_NAME};
+use schema::{Projection, Schema, TIME_COLUMN_NAME, builder::SchemaBuilder};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{collections::BTreeSet, ops::Range};
 
@@ -31,7 +31,7 @@ pub mod writer;
 
 pub use payload::*;
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Column error on column {}: {}", column, source))]

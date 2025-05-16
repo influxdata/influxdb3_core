@@ -1305,7 +1305,7 @@ mod test {
     use crate::show_tag_keys::ShowTagKeysStatement;
     use crate::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
     use crate::simple_from_clause::{DeleteFromClause, ShowFromClause};
-    use crate::statement::{statement, Statement};
+    use crate::statement::{Statement, statement};
 
     struct TestVisitor(Vec<String>);
 
@@ -1490,7 +1490,9 @@ mod test {
         insta::assert_yaml_snapshot!(visit_statement!(
             "SHOW TAG VALUES WITH KEY IN (host, region)"
         ));
-        insta::assert_yaml_snapshot!(visit_statement!("SHOW TAG VALUES ON telegraf FROM cpu WITH KEY = host WHERE host = \"west\" LIMIT 5 OFFSET 10"));
+        insta::assert_yaml_snapshot!(visit_statement!(
+            "SHOW TAG VALUES ON telegraf FROM cpu WITH KEY = host WHERE host = \"west\" LIMIT 5 OFFSET 10"
+        ));
     }
 
     #[test]

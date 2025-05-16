@@ -1,8 +1,8 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use bytes::{Bytes, BytesMut};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use data_types::{NamespaceId, TableId};
 use dml::DmlWrite;
 use generated_types::influxdata::pbdata::v1::DatabaseBatch;

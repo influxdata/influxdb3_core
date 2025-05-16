@@ -59,8 +59,12 @@ impl ScalarUDFImpl for ToTimestampUDF {
             // You may only have a single argument if you're not parsing utf8
             [DataType::Timestamp(_, _) | DataType::Int64] => Ok(arg_types.to_vec()),
             // But multple arguments are allowed when the first is utf8
-            [DataType::Utf8, rest @ ..] if rest.iter().all(|d| *d == DataType::Utf8) => Ok(arg_types.to_vec()),
-            _ => Err(plan_datafusion_err!("{TO_TIMESTAMP_FUNCTION_NAME} supports either 1 argument (being Int64 or Timestamp), or multiple arguments, all of which being Utf8. Could not coerce the provided {arg_types:?} to these types."))
+            [DataType::Utf8, rest @ ..] if rest.iter().all(|d| *d == DataType::Utf8) => {
+                Ok(arg_types.to_vec())
+            }
+            _ => Err(plan_datafusion_err!(
+                "{TO_TIMESTAMP_FUNCTION_NAME} supports either 1 argument (being Int64 or Timestamp), or multiple arguments, all of which being Utf8. Could not coerce the provided {arg_types:?} to these types."
+            )),
         }
     }
 
@@ -75,7 +79,7 @@ impl ScalarUDFImpl for ToTimestampUDF {
             {
                 arg0.cast_to(&DataType::Timestamp(TimeUnit::Nanosecond, None), None)
             }
-            _ => self.fallback.invoke(args),
+            _ => self.fallback.invoke_batch(args, args.len()),
         }
     }
 }

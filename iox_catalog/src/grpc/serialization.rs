@@ -1,8 +1,8 @@
 use data_types::{
-    partition_template::NamespacePartitionTemplateOverride, Column, ColumnId, ColumnSet,
-    ColumnType, CompactionLevel, MaxL0CreatedAt, Namespace, NamespaceId, NamespaceVersion,
-    ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams, ParquetFileSource, Partition,
-    PartitionId, SkippedCompaction, SortKeyIds, Table, TableId, Timestamp,
+    Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, MaxL0CreatedAt, Namespace,
+    NamespaceId, NamespaceVersion, ObjectStoreId, ParquetFile, ParquetFileId, ParquetFileParams,
+    ParquetFileSource, Partition, PartitionId, SkippedCompaction, SortKeyIds, Table, TableId,
+    Timestamp, partition_template::NamespacePartitionTemplateOverride,
 };
 use generated_types::google::protobuf as google;
 use generated_types::influxdata::iox::catalog::v2 as proto;
@@ -49,6 +49,8 @@ pub(crate) fn serialize_table(t: Table) -> proto::Table {
         namespace_id: t.namespace_id.get(),
         name: t.name,
         partition_template: t.partition_template.as_proto().cloned(),
+        iceberg_enabled: t.iceberg_enabled,
+        deleted_at: t.deleted_at.map(|t| t.get()),
     }
 }
 
@@ -58,6 +60,8 @@ pub(crate) fn deserialize_table(t: proto::Table) -> Result<Table, Error> {
         namespace_id: NamespaceId::new(t.namespace_id),
         name: t.name,
         partition_template: t.partition_template.convert().ctx("partition_template")?,
+        iceberg_enabled: t.iceberg_enabled,
+        deleted_at: t.deleted_at.map(Timestamp::new),
     })
 }
 
@@ -196,7 +200,7 @@ pub(crate) fn deserialize_column_set(set: proto::ColumnSet) -> ColumnSet {
 }
 
 // See comment in the body for why the use of deprecated `max_l0_created_at` is fine.
-#[allow(deprecated)]
+#[expect(deprecated)]
 pub(crate) fn serialize_parquet_file_params(
     params: &ParquetFileParams,
     created_at: Timestamp,
@@ -245,7 +249,7 @@ pub(crate) fn serialize_parquet_file_params(
 }
 
 // See comment in the body for why the use of deprecated `max_l0_created_at` is fine.
-#[allow(deprecated)]
+#[expect(deprecated)]
 pub(crate) fn deserialize_parquet_file_params(
     params: proto::ParquetFileParams,
 ) -> Result<ParquetFileParams, Error> {
@@ -361,8 +365,8 @@ mod tests {
         serialize_soft_deleted_rows,
     };
     use data_types::{
-        partition_template::TablePartitionTemplateOverride, CompactionLevel, PartitionHashId,
-        PartitionKey,
+        CompactionLevel, PartitionHashId, PartitionKey,
+        partition_template::TablePartitionTemplateOverride,
     };
 
     use super::*;
@@ -475,6 +479,8 @@ mod tests {
                 &NamespacePartitionTemplateOverride::const_default(),
             )
             .unwrap(),
+            iceberg_enabled: false,
+            deleted_at: Some(Timestamp::new(12345678)),
         };
         let protobuf = serialize_table(table.clone());
         let table2 = deserialize_table(protobuf).unwrap();
@@ -599,7 +605,6 @@ mod tests {
         assert_eq!(set, set2);
     }
 
-    #[allow(deprecated)]
     #[test]
     fn test_parquet_file_params_roundtrip() {
         // This is only needed until `created_at` is fully deprecated
@@ -647,7 +652,7 @@ mod tests {
     }
 
     // This test is exercising uses of the deprecated `max_l0_created_at` field.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     #[test]
     fn max_l0_created_at_deprecated_but_still_supported() {
         let (high64, low64) = ObjectStoreId::from_uuid(Uuid::from_u128(1337))

@@ -10,10 +10,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-flate2 = "1.0"
+flate2 = "1.1"
 
 [dev-dependencies]
-bytes = "1.9"
+bytes = "1.10"
 criterion = { version = "0.5", default-features = false, features = ["rayon"] }
 data_types = { path = "../data_types", default-features = false }
 dml = { path = "../dml" }

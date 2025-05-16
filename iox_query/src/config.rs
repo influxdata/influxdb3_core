@@ -1,12 +1,10 @@
 use std::{any::Any, str::FromStr, sync::Arc, time::Duration};
 
 use datafusion::{
-    common::{extensions_options, Result},
+    common::{Result, extensions_options},
     config::{ConfigEntry, ConfigExtension, ExtensionOptions},
 };
 use meta_data_cache::MetaIndexCache;
-
-use crate::file_access_observer::FileAccessObserver;
 
 /// IOx-specific config extension prefix.
 pub const IOX_CONFIG_PREFIX: &str = "iox";
@@ -65,6 +63,9 @@ extensions_options! {
         /// - avoids excessive read request for parquet files
         /// - decouples tokio IO/main-runtime from CPU-bound DataFusion runtime
         pub use_cached_parquet_loader: bool, default = true
+
+        /// Hint known object store size from catalog to object store subsystem.
+        pub hint_known_object_size_to_object_store: bool, default = true
     }
 }
 
@@ -158,9 +159,6 @@ pub const IOX_CACHE_PREFIX: &str = "iox_meta_cache";
 pub struct IoxCacheExt {
     /// metadata cache
     pub meta_cache: Option<Arc<MetaIndexCache>>,
-
-    /// file access observer
-    pub file_access_observer: Option<Arc<FileAccessObserver>>,
 }
 
 impl ExtensionOptions for IoxCacheExt {

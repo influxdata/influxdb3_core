@@ -79,12 +79,13 @@ pub mod v3;
 use fmt::Display;
 use log::debug;
 use nom::{
+    Parser,
     branch::alt,
     bytes::complete::{tag, take_while1},
     character::complete::digit1,
     combinator::{map, opt, recognize},
     multi::many0,
-    sequence::{preceded, separated_pair, terminated, tuple},
+    sequence::{preceded, separated_pair, terminated},
 };
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
@@ -571,17 +572,18 @@ fn parse_line(i: &str) -> IResult<&str, ParsedLine<'_>> {
     let field_set = preceded(whitespace, field_set);
     let timestamp = preceded(whitespace, terminated(timestamp, opt(whitespace)));
 
-    let line = tuple((series, field_set, opt(timestamp)));
+    let line = (series, field_set, opt(timestamp));
 
     map(line, |(series, field_set, timestamp)| ParsedLine {
         series,
         field_set,
         timestamp,
-    })(i)
+    })
+    .parse(i)
 }
 
 fn series(i: &str) -> IResult<&str, Series<'_>> {
-    let series = tuple((measurement, maybe_tagset));
+    let series = (measurement, maybe_tagset);
     let series_and_raw_input = parse_and_recognize(series);
 
     map(
@@ -591,7 +593,8 @@ fn series(i: &str) -> IResult<&str, Series<'_>> {
             measurement,
             tag_set,
         },
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Tagsets are optional, but if a comma follows the measurement, then we must have at least one tag=value pair.
@@ -621,7 +624,7 @@ fn measurement(i: &str) -> IResult<&str, Measurement<'_>, Error> {
         !is_whitespace_boundary_char(c) && !is_null_char(c) && c != ',' && c != '\\'
     });
 
-    let space = map(tag(" "), |_| " ");
+    let space = map(tag::<_, _, Error>(" "), |_| " ");
     let comma = map(tag(","), |_| ",");
     let backslash = map(tag("\\"), |_| "\\");
 
@@ -639,13 +642,15 @@ fn tag_set(i: &str) -> IResult<&str, TagSet<'_>> {
 }
 
 fn tag_key(i: &str) -> IResult<&str, EscapedStr<'_>> {
-    let normal_char = take_while1(|c| !is_whitespace_boundary_char(c) && c != '=' && c != '\\');
+    let normal_char =
+        take_while1::<_, _, Error>(|c| !is_whitespace_boundary_char(c) && c != '=' && c != '\\');
 
     escaped_value(normal_char)(i)
 }
 
 fn tag_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
-    let normal_char = take_while1(|c| !is_whitespace_boundary_char(c) && c != ',' && c != '\\');
+    let normal_char =
+        take_while1::<_, _, Error>(|c| !is_whitespace_boundary_char(c) && c != ',' && c != '\\');
     escaped_value(normal_char)(i)
 }
 
@@ -660,7 +665,8 @@ fn field_set(i: &str) -> IResult<&str, FieldSet<'_>> {
 }
 
 fn field_key(i: &str) -> IResult<&str, EscapedStr<'_>> {
-    let normal_char = take_while1(|c| !is_whitespace_boundary_char(c) && c != '=' && c != '\\');
+    let normal_char =
+        take_while1::<_, _, Error>(|c| !is_whitespace_boundary_char(c) && c != '=' && c != '\\');
     escaped_value(normal_char)(i)
 }
 
@@ -671,7 +677,7 @@ fn field_value(i: &str) -> IResult<&str, FieldValue<'_>> {
     let string = map(field_string_value, FieldValue::String);
     let boolv = map(field_bool_value, FieldValue::Boolean);
 
-    alt((int, uint, float, string, boolv))(i)
+    alt((int, uint, float, string, boolv)).parse(i)
 }
 
 fn field_integer_value(i: &str) -> IResult<&str, i64> {
@@ -701,7 +707,7 @@ fn field_float_value(i: &str) -> IResult<&str, f64> {
 }
 
 fn field_float_value_with_decimal(i: &str) -> IResult<&str, &str> {
-    recognize(separated_pair(integral_value_signed, tag("."), digit1))(i)
+    recognize(separated_pair(integral_value_signed, tag("."), digit1)).parse(i)
 }
 
 fn field_float_value_with_exponential_and_decimal(i: &str) -> IResult<&str, &str> {
@@ -709,19 +715,21 @@ fn field_float_value_with_exponential_and_decimal(i: &str) -> IResult<&str, &str
         integral_value_signed,
         tag("."),
         exponential_value,
-    ))(i)
+    ))
+    .parse(i)
 }
 
 fn field_float_value_with_exponential_no_decimal(i: &str) -> IResult<&str, &str> {
-    recognize(preceded(opt(tag("-")), exponential_value))(i)
+    recognize(preceded(opt(tag("-")), exponential_value)).parse(i)
 }
 
 fn exponential_value(i: &str) -> IResult<&str, &str> {
     recognize(separated_pair(
         digit1,
-        tuple((alt((tag("e"), tag("E"))), opt(alt((tag("-"), tag("+")))))),
+        (alt((tag("e"), tag("E"))), opt(alt((tag("-"), tag("+"))))),
         digit1,
-    ))(i)
+    ))
+    .parse(i)
 }
 
 fn field_float_value_no_decimal(i: &str) -> IResult<&str, &str> {
@@ -729,7 +737,7 @@ fn field_float_value_no_decimal(i: &str) -> IResult<&str, &str> {
 }
 
 fn integral_value_signed(i: &str) -> IResult<&str, &str> {
-    recognize(preceded(opt(tag("-")), digit1))(i)
+    recognize(preceded(opt(tag("-")), digit1)).parse(i)
 }
 
 fn timestamp(i: &str) -> IResult<&str, i64> {
@@ -783,7 +791,8 @@ fn field_bool_value(i: &str) -> IResult<&str, bool> {
         map(tag("FALSE"), |_| false),
         map(tag("f"), |_| false),
         map(tag("F"), |_| false),
-    ))(i)
+    ))
+    .parse(i)
 }
 
 /// Truncates the input slice to remove all whitespace from the
@@ -820,7 +829,7 @@ fn is_null_char(c: char) -> bool {
 /// escaped, we support the client escaping them proactively to
 /// provide a common experience.
 fn escaped_value<'a>(
-    normal: impl Fn(&'a str) -> IResult<&'a str, &'a str>,
+    normal: impl Parser<&'a str, Output = &'a str, Error = Error>,
 ) -> impl FnOnce(&'a str) -> IResult<&'a str, EscapedStr<'a>> {
     move |i| {
         let backslash = map(tag("\\"), |_| "\\");
@@ -838,10 +847,10 @@ fn escaped_value<'a>(
 /// potentially-escaped characters. If the character *isn't* escaped,
 /// treat it as a literal character.
 fn escape_or_fallback<'a>(
-    normal: impl FnMut(&'a str) -> IResult<&'a str, &'a str>,
+    normal: impl Parser<&'a str, Output = &'a str, Error = Error>,
     escape_char: &'static str,
-    escaped: impl FnMut(&'a str) -> IResult<&'a str, &'a str>,
-) -> impl FnOnce(&'a str) -> IResult<&'a str, EscapedStr<'a>> {
+    escaped: impl Parser<&'a str, Output = &'a str, Error = Error>,
+) -> impl FnOnce(&'a str) -> IResult<&'a str, EscapedStr<'a>, Error> {
     move |i| {
         let (remaining, s) = escape_or_fallback_inner(normal, escape_char, escaped)(i)?;
 
@@ -858,9 +867,9 @@ fn escape_or_fallback<'a>(
 }
 
 fn escape_or_fallback_inner<'a, Error>(
-    mut normal: impl FnMut(&'a str) -> IResult<&'a str, &'a str, Error>,
+    mut normal: impl Parser<&'a str, Output = &'a str, Error = Error>,
     escape_char: &'static str,
-    mut escaped: impl FnMut(&'a str) -> IResult<&'a str, &'a str, Error>,
+    mut escaped: impl Parser<&'a str, Output = &'a str, Error = Error>,
 ) -> impl FnMut(&'a str) -> IResult<&'a str, EscapedStr<'a>, Error>
 where
     Error: nom::error::ParseError<&'a str>,
@@ -870,7 +879,7 @@ where
         let mut head = i;
 
         loop {
-            match normal(head) {
+            match normal.parse(head) {
                 Ok((remaining, parsed)) => {
                     result.push(parsed);
                     head = remaining;
@@ -880,7 +889,7 @@ where
                     if head.starts_with(escape_char) {
                         let after = &head[escape_char.len()..];
 
-                        match escaped(after) {
+                        match escaped.parse(after) {
                             Ok((remaining, parsed)) => {
                                 result.push(parsed);
                                 head = remaining;
@@ -930,14 +939,14 @@ fn parameterized_separated_list<I, O, O2, E, F, G, Ret>(
 ) -> impl FnOnce(I) -> IResult<I, Ret, E>
 where
     I: Clone + PartialEq,
-    F: FnMut(I) -> IResult<I, O, E>,
+    F: Parser<I, Output = O, Error = E>,
     G: FnMut(I) -> IResult<I, O2, E>,
     E: nom::error::ParseError<I>,
 {
     move |mut i: I| {
         let mut res = cre();
 
-        match f(i.clone()) {
+        match f.parse(i.clone()) {
             Err(nom::Err::Error(_)) => return Ok((i, res)),
             Err(e) => return Err(e),
             Ok((i1, o)) => {
@@ -965,7 +974,7 @@ where
                         )));
                     }
 
-                    match f(i1.clone()) {
+                    match f.parse(i1.clone()) {
                         Err(nom::Err::Error(_)) => return Ok((i, res)),
                         Err(e) => return Err(e),
                         Ok((i2, o)) => {
@@ -994,12 +1003,12 @@ fn parameterized_separated_list1<I, O, O2, E, F, G, Ret>(
 ) -> impl FnOnce(I) -> IResult<I, Ret, E>
 where
     I: Clone + PartialEq,
-    F: FnMut(I) -> IResult<I, O, E>,
+    F: Parser<I, Output = O, Error = E>,
     G: FnMut(I) -> IResult<I, O2, E>,
     E: nom::error::ParseError<I>,
 {
     move |i| {
-        let (rem, first) = f(i)?;
+        let (rem, first) = f.parse(i)?;
 
         let mut res = cre();
         add(&mut res, first);
@@ -1014,23 +1023,18 @@ where
 
 /// This is a copied version of nom's `recognize` that runs the parser
 /// **and** returns the entire matched input.
-fn parse_and_recognize<
-    I: Clone + nom::Offset + nom::Slice<std::ops::RangeTo<usize>>,
-    O,
-    E: nom::error::ParseError<I>,
-    F,
->(
+fn parse_and_recognize<I: Clone + nom::Offset + nom::Input, O, E: nom::error::ParseError<I>, F>(
     mut parser: F,
 ) -> impl FnMut(I) -> IResult<I, (I, O), E>
 where
-    F: FnMut(I) -> IResult<I, O, E>,
+    F: Parser<I, Output = O, Error = E>,
 {
     move |input: I| {
         let i = input.clone();
-        match parser(i) {
+        match parser.parse(i) {
             Ok((i, o)) => {
                 let index = input.offset(&i);
-                Ok((i, (input.slice(..index), o)))
+                Ok((i, (input.take(index), o)))
             }
             Err(e) => Err(e),
         }
@@ -1040,11 +1044,11 @@ where
 /// This is very similar to nom's `map_res`, but creates a
 /// `nom::Err::Failure` instead.
 fn map_fail<'a, R1, R2>(
-    mut first: impl FnMut(&'a str) -> IResult<&'a str, R1>,
+    mut first: impl Parser<&'a str, Output = R1, Error = Error>,
     second: impl FnOnce(R1) -> Result<R2, Error>,
 ) -> impl FnOnce(&'a str) -> IResult<&'a str, R2> {
     move |i| {
-        let (remaining, value) = first(i)?;
+        let (remaining, value) = first.parse(i)?;
 
         match second(value) {
             Ok(v) => Ok((remaining, v)),
@@ -1168,15 +1172,15 @@ mod test {
         assert!(es.ends_with("Bar"));
 
         // Test PartialEq implementation for escaped str
-        assert!(es == "Foo\\aBar");
-        assert!(es != "Foo\\aBa");
-        assert!(es != "Foo\\aBaz");
-        assert!(es != "Foo\\a");
-        assert!(es != "Foo\\");
-        assert!(es != "Foo");
-        assert!(es != "Fo");
-        assert!(es != "F");
-        assert!(es != "");
+        assert_eq!(es, "Foo\\aBar");
+        assert_ne!(es, "Foo\\aBa");
+        assert_ne!(es, "Foo\\aBaz");
+        assert_ne!(es, "Foo\\a");
+        assert_ne!(es, "Foo\\");
+        assert_ne!(es, "Foo");
+        assert_ne!(es, "Fo");
+        assert_ne!(es, "F");
+        assert_ne!(es, "");
     }
 
     #[test]
@@ -1439,6 +1443,7 @@ mod test {
             (r#"foo asdf="too hot\\\cold""#, r"too hot\\cold"),
             (r#"foo asdf="too hot\\\\cold""#, r"too hot\\cold"),
             (r#"foo asdf="too hot\\\\\cold""#, r"too hot\\\cold"),
+            (r#"foo asdf="too hot\\\\\\cold""#, r"too hot\\\cold"),
         ];
 
         for (input, expected_parsed_string_value) in test_data {
@@ -2327,8 +2332,10 @@ her"#,
             )
         );
         // str & str
-        assert!(FieldValue::String(EscapedStr::SingleSlice("bananas"))
-            .is_same_type(&FieldValue::String(EscapedStr::SingleSlice("platanos"))));
+        assert!(
+            FieldValue::String(EscapedStr::SingleSlice("bananas"))
+                .is_same_type(&FieldValue::String(EscapedStr::SingleSlice("platanos")))
+        );
         // str & String
         assert!(
             FieldValue::String(EscapedStr::SingleSlice("bananas")).is_same_type(
@@ -2519,6 +2526,30 @@ her"#,
         let vals = parsed.unwrap();
 
         assert_eq!(vals[0].field_value(&value_name).unwrap().unwrap_i64(), 1);
+    }
+
+    #[test]
+    #[ignore = "https://github.com/influxdata/influxdb_iox/issues/13372"]
+    fn test_many_canonical_escape() {
+        let input = r#"bananas,tag1=\\\\\\0 test=42i"#;
+        let want_tag_value = r#"\\\0"#;
+
+        // Parse the input and assert the tag value is correctly escaped.
+        let parsed = parse(input).unwrap();
+        assert_eq!(
+            parsed[0].tag_value("tag1").unwrap().as_str(),
+            want_tag_value
+        );
+
+        // Convert the parsed form into the canonical representation.
+        let input2 = parsed[0].to_string();
+
+        // Which should match the first parsed output.
+        let parsed = parse(&input2).unwrap();
+        assert_eq!(
+            parsed[0].tag_value("tag1").unwrap().as_str(),
+            want_tag_value
+        );
     }
 
     /// Assert that the field named `field_name` has a float value

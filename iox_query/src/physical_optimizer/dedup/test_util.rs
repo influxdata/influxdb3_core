@@ -5,11 +5,10 @@ use datafusion::physical_plan::ExecutionPlan;
 use schema::Schema;
 
 use crate::{
-    chunk_order_field,
-    provider::{chunks_to_physical_nodes, DeduplicateExec},
+    QueryChunk, chunk_order_field,
+    provider::{DeduplicateExec, chunks_to_physical_nodes},
     test::TestChunk,
     util::arrow_sort_key_exprs,
-    QueryChunk,
 };
 
 pub fn dedup_plan(schema: Schema, chunks: Vec<TestChunk>) -> Arc<dyn ExecutionPlan> {

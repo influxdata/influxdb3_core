@@ -1,5 +1,5 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use std::{
     sync::{Arc, Barrier},
@@ -7,15 +7,15 @@ use std::{
 };
 
 use criterion::{
-    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion, Throughput,
+    BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime,
 };
 use data_types::NamespaceName;
 use mutable_batch::MutableBatch;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{Rng, distr::Alphanumeric, rng};
 use sharder::{JumpHash, RoundRobin, Sharder};
 
 fn get_random_string(length: usize) -> String {
-    thread_rng()
+    rng()
         .sample_iter(&Alphanumeric)
         .take(length)
         .map(char::from)

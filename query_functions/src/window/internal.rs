@@ -5,7 +5,7 @@
 //! transliteration of the original Go code into Rust as possible. It
 //! does not forcing idomatic Rust when that might obscure the mapping
 //! between the original code and this port.
-use chrono::{prelude::*, Month::February};
+use chrono::{Month::February, prelude::*};
 use std::ops::{Add, Mul};
 
 /// Duration is a vector representing the duration unit components.
@@ -402,7 +402,7 @@ mod tests {
             want: Bounds,
         }
 
-        #[allow(clippy::identity_op)]
+        #[expect(clippy::identity_op)]
         let testcases = vec![
             TestCase {
                 name: "simple",

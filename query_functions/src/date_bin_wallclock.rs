@@ -1,17 +1,17 @@
 //! Implementation of the date_bin_wallclock UDF.
 
-use arrow::array::timezone::Tz;
 use arrow::array::TimestampNanosecondBuilder;
+use arrow::array::timezone::Tz;
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use arrow::temporal_conversions::timestamp_ns_to_datetime;
 use chrono::{MappedLocalTime, Offset, TimeZone};
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{exec_err, not_impl_err, Result};
+use datafusion::common::{Result, exec_err, not_impl_err};
 use datafusion::error::DataFusionError;
 use datafusion::functions::datetime::date_bin;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    TIMEZONE_WILDCARD,
+    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD, TypeSignature,
+    Volatility,
 };
 use datafusion::scalar::ScalarValue;
 use std::str::FromStr;
@@ -180,13 +180,18 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
                     // DATE_BIN_WALLCLOCK requires that the origin parameter has no time zone,
                     // according to the signature this isn't valid for DATE_BIN. The value doesn't
                     // need adjusting but set the timezone to match the times array.
-                    self.date_bin.invoke(&[
-                        interval.clone(),
-                        source.clone(),
-                        ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(origin, tz)),
-                    ])
+                    self.date_bin.invoke_batch(
+                        &[
+                            interval.clone(),
+                            source.clone(),
+                            ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(origin, tz)),
+                        ],
+                        args.len(),
+                    )
                 }
-                None => self.date_bin.invoke(&[interval.clone(), source.clone()]),
+                None => self
+                    .date_bin
+                    .invoke_batch(&[interval.clone(), source.clone()], args.len()),
             };
         }
 
@@ -249,12 +254,17 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
         };
 
         let result = match origin {
-            Some(origin) => self.date_bin.invoke(&[
-                interval.clone(),
-                wallclocks,
-                ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(origin, None)),
-            ])?,
-            None => self.date_bin.invoke(&[interval.clone(), wallclocks])?,
+            Some(origin) => self.date_bin.invoke_batch(
+                &[
+                    interval.clone(),
+                    wallclocks,
+                    ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(origin, None)),
+                ],
+                args.len(),
+            )?,
+            None => self
+                .date_bin
+                .invoke_batch(&[interval.clone(), wallclocks], args.len())?,
         };
 
         let result = match result {
@@ -397,8 +407,8 @@ fn offset_from_local_ns(
 
 /// Functions for creating expressions that call the `date_bin_wallclock` UDF.
 pub mod expr_fn {
-    use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::expr::ScalarFunction;
 
     /// Create a scalar function expression that calls the `date_bin_wallclock` function.
     pub fn date_bin_wallclock(stride: Expr, source: Expr, origin: Expr) -> Expr {
@@ -432,7 +442,7 @@ mod tests {
                 None,
             )),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -451,7 +461,7 @@ mod tests {
                 Some(Arc::from("America/New_York")),
             )),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -476,7 +486,7 @@ mod tests {
                 Some(Arc::from("Europe/Paris")),
             )),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -505,7 +515,7 @@ mod tests {
                 None,
             )),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -534,7 +544,7 @@ mod tests {
                 None,
             )),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -564,7 +574,7 @@ mod tests {
             ))),
             ColumnarValue::Array(arr),
         ];
-        let result = match udf.invoke(&args).unwrap() {
+        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
             ColumnarValue::Array(arr) => as_timestamp_nanosecond_array(&arr).unwrap().clone(),
             _ => panic!("Expected array value"),
         };
@@ -602,7 +612,7 @@ mod tests {
                 Some(Arc::from("UTC")),
             )),
         ];
-        let result = udf.invoke(&args);
+        let result = udf.invoke_batch(&args, args.len());
         assert_eq!(
             result.unwrap_err().to_string(),
             "This feature is not implemented: DATE_BIN only supports literal values for the stride argument, not arrays"
@@ -627,7 +637,7 @@ mod tests {
             )),
             ColumnarValue::Array(arr),
         ];
-        let result = udf.invoke(&args);
+        let result = udf.invoke_batch(&args, args.len());
         assert_eq!(
             result.unwrap_err().to_string(),
             "This feature is not implemented: DATE_BIN_WALLCLOCK only supports literal values for the origin argument, not arrays"
@@ -652,7 +662,7 @@ mod tests {
                 None,
             )),
         ];
-        udf.invoke(&args).unwrap();
+        udf.invoke_batch(&args, args.len()).unwrap();
     }
 
     /// A UDF that is a stub `date_bin` which checks that the `source`

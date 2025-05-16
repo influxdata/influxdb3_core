@@ -1,9 +1,9 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use arrow_util::assert_batches_eq;
 use data_types::PartitionKey;
-use mutable_batch::{writer::Writer, MutableBatch, WritePayload};
+use mutable_batch::{MutableBatch, WritePayload, writer::Writer};
 use mutable_batch_pb::{decode::write_table_batch, encode::encode_batch};
 use partition::PartitionWrite;
 use schema::Projection;

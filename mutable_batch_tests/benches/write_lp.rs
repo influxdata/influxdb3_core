@@ -1,8 +1,8 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use mutable_batch_lp::lines_to_batches;
 use mutable_batch_tests::benchmark_lp;

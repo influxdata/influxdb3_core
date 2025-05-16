@@ -1,28 +1,33 @@
 //! Fault injection for testing purposes.
 
-#![allow(deprecated)] // injecting faults into deprecated trait methods is fine
+#![expect(deprecated)] // injecting faults into deprecated trait methods is fine
 
 use crate::interface::{
-    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-    RepoCollection, Result, RootRepo, SoftDeletedRows, TableRepo,
+    CasFailure, Catalog, ColumnRepo, Error, NamespaceRepo, NamespaceSorting, Paginated,
+    PaginationOptions, ParquetFileRepo, PartitionRepo, RepoCollection, Result, RootRepo,
+    SoftDeletedRows, TableRepo, TableSorting,
 };
 use async_trait::async_trait;
 use data_types::snapshot::namespace::NamespaceSnapshot;
 use data_types::snapshot::root::RootSnapshot;
 use data_types::snapshot::table::TableSnapshot;
 use data_types::{
-    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
-    snapshot::partition::PartitionSnapshot,
     Column, ColumnType, CompactionLevel, MaxColumnsPerTable, MaxTables, Namespace, NamespaceId,
     NamespaceName, NamespaceServiceProtectionLimitsOverride, ObjectStoreId, ParquetFile,
     ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, Table,
     TableId, Timestamp,
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
+    snapshot::partition::PartitionSnapshot,
 };
 use data_types::{NamespaceWithStorage, TableWithStorage};
 use iox_time::TimeProvider;
 use parking_lot::Mutex;
-use std::collections::HashSet;
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::Arc,
+    time::Duration,
+};
 use trace::ctx::SpanContext;
 
 #[derive(Debug)]
@@ -98,6 +103,10 @@ impl std::fmt::Debug for FaultCatalog {
 
 #[async_trait]
 impl Catalog for FaultCatalog {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<()> {
         self.state.check(FaultPoint::CatalogSetupPre)?;
         let res = self.inner.setup().await;
@@ -177,7 +186,7 @@ impl RepoCollection for Repos {
     }
 }
 
-macro_rules! gen {
+macro_rules! generate {
     {
         $({
             impl_trait = $trait:ident,
@@ -247,7 +256,7 @@ macro_rules! gen {
     };
 }
 
-gen! {
+generate! {
     {
         impl_trait = RootRepo,
         repo = root,
@@ -262,15 +271,17 @@ gen! {
             create(&mut self, name: &NamespaceName<'_>, partition_template: Option<NamespacePartitionTemplateOverride>, retention_period_ns: Option<i64>, service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>) -> Result<Namespace>;
             update_retention_period(&mut self, id: NamespaceId, retention_period_ns: Option<i64>) -> Result<Namespace>;
             list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
-            list_storage(&mut self) -> Result<Vec<NamespaceWithStorage>>;
+            list_storage(&mut self, sorting: Option<NamespaceSorting>, pagination: Option<PaginationOptions>, deleted: SoftDeletedRows) -> Result<Paginated<NamespaceWithStorage>>;
             get_by_id(&mut self, id: NamespaceId, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
-            get_by_name(&mut self, name: &str, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
-            soft_delete(&mut self, id: NamespaceId) -> Result<NamespaceId>;
+            get_by_name(&mut self, name: &str) -> Result<Option<Namespace>>;
+            soft_delete(&mut self, id: NamespaceId) -> Result<Namespace>;
             update_table_limit(&mut self, id: NamespaceId, new_max: MaxTables) -> Result<Namespace>;
             update_column_limit(&mut self, id: NamespaceId, new_max: MaxColumnsPerTable) -> Result<Namespace>;
             snapshot(&mut self, namespace_id: NamespaceId) -> Result<NamespaceSnapshot>;
             snapshot_by_name(&mut self, name: &str) -> Result<NamespaceSnapshot>;
-            get_storage_by_id(&mut self, id: NamespaceId) -> Result<Option<NamespaceWithStorage>>;
+            get_storage_by_id(&mut self, id: NamespaceId, deleted: SoftDeletedRows) -> Result<Option<NamespaceWithStorage>>;
+            rename(&mut self, id: NamespaceId, new_name: NamespaceName<'_>) -> Result<Namespace>;
+            undelete(&mut self, id: NamespaceId) -> Result<Namespace>;
         ],
     },
     {
@@ -279,12 +290,18 @@ gen! {
         methods = [
             create(&mut self, name: &str, partition_template: TablePartitionTemplateOverride, namespace_id: NamespaceId) -> Result<Table>;
             get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
-            get_storage_by_id(&mut self, table_id: TableId) -> Result<Option<TableWithStorage>>;
+            get_storage_by_id(&mut self, table_id: TableId, deleted: SoftDeletedRows) -> Result<Option<TableWithStorage>>;
             get_by_namespace_and_name(&mut self, namespace_id: NamespaceId, name: &str) -> Result<Option<Table>>;
             list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Table>>;
-            list_storage_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<TableWithStorage>>;
+            list_storage_by_namespace_id(&mut self, namespace_id: NamespaceId, sorting: Option<TableSorting>, pagination: Option<PaginationOptions>, deleted: SoftDeletedRows) -> Result<Paginated<TableWithStorage>>;
             list(&mut self) -> Result<Vec<Table>>;
             snapshot(&mut self, table_id: TableId) -> Result<TableSnapshot>;
+            list_by_iceberg_enabled(&mut self, _namespace_id: NamespaceId) -> Result<Vec<TableId>>;
+            enable_iceberg(&mut self, table_id: TableId) -> Result<()>;
+            disable_iceberg(&mut self, table_id: TableId) -> Result<()>;
+            soft_delete(&mut self, id: TableId) -> Result<Table>;
+            rename(&mut self, id: TableId, new_name: &str) -> Result<Table>;
+            undelete(&mut self, id: TableId) -> Result<Table>;
         ],
     },
     {
@@ -295,7 +312,7 @@ gen! {
             list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Column>>;
             list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Column>>;
             create_or_get_many_unchecked(&mut self, table_id: TableId, columns: HashMap<&str, ColumnType>) -> Result<Vec<Column>>;
-            list(&mut self) -> Result<Vec<Column>>;
+            list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Column>>;
         ],
     },
     {
@@ -317,7 +334,7 @@ gen! {
             update_cold_compact(&mut self, partition_id: PartitionId, cold_compact_at: Timestamp) -> Result<()>;
             get_in_skipped_compactions(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<SkippedCompaction>>;
             list_old_style(&mut self) -> Result<Vec<Partition>>;
-            delete_by_retention(&mut self) -> Result<Vec<(TableId, PartitionId)>>;
+            delete_by_retention(&mut self, partition_cutoff: Duration) -> Result<Vec<(TableId, PartitionId)>>;
             snapshot(&mut self, partition_id: PartitionId) -> Result<PartitionSnapshot>;
             snapshot_generation(&mut self, partition_id: PartitionId) -> Result<u64>;
         ],
@@ -328,7 +345,7 @@ gen! {
         methods = [
             flag_for_delete_by_retention(&mut self) -> Result<Vec<(PartitionId, ObjectStoreId)>>;
             delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ObjectStoreId>>;
-            delete_old_ids_count(&mut self, older_than: Timestamp) -> Result<u64>;
+            delete_old_ids_count(&mut self, older_than: Timestamp, limit: u32) -> Result<(u64, Option<Timestamp>)>;
             list_by_partition_not_to_delete_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<ParquetFile>>;
             active_as_of(&mut self, as_of: Timestamp) -> Result<Vec<ParquetFile>>;
             get_by_object_store_id(&mut self, object_store_id: ObjectStoreId) -> Result<Option<ParquetFile>>;
@@ -352,7 +369,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
-        crate::interface_tests::test_catalog(|| async {
+        crate::interface_tests::test_catalog(async || {
             let metrics = Arc::new(metric::Registry::default());
             let time_provider = Arc::new(SystemProvider::new());
 
@@ -447,13 +464,15 @@ mod tests {
                 .unwrap_err(),
             Error::NotImplemented { .. }
         );
-        assert!(catalog
-            .repositories()
-            .namespaces()
-            .get_by_name(&ns, SoftDeletedRows::AllRows)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            catalog
+                .repositories()
+                .namespaces()
+                .get_by_name(&ns)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // post: DOES create
         assert_matches!(
@@ -465,12 +484,14 @@ mod tests {
                 .unwrap_err(),
             Error::NotImplemented { .. }
         );
-        assert!(catalog
-            .repositories()
-            .namespaces()
-            .get_by_name(&ns, SoftDeletedRows::AllRows)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            catalog
+                .repositories()
+                .namespaces()
+                .get_by_name(&ns)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

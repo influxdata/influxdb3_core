@@ -1,7 +1,7 @@
 use super::registry::AbstractTaskRegistry;
 use super::{TaskId, TaskRegistration, TaskTracker};
-use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use observability_deps::tracing::*;
 use std::hash::Hash;
 

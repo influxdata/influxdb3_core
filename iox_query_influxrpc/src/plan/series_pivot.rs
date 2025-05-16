@@ -1,7 +1,7 @@
 use crate::schema::{FieldExt, SeriesColumnType, SeriesSchema};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::logical_expr::{
-    expr_vec_fmt, Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore,
+    Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore, expr_vec_fmt,
 };
 use datafusion_util::ThenWithOpt;
 use std::cmp::Ordering;

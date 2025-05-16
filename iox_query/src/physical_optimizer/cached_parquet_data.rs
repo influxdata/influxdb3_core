@@ -14,16 +14,16 @@ use datafusion::{
         arrow::async_reader::AsyncFileReader, errors::ParquetError, file::metadata::ParquetMetaData,
     },
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{metrics::ExecutionPlanMetricsSet, ExecutionPlan},
+    physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet},
 };
 use executor::spawn_io;
-use futures::{future::Shared, prelude::future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::Shared, prelude::future::BoxFuture};
 use meta_data_cache::MetaIndexCache;
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
+use object_store_size_hinting::hint_size;
 use observability_deps::tracing::warn;
 use parquet_file::ParquetFilePath;
 
-use crate::file_access_observer::{FileAccessObserver, QueryFileScope};
 use crate::{
     config::{IoxCacheExt, IoxConfigExt},
     provider::PartitionedFileExt,
@@ -38,13 +38,12 @@ impl PhysicalOptimizerRule for CachedParquetData {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let enabled = config
+        let config_ext = config
             .extensions
             .get::<IoxConfigExt>()
             .cloned()
-            .unwrap_or_default()
-            .use_cached_parquet_loader;
-        if !enabled {
+            .unwrap_or_default();
+        if !config_ext.use_cached_parquet_loader {
             return Ok(plan);
         }
 
@@ -75,7 +74,6 @@ impl PhysicalOptimizerRule for CachedParquetData {
             // and hence won't benefit from caching the file metadata.
             let iox_cache_ext = config.extensions.get::<IoxCacheExt>();
             let meta_cache = iox_cache_ext.and_then(|e| e.meta_cache.clone());
-            let observer = iox_cache_ext.and_then(|e| e.file_access_observer.clone());
 
             let parquet_exec = parquet_exec
                 .clone()
@@ -83,7 +81,7 @@ impl PhysicalOptimizerRule for CachedParquetData {
                     Arc::clone(&ext.object_store),
                     Arc::clone(&ext.table_schema),
                     meta_cache,
-                    observer,
+                    config_ext.hint_known_object_size_to_object_store,
                 )));
             Ok(Transformed::yes(Arc::new(parquet_exec)))
         })
@@ -109,7 +107,7 @@ struct CachedParquetFileReaderFactory {
     object_store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
     meta_cache: Option<Arc<MetaIndexCache>>,
-    observer: Option<Arc<FileAccessObserver>>,
+    hint_size_to_object_store: bool,
 }
 
 impl CachedParquetFileReaderFactory {
@@ -118,13 +116,13 @@ impl CachedParquetFileReaderFactory {
         object_store: Arc<DynObjectStore>,
         table_schema: SchemaRef,
         meta_cache: Option<Arc<MetaIndexCache>>,
-        observer: Option<Arc<FileAccessObserver>>,
+        hint_size_to_object_store: bool,
     ) -> Self {
         Self {
             object_store,
             table_schema,
             meta_cache,
-            observer,
+            hint_size_to_object_store,
         }
     }
 }
@@ -142,24 +140,29 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 
         let object_store = Arc::clone(&self.object_store);
         let location = file_meta.object_meta.location.clone();
+        let size = file_meta.object_meta.size;
+        let hint_size_to_object_store = self.hint_size_to_object_store;
         let data = spawn_io(async move {
-            let res = object_store.get(&location).await.map_err(Arc::new)?;
+            let options = if hint_size_to_object_store {
+                hint_size(size)
+            } else {
+                Default::default()
+            };
+            let res = object_store
+                .get_opts(&location, options)
+                .await
+                .map_err(Arc::new)?;
             res.bytes().await.map_err(Arc::new)
         })
         .boxed()
         .shared();
         let meta = Arc::new(file_meta.object_meta);
-        let observer = self.observer.as_ref().and_then(|observer| {
-            ParquetFilePath::uuid_from_path(&meta.location)
-                .map(|id| observer.open_query_file_scope(id, meta.size))
-        });
 
         let file_reader = ParquetFileReader {
             meta: Arc::clone(&meta),
             file_metrics: Some(file_metrics),
             metadata_size_hint,
             data,
-            observer,
         };
 
         // no meta cache available when this is executed by the compactor
@@ -243,7 +246,6 @@ struct ParquetFileReader {
     file_metrics: Option<ParquetFileMetrics>,
     metadata_size_hint: Option<usize>,
     data: Shared<BoxFuture<'static, Result<Bytes, Arc<ObjectStoreError>>>>,
-    observer: Option<QueryFileScope>,
 }
 
 impl ParquetFileReader {
@@ -258,7 +260,6 @@ impl ParquetFileReader {
             file_metrics: None,
             metadata_size_hint: self.metadata_size_hint,
             data: self.data.clone(),
-            observer: None,
         }
     }
     /// Loads [`ParquetMetaData`] from file.
@@ -290,10 +291,6 @@ impl AsyncFileReader for ParquetFileReader {
         &mut self,
         ranges: Vec<Range<usize>>,
     ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
-        if let Some(observer) = &self.observer {
-            observer.request(&ranges);
-        }
-
         Box::pin(async move {
             let data = self
                 .data

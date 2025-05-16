@@ -3,6 +3,7 @@
 syntax = "proto3";
 
 package influxdata.iox.authz.v1;
+
 option go_package = "github.com/influxdata/iox/authz/v1";
 
 /*
@@ -10,16 +11,15 @@ option go_package = "github.com/influxdata/iox/authz/v1";
  * the permissions associated with the token.
  */
 service IoxAuthorizerService {
-
   /*
-    * Authorize is used to validate a token and return the set of 
-    * permissions associated with the token.
-    */
+   * Authorize is used to validate a token and return the set of
+   * permissions associated with the token.
+   */
   rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
 }
 
 /*
- * The request message 
+ * The request message
  */
 message AuthorizeRequest {
   /*
@@ -71,7 +71,7 @@ message ResourceActionPermission {
     RESOURCE_TYPE_UNSPECIFIED = 0;
 
     /*
-     * Permission to access a database.
+     * Permission to access a database by name, name-pattern or ID.
      */
     RESOURCE_TYPE_DATABASE = 1;
   }
@@ -92,7 +92,11 @@ message ResourceActionPermission {
   }
 
   ResourceType resource_type = 1;
-  optional string resource_id = 2;
+  // The target which this action is permissible for.
+  oneof target {
+    string resource_name = 2;
+    string resource_id = 4;
+  }
   Action action = 3;
 }
 
@@ -103,4 +107,3 @@ message Subject {
    */
   string id = 1;
 }
-

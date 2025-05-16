@@ -3,20 +3,21 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-tag-values
 
 use crate::common::{
-    limit_clause, offset_clause, where_clause, ws0, ws1, LimitClause, OffsetClause, OneOrMore,
-    WhereClause,
+    LimitClause, OffsetClause, OneOrMore, WhereClause, limit_clause, offset_clause, where_clause,
+    ws0, ws1,
 };
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, ParseResult};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::show::{on_clause, OnClause};
-use crate::simple_from_clause::{show_from_clause, ShowFromClause};
-use crate::string::{regex, Regex};
+use crate::show::{OnClause, on_clause};
+use crate::simple_from_clause::{ShowFromClause, show_from_clause};
+use crate::string::{Regex, regex};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{map, opt};
-use nom::sequence::{delimited, preceded, tuple};
+use nom::sequence::{delimited, preceded};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
@@ -88,7 +89,7 @@ pub(crate) fn show_tag_values(i: &str) -> ParseResult<&str, ShowTagValuesStateme
             limit,
             offset,
         ),
-    ) = tuple((
+    ) = (
         keyword("VALUES"),
         opt(preceded(ws1, on_clause)),
         opt(preceded(ws1, show_from_clause)),
@@ -99,7 +100,8 @@ pub(crate) fn show_tag_values(i: &str) -> ParseResult<&str, ShowTagValuesStateme
         opt(preceded(ws1, where_clause)),
         opt(preceded(ws1, limit_clause)),
         opt(preceded(ws1, offset_clause)),
-    ))(i)?;
+    )
+        .parse(i)?;
 
     Ok((
         remaining_input,
@@ -166,16 +168,17 @@ fn identifier_list(i: &str) -> ParseResult<&str, InList> {
             "invalid identifier list, expected ')'",
             preceded(ws0, char(')')),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 fn with_key_clause(i: &str) -> ParseResult<&str, WithKeyClause> {
     preceded(
-        tuple((
+        (
             keyword("WITH"),
             ws1,
             expect("invalid WITH KEY clause, expected KEY", keyword("KEY")),
-        )),
+        ),
         expect(
             "invalid WITH KEY clause, expected condition",
             alt((
@@ -231,7 +234,8 @@ fn with_key_clause(i: &str) -> ParseResult<&str, WithKeyClause> {
                 ),
             )),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 #[cfg(test)]

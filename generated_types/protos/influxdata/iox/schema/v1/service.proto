@@ -27,8 +27,12 @@ message GetSchemaResponse {
 }
 
 message UpsertSchemaRequest {
-  // The namespace in which to upsert the schema
-  string namespace = 1;
+  oneof namespace_target {
+    // The name of the namespace in which to upsert the schema
+    string namespace_name = 1 [deprecated = true];
+    // The id of the namespace in which to upsert the schema
+    int64 namespace_id = 4;
+  }
 
   // The table for which to upsert the schema
   string table = 2;

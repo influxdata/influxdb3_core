@@ -17,7 +17,7 @@ use super::{
 
 /// Error for [`NamespaceSnapshot`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Invalid table name: {source}"))]
     NamespaceName { source: std::str::Utf8Error },
@@ -48,7 +48,9 @@ pub enum Error {
         source: crate::snapshot::hash::Error,
     },
 
-    #[snafu(display("Table name hash lookup resulted in out of bounds. Wanted index {wanted} but there are only {entries} entries."))]
+    #[snafu(display(
+        "Table name hash lookup resulted in out of bounds. Wanted index {wanted} but there are only {entries} entries."
+    ))]
     TableNameHashOutOfBounds { wanted: usize, entries: usize },
 }
 
@@ -83,14 +85,18 @@ impl NamespaceSnapshot {
             .map(|t| proto::NamespaceTable {
                 id: t.id.get(),
                 name: t.name.into(),
+                deleted_at: None,
             })
             .collect();
         // TODO(marco): wire up binary search to find table by ID
         tables.sort_unstable_by_key(|t| t.id);
 
         let mut table_names = HashBucketsEncoder::new(tables.len());
-        for table in &tables {
-            table_names.push(&table.name);
+        for (index, table) in tables.iter().enumerate() {
+            // exclude soft-deleted entries from lookup-by-name
+            if table.deleted_at.is_none() {
+                table_names.push(&table.name, index as u32);
+            }
         }
 
         Ok(Self {
@@ -203,6 +209,7 @@ impl NamespaceSnapshot {
 pub struct NamespaceSnapshotTable {
     id: TableId,
     name: Bytes,
+    deleted_at: Option<Timestamp>,
 }
 
 impl NamespaceSnapshotTable {
@@ -215,6 +222,11 @@ impl NamespaceSnapshotTable {
     pub fn name(&self) -> &[u8] {
         &self.name
     }
+
+    /// Returns the timestamp when the table was marked for deletion
+    pub fn deleted_at(&self) -> Option<Timestamp> {
+        self.deleted_at
+    }
 }
 
 impl From<proto::NamespaceTable> for NamespaceSnapshotTable {
@@ -222,6 +234,7 @@ impl From<proto::NamespaceTable> for NamespaceSnapshotTable {
         Self {
             id: TableId::new(value.id),
             name: value.name,
+            deleted_at: value.deleted_at.map(Timestamp::new),
         }
     }
 }

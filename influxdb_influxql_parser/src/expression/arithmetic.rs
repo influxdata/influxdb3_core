@@ -1,20 +1,21 @@
 use crate::common::ws0;
 use crate::identifier::unquoted_identifier;
-use crate::internal::{expect, Error, ParseError, ParseResult};
+use crate::internal::{Error, ParseError, ParseResult, expect};
 use crate::keywords::keyword;
-use crate::literal::{literal_regex, Duration};
+use crate::literal::{Duration, literal_regex};
 use crate::timestamp::Timestamp;
 use crate::{
-    identifier::{identifier, Identifier},
+    identifier::{Identifier, identifier},
     literal::Literal,
     parameter::BindParameter,
 };
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{cut, map, opt, value};
 use nom::multi::{many0, separated_list0};
-use nom::sequence::{delimited, pair, preceded, separated_pair, terminated, tuple};
+use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
 use num_traits::cast;
 use std::fmt::{Display, Formatter, Write};
 use std::ops::Neg;
@@ -51,7 +52,7 @@ pub struct VarRef {
     /// * `usage_idle::integer` will return either a float or integer field named `usage_idle`,
     ///   and casting it to an `integer`
     /// * `idle::boolean` will return a field named `idle` that has a matching data type of
-    ///    `boolean`
+    ///   `boolean`
     pub data_type: Option<VarRefDataType>,
 }
 
@@ -367,13 +368,9 @@ impl BinaryOperator {
         U: num_traits::NumCast,
     {
         match self {
-            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => Some(self.reduce_number(
-                lhs,
-                match cast(rhs) {
-                    Some(v) => v,
-                    None => return None,
-                },
-            )),
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => {
+                Some(self.reduce_number(lhs, cast(rhs)?))
+            }
             _ => None,
         }
     }
@@ -405,7 +402,8 @@ where
             value(UnaryOperator::Plus, char('+')),
             value(UnaryOperator::Minus, char('-')),
         )),
-    )(i)?;
+    )
+    .parse(i)?;
 
     let (i, e) = factor::<T>(i)?;
 
@@ -416,7 +414,9 @@ where
         match e {
             Expr::Literal(Literal::Float(v)) => Expr::Literal(Literal::Float(v.neg())),
             Expr::Literal(Literal::Integer(v)) => Expr::Literal(Literal::Integer(v.neg())),
-            Expr::Literal(Literal::Duration(v)) => Expr::Literal(Literal::Duration((v.0.neg()).into())),
+            Expr::Literal(Literal::Duration(v)) => {
+                Expr::Literal(Literal::Duration((v.0.neg()).into()))
+            }
             Expr::Literal(Literal::Unsigned(v)) => {
                 if v == (i64::MAX as u64) + 1 {
                     // The minimum i64 is parsed as a Literal::Unsigned, as it exceeds
@@ -429,19 +429,20 @@ where
                         "constant overflows signed integer",
                     )));
                 }
-            },
-            v @ Expr::VarRef { .. } | v @ Expr::Call { .. } | v @ Expr::Nested(..) | v @ Expr::BindParameter(..) => {
-                Expr::Binary(Binary {
-                    lhs: Box::new(Expr::Literal(Literal::Integer(-1))),
-                    op: BinaryOperator::Mul,
-                    rhs: Box::new(v),
-                })
             }
+            v @ Expr::VarRef { .. }
+            | v @ Expr::Call { .. }
+            | v @ Expr::Nested(..)
+            | v @ Expr::BindParameter(..) => Expr::Binary(Binary {
+                lhs: Box::new(Expr::Literal(Literal::Integer(-1))),
+                op: BinaryOperator::Mul,
+                rhs: Box::new(v),
+            }),
             _ => {
                 return Err(nom::Err::Failure(Error::from_message(
                     i,
                     "unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis",
-                )))
+                )));
             }
         }
     } else {
@@ -460,7 +461,8 @@ where
         preceded(ws0, char('(')),
         map(arithmetic::<T>, |e| Expr::Nested(e.into())),
         preceded(ws0, char(')')),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a function call expression.
@@ -490,7 +492,8 @@ where
             ),
         ),
         |(name, args)| Expr::Call(Call { name, args }),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a segmented identifier
@@ -521,7 +524,8 @@ fn segmented_identifier(i: &str) -> ParseResult<&str, Identifier> {
             }),
         ))),
         identifier,
-    )(i)?;
+    )
+    .parse(i)?;
 
     Ok((
         remaining,
@@ -558,7 +562,7 @@ pub(crate) fn var_ref(i: &str) -> ParseResult<&str, Expr> {
             )),
         ),
         |(name, data_type)| Expr::VarRef(VarRef { name, data_type }),
-    )(i)
+    ).parse(i)
 }
 
 /// Parse precedence priority 1 operators.
@@ -568,7 +572,7 @@ fn factor<T>(i: &str) -> ParseResult<&str, Expr>
 where
     T: ArithmeticParsers,
 {
-    alt((unary::<T>, parens::<T>, T::operand))(i)
+    alt((unary::<T>, parens::<T>, T::operand)).parse(i)
 }
 
 /// Parse arithmetic, precedence priority 2 operators.
@@ -579,7 +583,7 @@ where
     T: ArithmeticParsers,
 {
     let (input, left) = factor::<T>(i)?;
-    let (input, remaining) = many0(tuple((
+    let (input, remaining) = many0((
         preceded(
             ws0,
             alt((
@@ -590,7 +594,8 @@ where
             )),
         ),
         factor::<T>,
-    )))(input)?;
+    ))
+    .parse(input)?;
     Ok((input, reduce_expr(left, remaining)))
 }
 
@@ -602,7 +607,7 @@ where
     T: ArithmeticParsers,
 {
     let (input, left) = term::<T>(i)?;
-    let (input, remaining) = many0(tuple((
+    let (input, remaining) = many0((
         preceded(
             ws0,
             alt((
@@ -613,7 +618,8 @@ where
             )),
         ),
         cut(term::<T>),
-    )))(input)?;
+    ))
+    .parse(input)?;
     Ok((input, reduce_expr(left, remaining)))
 }
 
@@ -705,7 +711,8 @@ mod test {
                     var_ref,
                     map(parameter, Expr::BindParameter),
                 )),
-            )(i)
+            )
+            .parse(i)
         }
     }
 
@@ -828,7 +835,10 @@ mod test {
 
         // Fallible cases
 
-        assert_expect_error!(var_ref("foo::invalid"), "invalid data type for tag or field reference, expected float, integer, unsigned, string, boolean, field, tag");
+        assert_expect_error!(
+            var_ref("foo::invalid"),
+            "invalid data type for tag or field reference, expected float, integer, unsigned, string, boolean, field, tag"
+        );
     }
 
     #[test]

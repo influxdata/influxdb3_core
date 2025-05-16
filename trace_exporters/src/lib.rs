@@ -1,4 +1,4 @@
-#![allow(unreachable_pub)]
+#![expect(unreachable_pub)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -17,14 +17,13 @@ mod jaeger;
 mod rate_limiter;
 
 /// Auto-generated thrift code
-#[allow(
+#[expect(
     dead_code,
     deprecated,
     clippy::redundant_field_names,
     clippy::unused_unit,
     clippy::use_self,
-    clippy::too_many_arguments,
-    clippy::type_complexity
+    clippy::too_many_arguments
 )]
 mod thrift {
     pub mod agent;

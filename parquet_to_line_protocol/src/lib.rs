@@ -1,31 +1,30 @@
 //! Code that can convert between parquet files and line protocol
 
-#![allow(clippy::clone_on_ref_ptr)]
-
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+use datafusion::common::Statistics;
 use datafusion::{
     arrow::datatypes::SchemaRef as ArrowSchemaRef,
     config::TableOptions,
     datasource::{
-        file_format::{parquet::ParquetFormat, FileFormat},
+        file_format::{FileFormat, parquet::ParquetFormat},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
+        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
     },
     execution::{
         context::TaskContext, runtime_env::RuntimeEnv, session_state::SessionStateBuilder,
     },
-    physical_plan::{execute_stream, SendableRecordBatchStream, Statistics},
+    physical_plan::{SendableRecordBatchStream, execute_stream},
     prelude::SessionContext,
 };
 use datafusion_util::config::{
     iox_file_formats, iox_session_config, register_iox_object_store, table_parquet_options,
 };
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use object_store::{
-    local::LocalFileSystem, path::Path as ObjectStorePath, ObjectMeta, ObjectStore,
+    ObjectMeta, ObjectStore, local::LocalFileSystem, path::Path as ObjectStorePath,
 };
 use parquet_file::metadata::{IoxMetadata, METADATA_KEY};
 use schema::Schema;
@@ -34,6 +33,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
 mod batch;
 pub use batch::convert_to_lines;
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
@@ -248,23 +248,11 @@ impl ParquetFileReader {
     /// read the parquet file as a stream
     pub async fn read(&self) -> Result<SendableRecordBatchStream, Error> {
         let file_schema = self.schema();
-        let statistics = Statistics::new_unknown(&file_schema);
-        let base_config = FileScanConfig {
-            object_store_url: self.object_store_url.clone(),
-            file_schema,
-            file_groups: vec![vec![PartitionedFile {
-                object_meta: self.object_meta.clone(),
-                partition_values: vec![],
-                range: None,
-                extensions: None,
-                statistics: Some(statistics.clone()),
-            }]],
-            statistics,
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-        };
+        let mut partitioned_file = PartitionedFile::from(self.object_meta.clone());
+        partitioned_file.statistics = Some(Statistics::new_unknown(&file_schema));
+
+        let base_config = FileScanConfig::new(self.object_store_url.clone(), file_schema)
+            .with_file(partitioned_file);
 
         // set up enough datafusion context to do the real read session
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());

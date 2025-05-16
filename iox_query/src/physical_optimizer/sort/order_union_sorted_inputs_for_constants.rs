@@ -6,10 +6,10 @@ use datafusion::{
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
+        ExecutionPlan,
         expressions::Column,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        ExecutionPlan,
     },
 };
 
@@ -21,8 +21,8 @@ use crate::{
 };
 
 use super::util::{
-    accepted_union_exec, add_sort_preserving_merge, all_physical_sort_exprs_on_column,
-    ValueRangeAndColValues,
+    ValueRangeAndColValues, accepted_union_exec, add_sort_preserving_merge,
+    all_physical_sort_exprs_on_column,
 };
 
 /// IOx specific optimization rule to replace SortPreservingMerge with ProgressiveEval if
@@ -201,26 +201,26 @@ mod test {
         datatypes::{DataType, SchemaRef},
     };
     use datafusion::{
-        physical_expr::PhysicalSortExpr,
+        physical_expr::{LexOrdering, PhysicalSortExpr},
         physical_plan::{
+            ExecutionPlan, PhysicalExpr,
             expressions::{Column, Literal},
             projection::ProjectionExec,
             sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
             union::UnionExec,
-            ExecutionPlan, PhysicalExpr,
         },
         scalar::ScalarValue,
     };
     use schema::{InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
 
     use crate::{
+        CHUNK_ORDER_COLUMN_NAME, QueryChunk,
         physical_optimizer::{
             sort::order_union_sorted_inputs_for_constants::OrderUnionSortedInputsForConstants,
             test_util::OptimizationTest,
         },
-        provider::{chunks_to_physical_nodes, RecordBatchesExec},
+        provider::{RecordBatchesExec, chunks_to_physical_nodes},
         test::TestChunk,
-        QueryChunk, CHUNK_ORDER_COLUMN_NAME,
     };
 
     // ------------------------------------------------------------------
@@ -273,7 +273,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
@@ -353,7 +353,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
@@ -430,7 +430,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[1 as iox::measurement, 10 as key, tag0@1 as value]"
@@ -499,7 +499,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag1 as another_key, tag0@1 as value]"
@@ -620,13 +620,13 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
           - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
             - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
@@ -676,7 +676,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
@@ -685,7 +685,7 @@ mod test {
           - "       RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
@@ -738,22 +738,22 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
-          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
             - "   UnionExec"
-            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         "#
@@ -806,22 +806,22 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[tag0 as iox::measurement, tag1 as key, tag1@2 as value]"
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC]"
-            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "     SortExec: expr=[iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[tag0 as iox::measurement, tag1 as key, tag1@2 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         "#
@@ -880,7 +880,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[tag0@1 as value, m1 as iox::measurement, tag0 as key]"
@@ -890,7 +890,7 @@ mod test {
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[tag0@1 as value, m1 as iox::measurement, tag0 as key]"
@@ -955,7 +955,7 @@ mod test {
             OptimizationTest::new(plan_spm, opt),
             @r#"
         input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
           - "   UnionExec"
           - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
           - "       ProjectionExec: expr=[m1 as iox::measurement, tag0@1 as key, tag1@2 as value]"
@@ -965,7 +965,7 @@ mod test {
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,key@1 ASC NULLS LAST,value@2 ASC NULLS LAST]"
+            - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m1 as iox::measurement, tag0@1 as key, tag1@2 as value]"
@@ -1028,9 +1028,7 @@ mod test {
         min: i64,
         max: i64,
     ) -> Arc<dyn ExecutionPlan> {
-        let chunks = std::iter::repeat(test_chunk(min, max, false))
-            .take(n_chunks)
-            .collect::<Vec<_>>();
+        let chunks = std::iter::repeat_n(test_chunk(min, max, false), n_chunks).collect::<Vec<_>>();
 
         Arc::new(RecordBatchesExec::new(chunks, schema(), None))
     }
@@ -1127,7 +1125,7 @@ mod test {
         ]
     }
 
-    fn sort_order_for_sort_preserving_merge() -> Vec<PhysicalSortExpr> {
+    fn sort_order_for_sort_preserving_merge() -> LexOrdering {
         let measurement = Arc::new(Column::new("iox::measurement", 0)) as Arc<dyn PhysicalExpr>;
         let key = Arc::new(Column::new("key", 1)) as Arc<dyn PhysicalExpr>;
         let value = Arc::new(Column::new("value", 2)) as Arc<dyn PhysicalExpr>;
@@ -1155,9 +1153,10 @@ mod test {
                 },
             },
         ]
+        .into()
     }
 
-    fn sort_order_for_sort() -> Vec<PhysicalSortExpr> {
+    fn sort_order_for_sort() -> LexOrdering {
         let value = Arc::new(Column::new("value", 2)) as Arc<dyn PhysicalExpr>;
 
         vec![PhysicalSortExpr {
@@ -1167,9 +1166,10 @@ mod test {
                 nulls_first: false,
             },
         }]
+        .into()
     }
 
-    fn sort_order_two_cols() -> Vec<PhysicalSortExpr> {
+    fn sort_order_two_cols() -> LexOrdering {
         let measurement = Arc::new(Column::new("iox::measurement", 0)) as Arc<dyn PhysicalExpr>;
         let key = Arc::new(Column::new("key", 1)) as Arc<dyn PhysicalExpr>;
 
@@ -1189,9 +1189,10 @@ mod test {
                 },
             },
         ]
+        .into()
     }
 
-    fn sort_order_not_on_column() -> Vec<PhysicalSortExpr> {
+    fn sort_order_not_on_column() -> LexOrdering {
         let measurement =
             Arc::new(Literal::new(ScalarValue::from("iox::measurement"))) as Arc<dyn PhysicalExpr>;
 
@@ -1202,5 +1203,6 @@ mod test {
                 nulls_first: false,
             },
         }]
+        .into()
     }
 }

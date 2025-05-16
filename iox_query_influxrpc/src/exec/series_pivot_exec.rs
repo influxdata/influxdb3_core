@@ -4,7 +4,8 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PhysicalExpr,
+    PlanProperties,
 };
 use std::sync::Arc;
 
@@ -47,11 +48,11 @@ impl SeriesPivotExec {
     fn calculate_properties(input: &Arc<dyn ExecutionPlan>, schema: &SchemaRef) -> PlanProperties {
         let input_properties = input.properties();
         let partitioning = input_properties.output_partitioning().clone();
-        let execution_mode = input_properties.execution_mode();
         PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(schema)),
             partitioning,
-            execution_mode,
+            input.pipeline_behavior(),
+            input.boundedness(),
         )
     }
 

@@ -2,8 +2,8 @@
 //! download & execute a scan.
 
 use crate::{
-    storage::{ParquetExecInput, ParquetStorage},
     ParquetFilePath,
+    storage::{ParquetExecInput, ParquetStorage},
 };
 use data_types::{ObjectStoreId, ParquetFile, TimestampMinMax};
 use schema::Schema;

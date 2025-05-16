@@ -22,7 +22,7 @@ use crate::{CacheKey, CacheValue};
 
 /// Error type for list streams
 #[derive(Debug, Snafu)]
-#[allow(missing_copy_implementations, missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Unexpected EOF whilst decoding list stream"))]
     UnexpectedEOF,

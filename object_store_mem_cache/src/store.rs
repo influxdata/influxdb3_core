@@ -2,20 +2,21 @@ use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
 use metric::U64Counter;
 use object_store::{
-    path::Path, AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult,
-    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result,
+    AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult, GetResultPayload,
+    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload,
+    PutResult, Result, path::Path,
 };
+use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_size_hinting::{extract_size_hint, hint_size};
 
-use crate::cache_system::{s3_fifo_cache::S3FifoCache, Cache};
+use crate::cache_system::{Cache, s3_fifo_cache::S3FifoCache};
 use crate::{
-    attributes::ATTR_CACHE_STATE,
     cache_system::{
+        HasSize,
         hook::{chain::HookChain, observer::ObserverHook},
-        CacheState, HasSize,
     },
     object_store_helpers::{any_options_set, dyn_error_to_object_store_error},
 };
@@ -30,8 +31,16 @@ struct CacheValue {
 }
 
 impl CacheValue {
-    async fn fetch(store: &DynObjectStore, location: &Path) -> Result<Self> {
-        let res = store.get(location).await?;
+    async fn fetch(
+        store: &DynObjectStore,
+        location: &Path,
+        size_hint: Option<usize>,
+    ) -> Result<Self> {
+        let options = match size_hint {
+            Some(size) => hint_size(size),
+            None => GetOptions::default(),
+        };
+        let res = store.get_opts(location, options).await?;
         let meta = res.meta.clone();
         let data = res.bytes().await?;
         Ok(Self { data, meta })
@@ -135,17 +144,21 @@ pub struct MemCacheObjectStore {
 }
 
 impl MemCacheObjectStore {
-    async fn get_or_fetch(&self, location: &Path) -> Result<(Arc<CacheValue>, CacheState)> {
+    async fn get_or_fetch(
+        &self,
+        location: &Path,
+        size_hint: Option<usize>,
+    ) -> Result<(Arc<CacheValue>, CacheState)> {
         let captured_store = Arc::clone(&self.store);
         let (res, state) = self
             .cache
             .get_or_fetch(
                 &Arc::new(location.clone()),
-                Box::new(|location| {
+                Box::new(move |location| {
                     let location = location.clone();
 
                     async move {
-                        CacheValue::fetch(&captured_store, &location)
+                        CacheValue::fetch(&captured_store, &location, size_hint)
                             .await
                             .map_err(|e| Arc::new(e) as _)
                     }
@@ -200,7 +213,18 @@ impl ObjectStore for MemCacheObjectStore {
     }
 
     async fn get(&self, location: &Path) -> Result<GetResult> {
-        let (v, state) = self.get_or_fetch(location).await?;
+        self.get_opts(location, Default::default()).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        let (options, size_hint) = extract_size_hint(options)?;
+
+        // be rather conservative
+        if any_options_set(&options) {
+            return Err(Error::NotImplemented);
+        }
+
+        let (v, state) = self.get_or_fetch(location, size_hint).await?;
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(futures::stream::iter([Ok(v.data.clone())]).boxed()),
@@ -208,15 +232,6 @@ impl ObjectStore for MemCacheObjectStore {
             range: 0..v.data.len(),
             attributes: Attributes::from_iter([(ATTR_CACHE_STATE, AttributeValue::from(state))]),
         })
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        // be rather conservative
-        if any_options_set(&options) {
-            return Err(Error::NotImplemented);
-        }
-
-        self.get(location).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
@@ -229,7 +244,7 @@ impl ObjectStore for MemCacheObjectStore {
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
-        let (v, _state) = self.get_or_fetch(location).await?;
+        let (v, _state) = self.get_or_fetch(location, None).await?;
 
         ranges
             .iter()
@@ -261,7 +276,7 @@ impl ObjectStore for MemCacheObjectStore {
     }
 
     async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let (v, _state) = self.get_or_fetch(location).await?;
+        let (v, _state) = self.get_or_fetch(location, None).await?;
 
         Ok(v.meta.clone())
     }
@@ -315,7 +330,7 @@ impl ObjectStore for MemCacheObjectStore {
 #[cfg(test)]
 mod tests {
     use futures::FutureExt;
-    use object_store::memory::InMemory;
+    use object_store_mock::MockStore;
 
     use crate::{gen_store_tests, object_store_cache_tests::Setup};
 
@@ -323,17 +338,17 @@ mod tests {
 
     struct TestSetup {
         store: Arc<DynObjectStore>,
-        inner: Arc<DynObjectStore>,
+        inner: Arc<MockStore>,
     }
 
     impl Setup for TestSetup {
         fn new() -> futures::future::BoxFuture<'static, Self> {
             async move {
-                let inner = Arc::new(InMemory::new());
+                let inner = MockStore::new();
 
                 let store = Arc::new(
                     MemCacheObjectStoreParams {
-                        inner: Arc::clone(&inner) as _,
+                        inner: Arc::clone(&inner).as_store(),
                         memory_limit: NonZeroUsize::MAX,
                         s3_fifo_ghost_memory_limit: NonZeroUsize::MAX,
                         metrics: &metric::Registry::new(),
@@ -347,7 +362,7 @@ mod tests {
             .boxed()
         }
 
-        fn inner(&self) -> &Arc<DynObjectStore> {
+        fn inner(&self) -> &Arc<MockStore> {
             &self.inner as _
         }
 

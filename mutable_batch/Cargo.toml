@@ -27,7 +27,7 @@ mutable_batch_lp = { path = "../mutable_batch_lp" }
 partition = { path = "../partition" }
 pretty_assertions = "1.4.1"
 proptest = { workspace = true }
-rand = "0.8"
+rand = "0.9"
 
 [features]
 arbitrary = ["proptest"]

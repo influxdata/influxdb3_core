@@ -6,7 +6,7 @@
 //! - [`Cache`]: The actual cache that maps keys to [shared futures] that return results.
 //! - [`Hook`]: Can react to state changes of the cache state. Implements logging but also size limitations.
 //! - [`Reactor`]: Drives pruning / garbage-collection decisions of the [`Cache`]. Implemented as background task so
-//!       users don't need to drive that themselves.
+//!   users don't need to drive that themselves.
 //!
 //! ```text
 //!    +-------+                         +------+
@@ -32,6 +32,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use object_store_metrics::cache_state::CacheState;
 use std::{fmt::Debug, hash::Hash};
 
 use std::sync::Arc;
@@ -134,19 +135,6 @@ where
 
     /// Prune entries that failed to fetch or that weren't used since the last [`prune`](Self::prune) call.
     fn prune(&self);
-}
-
-/// State that provides more information about [`get_or_fetch`](Cache::get_or_fetch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CacheState {
-    /// Entry was already part of the cache and fully fetched..
-    WasCached,
-
-    /// Entry was already part of the cache but did not finish loading.
-    AlreadyLoading,
-
-    /// A new entry was created.
-    NewEntry,
 }
 
 pub mod hook;

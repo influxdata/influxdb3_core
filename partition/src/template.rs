@@ -1,7 +1,7 @@
 use crate::{Batch, PartitionKeyError, PartitioningColumn};
 use data_types::partition_template::{
-    TemplatePart, ENCODED_PARTITION_KEY_CHARS, PARTITION_KEY_MAX_PART_LEN,
-    PARTITION_KEY_PART_TRUNCATED, PARTITION_KEY_VALUE_EMPTY_STR, PARTITION_KEY_VALUE_NULL_STR,
+    ENCODED_PARTITION_KEY_CHARS, PARTITION_KEY_MAX_PART_LEN, PARTITION_KEY_PART_TRUNCATED,
+    PARTITION_KEY_VALUE_EMPTY_STR, PARTITION_KEY_VALUE_NULL_STR, TemplatePart,
 };
 use percent_encoding::utf8_percent_encode;
 use std::borrow::Cow;
@@ -27,7 +27,7 @@ pub use strftime::StrftimeFormatter;
 /// [`TablePartitionTemplateOverride`]: `data_types::partition_template::TablePartitionTemplateOverride`
 /// [`PARTITION_KEY_DELIMITER`]: `data_types::partition_template::PARTITION_KEY_DELIMITER`
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum Template<'a, T: PartitioningColumn> {
     TagValue(&'a T, Option<&'a T::TagIdentityKey>),
     TimeFormat(&'a [i64], StrftimeFormatter<'a>),

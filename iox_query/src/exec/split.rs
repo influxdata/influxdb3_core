@@ -53,7 +53,7 @@ use std::{
 };
 
 use arrow::{
-    array::{as_boolean_array, Array, ArrayRef, BooleanArray},
+    array::{Array, ArrayRef, BooleanArray, as_boolean_array},
     compute::{self, filter_record_batch},
     datatypes::SchemaRef,
     record_batch::RecordBatch,
@@ -64,16 +64,15 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
     logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
-    physical_expr::PhysicalSortRequirement,
     physical_plan::{
-        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
         ColumnarValue, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
         ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream, Statistics,
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
     },
     scalar::ScalarValue,
 };
-use datafusion_util::{watch::WatchedTask, AdapterStream};
+use datafusion_util::{AdapterStream, watch::WatchedTask};
 use futures::StreamExt;
 use observability_deps::tracing::*;
 use parking_lot::Mutex;
@@ -189,7 +188,12 @@ impl StreamSplitExec {
         // Always produces exactly two outputs
         let output_partitioning = Partitioning::UnknownPartitioning(split_exprs.len() + 1);
 
-        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )
     }
 }
 
@@ -230,7 +234,8 @@ impl ExecutionPlan for StreamSplitExec {
             .input
             .properties()
             .output_ordering()
-            .map(PhysicalSortRequirement::from_sort_exprs);
+            .cloned()
+            .map(LexRequirement::from_lex_ordering);
 
         vec![requirement]
     }
@@ -540,7 +545,11 @@ fn and(left: &ColumnarValue, right: &ColumnarValue) -> Result<ColumnarValue> {
             }
         }
         _ => {
-            panic!("Expected either two boolean arrays or two boolean scalars, but had type {:?} and type {:?}", left.data_type(), right.data_type());
+            panic!(
+                "Expected either two boolean arrays or two boolean scalars, but had type {:?} and type {:?}",
+                left.data_type(),
+                right.data_type()
+            );
         }
     }
 }

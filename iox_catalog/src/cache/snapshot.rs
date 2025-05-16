@@ -5,13 +5,13 @@ use catalog_cache::{CacheKey, CacheValue};
 use data_types::snapshot::namespace::NamespaceSnapshot;
 use data_types::snapshot::root::RootSnapshot;
 use data_types::{
-    snapshot::partition::PartitionSnapshot, snapshot::table::TableSnapshot, NamespaceId,
-    PartitionId, TableId,
+    NamespaceId, PartitionId, TableId, snapshot::partition::PartitionSnapshot,
+    snapshot::table::TableSnapshot,
 };
 
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
-use generated_types::prost::bytes::Bytes;
 use generated_types::prost::Message;
+use generated_types::prost::bytes::Bytes;
 
 use crate::interface::{Catalog, Result};
 
@@ -31,7 +31,7 @@ pub(crate) trait Snapshot: Clone + std::fmt::Debug + Send + Sync + 'static {
 
     /// Create new snapshot.
     fn snapshot(backing: &dyn Catalog, key: Self::Key)
-        -> impl Future<Output = Result<Self>> + Send;
+    -> impl Future<Output = Result<Self>> + Send;
 
     /// Get the generation number of a snapshot for a given key. This
     /// can be used as an optimization where creating a snapshot is

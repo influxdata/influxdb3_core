@@ -1,22 +1,24 @@
 //! Client for the cache HTTP API
 
-use crate::api::list::{v1, v2, ListEntry, MAX_VALUE_SIZE};
-use crate::api::{RequestPath, GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE};
+use crate::api::list::{ListEntry, MAX_VALUE_SIZE, v1, v2};
+use crate::api::{GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE, RequestPath};
 use crate::{CacheKey, CacheValue};
 use futures::prelude::*;
 use futures::stream::BoxStream;
 use hyper::client::connect::dns::{GaiResolver, Name};
-use hyper::header::{ToStrError, ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use hyper::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH, ToStrError};
 use hyper::service::Service;
+use iox_http_util::empty_request_body;
+
 use metric::DurationHistogram;
 use reqwest::dns::{Resolve, Resolving};
 use reqwest::{Client, StatusCode, Url};
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Creating client: {source}"))]
     Client { source: reqwest::Error },
@@ -274,7 +276,7 @@ impl CatalogCacheClient {
             builder = builder.body(data);
         } else {
             builder = builder.header(&NO_VALUE, "true");
-            builder = builder.body(hyper::Body::empty());
+            builder = builder.body(empty_request_body());
         }
 
         let response = builder

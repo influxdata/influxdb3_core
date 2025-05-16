@@ -153,11 +153,12 @@ mod tests {
     use arrow::datatypes::Schema;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
     use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
     use datafusion::execution::object_store::ObjectStoreUrl;
-    use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_expr::LexOrdering;
     use datafusion::physical_plan::Statistics;
+    use datafusion::physical_plan::union::UnionExec;
     use datafusion_util::config::table_parquet_options;
     use std::sync::Arc;
 
@@ -259,7 +260,7 @@ mod tests {
                     "1/3/partition1/file02",
                     "1/4/partition1/file01",
                 ]),
-                Vec::new(),
+                LexOrdering::default(),
                 false,
             )),
         ];
@@ -298,7 +299,7 @@ mod tests {
                     ("1/2/partition2/file2", (2, 3)),
                     ("1/2/partition2/file3", (1, 2)),
                 ]),
-                Vec::new(),
+                LexOrdering::default(),
                 false,
             )),
             Arc::new(DeduplicateExec::new(
@@ -306,7 +307,7 @@ mod tests {
                     ("1/2/partition2/file2", (1, 2)),
                     ("1/2/partition2/file4", (1, 2)),
                 ]),
-                Vec::new(),
+                LexOrdering::default(),
                 false,
             )),
         ];
@@ -334,13 +335,12 @@ mod tests {
     fn parquet_exec_with_optional_ranges(
         files: impl IntoIterator<Item = (&'static str, Option<(i64, i64)>)>,
     ) -> Arc<dyn ExecutionPlan> {
-        let base_config = FileScanConfig {
-            object_store_url: ObjectStoreUrl::local_filesystem(),
-            file_schema: Arc::new(Schema {
-                fields: Default::default(),
-                metadata: Default::default(),
-            }),
-            file_groups: files
+        let base_config = FileScanConfig::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(Schema::empty()),
+        )
+        .with_file_groups(
+            files
                 .into_iter()
                 .map(|(f, r)| {
                     let mut file = PartitionedFile::new(f, 0);
@@ -350,16 +350,12 @@ mod tests {
                     vec![file]
                 })
                 .collect(),
-            statistics: Statistics {
-                num_rows: Precision::Absent,
-                total_byte_size: Precision::Absent,
-                column_statistics: vec![],
-            },
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-        };
+        )
+        .with_statistics(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![],
+        });
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         builder.build_arc()
     }

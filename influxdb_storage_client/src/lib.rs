@@ -1,6 +1,5 @@
 //! An InfluxDB gRPC storage API client
 #![warn(missing_docs)]
-#![allow(clippy::missing_docs_in_private_items)]
 
 use measurement_fields_response::MessageField;
 // Workaround for "unused crate" lint false positives.
@@ -21,7 +20,7 @@ pub use client_util::connection;
 
 use self::connection::Connection;
 use self::generated_types::*;
-use ::generated_types::google::protobuf::*;
+use ::generated_types::{Status, google::protobuf::*};
 use observability_deps::tracing::{debug, trace};
 use std::num::NonZeroU64;
 
@@ -99,7 +98,7 @@ impl Client {
     }
 
     /// return the capabilities of the server as a hash map
-    pub async fn capabilities(&mut self) -> Result<HashMap<String, Vec<String>>, tonic::Status> {
+    pub async fn capabilities(&mut self) -> Result<HashMap<String, Vec<String>>, Status> {
         let response = self
             .inner
             .capabilities(Empty {})
@@ -123,7 +122,7 @@ impl Client {
     pub async fn measurement_names(
         &mut self,
         request: MeasurementNamesRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
+    ) -> Result<Vec<String>, Status> {
         let request = request.log_trace("measurement_names request");
         let responses = self
             .inner
@@ -142,7 +141,7 @@ impl Client {
     pub async fn read_window_aggregate(
         &mut self,
         request: ReadWindowAggregateRequest,
-    ) -> Result<Vec<read_response::frame::Data>, tonic::Status> {
+    ) -> Result<Vec<read_response::frame::Data>, Status> {
         let request = request.log_trace("read_window_aggregate request");
         let responses: Vec<_> = self
             .inner
@@ -158,10 +157,7 @@ impl Client {
 
     /// Make a request to query::tag_keys and do the
     /// required async dance to flatten the resulting stream to Strings
-    pub async fn tag_keys(
-        &mut self,
-        request: TagKeysRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
+    pub async fn tag_keys(&mut self, request: TagKeysRequest) -> Result<Vec<String>, Status> {
         let request = request.log_trace("tag_keys request");
         let responses = self
             .inner
@@ -180,7 +176,7 @@ impl Client {
     pub async fn measurement_tag_keys(
         &mut self,
         request: MeasurementTagKeysRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
+    ) -> Result<Vec<String>, Status> {
         let request = request.log_trace("measurement_tag_keys request");
         let responses = self
             .inner
@@ -196,10 +192,7 @@ impl Client {
 
     /// Make a request to query::tag_values and do the
     /// required async dance to flatten the resulting stream to Strings
-    pub async fn tag_values(
-        &mut self,
-        request: TagValuesRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
+    pub async fn tag_values(&mut self, request: TagValuesRequest) -> Result<Vec<String>, Status> {
         let request = request.log_trace("tag_values request");
         let responses = self
             .inner
@@ -218,7 +211,7 @@ impl Client {
     pub async fn tag_values_grouped_by_measurement_and_tag_key(
         &mut self,
         request: TagValuesGroupedByMeasurementAndTagKeyRequest,
-    ) -> Result<Vec<TagValuesResponse>, tonic::Status> {
+    ) -> Result<Vec<TagValuesResponse>, Status> {
         let request = request.log_trace("tag_values_grouped_by_measurement_and_tag_key request");
         let responses: Vec<_> = self
             .inner
@@ -237,7 +230,7 @@ impl Client {
     pub async fn measurement_tag_values(
         &mut self,
         request: MeasurementTagValuesRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
+    ) -> Result<Vec<String>, Status> {
         let request = request.log_trace("measurement_tag_values request");
         let responses = self
             .inner
@@ -256,7 +249,7 @@ impl Client {
     pub async fn read_filter(
         &mut self,
         request: ReadFilterRequest,
-    ) -> Result<Vec<read_response::frame::Data>, tonic::Status> {
+    ) -> Result<Vec<read_response::frame::Data>, Status> {
         let request = request.log_trace("read_filter request");
         let responses: Vec<_> = self
             .inner
@@ -275,7 +268,7 @@ impl Client {
     pub async fn read_group(
         &mut self,
         request: ReadGroupRequest,
-    ) -> Result<Vec<read_response::frame::Data>, tonic::Status> {
+    ) -> Result<Vec<read_response::frame::Data>, Status> {
         let request = request.log_trace("read_group request");
         let responses: Vec<_> = self
             .inner
@@ -294,7 +287,7 @@ impl Client {
     pub async fn measurement_fields(
         &mut self,
         request: MeasurementFieldsRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
+    ) -> Result<Vec<String>, Status> {
         let request = request.log_trace("measurement_fields request");
         let measurement_fields_response = self.inner.measurement_fields(request).await?;
 

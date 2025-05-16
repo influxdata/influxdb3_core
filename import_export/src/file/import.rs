@@ -3,27 +3,25 @@
 
 use bytes::Bytes;
 use data_types::{
-    partition_template::{
-        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, PARTITION_BY_DAY_PROTO,
-    },
     Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, CompactionLevelProtoError,
     MaxL0CreatedAt, Namespace, NamespaceId, NamespaceName, NamespaceNameError, ParquetFileParams,
     Partition, PartitionKey, SortKeyIds, Statistics, Table, TableId, Timestamp,
+    partition_template::{
+        NamespacePartitionTemplateOverride, PARTITION_BY_DAY_PROTO, TablePartitionTemplateOverride,
+    },
 };
 use generated_types::influxdata::iox::catalog::v1 as proto;
 use generated_types::influxdata::iox::table::v1 as table;
 //    ParquetFile as ProtoParquetFile, Partition as ProtoPartition,
 use iox_catalog::{
-    interface::{
-        CasFailure, Catalog, ColumnRepo, ParquetFileRepoExt, RepoCollection, SoftDeletedRows,
-    },
+    interface::{CasFailure, Catalog, ColumnRepo, ParquetFileRepoExt, RepoCollection},
     util::get_table_columns_by_id,
 };
 use object_store::{ObjectStore, PutPayload};
 use observability_deps::tracing::{debug, info, warn};
 use parquet_file::{
-    metadata::{DecodedIoxParquetMetaData, IoxMetadata, IoxParquetMetaData},
     ParquetFilePath,
+    metadata::{DecodedIoxParquetMetaData, IoxMetadata, IoxParquetMetaData},
 };
 use schema::SchemaIter;
 use std::{
@@ -412,10 +410,7 @@ impl RemoteImporter {
         let namespace_name = iox_metadata.namespace_name.as_ref();
         let mut repos = self.catalog.repositories();
 
-        let namespace = repos
-            .namespaces()
-            .get_by_name(namespace_name, SoftDeletedRows::ExcludeDeleted)
-            .await?;
+        let namespace = repos.namespaces().get_by_name(namespace_name).await?;
 
         // create namespace if it doesn't exist
         let namespace = match namespace {
@@ -722,7 +717,9 @@ impl RemoteImporter {
 
             SortKeyIds::from(column_map.map_old_column_ids_to_new_ids(new_sort_key_ids))
         } else {
-            warn!("Could not find sort key in catalog metadata export, falling back to embedded metadata");
+            warn!(
+                "Could not find sort key in catalog metadata export, falling back to embedded metadata"
+            );
             let sort_key = iox_metadata
                 .sort_key
                 .as_ref()
@@ -758,7 +755,7 @@ impl RemoteImporter {
     /// First attempts to use any available metadata from the
     /// catalog export, and falls back to what is in the iox
     /// metadata stored in the parquet file, if needed
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn parquet_file_params(
         &self,
         namespace: &Namespace,

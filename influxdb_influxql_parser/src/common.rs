@@ -1,12 +1,13 @@
 //! Type and parsers common to many statements.
 
-use crate::expression::conditional::{conditional_expression, ConditionalExpression};
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, verify, ParseResult};
-use crate::keywords::{keyword, Token};
+use crate::expression::conditional::{ConditionalExpression, conditional_expression};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect, verify};
+use crate::keywords::{Token, keyword};
 use crate::literal::unsigned_integer;
-use crate::string::{regex, Regex};
+use crate::string::{Regex, regex};
 use core::fmt;
+use nom::Parser as _;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::{char, multispace1};
@@ -55,7 +56,8 @@ impl Parser for MeasurementName {
         alt((
             map(identifier, MeasurementName::Name),
             map(regex, MeasurementName::Regex),
-        ))(i)
+        ))
+        .parse(i)
     }
 }
 
@@ -136,7 +138,8 @@ pub(crate) fn qualified_measurement_name(i: &str) -> ParseResult<&str, Qualified
             map(terminated(identifier, tag(".")), |rp| (None, Some(rp))),
         ))),
         MeasurementName::parse,
-    )(i)?;
+    )
+    .parse(i)?;
 
     // Extract possible `database` and / or `retention_policy`
     let (database, retention_policy) = opt_db_rp.unwrap_or_default();
@@ -153,7 +156,7 @@ pub(crate) fn qualified_measurement_name(i: &str) -> ParseResult<&str, Qualified
 
 /// Parse a SQL-style single-line comment
 fn comment_single_line(i: &str) -> ParseResult<&str, &str> {
-    recognize(pair(tag("--"), take_till(|c| c == '\n' || c == '\r')))(i)
+    recognize(pair(tag("--"), take_till(|c| c == '\n' || c == '\r'))).parse(i)
 }
 
 /// Parse a SQL-style inline comment, which can span multiple lines
@@ -165,38 +168,43 @@ fn comment_inline(i: &str) -> ParseResult<&str, &str> {
             take_until("*/"),
         ),
         tag("*/"),
-    ))(i)
+    ))
+    .parse(i)
 }
 
 /// Repeats the embedded parser until it fails, discarding the results.
 ///
 /// This parser is used as a non-allocating version of [`nom::multi::many0`].
-fn many0_<'a, A, F>(mut f: F) -> impl FnMut(&'a str) -> ParseResult<&'a str, ()>
+fn many0_<I, E, F>(f: F) -> impl nom::Parser<I, Output = (), Error = E>
 where
-    F: FnMut(&'a str) -> ParseResult<&'a str, A>,
+    I: Clone + nom::Input,
+    E: nom::error::ParseError<I>,
+    F: nom::Parser<I, Error = E>,
 {
-    move |i| fold_many0(&mut f, || (), |_, _| ())(i)
+    fold_many0::<I, E, F, _, _, _>(f, || (), |_, _| ())
 }
 
 /// Optionally consume all whitespace, single-line or inline comments
 pub(crate) fn ws0(i: &str) -> ParseResult<&str, ()> {
-    many0_(alt((multispace1, comment_single_line, comment_inline)))(i)
+    many0_(alt((multispace1, comment_single_line, comment_inline))).parse(i)
 }
 
 /// Runs the embedded parser until it fails, discarding the results.
 /// Fails if the embedded parser does not produce at least one result.
 ///
 /// This parser is used as a non-allocating version of [`nom::multi::many1`].
-fn many1_<'a, A, F>(mut f: F) -> impl FnMut(&'a str) -> ParseResult<&'a str, ()>
+fn many1_<I, E, F>(f: F) -> impl nom::Parser<I, Output = (), Error = E>
 where
-    F: FnMut(&'a str) -> ParseResult<&'a str, A>,
+    I: Clone + nom::Input,
+    E: nom::error::ParseError<I>,
+    F: nom::Parser<I, Error = E>,
 {
-    move |i| fold_many1(&mut f, || (), |_, _| ())(i)
+    fold_many1::<I, E, F, _, _, _>(f, || (), |_, _| ())
 }
 
 /// Must consume either whitespace, single-line or inline comments
 pub(crate) fn ws1(i: &str) -> ParseResult<&str, ()> {
-    many1_(alt((multispace1, comment_single_line, comment_inline)))(i)
+    many1_(alt((multispace1, comment_single_line, comment_inline))).parse(i)
 }
 
 /// Implements common behaviour for u64 tuple-struct types
@@ -252,7 +260,8 @@ pub(crate) fn limit_clause(i: &str) -> ParseResult<&str, LimitClause> {
             "invalid LIMIT clause, expected unsigned integer",
             map(unsigned_integer, LimitClause),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents the value for a `OFFSET` clause.
@@ -275,12 +284,13 @@ pub(crate) fn offset_clause(i: &str) -> ParseResult<&str, OffsetClause> {
             "invalid OFFSET clause, expected unsigned integer",
             map(unsigned_integer, OffsetClause),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse a terminator that ends a SQL statement.
 pub(crate) fn statement_terminator(i: &str) -> ParseResult<&str, ()> {
-    value((), char(';'))(i)
+    value((), char(';')).parse(i)
 }
 
 /// Represents the `WHERE` clause of a statement.
@@ -319,7 +329,8 @@ pub(crate) fn where_clause(i: &str) -> ParseResult<&str, WhereClause> {
     preceded(
         pair(keyword("WHERE"), ws0),
         map(conditional_expression, WhereClause),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents an InfluxQL `ORDER BY` clause.
@@ -409,7 +420,8 @@ pub(crate) fn order_by_clause(i: &str) -> ParseResult<&str, OrderByClause> {
                 ),
             )),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parser is a trait that allows a type to parse itself.
@@ -424,7 +436,7 @@ pub struct OneOrMore<T> {
     pub(crate) contents: Vec<T>,
 }
 
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 impl<T> OneOrMore<T> {
     /// Construct a new `OneOrMore<T>` with `contents`.
     ///
@@ -482,7 +494,8 @@ impl<T: Parser> OneOrMore<T> {
                     separated_list1(preceded(ws0, char(',')), preceded(ws0, T::parse)),
                 ),
                 Self::new,
-            )(i)
+            )
+            .parse(i)
         }
     }
 }
@@ -563,7 +576,8 @@ impl<T: Parser> ZeroOrMore<T> {
                     separated_list1(preceded(ws0, char(',')), preceded(ws0, T::parse)),
                 ),
                 Self::new,
-            )(i)
+            )
+            .parse(i)
         }
     }
 }
@@ -862,7 +876,7 @@ mod tests {
 
     impl Parser for String {
         fn parse(i: &str) -> ParseResult<&str, Self> {
-            map(alphanumeric1, &str::to_string)(i)
+            map(alphanumeric1, &str::to_string).parse(i)
         }
     }
 

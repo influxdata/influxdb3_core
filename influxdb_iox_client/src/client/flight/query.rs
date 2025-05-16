@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, marker::PhantomData};
 
-use generated_types::influxdata::iox::querier::v1::{read_info::QueryType, QueryParam, ReadInfo};
+use generated_types::influxdata::iox::querier::v1::{QueryParam, ReadInfo, read_info::QueryType};
 use iox_query_params::StatementParam;
 
 use super::{Client, IOxRecordBatchStream};
@@ -124,7 +124,7 @@ impl<'c> QueryBuilder<'c, NoQuery> {
     }
 }
 
-impl<'c> QueryBuilder<'c, Query> {
+impl QueryBuilder<'_, Query> {
     /// Query the given database with the SQL query constructed by this builder,
     /// returning a struct that can stream Arrow [`arrow::record_batch::RecordBatch`] results.
     pub async fn run(self) -> Result<IOxRecordBatchStream, super::Error> {

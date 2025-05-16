@@ -7,7 +7,7 @@
 //! Verifies that the rows and statistics are as expected after a number of interleaved writes
 
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use arrow::{
     array::{
@@ -18,18 +18,21 @@ use arrow::{
 };
 use arrow_util::bitset::BitSet;
 use data_types::{
-    partition_template::{test_table_partition_override, TemplatePart},
     IsNan, StatValues, Statistics,
+    partition_template::{TemplatePart, test_table_partition_override},
 };
 use hashbrown::HashSet;
-use mutable_batch::{writer::Writer, MutableBatch, WritePayload};
+use mutable_batch::{MutableBatch, WritePayload, writer::Writer};
 use partition::PartitionWrite;
+use rand::TryRngCore;
 use rand::prelude::*;
 use schema::Projection;
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range, sync::Arc};
 
 fn make_rng() -> StdRng {
-    let seed = rand::rngs::OsRng.next_u64();
+    let seed = rand::rngs::OsRng
+        .try_next_u64()
+        .expect("unable to get random seed");
     println!("Seed: {seed}");
     StdRng::seed_from_u64(seed)
 }
@@ -37,13 +40,13 @@ fn make_rng() -> StdRng {
 /// A random unicode string of up to 20 codepoints
 fn random_string(rng: &mut StdRng) -> String {
     let len = (rng.next_u32() % 64) as usize;
-    rng.sample_iter::<char, _>(rand::distributions::Standard)
+    rng.sample_iter::<char, _>(rand::distr::StandardUniform)
         .take(len)
         .collect()
 }
 
 fn random_bool(rng: &mut StdRng) -> bool {
-    rng.sample(rand::distributions::Standard)
+    rng.sample(rand::distr::StandardUniform)
 }
 
 /// Randomly may return an array containing randomly generated, nullable data
@@ -251,7 +254,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
             }
             None => expected
                 .tag_expected
-                .extend(std::iter::repeat(None).take(len as usize)),
+                .extend(std::iter::repeat_n(None, len as usize)),
         },
         false => {
             let values_len = rng.next_u32() % 18 + 1;
@@ -276,7 +279,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
                 }
                 None => expected
                     .tag_expected
-                    .extend(std::iter::repeat(None).take(len as usize)),
+                    .extend(std::iter::repeat_n(None, len as usize)),
             }
         }
     }
@@ -295,7 +298,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
         }
         None => expected
             .string_expected
-            .extend(std::iter::repeat(None).take(len as usize)),
+            .extend(std::iter::repeat_n(None, len as usize)),
     }
 
     match maybe_array(rng, len, random_bool) {
@@ -308,7 +311,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
         }
         None => expected
             .bool_expected
-            .extend(std::iter::repeat(None).take(len as usize)),
+            .extend(std::iter::repeat_n(None, len as usize)),
     }
 
     match maybe_array(rng, len, |rng| rng.next_u64()) {
@@ -321,7 +324,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
         }
         None => expected
             .u64_expected
-            .extend(std::iter::repeat(None).take(len as usize)),
+            .extend(std::iter::repeat_n(None, len as usize)),
     }
 
     match maybe_array(rng, len, |rng| rng.next_u64() as i64) {
@@ -334,7 +337,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
         }
         None => expected
             .i64_expected
-            .extend(std::iter::repeat(None).take(len as usize)),
+            .extend(std::iter::repeat_n(None, len as usize)),
     }
 
     match maybe_array(rng, len, |rng| f64::from_bits(rng.next_u64())) {
@@ -347,7 +350,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
         }
         None => expected
             .f64_expected
-            .extend(std::iter::repeat(None).take(len as usize)),
+            .extend(std::iter::repeat_n(None, len as usize)),
     }
 
     writer.commit();

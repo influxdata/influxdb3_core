@@ -8,18 +8,18 @@ use catalog_cache::{
     local::CatalogCache,
 };
 use data_types::{
-    partition_template::TablePartitionTemplateOverride, ColumnId, ColumnSet, CompactionLevel,
-    MaxL0CreatedAt, Namespace, NamespaceName, ObjectStoreId, ParquetFileParams, Partition, Table,
-    TableSchema, Timestamp,
+    ColumnId, ColumnSet, CompactionLevel, MaxL0CreatedAt, Namespace, NamespaceName, ObjectStoreId,
+    ParquetFileParams, Partition, Table, TableSchema, Timestamp,
+    partition_template::TablePartitionTemplateOverride,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use parking_lot::Mutex;
 
 use crate::{
     cache::{CachingCatalog, CachingCatalogParams},
-    interface::{Catalog, Error, ParquetFileRepoExt, RepoCollection, SoftDeletedRows},
+    interface::{Catalog, Error, ParquetFileRepoExt, RepoCollection},
     metrics::GetTimeMetric,
-    postgres::{parse_dsn, PostgresCatalog, PostgresConnectionOptions},
+    postgres::{PostgresCatalog, PostgresConnectionOptions, parse_dsn},
 };
 
 /// When the details of the namespace don't matter; the test just needs *a* catalog namespace
@@ -66,12 +66,9 @@ pub async fn arbitrary_namespace_with_retention_policy<R: RepoCollection + ?Size
         .await
     {
         Ok(ns) => ns,
-        Err(Error::AlreadyExists { .. }) => repos
-            .namespaces()
-            .get_by_name(name, SoftDeletedRows::AllRows)
-            .await
-            .unwrap()
-            .unwrap(),
+        Err(Error::AlreadyExists { .. }) => {
+            repos.namespaces().get_by_name(name).await.unwrap().unwrap()
+        }
         Err(e) => panic!("{e}"),
     }
 }
@@ -172,14 +169,14 @@ pub type CatalogAndCache = (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>
 /// calls [`catalog_from_backing`] with a temporary [`PostgresCatalog`]
 pub async fn catalog() -> CatalogAndCache {
     let (backing, db) = run_backing_postgres_catalog(Arc::default()).await;
-    let (cat, cache) = catalog_from_backing(backing);
+    let (cat, cache) = catalog_from_backing(Arc::new(backing) as _);
     cat.hold_onto(db);
     (cat, cache)
 }
 
 /// Call [`catalog_from_backing_and_times`] with the provided `backing`, [`SystemProvider`], and
 /// [`Duration::ZERO`]
-pub fn catalog_from_backing<C: Catalog + 'static>(backing: C) -> CatalogAndCache {
+pub fn catalog_from_backing(backing: Arc<dyn Catalog>) -> CatalogAndCache {
     catalog_from_backing_and_times(
         backing,
         Arc::new(SystemProvider::new()) as _,
@@ -189,8 +186,8 @@ pub fn catalog_from_backing<C: Catalog + 'static>(backing: C) -> CatalogAndCache
 
 /// Build a basic Catalog and Cache for use with tests, using the provided `backing` [`Catalog`]
 /// as the backing data store, with the provided times
-pub fn catalog_from_backing_and_times<C: Catalog + 'static>(
-    backing: C,
+pub fn catalog_from_backing_and_times(
+    backing: Arc<dyn Catalog>,
     time_provider: Arc<dyn TimeProvider>,
     batch_delay: Duration,
 ) -> CatalogAndCache {
@@ -205,7 +202,7 @@ pub fn catalog_from_backing_and_times<C: Catalog + 'static>(
 
     let params = CachingCatalogParams {
         cache: Arc::clone(&cache),
-        backing: Arc::new(backing),
+        backing,
         metrics,
         time_provider,
         quorum_fanout: 10,
@@ -328,6 +325,10 @@ impl<T: Catalog> TestCatalog<T> {
 
 #[async_trait]
 impl<T: Catalog> Catalog for TestCatalog<T> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn setup(&self) -> Result<(), Error> {
         self.inner.setup().await
     }

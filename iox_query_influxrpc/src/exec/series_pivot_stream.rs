@@ -4,16 +4,16 @@ use arrow::array::{
 };
 use arrow::compute::filter;
 use arrow::datatypes::{DataType, Int32Type, SchemaRef, UnionMode};
-use datafusion::common::cast::as_string_array;
 use datafusion::common::Result;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion::common::cast::as_string_array;
 use datafusion::execution::RecordBatchStream;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::metrics::{BaselineMetrics, RecordOutput};
 use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_plan::metrics::{BaselineMetrics, RecordOutput};
 use futures::ready;
 use futures::stream::Stream;
-use std::iter::repeat;
+use std::iter::repeat_n;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -53,7 +53,6 @@ pub(super) struct SeriesPivotStream<S> {
 }
 
 impl<S> SeriesPivotStream<S> {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         input: S,
         schema: SchemaRef,
@@ -112,7 +111,7 @@ impl<S> SeriesPivotStream<S> {
 
         let num_rows = values.len();
         let field_values = StringArray::from(vec![key.as_ref()]);
-        let field_keys = repeat(0_i32).take(num_rows).collect::<Int32Array>();
+        let field_keys = repeat_n(0_i32, num_rows).collect::<Int32Array>();
         let fields = Arc::new(DictionaryArray::new(field_keys, Arc::new(field_values)));
 
         let mut columns = Vec::with_capacity(tags.len() + 4);
@@ -136,7 +135,7 @@ impl<S> SeriesPivotStream<S> {
                 Ok(Arc::new(builder.finish()))
             }
             ColumnarValue::Scalar(scalar) => {
-                let keys = repeat(0_i32).take(batch.num_rows()).collect();
+                let keys = repeat_n(0_i32, batch.num_rows()).collect();
                 let values = scalar.to_array()?;
                 Ok(Arc::new(DictionaryArray::new(keys, values)))
             }
@@ -176,7 +175,7 @@ impl<S> SeriesPivotStream<S> {
         if let DataType::Union(union_fields, UnionMode::Sparse) = column.data_type() {
             Ok(Arc::new(UnionArray::try_new(
                 union_fields.clone(),
-                repeat(type_id).take(num_rows).collect(),
+                repeat_n(type_id, num_rows).collect(),
                 None,
                 children,
             )?))
@@ -273,7 +272,7 @@ mod tests {
     use datafusion::physical_plan::expressions::{Column, Literal};
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::scalar::ScalarValue;
-    use futures::stream::{once, TryStreamExt};
+    use futures::stream::{TryStreamExt, once};
     use insta::assert_snapshot;
     use schema::TIME_DATA_TIMEZONE;
 

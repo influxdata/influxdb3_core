@@ -1,14 +1,16 @@
+use reqwest::Client;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use metric::{Attributes, MetricKind, Observation};
+use metric::{Attributes, MetricKind, Observation, Registry};
 use std::io::Write;
+use std::sync::Arc;
 
-use observability_deps::tracing::error;
+use observability_deps::tracing::{debug, error, warn};
 use prometheus::proto::{Bucket, Histogram};
 use prometheus::{
-    proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType},
     Encoder, TextEncoder,
+    proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType},
 };
 
 /// A `metric::Reporter` that writes data in the prometheus text exposition format
@@ -186,6 +188,71 @@ impl<W: Write> metric::Reporter for PrometheusTextEncoder<'_, W> {
     }
 }
 
+/// Implementation of a client which can be used to send metrics stored
+/// within a [`Registry`] to a remote pushgateway server.
+#[derive(Debug)]
+pub struct PushGatewayClient {
+    client: Client,
+    metric_registry: Arc<Registry>,
+    address: String,
+    job_name: String,
+}
+
+impl PushGatewayClient {
+    /// Construct a new [`PushGatewayClient`].
+    pub fn new(address: &str, job_name: &str, metric_registry: Arc<Registry>) -> Self {
+        Self {
+            client: Client::new(),
+            metric_registry,
+            address: address.to_string(),
+            job_name: job_name.to_string(),
+        }
+    }
+
+    /// Get the full path used for the Prometheus PushGateway, containing
+    /// the interpolated server address and the job name.
+    fn pushgateway_path(&self) -> String {
+        format!("{}/metrics/job/{}", self.address, self.job_name)
+    }
+
+    /// Push the metrics stored in the internal [`Registry`] to the configured server.
+    pub async fn push_metrics(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        let mut encoder = PrometheusTextEncoder::new(&mut buf);
+
+        self.metric_registry.report(&mut encoder);
+
+        let pushgateway_path = self.pushgateway_path();
+        let resp = self
+            .client
+            .put(reqwest::Url::parse(&pushgateway_path)?)
+            .body(buf)
+            .send()
+            .await?;
+
+        match resp.error_for_status() {
+            Ok(success) => {
+                debug!(
+                    status_code = success.status().as_str(),
+                    pushgateway_path,
+                    job_name = self.job_name,
+                    "metrics pushed to gateway"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    %e,
+                    pushgateway_path,
+                    job_name = self.job_name,
+                    "unable to push metrics"
+                );
+                Err(Box::new(e))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +262,8 @@ mod tests {
     };
     use std::time::Duration;
     use test_helpers::assert_not_contains;
+
+    use mockito::Server;
 
     #[test]
     fn test_encode() {
@@ -281,5 +350,36 @@ foo_total{tag1="value",tag2="value2"} 7
 
         // no errors
         assert_not_contains!(tracing_capture.to_string(), "error");
+    }
+
+    #[test]
+    fn pushgateway_path_behaviour() {
+        let client = PushGatewayClient::new(
+            "http://127.0.0.1:9091",
+            "my_amazing_job",
+            Arc::new(Registry::default()),
+        );
+        assert_eq!(
+            client.pushgateway_path(),
+            format!("{}/metrics/job/{}", client.address, client.job_name),
+            "Unexpected change in pushgateway path usage behaviour"
+        );
+    }
+
+    #[tokio::test]
+    async fn pushgateway_client() {
+        let mut server = Server::new_async().await;
+        let job_name = "my_metrics_job";
+
+        let mock = server
+            .mock("PUT", format!("/metrics/job/{job_name}").as_str())
+            .with_status(200)
+            .create();
+
+        let client = PushGatewayClient::new(&server.url(), job_name, Arc::new(Registry::default()));
+        client.push_metrics().await.expect("Sending works in test");
+
+        // Assert the client called the setup mocked path
+        mock.assert();
     }
 }

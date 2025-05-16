@@ -3,9 +3,10 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/manage-database/#delete-measurements-with-drop-measurement
 
 use crate::common::ws1;
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, ParseResult};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
+use nom::Parser;
 use nom::combinator::map;
 use nom::sequence::{pair, preceded};
 use std::fmt::{Display, Formatter};
@@ -30,7 +31,8 @@ pub(crate) fn drop_statement(i: &str) -> ParseResult<&str, DropMeasurementStatem
             "invalid DROP statement, expected MEASUREMENT",
             drop_measurement,
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 fn drop_measurement(i: &str) -> ParseResult<&str, DropMeasurementStatement> {
@@ -43,7 +45,8 @@ fn drop_measurement(i: &str) -> ParseResult<&str, DropMeasurementStatement> {
             ),
             |name| DropMeasurementStatement { name },
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 #[cfg(test)]

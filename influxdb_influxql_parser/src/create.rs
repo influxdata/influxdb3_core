@@ -3,14 +3,15 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/manage-database/#create-database
 
 use crate::common::ws1;
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, ParseResult};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::literal::{duration, unsigned_integer, Duration};
+use crate::literal::{Duration, duration, unsigned_integer};
 use crate::statement::Statement;
+use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::{map, opt, peek};
-use nom::sequence::{pair, preceded, tuple};
+use nom::sequence::{pair, preceded};
 use std::fmt::{Display, Formatter};
 
 pub(crate) fn create_statement(i: &str) -> ParseResult<&str, Statement> {
@@ -20,7 +21,8 @@ pub(crate) fn create_statement(i: &str) -> ParseResult<&str, Statement> {
             "Invalid CREATE statement, expected DATABASE following CREATE",
             map(create_database, |s| Statement::CreateDatabase(Box::new(s))),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Represents a `CREATE DATABASE` statement.
@@ -87,10 +89,10 @@ fn create_database(i: &str) -> ParseResult<&str, CreateDatabaseStatement> {
             name,
             opt_with_clause,
         ),
-    ) = tuple((
+    ) = (
         keyword("DATABASE"),
         identifier,
-        opt(tuple((
+        opt((
             preceded(ws1, keyword("WITH")),
             expect(
                 "invalid WITH clause, expected \"DURATION\", \"REPLICATION\", \"SHARD\" or \"NAME\"",
@@ -138,8 +140,8 @@ fn create_database(i: &str) -> ParseResult<&str, CreateDatabaseStatement> {
                     identifier,
                 ),
             )),
-        ))),
-    ))(i)?;
+        )),
+    ).parse(i)?;
 
     let (_, _, duration, replication, shard_duration, retention_name) =
         opt_with_clause.unwrap_or(("", "", None, None, None, None));

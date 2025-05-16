@@ -1,27 +1,28 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
-use crate::statistics::{build_statistics_for_chunks, SchemaBoundStatistics};
+use crate::statistics::{SchemaBoundStatistics, build_statistics_for_chunks};
 use crate::{
-    provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs, QueryChunk,
-    QueryChunkData, CHUNK_ORDER_COLUMN_NAME,
+    CHUNK_ORDER_COLUMN_NAME, QueryChunk, QueryChunkData,
+    provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs,
 };
 use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef};
+use datafusion::physical_expr::LexOrdering;
 use datafusion::{
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
+        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
     },
     physical_expr::PhysicalSortExpr,
-    physical_plan::{empty::EmptyExec, expressions::Column, union::UnionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, empty::EmptyExec, expressions::Column, union::UnionExec},
     scalar::ScalarValue,
 };
 use datafusion_util::config::table_parquet_options;
 use object_store::{DynObjectStore, ObjectMeta, ObjectStore};
 use parquet_file::storage::ParquetExecInput;
-use schema::{sort::SortKey, Schema};
+use schema::{Schema, sort::SortKey};
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
 };
 
@@ -198,10 +199,12 @@ pub fn chunks_to_physical_nodes(
     // Remove the chunk order column from the schema if it exists
     let has_chunk_order_col = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).is_ok();
     let (table_partition_cols, schema_without_chunk_order) = if has_chunk_order_col {
-        let table_partition_cols = vec![schema
-            .field_with_name(CHUNK_ORDER_COLUMN_NAME)
-            .unwrap()
-            .clone()];
+        let table_partition_cols = vec![
+            schema
+                .field_with_name(CHUNK_ORDER_COLUMN_NAME)
+                .unwrap()
+                .clone(),
+        ];
         let schema_without_chunk_order = Arc::new(ArrowSchema::new(
             schema
                 .fields
@@ -237,7 +240,7 @@ pub fn chunks_to_physical_nodes(
         // Tell datafusion about the sort key, if any
         let output_ordering = sort_key.map(|sort_key| arrow_sort_key_exprs(&sort_key, schema));
         let output_ordering = if has_chunk_order_col {
-            Some(
+            Some(LexOrdering::from_iter(
                 output_ordering
                     .unwrap_or_default()
                     .into_iter()
@@ -247,9 +250,8 @@ pub fn chunks_to_physical_nodes(
                                 .expect("just added col"),
                         ),
                         options: Default::default(),
-                    }))
-                    .collect::<Vec<_>>(),
-            )
+                    })),
+            ))
         } else {
             output_ordering
         };
@@ -276,26 +278,27 @@ pub fn chunks_to_physical_nodes(
                         table_schema: Arc::clone(&schema_without_chunk_order),
                     })),
                     statistics: Some(chunk_stats),
+                    metadata_size_hint: None,
                 }
             }),
             target_partitions,
         );
 
         // No sort order is represented by an empty Vec
-        let output_ordering = vec![output_ordering.unwrap_or_default()];
+        let output_ordering = output_ordering
+            .map(|sort_order| vec![sort_order])
+            .unwrap_or_default();
 
         // Build base_config for the ParquetExec
-        let base_config = FileScanConfig {
+        let base_config = FileScanConfig::new(
             object_store_url,
             // file_schema is the schema of all files in the ParquetExec which is a superset of each file's schema
-            file_schema: Arc::clone(&schema_without_chunk_order),
-            file_groups,
-            statistics,
-            projection: None,
-            limit: None,
-            table_partition_cols: table_partition_cols.clone(),
-            output_ordering,
-        };
+            Arc::clone(&schema_without_chunk_order),
+        )
+        .with_file_groups(file_groups)
+        .with_statistics(statistics)
+        .with_table_partition_cols(table_partition_cols.clone())
+        .with_output_ordering(output_ordering);
 
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         output_nodes.push(builder.build_arc());
@@ -333,12 +336,12 @@ mod tests {
         datasource::physical_plan::ParquetExec,
         physical_plan::{ColumnStatistics, Statistics},
     };
-    use schema::{sort::SortKeyBuilder, InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME};
+    use schema::{InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME, sort::SortKeyBuilder};
 
     use crate::{
         chunk_order_field,
         statistics::build_statistics_for_chunks,
-        test::{format_execution_plan, TestChunk},
+        test::{TestChunk, format_execution_plan},
     };
 
     use super::*;
@@ -636,10 +639,12 @@ mod tests {
         };
         let plan_record_batches_exec = Arc::clone(&union_exec.inputs()[0]);
         // verify this is a RecordBatchesExec
-        assert!(plan_record_batches_exec
-            .as_any()
-            .downcast_ref::<RecordBatchesExec>()
-            .is_some());
+        assert!(
+            plan_record_batches_exec
+                .as_any()
+                .downcast_ref::<RecordBatchesExec>()
+                .is_some()
+        );
 
         // Build a ParquetExec for parquet_chunk
         //
@@ -656,10 +661,12 @@ mod tests {
         };
         let plan_parquet_exec = Arc::clone(&union_exec.inputs()[0]);
         // verify this is a ParquetExec
-        assert!(plan_parquet_exec
-            .as_any()
-            .downcast_ref::<ParquetExec>()
-            .is_some());
+        assert!(
+            plan_parquet_exec
+                .as_any()
+                .downcast_ref::<ParquetExec>()
+                .is_some()
+        );
 
         // Schema of 2 chunks are the same
         assert_eq!(record_batch_chunk.schema(), parquet_chunk.schema());
@@ -806,10 +813,12 @@ mod tests {
         };
         let plan_parquet_exec = Arc::clone(&union_exec.inputs()[0]);
         // verify this is a ParquetExec
-        assert!(plan_parquet_exec
-            .as_any()
-            .downcast_ref::<ParquetExec>()
-            .is_some());
+        assert!(
+            plan_parquet_exec
+                .as_any()
+                .downcast_ref::<ParquetExec>()
+                .is_some()
+        );
 
         // Verify only one file group and one partitioned file
         let parquet_exec = plan_parquet_exec

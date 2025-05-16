@@ -1,12 +1,12 @@
 use datafusion::arrow::{
     array::{
-        as_boolean_array, as_dictionary_array, as_primitive_array, as_string_array, Array,
-        ArrayAccessor, StringArray,
+        Array, ArrayAccessor, StringArray, as_boolean_array, as_dictionary_array,
+        as_primitive_array, as_string_array,
     },
     datatypes::{Float64Type, Int32Type, Int64Type, TimestampNanosecondType, UInt64Type},
     record_batch::RecordBatch,
 };
-use influxdb_line_protocol::{builder::FieldValue, FieldValue as LPFieldValue};
+use influxdb_line_protocol::{FieldValue as LPFieldValue, builder::FieldValue};
 use schema::{InfluxColumnType, InfluxFieldType, Schema};
 
 /// Converts a [`RecordBatch`] into line protocol lines.

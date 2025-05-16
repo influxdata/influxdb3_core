@@ -4,17 +4,17 @@ mod measurement_rewrite;
 mod rewrite;
 mod value_rewrite;
 
-use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 use crate::Predicate;
+use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::ToDFSchema;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
-use datafusion::prelude::{lit, Expr};
+use datafusion::prelude::{Expr, lit};
 use futures::{StreamExt, TryStreamExt};
 use observability_deps::tracing::{debug, trace};
 use schema::Schema;
@@ -154,7 +154,7 @@ impl InfluxRpcPredicate {
                 }
             })
             .buffered(concurrent_jobs)
-            .and_then(|(table_name, maybe_table)| async move {
+            .and_then(async move |(table_name, maybe_table)| {
                 let (table_and_schema, predicate) = match maybe_table {
                     Some(table) => {
                         let schema = Schema::try_from(table.schema())
@@ -532,7 +532,7 @@ mod tests {
             .unwrap()
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     const fn assert_send<T: Send>() {}
 
     // `InfluxRpcPredicate` shall be `Send`, otherwise we will have problems constructing plans for InfluxRPC

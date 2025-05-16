@@ -1,12 +1,13 @@
 //! Types and parsers for literals.
 
 use crate::common::ws0;
-use crate::internal::{map_error, map_fail, ParseResult};
+use crate::internal::{ParseResult, map_error, map_fail};
 use crate::keywords::keyword;
-use crate::string::{regex, single_quoted_string, Regex};
+use crate::string::{Regex, regex, single_quoted_string};
 use crate::timestamp::Timestamp;
 use crate::{impl_tuple_clause, write_escaped};
 use chrono::{DateTime, Utc};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{char, digit0, digit1};
@@ -212,7 +213,7 @@ impl From<i64> for Number {
 
 /// Parse a signed [`Number`].
 pub(crate) fn number(i: &str) -> ParseResult<&str, Number> {
-    let (remaining, sign) = opt(alt((char('-'), char('+'))))(i)?;
+    let (remaining, sign) = opt(alt((char('-'), char('+')))).parse(i)?;
     preceded(
         ws0,
         alt((
@@ -223,12 +224,13 @@ pub(crate) fn number(i: &str) -> ParseResult<&str, Number> {
                 Number::Integer(v * if let Some('-') = sign { -1 } else { 1 })
             }),
         )),
-    )(remaining)
+    )
+    .parse(remaining)
 }
 
 /// Parse the input for an InfluxQL boolean, which must be the value `true` or `false`.
 fn boolean(i: &str) -> ParseResult<&str, bool> {
-    alt((value(true, keyword("TRUE")), value(false, keyword("FALSE"))))(i)
+    alt((value(true, keyword("TRUE")), value(false, keyword("FALSE")))).parse(i)
 }
 
 #[derive(Clone)]
@@ -327,7 +329,8 @@ pub(crate) fn duration(i: &str) -> ParseResult<&str, Duration> {
     map(
         fold_many1(single_duration, || 0, |acc, fragment| acc + fragment),
         Duration,
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Parse an InfluxQL literal, except a [`Regex`].
@@ -341,17 +344,18 @@ pub(crate) fn literal_no_regex(i: &str) -> ParseResult<&str, Literal> {
         integer_literal,
         map(single_quoted_string, Literal::String),
         map(boolean, Literal::Boolean),
-    ))(i)
+    ))
+    .parse(i)
 }
 
 /// Parse any InfluxQL literal.
 pub(crate) fn literal(i: &str) -> ParseResult<&str, Literal> {
-    alt((literal_no_regex, map(regex, Literal::Regex)))(i)
+    alt((literal_no_regex, map(regex, Literal::Regex))).parse(i)
 }
 
 /// Parse an InfluxQL literal regular expression.
 pub(crate) fn literal_regex(i: &str) -> ParseResult<&str, Literal> {
-    map(regex, Literal::Regex)(i)
+    map(regex, Literal::Regex).parse(i)
 }
 
 /// Returns `nanos` as a timestamp.

@@ -1,7 +1,9 @@
-use generated_types::google::{AlreadyExists, FieldViolation, NotFound, PreconditionViolation};
+use generated_types::{
+    Code, Status,
+    google::{AlreadyExists, FieldViolation, NotFound, PreconditionViolation},
+};
 use std::fmt::Debug;
 use thiserror::Error;
-use tonic::{Code, Status};
 
 /// A generic opaque error
 pub type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -16,7 +18,7 @@ pub struct ServerError<D> {
     pub details: Option<D>,
 }
 
-fn parse_status<D: ServerErrorDetails>(status: tonic::Status) -> ServerError<D> {
+fn parse_status<D: ServerErrorDetails>(status: Status) -> ServerError<D> {
     ServerError {
         message: status.message().to_string(),
         details: D::try_decode(&status),
@@ -24,42 +26,42 @@ fn parse_status<D: ServerErrorDetails>(status: tonic::Status) -> ServerError<D> 
 }
 
 trait ServerErrorDetails: Sized {
-    fn try_decode(data: &tonic::Status) -> Option<Self>;
+    fn try_decode(data: &Status) -> Option<Self>;
 }
 
 impl ServerErrorDetails for () {
-    fn try_decode(_: &tonic::Status) -> Option<Self> {
+    fn try_decode(_: &Status) -> Option<Self> {
         None
     }
 }
 
 impl ServerErrorDetails for FieldViolation {
-    fn try_decode(status: &tonic::Status) -> Option<Self> {
+    fn try_decode(status: &Status) -> Option<Self> {
         generated_types::google::decode_field_violation(status).next()
     }
 }
 
 impl ServerErrorDetails for AlreadyExists {
-    fn try_decode(status: &tonic::Status) -> Option<Self> {
+    fn try_decode(status: &Status) -> Option<Self> {
         generated_types::google::decode_already_exists(status).next()
     }
 }
 
 impl ServerErrorDetails for NotFound {
-    fn try_decode(status: &tonic::Status) -> Option<Self> {
+    fn try_decode(status: &Status) -> Option<Self> {
         generated_types::google::decode_not_found(status).next()
     }
 }
 
 impl ServerErrorDetails for PreconditionViolation {
-    fn try_decode(status: &tonic::Status) -> Option<Self> {
+    fn try_decode(status: &Status) -> Option<Self> {
         generated_types::google::decode_precondition_violation(status).next()
     }
 }
 
 /// The errors returned by this client
 #[derive(Error, Debug)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[error("The operation was cancelled: {0}")]
     Cancelled(ServerError<()>),
@@ -116,7 +118,7 @@ pub enum Error {
     Client(StdError),
 }
 
-impl From<tonic::Status> for Error {
+impl From<Status> for Error {
     fn from(s: Status) -> Self {
         match s.code() {
             Code::Ok => Self::Client("status is not an error".into()),

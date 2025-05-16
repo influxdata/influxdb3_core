@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
@@ -7,11 +7,11 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::ExecutionPlan,
 };
-use schema::{sort::SortKeyBuilder, TIME_COLUMN_NAME};
+use schema::sort::SortKeyBuilder;
 
 use crate::{
     physical_optimizer::chunk_extraction::extract_chunks,
-    provider::{chunks_to_physical_nodes, DeduplicateExec},
+    provider::{DeduplicateExec, chunks_to_physical_nodes},
     util::arrow_sort_key_exprs,
 };
 
@@ -21,6 +21,8 @@ use crate::{
 ///
 /// We assume that, columns that are NOT present in any chunks and hence are only created as pure NULL-columns are
 /// not relevant for deduplication since they are effectively constant.
+///
+/// The order of the sort key of the existing [`DeduplicateExec`] will be preserved, i.e. this only filters columns.
 ///
 ///
 /// [`QueryChunk`]: crate::QueryChunk
@@ -45,22 +47,22 @@ impl PhysicalOptimizerRule for DedupNullColumns {
                     return Ok(Transformed::no(plan));
                 };
 
-                let pk_cols = dedup_exec.sort_columns();
+                let pk_cols = dedup_exec.sort_columns_ordered();
 
-                let mut used_pk_cols = HashSet::new();
+                let mut used_pk_cols = HashMap::new();
                 for chunk in &chunks {
                     for (_type, field) in chunk.schema().iter() {
-                        if pk_cols.contains(field.name().as_str()) {
-                            used_pk_cols.insert(field.name().as_str());
+                        if let Some(pos) = pk_cols.get(field.name().as_str()) {
+                            used_pk_cols.insert(field.name().as_str(), *pos);
                         }
                     }
                 }
 
                 let mut used_pk_cols = used_pk_cols.into_iter().collect::<Vec<_>>();
-                used_pk_cols.sort_by_key(|col| (*col == TIME_COLUMN_NAME, *col));
+                used_pk_cols.sort_by_key(|(_col, pos)| *pos);
 
                 let mut sort_key_builder = SortKeyBuilder::new();
-                for col in used_pk_cols {
+                for (col, _pos) in used_pk_cols {
                     sort_key_builder = sort_key_builder.with_col(col);
                 }
 
@@ -99,12 +101,12 @@ mod tests {
     use schema::SchemaBuilder;
 
     use crate::{
+        QueryChunk,
         physical_optimizer::{
             dedup::test_util::{chunk, dedup_plan, dedup_plan_with_chunk_order_col},
             test_util::OptimizationTest,
         },
         test::TestChunk,
-        QueryChunk,
     };
 
     use super::*;
@@ -239,6 +241,39 @@ mod tests {
             - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,tag3@2 ASC,time@4 ASC]"
             - "   UnionExec"
             - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
+        "#
+        );
+    }
+
+    #[test]
+    fn test_tie_breaking() {
+        let chunk = TestChunk::new("table")
+            .with_id(1)
+            .with_tag_column("tag1")
+            .with_tag_column("tag2")
+            .with_time_column()
+            .with_dummy_parquet_file();
+        let schema = SchemaBuilder::new()
+            .tag("tag2")
+            .tag("tag1")
+            .tag("tag3")
+            .timestamp()
+            .build()
+            .unwrap();
+        let plan = dedup_plan(schema, vec![chunk]);
+        let opt = DedupNullColumns;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan, opt),
+            @r#"
+        input:
+          - " DeduplicateExec: [tag2@0 ASC,tag1@1 ASC,tag3@2 ASC,time@3 ASC]"
+          - "   UnionExec"
+          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag2, tag1, tag3, time]"
+        output:
+          Ok:
+            - " DeduplicateExec: [tag2@0 ASC,tag1@1 ASC,time@3 ASC]"
+            - "   UnionExec"
+            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag2, tag1, tag3, time]"
         "#
         );
     }

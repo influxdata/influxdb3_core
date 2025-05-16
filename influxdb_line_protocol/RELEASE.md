@@ -20,7 +20,7 @@ Update the version in Cargo.toml, like:
 -version = "1.0.0"
 +version = "2.0.0"
  authors = ["InfluxDB IOx Project Developers"]
- edition = "2021"
+ edition = "2024"
  license = "MIT OR Apache-2.0"
 ```
 

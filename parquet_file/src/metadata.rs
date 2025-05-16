@@ -86,7 +86,7 @@
 //! [Apache Parquet]: https://parquet.apache.org/
 //! [Apache Thrift]: https://thrift.apache.org/
 //! [Thrift Compact Protocol]: https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, CompactionLevelProtoError, InfluxDbType,
@@ -112,10 +112,10 @@ use parquet::{
 };
 use prost::Message;
 use schema::{
-    sort::{SortKey, SortKeyBuilder},
     InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME,
+    sort::{SortKey, SortKeyBuilder},
 };
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use std::{convert::TryInto, fmt::Debug, mem, sync::Arc};
 use thiserror::Error;
 use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol, TOutputProtocol};
@@ -133,7 +133,7 @@ pub const METADATA_VERSION: u32 = 10;
 pub const METADATA_KEY: &str = "IOX:metadata";
 
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Cannot read parquet metadata from bytes: {}", source))]
     ParquetMetaDataRead {
@@ -245,7 +245,7 @@ pub enum Error {
     },
 }
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// IOx-specific metadata.
@@ -282,16 +282,16 @@ pub struct IoxMetadata {
     /// The compaction level of the file.
     ///
     ///  * 0 (`CompactionLevel::Initial`): represents a level-0 file that is persisted by an
-    ///      Ingester. Partitions with level-0 files are usually hot/recent partitions.
+    ///    Ingester. Partitions with level-0 files are usually hot/recent partitions.
     ///  * 1 (`CompactionLevel::FileOverlapped`): represents a level-1 file that is persisted by a
-    ///      Compactor and potentially overlaps with other level-1 files. Partitions with level-1
-    ///      files are partitions with a lot of or/and large overlapped files that have to go
-    ///      through many compaction cycles before they are fully compacted to non-overlapped
-    ///      files.
+    ///    Compactor and potentially overlaps with other level-1 files. Partitions with level-1
+    ///    files are partitions with a lot of or/and large overlapped files that have to go
+    ///    through many compaction cycles before they are fully compacted to non-overlapped
+    ///    files.
     ///  * 2 (`CompactionLevel::FileNonOverlapped`): represents a level-1 file that is persisted by
-    ///      a Compactor and does not overlap with other files except level 0 ones. Eventually,
-    ///      cold partitions (partitions that no longer needs to get compacted) will only include
-    ///      one or many level-1 files
+    ///    a Compactor and does not overlap with other files except level 0 ones. Eventually,
+    ///    cold partitions (partitions that no longer needs to get compacted) will only include
+    ///    one or many level-1 files
     pub compaction_level: CompactionLevel,
 
     /// Sort key of this chunk
@@ -309,6 +309,17 @@ impl TryFrom<&IoxMetadata> for Vec<KeyValue> {
             key: METADATA_KEY.to_string(),
             value: Some(iox_metadata.to_base64()?),
         }])
+    }
+}
+
+impl TryFrom<&IoxMetadata> for KeyValue {
+    type Error = prost::EncodeError;
+
+    fn try_from(iox_metadata: &IoxMetadata) -> Result<Self, Self::Error> {
+        Ok(KeyValue {
+            key: METADATA_KEY.to_string(),
+            value: (Some(iox_metadata.to_base64()?)),
+        })
     }
 }
 
@@ -515,8 +526,8 @@ impl IoxMetadata {
     pub fn size(&self) -> usize {
         // size of this structure, including inlined size + heap sizes
         let size_without_sortkey_refs = mem::size_of_val(self)
-            + self.namespace_name.as_bytes().len()
-            + self.table_name.as_bytes().len()
+            + self.namespace_name.len()
+            + self.table_name.len()
             + std::mem::size_of::<PartitionKey>();
 
         if let Some(sort_key) = self.sort_key.as_ref() {
@@ -1059,7 +1070,7 @@ pub fn file_timestamp_min_max(
 }
 
 /// Errors that may happen while collecting the min and max timestamps
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Error)]
 pub enum TimestampMinMaxError {
     #[error("Could not convert Parquet schema to Arrow schema: {0}")]
@@ -1112,8 +1123,8 @@ mod tests {
         record_batch::RecordBatch,
     };
     use data_types::CompactionLevel;
-    use datafusion_util::{unbounded_memory_pool, MemoryStream};
-    use schema::{builder::SchemaBuilder, TIME_DATA_TIMEZONE};
+    use datafusion_util::{MemoryStream, unbounded_memory_pool};
+    use schema::{TIME_DATA_TIMEZONE, builder::SchemaBuilder};
 
     #[test]
     fn iox_metadata_protobuf_round_trip() {

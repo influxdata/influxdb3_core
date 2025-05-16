@@ -10,8 +10,8 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use datafusion_util::watch::WatchedTask;
 use datafusion_util::AdapterStream;
+use datafusion_util::watch::WatchedTask;
 use observability_deps::tracing::debug;
 use std::fmt;
 use std::sync::Arc;
@@ -54,7 +54,12 @@ impl SchemaPivotExec {
             UnknownPartitioning(num_partitions) => UnknownPartitioning(*num_partitions),
         };
 
-        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )
     }
 }
 
@@ -241,7 +246,7 @@ mod tests {
     use super::*;
     use crate::plan::schema_pivot_schema;
     use arrow::{
-        array::{as_dictionary_array, as_string_array, Int64Array, StringArray},
+        array::{Int64Array, StringArray, as_dictionary_array, as_string_array},
         datatypes::{DataType, Field, Int32Type, Schema, SchemaRef},
     };
     use datafusion::physical_plan::memory::MemoryExec;

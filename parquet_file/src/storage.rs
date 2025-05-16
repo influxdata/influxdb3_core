@@ -2,9 +2,9 @@
 //! object store and reading it back.
 
 use crate::{
+    ParquetFilePath,
     metadata::{IoxMetadata, IoxParquetMetaData},
     serialize::{self, CodecError, ParallelParquetWriterOptions},
-    ParquetFilePath,
 };
 use arrow::{
     datatypes::{Field, SchemaRef},
@@ -16,11 +16,11 @@ use datafusion::{
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
+        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
     },
     error::DataFusionError,
     execution::runtime_env::RuntimeEnv,
-    physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics},
+    physical_plan::{ExecutionPlan, SendableRecordBatchStream},
     prelude::SessionContext,
 };
 use datafusion_util::config::{
@@ -127,24 +127,8 @@ impl ParquetExecInput {
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         // Compute final (output) schema after selection
         let schema = Arc::new(projection.project_schema(&schema).as_ref().clone());
-        let statistics = Statistics::new_unknown(&schema);
-        let base_config = FileScanConfig {
-            object_store_url: self.object_store_url.clone(),
-            file_schema: schema,
-            file_groups: vec![vec![PartitionedFile {
-                object_meta: self.object_meta.clone(),
-                partition_values: vec![],
-                range: None,
-                extensions: None,
-                statistics: None,
-            }]],
-            statistics,
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            // Parquet files ARE actually sorted but we don't care here since we just construct a `collect` plan.
-            output_ordering: vec![],
-        };
+        let base_config = FileScanConfig::new(self.object_store_url.clone(), schema)
+            .with_file(PartitionedFile::from(self.object_meta.clone()));
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let exec = builder.build();
         let exec_schema = exec.schema();
@@ -448,7 +432,6 @@ impl ParquetStorage {
 
 /// Error during projecting parquet file data to an expected schema.
 #[derive(Debug, Error)]
-#[allow(clippy::large_enum_variant)]
 pub enum ProjectionError {
     /// Unknown field.
     #[error("Unknown field: {0}")]
@@ -478,7 +461,7 @@ mod tests {
         Timestamp,
     };
     use datafusion::common::{DataFusionError, ScalarValue};
-    use datafusion_util::{config::BATCH_SIZE, unbounded_memory_pool, MemoryStream};
+    use datafusion_util::{MemoryStream, config::BATCH_SIZE, unbounded_memory_pool};
     use iox_time::Time;
     use schema::{Error::InvalidInfluxColumnType, Schema as IoxSchema, SchemaBuilder};
     use tokio::runtime::{Handle, RuntimeFlavor};
@@ -1124,7 +1107,7 @@ mod tests {
     }
 
     /// Perform (not assert): download
-    async fn download<'a>(
+    async fn download(
         store: &ParquetStorage,
         partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,

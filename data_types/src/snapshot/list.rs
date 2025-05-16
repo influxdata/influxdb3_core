@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use prost::Message;
-use snafu::{ensure, Snafu};
+use snafu::{Snafu, ensure};
 use std::marker::PhantomData;
 use std::ops::Range;
 
@@ -10,7 +10,7 @@ use generated_types::influxdata::iox::catalog_cache::v1 as generated;
 
 /// Error type for [`MessageList`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(context(false), display("PackedList decode error: {source}"))]
     DecodeError { source: prost::DecodeError },

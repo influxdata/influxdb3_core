@@ -2,7 +2,7 @@
 
 // `clippy::use_self` is deliberately excluded from the lints this crate uses.
 // See <https://github.com/rust-lang/rust-clippy/issues/6902>.
-#![allow(clippy::use_self)]
+#![expect(clippy::use_self)]
 #![warn(missing_docs)]
 
 use thiserror::Error;
@@ -23,6 +23,13 @@ pub mod snapshot;
 
 pub use service_limits::*;
 
+use generated_types::google::protobuf as google;
+use generated_types::influxdata::iox::{
+    Target, catalog::v1 as catalog_proto, catalog_storage::v1 as catalog_storage_proto,
+    schema::v1 as schema_proto, skipped_compaction::v1 as skipped_compaction_proto,
+    table::v1 as table_proto,
+};
+use iox_time::Time;
 use observability_deps::tracing::warn;
 use schema::TIME_COLUMN_NAME;
 use snafu::Snafu;
@@ -42,7 +49,7 @@ use uuid::Uuid;
 /// Errors deserialising a protobuf serialised [`ParquetFile`].
 #[derive(Debug, Snafu)]
 #[snafu(display("invalid compaction level value"))]
-#[allow(missing_copy_implementations)]
+#[expect(missing_copy_implementations)]
 pub struct CompactionLevelProtoError {}
 
 /// Compaction levels
@@ -130,7 +137,7 @@ impl CompactionLevel {
 #[sqlx(transparent)]
 pub struct NamespaceId(i64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl NamespaceId {
     pub const fn new(v: i64) -> Self {
         Self(v)
@@ -146,12 +153,18 @@ impl std::fmt::Display for NamespaceId {
     }
 }
 
+impl From<NamespaceId> for Target {
+    fn from(value: NamespaceId) -> Self {
+        Self::Id(value.get())
+    }
+}
+
 /// Unique ID for a `Table`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type, sqlx::FromRow)]
 #[sqlx(transparent)]
 pub struct TableId(i64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl TableId {
     pub const fn new(v: i64) -> Self {
         Self(v)
@@ -176,7 +189,7 @@ impl std::fmt::Display for TableId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SequenceNumber(u64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl SequenceNumber {
     pub fn new(v: u64) -> Self {
         Self(v)
@@ -213,7 +226,7 @@ impl Sub<u64> for SequenceNumber {
 #[sqlx(transparent)]
 pub struct Timestamp(i64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl Timestamp {
     pub fn new(v: i64) -> Self {
         Self(v)
@@ -273,7 +286,7 @@ impl Sub<i64> for Timestamp {
 #[sqlx(transparent)]
 pub struct ParquetFileId(i64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl ParquetFileId {
     pub fn new(v: i64) -> Self {
         Self(v)
@@ -295,9 +308,9 @@ impl std::fmt::Display for ParquetFileId {
 #[sqlx(transparent)]
 pub struct ObjectStoreId(Uuid);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl ObjectStoreId {
-    #[allow(clippy::new_without_default)]
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         Self::from_uuid(Uuid::new_v4())
     }
@@ -394,12 +407,14 @@ pub struct NamespaceWithStorage {
     pub size_bytes: i64,
     /// Total number of active tables in this namespace
     pub table_count: i64,
+    /// The optional timestamp of when this namespace was soft-deleted.
+    /// This field is only set if the namespace is soft-deleted.
+    /// None means "not deleted", i.e. the namespace is active.
+    pub deleted_at: Option<Timestamp>,
 }
 
 /// Serialise a [`NamespaceWithStorage`] object into its protobuf representation.
-impl From<NamespaceWithStorage>
-    for generated_types::influxdata::iox::catalog_storage::v1::NamespaceWithStorage
-{
+impl From<NamespaceWithStorage> for catalog_storage_proto::NamespaceWithStorage {
     fn from(value: NamespaceWithStorage) -> Self {
         Self {
             id: value.id.get(),
@@ -410,7 +425,71 @@ impl From<NamespaceWithStorage>
             partition_template: value.partition_template.as_proto().cloned(),
             size_bytes: value.size_bytes,
             table_count: value.table_count as i32,
+            deleted_at: value.deleted_at.map(serialize_timestamp),
         }
+    }
+}
+
+fn serialize_timestamp(ts: Timestamp) -> google::Timestamp {
+    let time = Time::from(ts);
+    google::Timestamp {
+        seconds: time.timestamp(),
+        nanos: time.timestamp_subsec_nanos() as i32,
+    }
+}
+
+fn deserialize_timestamp(ts: google::Timestamp) -> Timestamp {
+    let time = ts.seconds * 1_000_000_000 + ts.nanos as i64;
+    Timestamp::new(time)
+}
+
+/// Errors converting from a catalog_storage proto v1 NamespaceWithStorage or TableWithStorage to
+/// [`NamespaceWithStorage`] or [`TableWithStorage`].
+#[derive(Debug, Error)]
+pub enum ProtoV1AnyWithStorageError {
+    /// invalid value for MaxTables
+    #[error("Error converting max_tables: {0}")]
+    MaxTables(ServiceLimitError),
+
+    /// invalid value for MaxColumnsPerTable
+    #[error("Error converting max_columns_per_table: {0}")]
+    MaxColumnsPerTable(ServiceLimitError),
+
+    /// invalid value for PartitionTemplate
+    #[error("Error converting partition_template: {0}")]
+    PartitionTemplate(ValidationError),
+}
+
+impl TryFrom<catalog_storage_proto::NamespaceWithStorage> for NamespaceWithStorage {
+    type Error = ProtoV1AnyWithStorageError;
+
+    /// We require fallible conversion because generated protobuf structs can carry any i32
+    /// value for `max_tables` and `max_columns_per_table`, which is larger than the domain
+    /// `MaxTables` and `MaxColumnsPerTable` can represent (i.e. 0..=i32::MAX).
+    /// The `partition_template` can also be invalid.
+    fn try_from(value: catalog_storage_proto::NamespaceWithStorage) -> Result<Self, Self::Error> {
+        let max_tables =
+            MaxTables::try_from(value.max_tables).map_err(ProtoV1AnyWithStorageError::MaxTables)?;
+        let max_columns_per_table = MaxColumnsPerTable::try_from(value.max_columns_per_table)
+            .map_err(ProtoV1AnyWithStorageError::MaxColumnsPerTable)?;
+        let partition_template = value
+            .partition_template
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(ProtoV1AnyWithStorageError::PartitionTemplate)?
+            .unwrap_or_default();
+
+        Ok(Self {
+            id: NamespaceId::new(value.id),
+            name: value.name,
+            retention_period_ns: value.retention_period_ns,
+            max_tables,
+            max_columns_per_table,
+            partition_template,
+            size_bytes: value.size_bytes,
+            table_count: value.table_count as i64,
+            deleted_at: value.deleted_at.map(deserialize_timestamp),
+        })
     }
 }
 
@@ -452,6 +531,91 @@ pub struct NamespaceSchema {
     pub config: NamespaceConfig,
 }
 
+/// A selector enum for querying a namespace, where the selector has been validated to be in the
+/// correct format. Can be converted from the more generic [`Target`] via a [`TryFrom`] impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceTarget<'a> {
+    /// Selects a namespace by name
+    ///
+    /// For active (non-deleted) namespaces, names are guaranteed to be unique
+    Name(NamespaceName<'a>),
+    /// Selects a namespace by its unique ID.
+    Id(NamespaceId),
+}
+
+impl<'a> TryFrom<Target> for NamespaceTarget<'a> {
+    type Error = <NamespaceName<'a> as TryFrom<String>>::Error;
+    fn try_from(value: Target) -> Result<Self, Self::Error> {
+        Ok(match value {
+            Target::Name(name) => Self::Name(NamespaceName::try_from(name)?),
+            Target::Id(id) => Self::Id(NamespaceId::new(id)),
+        })
+    }
+}
+
+impl<'a> From<NamespaceTarget<'a>> for Target {
+    fn from(value: NamespaceTarget<'a>) -> Self {
+        match value {
+            NamespaceTarget::Name(name) => Self::Name(name.into()),
+            NamespaceTarget::Id(id) => Self::Id(id.get()),
+        }
+    }
+}
+
+impl core::fmt::Display for NamespaceTarget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Id(id) => {
+                id.fmt(f)?;
+                write!(f, " (ID)")
+            }
+            Self::Name(name) => {
+                name.fmt(f)?;
+                write!(f, " (name)")
+            }
+        }
+    }
+}
+
+impl From<i64> for NamespaceTarget<'_> {
+    fn from(value: i64) -> Self {
+        Self::Id(NamespaceId::new(value))
+    }
+}
+
+impl From<NamespaceId> for NamespaceTarget<'_> {
+    fn from(value: NamespaceId) -> Self {
+        Self::Id(value)
+    }
+}
+
+impl<'a> From<NamespaceName<'a>> for NamespaceTarget<'a> {
+    fn from(value: NamespaceName<'a>) -> Self {
+        Self::Name(value)
+    }
+}
+
+impl<'a> TryFrom<String> for NamespaceTarget<'a> {
+    type Error = <NamespaceName<'a> as TryFrom<String>>::Error;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Ok(Self::Name(value.try_into()?))
+    }
+}
+
+impl<'a> TryFrom<&'a String> for NamespaceTarget<'a> {
+    type Error = <NamespaceName<'a> as TryFrom<&'a String>>::Error;
+    fn try_from(value: &'a String) -> Result<Self, Self::Error> {
+        Ok(Self::Name(value.try_into()?))
+    }
+}
+
+impl<'a> TryFrom<&'a str> for NamespaceTarget<'a> {
+    type Error = <NamespaceName<'a> as TryFrom<&'a str>>::Error;
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        Ok(Self::Name(value.try_into()?))
+    }
+}
+
 impl NamespaceSchema {
     /// Start a new `NamespaceSchema` with empty `tables` but the rest of the information populated
     /// from the given `Namespace`.
@@ -483,7 +647,7 @@ impl NamespaceSchema {
 impl NamespaceSchema {
     /// Estimated Size in bytes including `self`.
     pub fn size(&self) -> usize {
-        std::mem::size_of_val(self)
+        size_of_val(self)
             + self
                 .tables
                 .iter()
@@ -492,7 +656,7 @@ impl NamespaceSchema {
     }
 }
 
-impl From<&NamespaceSchema> for generated_types::influxdata::iox::schema::v1::NamespaceSchema {
+impl From<&NamespaceSchema> for schema_proto::NamespaceSchema {
     fn from(schema: &NamespaceSchema) -> Self {
         namespace_schema_proto(schema.id, schema.tables.iter())
     }
@@ -503,13 +667,13 @@ impl From<&NamespaceSchema> for generated_types::influxdata::iox::schema::v1::Na
 /// the whole `NamespaceSchema` to use the `From` impl.
 pub fn namespace_schema_proto<'a>(
     id: NamespaceId,
-    tables: impl Iterator<Item = (&'a String, &'a TableSchema)>,
-) -> generated_types::influxdata::iox::schema::v1::NamespaceSchema {
-    use generated_types::influxdata::iox::schema::v1 as proto;
-    proto::NamespaceSchema {
+    tables: impl IntoIterator<Item = (&'a String, &'a TableSchema)>,
+) -> schema_proto::NamespaceSchema {
+    schema_proto::NamespaceSchema {
         id: id.get(),
         tables: tables
-            .map(|(name, t)| (name.clone(), proto::TableSchema::from(t)))
+            .into_iter()
+            .map(|(name, t)| (name.clone(), schema_proto::TableSchema::from(t)))
             .collect(),
     }
 }
@@ -525,16 +689,21 @@ pub struct Table {
     pub name: String,
     /// The partition template to use for writes in this table.
     pub partition_template: TablePartitionTemplateOverride,
+    /// Whether this table is enabled for an iceberg export.
+    pub iceberg_enabled: bool,
+    /// When this table was marked for deletion
+    pub deleted_at: Option<Timestamp>,
 }
 
 /// Serialise a [`Table`] object into its protobuf representation.
-impl From<Table> for generated_types::influxdata::iox::table::v1::Table {
+impl From<Table> for table_proto::Table {
     fn from(value: Table) -> Self {
         Self {
             id: value.id.get(),
             name: value.name,
             namespace_id: value.namespace_id.get(),
             partition_template: value.partition_template.as_proto().cloned(),
+            iceberg_enabled: value.iceberg_enabled,
         }
     }
 }
@@ -552,12 +721,16 @@ pub struct TableWithStorage {
     pub partition_template: TablePartitionTemplateOverride,
     /// The total size of the table, in bytes.
     pub size_bytes: i64,
+    /// The optional timestamp of when this table was soft-deleted.
+    /// This field is only set if the table is soft-deleted.
+    /// None means "not deleted", i.e. the table is active.
+    pub deleted_at: Option<Timestamp>,
+    /// The total number of active columns in this table.
+    pub column_count: i64,
 }
 
 /// Serialise a [`TableWithStorage`] object into its protobuf representation.
-impl From<TableWithStorage>
-    for generated_types::influxdata::iox::catalog_storage::v1::TableWithStorage
-{
+impl From<TableWithStorage> for catalog_storage_proto::TableWithStorage {
     fn from(value: TableWithStorage) -> Self {
         Self {
             id: value.id.get(),
@@ -565,7 +738,33 @@ impl From<TableWithStorage>
             namespace_id: value.namespace_id.get(),
             partition_template: value.partition_template.as_proto().cloned(),
             size_bytes: value.size_bytes,
+            deleted_at: value.deleted_at.map(serialize_timestamp),
+            column_count: value.column_count,
         }
+    }
+}
+
+impl TryFrom<catalog_storage_proto::TableWithStorage> for TableWithStorage {
+    type Error = ProtoV1AnyWithStorageError;
+
+    /// We require fallible conversion because `partition_template` can be invalid.
+    fn try_from(value: catalog_storage_proto::TableWithStorage) -> Result<Self, Self::Error> {
+        let partition_template = value
+            .partition_template
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(ProtoV1AnyWithStorageError::PartitionTemplate)?
+            .unwrap_or_default();
+
+        Ok(Self {
+            id: TableId::new(value.id),
+            name: value.name,
+            namespace_id: NamespaceId::new(value.namespace_id),
+            partition_template,
+            size_bytes: value.size_bytes,
+            deleted_at: value.deleted_at.map(deserialize_timestamp),
+            column_count: value.column_count,
+        })
     }
 }
 
@@ -658,10 +857,8 @@ impl TableSchema {
     }
 }
 
-impl From<&TableSchema> for generated_types::influxdata::iox::schema::v1::TableSchema {
+impl From<&TableSchema> for schema_proto::TableSchema {
     fn from(table_schema: &TableSchema) -> Self {
-        use generated_types::influxdata::iox::schema::v1 as proto;
-
         Self {
             id: table_schema.id.get(),
             columns: table_schema
@@ -670,7 +867,7 @@ impl From<&TableSchema> for generated_types::influxdata::iox::schema::v1::TableS
                 .map(|(name, c)| {
                     (
                         name.to_string(),
-                        proto::ColumnSchema {
+                        schema_proto::ColumnSchema {
                             id: c.id.get(),
                             column_type: c.column_type as i32,
                         },
@@ -678,6 +875,33 @@ impl From<&TableSchema> for generated_types::influxdata::iox::schema::v1::TableS
                 })
                 .collect(),
         }
+    }
+}
+
+/// For something that may or may not be just a [`TableSchema`]. Allows for usage of either
+/// BTreeMap<String, [`Table`]> or BTreeMap<String, [`TableSchema`]> without needing to convert
+/// the entire `BTreeMap` from `Table` to `TableSchema`
+pub trait MaybeTableSchema: Send + Sync {
+    /// Maybe extract the inner [`TableSchema`]
+    fn schema_if_active(&self) -> Option<&TableSchema>;
+    /// Maybe extract the inner [`TableSchema`] mutably
+    fn schema_mut_if_active(&mut self) -> Option<&mut TableSchema>;
+    /// Get the Id of the referenced table (should be known even if this doesn't contain a
+    /// [`TableSchema`] itself
+    fn id(&self) -> TableId;
+}
+
+impl MaybeTableSchema for TableSchema {
+    fn schema_if_active(&self) -> Option<&TableSchema> {
+        Some(self)
+    }
+
+    fn schema_mut_if_active(&mut self) -> Option<&mut TableSchema> {
+        Some(self)
+    }
+
+    fn id(&self) -> TableId {
+        self.id
     }
 }
 
@@ -702,9 +926,7 @@ pub struct SkippedCompaction {
     pub limit_num_files_first_in_partition: i64,
 }
 
-impl From<SkippedCompaction>
-    for generated_types::influxdata::iox::skipped_compaction::v1::SkippedCompaction
-{
+impl From<SkippedCompaction> for skipped_compaction_proto::SkippedCompaction {
     fn from(skipped_compaction: SkippedCompaction) -> Self {
         let SkippedCompaction {
             partition_id,
@@ -730,12 +952,8 @@ impl From<SkippedCompaction>
     }
 }
 
-impl From<generated_types::influxdata::iox::skipped_compaction::v1::SkippedCompaction>
-    for SkippedCompaction
-{
-    fn from(
-        skipped_compaction: generated_types::influxdata::iox::skipped_compaction::v1::SkippedCompaction,
-    ) -> Self {
+impl From<skipped_compaction_proto::SkippedCompaction> for SkippedCompaction {
+    fn from(skipped_compaction: skipped_compaction_proto::SkippedCompaction) -> Self {
         Self {
             partition_id: PartitionId::new(skipped_compaction.partition_id),
             reason: skipped_compaction.reason,
@@ -809,16 +1027,16 @@ pub struct ParquetFile {
     /// The compaction level of the file.
     ///
     ///  * 0 (`CompactionLevel::Initial`): represents a level-0 file that is persisted by an
-    ///      Ingester. Partitions with level-0 files are usually hot/recent partitions.
+    ///    Ingester. Partitions with level-0 files are usually hot/recent partitions.
     ///  * 1 (`CompactionLevel::FileOverlapped`): represents a level-1 file that is persisted by a
-    ///      Compactor and potentially overlaps with other level-1 files. Partitions with level-1
-    ///      files are partitions with a lot of or/and large overlapped files that have to go
-    ///      through many compaction cycles before they are fully compacted to non-overlapped
-    ///      files.
+    ///    Compactor and potentially overlaps with other level-1 files. Partitions with level-1
+    ///    files are partitions with a lot of or/and large overlapped files that have to go
+    ///    through many compaction cycles before they are fully compacted to non-overlapped
+    ///    files.
     ///  * 2 (`CompactionLevel::FileNonOverlapped`): represents a level-1 file that is persisted by
-    ///      a Compactor and does not overlap with other files except level 0 ones. Eventually,
-    ///      cold partitions (partitions that no longer needs to get compacted) will only include
-    ///      one or many level-1 files
+    ///    a Compactor and does not overlap with other files except level 0 ones. Eventually,
+    ///    cold partitions (partitions that no longer needs to get compacted) will only include
+    ///    one or many level-1 files
     pub compaction_level: CompactionLevel,
     /// the creation time of the parquet file
     pub created_at: Timestamp,
@@ -827,8 +1045,9 @@ pub struct ParquetFile {
     /// # Relation to Table-wide Column Set
     /// Columns within this set may or may not be part of the table-wide schema.
     ///
-    /// Columns that are NOT part of the table-wide schema must be ignored. It is likely that these
-    /// columns were originally part of the table but were later removed.
+    /// Columns that are NOT part of the table-wide schema must be ignored. While there is no way
+    /// to remove columns from a table schema at the time this comment is being written, there may
+    /// be ways to delete columns in the future.
     ///
     /// # Column Types
     /// Column types are identical to the table-wide types.
@@ -898,8 +1117,7 @@ impl ParquetFile {
             .map(|x| x.size())
             .unwrap_or_default();
 
-        std::mem::size_of_val(self) + hash_id + self.column_set.size()
-            - std::mem::size_of_val(&self.column_set)
+        size_of_val(self) + hash_id + self.column_set.size() - size_of_val(&self.column_set)
     }
 
     /// Return true if the time range overlaps with the time range of the given file
@@ -930,7 +1148,7 @@ impl ParquetFile {
     }
 }
 
-impl From<ParquetFile> for generated_types::influxdata::iox::catalog::v1::ParquetFile {
+impl From<ParquetFile> for catalog_proto::ParquetFile {
     fn from(v: ParquetFile) -> Self {
         Self {
             id: v.id.get(),
@@ -972,18 +1190,20 @@ pub enum ProtoV1ParquetFileError {
     CompactionLevel,
 }
 
-impl TryFrom<generated_types::influxdata::iox::catalog::v1::ParquetFile> for ParquetFile {
+impl TryFrom<catalog_proto::ParquetFile> for ParquetFile {
     type Error = ProtoV1ParquetFileError;
 
-    fn try_from(
-        v: generated_types::influxdata::iox::catalog::v1::ParquetFile,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(v: catalog_proto::ParquetFile) -> Result<Self, Self::Error> {
         Ok(Self {
             id: ParquetFileId::new(v.id),
             namespace_id: NamespaceId::new(v.namespace_id),
             table_id: TableId::new(v.table_id),
             partition_id: PartitionId::new(v.partition_id),
-            partition_hash_id: Some(v.partition_hash_id[..].try_into()?),
+            partition_hash_id: if v.partition_hash_id.is_empty() {
+                None
+            } else {
+                Some(v.partition_hash_id[..].try_into()?)
+            },
             object_store_id: ObjectStoreId::from_str(&v.object_store_id)?,
             min_time: Timestamp::new(v.min_time),
             max_time: Timestamp::new(v.max_time),
@@ -1130,7 +1350,7 @@ pub struct ChunkId(Uuid);
 
 impl ChunkId {
     /// Create new, random ID.
-    #[allow(clippy::new_without_default)] // `new` creates non-deterministic result
+    #[expect(clippy::new_without_default)] // `new` creates non-deterministic result
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -1333,7 +1553,7 @@ impl std::fmt::Display for Op {
 
 /// Scalar value of a certain type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Scalar {
     Bool(bool),
     I64(i64),
@@ -1468,7 +1688,7 @@ impl ColumnSummary {
 
 // Replicate this enum here as it can't be derived from the existing statistics
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum InfluxDbType {
     Tag,
     Field,
@@ -1739,7 +1959,7 @@ impl IsNan for f64 {
 
 /// Statistics and type information for a column.
 #[derive(Debug, PartialEq, Clone)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Statistics {
     I64(StatValues<i64>),
     U64(StatValues<u64>),
@@ -1909,7 +2129,7 @@ impl TableSummary {
     pub fn size(&self) -> usize {
         let size: usize = self.columns.iter().map(|c| c.size()).sum();
         size + mem::size_of::<Self>() // Add size of this struct that points to
-                                      // table and ColumnSummary
+        // table and ColumnSummary
     }
 
     /// Extracts min/max values of the timestamp column, if possible
@@ -3121,5 +3341,131 @@ mod tests {
         let tr = TimestampRange::new(2, 1);
         assert_eq!(tr.start(), 1);
         assert_eq!(tr.end(), 1);
+    }
+
+    #[test]
+    fn catalog_service_parquet_file_serde_roundtrip() {
+        // This part of the test can be removed when all partitions have hash IDs.
+        let old_style_parquet_file = ParquetFile {
+            id: ParquetFileId::new(3),
+            namespace_id: NamespaceId::new(4),
+            table_id: TableId::new(5),
+            partition_id: PartitionId::new(6),
+            partition_hash_id: None, // this is the important part for this test
+            object_store_id: ObjectStoreId::new(),
+            min_time: Timestamp::new(30),
+            max_time: Timestamp::new(50),
+            to_delete: None,
+            file_size_bytes: 1024,
+            row_count: 42,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(70),
+            column_set: ColumnSet::empty(),
+            max_l0_created_at: Timestamp::new(70),
+            source: None,
+        };
+        let catalog_proto_old_style_parquet_file =
+            catalog_proto::ParquetFile::from(old_style_parquet_file.clone());
+        let round_trip_old_style_parquet_file =
+            ParquetFile::try_from(catalog_proto_old_style_parquet_file).unwrap();
+        assert_eq!(old_style_parquet_file, round_trip_old_style_parquet_file);
+
+        let table_id = TableId::new(5);
+        let parquet_file = ParquetFile {
+            id: ParquetFileId::new(3),
+            namespace_id: NamespaceId::new(4),
+            table_id,
+            partition_id: PartitionId::new(6),
+            partition_hash_id: Some(PartitionHashId::new(
+                table_id,
+                &PartitionKey::from("arbitrary"),
+            )),
+            object_store_id: ObjectStoreId::new(),
+            min_time: Timestamp::new(30),
+            max_time: Timestamp::new(50),
+            to_delete: None,
+            file_size_bytes: 1024,
+            row_count: 42,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(70),
+            column_set: ColumnSet::empty(),
+            max_l0_created_at: Timestamp::new(70),
+            source: None,
+        };
+        let catalog_proto_parquet_file = catalog_proto::ParquetFile::from(parquet_file.clone());
+        let round_trip_parquet_file = ParquetFile::try_from(catalog_proto_parquet_file).unwrap();
+        assert_eq!(parquet_file, round_trip_parquet_file);
+    }
+
+    #[test]
+    fn catalog_storage_service_namespace_serde_roundtrip() {
+        // active namespace
+        let namespace_active = NamespaceWithStorage {
+            id: NamespaceId::new(1),
+            name: "a".into(),
+            retention_period_ns: Some(1),
+            size_bytes: 1,
+            table_count: 1,
+            max_tables: Default::default(),
+            max_columns_per_table: Default::default(),
+            partition_template: Default::default(),
+            deleted_at: None,
+        };
+        let catalog_proto_namespace =
+            catalog_storage_proto::NamespaceWithStorage::from(namespace_active.clone());
+        let round_trip_namespace_active =
+            NamespaceWithStorage::try_from(catalog_proto_namespace).unwrap();
+        assert_eq!(namespace_active, round_trip_namespace_active);
+
+        // deleted namespace
+        let namespace_deleted = NamespaceWithStorage {
+            id: NamespaceId::new(2),
+            name: "b".into(),
+            retention_period_ns: Some(2),
+            size_bytes: 2,
+            table_count: 2,
+            max_tables: Default::default(),
+            max_columns_per_table: Default::default(),
+            partition_template: Default::default(),
+            deleted_at: Some(Timestamp(1_000_000_001)),
+        };
+        let catalog_proto_namespace =
+            catalog_storage_proto::NamespaceWithStorage::from(namespace_deleted.clone());
+        let round_trip_namespace_deleted =
+            NamespaceWithStorage::try_from(catalog_proto_namespace).unwrap();
+        assert_eq!(namespace_deleted, round_trip_namespace_deleted);
+    }
+
+    #[test]
+    fn catalog_storage_service_table_serde_roundtrip() {
+        // active table
+        let table_active = TableWithStorage {
+            id: TableId::new(1),
+            namespace_id: NamespaceId::new(1),
+            name: "a".into(),
+            partition_template: Default::default(),
+            size_bytes: 1,
+            deleted_at: None,
+            column_count: 1,
+        };
+        let catalog_proto_table =
+            catalog_storage_proto::TableWithStorage::from(table_active.clone());
+        let round_trip_table_active = TableWithStorage::try_from(catalog_proto_table).unwrap();
+        assert_eq!(table_active, round_trip_table_active);
+
+        // deleted table
+        let table_deleted = TableWithStorage {
+            id: TableId::new(2),
+            namespace_id: NamespaceId::new(2),
+            name: "b".into(),
+            partition_template: Default::default(),
+            size_bytes: 2,
+            deleted_at: Some(Timestamp::new(1_000_000_001)),
+            column_count: 2,
+        };
+        let catalog_proto_table =
+            catalog_storage_proto::TableWithStorage::from(table_deleted.clone());
+        let round_trip_table_deleted = TableWithStorage::try_from(catalog_proto_table).unwrap();
+        assert_eq!(table_deleted, round_trip_table_deleted);
     }
 }

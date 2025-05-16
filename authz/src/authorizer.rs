@@ -3,17 +3,18 @@ use std::ops::ControlFlow;
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
 
-use super::{Error, Permission};
+use super::{Authorization, Error, Permission};
 
 /// An authorizer is used to validate a request
 /// (+ associated permissions needed to fulfill the request)
 /// with an authorization token that has been extracted from the request.
 #[async_trait]
 pub trait Authorizer: std::fmt::Debug + Send + Sync {
-    /// Determine the permissions associated with a request token.
+    /// Determine the authorization provided by a request token.
     ///
-    /// The returned list of permissions is the intersection of the permissions
-    /// requested and the permissions associated with the token.
+    /// The returned [Authorization] contains the subject associated
+    /// with the token, if available, along with the subset of the
+    /// requested permissions provided by the token.
     ///
     /// Implementations of this trait should return the specified errors under
     /// the following conditions:
@@ -29,11 +30,11 @@ pub trait Authorizer: std::fmt::Debug + Send + Sync {
     ///
     /// * [`Error::Verification`]: the token permissions were not possible
     ///       to validate - an internal error has occurred
-    async fn permissions(
+    async fn authorize(
         &self,
         token: Option<Vec<u8>>,
         perms: &[Permission],
-    ) -> Result<Vec<Permission>, Error>;
+    ) -> Result<Authorization, Error>;
 
     /// Make a test request that determines if end-to-end communication
     /// with the service is working.
@@ -41,17 +42,15 @@ pub trait Authorizer: std::fmt::Debug + Send + Sync {
     /// Test is performed during deployment, with ordering of availability not being guaranteed.
     async fn probe(&self) -> Result<(), Error> {
         Backoff::new(&BackoffConfig::default())
-            .retry_with_backoff("probe iox-authz service", move || {
-                async {
-                    match self.permissions(Some(b"".to_vec()), &[]).await {
-                        // got response from authorizer server
-                        Ok(_)
-                        | Err(Error::Forbidden)
-                        | Err(Error::InvalidToken)
-                        | Err(Error::NoToken) => ControlFlow::Break(Ok(())),
-                        // communication error == Error::Verification
-                        Err(e) => ControlFlow::<_, Error>::Continue(e),
-                    }
+            .retry_with_backoff("probe iox-authz service", async move || {
+                match self.authorize(Some(b"".to_vec()), &[]).await {
+                    // got response from authorizer server
+                    Ok(_)
+                    | Err(Error::Forbidden { .. })
+                    | Err(Error::InvalidToken)
+                    | Err(Error::NoToken) => ControlFlow::Break(Ok(())),
+                    // communication error == Error::Verification
+                    Err(e) => ControlFlow::<_, Error>::Continue(e),
                 }
             })
             .await
@@ -63,26 +62,26 @@ pub trait Authorizer: std::fmt::Debug + Send + Sync {
 /// Provides response to inner `IoxAuthorizer::permissions()`
 #[async_trait]
 impl<T: Authorizer> Authorizer for Option<T> {
-    async fn permissions(
+    async fn authorize(
         &self,
         token: Option<Vec<u8>>,
         perms: &[Permission],
-    ) -> Result<Vec<Permission>, Error> {
+    ) -> Result<Authorization, Error> {
         match self {
-            Some(authz) => authz.permissions(token, perms).await,
+            Some(authz) => authz.authorize(token, perms).await,
             // no authz rpc service => return same perms requested. Used for testing.
-            None => Ok(perms.to_vec()),
+            None => Ok(Authorization::new(None, perms.to_vec())),
         }
     }
 }
 
 #[async_trait]
 impl<T: AsRef<dyn Authorizer> + std::fmt::Debug + Send + Sync> Authorizer for T {
-    async fn permissions(
+    async fn authorize(
         &self,
         token: Option<Vec<u8>>,
         perms: &[Permission],
-    ) -> Result<Vec<Permission>, Error> {
-        self.as_ref().permissions(token, perms).await
+    ) -> Result<Authorization, Error> {
+        self.as_ref().authorize(token, perms).await
     }
 }

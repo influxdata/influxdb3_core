@@ -108,7 +108,7 @@
 //!
 //! Any partition template for a _newly_ created record (namespace or table)
 //! MUST contain a [`TemplatePart::TimeFormat`] part. Partition templates for
-//! pre-existing records are allowed to forgoe this requirement as no reasonable
+//! pre-existing records are allowed to forgo this requirement as no reasonable
 //! migration path existed at the time this extra validation was introduced.
 //!
 //! Partitioning without time has bad long-term performance implications, but
@@ -141,7 +141,7 @@
 //! parts:
 //!
 //!   * `time` - The time column has special meaning and is covered by strftime
-//!              formatters ([`TAG_VALUE_KEY_TIME`])
+//!     formatters ([`TAG_VALUE_KEY_TIME`])
 //!
 //! ### Examples
 //!
@@ -178,15 +178,19 @@
 use std::{
     borrow::Cow,
     cmp::min,
-    fmt::{Display, Formatter},
+    collections::{HashMap, HashSet},
+    fmt::{Display, Formatter, Write},
     ops::{Add, Range},
     sync::{Arc, LazyLock},
 };
 
-use chrono::{format::StrftimeItems, DateTime, Days, Months, Utc};
+use chrono::{
+    DateTime, Days, Months, Utc,
+    format::{self, Numeric, StrftimeItems},
+};
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use murmur3::murmur3_32;
-use percent_encoding::{percent_decode_str, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str};
 use schema::TIME_COLUMN_NAME;
 use thiserror::Error;
 
@@ -194,7 +198,6 @@ use crate::{MismatchedNumPartsError, PartitionKey, PartitionKeyBuilder};
 
 /// Reasons a user-specified partition template isn't valid.
 #[derive(Debug, Error)]
-#[allow(missing_copy_implementations)]
 pub enum ValidationError {
     /// The partition template didn't define any parts.
     #[error("Custom partition template must have at least one part")]
@@ -251,6 +254,22 @@ pub enum ValidationError {
     /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
     #[error("partition template must include a time format part")]
     TimeFormatPartRequired,
+
+    /// The partition template defines a [`TimeFormat`] part, but the
+    /// provided strftime formatter contains unsupported specifiers.
+    ///
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
+    #[error("unsupported specifier found in time format \"{0}\" - supported specifiers: {1}")]
+    UnsupportedStrfTimeSpecifier(String, String),
+
+    /// The partition template defines a [`TimeFormat`] part, but the
+    /// provided strftime format that is missing required specifiers.
+    ///
+    /// For example: using %m without %Y.
+    ///
+    /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
+    #[error("missing required specifier(s) in time format of partition template: {0}")]
+    MissingRequiredStrfTimeSpecifier(String),
 }
 
 /// The maximum number of template parts a custom partition template may specify, to limit the
@@ -416,6 +435,179 @@ fn split_partition_key(key: &str) -> impl Iterator<Item = &str> {
 #[sqlx(transparent, no_pg_array)]
 pub struct NamespacePartitionTemplateOverride(Option<serialization::Wrapper>);
 
+/// Function validates a strftime format string for use in an existing partition template.
+/// This is more permissive, since we don't break existing (though probably sub-optimal)
+/// partition templates when we tighten restriction on new format strings.
+///
+/// This function basically weeds out the format strings that would cause stability
+/// issues.
+///
+/// # Errors
+///
+/// This function will return ValidationError if the strftime format string is invalid.
+fn validate_existing_time_format(fmt: &str) -> Result<(), ValidationError> {
+    // Empty is not a valid time format
+    if fmt.is_empty() {
+        return Err(ValidationError::InvalidStrftime(fmt.into()));
+    }
+
+    // Chrono will panic during timestamp formatting if this
+    // formatter directive is used!
+    //
+    // An upper-case Z does not trigger the panic code path so
+    // is not checked for.  Technically this excludes the legal
+    // case of "%%#z" - we can fix this later if anyone cares.
+    if fmt.contains("%#z") {
+        return Err(ValidationError::InvalidStrftime(
+            "%#z cannot be used".to_string(),
+        ));
+    }
+
+    // Currently we can only tell whether a nonempty format is valid by trying
+    // to use it. See <https://github.com/chronotope/chrono/issues/47>
+    let mut dev_null = String::new();
+    write!(
+        dev_null,
+        "{}",
+        Utc::now().format_with_items(StrftimeItems::new(fmt))
+    )
+    .map_err(|_| ValidationError::InvalidStrftime(fmt.into()))
+}
+
+/// Function validates a strftime format string for use in a NEW partition template.
+/// This is where newer restrictions are applied to reject the creation of ill-advised
+/// partition templates. This will not break existing partition templates.
+///
+/// Restrictions:
+/// - | cannot be used
+/// - at least one specifier is required
+/// - no unsupported specifiers
+/// - no dangling specifiers (i.e. %m without %Y)
+/// - no repeated specifiers
+///
+/// # Errors
+///
+/// This function will return a ValidationError with an actionable message for the user.
+fn validate_new_time_format(fmt: &str) -> Result<(), ValidationError> {
+    // Don't allow the field delimiter inside the time format.
+    if fmt.contains("|") {
+        return Err(ValidationError::InvalidStrftime(
+            "'|' cannot be used in the time format".to_string(),
+        ));
+    }
+
+    // Error messages need to use the character representation of the specifier
+    static SUPPORTED_SPEC_CHAR_MAP: LazyLock<HashMap<Numeric, char>> = LazyLock::new(|| {
+        HashMap::from([
+            (Numeric::Year, 'Y'),
+            (Numeric::Month, 'm'),
+            (Numeric::Day, 'd'),
+        ])
+    });
+
+    // String of supported specifiers
+    static SUPPORTED_SPECIFIERS_STR: LazyLock<String> = LazyLock::new(|| {
+        SUPPORTED_SPEC_CHAR_MAP
+            .values()
+            .map(|v| format!("%{}", v))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+
+    // Some specifiers make sense only in the context of another.  For example, day of the month (%d) requires
+    // the month (%m) to be present. In this map, the key requires the value.
+    static SPEC_DEPS: LazyLock<HashMap<Numeric, Numeric>> = LazyLock::new(|| {
+        HashMap::from([
+            (Numeric::Day, Numeric::Month),
+            (Numeric::Month, Numeric::Year),
+        ])
+    });
+
+    let mut specs_found_set: HashSet<Numeric> = HashSet::new();
+
+    for item in StrftimeItems::new(fmt) {
+        match item {
+            // these don't have specifiers
+            format::Item::Literal(_)
+            | format::Item::OwnedLiteral(_)
+            | format::Item::Space(_)
+            | format::Item::OwnedSpace(_) => continue,
+
+            // fmt doesn't parse
+            format::Item::Error => {
+                return Err(ValidationError::InvalidStrftime(fmt.into()));
+            }
+
+            // no Fixed specifiers currently supported
+            format::Item::Fixed(_) => {
+                return Err(ValidationError::UnsupportedStrfTimeSpecifier(
+                    fmt.into(),
+                    SUPPORTED_SPECIFIERS_STR.as_str().to_owned(),
+                ));
+            }
+
+            // All supported specifiers are Numeric
+            format::Item::Numeric(n, _pad) => {
+                if SUPPORTED_SPEC_CHAR_MAP.contains_key(&n) {
+                    let spec = SUPPORTED_SPEC_CHAR_MAP[&n];
+
+                    if !specs_found_set.insert(n) {
+                        return Err(ValidationError::InvalidStrftime(format!(
+                            "Duplicate specifier (%{}) found in time format: \"{}\"",
+                            spec, fmt
+                        )));
+                    }
+                } else {
+                    return Err(ValidationError::UnsupportedStrfTimeSpecifier(
+                        fmt.into(),
+                        SUPPORTED_SPECIFIERS_STR.as_str().to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if specs_found_set.is_empty() {
+        return Err(ValidationError::InvalidStrftime(format!(
+            "No specifiers found in time format: \"{}\"",
+            fmt
+        )));
+    }
+
+    for spec in &specs_found_set {
+        if let Some(required) = SPEC_DEPS.get(spec) {
+            if !specs_found_set.contains(required) {
+                return Err(ValidationError::MissingRequiredStrfTimeSpecifier(format!(
+                    "Specifier %{} in \"{}\" requires %{}",
+                    SUPPORTED_SPEC_CHAR_MAP[spec], fmt, SUPPORTED_SPEC_CHAR_MAP[required]
+                )));
+            }
+        }
+    }
+
+    // While redundant, ensures rejection of anything that would fail in serialization later.
+    validate_existing_time_format(fmt)?;
+
+    Ok(())
+}
+
+fn validate_time_format_in_parts(parts: &[proto::TemplatePart]) -> Result<(), ValidationError> {
+    let mut has_time_format = false;
+
+    for part in parts {
+        if let Some(proto::template_part::Part::TimeFormat(fmt)) = part.part.as_ref() {
+            has_time_format = true;
+            validate_new_time_format(fmt)?; // Call the existing validation function
+        }
+    }
+
+    if !has_time_format {
+        return Err(ValidationError::TimeFormatPartRequired);
+    }
+
+    Ok(())
+}
+
 impl NamespacePartitionTemplateOverride {
     /// A const "default" impl for testing.
     pub const fn const_default() -> Self {
@@ -430,19 +622,13 @@ impl NamespacePartitionTemplateOverride {
     ///
     /// This function will return an error if the custom partition template
     /// specified is invalid. If `partition_template` does not contain a
-    /// [`TimeFormat`] part it will also be rejected.
+    /// valid [`TimeFormat`] part it will also be rejected.
     ///
     /// [`TimeFormat`]: [`proto::template_part::Part::TimeFormat`]
     pub fn try_new(partition_template: proto::PartitionTemplate) -> Result<Self, ValidationError> {
-        let namespace_template = Self::try_from(partition_template)?;
+        let namespace_template = Self::try_from(partition_template.clone())?;
 
-        let template_contains_time_format = namespace_template
-            .parts()
-            .any(|p| matches!(p, TemplatePart::TimeFormat(_)));
-
-        if !template_contains_time_format {
-            return Err(ValidationError::TimeFormatPartRequired);
-        }
+        validate_time_format_in_parts(partition_template.parts.as_slice())?;
 
         Ok(namespace_template)
     }
@@ -536,20 +722,8 @@ impl TablePartitionTemplateOverride {
     ) -> Result<Self, ValidationError> {
         // If a custom table template was specified for the new table and no
         // part in it is a [`TimeFormat`] part then it should not be created.
-        if custom_table_template
-            .as_ref()
-            .is_some_and(|table_template| {
-                !table_template.parts.iter().any(|p| {
-                    matches!(
-                        p,
-                        proto::TemplatePart {
-                            part: Some(proto::template_part::Part::TimeFormat(..))
-                        }
-                    )
-                })
-            })
-        {
-            return Err(ValidationError::TimeFormatPartRequired);
+        if let Some(table_template) = &custom_table_template {
+            validate_time_format_in_parts(table_template.parts.as_slice())?;
         }
 
         let table = Self::try_from_existing(custom_table_template, namespace_template)?;
@@ -582,7 +756,7 @@ impl TablePartitionTemplateOverride {
     }
 
     /// Returns the number of parts in this template.
-    #[allow(clippy::len_without_is_empty)] // Senseless - there must always be >0 parts.
+    #[expect(clippy::len_without_is_empty)] // Senseless - there must always be >0 parts.
     pub fn len(&self) -> usize {
         self.parts().count()
     }
@@ -692,18 +866,33 @@ impl TryFrom<Option<proto::PartitionTemplate>> for TablePartitionTemplateOverrid
     }
 }
 
+impl TryFrom<proto::PartitionTemplate> for TablePartitionTemplateOverride {
+    type Error = ValidationError;
+
+    /// An existing namepsace pulled from the catalog may contain a valid, but since
+    /// disallowed partition template.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the custom partition template specified is invalid.
+    fn try_from(partition_template: proto::PartitionTemplate) -> Result<Self, Self::Error> {
+        Ok(Self(Some(serialization::Wrapper::try_from(
+            partition_template,
+        )?)))
+    }
+}
+
 /// This manages the serialization/deserialization of the `proto::PartitionTemplate` type to and
 /// from the database through `sqlx` for the `NamespacePartitionTemplateOverride` and
 /// `TablePartitionTemplateOverride` types. It's an internal implementation detail to minimize code
 /// duplication.
 mod serialization {
     use super::{
-        TemplatePart, ValidationError, ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
-        PARTITION_BY_DAY_PROTO, TAG_VALUE_KEY_TIME,
+        ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_BY_DAY_PROTO,
+        TAG_VALUE_KEY_TIME, TemplatePart, ValidationError, validate_existing_time_format,
     };
-    use chrono::{format::StrftimeItems, Utc};
     use generated_types::influxdata::iox::partition_template::v1 as proto;
-    use std::{collections::HashSet, fmt::Write, sync::Arc};
+    use std::{collections::HashSet, sync::Arc};
 
     #[derive(Debug, Clone, PartialEq, Hash)]
     pub struct Wrapper(Arc<proto::PartitionTemplate>);
@@ -777,31 +966,7 @@ mod serialization {
             for part in &partition_template.parts {
                 match &part.part {
                     Some(proto::template_part::Part::TimeFormat(fmt)) => {
-                        // Empty is not a valid time format
-                        if fmt.is_empty() {
-                            return Err(ValidationError::InvalidStrftime(fmt.into()));
-                        }
-
-                        // Chrono will panic during timestamp formatting if this
-                        // formatter directive is used!
-                        //
-                        // An upper-case Z does not trigger the panic code path so
-                        // is not checked for.
-                        if fmt.contains("%#z") {
-                            return Err(ValidationError::InvalidStrftime(
-                                "%#z cannot be used".to_string(),
-                            ));
-                        }
-
-                        // Currently we can only tell whether a nonempty format is valid by trying
-                        // to use it. See <https://github.com/chronotope/chrono/issues/47>
-                        let mut dev_null = String::new();
-                        write!(
-                            dev_null,
-                            "{}",
-                            Utc::now().format_with_items(StrftimeItems::new(fmt))
-                        )
-                        .map_err(|_| ValidationError::InvalidStrftime(fmt.into()))?
+                        validate_existing_time_format(fmt)?;
                     }
                     Some(proto::template_part::Part::TagValue(value)) => {
                         // Empty is not a valid tag value
@@ -1040,7 +1205,7 @@ impl<'t> ColumnValuesBuilder<'t> {
     }
 
     /// Get the number of [`TemplatePart`]s used to create this builder.
-    #[allow(clippy::len_without_is_empty)] // there must always be >0 parts.
+    #[expect(clippy::len_without_is_empty)] // there must always be >0 parts.
     pub fn len(&self) -> usize {
         self.parts.len()
     }
@@ -1155,7 +1320,7 @@ fn parse_part_bucket(value: &str, num_buckets: u32) -> Option<ColumnValue<'_>> {
     Some(ColumnValue::Bucket { id, num_buckets })
 }
 
-fn parsed_implicit_defaults(mut parsed: chrono::format::Parsed) -> Option<chrono::format::Parsed> {
+fn parsed_implicit_defaults(mut parsed: format::Parsed) -> Option<format::Parsed> {
     parsed.year?;
 
     if parsed.month.is_none() {
@@ -1209,14 +1374,19 @@ fn parsed_implicit_defaults(mut parsed: chrono::format::Parsed) -> Option<chrono
 pub struct TimeFormatColumnValueState<'t> {
     /// The parsed time format string. This is used to construct a DateTime from the partition key
     /// timestamp
-    parsed_format: Vec<chrono::format::Item<'t>>,
+    parsed_format: Vec<format::Item<'t>>,
     /// Computed time duration to add to a partition key timestamp (representing the lower bound of
     /// the partition time interval) to get the upper bound of the partition time interval
     partition_duration: PartitionDuration,
 }
 
 impl<'t> TimeFormatColumnValueState<'t> {
-    fn try_new(format: &'t str) -> Option<Self> {
+    /// Construct a new [`TimeFormatColumnValueState`] from a formatted time string slice.
+    ///
+    /// A formatted time string slice may look like:
+    /// - '%Y-%m-%d'
+    /// - '%Y-%m'
+    pub fn try_new(format: &'t str) -> Option<Self> {
         let parsed_format = StrftimeItems::new(format).collect::<Vec<_>>();
         let partition_duration = PartitionDuration::from_format_items(parsed_format.iter())?;
         Some(Self {
@@ -1225,8 +1395,13 @@ impl<'t> TimeFormatColumnValueState<'t> {
         })
     }
 
+    /// Return a reference to the [`PartitionDuration`].
+    pub fn partition_duration(&self) -> &PartitionDuration {
+        &self.partition_duration
+    }
+
     fn parse_part_time_format(&self, value: &'t str) -> Option<ColumnValue<'t>> {
-        use chrono::format::{parse, Parsed};
+        use chrono::format::{Parsed, parse};
         let Self {
             parsed_format,
             partition_duration,
@@ -1263,7 +1438,7 @@ impl PartitionDuration {
     /// Convert from a numeric time specifier. For example [`chrono::format::Numeric::Year`] is converted to
     /// [`PartitionDuration::Yearly`]. A value of [`None`] indicates that the time format is not supported by
     /// partition pruning.
-    fn from_numeric_format_part(value: chrono::format::Numeric) -> Option<Self> {
+    fn from_numeric_format_part(value: format::Numeric) -> Option<Self> {
         use chrono::format::Numeric;
         Some(match value {
             Numeric::Year => PartitionDuration::Yearly,
@@ -1276,7 +1451,7 @@ impl PartitionDuration {
     /// Convert from an iterator of chrono time format items, obtained by parsing a
     /// [`TemplatePart::TimeFormat`] string.
     fn from_format_items<'a>(
-        items: impl IntoIterator<Item = &'a chrono::format::Item<'a>>,
+        items: impl IntoIterator<Item = &'a format::Item<'a>>,
     ) -> Option<Self> {
         use chrono::format::Item;
         let mut min_duration = None;
@@ -1284,7 +1459,7 @@ impl PartitionDuration {
             match item {
                 // ignore these
                 Item::Literal(_) | Item::OwnedLiteral(_) | Item::Space(_) | Item::OwnedSpace(_) => {
-                    continue
+                    continue;
                 }
                 // break out on error
                 Item::Error => return None,
@@ -2354,6 +2529,95 @@ mod tests {
     }
 
     #[test]
+    fn new_time_format_validation_fn_allows_good_input() {
+        assert!(validate_new_time_format("%Y-%m-%d is 100%% ok").is_ok());
+        assert!(validate_new_time_format("%Y-%m").is_ok());
+        assert!(validate_new_time_format("%Y").is_ok());
+        assert!(validate_new_time_format("%Y %m %d").is_ok());
+        assert!(validate_new_time_format("%d %m %Y").is_ok());
+        assert!(validate_new_time_format("in the year %Y").is_ok());
+    }
+
+    #[test]
+    fn existing_time_format_validation_fn_allows_questionable_serialized_formats() {
+        assert!(validate_existing_time_format("%Y wk:%M").is_ok()); // nonsense in use by a customer
+        assert!(validate_existing_time_format("%d").is_ok());
+    }
+
+    #[test]
+    fn existing_time_format_validation_fn_allows_good_formats() {
+        assert!(validate_existing_time_format("%Y-%m-%d").is_ok());
+        assert!(validate_new_time_format("%Y %m").is_ok());
+        assert!(validate_new_time_format("%Y").is_ok());
+    }
+
+    #[test]
+    fn new_time_format_restricts_pipe_delimiter() {
+        assert_matches!(
+            validate_new_time_format("%Y|%m|%d"),
+            Err(ValidationError::InvalidStrftime(_))
+        );
+    }
+
+    #[test]
+    fn new_time_format_restricts_unsupported_spec() {
+        assert_matches!(
+            validate_new_time_format("%Y-%m-%d %H:%M:%S"),
+            Err(ValidationError::UnsupportedStrfTimeSpecifier(_, _))
+        );
+    }
+
+    #[test]
+    fn new_time_format_restricts_unsupported_spec_customer_example() {
+        // Real world example that can't be used in new tables or namespaces because %M is unsupported.
+        // Sadly, we can't ensure literals make sense...
+        assert_matches!(
+            validate_new_time_format("%Y wk:%M"),
+            Err(ValidationError::UnsupportedStrfTimeSpecifier(_, _))
+        );
+    }
+
+    #[test]
+    fn new_time_format_restricts_unsupported_spec_in_fixed_category() {
+        assert_matches!(
+            validate_new_time_format("%Y %B"),
+            Err(ValidationError::UnsupportedStrfTimeSpecifier(_, _))
+        );
+        assert_matches!(
+            validate_new_time_format("%Y %#z"),
+            Err(ValidationError::UnsupportedStrfTimeSpecifier(_, _))
+        );
+    }
+
+    #[test]
+    fn new_time_format_rejects_missing_specifiers() {
+        assert_matches!(
+            validate_new_time_format("%m/%d"), // needs %Y
+            Err(ValidationError::MissingRequiredStrfTimeSpecifier(_))
+        );
+        assert_matches!(
+            validate_new_time_format("%Y %d"), // needs %m
+            Err(ValidationError::MissingRequiredStrfTimeSpecifier(_))
+        );
+    }
+
+    #[test]
+    fn new_time_formats_restrict_invalid() {
+        assert_matches!(
+            validate_new_time_format(""),
+            Err(ValidationError::InvalidStrftime(_))
+        );
+        assert_matches!(
+            validate_new_time_format("no spec"),
+            Err(ValidationError::InvalidStrftime(_))
+        );
+        assert_matches!(
+            validate_new_time_format("%Y-%m %Y/%m/%d"),
+            Err(ValidationError::InvalidStrftime(_))
+        );
+    }
+
+    #[test]
     fn new_custom_table_template_requires_time_specified() {
         let custom_table_template = proto::PartitionTemplate {
             parts: vec![proto::TemplatePart {
@@ -2374,6 +2638,24 @@ mod tests {
         let custom_table_template = proto::PartitionTemplate {
             parts: vec![proto::TemplatePart {
                 part: Some(proto::template_part::Part::TagValue("region".into())),
+            }],
+        };
+
+        let table_template = TablePartitionTemplateOverride::try_from_existing(
+            Some(custom_table_template.clone()),
+            &NamespacePartitionTemplateOverride::default(),
+        )
+        .unwrap();
+
+        assert_eq!(table_template.len(), 1);
+        assert_eq!(table_template.0.unwrap().inner(), &custom_table_template);
+    }
+
+    #[test]
+    fn existing_bad_time_format_deserializes_without_error() {
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TimeFormat("%Y wk:%M".into())), // nonsense existing format
             }],
         };
 

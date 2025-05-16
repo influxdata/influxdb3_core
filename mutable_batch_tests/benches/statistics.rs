@@ -1,15 +1,15 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 use data_types::StatValues;
 use mutable_batch::{
-    column::{recompute_min_max, Column, ColumnData},
-    writer::Writer,
     MutableBatch,
+    column::{Column, ColumnData, recompute_min_max},
+    writer::Writer,
 };
 
 const N_VALUES: usize = 16_000; // Must be multiple of 8
@@ -18,9 +18,7 @@ fn generate_f64() -> Column {
     let mut mb = MutableBatch::default();
 
     let mut w = Writer::new(&mut mb, N_VALUES);
-    let mask = std::iter::repeat(0b01010101)
-        .take(N_VALUES / 8)
-        .collect::<Vec<_>>();
+    let mask = std::iter::repeat_n(0b01010101, N_VALUES / 8).collect::<Vec<_>>();
 
     let values = (0..).map(|v| v as f64).take(N_VALUES / 2);
 
@@ -36,9 +34,7 @@ fn generate_u64() -> Column {
     let mut mb = MutableBatch::default();
 
     let mut w = Writer::new(&mut mb, N_VALUES);
-    let mask = std::iter::repeat(0b01010101)
-        .take(N_VALUES / 8)
-        .collect::<Vec<_>>();
+    let mask = std::iter::repeat_n(0b01010101, N_VALUES / 8).collect::<Vec<_>>();
 
     let values = (0..).map(|v| v as u64).take(N_VALUES / 2);
 
@@ -54,9 +50,7 @@ fn generate_bool() -> Column {
     let mut mb = MutableBatch::default();
 
     let mut w = Writer::new(&mut mb, N_VALUES);
-    let mask = std::iter::repeat(0b01010101)
-        .take(N_VALUES / 8)
-        .collect::<Vec<_>>();
+    let mask = std::iter::repeat_n(0b01010101, N_VALUES / 8).collect::<Vec<_>>();
 
     let values = (0..).map(|v| v & 1 == 0).take(N_VALUES / 2);
 
@@ -72,9 +66,7 @@ fn generate_tag() -> Column {
     let mut mb = MutableBatch::default();
 
     let mut w = Writer::new(&mut mb, N_VALUES);
-    let mask = std::iter::repeat(0b01010101)
-        .take(N_VALUES / 8)
-        .collect::<Vec<_>>();
+    let mask = std::iter::repeat_n(0b01010101, N_VALUES / 8).collect::<Vec<_>>();
 
     let values = (0..)
         .map(|v| (v % 100).to_string())

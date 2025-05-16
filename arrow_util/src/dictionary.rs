@@ -183,7 +183,7 @@ where
                 RawEntryMut::Occupied(_) => {
                     return Err(Error::DuplicateKeyFound {
                         key: value.to_string(),
-                    })
+                    });
                 }
                 RawEntryMut::Vacant(entry) => {
                     let key =

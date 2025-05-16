@@ -2,18 +2,19 @@ use std::ops::{Deref, DerefMut};
 
 use log::debug;
 use nom::{
+    Parser,
     branch::alt,
     bytes::complete::{tag, take_while1},
     combinator::{map, opt},
-    sequence::{preceded, separated_pair, terminated, tuple},
+    sequence::{preceded, separated_pair, terminated},
 };
 use smallvec::SmallVec;
 
 use crate::{
+    Error, EscapedStr, FieldSet, FieldValue, IResult, Measurement, SeriesKeyMalformedSnafu,
     escaped_value, field_set, is_whitespace_boundary_char, measurement,
     parameterized_separated_list, parse_and_recognize, split_lines, timestamp, trim_leading,
-    whitespace, Error, EscapedStr, FieldSet, FieldValue, IResult, Measurement,
-    SeriesKeyMalformedSnafu,
+    whitespace,
 };
 
 use super::Result;
@@ -76,7 +77,7 @@ impl<'a> ParsedLine<'a> {
 pub struct Series<'a> {
     // raw_input is added to replicate the original parser, but is only used
     // in tests there, so may be removed?
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     raw_input: &'a str,
     pub measurement: Measurement<'a>,
     pub series_key: Option<SeriesKey<'a>>,
@@ -180,17 +181,18 @@ fn parse_line(i: &str) -> IResult<&str, ParsedLine<'_>> {
     let field_set = preceded(whitespace, field_set);
     let timestamp = preceded(whitespace, terminated(timestamp, opt(whitespace)));
 
-    let line = tuple((series, field_set, opt(timestamp)));
+    let line = (series, field_set, opt(timestamp));
 
     map(line, |(series, field_set, timestamp)| ParsedLine {
         series,
         field_set,
         timestamp,
-    })(i)
+    })
+    .parse(i)
 }
 
 fn series(i: &str) -> IResult<&str, Series<'_>> {
-    let series = tuple((measurement, maybe_series_key));
+    let series = (measurement, maybe_series_key);
     let series_and_raw_input = parse_and_recognize(series);
 
     map(
@@ -200,7 +202,8 @@ fn series(i: &str) -> IResult<&str, Series<'_>> {
             measurement,
             series_key,
         },
-    )(i)
+    )
+    .parse(i)
 }
 
 /// Series Keys are optional, but similar to tags, if a comma follows the measurement, then we
@@ -238,7 +241,7 @@ fn series_key_key(i: &str) -> IResult<&str, EscapedStr<'_>> {
 fn series_key_value(i: &str) -> IResult<&str, SeriesValue<'_>> {
     let string = map(series_key_string_value, SeriesValue::String);
 
-    alt((string,))(i)
+    alt((string,)).parse(i)
 }
 
 fn series_key_string_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
@@ -249,7 +252,7 @@ fn series_key_string_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{v3::SeriesValue, Error, EscapedStr, FieldValue};
+    use crate::{Error, EscapedStr, FieldValue, v3::SeriesValue};
 
     use super::ParsedLine;
 

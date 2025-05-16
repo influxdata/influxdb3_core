@@ -7,11 +7,11 @@ use crate::{
     constants::TIME_COLUMN,
     interface::{CasFailure, Catalog, Error, RepoCollection, SoftDeletedRows},
 };
-use data_types::{partition_template::ColumnValue, CompactionLevel, NamespaceName};
 use data_types::{
+    ColumnType, ColumnsByName, CompactionLevel, MaybeTableSchema, Namespace, NamespaceId,
+    NamespaceName, NamespaceSchema, PartitionId, PartitionKey, SortKeyIds, TableId, TableSchema,
+    partition_template::ColumnValue,
     partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
-    ColumnType, ColumnsByName, Namespace, NamespaceId, NamespaceSchema, PartitionId, PartitionKey,
-    SortKeyIds, TableId, TableSchema,
 };
 use iox_time::Time;
 use std::time::Duration;
@@ -36,7 +36,7 @@ where
         return Ok(None);
     };
 
-    let schema = get_schema_internal(&namespace, repos).await?;
+    let schema = get_schema_from_namespace(&namespace, repos).await?;
 
     Ok(Some((
         NamespaceName::new(namespace.name).expect("namespace name in catalog must be valid"),
@@ -44,23 +44,25 @@ where
     )))
 }
 
-/// Gets the namespace schema including all tables and columns.
+/// Gets the [`NamespaceSchema`] for the active namespace with `name`, including
+/// all tables and columns.
 pub async fn get_schema_by_name<R>(
     name: &str,
     repos: &mut R,
-    deleted: SoftDeletedRows,
 ) -> Result<Option<NamespaceSchema>, crate::interface::Error>
 where
     R: RepoCollection + ?Sized,
 {
-    let Some(namespace) = repos.namespaces().get_by_name(name, deleted).await? else {
+    let Some(namespace) = repos.namespaces().get_by_name(name).await? else {
         return Ok(None);
     };
 
-    Ok(Some(get_schema_internal(&namespace, repos).await?))
+    Ok(Some(get_schema_from_namespace(&namespace, repos).await?))
 }
 
-async fn get_schema_internal<R>(
+/// Builds a [`NamespaceSchema`] from the provided [`Namespace`], fetching all tables
+/// and columns from the catalog.
+pub async fn get_schema_from_namespace<R>(
     namespace: &Namespace,
     repos: &mut R,
 ) -> Result<NamespaceSchema, crate::interface::Error>
@@ -96,12 +98,11 @@ pub async fn get_schema_by_namespace_and_table<R>(
     name: &str,
     table_name: &str,
     repos: &mut R,
-    deleted: SoftDeletedRows,
 ) -> Result<Option<NamespaceSchema>, crate::interface::Error>
 where
     R: RepoCollection + ?Sized,
 {
-    let Some(namespace) = repos.namespaces().get_by_name(name, deleted).await? else {
+    let Some(namespace) = repos.namespaces().get_by_name(name).await? else {
         return Ok(None);
     };
 
@@ -175,6 +176,7 @@ where
 /// No schemas for soft-deleted namespaces are returned.
 pub async fn list_schemas(
     catalog: &dyn Catalog,
+    use_deleted_column_pushdown: bool,
 ) -> Result<impl Iterator<Item = (Namespace, NamespaceSchema)>, crate::interface::Error> {
     let mut repos = catalog.repositories();
 
@@ -190,9 +192,18 @@ pub async fn list_schemas(
     // This approach also tolerates concurrently deleted namespaces, which are
     // simply ignored at the end when joining to the namespace query result.
 
-    // First fetch all the columns - this is the state snapshot of the catalog
-    // schemas.
-    let columns = repos.columns().list().await?;
+    let columns = if use_deleted_column_pushdown {
+        // Listing without deleted columns introduces additional catalog load
+        // but should lower memory costs in the router.
+        repos
+            .columns()
+            .list(SoftDeletedRows::ExcludeDeleted)
+            .await?
+    } else {
+        // First fetch all the columns - this is the state snapshot of the catalog
+        // schemas.
+        repos.columns().list(SoftDeletedRows::AllRows).await?
+    };
 
     // Construct the set of table IDs these columns belong to.
     let retain_table_ids = columns.iter().map(|c| c.table_id).collect::<HashSet<_>>();
@@ -381,21 +392,27 @@ impl TableScopedError {
     }
 }
 
-/// Given an iterator of `(table_name, batch)` to validate, this function
-/// ensures all the columns within `batch` match the existing schema for
-/// `table_name` in `namespace_table_schema`, belonging to `namespace_id`
-/// with `namespace_partition_template`. If the column does not already exist
-/// in `namespace_table_schema`, it is created and an updated `(table_name,
-/// table_schema)` mapping is returned.
+/// Given an iterator of `(table_name, batch)` to validate, this function ensures all the columns
+/// within `batch` match the existing schema for `table_name` in `namespace_table_schema` belong to
+/// `namespace_id` with `namespace_partition_template`. If the column does not already exist in
+/// `namespace_table_schema`, it is created and an updated `(table_name, table_schema)` mapping is
+/// returned. The returned mapping only includes the schemas that needed to be created or modified.
 ///
-/// This function pushes schema additions through to the backend catalog,
-/// relying on the catalog to serialize concurrent additions of a given
-/// column.
-pub async fn validate_or_insert_schema<'a, T, U, C, R>(
+/// If the table that the given batch is trying to write to has been soft-deleted, we don't know
+/// the schema anymore, and thus cannot validate (and this function will return an error).
+///
+/// This needs to return a mapping of `TableSchema`s instead of just `MT`s because it's a promise
+/// to the caller that the schema exists - if we returned `MT`s, that represents something that is
+/// *maybe* a schema and that would add extra complexity to the caller to validate, once again,
+/// that it actually is a schema.
+///
+/// This function pushes schema additions through to the backend catalog, relying on the catalog to
+/// serialize concurrent additions of a given column.
+pub async fn validate_or_insert_schema<'a, 'input_schema, T, U, C, MT, R>(
     new_tables: T,
     namespace_id: NamespaceId,
     namespace_partition_template: &NamespacePartitionTemplateOverride,
-    namespace_table_schema: &BTreeMap<String, TableSchema>,
+    namespace_table_schema: &'input_schema BTreeMap<String, MT>,
     repos: &mut R,
 ) -> Result<Option<BTreeMap<String, TableSchema>>, TableScopedError>
 where
@@ -403,49 +420,53 @@ where
     U: Iterator<Item = (&'a str, C)> + Send, // Tables and column iters
     C: Iterator<Item = (&'a String, ColumnType)> + Send, // Column iters
     R: RepoCollection + ?Sized,
+    MT: MaybeTableSchema + Clone,
 {
     let new_tables = new_tables.into_iter();
 
-    // The (potentially updated) NamespaceSchema to return to the caller.
-    let mut namespace_table_schema = Cow::Borrowed(namespace_table_schema);
+    let mut return_schemas = None;
 
+    // The (potentially updated) NamespaceSchema to return to the caller.
     for (table_name, columns) in new_tables {
         validate_mutable_table(
             columns,
             table_name,
             namespace_id,
             namespace_partition_template,
-            &mut namespace_table_schema,
+            namespace_table_schema,
             repos,
+            &mut return_schemas,
         )
         .await?;
     }
 
-    match namespace_table_schema {
-        Cow::Owned(updated_namespace_table_schema) => Ok(Some(updated_namespace_table_schema)),
-        Cow::Borrowed(_) => Ok(None),
-    }
+    Ok(return_schemas)
 }
 
-// &mut Cow is used to avoid a copy, so allow it
-#[allow(clippy::ptr_arg)]
-async fn validate_mutable_table<R>(
+async fn validate_mutable_table<'input_schemas, R, MT>(
     columns: impl Iterator<Item = (&String, ColumnType)> + Send,
     table_name: &str,
     namespace_id: NamespaceId,
     namespace_partition_template: &NamespacePartitionTemplateOverride,
-    namespace_table_schema: &mut Cow<'_, BTreeMap<String, TableSchema>>,
+    namespace_table_schema: &'input_schemas BTreeMap<String, MT>,
     repos: &mut R,
+    return_schemas: &mut Option<BTreeMap<String, TableSchema>>,
 ) -> Result<(), TableScopedError>
 where
     R: RepoCollection + ?Sized,
+    MT: MaybeTableSchema + Clone,
 {
     // Check if the table exists in the schema.
     //
     // Because the entry API requires &mut it is not used to avoid a premature
     // clone of the Cow.
     let mut table = match namespace_table_schema.get(table_name) {
-        Some(t) => Cow::Borrowed(t),
+        Some(t) => Cow::Borrowed(
+            t.schema_if_active()
+                .ok_or_else(|| TableScopedError(table_name.to_string(), Error::NotFound {
+                    descr: "A table with the given name was found, but no schema was found for it - was it soft-deleted?".into()
+                }))?
+        ),
         None => {
             // The table does not exist in the cached schema.
             //
@@ -460,12 +481,7 @@ where
             .await
             .map_err(|e| TableScopedError(table_name.to_string(), e))?;
 
-            assert!(namespace_table_schema
-                .to_mut()
-                .insert(table_name.to_string(), table)
-                .is_none());
-
-            Cow::Borrowed(namespace_table_schema.get(table_name).unwrap())
+            Cow::Owned(table)
         }
     };
 
@@ -478,12 +494,9 @@ where
     validate_and_insert_columns(columns, table_name, &mut table, repos).await?;
 
     if let Cow::Owned(table) = table {
-        // The table schema was mutated and needs inserting into the namespace
-        // schema to make the changes visible to the caller.
-        assert!(namespace_table_schema
-            .to_mut()
-            .insert(table_name.to_string(), table)
-            .is_some());
+        return_schemas
+            .get_or_insert_default()
+            .insert(table_name.to_string(), table);
     }
 
     Ok(())
@@ -497,7 +510,6 @@ where
 /// to serialize concurrent additions of a given column, ensuring only one type is ever accepted
 /// per column.
 // &mut Cow is used to avoid a copy, so allow it
-#[allow(clippy::ptr_arg)]
 pub async fn validate_and_insert_columns<R>(
     columns: impl Iterator<Item = (&String, ColumnType)> + Send,
     table_name: &str,
@@ -661,10 +673,21 @@ pub(crate) const fn compaction_level_sql_predicate(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        ops::DerefMut,
+        sync::Arc,
+    };
 
     use super::*;
-    use crate::{interface::SoftDeletedRows, mem::MemCatalog, util::get_schema_by_name};
+    use crate::{
+        interface::Catalog,
+        mem::MemCatalog,
+        test_helpers::{arbitrary_namespace, arbitrary_table},
+    };
+
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
 
     // Generate a test that simulates multiple, sequential writes in `lp` and
     // asserts the resulting schema.
@@ -679,12 +702,8 @@ mod tests {
             want_schema = {$($want_schema:tt) +}                    // The expected resulting schema after all writes complete.
         ) => {
             paste::paste! {
-                #[allow(clippy::bool_assert_comparison)]
                 #[tokio::test]
                 async fn [<test_validate_schema_ $name>]() {
-                    use crate::{interface::Catalog, test_helpers::arbitrary_namespace};
-                    use std::ops::DerefMut;
-                    use pretty_assertions::assert_eq;
                     const NAMESPACE_NAME: &str = "bananas";
 
                     let metrics = Arc::new(metric::Registry::default());
@@ -712,8 +731,8 @@ mod tests {
                                 schema.id,
                                 &schema.partition_template,
                                 &schema.tables,
-                                txn.deref_mut())
-                                .await;
+                                txn.deref_mut()
+                            ).await;
 
                             match got {
                                 Err(TableScopedError(_, Error::AlreadyExists{ .. })) => {
@@ -721,11 +740,14 @@ mod tests {
                                     schema
                                 },
                                 Err(e) => panic!("unexpected error: {}", e),
-                                Ok(Some(tables)) => NamespaceSchema {
-                                    tables,
-                                    ..schema
-                                },
-                                Ok(None) => schema,
+                                Ok(valid_tables) => {
+                                    let mut tables = schema.tables.clone();
+                                    if let  Some(new_tables) = valid_tables {
+                                        tables.extend(new_tables);
+                                    }
+
+                                    NamespaceSchema { tables, ..schema }
+                                }
                             }
                         };
                     )+
@@ -735,7 +757,7 @@ mod tests {
                     // Invariant: in absence of concurrency, the schema within
                     // the database must always match the incrementally built
                     // cached schema.
-                    let db_schema = get_schema_by_name(NAMESPACE_NAME, txn.deref_mut(), SoftDeletedRows::ExcludeDeleted)
+                    let db_schema = get_schema_by_name(NAMESPACE_NAME, txn.deref_mut())
                         .await
                         .expect("database failed to query for namespace schema")
                         .expect("namespace exists");
@@ -935,8 +957,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_table_create_race_doesnt_get_all_columns() {
-        use crate::{interface::Catalog, test_helpers::arbitrary_namespace};
-        use std::{collections::BTreeSet, ops::DerefMut};
         const NAMESPACE_NAME: &str = "bananas";
 
         let repo = MemCatalog::new(
@@ -983,5 +1003,106 @@ mod tests {
         // at a higher level by the namespace cache/gossip system
         let table = formerly_empty_tables.get("m1").unwrap();
         assert_eq!(table.columns.names(), BTreeSet::from(["t2", "f2", "time"]));
+    }
+
+    #[derive(Clone)]
+    struct NotATable;
+
+    impl MaybeTableSchema for NotATable {
+        fn schema_if_active(&self) -> Option<&TableSchema> {
+            None
+        }
+
+        fn schema_mut_if_active(&mut self) -> Option<&mut TableSchema> {
+            None
+        }
+
+        fn id(&self) -> TableId {
+            TableId::new(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_schema_fails_on_soft_deleted() {
+        const NAMESPACE_NAME: &str = "bananas";
+
+        let repo = MemCatalog::new(
+            Default::default(),
+            Arc::new(iox_time::SystemProvider::new()),
+        );
+        let mut txn = repo.repositories();
+        let namespace = arbitrary_namespace(&mut *txn, NAMESPACE_NAME).await;
+
+        // And we want to ensure that if we try to write to it, it fails because the table is
+        // soft-deleted.
+        let writes = mutable_batch_lp::lines_to_batches("m1,t1=a f1=2i", 42).unwrap();
+        let tables = [("m1".to_string(), NotATable)].into_iter().collect();
+        let res = validate_or_insert_schema(
+            writes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.iter_column_types())),
+            namespace.id,
+            &namespace.partition_template,
+            &tables,
+            &mut *txn,
+        )
+        .await;
+
+        assert_matches!(res.unwrap_err().into_err(), Error::NotFound { .. });
+    }
+
+    #[tokio::test]
+    async fn validate_schema_returns_all_columns() {
+        const NAMESPACE_NAME: &str = "bananas";
+        const TABLE_NAME: &str = "m1";
+
+        let repo = MemCatalog::new(
+            Default::default(),
+            Arc::new(iox_time::SystemProvider::new()),
+        );
+        let mut txn = repo.repositories();
+        let namespace = arbitrary_namespace(&mut *txn, NAMESPACE_NAME).await;
+        let mut ns_schema = NamespaceSchema::new_empty_from(&namespace);
+
+        _ = arbitrary_table(&mut *txn, TABLE_NAME, &namespace).await;
+
+        // So first we write to it with two fields...
+        let writes = mutable_batch_lp::lines_to_batches("m1,t1=a f1=2i", 42).unwrap();
+        let new_schema = validate_or_insert_schema(
+            writes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.iter_column_types())),
+            ns_schema.id,
+            &ns_schema.partition_template,
+            &ns_schema.tables,
+            &mut *txn,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        ns_schema.tables.extend(new_schema);
+
+        // and then we want to make sure that when we validate the schema for a given write which
+        // only touches a subset of the existing columns, the schema that is returned still
+        // contains all the coulmns - those which were touched and those which weren't
+        let writes = mutable_batch_lp::lines_to_batches("m1,t1=a f2=2i", 45).unwrap();
+        let schema = validate_or_insert_schema(
+            writes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.iter_column_types())),
+            ns_schema.id,
+            &ns_schema.partition_template,
+            &ns_schema.tables,
+            &mut *txn,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let table_schema = schema.get("m1").unwrap();
+        assert!(table_schema.columns.contains_column_name("t1"));
+        assert!(table_schema.columns.contains_column_name("f1"));
+        assert!(table_schema.columns.contains_column_name("f2"));
     }
 }

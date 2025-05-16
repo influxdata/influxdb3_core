@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
-#![allow(clippy::missing_docs_in_private_items, clippy::type_complexity)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -10,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use either::Either;
 use futures::{future::BoxFuture, prelude::stream::BoxStream};
 use sqlx::{
-    pool::PoolConnection, Acquire, Database, Describe, Error, Execute, Executor, Pool, Transaction,
+    Acquire, Database, Describe, Error, Execute, Executor, Pool, Transaction, pool::PoolConnection,
 };
 
 /// A `HotSwapPool` is a Pool that wraps another Pool and it allows the pool to
@@ -134,8 +133,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use rand::{distributions::Alphanumeric, Rng};
-    use sqlx::{postgres::PgPoolOptions, Postgres};
+    use rand::{Rng, distr::Alphanumeric};
+    use sqlx::{Postgres, postgres::PgPoolOptions};
 
     // Helper macro to skip tests if TEST_INTEGRATION and TEST_INFLUXDB_IOX_CATALOG_DSN environment variables
     // are not set.
@@ -181,7 +180,7 @@ mod tests {
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
             // not carried past await points
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             (&mut rng)
                 .sample_iter(Alphanumeric)
                 .filter(|c| c.is_ascii_alphabetic())

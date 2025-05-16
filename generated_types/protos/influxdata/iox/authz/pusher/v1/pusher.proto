@@ -13,8 +13,9 @@ message AuthzConfig {
 
 message Principal {
   oneof identified_by {
-    bytes sha512_hash = 1; 
+    bytes sha512_hash = 1;
     // future: jwt subjects or whatnot
   }
   repeated influxdata.iox.authz.v1.Permission permissions = 2;
+  optional influxdata.iox.authz.v1.Subject subject = 3;
 }

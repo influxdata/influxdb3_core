@@ -137,7 +137,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::FlightData;
-use futures::{stream::BoxStream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use observability_deps::tracing::{info, warn};
 use tokio::time::{Interval, MissedTickBehavior};
 
@@ -169,7 +169,7 @@ where
             ticker,
         };
 
-        let inner = futures::stream::unfold(state, |mut state| async move {
+        let inner = futures::stream::unfold(state, async move |mut state| {
             loop {
                 tokio::select! {
                     _ = state.ticker.tick() => {
@@ -290,7 +290,7 @@ fn build_empty_batch_msg(schema: Option<&SchemaRef>) -> Option<FlightData> {
 pub(crate) mod test_util {
     use std::time::Duration;
 
-    use futures::{stream::BoxStream, Stream, StreamExt};
+    use futures::{Stream, StreamExt, stream::BoxStream};
 
     /// Ensure that there is a delay between steam responses.
     pub(crate) fn make_stream_slow<S>(s: S, delay: Duration) -> BoxStream<'static, S::Item>
@@ -345,7 +345,9 @@ mod tests {
         let s = FlightRecordBatchStream::new_from_flight_data(s);
         let batches: Vec<_> = s.try_collect().await.unwrap();
         assert_batches_eq!(
-            ["+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"],
+            [
+                "+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"
+            ],
             &batches
         );
 
@@ -368,7 +370,9 @@ mod tests {
         let s = FlightRecordBatchStream::new_from_flight_data(s);
         let batches: Vec<_> = s.try_collect().await.unwrap();
         assert_batches_eq!(
-            ["+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"],
+            [
+                "+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"
+            ],
             &batches
         );
 
@@ -391,7 +395,9 @@ mod tests {
         let s = FlightRecordBatchStream::new_from_flight_data(s);
         let batches: Vec<_> = s.try_collect().await.unwrap();
         assert_batches_eq!(
-            ["+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"],
+            [
+                "+---+", "| f |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |", "+---+"
+            ],
             &batches
         );
 

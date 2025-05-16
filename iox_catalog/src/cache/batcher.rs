@@ -7,10 +7,10 @@ use std::{
     time::Duration,
 };
 
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{DashMap, mapref::entry::Entry};
 use futures::{
-    future::{BoxFuture, Shared},
     FutureExt,
+    future::{BoxFuture, Shared},
 };
 use iox_time::TimeProvider;
 use parking_lot::Mutex;
@@ -197,7 +197,7 @@ where
     driver: Shared<Driver>,
 
     /// Keep metadata alive.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     metadata_alive: Arc<()>,
 }
 
@@ -239,9 +239,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use futures_test_utils::AssertFutureExt;
     use iox_time::{MockProvider, Time};
-
-    use crate::cache::test_utils::AssertPendingExt;
 
     use super::*;
 

@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-async-trait = "0.1.83"
+async-trait = "0.1.88"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }

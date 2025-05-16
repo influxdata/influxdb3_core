@@ -3,17 +3,18 @@
 
 use super::{
     cross_rt_stream::CrossRtStream,
-    gapfill::{plan_gap_fill, GapFill},
+    gapfill::{GapFill, plan_gap_fill},
     sleep::SleepNode,
     split::StreamSplitNode,
 };
 use crate::{
+    Extension,
     analyzer::register_iox_analyzers,
     config::IoxConfigExt,
     exec::{query_tracing::TracedStream, split::StreamSplitExec},
     logical_optimizer::register_iox_logical_optimizers,
+    memory_pool::PerQueryMemoryPool,
     physical_optimizer::register_iox_physical_optimizers,
-    Extension,
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -23,20 +24,21 @@ use datafusion::{
     config::ConfigExtension,
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
+        memory_pool::{MemoryConsumer, MemoryPool},
         runtime_env::RuntimeEnv,
         session_state::SessionStateBuilder,
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
-        coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
         EmptyRecordBatchStream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
     },
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::*,
 };
 use datafusion::{catalog::Session, config::TableOptions};
 use datafusion_util::config::{
-    iox_file_formats, iox_session_config, table_parquet_options, DEFAULT_CATALOG,
+    DEFAULT_CATALOG, iox_file_formats, iox_session_config, table_parquet_options,
 };
 use executor::DedicatedExecutor;
 use futures::TryStreamExt;
@@ -161,6 +163,10 @@ pub struct IOxSessionConfig {
 
     /// Registered extensions to the IOx querier.
     query_extensions: Vec<Arc<dyn Extension>>,
+
+    /// The minimum size of the memory pool pre-allocated for each query, in bytes.
+    /// See `INFLUXDB_IOX_EXEC_PER_QUERY_MEM_POOL_BYTES` for details.
+    per_query_mem_pool_size: usize,
 }
 
 impl fmt::Debug for IOxSessionConfig {
@@ -170,7 +176,11 @@ impl fmt::Debug for IOxSessionConfig {
 }
 
 impl IOxSessionConfig {
-    pub(super) fn new(exec: DedicatedExecutor, runtime: Arc<RuntimeEnv>) -> Self {
+    pub(super) fn new(
+        exec: DedicatedExecutor,
+        runtime: Arc<RuntimeEnv>,
+        per_query_mem_pool_size: usize,
+    ) -> Self {
         let mut session_config = iox_session_config();
         session_config
             .options_mut()
@@ -184,6 +194,7 @@ impl IOxSessionConfig {
             default_catalog: None,
             span_ctx: None,
             query_extensions: vec![],
+            per_query_mem_pool_size,
         }
     }
 
@@ -267,10 +278,40 @@ impl IOxSessionConfig {
             .session_config
             .with_extension(Arc::new(recorder.span().cloned()));
 
+        // Creates a memory pool for the query based on the `per_query_mem_pool_size`.
+        //
+        // If `per_query_mem_pool_size` is zero, this query will use the central
+        // memory pool from the runtime. Otherwise, it creates a new `PerQueryMemoryPool`
+        // with a minimum memory budget, ensuring each query has a reserved amount of
+        // memory. This prevents the query from being starved of resources and allows it
+        // it to use the central memory pool if the budget is exhausted.
+        let memory_pool: Arc<dyn MemoryPool> = match self.per_query_mem_pool_size {
+            0 => Arc::clone(&self.runtime.memory_pool),
+            per_query_mem_pool_size => {
+                // The memory reservation for the central memory pool.
+                let reservation = MemoryConsumer::new(format!(
+                    "query_execution{}", // The consumer name will look like: "query_execution" or "query_execution(traceID:1234567)"
+                    self.span_ctx
+                        .as_ref()
+                        .map_or_else(String::new, |span| format!(
+                            "(traceID:{})",
+                            span.trace_id.get()
+                        ))
+                ))
+                .register(&self.runtime.memory_pool);
+
+                Arc::new(PerQueryMemoryPool::new(
+                    reservation,
+                    // The `unwrap` is safe here because `per_query_mem_pool_size` is guaranteed to be non-zero.
+                    NonZeroUsize::new(per_query_mem_pool_size).unwrap(),
+                ))
+            }
+        };
+
         let memory_monitor = Arc::new(Default::default());
         let runtime = RuntimeEnv {
             memory_pool: Arc::new(MonitoredMemoryPool::new(
-                Arc::clone(&self.runtime.memory_pool),
+                memory_pool,
                 Arc::clone(&memory_monitor),
             )),
             disk_manager: Arc::clone(&self.runtime.disk_manager),

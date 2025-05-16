@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 
-use arrow::compute::{concat_batches, SortOptions};
+use arrow::compute::{SortOptions, concat_batches};
 use arrow::{
     array::{ArrayRef, UInt64Array},
     compute::TakeOptions,
@@ -12,15 +12,17 @@ use arrow::{
 };
 use arrow_util::optimize::optimize_dictionaries;
 use datafusion::error::DataFusionError;
-use datafusion::physical_plan::{expressions::PhysicalSortExpr, metrics, PhysicalExpr};
+use datafusion::physical_expr_common::sort_expr::LexOrdering;
+use datafusion::physical_plan::{PhysicalExpr, metrics};
 use observability_deps::tracing::{debug, trace};
 
-// Handles the deduplication across potentially multiple
-// [`RecordBatch`]es which are already sorted on a primary key,
-// including primary keys which straddle RecordBatch boundaries
+/// Handles the deduplication across potentially multiple
+/// [`RecordBatch`]es which are already sorted on a primary key,
+/// including primary keys which straddle RecordBatch boundaries
 #[derive(Debug)]
 pub struct RecordBatchDeduplicator {
-    sort_keys: Vec<PhysicalSortExpr>,
+    /// The ordering of the record batches.
+    sort_keys: LexOrdering,
     last_batch: Option<RecordBatch>,
     num_dupes: metrics::Count,
 }
@@ -38,7 +40,7 @@ struct DuplicateRanges {
 
 impl RecordBatchDeduplicator {
     pub fn new(
-        sort_keys: Vec<PhysicalSortExpr>,
+        sort_keys: LexOrdering,
         num_dupes: metrics::Count,
         last_batch: Option<RecordBatch>,
     ) -> Self {
@@ -116,7 +118,7 @@ impl RecordBatchDeduplicator {
 
                     // Key column of last_batch of this index
                     let last_batch_array = last_batch.column(index);
-                    if last_batch_array.len() == 0 {
+                    if last_batch_array.is_empty() {
                         panic!("Key column, {name}, of last_batch has no data");
                     }
                     DedupSortColumn {
@@ -138,7 +140,7 @@ impl RecordBatchDeduplicator {
 
                     // Key column of current batch of this index
                     let array = batch.column(index);
-                    if array.len() == 0 {
+                    if array.is_empty() {
                         panic!("Key column, {name}, of current batch has no data");
                     }
                     DedupSortColumn {
@@ -359,7 +361,7 @@ impl RecordBatchDeduplicator {
                 let value_index = r
                     .clone()
                     .filter(|&i| input_array.is_valid(i))
-                    .last()
+                    .next_back()
                     .map(|i| i as u64)
                     // if all field values are none, pick one arbitrarily
                     .unwrap_or(r.start as u64);
@@ -408,6 +410,7 @@ mod test {
     };
 
     use arrow_util::assert_batches_eq;
+    use datafusion::physical_expr::PhysicalSortExpr;
     use datafusion::physical_plan::expressions::col;
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 
@@ -463,13 +466,13 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = vec![PhysicalSortExpr {
+        let sort_keys = LexOrdering::from(vec![PhysicalSortExpr {
             expr: col("t1", &current_batch.schema()).unwrap(),
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
             },
-        }];
+        }]);
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -538,7 +541,7 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = vec![
+        let sort_keys = LexOrdering::from(vec![
             PhysicalSortExpr {
                 expr: col("t1", &current_batch.schema()).unwrap(),
                 options: SortOptions {
@@ -553,7 +556,7 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ];
+        ]);
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -617,13 +620,13 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = vec![PhysicalSortExpr {
+        let sort_keys = LexOrdering::from(vec![PhysicalSortExpr {
             expr: col("t1", &current_batch.schema()).unwrap(),
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
             },
-        }];
+        }]);
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -678,7 +681,7 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = vec![
+        let sort_keys = LexOrdering::from(vec![
             PhysicalSortExpr {
                 expr: col("t1", &current_batch.schema()).unwrap(),
                 options: SortOptions {
@@ -693,7 +696,7 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ];
+        ]);
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -726,7 +729,7 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = vec![
+        let sort_keys = LexOrdering::from(vec![
             PhysicalSortExpr {
                 expr: col("t1", &current_batch.schema()).unwrap(),
                 options: SortOptions {
@@ -741,7 +744,7 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ];
+        ]);
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), None);
 
@@ -829,7 +832,7 @@ mod test {
             },
         ];
 
-        let dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), None);
+        let dedupe = RecordBatchDeduplicator::new(sort_keys.into(), make_counter(), None);
         let key_ranges = dedupe.compute_ranges(&batch).unwrap().ranges;
 
         let expected_key_range = vec![

@@ -72,9 +72,11 @@ pub(crate) mod map {
         #[test]
         fn test_planner_error_display() {
             // The InfluxQL internal error:
-            assert!(PlannerError::Internal("****".to_owned())
-                .to_string()
-                .starts_with("InfluxQL internal error: "))
+            assert!(
+                PlannerError::Internal("****".to_owned())
+                    .to_string()
+                    .starts_with("InfluxQL internal error: ")
+            )
         }
     }
 }

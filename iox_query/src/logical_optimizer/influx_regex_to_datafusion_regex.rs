@@ -5,11 +5,11 @@ use datafusion::{
     common::tree_node::TreeNodeRewriter,
     error::DataFusionError,
     logical_expr::{LogicalPlan, Operator},
-    optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
-    prelude::{binary_expr, lit, Expr},
+    optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
+    prelude::{Expr, binary_expr, lit},
     scalar::ScalarValue,
 };
-use query_functions::{clean_non_meta_escapes, REGEX_MATCH_UDF_NAME, REGEX_NOT_MATCH_UDF_NAME};
+use query_functions::{REGEX_MATCH_UDF_NAME, REGEX_NOT_MATCH_UDF_NAME, clean_non_meta_escapes};
 
 /// Replaces InfluxDB-specific regex operator with DataFusion regex operator.
 ///

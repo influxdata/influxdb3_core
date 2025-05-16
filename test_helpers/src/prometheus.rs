@@ -3,7 +3,7 @@
 //! This module provides a [`scrape()`] function to query a Prometheus HTTP
 //! endpoint and parse the returned body into a [`MetricSet`] for inspection.
 //!
-#![allow(missing_copy_implementations)]
+#![expect(missing_copy_implementations)]
 
 use std::collections::BTreeMap;
 

@@ -1,18 +1,18 @@
 use crate::{
+    QueryChunk,
     config::IoxConfigExt,
     physical_optimizer::chunk_extraction::extract_chunks,
     provider::{
-        chunks_to_physical_nodes, group_potential_duplicates, overlap::timestamp_min_max,
-        DeduplicateExec,
+        DeduplicateExec, chunks_to_physical_nodes, group_potential_duplicates,
+        overlap::timestamp_min_max,
     },
-    QueryChunk,
 };
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{empty::EmptyExec, union::UnionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, empty::EmptyExec, union::UnionExec},
 };
 use hashbrown::HashMap;
 use observability_deps::tracing::warn;
@@ -82,7 +82,7 @@ impl PhysicalOptimizerRule for SplitDedup {
                         if needs_dedup {
                             Arc::new(DeduplicateExec::new(
                                 plan,
-                                dedup_exec.sort_keys().to_vec(),
+                                dedup_exec.sort_keys().clone(),
                                 dedup_exec.use_chunk_order_col(),
                             )) as _
                         } else {
@@ -346,7 +346,7 @@ mod tests {
 
             // Partition with hash ID in the catalog
             let transition_partition_id =
-                TransitionPartitionId::Deterministic(PartitionHashId::arbitrary_for_testing());
+                TransitionPartitionId::Hash(PartitionHashId::arbitrary_for_testing());
 
             let chunk1 = chunk(1).with_partition_id(legacy_transition_partition_id.clone());
             let chunk2 = chunk(2).with_partition_id(transition_partition_id.clone());

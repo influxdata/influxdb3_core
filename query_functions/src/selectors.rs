@@ -104,10 +104,10 @@ use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
     error::Result as DataFusionResult,
     logical_expr::{
-        function::{AccumulatorArgs, StateFieldsArgs},
         AggregateUDF, Signature, Volatility,
+        function::{AccumulatorArgs, StateFieldsArgs},
     },
-    physical_plan::{expressions::format_state_name, Accumulator},
+    physical_plan::{Accumulator, expressions::format_state_name},
     prelude::SessionContext,
 };
 

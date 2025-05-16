@@ -80,7 +80,7 @@ mod tests {
         let sharder = RoundRobin::new(shards.iter().map(Arc::new));
 
         // Request the first N mappings.
-        #[allow(clippy::needless_collect)] // Incorrect lint
+        #[expect(clippy::needless_collect)] // Incorrect lint
         let mappings = (0..shards.len())
             .map(|_| sharder.next())
             .collect::<Vec<_>>();

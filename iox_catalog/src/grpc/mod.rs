@@ -30,7 +30,7 @@ mod tests {
     async fn test_catalog() {
         maybe_start_logging();
 
-        crate::interface_tests::test_catalog(|| async {
+        crate::interface_tests::test_catalog(async || {
             let metrics = Arc::new(metric::Registry::default());
             let time_provider = Arc::new(SystemProvider::new()) as _;
             let backing_catalog = Arc::new(MemCatalog::new(metrics, Arc::clone(&time_provider)));
@@ -184,6 +184,7 @@ mod tests {
                 .await
                 .expect("failed to connect client");
 
+        use proto::namespace_soft_delete_response::Deleted;
         let deleted_id = grpc_client
             .namespace_soft_delete(proto::NamespaceSoftDeleteRequest {
                 target: Some(proto::namespace_soft_delete_request::Target::Id(
@@ -191,9 +192,11 @@ mod tests {
                 )),
             })
             .await
-            .expect("failed to delete")
-            .into_inner()
-            .namespace_id;
+            .map(|resp| match resp.into_inner().deleted.unwrap() {
+                Deleted::Namespace(ns) => ns.id,
+                Deleted::NamespaceId(id) => id,
+            })
+            .expect("failed to delete");
 
         assert_eq!(deleted_id, created_ns.id.get());
 

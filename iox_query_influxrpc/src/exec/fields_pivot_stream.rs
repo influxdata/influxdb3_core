@@ -3,15 +3,15 @@ use arrow::array::{Int32Builder, Int64Builder, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::cast::as_timestamp_nanosecond_array;
 use datafusion::common::{DataFusionError, Result};
-use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::execution::RecordBatchStream;
+use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::physical_plan::metrics::{BaselineMetrics, RecordOutput};
 use futures::ready;
 use futures::stream::Stream;
 use hashbrown::HashSet;
 use observability_deps::tracing::{debug, trace};
 use schema::InfluxFieldType;
-use std::pin::{pin, Pin};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -187,7 +187,7 @@ mod tests {
         },
         common::cast::as_string_array,
     };
-    use futures::stream::{pending, StreamExt};
+    use futures::stream::{StreamExt, pending};
     use schema::{TIME_DATA_TIMEZONE, TIME_DATA_TYPE};
 
     #[tokio::test]

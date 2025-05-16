@@ -13,21 +13,21 @@ use arrow::{
 };
 
 use data_types::TimestampMinMax;
-use datafusion::common::DFSchema;
-use datafusion::physical_expr::{analyze, AnalysisContext, ExprBoundaries};
+use datafusion::physical_expr::{AnalysisContext, ExprBoundaries, analyze};
+use datafusion::{common::DFSchema, physical_expr::LexOrdering};
 use datafusion::{common::stats::Precision, execution::context::SessionState};
 use datafusion::{
     error::DataFusionError,
-    logical_expr::{interval_arithmetic::Interval, SortExpr},
-    physical_plan::expressions::{col as physical_col, PhysicalSortExpr},
+    logical_expr::{SortExpr, interval_arithmetic::Interval},
+    physical_plan::expressions::{PhysicalSortExpr, col as physical_col},
     prelude::{Column, Expr},
 };
 use itertools::Itertools;
-use schema::{sort::SortKey, TIME_COLUMN_NAME};
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
+use schema::{TIME_COLUMN_NAME, sort::SortKey};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 #[derive(Debug, Snafu)]
-#[allow(missing_copy_implementations, missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("The Record batch is empty"))]
     EmptyBatch,
@@ -58,24 +58,19 @@ pub fn logical_sort_key_exprs(sort_key: &SortKey) -> Vec<SortExpr> {
         .collect()
 }
 
-pub fn arrow_sort_key_exprs(
-    sort_key: &SortKey,
-    input_schema: &ArrowSchema,
-) -> Vec<PhysicalSortExpr> {
-    sort_key
-        .iter()
-        .flat_map(|(key, options)| {
-            // Skip over missing columns
-            let expr = physical_col(key, input_schema).ok()?;
-            Some(PhysicalSortExpr {
-                expr,
-                options: SortOptions {
-                    descending: options.descending,
-                    nulls_first: options.nulls_first,
-                },
-            })
+/// Build a datafusion [`LexOrdering`] from an iox [`SortKey`].
+pub fn arrow_sort_key_exprs(sort_key: &SortKey, input_schema: &ArrowSchema) -> LexOrdering {
+    LexOrdering::from_iter(sort_key.iter().flat_map(|(key, options)| {
+        // Skip over missing columns
+        let expr = physical_col(key, input_schema).ok()?;
+        Some(PhysicalSortExpr {
+            expr,
+            options: SortOptions {
+                descending: options.descending,
+                nulls_first: options.nulls_first,
+            },
         })
-        .collect()
+    }))
 }
 
 /// Return min and max for column `time` of the given set of record batches by
@@ -188,11 +183,11 @@ pub fn calculate_field_interval(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::common::rounding::next_down;
     use datafusion::common::ScalarValue;
+    use datafusion::common::rounding::next_down;
     use datafusion::execution::context::SessionContext;
     use datafusion::logical_expr::{col, lit};
-    use schema::{builder::SchemaBuilder, InfluxFieldType, TIME_DATA_TIMEZONE};
+    use schema::{InfluxFieldType, TIME_DATA_TIMEZONE, builder::SchemaBuilder};
 
     use super::*;
 
@@ -288,7 +283,9 @@ mod tests {
 
         assert_eq!(
             "Arrow error: Schema error: Unable to get field named \"b\". Valid fields: [\"time\", \"a\"]",
-            calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "b").unwrap_err().to_string(),
+            calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "b")
+                .unwrap_err()
+                .to_string(),
         );
     }
 }

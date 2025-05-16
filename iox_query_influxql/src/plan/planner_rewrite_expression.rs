@@ -126,12 +126,12 @@ use std::sync::Arc;
 use crate::plan::util::IQLSchema;
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
-use datafusion::common::{not_impl_err, Result, ScalarValue};
+use datafusion::common::{Result, ScalarValue, not_impl_err};
 use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
-use datafusion::logical_expr::{binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator, binary_expr, cast, lit};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{when, Column};
+use datafusion::prelude::{Column, when};
 use observability_deps::tracing::trace;
 use predicate::rpc_predicate::{iox_expr_rewrite, simplify_predicate};
 
@@ -433,7 +433,7 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
             // to be consistent with OG.
             Expr::AggregateFunction(AggregateFunction { ref args, .. } )
             | Expr::WindowFunction(WindowFunction { ref args, .. } ) => match &args[0] {
-               Expr::Column(Column { ref name, ..  }) if schema.is_tag_field(name) => yes(lit(ScalarValue::Null)),
+               Expr::Column(Column { name, ..  }) if schema.is_tag_field(name) => yes(lit(ScalarValue::Null)),
                _ => no(expr),
             }
 
@@ -568,7 +568,7 @@ mod test {
 
     use super::*;
     use datafusion::prelude::col;
-    use datafusion_util::{lit_timestamptz_nano, AsExpr};
+    use datafusion_util::{AsExpr, lit_timestamptz_nano};
 
     use chrono::{DateTime, NaiveDate, Utc};
     use datafusion::common::{DFSchemaRef, ToDFSchema};

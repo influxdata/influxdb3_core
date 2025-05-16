@@ -1,26 +1,28 @@
 use async_trait::async_trait;
-use generated_types::influxdata::iox::authz::v1::{self as proto, AuthorizeResponse};
+use generated_types::{
+    Response, Status, StdError,
+    influxdata::iox::authz::v1::{self as proto, AuthorizeResponse},
+    transport,
+};
 use observability_deps::tracing::warn;
 use snafu::Snafu;
-use tonic::Response;
 
-use super::{Authorizer, Permission};
+use super::{Authorization, Authorizer, Permission};
 
 /// Authorizer implementation using influxdata.iox.authz.v1 protocol.
 #[derive(Clone, Debug)]
 pub struct IoxAuthorizer {
-    client:
-        proto::iox_authorizer_service_client::IoxAuthorizerServiceClient<tonic::transport::Channel>,
+    client: proto::iox_authorizer_service_client::IoxAuthorizerServiceClient<transport::Channel>,
 }
 
 impl IoxAuthorizer {
     /// Attempt to create a new client by connecting to a given endpoint.
     pub fn connect_lazy<D>(dst: D) -> Result<Self, Box<dyn std::error::Error>>
     where
-        D: TryInto<tonic::transport::Endpoint> + Send,
-        D::Error: Into<tonic::codegen::StdError>,
+        D: TryInto<transport::Endpoint> + Send,
+        D::Error: Into<StdError>,
     {
-        let ep = tonic::transport::Endpoint::new(dst)?;
+        let ep = transport::Endpoint::new(dst)?;
         let client = proto::iox_authorizer_service_client::IoxAuthorizerServiceClient::new(
             ep.connect_lazy(),
         );
@@ -31,7 +33,7 @@ impl IoxAuthorizer {
         &self,
         token: Vec<u8>,
         requested_perms: &[Permission],
-    ) -> Result<Response<AuthorizeResponse>, tonic::Status> {
+    ) -> Result<Response<AuthorizeResponse>, Status> {
         let req = proto::AuthorizeRequest {
             token,
             permissions: requested_perms
@@ -46,11 +48,11 @@ impl IoxAuthorizer {
 
 #[async_trait]
 impl Authorizer for IoxAuthorizer {
-    async fn permissions(
+    async fn authorize(
         &self,
         token: Option<Vec<u8>>,
         requested_perms: &[Permission],
-    ) -> Result<Vec<Permission>, Error> {
+    ) -> Result<Authorization, Error> {
         let authz_rpc_result = self
             .request(token.ok_or(Error::NoToken)?, requested_perms)
             .await
@@ -76,10 +78,14 @@ impl Authorizer for IoxAuthorizer {
             })
             .collect();
 
-        if intersected_perms.is_empty() {
-            return Err(Error::Forbidden);
+        let authorization =
+            Authorization::new(authz_rpc_result.subject.map(|s| s.id), intersected_perms);
+
+        if authorization.permissions().is_empty() {
+            Err(Error::Forbidden { authorization })
+        } else {
+            Ok(authorization)
         }
-        Ok(intersected_perms)
     }
 }
 
@@ -101,7 +107,11 @@ pub enum Error {
 
     /// The token's permissions do not allow the operation.
     #[snafu(display("forbidden"))]
-    Forbidden,
+    Forbidden {
+        /// Authorization information for the valid token that has none
+        /// of the requested permissions.
+        authorization: Authorization,
+    },
 
     /// No token has been supplied, but is required.
     #[snafu(display("no token"))]
@@ -121,8 +131,8 @@ impl Error {
     }
 }
 
-impl From<tonic::Status> for Error {
-    fn from(value: tonic::Status) -> Self {
+impl From<Status> for Error {
+    fn from(value: Status) -> Self {
         Self::verification(value.message(), value.clone())
     }
 }
@@ -132,42 +142,49 @@ mod test {
     use std::{
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
 
     use assert_matches::assert_matches;
+    use generated_types::{
+        Request,
+        transport::{Server, server::TcpIncoming},
+    };
     use test_helpers_authz::Authorizer as AuthorizerServer;
     use tokio::{
         net::TcpListener,
-        task::{spawn, JoinHandle},
+        task::{JoinHandle, spawn},
     };
-    use tonic::transport::{server::TcpIncoming, Server};
 
     use super::*;
-    use crate::{Action, Authorizer, Permission, Resource};
+    use crate::{Action, Authorizer, Permission, Resource, Target};
 
     const NAMESPACE: &str = "bananas";
+    const NAMESPACE_ID: &str = "1234";
 
     macro_rules! test_iox_authorizer {
         (
             $name:ident,
             token_permissions = $token_permissions:expr,
             permissions_required = $permissions_required:expr,
-            want = $want:pat
+            want = $want:pat$(,
+            legacy_tokens = $legacy_tokens:expr$(,)?)?
         ) => {
             paste::paste! {
                 #[tokio::test]
                 async fn [<test_iox_authorizer_ $name>]() {
-                    let mut authz_server = AuthorizerServer::create().await;
+                    let mut authz_server = AuthorizerServer::create()
+                        .await
+                        $(.use_legacy_tokens($legacy_tokens))?;
                     let authz = IoxAuthorizer::connect_lazy(authz_server.addr())
                             .expect("Failed to create IoxAuthorizer client.");
 
-                    let token = authz_server.create_token_for(NAMESPACE, $token_permissions);
+                    let token = authz_server.create_token_for(NAMESPACE, NAMESPACE_ID, $token_permissions);
 
-                    let got = authz.permissions(
+                    let got = authz.authorize(
                         Some(token.as_bytes().to_vec()),
                         $permissions_required
                     ).await;
@@ -179,31 +196,96 @@ mod test {
     }
 
     test_iox_authorizer!(
-        ok,
+        ok_legacy,
         token_permissions = &["ACTION_WRITE"],
         permissions_required = &[Permission::ResourceAction(
-            Resource::Database(NAMESPACE.to_string()),
+            Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
             Action::Write,
         )],
+        want = Ok(_),
+        legacy_tokens = true
+    );
+
+    test_iox_authorizer!(
+        insufficient_perms_legacy,
+        token_permissions = &["ACTION_READ"],
+        permissions_required = &[Permission::ResourceAction(
+            Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+            Action::Write,
+        )],
+        want = Err(Error::Forbidden { .. }),
+        legacy_tokens = true
+    );
+
+    test_iox_authorizer!(
+        any_of_required_perms_legacy,
+        token_permissions = &["ACTION_WRITE"],
+        permissions_required = &[
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Create,
+            )
+        ],
+        want = Ok(_),
+        legacy_tokens = true
+    );
+
+    test_iox_authorizer!(
+        ok,
+        token_permissions = &["ACTION_WRITE"],
+        permissions_required = &[
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Write,
+            )
+        ],
         want = Ok(_)
     );
 
     test_iox_authorizer!(
         insufficient_perms,
         token_permissions = &["ACTION_READ"],
-        permissions_required = &[Permission::ResourceAction(
-            Resource::Database(NAMESPACE.to_string()),
-            Action::Write,
-        )],
-        want = Err(Error::Forbidden)
+        permissions_required = &[
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Write,
+            )
+        ],
+        want = Err(Error::Forbidden { .. })
     );
 
     test_iox_authorizer!(
         any_of_required_perms,
         token_permissions = &["ACTION_WRITE"],
         permissions_required = &[
-            Permission::ResourceAction(Resource::Database(NAMESPACE.to_string()), Action::Write,),
-            Permission::ResourceAction(Resource::Database(NAMESPACE.to_string()), Action::Create,)
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
+                Action::Create,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Write,
+            ),
+            Permission::ResourceAction(
+                Resource::Database(Target::ResourceId(NAMESPACE_ID.to_string())),
+                Action::Create,
+            )
         ],
         want = Ok(_)
     );
@@ -217,10 +299,10 @@ mod test {
         let invalid_token = b"UGLY";
 
         let got = authz
-            .permissions(
+            .authorize(
                 Some(invalid_token.to_vec()),
                 &[Permission::ResourceAction(
-                    Resource::Database(NAMESPACE.to_string()),
+                    Resource::Database(Target::ResourceName(NAMESPACE.to_string())),
                     Action::Read,
                 )],
             )
@@ -248,14 +330,14 @@ mod test {
         impl proto::iox_authorizer_service_server::IoxAuthorizerService for DelayedAuthorizer {
             async fn authorize(
                 &self,
-                _request: tonic::Request<proto::AuthorizeRequest>,
-            ) -> Result<tonic::Response<AuthorizeResponse>, tonic::Status> {
+                _request: Request<proto::AuthorizeRequest>,
+            ) -> Result<Response<AuthorizeResponse>, Status> {
                 let startup_done = self.0.load(Ordering::Relaxed);
                 if !startup_done {
-                    return Err(tonic::Status::deadline_exceeded("startup not done"));
+                    return Err(Status::deadline_exceeded("startup not done"));
                 }
 
-                Ok(tonic::Response::new(AuthorizeResponse {
+                Ok(Response::new(AuthorizeResponse {
                     valid: true,
                     subject: None,
                     permissions: vec![],
@@ -266,7 +348,7 @@ mod test {
         #[derive(Debug)]
         struct DelayedServer {
             addr: SocketAddr,
-            handle: JoinHandle<Result<(), tonic::transport::Error>>,
+            handle: JoinHandle<Result<(), transport::Error>>,
         }
 
         impl DelayedServer {
