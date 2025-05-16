@@ -69,7 +69,7 @@ impl FlightSQLPlanner {
             FlightSQLCommand::CommandGetSqlInfo(CommandGetSqlInfo { .. }) => {
                 Ok(iox_sql_info_data().schema())
             }
-            FlightSQLCommand::CommandGetCatalogs(req) => Ok(req.clone().into_builder().schema()),
+            FlightSQLCommand::CommandGetCatalogs(req) => Ok(req.into_builder().schema()),
             FlightSQLCommand::CommandGetCrossReference(CommandGetCrossReference { .. }) => {
                 Ok(Arc::clone(&GET_CROSS_REFERENCE_SCHEMA))
             }

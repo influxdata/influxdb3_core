@@ -169,31 +169,32 @@ pub type CatalogAndCache = (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>
 /// calls [`catalog_from_backing`] with a temporary [`PostgresCatalog`]
 pub async fn catalog() -> CatalogAndCache {
     let (backing, db) = run_backing_postgres_catalog(Arc::default()).await;
-    let (cat, cache) = catalog_from_backing(Arc::new(backing) as _);
+    let (cat, cache) = catalog_from_backing(Arc::new(backing) as _).await;
     cat.hold_onto(db);
     (cat, cache)
 }
 
 /// Call [`catalog_from_backing_and_times`] with the provided `backing`, [`SystemProvider`], and
 /// [`Duration::ZERO`]
-pub fn catalog_from_backing(backing: Arc<dyn Catalog>) -> CatalogAndCache {
+pub async fn catalog_from_backing(backing: Arc<dyn Catalog>) -> CatalogAndCache {
     catalog_from_backing_and_times(
         backing,
         Arc::new(SystemProvider::new()) as _,
         Duration::ZERO,
     )
+    .await
 }
 
 /// Build a basic Catalog and Cache for use with tests, using the provided `backing` [`Catalog`]
 /// as the backing data store, with the provided times
-pub fn catalog_from_backing_and_times(
+pub async fn catalog_from_backing_and_times(
     backing: Arc<dyn Catalog>,
     time_provider: Arc<dyn TimeProvider>,
     batch_delay: Duration,
 ) -> CatalogAndCache {
     let metrics = backing.metrics();
-    let peer0 = TestCacheServer::bind_ephemeral(&metrics);
-    let peer1 = TestCacheServer::bind_ephemeral(&metrics);
+    let peer0 = TestCacheServer::bind_ephemeral(&metrics).await;
+    let peer1 = TestCacheServer::bind_ephemeral(&metrics).await;
 
     let cache = Arc::new(QuorumCatalogCache::new(
         Arc::new(CatalogCache::default()),

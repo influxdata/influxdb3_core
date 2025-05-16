@@ -25,6 +25,7 @@ use crate::statistics::{column_statistics_min_max, statistics_by_partition};
 /// Output will have N ranges where N is the number of output partitions
 ///
 /// Returns None if not possible to determine ranges.
+#[cfg_attr(not(test), expect(unused))]
 pub(crate) fn extract_disjoint_ranges_from_plan(
     exprs: &LexOrdering,
     input_plan: &Arc<dyn ExecutionPlan>,

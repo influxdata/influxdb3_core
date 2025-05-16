@@ -12,7 +12,6 @@ use datafusion::{
         union::UnionExec,
     },
 };
-use itertools::Itertools;
 
 use crate::{
     physical_optimizer::sort::util::{
@@ -21,12 +20,9 @@ use crate::{
     provider::progressive_eval::ProgressiveEvalExec,
 };
 
-use super::{
-    lexical_range::LexicalRange,
-    util::{
-        ValueRangeAndColValues, accepted_union_exec, add_sort_preserving_merge,
-        all_physical_sort_exprs_on_column,
-    },
+use super::util::{
+    ValueRangeAndColValues, accepted_union_exec, add_sort_preserving_merge,
+    all_physical_sort_exprs_on_column,
 };
 
 /// IOx specific optimization rule to replace SortPreservingMerge with ProgressiveEval if
@@ -173,28 +169,12 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputsForConstants {
             );
 
             // Make new union with sorted streams
-            let cnt_partitions = new_plans_value_ranges.plans.len();
             let new_union_exec = Arc::new(UnionExec::new(new_plans_value_ranges.plans));
-
-            // This LexicalRange is then only used for display in ProgressiveEvalExec,
-            // the rest of the OrderUnionSortedInputsForConstants logic remains tied to
-            // the legacy ValueRangeAndColValues.
-            let lexical_ranges = new_plans_value_ranges
-                .value_ranges
-                .into_iter()
-                .map(|(min, max)| {
-                    let mut builder = LexicalRange::builder();
-                    builder.push(min, max);
-                    builder.build()
-                })
-                .collect_vec();
-
-            assert_eq!(lexical_ranges.len(), cnt_partitions);
 
             // Replace SortPreservingMergeExec with ProgressiveEvalExec
             let progresive_eval_exec = Arc::new(ProgressiveEvalExec::new(
                 new_union_exec,
-                Some(lexical_ranges),
+                Some(new_plans_value_ranges.value_ranges),
                 None,
             ));
 
@@ -303,7 +283,7 @@ mod test {
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(m0)->(m0), (m1)->(m1)]"
+            - " ProgressiveEvalExec: input_ranges=[(Utf8(\"m0\"), Utf8(\"m0\")), (Utf8(\"m1\"), Utf8(\"m1\"))]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
@@ -386,9 +366,9 @@ mod test {
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(m0)->(m0), (m1)->(m1)]"
+            - " ProgressiveEvalExec: input_ranges=[(Utf8(\"m0\"), Utf8(\"m0\")), (Utf8(\"m1\"), Utf8(\"m1\"))]"
             - "   UnionExec"
-            - "     ProgressiveEvalExec: input_ranges=[(m0)->(m0), (m0)->(m0)]"
+            - "     ProgressiveEvalExec: input_ranges=[(Utf8(\"m0\"), Utf8(\"m0\")), (Utf8(\"m0\"), Utf8(\"m0\"))]"
             - "       UnionExec"
             - "         SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "           ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
@@ -460,7 +440,7 @@ mod test {
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(1)->(1), (2)->(2)]"
+            - " ProgressiveEvalExec: input_ranges=[(Utf8(\"1\"), Utf8(\"1\")), (Utf8(\"2\"), Utf8(\"2\"))]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[1 as iox::measurement, 10 as key, tag0@1 as value]"
@@ -529,7 +509,7 @@ mod test {
           - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(m0)->(m0), (m1)->(m1)]"
+            - " ProgressiveEvalExec: input_ranges=[(Utf8(\"m0\"), Utf8(\"m0\")), (Utf8(\"m1\"), Utf8(\"m1\"))]"
             - "   UnionExec"
             - "     SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag1 as another_key, tag0@1 as value]"

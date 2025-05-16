@@ -667,7 +667,7 @@ mod tests {
             table_id: 2,
             partition_id: 3,
             partition_hash_id: Some(PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()),
-            object_store_id: Some(object_store_id.clone()),
+            object_store_id: Some(object_store_id),
             min_time: 4,
             max_time: 5,
             file_size_bytes: 6,
@@ -695,7 +695,7 @@ mod tests {
                 partition_hash_id: Some(
                     PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()
                 ),
-                object_store_id: Some(object_store_id.clone()),
+                object_store_id: Some(object_store_id),
                 min_time: 4,
                 max_time: 5,
                 file_size_bytes: 6,
@@ -722,7 +722,7 @@ mod tests {
             table_id: 2,
             partition_id: 3,
             partition_hash_id: Some(PartitionHashId::arbitrary_for_testing().as_bytes().to_vec()),
-            object_store_id: Some(object_store_id.clone()),
+            object_store_id: Some(object_store_id),
             min_time: 4,
             max_time: 5,
             file_size_bytes: 6,

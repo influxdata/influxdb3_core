@@ -16,8 +16,6 @@ aws-sdk-sts = "1.68.0"
 clap = { version = "4", features = ["derive", "env", "string"] }
 ed25519-dalek = { version = "2", features = ["pem"] }
 http = { workspace = true }
-# object store crate uses new version of http crate
-http_1 = { version = "1.1", package = "http" }
 humantime = "2.2.0"
 iox_catalog = { path = "../iox_catalog" }
 iox_time = { path = "../iox_time" }

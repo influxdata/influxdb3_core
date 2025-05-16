@@ -2,9 +2,9 @@
 // crates because of all the generated code it contains that we don't have much
 // control over.
 #![expect(
+    clippy::clone_on_ref_ptr,
     clippy::derive_partial_eq_without_eq,
     clippy::large_enum_variant,
-    clippy::needless_borrows_for_generic_args,
     clippy::needless_lifetimes,
     clippy::use_self,
     clippy::allow_attributes,

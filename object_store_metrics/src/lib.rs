@@ -102,6 +102,7 @@ where
 pub struct ObjectStoreMetrics {
     inner: Arc<dyn ObjectStore>,
     time_provider: Arc<dyn TimeProvider>,
+    bucket: Option<String>,
 
     put: Arc<MetricsWithBytes>,
     put_opts: Arc<MetricsWithBytes>,
@@ -130,59 +131,100 @@ impl ObjectStoreMetrics {
         time_provider: Arc<dyn TimeProvider>,
         store_type: impl Into<StoreType>,
         registry: &metric::Registry,
+        bucket: Option<impl Into<String>>,
     ) -> Self {
         let store_type = store_type.into();
+        let bucket = bucket.map(Into::into);
 
         Self {
             inner,
             time_provider,
 
-            put: Arc::new(MetricsWithBytes::new(registry, &store_type, "put")),
-            put_opts: Arc::new(MetricsWithBytes::new(registry, &store_type, "put_opts")),
+            put: Arc::new(MetricsWithBytes::new(registry, &store_type, "put", &bucket)),
+            put_opts: Arc::new(MetricsWithBytes::new(
+                registry,
+                &store_type,
+                "put_opts",
+                &bucket,
+            )),
             put_multipart: Arc::new(MetricsWithBytes::new(
                 registry,
                 &store_type,
                 "put_multipart",
+                &bucket,
             )),
             put_multipart_opts: Arc::new(MetricsWithBytes::new(
                 registry,
                 &store_type,
                 "put_multipart_opts",
+                &bucket,
             )),
-            get: Arc::new(MetricsWithBytesAndTtfb::new(registry, &store_type, "get")),
+            get: Arc::new(MetricsWithBytesAndTtfb::new(
+                registry,
+                &store_type,
+                "get",
+                &bucket,
+            )),
             get_opts: Arc::new(MetricsWithBytesAndTtfb::new(
                 registry,
                 &store_type,
                 "get_opts",
+                &bucket,
             )),
-            get_range: Arc::new(MetricsWithBytes::new(registry, &store_type, "get_range")),
-            get_ranges: Arc::new(MetricsWithBytes::new(registry, &store_type, "get_ranges")),
-            head: Arc::new(Metrics::new(registry, &store_type, "head")),
-            delete: Arc::new(Metrics::new(registry, &store_type, "delete")),
+            get_range: Arc::new(MetricsWithBytes::new(
+                registry,
+                &store_type,
+                "get_range",
+                &bucket,
+            )),
+            get_ranges: Arc::new(MetricsWithBytes::new(
+                registry,
+                &store_type,
+                "get_ranges",
+                &bucket,
+            )),
+            head: Arc::new(Metrics::new(registry, &store_type, "head", &bucket)),
+            delete: Arc::new(Metrics::new(registry, &store_type, "delete", &bucket)),
             delete_stream: Arc::new(MetricsWithCount::new(
                 registry,
                 &store_type,
                 "delete_stream",
+                &bucket,
             )),
-            list: Arc::new(MetricsWithCount::new(registry, &store_type, "list")),
+            list: Arc::new(MetricsWithCount::new(
+                registry,
+                &store_type,
+                "list",
+                &bucket,
+            )),
             list_with_offset: Arc::new(MetricsWithCount::new(
                 registry,
                 &store_type,
                 "list_with_offset",
+                &bucket,
             )),
             list_with_delimiter: Arc::new(MetricsWithCount::new(
                 registry,
                 &store_type,
                 "list_with_delimiter",
+                &bucket,
             )),
-            copy: Arc::new(Metrics::new(registry, &store_type, "copy")),
-            rename: Arc::new(Metrics::new(registry, &store_type, "rename")),
-            copy_if_not_exists: Arc::new(Metrics::new(registry, &store_type, "copy_if_not_exists")),
+            copy: Arc::new(Metrics::new(registry, &store_type, "copy", &bucket)),
+            rename: Arc::new(Metrics::new(registry, &store_type, "rename", &bucket)),
+            copy_if_not_exists: Arc::new(Metrics::new(
+                registry,
+                &store_type,
+                "copy_if_not_exists",
+                &bucket,
+            )),
             rename_if_not_exists: Arc::new(Metrics::new(
                 registry,
                 &store_type,
                 "rename_if_not_exists",
+                &bucket,
             )),
+
+            bucket,
         }
     }
 }
@@ -204,6 +246,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let size = payload.content_length();
         let res = self.inner.put(location, payload).await;
@@ -224,6 +267,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let size = bytes.content_length();
         let res = self.inner.put_opts(location, bytes, opts).await;
@@ -239,6 +283,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.put_multipart(location).await;
         wrap_multipart_upload_res(res, recorder)
@@ -256,6 +301,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.put_multipart_opts(location, opts).await;
         wrap_multipart_upload_res(res, recorder)
@@ -269,6 +315,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.get(location).await;
         wrap_getresult_res(res, recorder).await
@@ -283,6 +330,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 get_range: options.range.clone(),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.get_opts(location, options).await;
         wrap_getresult_res(res, recorder).await
@@ -297,6 +345,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 get_range: Some(range.clone().into()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.get_range(location, range).await;
         recorder.submit((&res).into(), res.as_ref().ok().map(|b| b.len() as _));
@@ -311,6 +360,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.get_ranges(location, ranges).await;
         recorder.submit(
@@ -330,6 +380,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.head(location).await;
         recorder.submit((&res).into());
@@ -344,6 +395,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 location: Some(location.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.delete(location).await;
         recorder.submit((&res).into());
@@ -358,6 +410,7 @@ impl ObjectStore for ObjectStoreMetrics {
             Arc::clone(&self.delete_stream),
             &self.time_provider,
             LogContext::default(),
+            &self.bucket,
         );
 
         let s = self.inner.delete_stream(locations);
@@ -377,6 +430,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 prefix: prefix.cloned(),
                 ..Default::default()
             },
+            &self.bucket,
         );
 
         let s = self.inner.list(prefix);
@@ -401,6 +455,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 offset: Some(offset.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
 
         let s = self.inner.list_with_offset(prefix, offset);
@@ -420,6 +475,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 prefix: prefix.cloned(),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.list_with_delimiter(prefix).await;
         recorder.submit(
@@ -438,6 +494,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 to: Some(to.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.copy(from, to).await;
         recorder.submit((&res).into());
@@ -453,6 +510,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 to: Some(to.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.rename(from, to).await;
         recorder.submit((&res).into());
@@ -468,6 +526,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 to: Some(to.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.copy_if_not_exists(from, to).await;
         recorder.submit((&res).into());
@@ -483,6 +542,7 @@ impl ObjectStore for ObjectStoreMetrics {
                 to: Some(to.clone()),
                 ..Default::default()
             },
+            &self.bucket,
         );
         let res = self.inner.rename_if_not_exists(from, to).await;
         recorder.submit((&res).into());
@@ -575,6 +635,9 @@ mod tests {
 
     use super::*;
 
+    /// Alias for helping the compiler when using `None` in tests that do not use a bucket below:
+    type Bucket = Option<String>;
+
     #[tokio::test]
     async fn test_put() {
         let capture = capture();
@@ -593,7 +656,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.put(&path, payload).await.expect("put should succeed");
 
@@ -665,7 +728,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .put(&path, payload)
@@ -743,7 +806,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .put_opts(&path, payload, Default::default())
@@ -817,7 +880,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut multipart_upload = store
             .put_multipart(&path)
@@ -906,7 +969,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut multipart_upload = store
             .put_multipart(&path)
@@ -994,7 +1057,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut multipart_upload = store
             .put_multipart(&path)
@@ -1083,7 +1146,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut multipart_upload = store
             .put_multipart(&path)
@@ -1159,7 +1222,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let multipart_upload = store
             .put_multipart(&path)
@@ -1281,7 +1344,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.put_multipart(&path).await.unwrap_err();
 
@@ -1351,7 +1414,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut multipart_upload = store
             .put_multipart(&path)
@@ -1459,7 +1522,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         // FAILURE: one write ok, one write failure.
         let mut multipart_upload = store
@@ -1549,7 +1612,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         // FAILURE: one write ok, one flush failure.
         let mut multipart_upload = store
@@ -1634,7 +1697,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut multipart_upload = store
             .put_multipart_opts(&path, Default::default())
@@ -1724,7 +1787,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.list(None).try_collect::<Vec<_>>().await.unwrap();
 
@@ -1796,7 +1859,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .list_with_offset(None, &path)
@@ -1881,7 +1944,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         assert!(
             store.list(None).try_collect::<Vec<_>>().await.is_err(),
@@ -1937,7 +2000,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .list_with_delimiter(Some(&path))
@@ -2011,7 +2074,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         assert!(
             store.list_with_delimiter(Some(&path)).await.is_err(),
@@ -2064,7 +2127,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.head(&path).await.unwrap();
 
@@ -2104,7 +2167,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .head(&path)
@@ -2147,7 +2210,7 @@ mod tests {
 
         let time = Arc::new(MockProvider::new(Time::MIN));
         let metrics = Arc::new(metric::Registry::default());
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let mut f = store.get(&path);
         f.assert_pending().await;
@@ -2199,7 +2262,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.get(&path).await.expect_err("mock configured to fail");
 
@@ -2289,7 +2352,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let res = store.get_range(&path, range).await.unwrap();
         assert_eq!(res, DATA);
@@ -2363,7 +2426,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .get_range(&path, range)
@@ -2421,7 +2484,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.get_ranges(&path, ranges).await.unwrap();
 
@@ -2504,7 +2567,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.copy(&path, &path2).await.unwrap();
 
@@ -2546,7 +2609,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.copy_if_not_exists(&path, &path2).await.unwrap();
 
@@ -2588,7 +2651,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.rename(&path, &path2).await.unwrap();
 
@@ -2650,7 +2713,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.rename_if_not_exists(&path, &path2).await.unwrap();
 
@@ -2724,7 +2787,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store
             .delete_stream(futures::stream::iter([path, path2]).map(Ok).boxed())
@@ -2810,7 +2873,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         store.delete(&path).await.unwrap();
 
@@ -2850,7 +2913,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let got = store.get(&path).await.expect("should read stream");
         match got.payload {
@@ -2954,7 +3017,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let got = store.get(&path).await.expect("should read file");
         match got.payload {
@@ -3054,7 +3117,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::default());
         let time = Arc::new(MockProvider::new(Time::MIN));
-        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics);
+        let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
         let got = store
             .get_opts(&path, Default::default())
@@ -3135,6 +3198,109 @@ mod tests {
           op: "\"get_opts\""
           result: "\"success\""
           store_type: "\"bananas\""
+        "#);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_label() {
+        let capture = capture();
+        let path = path();
+        let store = MockStore::new()
+            .mock_next(MockCall::Get {
+                params: path.clone(),
+                barriers: vec![],
+                res: Ok(get_result_stream()),
+            })
+            .as_store();
+
+        let metrics = Arc::new(metric::Registry::default());
+        let time = Arc::new(MockProvider::new(Time::MIN));
+        let store = ObjectStoreMetrics::new(store, time, "buckets", &metrics, Some("my_bucket"));
+
+        let got = store.get(&path).await.expect("should read stream");
+        match got.payload {
+            GetResultPayload::Stream(mut stream) => while (stream.next().await).is_some() {},
+            v => panic!("not a stream: {v:?}"),
+        }
+
+        assert_counter_value(
+            &metrics,
+            "object_store_transfer_bytes",
+            [
+                ("store_type", "buckets"),
+                ("op", "get"),
+                ("result", "success"),
+                ("bucket", "my_bucket"),
+            ],
+            DATA.len() as u64,
+        );
+        assert_u64histogram_hits(
+            &metrics,
+            "object_store_transfer_bytes_hist",
+            [
+                ("store_type", "buckets"),
+                ("op", "get"),
+                ("result", "success"),
+                ("bucket", "my_bucket"),
+            ],
+            1,
+        );
+        assert_u64histogram_total(
+            &metrics,
+            "object_store_transfer_bytes_hist",
+            [
+                ("store_type", "buckets"),
+                ("op", "get"),
+                ("result", "success"),
+                ("bucket", "my_bucket"),
+            ],
+            DATA.len() as u64,
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_duration",
+            [
+                ("store_type", "buckets"),
+                ("op", "get"),
+                ("result", "success"),
+                ("bucket", "my_bucket"),
+            ],
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_headers",
+            [
+                ("store_type", "buckets"),
+                ("op", "get"),
+                ("result", "success"),
+                ("bucket", "my_bucket"),
+            ],
+        );
+        assert_histogram_hit(
+            &metrics,
+            "object_store_op_ttfb",
+            [
+                ("store_type", "buckets"),
+                ("op", "get"),
+                ("result", "success"),
+                ("bucket", "my_bucket"),
+            ],
+        );
+
+        insta::assert_yaml_snapshot!(
+            capture.lines_as_maps(),
+            @r#"
+        - bucket: "\"my_bucket\""
+          bytes: 11
+          duration_secs: 0
+          first_byte_secs: 0
+          headers_secs: 0
+          level: DEBUG
+          location: "\"path\""
+          message: object store operation
+          op: "\"get\""
+          result: "\"success\""
+          store_type: "\"buckets\""
         "#);
     }
 

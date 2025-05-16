@@ -20,6 +20,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, Metric,
     Partitioning, PlanProperties, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+use datafusion::scalar::ScalarValue;
 use futures::{Stream, StreamExt, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,7 +28,6 @@ use std::task::{Context, Poll};
 use observability_deps::tracing::{debug, trace, warn};
 
 use crate::config::IoxConfigExt;
-use crate::physical_optimizer::sort::lexical_range::LexicalRange;
 
 /// ProgressiveEval return a stream of record batches in the order of its inputs.
 /// It will stop when the number of output rows reach the given limit.
@@ -61,9 +61,9 @@ pub(crate) struct ProgressiveEvalExec {
     /// Input plan
     input: Arc<dyn ExecutionPlan>,
 
-    /// Corresponding value ranges of the input plan, per partition.
+    /// Corresponding value ranges of the input plan
     /// None if the value ranges are not available
-    value_ranges: Option<Vec<LexicalRange>>,
+    value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
 
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
@@ -79,14 +79,14 @@ impl ProgressiveEvalExec {
     /// Create a new progressive execution plan
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        value_ranges: Option<Vec<LexicalRange>>,
+        value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
     ) -> Self {
         let cache = Self::compute_properties(&input);
         Self {
             input,
-            metrics: ExecutionPlanMetricsSet::new(),
             value_ranges,
+            metrics: ExecutionPlanMetricsSet::new(),
             fetch,
             cache,
         }
@@ -122,17 +122,8 @@ impl DisplayAs for ProgressiveEvalExec {
                 if let Some(fetch) = self.fetch {
                     write!(f, "fetch={fetch}, ")?;
                 };
-
-                if let Some(lexical_ranges) = &self.value_ranges {
-                    write!(
-                        f,
-                        "input_ranges=[{}]",
-                        lexical_ranges
-                            .iter()
-                            .map(|r| r.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )?;
+                if let Some(value_ranges) = &self.value_ranges {
+                    write!(f, "input_ranges={value_ranges:?}")?;
                 };
 
                 Ok(())
@@ -583,7 +574,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
-    use datafusion::common::ScalarValue;
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -1662,7 +1652,7 @@ mod tests {
 
     async fn _test_progressive_eval(
         partitions: &[Vec<RecordBatch>],
-        _value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
+        value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
         expected_result: &[&str],
         expected_num_input_streams: usize,
@@ -1679,7 +1669,11 @@ mod tests {
         };
 
         let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let progressive = Arc::new(ProgressiveEvalExec::new(Arc::new(exec), None, fetch));
+        let progressive = Arc::new(ProgressiveEvalExec::new(
+            Arc::new(exec),
+            value_ranges,
+            fetch,
+        ));
 
         let progressive_clone = Arc::clone(&progressive);
 

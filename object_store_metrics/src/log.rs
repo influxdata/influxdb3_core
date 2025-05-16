@@ -28,10 +28,16 @@ pub(crate) struct LogRecord {
     pub(crate) d_headers: Option<Duration>,
     pub(crate) d_first_byte: Option<Duration>,
     pub(crate) count: Option<u64>,
+    pub(crate) bucket: Option<String>,
 }
 
 impl LogRecord {
-    pub(crate) fn new(store_type: StoreType, op: &'static str, context: LogContext) -> Self {
+    pub(crate) fn new(
+        store_type: StoreType,
+        op: &'static str,
+        context: LogContext,
+        bucket: &Option<String>,
+    ) -> Self {
         Self {
             store_type,
             op,
@@ -42,6 +48,7 @@ impl LogRecord {
             d_headers: None,
             d_first_byte: None,
             count: None,
+            bucket: bucket.clone(),
         }
     }
 
@@ -56,6 +63,7 @@ impl LogRecord {
             d_headers,
             d_first_byte,
             count,
+            bucket,
         } = self;
 
         let LogContext {
@@ -90,6 +98,7 @@ impl LogRecord {
             headers_secs = d_headers.map(|d| d.as_secs_f64()),
             first_byte_secs = d_first_byte.map(|d| d.as_secs_f64()),
             count,
+            bucket = bucket.as_ref(),
             "object store operation"
         );
     }

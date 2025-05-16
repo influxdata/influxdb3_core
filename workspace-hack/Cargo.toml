@@ -21,8 +21,8 @@ workspace = true
 [dependencies]
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
 arrayvec = { version = "0.7", default-features = false, features = ["std"] }
-arrow = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a", features = ["chrono-tz", "prettyprint"] }
-arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a", features = ["lz4"] }
+arrow = { version = "53", features = ["chrono-tz", "prettyprint"] }
+arrow-ipc = { version = "53", features = ["lz4"] }
 aws-credential-types = { version = "1", default-features = false, features = ["test-util"] }
 aws-smithy-async = { version = "1", default-features = false, features = ["rt-tokio"] }
 aws-smithy-http = { version = "0.62", default-features = false, features = ["event-stream"] }
@@ -58,9 +58,8 @@ getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-f
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", features = ["raw"] }
 httparse = { version = "1" }
-hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["full"] }
-hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", features = ["client", "http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "server-graceful", "service"] }
 idna = { version = "1", default-features = false, features = ["compiled_data", "std"] }
 indexmap = { version = "2" }
 insta = { version = "1", features = ["json", "redactions", "yaml"] }
@@ -73,15 +72,14 @@ memchr = { version = "2" }
 num-bigint = { version = "0.4", features = ["serde"] }
 num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
-object_store = { git = "https://github.com/influxdata/arrow-rs.git", rev = "c946cd81fa12e6588a3be33be08e3d8e9a2770e7", default-features = false, features = ["aws", "azure", "gcp"] }
+object_store = { version = "0.11", default-features = false, features = ["aws", "azure", "gcp"] }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.6" }
 phf_shared = { version = "0.11" }
 proptest = { version = "1" }
-prost-594e8ee84c453af0 = { package = "prost", version = "0.13", features = ["prost-derive"] }
-prost-5ef9efb8ec2df382 = { package = "prost", version = "0.12", features = ["prost-derive"] }
-prost-types = { version = "0.12" }
+prost = { version = "0.13", features = ["prost-derive"] }
+prost-types = { version = "0.13" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_core-274715c4dabd11b0 = { package = "rand_core", version = "0.9", default-features = false, features = ["os_rng", "std"] }
@@ -89,12 +87,11 @@ rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-f
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["gzip", "http2", "json", "multipart", "rustls-tls", "rustls-tls-native-roots", "stream"] }
-reqwest-a6292c17cd707f01 = { package = "reqwest", version = "0.11", default-features = false, features = ["json", "multipart", "rustls-tls-native-roots", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "http2", "json", "multipart", "rustls-tls", "rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-pemfile = { version = "2" }
-rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10", features = ["oid"] }
@@ -108,11 +105,12 @@ sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring", "any
 sqlx-postgres = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2" }
+sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thrift = { version = "0.17" }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 tokio-metrics = { version = "0.4" }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tokio-util = { version = "0.7", features = ["codec", "compat", "io"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit"] }
@@ -163,8 +161,8 @@ parking_lot = { version = "0.12", features = ["arc_lock"] }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.6" }
 phf_shared = { version = "0.11" }
-prost-5ef9efb8ec2df382 = { package = "prost", version = "0.12", features = ["prost-derive"] }
-prost-types = { version = "0.12" }
+prost = { version = "0.13", features = ["prost-derive"] }
+prost-types = { version = "0.13" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
@@ -173,7 +171,7 @@ regex-syntax = { version = "0.8" }
 ring = { version = "0.17", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-pemfile = { version = "2" }
-rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10", features = ["oid"] }
@@ -198,11 +196,9 @@ zeroize = { version = "1", features = ["derive", "std"] }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
-hyper-rustls-754bda37e0fb3874 = { package = "hyper-rustls", version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-hyper-rustls-adf3d7031871b0af = { package = "hyper-rustls", version = "0.24", features = ["http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
 nix = { version = "0.30", default-features = false, features = ["fs", "signal", "socket"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
@@ -216,12 +212,9 @@ socket2 = { version = "0.5", default-features = false, features = ["all"] }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
-hyper-rustls-754bda37e0fb3874 = { package = "hyper-rustls", version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-hyper-rustls-adf3d7031871b0af = { package = "hyper-rustls", version = "0.24", features = ["http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
 nix = { version = "0.30", default-features = false, features = ["signal", "socket"] }
-security-framework-sys = { version = "2", default-features = false, features = ["OSX_10_12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
@@ -235,12 +228,9 @@ socket2 = { version = "0.5", default-features = false, features = ["all"] }
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "gzip", "tokio", "xz", "zstd"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
-hyper-rustls-754bda37e0fb3874 = { package = "hyper-rustls", version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-hyper-rustls-adf3d7031871b0af = { package = "hyper-rustls", version = "0.24", features = ["http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
 nix = { version = "0.30", default-features = false, features = ["signal", "socket"] }
-security-framework-sys = { version = "2", default-features = false, features = ["OSX_10_12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
@@ -253,15 +243,12 @@ socket2 = { version = "0.5", default-features = false, features = ["all"] }
 [target.x86_64-pc-windows-msvc.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["bzip2", "gzip", "tokio", "xz", "zstd"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
-hyper-rustls-754bda37e0fb3874 = { package = "hyper-rustls", version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
-hyper-rustls-adf3d7031871b0af = { package = "hyper-rustls", version = "0.24", features = ["http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 lzma-sys = { version = "0.1", default-features = false, features = ["static"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "errhandlingapi", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "minwinbase", "minwindef", "ntsecapi", "processenv", "profileapi", "windef", "winioctl", "winnt"] }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse"] }
-windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Registry", "Win32_System_Time", "Win32_UI_Shell"] }
 xz2 = { version = "0.1", default-features = false, features = ["static"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
@@ -269,6 +256,5 @@ getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-f
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse"] }
-windows-sys-c8eced492e86ede7 = { package = "windows-sys", version = "0.48", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Registry", "Win32_System_Time", "Win32_UI_Shell"] }
 
 ### END HAKARI SECTION

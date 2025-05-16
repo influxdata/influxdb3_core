@@ -1,3 +1,5 @@
+#![expect(dead_code)] // Part of https://github.com/influxdata/influxdb_iox/issues/13572
+
 //! [`NonOverlappingOrderedLexicalRanges`] represents ranges of lexically ordered values.
 
 use arrow::array::ArrayRef;

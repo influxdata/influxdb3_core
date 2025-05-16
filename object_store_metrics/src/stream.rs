@@ -267,11 +267,13 @@ mod tests {
             &metrics,
             &StoreType("bananas".into()),
             "test",
+            &None,
         ));
         let recorder = MetricsWithBytesAndTtfbRecorder::new(
             Arc::clone(&m),
             &(Arc::clone(&time_provider) as _),
             LogContext::default(),
+            &None,
         );
 
         // Sleep at least 10ms to assert the recorder to captures the wall clock
@@ -501,11 +503,13 @@ mod tests {
             &metrics,
             &StoreType("bananas".into()),
             "test",
+            &None,
         ));
         let recorder = MetricsWithBytesAndTtfbRecorder::new(
             Arc::clone(&m),
             &(Arc::clone(&time_provider) as _),
             LogContext::default(),
+            &None,
         );
 
         // Sleep at least 10ms to assert the recorder to captures the wall clock
@@ -590,11 +594,13 @@ mod tests {
             &metrics,
             &StoreType("bananas".into()),
             "test",
+            &None,
         ));
         let recorder = MetricsWithBytesAndTtfbRecorder::new(
             Arc::clone(&m),
             &(Arc::clone(&time_provider) as _),
             LogContext::default(),
+            &None,
         );
 
         let mut stream = StreamMetricRecorder::new(
@@ -713,11 +719,13 @@ mod tests {
             &metrics,
             &StoreType("bananas".into()),
             "test",
+            &None,
         ));
         let recorder = MetricsWithBytesAndTtfbRecorder::new(
             Arc::clone(&m),
             &(Arc::clone(&time_provider) as _),
             LogContext::default(),
+            &None,
         );
 
         let mut stream = StreamMetricRecorder::new(
@@ -832,11 +840,13 @@ mod tests {
             &metrics,
             &StoreType("bananas".into()),
             "test",
+            &None,
         ));
         let recorder = MetricsWithBytesAndTtfbRecorder::new(
             Arc::clone(&m),
             &(Arc::clone(&time_provider) as _),
             LogContext::default(),
+            &None,
         );
 
         let stream = StreamMetricRecorder::new(
@@ -905,11 +915,13 @@ mod tests {
             &metrics,
             &StoreType("bananas".into()),
             "test",
+            &None,
         ));
         let recorder = MetricsWithBytesAndTtfbRecorder::new(
             Arc::clone(&m),
             &(Arc::clone(&time_provider) as _),
             LogContext::default(),
+            &None,
         );
 
         let mut stream = StreamMetricRecorder::new(

@@ -1489,14 +1489,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_catalog() {
-        crate::interface_tests::test_catalog(|| async { Arc::new(catalog().0) as _ }).await;
+        crate::interface_tests::test_catalog(|| async { Arc::new(catalog().await.0) as _ }).await;
     }
 
     #[tokio::test]
     async fn test_catalog_metrics() {
         maybe_start_logging();
 
-        let catalog = Arc::new(catalog().0);
+        let catalog = Arc::new(catalog().await.0);
         let metrics = catalog.metrics();
 
         let ns = catalog
@@ -1555,7 +1555,7 @@ mod tests {
     async fn test_quorum_recovery() {
         maybe_start_logging();
 
-        let (catalog, cache) = catalog();
+        let (catalog, cache) = catalog().await;
 
         let mut repos = catalog.repositories();
 
@@ -1608,7 +1608,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_etag() {
-        let (catalog, cache) = catalog();
+        let (catalog, cache) = catalog().await;
 
         let mut repos = catalog.repositories();
         repos
@@ -1781,7 +1781,8 @@ mod tests {
 
         let batch_delay = Duration::from_secs(1);
         let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_millis(0).unwrap()));
-        let (catalog, _cache) = catalog_with_params(Arc::clone(&time_provider) as _, batch_delay);
+        let (catalog, _cache) =
+            catalog_with_params(Arc::clone(&time_provider) as _, batch_delay).await;
 
         let mut repos = catalog.repositories();
 
@@ -1878,11 +1879,11 @@ mod tests {
         assert_eq!(file_uuids_actual, file_uuids_expected);
     }
 
-    fn catalog() -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
-        catalog_with_params(Arc::new(SystemProvider::new()), Duration::ZERO)
+    async fn catalog() -> (TestCatalog<CachingCatalog>, Arc<QuorumCatalogCache>) {
+        catalog_with_params(Arc::new(SystemProvider::new()), Duration::ZERO).await
     }
 
-    fn catalog_with_params(
+    async fn catalog_with_params(
         time_provider: Arc<dyn TimeProvider>,
         batch_delay: Duration,
     ) -> CatalogAndCache {
@@ -1891,6 +1892,7 @@ mod tests {
             time_provider,
             batch_delay,
         )
+        .await
     }
 
     #[track_caller]
@@ -1959,7 +1961,8 @@ mod tests {
             Arc::clone(&backing) as _,
             Arc::clone(&time_provider) as _,
             Duration::ZERO,
-        );
+        )
+        .await;
         let mut repos = catalog.repositories();
 
         let active_ns_snapshot = repos.namespaces().snapshot(namespace.id).await.unwrap();
@@ -2248,7 +2251,8 @@ mod tests {
                     Arc::clone(&backing) as _,
                     Arc::clone(&time_provider) as _,
                     Duration::ZERO,
-                );
+                )
+                .await;
                 let mut repos = catalog.repositories();
 
                 let partition = if self.partition_in_cache || self.partition_in_backing {

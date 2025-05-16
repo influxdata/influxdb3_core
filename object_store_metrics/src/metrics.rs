@@ -50,7 +50,8 @@ use std::{borrow::Cow, sync::Arc};
 
 use iox_time::{Time, TimeProvider};
 use metric::{
-    DurationHistogram, Metric, MetricObserver, U64Counter, U64Histogram, U64HistogramOptions,
+    Attributes, DurationHistogram, Metric, MetricObserver, U64Counter, U64Histogram,
+    U64HistogramOptions,
 };
 
 use object_store::Result;
@@ -105,23 +106,28 @@ impl<T> OpResultMetric<T>
 where
     T: MetricObserver<Recorder = T>,
 {
-    pub(crate) fn new(metric: Metric<T>, store_type: &StoreType, op: &'static str) -> Self {
+    pub(crate) fn new(
+        metric: Metric<T>,
+        store_type: &StoreType,
+        op: &'static str,
+        bucket: &Option<String>,
+    ) -> Self {
+        let attributes = |result| {
+            let mut attributes = Attributes::from([
+                ("store_type", store_type.0.clone()),
+                ("op", Cow::Borrowed(op)),
+                ("result", Cow::Borrowed(result)),
+            ]);
+            if let Some(bucket) = bucket {
+                attributes.insert("bucket", bucket.clone());
+            }
+            attributes
+        };
+
         Self {
-            success: metric.recorder([
-                ("store_type", store_type.0.clone()),
-                ("op", Cow::Borrowed(op)),
-                ("result", Cow::Borrowed("success")),
-            ]),
-            error: metric.recorder([
-                ("store_type", store_type.0.clone()),
-                ("op", Cow::Borrowed(op)),
-                ("result", Cow::Borrowed("error")),
-            ]),
-            canceled: metric.recorder([
-                ("store_type", store_type.0.clone()),
-                ("op", Cow::Borrowed(op)),
-                ("result", Cow::Borrowed("canceled")),
-            ]),
+            success: metric.recorder(attributes("success")),
+            error: metric.recorder(attributes("error")),
+            canceled: metric.recorder(attributes("canceled")),
         }
     }
 
@@ -147,6 +153,7 @@ impl Metrics {
         registry: &metric::Registry,
         store_type: &StoreType,
         op: &'static str,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
             duration: OpResultMetric::new(
@@ -156,6 +163,7 @@ impl Metrics {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
             op,
             store_type: store_type.clone(),
@@ -192,11 +200,13 @@ where
         metrics: Arc<M>,
         time_provider: &Arc<dyn TimeProvider>,
         context: LogContext,
+        bucket: &Option<String>,
     ) -> Self {
         let log_record = LogRecord::new(
             metrics.as_ref().as_ref().store_type.clone(),
             metrics.as_ref().as_ref().op,
             context,
+            bucket,
         );
 
         Self {
@@ -264,9 +274,10 @@ impl MetricsWithBytes {
         registry: &metric::Registry,
         store_type: &StoreType,
         op: &'static str,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
-            inner: Metrics::new(registry, store_type, op),
+            inner: Metrics::new(registry, store_type, op, bucket),
             bytes: OpResultMetric::new(
                 registry.register_metric::<U64Counter>(
                     "object_store_transfer_bytes",
@@ -274,6 +285,7 @@ impl MetricsWithBytes {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
             bytes_hist: OpResultMetric::new(
                 registry.register_metric_with_options::<U64Histogram, _>(
@@ -297,6 +309,7 @@ impl MetricsWithBytes {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
         }
     }
@@ -333,9 +346,10 @@ where
         metrics: Arc<M>,
         time_provider: &Arc<dyn TimeProvider>,
         context: LogContext,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
-            inner: MetricsRecorder::new(metrics, time_provider, context),
+            inner: MetricsRecorder::new(metrics, time_provider, context, bucket),
             bytes: None,
         }
     }
@@ -378,9 +392,10 @@ impl MetricsWithBytesAndTtfb {
         registry: &metric::Registry,
         store_type: &StoreType,
         op: &'static str,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
-            inner: MetricsWithBytes::new(registry, store_type, op),
+            inner: MetricsWithBytes::new(registry, store_type, op, bucket),
             duration_headers: OpResultMetric::new(
                 registry.register_metric(
                     "object_store_op_headers",
@@ -388,6 +403,7 @@ impl MetricsWithBytesAndTtfb {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
             duration_ttfb: OpResultMetric::new(
                 registry.register_metric(
@@ -396,6 +412,7 @@ impl MetricsWithBytesAndTtfb {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
         }
     }
@@ -449,9 +466,10 @@ where
         metrics: Arc<M>,
         time_provider: &Arc<dyn TimeProvider>,
         context: LogContext,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
-            inner: MetricsWithBytesRecorder::new(metrics, time_provider, context),
+            inner: MetricsWithBytesRecorder::new(metrics, time_provider, context, bucket),
             t_headers: None,
             t_first_byte: None,
         }
@@ -527,9 +545,10 @@ impl MetricsWithCount {
         registry: &metric::Registry,
         store_type: &StoreType,
         op: &'static str,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
-            inner: Metrics::new(registry, store_type, op),
+            inner: Metrics::new(registry, store_type, op, bucket),
             count: OpResultMetric::new(
                 registry.register_metric::<U64Counter>(
                     "object_store_transfer_objects",
@@ -537,6 +556,7 @@ impl MetricsWithCount {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
             count_hist: OpResultMetric::new(
                 registry.register_metric_with_options::<U64Histogram, _>(
@@ -560,6 +580,7 @@ impl MetricsWithCount {
                 ),
                 store_type,
                 op,
+                bucket,
             ),
         }
     }
@@ -596,9 +617,10 @@ where
         metrics: Arc<M>,
         time_provider: &Arc<dyn TimeProvider>,
         context: LogContext,
+        bucket: &Option<String>,
     ) -> Self {
         Self {
-            inner: MetricsRecorder::new(metrics, time_provider, context),
+            inner: MetricsRecorder::new(metrics, time_provider, context, bucket),
             count: None,
         }
     }

@@ -5,12 +5,11 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 # crates.io dependencies in alphabetical order
 async-trait = "0.1"
-hyper = {workspace = true}
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy"] }
 parking_lot = "0.12"
 serde = "1.0"
 serde_urlencoded = "0.7"

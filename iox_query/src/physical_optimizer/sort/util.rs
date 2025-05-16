@@ -1,7 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    physical_optimizer::sort::lexical_range::LexicalRange,
     provider::{DeduplicateExec, progressive_eval::ProgressiveEvalExec},
     statistics::{column_statistics_min_max, compute_stats_column_min_max, overlap},
 };
@@ -26,9 +25,6 @@ use observability_deps::tracing::{trace, warn};
 
 /// Compute statistics for the given plans on a given column name
 /// Return none if the statistics are not available
-///
-/// TODO(wiedld): remove in cleanup PR
-#[expect(unused)]
 pub(crate) fn collect_statistics_min_max(
     plans: &[Arc<dyn ExecutionPlan>],
     col_name: &str,
@@ -342,9 +338,6 @@ impl ValueRangeAndColValues {
 /// This function is to split non-overlapped files in the same ParquetExec into different groups/DF partitions and
 ///  set the `preserve_partitioning` so they will be executed sequentially. Note that files in same group will are read sequentially.
 /// If we cannot split them, we have to add SortPreservingMerge to keep data outputed in the right sort order
-///
-/// TODO(wiedld): remove in cleanup PR
-#[expect(unused)]
 pub(crate) fn split_files_or_add_sort_preserving_merge(
     plans: Vec<Arc<dyn ExecutionPlan>>,
     sort_col_name: &str,
@@ -589,13 +582,11 @@ pub(crate) fn transform_parquet_exec_single_file_each_group(
     new_plan
 }
 
-/// TODO(wiedld): remove in cleanup PR
 // Recursively check if there is a `DeduplicateExec` in the plan
 pub(crate) fn has_deduplicate(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
     plan.exists(|plan| Ok(plan.as_any().downcast_ref::<DeduplicateExec>().is_some()))
 }
 
-/// TODO(wiedld): remove in cleanup PR
 /// Recursively check if there is only one ParquetExec
 pub(crate) fn only_one_parquet_exec(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
     let mut visitor = CountParquetExecVisitor { count: 0 };
@@ -603,7 +594,6 @@ pub(crate) fn only_one_parquet_exec(plan: &Arc<dyn ExecutionPlan>) -> Result<boo
     Ok(visitor.count == 1)
 }
 
-/// TODO(wiedld): remove in cleanup PR
 #[derive(Debug)]
 struct CountParquetExecVisitor {
     count: usize,
@@ -620,7 +610,6 @@ impl ExecutionPlanVisitor for CountParquetExecVisitor {
     }
 }
 
-/// TODO(wiedld): remove in cleanup PR
 /// Add union and then progressive eval on top of the plans
 pub(crate) fn add_union_and_progressive_eval(
     plans: Vec<Arc<dyn ExecutionPlan>>,
@@ -630,8 +619,9 @@ pub(crate) fn add_union_and_progressive_eval(
     assert!(plans.len() > 1);
 
     // make value ranges
-    let lexical_range = LexicalRange::new_from_constants(vec![value_for_ranges]);
-    let value_ranges = std::iter::repeat_n(lexical_range, plans.len()).collect::<Vec<_>>();
+    let value_ranges = (0..plans.len())
+        .map(|_| (value_for_ranges.clone(), value_for_ranges.clone()))
+        .collect::<Vec<_>>();
 
     // Create a union of all the plans
     let union_exec = Arc::new(UnionExec::new(plans));

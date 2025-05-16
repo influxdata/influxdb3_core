@@ -1,6 +1,5 @@
 //! Code to decode [`MutableBatch`] from pbdata protobuf
 
-use generated_types::DecodeError;
 use generated_types::influxdata::pbdata::v1::{
     Column as PbColumn, DatabaseBatch, PackedStrings, TableBatch,
     column::{SemanticType, Values as PbValues},
@@ -51,7 +50,10 @@ pub enum Error {
     MultipleValues { column: String },
 
     #[snafu(display("unknown type for column {column}: {source}"))]
-    UnknownType { source: DecodeError, column: String },
+    UnknownType {
+        source: generated_types::prost::UnknownEnumValue,
+        column: String,
+    },
 
     #[snafu(display("cannot infer type for column: {}", column))]
     InvalidType { column: String },
