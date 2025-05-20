@@ -35,7 +35,6 @@ members = [
     "schema",
     "service_common",
     "service_grpc_flight",
-    # "service_grpc_testing",
     "sharder",
     # "sqlx-hotswap-pool",
     "tokio_metrics_bridge",
