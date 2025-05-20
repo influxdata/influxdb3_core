@@ -13,7 +13,6 @@ members = [
     "influxdb_iox_client",
     "influxdb_line_protocol",
     "influxdb2_client",
-    # "influxrpc_parser",
     # "iox_catalog",
     "iox_http",
     "iox_query_influxql",
