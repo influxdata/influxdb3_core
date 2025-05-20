@@ -24,8 +24,6 @@ members = [
     "metric",
     "mutable_batch_lp",
     "mutable_batch_lp/fuzz",
-    # "mutable_batch_pb",
-    # "mutable_batch_tests",
     # "mutable_batch",
     "object_store_mem_cache",
     "object_store_metrics",
