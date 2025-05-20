@@ -36,6 +36,7 @@ either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
 flate2 = { version = "1" }
 form_urlencoded = { version = "1" }
+futures = { version = "0.3" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-executor = { version = "0.3" }
@@ -67,14 +68,14 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
 rustls-pemfile = { version = "2" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
 similar = { version = "2", features = ["inline"] }
-smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 snafu = { version = "0.8" }
 socket2 = { version = "0.5", default-features = false, features = ["all"] }
 spin = { version = "0.9" }
@@ -136,7 +137,7 @@ rustls-pemfile = { version = "2" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
-smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 spin = { version = "0.9" }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["any", "json", "migrate", "offline", "uuid"] }
