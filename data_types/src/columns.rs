@@ -4,7 +4,7 @@ use super::TableId;
 use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use generated_types::influxdata::iox::{catalog, column_type::v1 as proto, gossip};
 use influxdb_line_protocol::FieldValue;
-use schema::{builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, Schema};
+use schema::{InfluxColumnType, InfluxFieldType, Schema, builder::SchemaBuilder, sort::SortKey};
 use snafu::Snafu;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -20,7 +20,7 @@ use std::{
 #[sqlx(transparent)]
 pub struct ColumnId(i64);
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 impl ColumnId {
     pub fn new(v: i64) -> Self {
         Self(v)
@@ -275,7 +275,7 @@ impl TryFrom<&gossip::v1::Column> for ColumnSchema {
 }
 
 /// The column data type
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
 #[repr(i8)]
 pub enum ColumnType {
@@ -422,7 +422,7 @@ impl TryFrom<&ArrowDataType> for ColumnType {
 /// Errors deserialising a protobuf serialised [`ColumnType`].
 #[derive(Debug, Snafu)]
 #[snafu(display("invalid column value"))]
-#[allow(missing_copy_implementations)]
+#[expect(missing_copy_implementations)]
 pub struct ColumnTypeProtoError {}
 
 impl TryFrom<i16> for ColumnType {
@@ -630,18 +630,20 @@ impl ColumnSet {
     ) -> impl Iterator<Item = (usize, ColumnId)> + 'a {
         let mut left_idx = 0;
         let mut right_idx = 0;
-        std::iter::from_fn(move || loop {
-            let s = self.0.get(left_idx)?;
-            let o = other.get(right_idx)?;
+        std::iter::from_fn(move || {
+            loop {
+                let s = self.0.get(left_idx)?;
+                let o = other.get(right_idx)?;
 
-            match s.cmp(o) {
-                Ordering::Less => left_idx += 1,
-                Ordering::Greater => right_idx += 1,
-                Ordering::Equal => {
-                    let t = left_idx;
-                    left_idx += 1;
-                    right_idx += 1;
-                    return Some((t, *s));
+                match s.cmp(o) {
+                    Ordering::Less => left_idx += 1,
+                    Ordering::Greater => right_idx += 1,
+                    Ordering::Equal => {
+                        let t = left_idx;
+                        left_idx += 1;
+                        right_idx += 1;
+                        return Some((t, *s));
+                    }
                 }
             }
         })
@@ -1114,7 +1116,6 @@ mod tests {
     /// Assert a sensibly sized data type is used to represent a [`ColumnType`]
     /// in IOx, even though the catalog uses an overly large type.
     #[test]
-    #[allow(clippy::assertions_on_constants)]
     fn test_column_type_size() {
         assert_eq!(std::mem::size_of::<ColumnType>(), 1);
     }

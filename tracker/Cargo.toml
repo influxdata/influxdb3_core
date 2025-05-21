@@ -18,14 +18,15 @@ metric = { path = "../metric" }
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 pin-project = "1.1"
-sysinfo = "0.33.1"
-tokio = { version = "1.42", features = ["macros", "parking_lot", "sync", "time"] }
-tokio-util = { version = "0.7.13" }
+# Delaying upgrade until <https://github.com/GuillaumeGomez/sysinfo/issues/1496> is fixed
+sysinfo = "<0.36"
+tokio = { version = "1.45", features = ["macros", "parking_lot", "sync", "time"] }
+tokio-util = { version = "0.7.15" }
 trace = { path = "../trace"}
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-tempfile = "3.15.0"
+tempfile = "3.20.0"
 # Need the multi-threaded executor for testing
-tokio = { version = "1.42", features = ["macros", "parking_lot", "rt-multi-thread", "time"] }
+tokio = { version = "1.45", features = ["macros", "parking_lot", "rt-multi-thread", "time"] }
 test_helpers = { path = "../test_helpers" }

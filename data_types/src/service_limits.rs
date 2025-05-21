@@ -68,7 +68,7 @@ macro_rules! define_service_limit {
             }
         }
 
-        #[allow(missing_docs)]
+        #[expect(missing_docs)]
         impl $type_name {
             pub fn get(&self) -> usize {
                 self.0.get()
@@ -145,7 +145,9 @@ macro_rules! define_service_limit {
                 let data = <i32 as ::sqlx::decode::Decode<'r, DB>>::decode(value)?;
 
                 let data = Self::try_from(data).unwrap_or_else(|_| {
-                    error!("database contains invalid $type_name value {data}, using default value");
+                    error!(
+                        "database contains invalid $type_name value {data}, using default value"
+                    );
                     Self::default()
                 });
 
@@ -231,7 +233,9 @@ pub enum ServiceLimitError {
     MustFitInI32,
 
     /// Per-table column limits are restricted
-    #[error("per-table column limits are restricted to a maximum value of {0} for system performance purposes")]
+    #[error(
+        "per-table column limits are restricted to a maximum value of {0} for system performance purposes"
+    )]
     ColumnLimitTooLarge(MaxColumnsPerTable),
 }
 

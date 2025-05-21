@@ -2,24 +2,29 @@
 
 use crate::ingester::{IngesterChunk, MetricDecoratorStream};
 use crate::statistics::build_statistics_for_chunks;
-use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
+use crate::statistics::partition_statistics::{
+    PartitionStatistics, PartitionedStatistics, project_schema_onto_datasrc_statistics,
+};
+use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
 
 use super::adapter::SchemaAdapterStream;
 use arrow::datatypes::SchemaRef;
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::display::ProjectSchemaDisplay;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::{
     error::DataFusionError,
     execution::context::TaskContext,
     physical_expr::EquivalenceProperties,
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream, Statistics,
         expressions::{Column, PhysicalSortExpr},
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };
+use itertools::Itertools;
 use observability_deps::tracing::trace;
 use schema::sort::SortKey;
 use std::{collections::HashMap, fmt, sync::Arc};
@@ -74,7 +79,8 @@ impl RecordBatchesExec {
                     ),
                     options: Default::default(),
                 },
-            ];
+            ]
+            .into();
             EquivalenceProperties::new_with_orderings(Arc::clone(&schema), &[output_ordering])
         } else {
             EquivalenceProperties::new(Arc::clone(&schema))
@@ -114,7 +120,29 @@ impl RecordBatchesExec {
     ) -> PlanProperties {
         let output_partitioning = Partitioning::UnknownPartitioning(chunks.len());
 
-        PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Bounded)
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
+    }
+}
+
+impl PartitionStatistics for RecordBatchesExec {
+    fn statistics_by_partition(&self) -> datafusion::common::Result<PartitionedStatistics> {
+        // each chunk is a partition
+        self.chunks
+            .iter()
+            .map(|chunk| {
+                // some chunks may be missing schema columns
+                project_schema_onto_datasrc_statistics(
+                    &chunk.stats(),
+                    &chunk.schema().as_arrow(),
+                    &self.schema,
+                )
+            })
+            .try_collect::<Arc<Statistics>, Vec<_>, _>()
     }
 }
 

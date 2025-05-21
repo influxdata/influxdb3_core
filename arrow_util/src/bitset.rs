@@ -26,7 +26,7 @@ impl BitSet {
     /// bits.
     pub fn with_capacity(n: usize) -> Self {
         Self {
-            buffer: Vec::with_capacity((n + 7) / 8),
+            buffer: Vec::with_capacity(n.div_ceil(8)),
             len: 0,
         }
     }
@@ -40,21 +40,21 @@ impl BitSet {
 
     /// Reserve space for `count` further bits
     pub fn reserve(&mut self, count: usize) {
-        let new_buf_len = (self.len + count + 7) / 8;
+        let new_buf_len = (self.len + count).div_ceil(8);
         self.buffer.reserve(new_buf_len);
     }
 
     /// Appends `count` unset bits
     pub fn append_unset(&mut self, count: usize) {
         self.len += count;
-        let new_buf_len = (self.len + 7) / 8;
+        let new_buf_len = self.len.div_ceil(8);
         self.buffer.resize(new_buf_len, 0);
     }
 
     /// Appends `count` set bits
     pub fn append_set(&mut self, count: usize) {
         let new_len = self.len + count;
-        let new_buf_len = (new_len + 7) / 8;
+        let new_buf_len = new_len.div_ceil(8);
 
         let skew = self.len % 8;
         if skew != 0 {
@@ -73,7 +73,7 @@ impl BitSet {
 
     /// Truncates the bitset to the provided length
     pub fn truncate(&mut self, len: usize) {
-        let new_buf_len = (len + 7) / 8;
+        let new_buf_len = len.div_ceil(8);
         self.buffer.truncate(new_buf_len);
         let overrun = len % 8;
         if overrun > 0 {
@@ -107,7 +107,7 @@ impl BitSet {
         }
 
         let start_byte = range.start / 8;
-        let end_byte = (range.end + 7) / 8;
+        let end_byte = range.end.div_ceil(8);
         let skew = range.start % 8;
 
         // `append_bits` requires the provided `to_set` to be byte aligned, therefore
@@ -130,10 +130,10 @@ impl BitSet {
 
     /// Appends `count` boolean values from the slice of packed bits
     pub fn append_bits(&mut self, count: usize, to_set: &[u8]) {
-        assert_eq!((count + 7) / 8, to_set.len());
+        assert_eq!(count.div_ceil(8), to_set.len());
 
         let new_len = self.len + count;
-        let new_buf_len = (new_len + 7) / 8;
+        let new_buf_len = new_len.div_ceil(8);
         self.buffer.reserve(new_buf_len - self.buffer.len());
 
         let whole_bytes = count / 8;
@@ -357,14 +357,16 @@ pub fn iter_set_positions_with_offset(
     let skew = offset % 8;
     in_progress &= 0xFF << skew;
 
-    std::iter::from_fn(move || loop {
-        if in_progress != 0 {
-            let bit_pos = in_progress.trailing_zeros();
-            in_progress ^= 1 << bit_pos;
-            return Some((byte_idx * 8) + (bit_pos as usize));
+    std::iter::from_fn(move || {
+        loop {
+            if in_progress != 0 {
+                let bit_pos = in_progress.trailing_zeros();
+                in_progress ^= 1 << bit_pos;
+                return Some((byte_idx * 8) + (bit_pos as usize));
+            }
+            byte_idx += 1;
+            in_progress = *bytes.get(byte_idx)?;
         }
-        byte_idx += 1;
-        in_progress = *bytes.get(byte_idx)?;
     })
 }
 
@@ -374,6 +376,7 @@ mod tests {
     use proptest::prelude::*;
     use rand::prelude::*;
     use rand::rngs::OsRng;
+    use rand::{RngCore, TryRngCore};
 
     use super::*;
 
@@ -450,7 +453,7 @@ mod tests {
     }
 
     fn make_rng() -> StdRng {
-        let seed = OsRng.next_u64();
+        let seed = OsRng.try_next_u64().unwrap();
         println!("Seed: {seed}");
         StdRng::seed_from_u64(seed)
     }
@@ -463,7 +466,7 @@ mod tests {
 
         for _ in 0..100 {
             let mask_length = (rng.next_u32() % 50) as usize;
-            let bools: Vec<_> = std::iter::repeat(true).take(mask_length).collect();
+            let bools: Vec<_> = std::iter::repeat_n(true, mask_length).collect();
 
             let collected = compact_bools(&bools);
             mask.append_bits(mask_length, &collected);
@@ -537,7 +540,7 @@ mod tests {
                 false => mask.append_unset(len),
             }
 
-            all_bools.extend(std::iter::repeat(set).take(len));
+            all_bools.extend(std::iter::repeat_n(set, len));
 
             let collected = compact_bools(&all_bools);
             assert_eq!(mask.buffer, collected);

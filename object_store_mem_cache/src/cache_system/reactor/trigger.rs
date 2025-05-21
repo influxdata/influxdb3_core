@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use futures::{stream::BoxStream, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, stream::BoxStream};
 use iox_time::{Time, TimeProvider};
 use metric::U64Counter;
 use observability_deps::tracing::info;
@@ -54,6 +54,12 @@ impl TriggerExt for Trigger {
         trigger: &'static str,
         metrics: &metric::Registry,
     ) -> Trigger {
+        let counter = metrics
+            .register_metric::<U64Counter>(
+                "mem_cache_reactor_throttled",
+                "Actions throttled for the in-mem cache reactor",
+            )
+            .recorder(&[("cache", cache), ("trigger", trigger)]);
         futures::stream::unfold(
             ThrottleState {
                 time_provider,
@@ -61,13 +67,7 @@ impl TriggerExt for Trigger {
                 wait_until: None,
                 cache,
                 trigger_name: trigger,
-                counter:
-        metrics
-            .register_metric::<U64Counter>(
-                "mem_cache_reactor_throttled",
-                "Actions throttled for the in-mem cache reactor",
-            )
-            .recorder(&[("cache", cache), ("trigger", trigger)]),
+                counter,
             },
             move |mut state| async move {
                 if let Some(wait_until) = state.wait_until.take() {
@@ -133,7 +133,7 @@ pub fn ticker(delta: Duration) -> Trigger {
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval.reset(); // otherwise first tick return immediately
 
-    futures::stream::unfold(interval, |mut interval| async move {
+    futures::stream::unfold(interval, async move |mut interval| {
         interval.tick().await;
         Some(((), interval))
     })
@@ -142,10 +142,9 @@ pub fn ticker(delta: Duration) -> Trigger {
 
 #[cfg(test)]
 mod tests {
+    use futures_test_utils::AssertFutureExt;
     use iox_time::MockProvider;
     use metric::{Attributes, Metric};
-
-    use crate::cache_system::test_utils::{AssertPendingFutureExt, WithTimeoutFutureExt};
 
     use super::*;
 
@@ -153,11 +152,8 @@ mod tests {
     async fn test_throttle() {
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
         let trigger =
-            futures::stream::unfold(
-                rx,
-                |mut rx| async move { rx.recv().await.map(|_| ((), rx)) },
-            )
-            .boxed();
+            futures::stream::unfold(rx, async move |mut rx| rx.recv().await.map(|_| ((), rx)))
+                .boxed();
 
         let time_provider = Arc::new(MockProvider::new(Time::MIN));
         let metrics = metric::Registry::default();
@@ -187,37 +183,37 @@ mod tests {
         assert_eq!(throttle_count(), 0);
 
         // trigger first time
-        tx.send(()).with_timeout().await.unwrap();
-        fut_next.with_timeout().await.unwrap();
+        tx.send(()).boxed().poll_timeout().await.unwrap();
+        fut_next.poll_timeout().await.unwrap();
         assert_eq!(throttle_count(), 0);
 
         // wait for next trigger and trigger again
         time_provider.inc(Duration::from_secs(1));
-        tx.send(()).with_timeout().await.unwrap();
-        trigger.next().with_timeout().await.unwrap();
+        tx.send(()).boxed().poll_timeout().await.unwrap();
+        trigger.next().poll_timeout().await.unwrap();
         assert_eq!(throttle_count(), 0);
 
         // trigger too fast
-        tx.send(()).with_timeout().await.unwrap();
+        tx.send(()).boxed().poll_timeout().await.unwrap();
         let mut fut_next = trigger.next();
         fut_next.assert_pending().await;
         assert_eq!(throttle_count(), 1);
 
         // still too fast
-        tx.send(()).with_timeout().await.unwrap();
+        tx.send(()).boxed().poll_timeout().await.unwrap();
         fut_next.assert_pending().await;
         assert_eq!(throttle_count(), 2);
 
         // still too fast
         time_provider.inc(Duration::from_millis(10));
-        tx.send(()).with_timeout().await.unwrap();
+        tx.send(()).boxed().poll_timeout().await.unwrap();
         fut_next.assert_pending().await;
         assert_eq!(throttle_count(), 3);
 
         // unthrottled
         time_provider.inc(Duration::from_secs(1));
-        tx.send(()).with_timeout().await.unwrap();
-        fut_next.with_timeout().await.unwrap();
+        tx.send(()).boxed().poll_timeout().await.unwrap();
+        fut_next.poll_timeout().await.unwrap();
         assert_eq!(throttle_count(), 3);
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! [V1 Write API]:
 //!     https://docs.influxdata.com/influxdb/v1.8/tools/api/#write-http-endpoint
-use hyper::Request;
+use iox_http_util::Request;
 use serde::{Deserialize, Deserializer};
 
 use super::Precision;
@@ -71,10 +71,10 @@ pub struct WriteParamsV1 {
     pub password: Option<String>,
 }
 
-impl<T> TryFrom<&Request<T>> for WriteParamsV1 {
+impl TryFrom<&Request> for WriteParamsV1 {
     type Error = V1WriteParseError;
 
-    fn try_from(req: &Request<T>) -> Result<Self, Self::Error> {
+    fn try_from(req: &Request) -> Result<Self, Self::Error> {
         let query = req.uri().query().ok_or(V1WriteParseError::NoQueryParams)?;
         Ok(serde_urlencoded::from_str(query)?)
     }

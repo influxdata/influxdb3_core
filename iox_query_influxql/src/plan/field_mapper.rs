@@ -1,6 +1,6 @@
+use crate::plan::SchemaProvider;
 use crate::plan::ir::TagSet;
 use crate::plan::var_ref::{field_type_to_var_ref_data_type, influx_type_to_var_ref_data_type};
-use crate::plan::SchemaProvider;
 use influxdb_influxql_parser::expression::VarRefDataType;
 use schema::InfluxColumnType;
 use std::collections::HashMap;

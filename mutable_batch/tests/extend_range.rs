@@ -1,9 +1,9 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
-use mutable_batch::{writer::Writer, MutableBatch};
+use mutable_batch::{MutableBatch, writer::Writer};
 use schema::Projection;
 use std::{collections::BTreeMap, num::NonZeroU64};
 

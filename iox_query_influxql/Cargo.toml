@@ -24,11 +24,11 @@ predicate = { path = "../predicate" }
 query_functions = { path = "../query_functions" }
 regex = "1"
 schema = { path = "../schema" }
-serde_json = "1.0.134"
+serde_json = "1.0.140"
 thiserror = "2.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-chrono = { version = "0.4", default-features = false }
+chrono = { version = "0.4.39", default-features = false }
 insta = { version = "1", features = ["yaml"] }
 test_helpers = { path = "../test_helpers" }

@@ -5,7 +5,7 @@ use crate::snapshot::mask::{BitMask, BitMaskBuilder};
 use crate::{
     ColumnId, ColumnSet, CompactionLevelProtoError, NamespaceId, ObjectStoreId, ParquetFile,
     ParquetFileId, ParquetFileSource, Partition, PartitionHashId, PartitionHashIdError,
-    PartitionId, SkippedCompaction, SortKeyIds, TableId, Timestamp,
+    PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, TableId, Timestamp,
 };
 use bytes::Bytes;
 use generated_types::influxdata::iox::{
@@ -15,7 +15,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 /// Error for [`PartitionSnapshot`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Error decoding PartitionFile: {source}"))]
     FileDecode {
@@ -114,6 +114,7 @@ impl PartitionSnapshot {
                     max_l0_created_at: file.max_l0_created_at.0,
                     column_mask: Some(mask.finish().into()),
                     source: file.source.map(|i| i as i32).unwrap_or_default(),
+                    use_numeric_partition_id: Some(file.partition_hash_id.is_none()),
                 }
             })
             .collect::<Vec<_>>();
@@ -195,7 +196,22 @@ impl PartitionSnapshot {
             namespace_id: self.namespace_id,
             table_id: self.table_id,
             partition_id: self.partition_id,
-            partition_hash_id: self.partition_hash_id.clone(),
+            partition_hash_id: match file.use_numeric_partition_id {
+                // If the Parquet file uses the numeric partition ID, don't set a
+                // `partition_hash_id`, regardless of whether the Partition uses a `hash_id`
+                Some(true) => None,
+                Some(false) => Some(match self.partition_hash_id.clone() {
+                    Some(hash_id) => hash_id,
+                    // If the Parquet file uses the hash ID but the Partition doesn't yet,
+                    // compute it
+                    None => self
+                        .key()
+                        .map(|key| PartitionHashId::new(self.table_id, &key))?,
+                }),
+                // If the Parquet file doesn't specify whether it uses a hash ID, fall back to
+                // whatever the Partition uses
+                None => self.partition_hash_id.clone(),
+            },
             object_store_id: ObjectStoreId::from_uuid(uuid.into()),
             min_time: Timestamp(file.min_time),
             max_time: Timestamp(file.max_time),
@@ -215,14 +231,19 @@ impl PartitionSnapshot {
         (0..self.files.len()).map(|idx| self.file(idx))
     }
 
+    fn key(&self) -> Result<PartitionKey> {
+        Ok(std::str::from_utf8(&self.key)
+            .context(PartitionKeySnafu)?
+            .into())
+    }
+
     /// Returns the [`Partition`] for this snapshot
     pub fn partition(&self) -> Result<Partition> {
-        let key = std::str::from_utf8(&self.key).context(PartitionKeySnafu)?;
         Ok(Partition::new_catalog_only(
             self.partition_id,
             self.partition_hash_id.clone(),
             self.table_id,
-            key.into(),
+            self.key()?,
             self.sort_key.clone(),
             self.new_file_at,
             self.cold_compact_at,
@@ -260,5 +281,204 @@ impl From<PartitionSnapshot> for proto::Partition {
             cold_compact_at: value.cold_compact_at.map(|x| x.get()),
             created_at: value.created_at.map(|x| x.get()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CompactionLevel, PartitionKey};
+    use std::str::FromStr;
+
+    #[test]
+    fn partition_hash_id_transition_parquet_files_individually() {
+        let namespace_id = NamespaceId::new(3);
+        let table_id = TableId::new(4);
+        let partition_id = PartitionId::new(5);
+        let partition_key = PartitionKey::from("arbitrary");
+        let expected_partition_hash_id = PartitionHashId::new(table_id, &partition_key);
+        let generation = 6;
+        let parquet_file_defaults = ParquetFile {
+            id: ParquetFileId::new(7),
+            namespace_id,
+            table_id,
+            partition_id,
+            partition_hash_id: Some(expected_partition_hash_id.clone()),
+            object_store_id: ObjectStoreId::from_str("00000000-0000-0001-0000-000000000000")
+                .unwrap(),
+            min_time: Timestamp::new(2),
+            max_time: Timestamp::new(3),
+            to_delete: None,
+            file_size_bytes: 4,
+            row_count: 5,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(6),
+            column_set: ColumnSet::empty(),
+            max_l0_created_at: Timestamp::new(6),
+            source: None,
+        };
+
+        let encode_and_compare = |use_partition_hash_id: bool| {
+            // For a partition with or without a hash ID as specified,
+            let partition = Partition::new_catalog_only(
+                partition_id,
+                if use_partition_hash_id {
+                    Some(expected_partition_hash_id.clone())
+                } else {
+                    None
+                },
+                table_id,
+                partition_key.clone(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            );
+            // Create associated Parquet files:
+            let parquet_files = vec![
+                // one addressed by numeric ID,
+                ParquetFile {
+                    partition_hash_id: None,
+                    ..parquet_file_defaults.clone()
+                },
+                // one addressed by hash ID.
+                parquet_file_defaults.clone(),
+            ];
+
+            // Encode the partition and its Parquet files,
+            let encoded_partition = PartitionSnapshot::encode(
+                namespace_id,
+                partition,
+                parquet_files.clone(),
+                None,
+                generation,
+            )
+            .unwrap();
+
+            // then ensure accessing each Parquet file returns the same information as was encoded.
+            assert_eq!(
+                &encoded_partition.file(0).unwrap(),
+                &parquet_files[0],
+                "use_partition_hash_id: {use_partition_hash_id}"
+            );
+            assert_eq!(
+                &encoded_partition.file(1).unwrap(),
+                &parquet_files[1],
+                "use_partition_hash_id: {use_partition_hash_id}"
+            );
+        };
+
+        // Encoding and accessing Parquet files should work whether their associated Partition
+        // has a hash ID or not.
+        encode_and_compare(true);
+        encode_and_compare(false);
+    }
+
+    #[test]
+    fn decode_old_cached_proto() {
+        let partition_key = PartitionKey::from("arbitrary");
+
+        // Create cached proto for three different files:
+        //
+        // 1. without "use_numeric_partition_id", representing proto cached before the field was
+        //    added
+        // 2. with "use_numeric_partition_id" = false
+        // 3. with "use_numeric_partition_id" = true
+        let parquet_file_missing_new_numeric_id_field_proto = proto::PartitionFile {
+            id: 1,
+            use_numeric_partition_id: None,
+
+            column_mask: Default::default(),
+            compaction_level: Default::default(),
+            created_at: Default::default(),
+            file_size_bytes: Default::default(),
+            max_l0_created_at: Default::default(),
+            min_time: Default::default(),
+            max_time: Default::default(),
+            object_store_uuid: Some(ObjectStoreId::new().get_uuid().into()),
+            row_count: Default::default(),
+            source: Default::default(),
+        };
+        let parquet_file_new_numeric_id_field_false_proto = proto::PartitionFile {
+            id: 2,
+            use_numeric_partition_id: Some(false),
+            ..parquet_file_missing_new_numeric_id_field_proto.clone()
+        };
+        let parquet_file_new_numeric_id_field_true_proto = proto::PartitionFile {
+            id: 3,
+            use_numeric_partition_id: Some(true),
+            ..parquet_file_missing_new_numeric_id_field_proto.clone()
+        };
+
+        let files = MessageList::encode(&[
+            parquet_file_missing_new_numeric_id_field_proto,
+            parquet_file_new_numeric_id_field_false_proto,
+            parquet_file_new_numeric_id_field_true_proto,
+        ])
+        .unwrap();
+        let files_proto: proto::MessageList = files.into();
+
+        // Create cached proto for two different Partitions:
+        //
+        // 1. Identified with a hash ID (new style)
+        // 2. Identified only with a numeric ID (old style)
+        //
+        // and add the encoded Parquet file message list to each of them.
+        let hash_id_partition_proto = proto::Partition {
+            partition_hash_id: true,
+            partition_id: 6,
+
+            namespace_id: 4,
+            table_id: 5,
+            cold_compact_at: Default::default(),
+            created_at: Default::default(),
+            column_ids: Default::default(),
+            files: Some(files_proto.clone()),
+            key: partition_key.as_bytes().to_vec().into(),
+            new_file_at: Default::default(),
+            skipped_compaction: Default::default(),
+            sort_key_ids: Default::default(),
+        };
+        let numeric_id_partition_proto = proto::Partition {
+            partition_hash_id: false,
+            partition_id: 7,
+            ..hash_id_partition_proto.clone()
+        };
+
+        let decoded_hash_id_partition = PartitionSnapshot::decode(hash_id_partition_proto, 1);
+        let decoded_numeric_id_partition = PartitionSnapshot::decode(numeric_id_partition_proto, 1);
+
+        // For the Parquet file without `use_numeric_partition_id` set, it should be addressed in
+        // the same way as its partition is.
+        let pf0_hash_id_partition = decoded_hash_id_partition.file(0).unwrap();
+        assert_eq!(
+            pf0_hash_id_partition.partition_hash_id,
+            Some(decoded_hash_id_partition.partition_hash_id.clone().unwrap())
+        );
+        let pf0_numeric_id_partition = decoded_numeric_id_partition.file(0).unwrap();
+        assert_eq!(pf0_numeric_id_partition.partition_hash_id, None);
+
+        // For the Parquet file with `use_numeric_partition_id` set to `false`, it should be
+        // addressed with hash ID, regardless of how the partition is addressed.
+        let pf1_hash_id_partition = decoded_hash_id_partition.file(1).unwrap();
+        assert_eq!(
+            pf1_hash_id_partition.partition_hash_id,
+            Some(decoded_hash_id_partition.partition_hash_id.clone().unwrap())
+        );
+        let pf1_numeric_id_partition = decoded_numeric_id_partition.file(1).unwrap();
+        assert_eq!(
+            pf1_numeric_id_partition.partition_hash_id,
+            Some(PartitionHashId::new(
+                decoded_numeric_id_partition.table_id,
+                &decoded_numeric_id_partition.key().unwrap()
+            ))
+        );
+
+        // For the Parquet file with `use_numeric_partition_id` set to `true`, it should be
+        // addressed with numeric ID, regardless of how the partition is addressed.
+        let pf1_hash_id_partition = decoded_hash_id_partition.file(2).unwrap();
+        assert_eq!(pf1_hash_id_partition.partition_hash_id, None);
+        let pf1_numeric_id_partition = decoded_numeric_id_partition.file(2).unwrap();
+        assert_eq!(pf1_numeric_id_partition.partition_hash_id, None);
     }
 }

@@ -1,12 +1,12 @@
 use crate::error;
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{
+    DFSchemaRef, Result,
     scalar::{ScalarStructBuilder, ScalarValue},
     tree_node::{Transformed, TreeNode, TreeNodeRecursion},
-    DFSchemaRef, Result,
 };
 use datafusion::logical_expr::utils::expr_as_column_expr;
-use datafusion::logical_expr::{lit, Expr, ExprSchemable, LogicalPlan, Operator};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator, lit};
 use influxdb_influxql_parser::{expression::BinaryOperator, literal::Number, string::Regex};
 use query_functions::{clean_non_meta_escapes, coalesce_struct::coalesce_struct};
 use schema::InfluxColumnType;

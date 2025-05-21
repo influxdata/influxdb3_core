@@ -7,7 +7,6 @@ use datafusion::error::DataFusionError;
 use prost::DecodeError;
 use snafu::Snafu;
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 // allow Snafu 's to be used in the crate
 #[snafu(visibility(pub(crate)))]
@@ -16,7 +15,11 @@ pub enum Error {
     #[snafu(context(false))]
     Decode { source: DecodeError },
 
-    #[snafu(display("Invalid PreparedStatement handle. Expected protobuf Any or UTF-8 query string\nnot protobuf Any: {}\nand not UTF-8: {}", proto_source, source))]
+    #[snafu(display(
+        "Invalid PreparedStatement handle. Expected protobuf Any or UTF-8 query string\nnot protobuf Any: {}\nand not UTF-8: {}",
+        proto_source,
+        source
+    ))]
     InvalidHandle {
         proto_source: DecodeError,
         source: FromUtf8Error,

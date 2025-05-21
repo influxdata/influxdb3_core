@@ -12,7 +12,7 @@ pub use params::*;
 
 pub mod mock {
     use async_trait::async_trait;
-    use hyper::{Body, Request};
+    use iox_http_util::Request;
     use parking_lot::Mutex;
 
     use super::*;
@@ -65,13 +65,13 @@ pub mod mock {
 
     #[async_trait]
     impl WriteRequestUnifier for MockWriteRequestUnifier {
-        async fn parse_v1(&self, _req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+        async fn parse_v1(&self, _req: &Request) -> Result<WriteParams, WriteParseError> {
             let mut guard = self.state.lock();
             guard.calls.push(MockUnifyingParseCall::V1);
             guard.ret.next().unwrap()
         }
 
-        async fn parse_v2(&self, _req: &Request<Body>) -> Result<WriteParams, WriteParseError> {
+        async fn parse_v2(&self, _req: &Request) -> Result<WriteParams, WriteParseError> {
             let mut guard = self.state.lock();
             guard.calls.push(MockUnifyingParseCall::V2);
             guard.ret.next().unwrap()

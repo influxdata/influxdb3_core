@@ -18,6 +18,9 @@ message SchemaMessage {
 
     // One or more new columns were added to an existing table.
     TableUpdated table_updated = 3;
+
+    // A table was dropped
+    TableDropped table_dropped = 4;
   }
 
   // Wall-clock time when this consistency probe was enqueued for broadcast
@@ -46,14 +49,14 @@ message TableUpdated {
   string namespace_name = 2;
   int64 table_id = 3;
   // The namespace ID must be included to allow receivers to process messages
-  // correctly for mutable namespace names. 
+  // correctly for mutable namespace names.
   int64 namespace_id = 5;
 
   // The set of columns in this update.
   repeated Column columns = 4;
 }
 
-// Initialisation of a new table occured.
+// Initialisation of a new table occurred.
 //
 // This is a superset of the merge-able TableUpdated message, containing
 // immutable and large fields that should not be propagated for each column
@@ -72,6 +75,18 @@ message TableCreated {
 
   // The table partition template used for partitioning writes for this table.
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 2;
+}
+
+// A table was dropped, which (atow) can only occur due to soft-deletion
+message TableDropped {
+  // The id of the table which was dropped
+  int64 table_id = 1;
+
+  // The name of the table which was dropped
+  optional string table_name = 2;
+
+  // The id of the namespace which contains the dropped table
+  int64 namespace_id = 3;
 }
 
 // Representation of a column schema within a table.

@@ -4,8 +4,8 @@ use super::{Error, Result};
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     task::Waker,
 };
@@ -165,14 +165,20 @@ mod tests {
         assert_eq!(oom_counter.get(), 0);
 
         let err = limiter.reserve(20).unwrap_err().to_string();
-        assert_eq!(err, "Cannot reserve additional 20 bytes for cache containing 90 bytes as would exceed limit of 100 bytes");
+        assert_eq!(
+            err,
+            "Cannot reserve additional 20 bytes for cache containing 90 bytes as would exceed limit of 100 bytes"
+        );
         oom_counter.wait_for(1).await;
 
         limiter.reserve(10).unwrap();
         limiter.reserve(0).unwrap();
 
         let err = limiter.reserve(1).unwrap_err().to_string();
-        assert_eq!(err, "Cannot reserve additional 1 bytes for cache containing 100 bytes as would exceed limit of 100 bytes");
+        assert_eq!(
+            err,
+            "Cannot reserve additional 1 bytes for cache containing 100 bytes as would exceed limit of 100 bytes"
+        );
         oom_counter.wait_for(2).await;
 
         limiter.free(10);

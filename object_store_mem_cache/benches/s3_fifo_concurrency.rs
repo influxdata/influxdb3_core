@@ -13,7 +13,7 @@ use object_store_mem_cache::cache_system::{
     hook::test_utils::NoOpHook,
     s3_fifo_cache::{S3Config, S3Fifo},
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const WORST_N: usize = 3;
 
@@ -130,7 +130,7 @@ fn run_bench(
             let barrier = Arc::clone(&barrier);
             let store = Arc::clone(&store);
             let data = Arc::clone(&data);
-            let mut rng = StdRng::from_rng(&mut rng).unwrap();
+            let mut rng = StdRng::from_rng(&mut rng);
 
             handles.push(
                 std::thread::Builder::new()
@@ -142,7 +142,7 @@ fn run_bench(
 
                         for _ in 0..requests {
                             // generate keys with linearly decreasing probability
-                            let idx = rng.gen::<u64>() % (n_keys * n_keys);
+                            let idx = rng.random::<u64>() % (n_keys * n_keys);
                             let key_idx = n_keys - 1 - (idx as f64).sqrt().floor() as u64;
                             assert!(key_idx < n_keys, "{key_idx}");
 
@@ -197,7 +197,7 @@ fn main() {
     for iteration in 0..params.iters {
         println!("Running iteration {}/{}", iteration + 1, params.iters);
         let params = params.clone();
-        let rng = StdRng::from_rng(&mut rng).unwrap();
+        let rng = StdRng::from_rng(&mut rng);
         let m = run_bench(params, rng, t_program_start, iteration);
         measurements.extend(m);
     }

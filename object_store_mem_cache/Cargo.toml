@@ -6,24 +6,28 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait = { version = "0.1.83", default-features = false }
-bytes = { version = "1.9.0", default-features = false }
+async-trait = { version = "0.1.88", default-features = false }
+bytes = { version = "1.10.1", default-features = false }
 dashmap = "6.1.0"
 data_types = { path = "../data_types" }
 futures = { version = "0.3.31" }
-indexmap = { version = "2.7", features = ["std"] }
+indexmap = { version = "2.9", features = ["std"] }
 iox_time = { path = "../iox_time" }
 metric = { path = "../metric" }
 object_store.workspace = true
+object_store_metrics = { path = "../object_store_metrics" }
+object_store_mock = { path = "../object_store_mock" }
+object_store_size_hinting = { path = "../object_store_size_hinting" }
 observability_deps = { path = "../observability_deps" }
-tokio = { version = "1.42.0", default-features = false }
+tokio = { version = "1.45.0", default-features = false }
 tracker = { path = "../tracker" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 futures-concurrency = "7"
-rand = "0.8.5"
+futures_test_utils = { path = "../futures_test_utils" }
+rand = "0.9.1"
 
 [lints]
 workspace = true

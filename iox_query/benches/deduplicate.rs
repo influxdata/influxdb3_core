@@ -1,5 +1,5 @@
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use arrow::array::{
     ArrayRef, DictionaryArray, Float64Array, StringDictionaryBuilder, TimestampNanosecondArray,
@@ -7,17 +7,17 @@ use arrow::array::{
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion::physical_expr::expressions::col;
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::sorts::sort::sort_batch;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::SessionContext;
 use iox_query::provider::DeduplicateExec;
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -117,8 +117,8 @@ impl DataGenerator {
     /// return a tag value with given null probability and number of distinct values
     fn tag_value(&mut self) -> Option<usize> {
         // 5% nulls
-        if self.rng.gen_range(0.0..1.0) > 0.05 {
-            let tag_num = self.rng.gen_range(0..self.num_tag_values);
+        if self.rng.random_range(0.0..1.0) > 0.05 {
+            let tag_num = self.rng.random_range(0..self.num_tag_values);
             Some(tag_num)
         } else {
             None
@@ -154,7 +154,7 @@ impl DataGenerator {
 
     /// Return a random field value
     fn field_value(&mut self) -> f64 {
-        self.rng.gen::<f64>()
+        self.rng.random::<f64>()
     }
 
     /// Return a field column
@@ -230,7 +230,7 @@ impl TestScenario {
         let num_rows = input.num_rows();
         // First sort the input data by tags
         let fetch = None;
-        let mut batch = sort_batch(&input, &sort_keys, fetch).unwrap();
+        let mut batch = sort_batch(&input, &sort_keys.clone().into(), fetch).unwrap();
 
         // Divide into batches of 4k rows
         const BATCH_SIZE: usize = 4000;
@@ -279,7 +279,7 @@ impl TestScenario {
         let use_chunk_order_col = false;
         let exec = Arc::new(DeduplicateExec::new(
             Arc::clone(&self.input),
-            self.sort_keys.clone(),
+            self.sort_keys.clone().into(),
             use_chunk_order_col,
         )) as _;
         self.runtime.block_on(async move {

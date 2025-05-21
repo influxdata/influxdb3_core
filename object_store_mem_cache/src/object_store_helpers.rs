@@ -1,5 +1,5 @@
 //! Tools to make working with [`object_store`] a bit easier.
-use object_store::{path::Error as PathError, Error, GetOptions};
+use object_store::{Error, GetOptions, path::Error as PathError};
 
 use crate::cache_system::DynError;
 
@@ -48,14 +48,14 @@ pub fn any_options_set(options: &GetOptions) -> bool {
 
 /// Convert [`DynError`] to [`object_store::Error`].
 pub fn dyn_error_to_object_store_error(e: DynError, store_name: &'static str) -> Error {
-    let Some(e_os) = e.as_ref().downcast_ref::<&Error>() else {
+    let Some(e_os) = e.as_ref().downcast_ref::<Error>() else {
         return Error::Generic {
             store: store_name,
             source: Box::new(e),
         };
     };
 
-    // object_store::Erorr is not `Clone` so implement a manual version of Clone
+    // object_store::Error is not `Clone` so implement a manual version of Clone
     match e_os {
         Error::Generic { store, .. } => Error::Generic {
             store,
@@ -148,9 +148,9 @@ pub fn dyn_error_to_object_store_error(e: DynError, store_name: &'static str) ->
             key: key.clone(),
         },
         // object_store errors are non exhaustive
-        err => Error::Generic {
-            store: "iox",
-            source: Box::new(err.to_owned()),
+        _ => Error::Generic {
+            store: store_name,
+            source: Box::new(e),
         },
     }
 }

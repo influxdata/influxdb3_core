@@ -150,7 +150,7 @@ mod test {
     #[test]
     fn display_source_chain_overlapping_msgs() {
         // Create a complicated error chain with overlapping messages
-        let err = TestError::WithSource{
+        let err = TestError::WithSource {
             message: "Top-level Error: Source Error 1: Source Error 2",
             source: Box::new(TestError::WithSource {
                 message: "Source Error 1: Source Error 2",

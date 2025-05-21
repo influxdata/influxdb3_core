@@ -1,9 +1,9 @@
 //! The version 2 list protocol using size prefixed protobuf
 
-use crate::api::list::{ListEntry, Result, UnexpectedEOFSnafu, MAX_VALUE_SIZE};
 use crate::CacheKey;
+use crate::api::list::{ListEntry, MAX_VALUE_SIZE, Result, UnexpectedEOFSnafu};
 use bytes::{Buf, Bytes};
-use futures::{stream, Stream};
+use futures::{Stream, stream};
 use generated_types::google::protobuf::BytesValue;
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
 use generated_types::prost;
@@ -187,7 +187,7 @@ impl ListStreamState {
 pub fn decode_response(response: Response) -> Result<impl Stream<Item = Result<ListEntry>>> {
     let response = response.error_for_status()?;
     let state = ListStreamState::new(response);
-    Ok(stream::try_unfold(state, |mut state| async move {
+    Ok(stream::try_unfold(state, async move |mut state| {
         loop {
             if state.current.is_empty() {
                 match state.response.chunk().await? {

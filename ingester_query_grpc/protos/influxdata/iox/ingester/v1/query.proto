@@ -80,14 +80,14 @@ message IngesterQueryResponseMetadata {
   // Number of Parquet files that have been persisted to object storage for this partition.
   uint64 completed_persistence_count = 10;
 
-  // Either the catalog-assigned partition ID or the deterministic identifier
+  // Either the catalog-assigned partition ID or the hash identifier
   // created from the table ID and partition key.
   //
   // For "old-style" partitions that were created before the switch to
-  // deterministic partition IDs, a `catalog_id` is returned, and this is used
+  // hash partition IDs, a `catalog_id` is returned, and this is used
   // to address the partition by row ID.
   //
-  // For "new-style" partitions, a deterministic hash-based ID is used to
+  // For "new-style" partitions, a hash-based ID is used to
   // address a partition.
   //
   // Invariant: a partition is EITHER an "old-style", row addressed partition,
@@ -99,7 +99,7 @@ message IngesterQueryResponseMetadata {
     // An "old-style" partition addressed by catalog row ID.
     int64 catalog_id = 7;
 
-    // A "new-style" partition addressed by a deterministic hash ID.
+    // A "new-style" partition addressed by a hash ID.
     bytes hash_id = 11;
   }
 }

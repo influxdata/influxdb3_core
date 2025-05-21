@@ -22,13 +22,13 @@ use std::{
 };
 use tokio::{
     runtime::Handle,
-    sync::{oneshot::error::RecvError, Notify},
+    sync::{Notify, oneshot::error::RecvError},
     task::JoinSet,
 };
 
 use futures::{
-    future::{BoxFuture, Shared},
     Future, FutureExt, TryFutureExt,
+    future::{BoxFuture, Shared},
 };
 
 use observability_deps::tracing::warn;
@@ -39,7 +39,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
 /// Errors occurring when polling [`DedicatedExecutor::spawn`].
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum JobError {
     #[snafu(display("Worker thread gone, executor was likely shut down"))]
     WorkerGone,
@@ -298,7 +298,7 @@ impl DedicatedExecutor {
     ///
     /// Currently all tasks are added to the tokio executor immediately and
     /// compete for the threadpool's resources.
-    pub fn spawn<T>(&self, task: T) -> impl Future<Output = Result<T::Output, JobError>>
+    pub fn spawn<T>(&self, task: T) -> impl Future<Output = Result<T::Output, JobError>> + use<T>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
@@ -539,13 +539,7 @@ mod tests {
     #[tokio::test]
     async fn panic_on_executor_other() {
         let exec = exec();
-        let dedicated_task = exec.spawn(async move {
-            if true {
-                panic_any(1)
-            } else {
-                42
-            }
-        });
+        let dedicated_task = exec.spawn(async move { if true { panic_any(1) } else { 42 } });
 
         // should not be able to get the result
         let err = dedicated_task.await.unwrap_err();
@@ -632,7 +626,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::redundant_clone)]
     async fn executor_clone_join() {
         let exec = exec();
         // test it doesn't hang

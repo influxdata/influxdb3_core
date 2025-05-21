@@ -17,6 +17,7 @@ use crate::internal::ParseResult;
 use crate::keywords::sql_keyword;
 use crate::string::double_quoted_string;
 use crate::{impl_tuple_clause, write_quoted_string};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alpha1, alphanumeric1};
@@ -34,7 +35,8 @@ pub(crate) fn unquoted_identifier(i: &str) -> ParseResult<&str, &str> {
             alt((alpha1, tag("_"))),
             many0_count(alt((alphanumeric1, tag("_")))),
         )),
-    )(i)
+    )
+    .parse(i)
 }
 
 /// A type that represents an InfluxQL identifier.
@@ -52,7 +54,9 @@ impl From<&str> for Identifier {
 impl Identifier {
     /// Returns true if the identifier requires quotes.
     pub fn requires_quotes(&self) -> bool {
-        nom::sequence::terminated(unquoted_identifier, nom::combinator::eof)(&self.0).is_err()
+        nom::sequence::terminated(unquoted_identifier, nom::combinator::eof)
+            .parse(&self.0)
+            .is_err()
     }
 
     /// Takes the string value out of the identifier, leaving a default string value in its place.
@@ -85,7 +89,8 @@ pub(crate) fn identifier(i: &str) -> ParseResult<&str, Identifier> {
             map(unquoted_identifier, Into::into),
             map(double_quoted_string, Into::into),
         )),
-    )(i)
+    )
+    .parse(i)
 }
 
 #[cfg(test)]

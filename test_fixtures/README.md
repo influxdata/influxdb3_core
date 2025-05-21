@@ -21,6 +21,13 @@ If you add a new file to this directory, please add a brief description of it he
 # parquet directory
 
 - `influxql_logs/influxql_log_*.parquet` - Data exported from TSM for the purposes of testing bulk
-  ingest. Notably NOT generated with IOx.
+  ingest. Notably NOT generated with IOx. Their timestamp ranges are:
+  - `influxql_log_1.parquet`: December 23, 2023 4:23:02.889 - December 23, 2023 9:47:53.121
+  - `influxql_log_2.parquet`: December 25, 2023 5:10:29.034 - December 25, 2023 7:20:31.800
+  - `influxql_log_3.parquet`: December 23, 2023 1:07:06.385 - December 25, 2023 22:15:02.321
+
 - `sql_query_logs/sql_query_log_*.parquet` - Data exported from TSM for the purposes of testing
-  bulk ingest. Notably NOT generated with IOx.
+  bulk ingest. Notably NOT generated with IOx. Their timestamp ranges are:
+  - `sql_query_log_1.parquet`: December 22, 2023 23:07:28.562 - December 25, 2023 22:52:42.999
+  - `sql_query_log_2.parquet`: December 23, 2023 2:40:00.477 - December 26, 2023 0:00:04.257
+  - `sql_query_log_3.parquet`: December 23, 2023 3:35:00.268 - December 26, 2023 0:04:00.167

@@ -2,14 +2,14 @@ use async_trait::async_trait;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{DurationHistogram, Metric, Registry};
 
-use super::{Authorizer, Error, Permission};
+use super::{Authorization, Authorizer, Error, Permission};
 
 const AUTHZ_DURATION_METRIC: &str = "authz_permission_check_duration";
 
 /// An instrumentation decorator over a [`Authorizer`] implementation.
 ///
 /// This wrapper captures the latency distribution of the decorated
-/// [`Authorizer::permissions()`] call, faceted by success/error result.
+/// [`Authorizer::authorize()`] call, faceted by success/error result.
 #[derive(Debug)]
 pub struct AuthorizerInstrumentation<T, P = SystemProvider> {
     inner: T,
@@ -53,18 +53,18 @@ impl<T> Authorizer for AuthorizerInstrumentation<T>
 where
     T: Authorizer,
 {
-    async fn permissions(
+    async fn authorize(
         &self,
         token: Option<Vec<u8>>,
         perms: &[Permission],
-    ) -> Result<Vec<Permission>, Error> {
+    ) -> Result<Authorization, Error> {
         let t = self.time_provider.now();
-        let res = self.inner.permissions(token, perms).await;
+        let res = self.inner.authorize(token, perms).await;
 
         if let Some(delta) = self.time_provider.now().checked_duration_since(t) {
             match &res {
                 Ok(_) => self.ioxauth_rpc_duration_success_auth.record(delta),
-                Err(Error::Forbidden) | Err(Error::InvalidToken) => {
+                Err(Error::Forbidden { .. }) | Err(Error::InvalidToken) => {
                     self.ioxauth_rpc_duration_success_unauth.record(delta)
                 }
                 Err(Error::Verification { .. }) => self.ioxauth_rpc_duration_error.record(delta),
@@ -80,15 +80,15 @@ where
 mod test {
     use std::collections::VecDeque;
 
-    use metric::{assert_histogram, Attributes, Registry};
+    use metric::{Attributes, Registry, assert_histogram};
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::{Action, Resource};
+    use crate::{Action, Resource, Target};
 
     #[derive(Debug, Default)]
     struct MockAuthorizerState {
-        ret: VecDeque<Result<Vec<Permission>, Error>>,
+        ret: VecDeque<Result<Authorization, Error>>,
     }
 
     #[derive(Debug, Default)]
@@ -101,18 +101,22 @@ mod test {
             self,
             ret: impl Into<VecDeque<Result<Vec<Permission>, Error>>>,
         ) -> Self {
-            self.state.lock().ret = ret.into();
+            self.state.lock().ret = ret
+                .into()
+                .into_iter()
+                .map(|r| r.map(|p| Authorization::new(None, p)))
+                .collect();
             self
         }
     }
 
     #[async_trait]
     impl Authorizer for MockAuthorizer {
-        async fn permissions(
+        async fn authorize(
             &self,
             _token: Option<Vec<u8>>,
             _perms: &[Permission],
-        ) -> Result<Vec<Permission>, Error> {
+        ) -> Result<Authorization, Error> {
             self.state
                 .lock()
                 .ret
@@ -202,7 +206,7 @@ mod test {
 
                     let token = "any".as_bytes().to_vec();
                     let got = decorated_authz
-                        .permissions(Some(token), &[])
+                        .authorize(Some(token), &[])
                         .await;
                     assert_eq!(got.is_ok(), $will_pass_auth);
                     assert_metric_counts!(
@@ -219,7 +223,7 @@ mod test {
     test_authorizer_metric!(
         ok,
         rpc_response = Ok(vec![Permission::ResourceAction(
-            Resource::Database("foo".to_string()),
+            Resource::Database(Target::ResourceName("foo".to_string())),
             Action::Write,
         )]),
         will_pass_auth = true,

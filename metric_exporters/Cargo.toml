@@ -11,8 +11,11 @@ workspace = true
 [dependencies] # In alphabetical order
 observability_deps = { path = "../observability_deps" }
 metric = { path = "../metric" }
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
+reqwest.workspace = true
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
+mockito = { version = "1.7", default-features = false }
 test_helpers = { path = "../test_helpers" }
+tokio = { version = "1", features = ["rt"] }

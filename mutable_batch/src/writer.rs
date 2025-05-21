@@ -1,23 +1,21 @@
 //! A panic-safe write abstraction for [`MutableBatch`]
 
 use crate::{
+    MutableBatch,
     column::{Column, ColumnData, NULL_DID},
     noop_validator::NoopValidator,
-    MutableBatch,
 };
-use arrow_util::bitset::{iter_set_positions, iter_set_positions_with_offset, BitSet};
+use arrow_util::bitset::{BitSet, iter_set_positions, iter_set_positions_with_offset};
 use data_types::{IsNan, StatValues, Statistics};
 use hashbrown::hash_map::RawEntryMut;
 use schema::{InfluxColumnType, InfluxFieldType};
 use snafu::{ResultExt, Snafu};
 use std::{num::NonZeroU64, ops::Range};
 
-#[allow(missing_docs, missing_copy_implementations)]
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Unable to insert {inserted} type into column {column} with type {existing}"
-    ))]
+    #[snafu(display("Unable to insert {inserted} type into column {column} with type {existing}"))]
     TypeMismatch {
         column: String,
         existing: InfluxColumnType,
@@ -37,7 +35,7 @@ pub enum Error {
 /// A specialized `Error` for [`Writer`] errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum InvalidInsertionError {
     #[snafu(display(

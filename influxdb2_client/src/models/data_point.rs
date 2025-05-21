@@ -1,6 +1,6 @@
 //! Data point building and writing
 
-use snafu::{ensure, Snafu};
+use snafu::{Snafu, ensure};
 use std::{collections::BTreeMap, io};
 
 /// Errors that occur while building `DataPoint`s
@@ -336,7 +336,7 @@ where
         last = idx + delim.len();
     }
 
-    w.write_all(value[last..].as_bytes())
+    w.write_all(&value.as_bytes()[last..])
 }
 
 #[cfg(test)]

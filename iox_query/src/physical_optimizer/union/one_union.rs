@@ -5,7 +5,7 @@ use datafusion::{
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{union::UnionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, union::UnionExec},
 };
 
 /// Optimizer that replaces [`UnionExec`] with a single child node w/ the child note itself.

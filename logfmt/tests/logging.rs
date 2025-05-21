@@ -3,10 +3,10 @@
 // that.... So punting on that for now
 
 // Tests and benchmarks don't use all the crate dependencies and that's all right.
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use logfmt::LogFmtLayer;
-use observability_deps::tracing::{debug, error, info, span, trace, warn, Level};
+use observability_deps::tracing::{Level, debug, error, info, span, trace, warn};
 use parking_lot::Mutex;
 use regex::Regex;
 use std::{
@@ -293,7 +293,7 @@ fn normalize_spans(lines: Vec<String>) -> Vec<String> {
     // iterator can't borrow `lines`, we need to collect into a `Vec` to
     // stop borrowing `lines`.
     // See https://github.com/rust-lang/rust-clippy/issues/7336
-    #[allow(clippy::needless_collect)]
+    #[expect(clippy::needless_collect)]
     let span_ids: Vec<String> = lines
         .iter()
         .flat_map(|line| re.find_iter(line))

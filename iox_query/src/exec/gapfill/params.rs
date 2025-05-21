@@ -12,16 +12,15 @@ use datafusion::{
     error::{DataFusionError, Result},
     functions::datetime::date_bin::DateBinFunc,
     physical_expr::PhysicalExpr,
-    physical_plan::{expressions::Column, ColumnarValue},
+    physical_plan::{ColumnarValue, expressions::Column},
     scalar::ScalarValue,
 };
 use hashbrown::HashMap;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
 
 use super::{
-    date_bin_gap_expander::DateBinGapExpander,
+    FillStrategy, GapExpander, GapFillExecParams, date_bin_gap_expander::DateBinGapExpander,
     date_bin_wallclock_gap_expander::DateBinWallclockGapExpander, try_map_bound, try_map_range,
-    FillStrategy, GapExpander, GapFillExecParams,
 };
 
 /// The parameters to gap filling. Included here are the parameters
@@ -84,7 +83,7 @@ impl GapFillParams {
             Bound::Unbounded => {
                 return Err(DataFusionError::Execution(
                     "missing upper time bound for gap filling".to_string(),
-                ))
+                ));
             }
         };
 
@@ -97,10 +96,11 @@ impl GapFillParams {
             args.push(v)
         }
         let first_ts = first_ts
-            .map(|_| extract_timestamp_nanos(&params.date_bin_udf.invoke(&args)?))
+            .map(|_| extract_timestamp_nanos(&params.date_bin_udf.invoke_batch(&args, args.len())?))
             .transpose()?;
         args[1] = i64_to_columnar_ts(Some(last_ts), &tz);
-        let last_ts = extract_timestamp_nanos(&params.date_bin_udf.invoke(&args)?)?;
+        let last_ts =
+            extract_timestamp_nanos(&params.date_bin_udf.invoke_batch(&args, args.len())?)?;
 
         let gap_expander: Arc<dyn GapExpander + Send + Sync> =
             if params.date_bin_udf.inner().as_any().is::<DateBinFunc>() {
@@ -156,7 +156,7 @@ fn extract_timestamp_nanos(cv: &ColumnarValue) -> Result<i64> {
         _ => {
             return Err(DataFusionError::Execution(
                 "gap filling argument must be a scalar timestamp".to_string(),
-            ))
+            ));
         }
     })
 }
@@ -200,16 +200,16 @@ mod tests {
         error::Result,
         logical_expr::ScalarUDF,
         physical_plan::{
-            expressions::{Column, Literal},
             PhysicalExpr,
+            expressions::{Column, Literal},
         },
         scalar::ScalarValue,
     };
     use hashbrown::HashMap;
 
     use crate::exec::{
-        gapfill::{FillStrategy, GapFillExec, GapFillExecParams},
         Executor,
+        gapfill::{FillStrategy, GapFillExec, GapFillExecParams},
     };
 
     #[tokio::test]

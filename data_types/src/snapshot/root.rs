@@ -3,7 +3,7 @@ use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
 use snafu::{ResultExt, Snafu};
 
-use crate::{Namespace, NamespaceId};
+use crate::{Namespace, NamespaceId, Timestamp};
 
 use super::{
     hash::{HashBuckets, HashBucketsEncoder},
@@ -12,7 +12,7 @@ use super::{
 
 /// Error for [`RootSnapshot`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Error decoding namespace names: {source}"))]
     NamespaceNamesDecode {
@@ -40,6 +40,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Clone)]
 pub struct RootSnapshot {
     namespaces: MessageList<proto::RootNamespace>,
+    /// Hash table of namespaces keyed by name. Does not include soft-deleted entries.
     namespace_names: HashBuckets,
     generation: u64,
 }
@@ -55,14 +56,18 @@ impl RootSnapshot {
             .map(|ns| proto::RootNamespace {
                 id: ns.id.get(),
                 name: ns.name.into(),
+                deleted_at: ns.deleted_at.as_ref().map(Timestamp::get),
             })
             .collect();
         // TODO(marco): wire up binary search to find namespace by ID
         namespaces.sort_unstable_by_key(|ns| ns.id);
 
         let mut namespace_names = HashBucketsEncoder::new(namespaces.len());
-        for ns in &namespaces {
-            namespace_names.push(&ns.name);
+        for (index, ns) in namespaces.iter().enumerate() {
+            // exclude soft-deleted entries from name table
+            if ns.deleted_at.is_none() {
+                namespace_names.push(&ns.name, index as u32);
+            }
         }
 
         Ok(Self {
@@ -93,7 +98,7 @@ impl RootSnapshot {
         })
     }
 
-    /// Lookup a [`RootSnapshotNamespace`] by name
+    /// Lookup a [`RootSnapshotNamespace`] by name. Does not include deleted entries.
     pub fn lookup_namespace_by_name(&self, name: &str) -> Result<Option<RootSnapshotNamespace>> {
         for idx in self.namespace_names.lookup(name.as_bytes()) {
             let ns = self.namespaces.get(idx).context(NamespaceDecodeSnafu)?;
@@ -101,7 +106,6 @@ impl RootSnapshot {
                 return Ok(Some(ns.into()));
             }
         }
-
         Ok(None)
     }
 
@@ -116,6 +120,7 @@ impl RootSnapshot {
 pub struct RootSnapshotNamespace {
     id: NamespaceId,
     name: Bytes,
+    deleted_at: Option<Timestamp>,
 }
 
 impl RootSnapshotNamespace {
@@ -128,6 +133,11 @@ impl RootSnapshotNamespace {
     pub fn name(&self) -> &[u8] {
         &self.name
     }
+
+    /// Returns the timestamp when the namespace was marked for deletion
+    pub fn deleted_at(&self) -> Option<Timestamp> {
+        self.deleted_at
+    }
 }
 
 impl From<proto::RootNamespace> for RootSnapshotNamespace {
@@ -135,6 +145,7 @@ impl From<proto::RootNamespace> for RootSnapshotNamespace {
         Self {
             id: NamespaceId::new(value.id),
             name: value.name,
+            deleted_at: value.deleted_at.map(Timestamp::new),
         }
     }
 }

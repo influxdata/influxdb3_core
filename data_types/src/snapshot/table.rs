@@ -2,7 +2,7 @@
 use crate::snapshot::list::MessageList;
 use crate::{
     Column, ColumnId, ColumnTypeProtoError, NamespaceId, Partition, PartitionId, PartitionKey,
-    Table, TableId,
+    Table, TableId, Timestamp,
 };
 use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
@@ -12,7 +12,7 @@ use snafu::{ResultExt, Snafu};
 
 /// Error for [`TableSnapshot`]
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum Error {
     #[snafu(display("Error decoding TablePartition: {source}"))]
     PartitionDecode {
@@ -61,7 +61,9 @@ pub struct TableSnapshot {
     partitions: MessageList<proto::TablePartition>,
     columns: MessageList<proto::TableColumn>,
     partition_template: Option<PartitionTemplate>,
+    iceberg_enabled: bool,
     generation: u64,
+    deleted_at: Option<Timestamp>,
 }
 
 impl TableSnapshot {
@@ -96,7 +98,9 @@ impl TableSnapshot {
             partitions: MessageList::encode(&partitions).context(PartitionEncodeSnafu)?,
             columns: MessageList::encode(&columns).context(ColumnEncodeSnafu)?,
             partition_template: table.partition_template.as_proto().cloned(),
+            iceberg_enabled: table.iceberg_enabled,
             generation,
+            deleted_at: table.deleted_at,
         })
     }
 
@@ -110,6 +114,8 @@ impl TableSnapshot {
             partitions: MessageList::from(proto.partitions.unwrap_or_default()),
             columns: MessageList::from(proto.columns.unwrap_or_default()),
             partition_template: proto.partition_template,
+            iceberg_enabled: proto.iceberg_enabled,
+            deleted_at: proto.deleted_at.map(Timestamp::new),
         }
     }
 
@@ -127,6 +133,8 @@ impl TableSnapshot {
             namespace_id: self.namespace_id,
             name: name.into(),
             partition_template: template,
+            iceberg_enabled: self.iceberg_enabled,
+            deleted_at: self.deleted_at,
         })
     }
 
@@ -200,9 +208,25 @@ impl TableSnapshotPartition {
         self.id
     }
 
-    /// Returns the partition key for this partition
+    /// Returns the partition key for this partition without decoding it.
+    ///
+    /// This is a no-op operation and should be rather fast.
+    ///
+    /// See [`partition_key`](Self::partition_key) if need need the decoded form.
     pub fn key(&self) -> &[u8] {
         &self.key
+    }
+
+    /// Return the decoded partition key.
+    ///
+    /// Use [`key`](Self::key) if you only need the raw data, e.g. for performance-critical code.
+    pub fn partition_key(&self) -> PartitionKey {
+        PartitionKey::from(std::str::from_utf8(self.key()).expect("valid partition key in catalog"))
+    }
+
+    /// Return the raw partition key, consuming this struct.
+    pub fn into_key(self) -> Bytes {
+        self.key
     }
 }
 
@@ -215,6 +239,8 @@ impl From<TableSnapshot> for proto::Table {
             namespace_id: value.namespace_id.get(),
             table_id: value.table_id.get(),
             table_name: value.table_name,
+            iceberg_enabled: value.iceberg_enabled,
+            deleted_at: value.deleted_at.map(|t| t.get()),
         }
     }
 }

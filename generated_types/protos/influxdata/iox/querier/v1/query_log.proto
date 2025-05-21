@@ -37,6 +37,9 @@ message LogEntry {
   // Query parameters
   repeated QueryParam query_params = 21;
 
+  // Authentication ID
+  optional string auth_id = 25;
+
   // Trace ID.
   string trace_id = 6;
 

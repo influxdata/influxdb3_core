@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::plan::{parse_regex, InfluxQLToLogicalPlan, SchemaProvider};
+use crate::plan::{InfluxQLToLogicalPlan, SchemaProvider, parse_regex};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};
@@ -97,14 +97,19 @@ impl SchemaExec {
     fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
         let eq_properties = match input.properties().output_ordering() {
             None => EquivalenceProperties::new(schema),
-            Some(output_odering) => {
-                EquivalenceProperties::new_with_orderings(schema, &[output_odering.to_vec()])
+            Some(output_ordering) => {
+                EquivalenceProperties::new_with_orderings(schema, &[output_ordering.clone()])
             }
         };
 
         let output_partitioning = input.output_partitioning().clone();
 
-        PlanProperties::new(eq_properties, output_partitioning, input.execution_mode())
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )
     }
 }
 
