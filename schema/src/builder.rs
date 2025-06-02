@@ -161,7 +161,6 @@ impl SchemaBuilder {
         assert!(!self.finished, "build called multiple times");
         self.finished = true;
 
-        // enforce non-nullable based on series key membership
         #[cfg(feature = "v3")]
         if let Some(sk) = self.series_key.as_ref() {
             if sk
