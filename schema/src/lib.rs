@@ -291,12 +291,24 @@ impl Schema {
         Ok(record)
     }
 
+    /// Get the series key for the schema
+    ///
+    /// The series key is the ordered list of tag columns in the schema. Returns `None` if the meta-
+    /// data key for the series key is not set in the schema.
     #[cfg(feature = "v3")]
     pub fn series_key(&self) -> Option<Vec<&str>> {
         self.inner
             .metadata
             .get(SERIES_KEY_METADATA_KEY)
-            .map(|v| v.split(SERIES_KEY_METADATA_SEPARATOR).collect())
+            .map(|series_key_str| {
+                if series_key_str.is_empty() {
+                    vec![]
+                } else {
+                    series_key_str
+                        .split(SERIES_KEY_METADATA_SEPARATOR)
+                        .collect()
+                }
+            })
     }
 
     /// Returns true if the sort_key includes all primary key cols
@@ -513,45 +525,43 @@ impl Schema {
     #[cfg(feature = "v3")]
     pub fn primary_key(&self) -> Vec<&str> {
         use InfluxColumnType::*;
-        self.inner
-            .metadata
-            .get(SERIES_KEY_METADATA_KEY)
-            .map_or_else(
-                // use tags in lexicographical order
-                || {
-                    let mut primary_keys: Vec<_> = self
-                        .iter()
-                        .filter_map(|(column_type, field)| match column_type {
-                            Tag => Some((Tag, field)),
-                            Field(_) => None,
-                            Timestamp => Some((Timestamp, field)),
-                        })
-                        .collect();
+        self.series_key().map_or_else(
+            // use tags in lexicographical order
+            || {
+                let mut primary_keys: Vec<_> = self
+                    .iter()
+                    .filter_map(|(column_type, field)| match column_type {
+                        Tag => Some((Tag, field)),
+                        Field(_) => None,
+                        Timestamp => Some((Timestamp, field)),
+                    })
+                    .collect();
 
-                    // Now, sort lexographically (but put timestamp last)
-                    primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
-                        match (a_column_type, b_column_type) {
-                            (Tag, Tag) => a.name().cmp(b.name()),
-                            (Timestamp, Tag) => Ordering::Greater,
-                            (Tag, Timestamp) => Ordering::Less,
-                            (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
-                            _ => panic!("Unexpected types in key summary"),
-                        }
-                    });
+                // Now, sort lexographically (but put timestamp last)
+                primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
+                    match (a_column_type, b_column_type) {
+                        (Tag, Tag) => a.name().cmp(b.name()),
+                        (Timestamp, Tag) => Ordering::Greater,
+                        (Tag, Timestamp) => Ordering::Less,
+                        (Timestamp, Timestamp) => panic!("multiple timestamps in summary"),
+                        _ => panic!("Unexpected types in key summary"),
+                    }
+                });
 
-                    // Take just the names
-                    primary_keys
-                        .into_iter()
-                        .map(|(_column_type, field)| field.name().as_str())
-                        .collect()
-                },
-                // use the series key
-                |v| {
-                    v.split(SERIES_KEY_METADATA_SEPARATOR)
-                        .chain(self.time_iter().map(|f| f.name().as_str()))
-                        .collect()
-                },
-            )
+                // Take just the names
+                primary_keys
+                    .into_iter()
+                    .map(|(_column_type, field)| field.name().as_str())
+                    .collect()
+            },
+            // use the series key
+            |series_key| {
+                series_key
+                    .into_iter()
+                    .chain(self.time_iter().map(|f| f.name().as_str()))
+                    .collect()
+            },
+        )
     }
 
     /// Return columns used for the "primary key" in this table.
@@ -1492,8 +1502,39 @@ mod test {
     #[cfg(feature = "v3")]
     #[test]
     fn test_series_key_as_pk() {
+        // columns in sorted order:
         let schema = SchemaBuilder::new()
             .with_series_key(["a", "b"])
+            .tag("a")
+            .tag("b")
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .unwrap();
+        assert_eq!(vec!["a", "b", "time"], schema.primary_key());
+        // columns in not-sorted order have order preserved:
+        let schema = SchemaBuilder::new()
+            .with_series_key(["b", "a"])
+            .tag("a")
+            .tag("b")
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .unwrap();
+        assert_eq!(vec!["b", "a", "time"], schema.primary_key());
+        // empty series key means primary key is just ["time"]:
+        let schema = SchemaBuilder::new()
+            .with_series_key::<[&str; 0]>([])
+            .influx_field("f1", Float)
+            .timestamp()
+            .measurement("foo")
+            .build()
+            .unwrap();
+        assert_eq!(vec!["time"], schema.primary_key());
+        // not setting series key falls back on default tags in lexicographical order:
+        let schema = SchemaBuilder::new()
             .tag("a")
             .tag("b")
             .influx_field("f1", Float)
