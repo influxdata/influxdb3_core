@@ -185,12 +185,12 @@ use std::{
 };
 
 use chrono::{
-    DateTime, Days, Months, Utc,
     format::{self, Numeric, StrftimeItems},
+    DateTime, Days, Months, Utc,
 };
 use generated_types::influxdata::iox::partition_template::v1 as proto;
 use murmur3::murmur3_32;
-use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str};
+use percent_encoding::{percent_decode_str, AsciiSet, CONTROLS};
 use schema::TIME_COLUMN_NAME;
 use thiserror::Error;
 
@@ -888,8 +888,8 @@ impl TryFrom<proto::PartitionTemplate> for TablePartitionTemplateOverride {
 /// duplication.
 mod serialization {
     use super::{
-        ALLOWED_BUCKET_QUANTITIES, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_BY_DAY_PROTO,
-        TAG_VALUE_KEY_TIME, TemplatePart, ValidationError, validate_existing_time_format,
+        validate_existing_time_format, TemplatePart, ValidationError, ALLOWED_BUCKET_QUANTITIES,
+        MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_BY_DAY_PROTO, TAG_VALUE_KEY_TIME,
     };
     use generated_types::influxdata::iox::partition_template::v1 as proto;
     use std::{collections::HashSet, sync::Arc};
@@ -1401,7 +1401,7 @@ impl<'t> TimeFormatColumnValueState<'t> {
     }
 
     fn parse_part_time_format(&self, value: &'t str) -> Option<ColumnValue<'t>> {
-        use chrono::format::{Parsed, parse};
+        use chrono::format::{parse, Parsed};
         let Self {
             parsed_format,
             partition_duration,

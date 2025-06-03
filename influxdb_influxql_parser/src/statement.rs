@@ -1,20 +1,20 @@
 //! Types and parsers for an InfluxQL statement.
 
-use crate::create::{CreateDatabaseStatement, create_statement};
-use crate::delete::{DeleteStatement, delete_statement};
-use crate::drop::{DropMeasurementStatement, drop_statement};
-use crate::explain::{ExplainStatement, explain_statement};
+use crate::create::{create_statement, CreateDatabaseStatement};
+use crate::delete::{delete_statement, DeleteStatement};
+use crate::drop::{drop_statement, DropMeasurementStatement};
+use crate::explain::{explain_statement, ExplainStatement};
 use crate::internal::ParseResult;
-use crate::select::{SelectStatement, select_statement};
-use crate::show::{ShowDatabasesStatement, show_statement};
+use crate::select::{select_statement, SelectStatement};
+use crate::show::{show_statement, ShowDatabasesStatement};
 use crate::show_field_keys::ShowFieldKeysStatement;
 use crate::show_measurements::ShowMeasurementsStatement;
 use crate::show_retention_policies::ShowRetentionPoliciesStatement;
 use crate::show_tag_keys::ShowTagKeysStatement;
 use crate::show_tag_values::ShowTagValuesStatement;
-use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::map;
+use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 /// An InfluxQL statement.

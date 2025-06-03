@@ -11,7 +11,7 @@ use schema::sort::SortKeyBuilder;
 
 use crate::{
     physical_optimizer::chunk_extraction::extract_chunks,
-    provider::{DeduplicateExec, chunks_to_physical_nodes},
+    provider::{chunks_to_physical_nodes, DeduplicateExec},
     util::arrow_sort_key_exprs,
 };
 
@@ -101,12 +101,12 @@ mod tests {
     use schema::SchemaBuilder;
 
     use crate::{
-        QueryChunk,
         physical_optimizer::{
             dedup::test_util::{chunk, dedup_plan, dedup_plan_with_chunk_order_col},
             test_util::OptimizationTest,
         },
         test::TestChunk,
+        QueryChunk,
     };
 
     use super::*;

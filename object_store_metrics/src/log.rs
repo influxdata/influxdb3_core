@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use object_store::{GetRange, path::Path};
+use object_store::{path::Path, GetRange};
 use observability_deps::tracing::debug;
 
 use crate::{OpResult, StoreType};

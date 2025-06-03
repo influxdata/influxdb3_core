@@ -3,11 +3,11 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
-    datasource::physical_plan::{FileScanConfig, ParquetExec, parquet::ParquetExecBuilder},
+    datasource::physical_plan::{parquet::ParquetExecBuilder, FileScanConfig, ParquetExec},
     error::Result,
     physical_expr::LexOrdering,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{ExecutionPlan, sorts::sort::SortExec},
+    physical_plan::{sorts::sort::SortExec, ExecutionPlan},
 };
 use datafusion_util::config::table_parquet_options;
 use observability_deps::tracing::warn;
@@ -193,9 +193,10 @@ mod tests {
     };
 
     use crate::{
-        CHUNK_ORDER_COLUMN_NAME, chunk_order_field,
-        physical_optimizer::test_util::{OptimizationTest, assert_unknown_partitioning},
+        chunk_order_field,
+        physical_optimizer::test_util::{assert_unknown_partitioning, OptimizationTest},
         provider::{DeduplicateExec, RecordBatchesExec},
+        CHUNK_ORDER_COLUMN_NAME,
     };
 
     use super::*;

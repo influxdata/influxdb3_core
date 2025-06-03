@@ -1368,7 +1368,7 @@ mod test {
     use crate::show_tag_keys::ShowTagKeysStatement;
     use crate::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
     use crate::simple_from_clause::{DeleteFromClause, ShowFromClause};
-    use crate::statement::{Statement, statement};
+    use crate::statement::{statement, Statement};
 
     struct TestVisitor(Vec<String>);
 

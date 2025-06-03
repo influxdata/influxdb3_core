@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use authz::{
-    self, Action, Authorizer, Error, Permission, Resource, Target, extract_token,
-    http::AuthorizationHeaderExtension,
+    self, extract_token, http::AuthorizationHeaderExtension, Action, Authorizer, Error, Permission,
+    Resource, Target,
 };
 use data_types::NamespaceName;
 use iox_http_util::Request;
@@ -71,9 +71,9 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use base64::{Engine, prelude::BASE64_STANDARD};
+    use base64::{prelude::BASE64_STANDARD, Engine};
     use hyper::header::HeaderValue;
-    use iox_http_util::{RequestBuilder, empty_request_body};
+    use iox_http_util::{empty_request_body, RequestBuilder};
 
     use super::mock::*;
     use super::*;

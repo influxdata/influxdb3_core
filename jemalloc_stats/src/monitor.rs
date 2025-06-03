@@ -102,8 +102,9 @@ impl AllocationMonitor {
 mod jemalloc_stats {
     use std::sync::LazyLock;
     use tikv_jemalloc_ctl::{
-        Result, epoch, epoch_mib,
+        epoch, epoch_mib,
         stats::{allocated, allocated_mib},
+        Result,
     };
 
     static EPOCH_MIB: LazyLock<Result<epoch_mib>> = LazyLock::new(epoch::mib);

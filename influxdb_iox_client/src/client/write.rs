@@ -1,11 +1,11 @@
 use std::{fmt::Debug, num::NonZeroUsize, sync::Arc};
 
 use client_util::{connection::HttpConnection, namespace_translation::split_namespace};
-use futures_util::{FutureExt, Stream, StreamExt, TryStreamExt, future::BoxFuture};
+use futures_util::{future::BoxFuture, FutureExt, Stream, StreamExt, TryStreamExt};
 
 use crate::{
     connection::Connection,
-    error::{Error, translate_response},
+    error::{translate_response, Error},
 };
 use reqwest::{Body, Method};
 

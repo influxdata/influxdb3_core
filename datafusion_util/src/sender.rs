@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc::{Sender, UnboundedSender, error::SendError};
+use tokio::sync::mpsc::{error::SendError, Sender, UnboundedSender};
 
 /// Trait to abstract over [bounded](Sender) and [unbounded](UnboundedSender) tokio [MPSC](tokio::sync::mpsc) senders.
 #[async_trait]

@@ -74,8 +74,8 @@ where
 mod tests {
     use super::*;
     use mutable_batch::writer::Writer;
-    use rand::TryRngCore;
     use rand::prelude::*;
+    use rand::TryRngCore;
 
     fn make_rng() -> StdRng {
         let seed = rand::rngs::OsRng.try_next_u64().unwrap();

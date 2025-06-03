@@ -29,7 +29,6 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    Action, FlightClient, FlightDescriptor, FlightInfo, IpcMessage, PutResult, Ticket,
     decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
     error::{FlightError, Result},
@@ -40,9 +39,10 @@ use arrow_flight::{
         CommandGetTables, CommandGetXdbcTypeInfo, CommandPreparedStatementQuery,
         CommandStatementQuery, DoPutPreparedStatementResult, ProstMessageExt,
     },
+    Action, FlightClient, FlightDescriptor, FlightInfo, IpcMessage, PutResult, Ticket,
 };
 use bytes::Bytes;
-use futures_util::{Stream, TryStreamExt, stream::BoxStream};
+use futures_util::{stream::BoxStream, Stream, TryStreamExt};
 use generated_types::{metadata::MetadataMap, transport::Channel};
 use prost::Message;
 

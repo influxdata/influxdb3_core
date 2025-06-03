@@ -22,13 +22,13 @@ use std::{
 };
 use tokio::{
     runtime::Handle,
-    sync::{Notify, oneshot::error::RecvError},
+    sync::{oneshot::error::RecvError, Notify},
     task::JoinSet,
 };
 
 use futures::{
-    Future, FutureExt, TryFutureExt,
     future::{BoxFuture, Shared},
+    Future, FutureExt, TryFutureExt,
 };
 
 use observability_deps::tracing::warn;
@@ -539,7 +539,13 @@ mod tests {
     #[tokio::test]
     async fn panic_on_executor_other() {
         let exec = exec();
-        let dedicated_task = exec.spawn(async move { if true { panic_any(1) } else { 42 } });
+        let dedicated_task = exec.spawn(async move {
+            if true {
+                panic_any(1)
+            } else {
+                42
+            }
+        });
 
         // should not be able to get the result
         let err = dedicated_task.await.unwrap_err();

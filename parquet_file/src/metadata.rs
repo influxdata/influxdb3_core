@@ -86,7 +86,7 @@
 //! [Apache Parquet]: https://parquet.apache.org/
 //! [Apache Thrift]: https://thrift.apache.org/
 //! [Thrift Compact Protocol]: https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md
-use base64::{Engine, prelude::BASE64_STANDARD};
+use base64::{prelude::BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, CompactionLevelProtoError, InfluxDbType,
@@ -112,10 +112,10 @@ use parquet::{
 };
 use prost::Message;
 use schema::{
-    InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME,
     sort::{SortKey, SortKeyBuilder},
+    InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME,
 };
-use snafu::{OptionExt, ResultExt, Snafu, ensure};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{convert::TryInto, fmt::Debug, mem, sync::Arc};
 use thiserror::Error;
 use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol, TOutputProtocol};
@@ -1123,8 +1123,8 @@ mod tests {
         record_batch::RecordBatch,
     };
     use data_types::CompactionLevel;
-    use datafusion_util::{MemoryStream, unbounded_memory_pool};
-    use schema::{TIME_DATA_TIMEZONE, builder::SchemaBuilder};
+    use datafusion_util::{unbounded_memory_pool, MemoryStream};
+    use schema::{builder::SchemaBuilder, TIME_DATA_TIMEZONE};
 
     #[test]
     fn iox_metadata_protobuf_round_trip() {

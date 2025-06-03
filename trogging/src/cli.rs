@@ -1,6 +1,6 @@
 //! Common CLI flags for logging and tracing
-use crate::{Builder, config::*};
-use tracing_subscriber::fmt::{MakeWriter, writer::BoxMakeWriter};
+use crate::{config::*, Builder};
+use tracing_subscriber::fmt::{writer::BoxMakeWriter, MakeWriter};
 
 /// CLI config for the logging related subset of options.
 #[derive(Debug, Clone, clap::Parser)]

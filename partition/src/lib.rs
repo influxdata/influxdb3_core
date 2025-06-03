@@ -14,11 +14,11 @@ use std::{num::NonZeroUsize, ops::Range};
 
 use arrow::{array::UInt64Array, compute::take, error::ArrowError, record_batch::RecordBatch};
 use data_types::{
-    PartitionKey,
     partition_template::{
-        MAXIMUM_NUMBER_OF_TEMPLATE_PARTS, PARTITION_KEY_DELIMITER, TablePartitionTemplateOverride,
-        TemplatePart,
+        TablePartitionTemplateOverride, TemplatePart, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS,
+        PARTITION_KEY_DELIMITER,
     },
+    PartitionKey,
 };
 use hashbrown::HashMap;
 use mutable_batch::{MutableBatch, WritePayload};
@@ -383,12 +383,12 @@ mod tests {
     use super::*;
 
     use assert_matches::assert_matches;
-    use chrono::{DateTime, Datelike, Days, TimeZone, Utc, format::StrftimeItems};
-    use data_types::partition_template::{ColumnValue, test_table_partition_override};
-    use mutable_batch::{MutableBatch, writer::Writer};
+    use chrono::{format::StrftimeItems, DateTime, Datelike, Days, TimeZone, Utc};
+    use data_types::partition_template::{test_table_partition_override, ColumnValue};
+    use mutable_batch::{writer::Writer, MutableBatch};
     use proptest::{prelude::*, prop_compose, proptest, strategy::Strategy};
-    use rand::TryRngCore;
     use rand::prelude::*;
+    use rand::TryRngCore;
     use schema::{Projection, TIME_COLUMN_NAME};
 
     fn make_rng() -> StdRng {
@@ -703,15 +703,13 @@ mod tests {
             .unwrap();
         assert_eq!(filter_to_platanos1970_batch.num_rows(), 3);
 
-        assert!(
-            PartitionWrite::filter_to_partition(
-                &batch,
-                &table_partition_template,
-                &PartitionKey::from("1970-01-01 00:00:00|not-a-matching-partition-key"),
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(PartitionWrite::filter_to_partition(
+            &batch,
+            &table_partition_template,
+            &PartitionKey::from("1970-01-01 00:00:00|not-a-matching-partition-key"),
+        )
+        .unwrap()
+        .is_none());
 
         let initial_record_batch = batch.clone().try_into_arrow(Projection::All).unwrap();
         let filter_record_batch_to_platanos1970 = PartitionWrite::filter_to_partition(

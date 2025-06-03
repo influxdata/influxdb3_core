@@ -8,7 +8,7 @@ use workspace_hack as _;
 
 use datafusion::{
     execution::FunctionRegistry,
-    prelude::{Expr, SessionContext, lit},
+    prelude::{lit, Expr, SessionContext},
 };
 use group_by::WindowDuration;
 use window::EncodedWindowDuration;
@@ -42,9 +42,9 @@ pub mod gapfill;
 mod registry;
 mod to_timestamp;
 
+pub use crate::regex::clean_non_meta_escapes;
 pub use crate::regex::REGEX_MATCH_UDF_NAME;
 pub use crate::regex::REGEX_NOT_MATCH_UDF_NAME;
-pub use crate::regex::clean_non_meta_escapes;
 pub use crate::sleep::SLEEP_UDF_NAME;
 
 /// Return an Expr that invokes a InfluxRPC compatible regex match to

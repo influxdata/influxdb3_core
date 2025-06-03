@@ -5,21 +5,21 @@ use std::sync::Arc;
 
 use crate::error;
 use arrow::{
-    array::{Array, ArrayRef, cast},
+    array::{cast, Array, ArrayRef},
     datatypes::{DataType, Field},
+};
+use datafusion::{
+    common::plan_err,
+    logical_expr::{
+        function::{AccumulatorArgs, StateFieldsArgs},
+        AggregateUDFImpl,
+    },
 };
 use datafusion::{
     common::Result,
     logical_expr::{Accumulator, Signature, Volatility},
     physical_expr::expressions::format_state_name,
     scalar::ScalarValue,
-};
-use datafusion::{
-    common::plan_err,
-    logical_expr::{
-        AggregateUDFImpl,
-        function::{AccumulatorArgs, StateFieldsArgs},
-    },
 };
 use itertools::Itertools;
 

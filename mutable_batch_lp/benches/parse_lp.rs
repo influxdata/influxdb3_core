@@ -5,8 +5,8 @@ use std::fmt::Display;
 use std::{fmt::Write, path::PathBuf};
 
 use criterion::{
-    BatchSize, BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main,
-    measurement::WallTime,
+    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion,
+    Throughput,
 };
 use mutable_batch_lp::LinesConverter;
 

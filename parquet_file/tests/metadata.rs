@@ -12,7 +12,7 @@ use data_types::{
     PartitionId, PartitionKey, TableId, Timestamp, TransitionPartitionId,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion_util::{MemoryStream, unbounded_memory_pool};
+use datafusion_util::{unbounded_memory_pool, MemoryStream};
 use iox_time::Time;
 use object_store::DynObjectStore;
 use parquet_file::{
@@ -21,8 +21,8 @@ use parquet_file::{
     storage::{ParquetStorage, StorageId, UploadError},
 };
 use schema::{
-    InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME, TIME_DATA_TIMEZONE,
-    builder::SchemaBuilder, sort::SortKey,
+    builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME,
+    TIME_DATA_TIMEZONE,
 };
 
 #[tokio::test]

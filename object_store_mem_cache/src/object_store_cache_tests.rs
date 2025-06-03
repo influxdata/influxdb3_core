@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::{
-    DynObjectStore, Error, GetResult, GetResultPayload, ObjectMeta, PutPayload, path::Path,
+    path::Path, DynObjectStore, Error, GetResult, GetResultPayload, ObjectMeta, PutPayload,
 };
 
 /// Abstract test setup.
@@ -304,6 +304,6 @@ macro_rules! gen_store_tests {
 
 pub use gen_store_tests;
 
-use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_metrics::cache_state::{CacheState, ATTR_CACHE_STATE};
 use object_store_mock::MockStore;
 use object_store_size_hinting::hint_size;

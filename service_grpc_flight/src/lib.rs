@@ -14,28 +14,28 @@ mod request;
 
 use arrow::error::ArrowError;
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use authz::{Authorizer, extract_token};
+use authz::{extract_token, Authorizer};
 use data_types::NamespaceNameError;
 use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use error_reporting::DisplaySourceChain;
 use flightsql::FlightSQLCommand;
-use futures::{Stream, StreamExt, TryStreamExt, ready, stream::BoxStream};
+use futures::{ready, stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::{
-    Code, Request, Response, Status, Streaming,
     influxdata::iox::querier::v1 as proto,
     metadata::{AsciiMetadataValue, MetadataMap},
+    Code, Request, Response, Status, Streaming,
 };
 use iox_query::{
-    QueryDatabase,
     exec::IOxSessionContext,
     query_log::{PermitAndToken, QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
+    QueryDatabase,
 };
 use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
 use observability_deps::tracing::{debug, info, warn};

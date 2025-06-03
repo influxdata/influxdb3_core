@@ -1,7 +1,7 @@
 use super::{Batch, PartitioningColumn, TimeColumnError};
 use mutable_batch::{
-    MutableBatch,
     column::{Column as MutableBatchColumn, ColumnData},
+    MutableBatch,
 };
 use schema::TIME_COLUMN_NAME;
 

@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use chrono::{TimeZone, Utc, format::StrftimeItems};
+use chrono::{format::StrftimeItems, TimeZone, Utc};
 
 use crate::PartitionKeyError;
 

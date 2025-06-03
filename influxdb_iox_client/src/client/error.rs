@@ -1,6 +1,6 @@
 use generated_types::{
-    Code, Status,
     google::{AlreadyExists, FieldViolation, NotFound, PreconditionViolation},
+    Code, Status,
 };
 use std::fmt::Debug;
 use thiserror::Error;

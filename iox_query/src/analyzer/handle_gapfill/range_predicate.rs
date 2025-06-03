@@ -7,13 +7,14 @@ use std::{
 use arrow::datatypes::DataType;
 use datafusion::{
     common::{
-        DFSchema, internal_err,
+        internal_err,
         tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
+        DFSchema,
     },
     error::Result,
     logical_expr::{
-        Between, BinaryExpr, Cast, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator,
-        expr::Alias, utils::split_conjunction,
+        expr::Alias, utils::split_conjunction, Between, BinaryExpr, Cast, ExprSchemable,
+        LogicalPlan, LogicalPlanBuilder, Operator,
     },
     prelude::{Column, Expr},
 };
@@ -247,10 +248,11 @@ mod tests {
     use datafusion::{
         error::Result,
         logical_expr::{
-            Between, LogicalPlan, LogicalPlanBuilder, cast,
+            cast,
             logical_plan::{self, builder::LogicalTableSource},
+            Between, LogicalPlan, LogicalPlanBuilder,
         },
-        prelude::{Column, Expr, Partitioning, col, lit},
+        prelude::{col, lit, Column, Expr, Partitioning},
         scalar::ScalarValue,
         sql::TableReference,
     };

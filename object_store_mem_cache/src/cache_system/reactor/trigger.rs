@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use futures::{FutureExt, StreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, FutureExt, StreamExt};
 use iox_time::{Time, TimeProvider};
 use metric::U64Counter;
 use observability_deps::tracing::info;

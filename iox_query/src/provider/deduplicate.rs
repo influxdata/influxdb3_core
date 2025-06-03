@@ -6,23 +6,23 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use arrow::{error::ArrowError, record_batch::RecordBatch};
 use datafusion::physical_plan::ExecutionPlanProperties;
-use datafusion_util::{AdapterStream, watch::WatchedTask};
+use datafusion_util::{watch::WatchedTask, AdapterStream};
 
 use crate::CHUNK_ORDER_COLUMN_NAME;
 
-pub use self::algo::RecordBatchDeduplicator;
 use self::algo::get_col_name;
+pub use self::algo::RecordBatchDeduplicator;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, LexRequirement};
 use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream, Statistics,
         expressions::{Column, PhysicalSortExpr},
         metrics::{
             self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput,
         },
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream, Statistics,
     },
 };
 use futures::StreamExt;
@@ -397,7 +397,7 @@ async fn deduplicate(
 
 #[cfg(test)]
 mod test {
-    use arrow::compute::{SortOptions, concat_batches};
+    use arrow::compute::{concat_batches, SortOptions};
     use arrow::datatypes::{Int32Type, SchemaRef};
     use arrow::{
         array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray},
