@@ -1,7 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, as_string_array},
+    array::{as_string_array, ArrayRef, BooleanArray},
     datatypes::DataType,
 };
 use datafusion::{
@@ -203,7 +203,7 @@ mod test {
     use datafusion::prelude::SessionContext;
     use datafusion::{
         error::DataFusionError,
-        prelude::{Expr, col, lit},
+        prelude::{col, lit, Expr},
     };
     use std::sync::Arc;
 

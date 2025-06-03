@@ -5,7 +5,7 @@
 //! call information as the InfluxQL AST. These expressions are then
 //! rewritten at a later stage of planning, with more context available.
 
-use crate::{NUMERICS, error, plan::util::find_exprs_in_exprs};
+use crate::{error, plan::util::find_exprs_in_exprs, NUMERICS};
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},

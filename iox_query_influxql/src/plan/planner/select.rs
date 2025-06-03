@@ -9,7 +9,7 @@ use influxdb_influxql_parser::expression::{Call, Expr as IQLExpr, VarRef, VarRef
 use influxdb_influxql_parser::identifier::Identifier;
 use influxdb_influxql_parser::literal::Literal;
 use itertools::Itertools;
-use schema::{INFLUXQL_MEASUREMENT_COLUMN_NAME, InfluxColumnType};
+use schema::{InfluxColumnType, INFLUXQL_MEASUREMENT_COLUMN_NAME};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 

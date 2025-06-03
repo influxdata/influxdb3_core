@@ -2,9 +2,9 @@
 //! object store and reading it back.
 
 use crate::{
-    ParquetFilePath,
     metadata::{IoxMetadata, IoxParquetMetaData},
     serialize::{self, CodecError, ParallelParquetWriterOptions},
+    ParquetFilePath,
 };
 use arrow::{
     datatypes::{Field, SchemaRef},
@@ -16,7 +16,7 @@ use datafusion::{
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
+        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
     },
     error::DataFusionError,
     execution::runtime_env::RuntimeEnv,
@@ -461,7 +461,7 @@ mod tests {
         Timestamp,
     };
     use datafusion::common::{DataFusionError, ScalarValue};
-    use datafusion_util::{MemoryStream, config::BATCH_SIZE, unbounded_memory_pool};
+    use datafusion_util::{config::BATCH_SIZE, unbounded_memory_pool, MemoryStream};
     use iox_time::Time;
     use schema::{Error::InvalidInfluxColumnType, Schema as IoxSchema, SchemaBuilder};
     use tokio::runtime::{Handle, RuntimeFlavor};

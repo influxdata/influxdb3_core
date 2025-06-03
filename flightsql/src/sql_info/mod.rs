@@ -21,9 +21,9 @@
 mod meta;
 
 use arrow_flight::sql::{
+    metadata::{SqlInfoData, SqlInfoDataBuilder},
     SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity, SqlSupportedTransactions,
     SupportedSqlGrammar,
-    metadata::{SqlInfoData, SqlInfoDataBuilder},
 };
 use meta::{
     SQL_INFO_DATE_TIME_FUNCTIONS, SQL_INFO_NUMERIC_FUNCTIONS, SQL_INFO_SQL_KEYWORDS,

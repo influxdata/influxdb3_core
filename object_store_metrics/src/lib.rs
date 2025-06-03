@@ -8,12 +8,12 @@ use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, StreamExt};
 use iox_time::TimeProvider;
 
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
 };
 
 use crate::{
@@ -610,8 +610,8 @@ mod tests {
         io::{Read, Seek, Write},
         path::PathBuf,
         sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         },
         time::Duration,
     };
@@ -620,8 +620,8 @@ mod tests {
     use futures_test_utils::AssertFutureExt;
     use iox_time::{MockProvider, Time};
     use object_store_mock::{
-        DATA, MockCall, MockStore, err, get_result_stream, multipart_upload_err,
-        multipart_upload_ok, object_meta, path, path2,
+        err, get_result_stream, multipart_upload_err, multipart_upload_ok, object_meta, path,
+        path2, MockCall, MockStore, DATA,
     };
     use test_helpers::tracing::TracingCapture;
     use tokio::sync::Barrier;
@@ -886,19 +886,15 @@ mod tests {
             .put_multipart(&path)
             .await
             .expect("should get multipart upload");
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_ok());
         // demonstrate that it sums across bytes
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
+            .await
+            .is_ok());
         multipart_upload.complete().await.unwrap();
         drop(multipart_upload);
 
@@ -975,19 +971,15 @@ mod tests {
             .put_multipart(&path)
             .await
             .expect("should get multipart upload");
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_ok());
         // demonstrate that it sums across bytes
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
+            .await
+            .is_ok());
         drop(multipart_upload);
 
         assert_counter_value(
@@ -1063,19 +1055,15 @@ mod tests {
             .put_multipart(&path)
             .await
             .expect("should get multipart upload");
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_ok());
         // demonstrate that it sums across bytes
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
+            .await
+            .is_ok());
         multipart_upload.abort().await.unwrap();
         drop(multipart_upload);
 
@@ -1420,12 +1408,10 @@ mod tests {
             .put_multipart(&path)
             .await
             .expect("should get multipart upload");
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from(Bytes::from(vec![42_u8, 42, 42, 42, 42])))
-                .await
-                .is_err()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from(Bytes::from(vec![42_u8, 42, 42, 42, 42])))
+            .await
+            .is_err());
         drop(multipart_upload);
 
         assert_counter_value(
@@ -1530,19 +1516,15 @@ mod tests {
             .await
             .expect("should get multipart upload");
         // first write succeeds
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_ok());
         // second write fails
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_err()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_err());
         drop(multipart_upload);
 
         assert_counter_value(
@@ -1620,12 +1602,10 @@ mod tests {
             .await
             .expect("should get multipart upload");
         // first write succeeds
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_ok());
         // flush fails
         assert!(multipart_upload.complete().await.is_err());
         drop(multipart_upload);
@@ -1703,19 +1683,15 @@ mod tests {
             .put_multipart_opts(&path, Default::default())
             .await
             .expect("should get multipart upload");
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42, 42, 42]))
+            .await
+            .is_ok());
         // demonstrate that it sums across bytes
-        assert!(
-            multipart_upload
-                .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
-                .await
-                .is_ok()
-        );
+        assert!(multipart_upload
+            .put_part(PutPayload::from_static(&[42_u8, 42, 42]))
+            .await
+            .is_ok());
         multipart_upload.complete().await.unwrap();
         drop(multipart_upload);
 

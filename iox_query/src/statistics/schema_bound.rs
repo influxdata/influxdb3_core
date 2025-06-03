@@ -73,7 +73,7 @@ impl SchemaBoundStatistics {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{CHUNK_ORDER_COLUMN_NAME, test::TestChunk};
+    use crate::{test::TestChunk, CHUNK_ORDER_COLUMN_NAME};
     use datafusion::scalar::ScalarValue;
     use schema::{InfluxFieldType, SchemaBuilder};
 

@@ -3,15 +3,15 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/manage-database/#create-database
 
 use crate::common::ws1;
-use crate::identifier::{Identifier, identifier};
-use crate::internal::{ParseResult, expect};
+use crate::identifier::{identifier, Identifier};
+use crate::internal::{expect, ParseResult};
 use crate::keywords::keyword;
-use crate::literal::{Duration, duration, unsigned_integer};
+use crate::literal::{duration, unsigned_integer, Duration};
 use crate::statement::Statement;
-use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::{map, opt, peek};
 use nom::sequence::{pair, preceded};
+use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 pub(crate) fn create_statement(i: &str) -> ParseResult<&str, Statement> {

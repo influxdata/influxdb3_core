@@ -12,15 +12,16 @@ use datafusion::{
     error::{DataFusionError, Result},
     functions::datetime::date_bin::DateBinFunc,
     physical_expr::PhysicalExpr,
-    physical_plan::{ColumnarValue, expressions::Column},
+    physical_plan::{expressions::Column, ColumnarValue},
     scalar::ScalarValue,
 };
 use hashbrown::HashMap;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
 
 use super::{
-    FillStrategy, GapExpander, GapFillExecParams, date_bin_gap_expander::DateBinGapExpander,
+    date_bin_gap_expander::DateBinGapExpander,
     date_bin_wallclock_gap_expander::DateBinWallclockGapExpander, try_map_bound, try_map_range,
+    FillStrategy, GapExpander, GapFillExecParams,
 };
 
 /// The parameters to gap filling. Included here are the parameters
@@ -200,16 +201,16 @@ mod tests {
         error::Result,
         logical_expr::ScalarUDF,
         physical_plan::{
-            PhysicalExpr,
             expressions::{Column, Literal},
+            PhysicalExpr,
         },
         scalar::ScalarValue,
     };
     use hashbrown::HashMap;
 
     use crate::exec::{
-        Executor,
         gapfill::{FillStrategy, GapFillExec, GapFillExecParams},
+        Executor,
     };
 
     #[tokio::test]

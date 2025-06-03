@@ -108,8 +108,8 @@ use workspace_hack as _;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 
 mod counter;
 mod cumulative;
@@ -526,11 +526,9 @@ mod tests {
         assert_eq!(attributes.0.get("tag1").unwrap(), "foo");
         assert_eq!(observation, &Observation::U64Counter(23));
 
-        assert!(
-            registry
-                .get_instrument::<Metric<U64Counter>>("unregistered")
-                .is_none()
-        );
+        assert!(registry
+            .get_instrument::<Metric<U64Counter>>("unregistered")
+            .is_none());
 
         let counter = registry
             .get_instrument::<Metric<U64Counter>>("foo")

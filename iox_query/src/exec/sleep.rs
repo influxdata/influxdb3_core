@@ -12,11 +12,11 @@ use arrow::{
 use datafusion::{
     common::DFSchemaRef,
     error::DataFusionError,
-    execution::{TaskContext, context::SessionState},
+    execution::{context::SessionState, TaskContext},
     logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
-        SendableRecordBatchStream, Statistics, stream::RecordBatchStreamAdapter,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
+        PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
     },
     physical_planner::PhysicalPlanner,
     prelude::Expr,

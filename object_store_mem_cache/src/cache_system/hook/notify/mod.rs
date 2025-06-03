@@ -1,8 +1,8 @@
 use std::{
     pin::Pin,
     sync::{
-        Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
     },
     task::{Context, Poll, Waker},
 };

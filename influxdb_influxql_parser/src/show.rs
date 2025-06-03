@@ -3,9 +3,9 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/
 
 use crate::common::ws1;
-use crate::identifier::{Identifier, identifier};
+use crate::identifier::{identifier, Identifier};
 use crate::impl_tuple_clause;
-use crate::internal::{ParseResult, expect};
+use crate::internal::{expect, ParseResult};
 use crate::keywords::keyword;
 use crate::show_field_keys::show_field_keys;
 use crate::show_measurements::show_measurements;
@@ -13,10 +13,10 @@ use crate::show_retention_policies::show_retention_policies;
 use crate::show_tag_keys::show_tag_keys;
 use crate::show_tag_values::show_tag_values;
 use crate::statement::Statement;
-use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::{map, value};
 use nom::sequence::{pair, preceded};
+use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 const INVALID_SHOW_STATEMENT_ERROR: &str = "invalid SHOW statement, expected DATABASES, \

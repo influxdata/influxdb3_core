@@ -20,7 +20,7 @@ use arrow::record_batch::RecordBatch;
 use data_types::{ColumnType, StatValues, Statistics};
 use hashbrown::HashMap;
 use iox_time::Time;
-use schema::{Projection, Schema, TIME_COLUMN_NAME, builder::SchemaBuilder};
+use schema::{builder::SchemaBuilder, Projection, Schema, TIME_COLUMN_NAME};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{collections::BTreeSet, ops::Range};
 

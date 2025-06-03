@@ -5,8 +5,8 @@ use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::{
-    DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
     metrics::{MetricValue, MetricsSet},
+    DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::StreamExt;
 use hashbrown::HashMap;
@@ -359,12 +359,12 @@ mod tests {
     use datafusion::{
         execution::context::TaskContext,
         physical_plan::{
-            DisplayAs, Metric,
             metrics::{Count, Time, Timestamp},
+            DisplayAs, Metric,
         },
     };
     use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
-    use trace::{RingBufferTraceCollector, ctx::SpanContext, span::MetaValue};
+    use trace::{ctx::SpanContext, span::MetaValue, RingBufferTraceCollector};
 
     #[test]
     fn name_truncation() {

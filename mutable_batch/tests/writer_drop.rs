@@ -2,8 +2,8 @@
 #![expect(unused_crate_dependencies)]
 
 use arrow_util::assert_batches_eq;
-use mutable_batch::MutableBatch;
 use mutable_batch::writer::Writer;
+use mutable_batch::MutableBatch;
 use schema::Projection;
 
 #[test]

@@ -18,7 +18,7 @@ use futures::TryStreamExt;
 use iox_query_params::StatementParams;
 use parquet_file::storage::ParquetExecInput;
 use query_log::{QueryCompletedToken, QueryText, StateReceived};
-use schema::{Projection, Schema, sort::SortKey};
+use schema::{sort::SortKey, Projection, Schema};
 use std::{
     any::Any,
     fmt::Debug,

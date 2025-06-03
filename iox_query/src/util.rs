@@ -13,18 +13,18 @@ use arrow::{
 };
 
 use data_types::TimestampMinMax;
-use datafusion::physical_expr::{AnalysisContext, ExprBoundaries, analyze};
-use datafusion::{common::DFSchema, physical_expr::LexOrdering};
+use datafusion::physical_expr::{analyze, AnalysisContext, ExprBoundaries};
 use datafusion::{common::stats::Precision, execution::context::SessionState};
+use datafusion::{common::DFSchema, physical_expr::LexOrdering};
 use datafusion::{
     error::DataFusionError,
-    logical_expr::{SortExpr, interval_arithmetic::Interval},
-    physical_plan::expressions::{PhysicalSortExpr, col as physical_col},
+    logical_expr::{interval_arithmetic::Interval, SortExpr},
+    physical_plan::expressions::{col as physical_col, PhysicalSortExpr},
     prelude::{Column, Expr},
 };
 use itertools::Itertools;
-use schema::{TIME_COLUMN_NAME, sort::SortKey};
-use snafu::{OptionExt, ResultExt, Snafu, ensure};
+use schema::{sort::SortKey, TIME_COLUMN_NAME};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 #[expect(missing_docs)]
@@ -183,11 +183,11 @@ pub fn calculate_field_interval(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::common::ScalarValue;
     use datafusion::common::rounding::next_down;
+    use datafusion::common::ScalarValue;
     use datafusion::execution::context::SessionContext;
     use datafusion::logical_expr::{col, lit};
-    use schema::{InfluxFieldType, TIME_DATA_TIMEZONE, builder::SchemaBuilder};
+    use schema::{builder::SchemaBuilder, InfluxFieldType, TIME_DATA_TIMEZONE};
 
     use super::*;
 

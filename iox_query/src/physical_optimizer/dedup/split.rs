@@ -1,18 +1,18 @@
 use crate::{
-    QueryChunk,
     config::IoxConfigExt,
     physical_optimizer::chunk_extraction::extract_chunks,
     provider::{
-        DeduplicateExec, chunks_to_physical_nodes, group_potential_duplicates,
-        overlap::timestamp_min_max,
+        chunks_to_physical_nodes, group_potential_duplicates, overlap::timestamp_min_max,
+        DeduplicateExec,
     },
+    QueryChunk,
 };
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{ExecutionPlan, empty::EmptyExec, union::UnionExec},
+    physical_plan::{empty::EmptyExec, union::UnionExec, ExecutionPlan},
 };
 use hashbrown::HashMap;
 use observability_deps::tracing::warn;

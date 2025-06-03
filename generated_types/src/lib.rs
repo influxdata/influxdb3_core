@@ -24,9 +24,9 @@ pub use prost_types::FileDescriptorSet;
 
 // Re-export commonly-used Tonic types
 pub use tonic::{
-    self, Code, IntoRequest, Request, Response, Status, Streaming, async_trait,
-    codegen::{StdError, http},
-    metadata, transport,
+    self, async_trait,
+    codegen::{http, StdError},
+    metadata, transport, Code, IntoRequest, Request, Response, Status, Streaming,
 };
 
 /// This module imports the generated protobuf code into a Rust module

@@ -1,13 +1,13 @@
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use crate::cache_system::DynError;
 
 use super::{
-    EvictResult, Hook, HookDecision,
     notify::{Mailbox, Notifier},
+    EvictResult, Hook, HookDecision,
 };
 
 /// A [hook](Hook) that triggers whenever data is ingested and we are above a given threshold.

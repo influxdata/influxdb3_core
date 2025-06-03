@@ -3,11 +3,11 @@
 //! AKA it is a Mock
 
 use crate::{
-    Extension, QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace,
-    QueryText,
     exec::{Executor, IOxSessionContext, QueryConfig},
     provider::ProviderBuilder,
     query_log::{QueryLog, QueryLogEntries, StateReceived},
+    Extension, QueryChunk, QueryChunkData, QueryCompletedToken, QueryDatabase, QueryNamespace,
+    QueryText,
 };
 use arrow::array::{BooleanArray, Float64Array};
 use arrow::datatypes::SchemaRef;
@@ -30,7 +30,7 @@ use datafusion::{
 };
 use datafusion::{
     common::stats::Precision,
-    datasource::{TableProvider, TableType, object_store::ObjectStoreUrl},
+    datasource::{object_store::ObjectStoreUrl, TableProvider, TableType},
     physical_plan::{ColumnStatistics, Statistics as DataFusionStatistics},
     scalar::ScalarValue,
 };
@@ -38,11 +38,11 @@ use datafusion_util::{config::DEFAULT_SCHEMA, option_to_precision, timestamptz_n
 use iox_query_params::StatementParams;
 use iox_time::SystemProvider;
 use itertools::Itertools;
-use object_store::{ObjectMeta, path::Path};
+use object_store::{path::Path, ObjectMeta};
 use parking_lot::Mutex;
 use parquet_file::storage::ParquetExecInput;
 use schema::{
-    Schema, TIME_COLUMN_NAME, builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey,
+    builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey, Schema, TIME_COLUMN_NAME,
 };
 use std::{
     any::Any,
@@ -1233,14 +1233,13 @@ pub(crate) mod test_utils {
     use arrow::datatypes::SchemaRef;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::{
-        common::{Statistics, stats::Precision},
+        common::{stats::Precision, Statistics},
         datasource::{
             listing::PartitionedFile,
-            physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
+            physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
         },
         physical_expr::LexOrdering,
         physical_plan::{
-            Partitioning, PhysicalExpr,
             coalesce_batches::CoalesceBatchesExec,
             filter::FilterExec,
             joins::CrossJoinExec,
@@ -1249,6 +1248,7 @@ pub(crate) mod test_utils {
             repartition::RepartitionExec,
             sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
             union::UnionExec,
+            Partitioning, PhysicalExpr,
         },
     };
     use datafusion::{

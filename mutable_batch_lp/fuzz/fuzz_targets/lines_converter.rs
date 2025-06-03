@@ -5,7 +5,7 @@ use workspace_hack as _;
 
 use hashbrown::HashMap;
 use libfuzzer_sys::fuzz_target;
-use mutable_batch::{MutableBatch, WritePayload, column::ColumnData};
+use mutable_batch::{column::ColumnData, MutableBatch, WritePayload};
 use mutable_batch_lp::LinesConverter;
 use partition::PartitionWrite;
 

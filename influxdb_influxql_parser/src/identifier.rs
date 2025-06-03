@@ -17,13 +17,13 @@ use crate::internal::ParseResult;
 use crate::keywords::sql_keyword;
 use crate::string::double_quoted_string;
 use crate::{impl_tuple_clause, write_quoted_string};
-use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alpha1, alphanumeric1};
 use nom::combinator::{map, not, recognize};
 use nom::multi::many0_count;
 use nom::sequence::{pair, preceded};
+use nom::Parser;
 use std::fmt::{Display, Formatter, Write};
 use std::{fmt, mem};
 

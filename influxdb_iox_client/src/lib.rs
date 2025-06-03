@@ -6,8 +6,8 @@
 use insta as _;
 
 pub use generated_types::{
-    Code, IntoRequest, Request, Response, Status, google, metadata, protobuf_type_url,
-    protobuf_type_url_eq, transport::Body,
+    google, metadata, protobuf_type_url, protobuf_type_url_eq, transport::Body, Code, IntoRequest,
+    Request, Response, Status,
 };
 
 pub use client::*;

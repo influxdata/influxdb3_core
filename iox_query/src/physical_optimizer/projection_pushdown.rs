@@ -6,12 +6,11 @@ use std::{
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
+    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
     error::{DataFusionError, Result},
-    physical_expr::{LexOrdering, PhysicalSortExpr, utils::collect_columns},
+    physical_expr::{utils::collect_columns, LexOrdering, PhysicalSortExpr},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan, PhysicalExpr,
         empty::EmptyExec,
         expressions::Column,
         filter::FilterExec,
@@ -19,6 +18,7 @@ use datafusion::{
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
+        ExecutionPlan, PhysicalExpr,
     },
 };
 use datafusion_util::config::table_parquet_options;
@@ -415,17 +415,17 @@ mod tests {
         logical_expr::Operator,
         physical_expr::{EquivalenceProperties, ScalarFunctionExpr},
         physical_plan::{
-            DisplayAs, PhysicalExpr, PlanProperties,
             execution_plan::{Boundedness, EmissionType},
             expressions::{BinaryExpr, IsNullExpr, Literal},
-            joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode, utils::JoinFilter},
+            joins::{utils::JoinFilter, HashJoinExec, NestedLoopJoinExec, PartitionMode},
+            DisplayAs, PhysicalExpr, PlanProperties,
         },
         scalar::ScalarValue,
     };
     use serde::Serialize;
 
     use crate::{
-        physical_optimizer::test_util::{OptimizationTest, assert_unknown_partitioning},
+        physical_optimizer::test_util::{assert_unknown_partitioning, OptimizationTest},
         test::TestChunk,
     };
 
@@ -702,23 +702,21 @@ mod tests {
             Arc::clone(&schema),
         )
         .with_projection(Some(projection))
-        .with_output_ordering(vec![
-            vec![
-                PhysicalSortExpr {
-                    expr: expr_col("tag3", &schema_projected),
-                    options: Default::default(),
-                },
-                PhysicalSortExpr {
-                    expr: expr_col("field", &schema_projected),
-                    options: Default::default(),
-                },
-                PhysicalSortExpr {
-                    expr: expr_col("tag2", &schema_projected),
-                    options: Default::default(),
-                },
-            ]
-            .into(),
-        ]);
+        .with_output_ordering(vec![vec![
+            PhysicalSortExpr {
+                expr: expr_col("tag3", &schema_projected),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("field", &schema_projected),
+                options: Default::default(),
+            },
+            PhysicalSortExpr {
+                expr: expr_col("tag2", &schema_projected),
+                options: Default::default(),
+            },
+        ]
+        .into()]);
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
             .with_predicate(expr_string_cmp("tag1", &schema));
         let inner = builder.build();

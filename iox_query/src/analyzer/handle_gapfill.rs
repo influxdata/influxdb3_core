@@ -5,22 +5,22 @@ pub mod range_predicate;
 mod virtual_function;
 
 use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
-use datafusion::common::{DFSchema, internal_datafusion_err, plan_datafusion_err, plan_err};
-use datafusion::logical_expr::{ExprSchemable, expr::AggregateFunction};
+use datafusion::common::{internal_datafusion_err, plan_datafusion_err, plan_err, DFSchema};
+use datafusion::logical_expr::{expr::AggregateFunction, ExprSchemable};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
     error::{DataFusionError, Result},
     logical_expr::{
-        Aggregate, Extension, LogicalPlan, Projection, ScalarUDF,
         expr::{Alias, ScalarFunction},
         utils::expr_to_columns,
+        Aggregate, Extension, LogicalPlan, Projection, ScalarUDF,
     },
     optimizer::AnalyzerRule,
-    prelude::{Column, Expr, col},
+    prelude::{col, Column, Expr},
 };
-use hashbrown::{HashMap, hash_map};
+use hashbrown::{hash_map, HashMap};
 use query_functions::gapfill::{GapFillWrapper, INTERPOLATE_UDF_NAME, LOCF_UDF_NAME};
 use query_functions::tz::TzUDF;
 use std::{
@@ -662,9 +662,9 @@ mod test {
     use datafusion::error::Result;
     use datafusion::functions_aggregate::expr_fn::{avg, min};
     use datafusion::logical_expr::builder::table_scan_with_filters;
-    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, logical_plan};
+    use datafusion::logical_expr::{logical_plan, LogicalPlan, LogicalPlanBuilder};
     use datafusion::optimizer::{Analyzer, AnalyzerRule};
-    use datafusion::prelude::{Expr, case, col, lit};
+    use datafusion::prelude::{case, col, lit, Expr};
     use datafusion_util::lit_timestamptz_nano;
     use query_functions::gapfill::{
         DATE_BIN_GAPFILL_UDF_NAME, INTERPOLATE_UDF_NAME, LOCF_UDF_NAME,

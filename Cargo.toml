@@ -110,10 +110,12 @@ explicit_iter_loop = "deny"
 future_not_send = "deny"
 todo = "deny"
 use_self = "deny"
+allow_attributes = "warn"
 
 [workspace.lints.rustdoc]
-broken_intra_doc_links = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "allow"
 
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.

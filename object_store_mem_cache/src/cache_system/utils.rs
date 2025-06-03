@@ -1,7 +1,7 @@
 //! A few helpers to build cache-related code.
 use std::{
     future::Future,
-    panic::{AssertUnwindSafe, resume_unwind},
+    panic::{resume_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},

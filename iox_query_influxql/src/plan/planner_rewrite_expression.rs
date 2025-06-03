@@ -126,12 +126,12 @@ use std::sync::Arc;
 use crate::plan::util::IQLSchema;
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
-use datafusion::common::{Result, ScalarValue, not_impl_err};
+use datafusion::common::{not_impl_err, Result, ScalarValue};
 use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
-use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator, binary_expr, cast, lit};
+use datafusion::logical_expr::{binary_expr, cast, lit, BinaryExpr, Expr, ExprSchemable, Operator};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{Column, when};
+use datafusion::prelude::{when, Column};
 use observability_deps::tracing::trace;
 use predicate::rpc_predicate::{iox_expr_rewrite, simplify_predicate};
 
@@ -568,7 +568,7 @@ mod test {
 
     use super::*;
     use datafusion::prelude::col;
-    use datafusion_util::{AsExpr, lit_timestamptz_nano};
+    use datafusion_util::{lit_timestamptz_nano, AsExpr};
 
     use chrono::{DateTime, NaiveDate, Utc};
     use datafusion::common::{DFSchemaRef, ToDFSchema};

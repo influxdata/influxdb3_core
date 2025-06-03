@@ -106,10 +106,10 @@ pub fn walk_expr_mut<B>(
 
 #[cfg(test)]
 mod test {
-    use crate::expression::walk::{ExpressionMut, walk_expr_mut, walk_expression_mut};
+    use crate::expression::walk::{walk_expr_mut, walk_expression_mut, ExpressionMut};
     use crate::expression::{
-        ConditionalBinary, ConditionalExpression, ConditionalOperator, Expr, VarRef,
-        arithmetic_expression, conditional_expression,
+        arithmetic_expression, conditional_expression, ConditionalBinary, ConditionalExpression,
+        ConditionalOperator, Expr, VarRef,
     };
     use crate::literal::Literal;
 

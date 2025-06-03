@@ -15,14 +15,14 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::memory_pool::MemoryReservation,
     physical_plan::{
-        ExecutionPlan, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
         expressions::Column,
         metrics::{BaselineMetrics, RecordOutput},
+        ExecutionPlan, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
     },
 };
-use futures::{Stream, StreamExt, ready};
+use futures::{ready, Stream, StreamExt};
 
-use super::{GapFillExec, algo::GapFiller, buffered_input::BufferedInput, params::GapFillParams};
+use super::{algo::GapFiller, buffered_input::BufferedInput, params::GapFillParams, GapFillExec};
 
 /// An implementation of a gap-filling operator that uses the [Stream] trait.
 ///

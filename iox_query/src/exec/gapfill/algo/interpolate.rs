@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        Array, ArrayRef, PrimitiveArray, StructArray, TimestampNanosecondArray, as_primitive_array,
-        as_struct_array,
+        as_primitive_array, as_struct_array, Array, ArrayRef, PrimitiveArray, StructArray,
+        TimestampNanosecondArray,
     },
     datatypes::{ArrowPrimitiveType, DataType, Float64Type, Int64Type, UInt64Type},
 };
@@ -362,10 +362,10 @@ mod test {
     use schema::TIME_DATA_TIMEZONE;
 
     use crate::exec::gapfill::{
-        FillStrategy,
         algo::tests::{array_to_lines, assert_cursor_end_state, new_cursor_with_batch_size},
         date_bin_gap_expander::DateBinGapExpander,
         params::GapFillParams,
+        FillStrategy,
     };
 
     /// Verify the rounding behavior (really just truncating towards zero) which is

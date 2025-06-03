@@ -9,10 +9,10 @@ use workspace_hack as _;
 
 use crate::common::{statement_terminator, ws0};
 use crate::internal::Error as InternalError;
-use crate::statement::{Statement, statement};
+use crate::statement::{statement, Statement};
 use common::ParseError;
-use nom::Offset;
 use nom::combinator::eof;
+use nom::Offset;
 
 #[cfg(test)]
 mod test_util;

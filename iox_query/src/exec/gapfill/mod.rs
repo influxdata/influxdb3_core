@@ -25,10 +25,10 @@ use datafusion::{
     logical_expr::{LogicalPlan, ScalarUDF, UserDefinedLogicalNodeCore},
     physical_expr::{EquivalenceProperties, PhysicalSortExpr},
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-        Partitioning, PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
         expressions::Column,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+        Partitioning, PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
     },
     prelude::Expr,
     scalar::ScalarValue,
@@ -707,7 +707,7 @@ mod test {
         common::DFSchema,
         datasource::empty::EmptyTable,
         error::Result,
-        logical_expr::{ExprSchemable, Extension, UserDefinedLogicalNode, logical_plan},
+        logical_expr::{logical_plan, ExprSchemable, Extension, UserDefinedLogicalNode},
         prelude::{col, lit},
         scalar::ScalarValue,
     };

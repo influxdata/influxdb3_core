@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use futures_concurrency::prelude::*;
 use futures_test_utils::{AssertFutureExt, FutureObserver};
 use rand::Rng;

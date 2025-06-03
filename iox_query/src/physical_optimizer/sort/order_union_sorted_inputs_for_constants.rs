@@ -6,10 +6,10 @@ use datafusion::{
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan,
         expressions::Column,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
+        ExecutionPlan,
     },
 };
 
@@ -21,8 +21,8 @@ use crate::{
 };
 
 use super::util::{
-    ValueRangeAndColValues, accepted_union_exec, add_sort_preserving_merge,
-    all_physical_sort_exprs_on_column,
+    accepted_union_exec, add_sort_preserving_merge, all_physical_sort_exprs_on_column,
+    ValueRangeAndColValues,
 };
 
 /// IOx specific optimization rule to replace SortPreservingMerge with ProgressiveEval if
@@ -203,24 +203,24 @@ mod test {
     use datafusion::{
         physical_expr::{LexOrdering, PhysicalSortExpr},
         physical_plan::{
-            ExecutionPlan, PhysicalExpr,
             expressions::{Column, Literal},
             projection::ProjectionExec,
             sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
             union::UnionExec,
+            ExecutionPlan, PhysicalExpr,
         },
         scalar::ScalarValue,
     };
     use schema::{InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
 
     use crate::{
-        CHUNK_ORDER_COLUMN_NAME, QueryChunk,
         physical_optimizer::{
             sort::order_union_sorted_inputs_for_constants::OrderUnionSortedInputsForConstants,
             test_util::OptimizationTest,
         },
-        provider::{RecordBatchesExec, chunks_to_physical_nodes},
+        provider::{chunks_to_physical_nodes, RecordBatchesExec},
         test::TestChunk,
+        QueryChunk, CHUNK_ORDER_COLUMN_NAME,
     };
 
     // ------------------------------------------------------------------

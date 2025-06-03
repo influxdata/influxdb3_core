@@ -7,8 +7,8 @@ use std::{
     future::Future,
     hash::Hash,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
@@ -16,9 +16,9 @@ use std::{
 pub use s3_fifo::{S3Config, S3Fifo};
 
 use super::{
-    ArcResult, Cache, CacheFn, DynError, HasSize,
     hook::{EvictResult, Hook},
     utils::{CatchUnwindDynErrorExt, TokioTask},
+    ArcResult, Cache, CacheFn, DynError, HasSize,
 };
 
 mod fifo;
@@ -221,7 +221,7 @@ mod tests {
 
     use crate::cache_system::{
         hook::test_utils::{NoOpHook, TestHook, TestHookRecord},
-        test_utils::{TestSetup, TestValue, gen_cache_tests, runtime_shutdown},
+        test_utils::{gen_cache_tests, runtime_shutdown, TestSetup, TestValue},
     };
 
     #[test]
