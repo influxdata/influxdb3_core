@@ -4,7 +4,7 @@ use arrow::datatypes::Field;
 use datafusion::{
     common::DFSchema,
     logical_expr::{
-        LogicalPlan, binary::comparison_coercion, expr_rewriter::coerce_plan_expr_for_schema, union,
+        binary::comparison_coercion, expr_rewriter::coerce_plan_expr_for_schema, union, LogicalPlan,
     },
 };
 use itertools::izip;

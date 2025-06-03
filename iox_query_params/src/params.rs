@@ -2,7 +2,7 @@
 //! values that can be supplied as an InfluxDB bind parameter.
 use std::{
     borrow::Cow,
-    collections::{HashMap, hash_map},
+    collections::{hash_map, HashMap},
     ops::Index,
     sync::Arc,
 };
@@ -10,8 +10,8 @@ use std::{
 use arrow::{
     array::{ArrayRef, AsArray},
     datatypes::{
-        DataType, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-        UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+        DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
     record_batch::RecordBatch,
 };
@@ -23,8 +23,8 @@ use thiserror::Error;
 // remap protobuf types for convenience
 mod proto {
     pub(super) use generated_types::influxdata::iox::querier::v1::{
-        QueryParam,
         query_param::{NullValue, Value},
+        QueryParam,
     };
 }
 

@@ -1,6 +1,6 @@
 use client_util::connection::GrpcConnection;
 /// Re-export generated_types
-use generated_types::{TestErrorRequest, i_ox_testing_client::IOxTestingClient};
+use generated_types::{i_ox_testing_client::IOxTestingClient, TestErrorRequest};
 
 use crate::connection::Connection;
 use crate::error::Error;

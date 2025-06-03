@@ -4,8 +4,8 @@ use jemalloc_stats::{AllocationMonitor, AllocationMonitorError};
 use metric::U64Counter;
 use std::fmt::Debug;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub(crate) struct Monitor {

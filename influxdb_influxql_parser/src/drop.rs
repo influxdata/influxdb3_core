@@ -3,12 +3,12 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/manage-database/#delete-measurements-with-drop-measurement
 
 use crate::common::ws1;
-use crate::identifier::{Identifier, identifier};
-use crate::internal::{ParseResult, expect};
+use crate::identifier::{identifier, Identifier};
+use crate::internal::{expect, ParseResult};
 use crate::keywords::keyword;
-use nom::Parser;
 use nom::combinator::map;
 use nom::sequence::{pair, preceded};
+use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 /// Represents a `DROP MEASUREMENT` statement.

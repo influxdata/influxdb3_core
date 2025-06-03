@@ -1,21 +1,21 @@
 use std::{
     any::Any,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
 };
 
 use async_trait::async_trait;
 use futures::{
-    FutureExt, TryFutureExt,
     future::{BoxFuture, Shared},
+    FutureExt, TryFutureExt,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinError;
 
 use observability_deps::tracing::{error, info, warn};
-use trace::{TraceCollector, span::Span};
+use trace::{span::Span, TraceCollector};
 
 /// Size of the exporter buffer
 const CHANNEL_SIZE: usize = 100_000;

@@ -6,8 +6,8 @@ use datafusion::{
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan, displayable, expressions::Column,
-        sorts::sort_preserving_merge::SortPreservingMergeExec, union::UnionExec,
+        displayable, expressions::Column, sorts::sort_preserving_merge::SortPreservingMergeExec,
+        union::UnionExec, ExecutionPlan,
     },
 };
 use observability_deps::tracing::{trace, warn};
@@ -224,22 +224,21 @@ mod test {
         logical_expr::{LogicalPlanBuilder, Operator},
         physical_expr::{LexOrdering, PhysicalSortExpr},
         physical_plan::{
-            ExecutionPlan, Partitioning, PhysicalExpr,
             expressions::{BinaryExpr, Column},
             limit::GlobalLimitExec,
             projection::ProjectionExec,
             repartition::RepartitionExec,
             sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
             union::UnionExec,
+            ExecutionPlan, Partitioning, PhysicalExpr,
         },
         prelude::{col, lit},
         scalar::ScalarValue,
     };
     use executor::DedicatedExecutor;
-    use schema::{InfluxFieldType, SchemaBuilder as IOxSchemaBuilder, sort::SortKey};
+    use schema::{sort::SortKey, InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
 
     use crate::{
-        CHUNK_ORDER_COLUMN_NAME, QueryChunk,
         exec::{Executor, ExecutorConfig},
         physical_optimizer::{
             sort::{
@@ -248,9 +247,10 @@ mod test {
             },
             test_util::OptimizationTest,
         },
-        provider::{DeduplicateExec, ProviderBuilder, RecordBatchesExec, chunks_to_physical_nodes},
+        provider::{chunks_to_physical_nodes, DeduplicateExec, ProviderBuilder, RecordBatchesExec},
         statistics::{column_statistics_min_max, compute_stats_column_min_max},
-        test::{TestChunk, format_execution_plan},
+        test::{format_execution_plan, TestChunk},
+        QueryChunk, CHUNK_ORDER_COLUMN_NAME,
     };
 
     // ------------------------------------------------------------------

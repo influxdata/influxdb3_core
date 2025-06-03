@@ -1,19 +1,19 @@
 //! Types and parsers for literals.
 
 use crate::common::ws0;
-use crate::internal::{ParseResult, map_error, map_fail};
+use crate::internal::{map_error, map_fail, ParseResult};
 use crate::keywords::keyword;
-use crate::string::{Regex, regex, single_quoted_string};
+use crate::string::{regex, single_quoted_string, Regex};
 use crate::timestamp::Timestamp;
 use crate::{impl_tuple_clause, write_escaped};
 use chrono::{DateTime, Utc};
-use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{char, digit0, digit1};
 use nom::combinator::{map, opt, recognize, value};
 use nom::multi::fold_many1;
 use nom::sequence::{pair, preceded, separated_pair};
+use nom::Parser;
 use std::fmt;
 use std::fmt::{Display, Formatter, Write};
 

@@ -3,11 +3,11 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field};
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::logical_expr::function::StateFieldsArgs;
+use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
-    logical_expr::{Signature, TypeSignature, Volatility, function::AccumulatorArgs},
-    physical_plan::{Accumulator, expressions::format_state_name},
+    logical_expr::{function::AccumulatorArgs, Signature, TypeSignature, Volatility},
+    physical_plan::{expressions::format_state_name, Accumulator},
 };
 
 #[derive(Debug)]

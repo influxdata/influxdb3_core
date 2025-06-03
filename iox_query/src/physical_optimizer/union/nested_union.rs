@@ -5,7 +5,7 @@ use datafusion::{
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{ExecutionPlan, union::UnionExec},
+    physical_plan::{union::UnionExec, ExecutionPlan},
 };
 
 /// Optimizer that replaces nested [`UnionExec`]s with a single level.

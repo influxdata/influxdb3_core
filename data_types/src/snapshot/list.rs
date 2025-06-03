@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use prost::Message;
-use snafu::{Snafu, ensure};
+use snafu::{ensure, Snafu};
 use std::marker::PhantomData;
 use std::ops::Range;
 

@@ -6,15 +6,15 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use metric::{Registry, U64Histogram, U64HistogramOptions};
 use object_store::{
-    Attributes, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    path::Path, Attributes, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
 };
 use observability_deps::tracing::debug;
 use tracker::{LockMetrics, Mutex};
 
 use crate::{
+    cache_state::{CacheState, ATTR_CACHE_STATE},
     StoreType,
-    cache_state::{ATTR_CACHE_STATE, CacheState},
 };
 
 pub(crate) const CACHE_METRIC_BYTES: &str = "parquet_cache_bytes";
@@ -422,8 +422,8 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store_mem_cache::MemCacheObjectStoreParams;
 
-    use object_store_mock::{MockCall::GetOpts, MockStore, get_result_stream, path};
-    use rust_decimal::{Decimal, prelude::FromPrimitive};
+    use object_store_mock::{get_result_stream, path, MockCall::GetOpts, MockStore};
+    use rust_decimal::{prelude::FromPrimitive, Decimal};
     use test_helpers::tracing::TracingCapture;
     use tokio::sync::Barrier;
 

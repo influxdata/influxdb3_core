@@ -1,7 +1,7 @@
 use crate::{Batch, PartitionKeyError, PartitioningColumn};
 use data_types::partition_template::{
-    ENCODED_PARTITION_KEY_CHARS, PARTITION_KEY_MAX_PART_LEN, PARTITION_KEY_PART_TRUNCATED,
-    PARTITION_KEY_VALUE_EMPTY_STR, PARTITION_KEY_VALUE_NULL_STR, TemplatePart,
+    TemplatePart, ENCODED_PARTITION_KEY_CHARS, PARTITION_KEY_MAX_PART_LEN,
+    PARTITION_KEY_PART_TRUNCATED, PARTITION_KEY_VALUE_EMPTY_STR, PARTITION_KEY_VALUE_NULL_STR,
 };
 use percent_encoding::utf8_percent_encode;
 use std::borrow::Cow;

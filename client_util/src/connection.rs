@@ -1,7 +1,7 @@
 use crate::tower::{SetRequestHeadersLayer, SetRequestHeadersService};
-use http::HeaderMap;
 use http::header::HeaderName;
-use http::{HeaderValue, Uri, uri::InvalidUri};
+use http::HeaderMap;
+use http::{uri::InvalidUri, HeaderValue, Uri};
 use std::convert::TryInto;
 use std::time::Duration;
 use thiserror::Error;

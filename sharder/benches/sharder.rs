@@ -7,11 +7,11 @@ use std::{
 };
 
 use criterion::{
-    BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime,
+    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion, Throughput,
 };
 use data_types::NamespaceName;
 use mutable_batch::MutableBatch;
-use rand::{Rng, distr::Alphanumeric, rng};
+use rand::{distr::Alphanumeric, rng, Rng};
 use sharder::{JumpHash, RoundRobin, Sharder};
 
 fn get_random_string(length: usize) -> String {

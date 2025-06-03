@@ -1,0 +1,62 @@
+# Configuration documentation:
+#   https://embarkstudios.github.io/cargo-deny/index.html
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # paste crate is no longer maintained, but it is past 1.0
+    # Keep this here until our transisent dependencies no longer
+    # need it
+    "RUSTSEC-2024-0436",
+]
+git-fetch-with-cli = true
+
+[licenses]
+version = 2
+unused-allowed-license = "warn"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "NCSA",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = [
+    # We should probably NOT bundle CA certs but use the OS ones.
+    { name = "webpki-roots", allow = ["MPL-2.0"] },
+]
+
+[[licenses.clarify]]
+name = "ring"
+expression = "BSD-4-Clause AND ISC AND MIT AND OpenSSL"
+license-files = [
+    # https://github.com/briansmith/ring/blob/95948b3977013aed16db92ae32e6b8384496a740/LICENSE
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[sources.allow-org]
+github = ["influxdata"]
+
+[bans]
+multiple-versions = "allow"
+deny = [
+    # We are using rustls as the TLS implementation, so we shouldn't be linking
+    # in OpenSSL too.
+    #
+    # If you're hitting this, you might want to take a look at what new
+    # dependencies you have introduced and check if there's a way to depend on
+    # rustls instead of OpenSSL (tip: check the crate's feature flags).
+    { name = "openssl-sys" },
+    # We've decided to use the `humantime` crate to parse and generate friendly time formats; use
+    # that rather than chrono-english.
+    { name = "chrono-english" },
+    # Use stdlib ( https://doc.rust-lang.org/stable/std/io/trait.IsTerminal.html )
+    { name = "atty" },
+]

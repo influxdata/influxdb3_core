@@ -1,17 +1,17 @@
 //! Implementation of statistics based pruning
 
-use crate::QueryChunk;
 use crate::pruning_oracle::BucketPartitionPruningOracle;
+use crate::QueryChunk;
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, UInt64Array, new_empty_array},
+    array::{new_empty_array, ArrayRef, BooleanArray, UInt64Array},
     datatypes::{DataType, SchemaRef},
 };
 use datafusion::{
     physical_expr::execution_props::ExecutionProps,
     physical_optimizer::pruning::PruningStatistics,
     physical_plan::{ColumnStatistics, Statistics},
-    prelude::{Column, Expr, col},
+    prelude::{col, Column, Expr},
     scalar::ScalarValue,
 };
 use datafusion_util::{create_pruning_predicate, lit_timestamptz_nano};
@@ -303,9 +303,9 @@ mod test {
     use test_helpers::{assert_not_contains, tracing::TracingCapture};
 
     use crate::{
-        QueryChunk,
         pruning_oracle::{BucketInfo, BucketPartitionPruningOracleBuilder},
         test::TestChunk,
+        QueryChunk,
     };
 
     use super::*;
@@ -708,12 +708,10 @@ mod test {
             ),
         ) as Arc<dyn QueryChunk>;
 
-        let filters = vec![
-            col("column1")
-                .is_null()
-                .not()
-                .and(col("column1").eq(lit_dict("bar"))),
-        ];
+        let filters = vec![col("column1")
+            .is_null()
+            .not()
+            .and(col("column1").eq(lit_dict("bar")))];
 
         let chunks = vec![c1, c2, c3];
         let schema = merge_schema(&chunks);
@@ -842,11 +840,9 @@ mod test {
                 .with_i64_field_column_with_stats("column2", Some(0), Some(4)),
         ) as Arc<dyn QueryChunk>;
 
-        let filters = vec![
-            col("column1")
-                .gt(lit(100i64))
-                .and(col("column2").lt(lit(5i64))),
-        ];
+        let filters = vec![col("column1")
+            .gt(lit(100i64))
+            .and(col("column2").lt(lit(5i64)))];
 
         let chunks = vec![c1, c2, c3, c4, c5, c6];
         let schema = merge_schema(&chunks);

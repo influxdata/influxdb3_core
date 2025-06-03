@@ -4,7 +4,7 @@ use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as generated;
 use siphasher::sip::SipHasher24;
 
-use snafu::{Snafu, ensure};
+use snafu::{ensure, Snafu};
 
 /// Error for [`HashBuckets`]
 #[derive(Debug, Snafu)]
@@ -171,7 +171,7 @@ impl HashBucketsEncoder {
 mod tests {
     use super::*;
     use prost::Message;
-    use rand::{Rng, rng};
+    use rand::{rng, Rng};
 
     #[test]
     fn test_collision() {

@@ -2,21 +2,21 @@ use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
 use metric::U64Counter;
 use object_store::{
-    AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload,
-    PutResult, Result, path::Path,
+    path::Path, AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult,
+    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result,
 };
-use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_metrics::cache_state::{CacheState, ATTR_CACHE_STATE};
 use object_store_size_hinting::{extract_size_hint, hint_size};
 
-use crate::cache_system::{Cache, s3_fifo_cache::S3FifoCache};
+use crate::cache_system::{s3_fifo_cache::S3FifoCache, Cache};
 use crate::{
     cache_system::{
-        HasSize,
         hook::{chain::HookChain, observer::ObserverHook},
+        HasSize,
     },
     object_store_helpers::{any_options_set, dyn_error_to_object_store_error},
 };

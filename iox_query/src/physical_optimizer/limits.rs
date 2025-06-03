@@ -153,12 +153,12 @@ mod tests {
     use arrow::datatypes::Schema;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
+    use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::LexOrdering;
-    use datafusion::physical_plan::Statistics;
     use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::Statistics;
     use datafusion_util::config::table_parquet_options;
     use std::sync::Arc;
 

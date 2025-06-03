@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, hash_map::Entry},
+    collections::{hash_map::Entry, HashMap},
     sync::Arc,
 };
 

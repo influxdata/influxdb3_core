@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::cache_system::{DynError, hook::Hook};
+use crate::cache_system::{hook::Hook, DynError};
 
 use super::{EvictResult, HookDecision};
 

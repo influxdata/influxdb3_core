@@ -1,6 +1,6 @@
 use ::generated_types::google::{FieldViolation, OptionalField};
 use client_util::connection::GrpcConnection;
-use futures_util::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures_util::{stream::BoxStream, StreamExt, TryStreamExt};
 
 use self::generated_types::{query_log_service_client::QueryLogServiceClient, *};
 use crate::connection::Connection;

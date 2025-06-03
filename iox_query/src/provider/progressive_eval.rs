@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::{DataFusionError, Result, internal_err};
+use datafusion::common::{internal_err, DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_plan::metrics::{
@@ -21,7 +21,7 @@ use datafusion::physical_plan::{
     Partitioning, PlanProperties, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
-use futures::{Stream, StreamExt, ready};
+use futures::{ready, Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

@@ -83,8 +83,8 @@
 use iox_time::{Time, TimeProvider};
 use std::fmt::Formatter;
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use tokio_util::sync::CancellationToken;

@@ -1,8 +1,8 @@
 use arrow::array::{Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::TimeDelta;
-use datafusion::common::Result;
 use datafusion::common::cast::as_timestamp_nanosecond_array;
+use datafusion::common::Result;
 use datafusion::scalar::ScalarValue;
 use std::cmp::{max, min};
 use std::ops::{Bound, Range};

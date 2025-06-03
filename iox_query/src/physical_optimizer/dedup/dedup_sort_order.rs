@@ -12,10 +12,10 @@ use indexmap::IndexSet;
 use schema::sort::SortKeyBuilder;
 
 use crate::{
-    CHUNK_ORDER_COLUMN_NAME,
     physical_optimizer::chunk_extraction::extract_chunks,
-    provider::{DeduplicateExec, chunks_to_physical_nodes},
+    provider::{chunks_to_physical_nodes, DeduplicateExec},
     util::arrow_sort_key_exprs,
+    CHUNK_ORDER_COLUMN_NAME,
 };
 
 /// Determine sort key order of [`DeduplicateExec`].
@@ -161,15 +161,15 @@ impl PhysicalOptimizerRule for DedupSortOrder {
 
 #[cfg(test)]
 mod tests {
-    use schema::{SchemaBuilder, TIME_COLUMN_NAME, sort::SortKey};
+    use schema::{sort::SortKey, SchemaBuilder, TIME_COLUMN_NAME};
 
     use crate::{
-        QueryChunk,
         physical_optimizer::{
             dedup::test_util::{chunk, dedup_plan, dedup_plan_with_chunk_order_col},
             test_util::OptimizationTest,
         },
         test::TestChunk,
+        QueryChunk,
     };
 
     use super::*;

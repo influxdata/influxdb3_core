@@ -6,10 +6,11 @@ use std::{
 };
 
 use observability_deps::tracing::{
-    self, Event,
+    self,
     field::Field,
     span::{Attributes, Id, Record},
     subscriber::{DefaultGuard, Subscriber},
+    Event,
 };
 use parking_lot::Mutex;
 use serde::Serialize;

@@ -25,7 +25,7 @@ use hashbrown::HashMap;
 
 use self::interpolate::Segment;
 
-use super::{FillStrategy, GapExpander, params::GapFillParams};
+use super::{params::GapFillParams, FillStrategy, GapExpander};
 
 /// Provides methods to the [`GapFillStream`](super::stream::GapFillStream)
 /// module that fill gaps in buffered input.
@@ -1043,10 +1043,10 @@ mod tests {
     use schema::{InfluxColumnType, TIME_DATA_TIMEZONE};
 
     use crate::exec::gapfill::{
-        FillStrategy,
         algo::{AggrColState, Cursor},
         date_bin_gap_expander::DateBinGapExpander,
         params::GapFillParams,
+        FillStrategy,
     };
 
     #[test]

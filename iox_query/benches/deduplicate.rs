@@ -7,17 +7,17 @@ use arrow::array::{
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
-use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion::physical_expr::PhysicalSortExpr;
+use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::sorts::sort::sort_batch;
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use iox_query::provider::DeduplicateExec;
+use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 

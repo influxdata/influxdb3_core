@@ -9,7 +9,7 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNodeRewriter},
     error::DataFusionError,
     logical_expr::{Extension, LogicalPlan},
-    prelude::{Expr, lit},
+    prelude::{lit, Expr},
     scalar::ScalarValue,
 };
 use query_functions::SLEEP_UDF_NAME;

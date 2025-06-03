@@ -7,23 +7,23 @@ use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRe
 use datafusion::common::DFSchema;
 use datafusion::{
     catalog::Session,
-    datasource::{TableProvider, provider_as_source},
+    datasource::{provider_as_source, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
         utils::{conjunction, split_conjunction},
+        LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
     },
     physical_plan::{
-        ExecutionPlan, expressions::col as physical_col, filter::FilterExec,
-        projection::ProjectionExec,
+        expressions::col as physical_col, filter::FilterExec, projection::ProjectionExec,
+        ExecutionPlan,
     },
     prelude::Expr,
     sql::TableReference,
 };
 use observability_deps::tracing::trace;
-use schema::{Schema, sort::SortKey};
+use schema::{sort::SortKey, Schema};
 
-use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk, chunk_order_field, util::arrow_sort_key_exprs};
+use crate::{chunk_order_field, util::arrow_sort_key_exprs, QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
 use snafu::{ResultExt, Snafu};
 
@@ -35,7 +35,7 @@ pub(crate) mod progressive_eval;
 mod record_batch_exec;
 pub use self::overlap::group_potential_duplicates;
 pub use deduplicate::{DeduplicateExec, RecordBatchDeduplicator};
-pub(crate) use physical::{PartitionedFileExt, chunks_to_physical_nodes};
+pub(crate) use physical::{chunks_to_physical_nodes, PartitionedFileExt};
 
 pub(crate) use record_batch_exec::RecordBatchesExec;
 
@@ -313,7 +313,7 @@ mod test {
     use crate::{
         exec::IOxSessionContext,
         pruning::retention_expr,
-        test::{TestChunk, format_execution_plan},
+        test::{format_execution_plan, TestChunk},
     };
     use datafusion::prelude::{col, lit};
 

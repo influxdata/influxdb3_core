@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::plan::{InfluxQLToLogicalPlan, SchemaProvider, parse_regex};
+use crate::plan::{parse_regex, InfluxQLToLogicalPlan, SchemaProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};

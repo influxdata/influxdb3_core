@@ -3,15 +3,15 @@ use std::{
     fmt::{Debug, Formatter},
     hash::Hash,
     sync::{
-        Arc,
         atomic::{AtomicU8, Ordering},
+        Arc,
     },
 };
 use tracker::{LockMetrics, Mutex};
 
 use crate::cache_system::{
-    HasSize,
     hook::{EvictResult, Hook},
+    HasSize,
 };
 
 use super::{fifo::Fifo, ordered_set::OrderedSet};

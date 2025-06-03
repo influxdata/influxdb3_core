@@ -3,9 +3,9 @@
 use crate::ingester::{IngesterChunk, MetricDecoratorStream};
 use crate::statistics::build_statistics_for_chunks;
 use crate::statistics::partition_statistics::{
-    PartitionStatistics, PartitionedStatistics, project_schema_onto_datasrc_statistics,
+    project_schema_onto_datasrc_statistics, PartitionStatistics, PartitionedStatistics,
 };
-use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
+use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
 use super::adapter::SchemaAdapterStream;
 use arrow::datatypes::SchemaRef;
@@ -17,10 +17,10 @@ use datafusion::{
     execution::context::TaskContext,
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream, Statistics,
         expressions::{Column, PhysicalSortExpr},
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };

@@ -17,7 +17,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, visit_execution_plan};
+use datafusion::physical_plan::{visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor};
 use datafusion::{physical_plan::ColumnStatistics, scalar::ScalarValue};
 use observability_deps::tracing::trace;
 
@@ -270,10 +270,10 @@ fn statistics_min_max(
 #[cfg(test)]
 mod test {
     use crate::{
-        QueryChunk,
         provider::chunks_to_physical_nodes,
         statistics::{column_statistics_min_max, overlap},
-        test::{TestChunk, format_execution_plan},
+        test::{format_execution_plan, TestChunk},
+        QueryChunk,
     };
 
     use super::*;

@@ -3,7 +3,7 @@
 
 use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
-use mutable_batch::{MutableBatch, writer::Writer};
+use mutable_batch::{writer::Writer, MutableBatch};
 use schema::Projection;
 use std::{collections::BTreeMap, num::NonZeroU64};
 

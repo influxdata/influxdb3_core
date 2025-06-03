@@ -1,7 +1,7 @@
 //! Internal result and error types used to build InfluxQL parsers
 //!
-use nom::Parser;
 use nom::error::{ErrorKind as NomErrorKind, ParseError as NomParseError};
+use nom::Parser;
 use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
 

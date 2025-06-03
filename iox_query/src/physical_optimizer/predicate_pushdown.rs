@@ -3,14 +3,14 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
+    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
     error::Result,
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan, PhysicalExpr, empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec,
-        union::UnionExec,
+        empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec, union::UnionExec,
+        ExecutionPlan, PhysicalExpr,
     },
 };
 use datafusion_util::config::table_parquet_options;
@@ -148,9 +148,9 @@ mod tests {
         logical_expr::Operator,
         physical_expr::LexOrdering,
         physical_plan::{
-            PhysicalExpr,
             expressions::{BinaryExpr, Column, Literal},
             placeholder_row::PlaceholderRowExec,
+            PhysicalExpr,
         },
         scalar::ScalarValue,
     };

@@ -346,9 +346,7 @@ mod tests {
         let a_content: Vec<_> = a.iter().collect();
         assert_eq!(
             a_content,
-            vec![
-                "hello", "world", "cupcake", "", "bar", "", "foo", "bar", "", "fiz"
-            ]
+            vec!["hello", "world", "cupcake", "", "bar", "", "foo", "bar", "", "fiz"]
         );
     }
 

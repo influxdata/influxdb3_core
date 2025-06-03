@@ -385,7 +385,7 @@ mod tests {
     use arrow_flight::sql::CommandStatementQuery;
     use assert_matches::assert_matches;
     use generated_types::influxdata::iox::querier::v1::read_info::QueryType;
-    use iox_query_params::{StatementParams, params};
+    use iox_query_params::{params, StatementParams};
 
     #[test]
     fn json_ticket_decoding_compatibility() {

@@ -3,12 +3,12 @@
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
 use datafusion::common::{
-    ColumnStatistics, Result, ScalarValue, Statistics, internal_datafusion_err,
+    internal_datafusion_err, ColumnStatistics, Result, ScalarValue, Statistics,
 };
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
+use datafusion::physical_expr::LexOrdering;
+use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
 use itertools::FoldWhile;
 use itertools::Itertools;
 use observability_deps::tracing::trace;
@@ -226,8 +226,8 @@ pub(crate) fn min_max_for_partitioned_filegroup(
 mod tests {
     use super::*;
     use crate::test::test_utils::{
-        SortKeyRange, parquet_exec_with_sort_with_statistics,
-        parquet_exec_with_sort_with_statistics_and_schema, sort_exec, union_exec,
+        parquet_exec_with_sort_with_statistics, parquet_exec_with_sort_with_statistics_and_schema,
+        sort_exec, union_exec, SortKeyRange,
     };
     use std::fmt::{Debug, Display, Formatter};
 

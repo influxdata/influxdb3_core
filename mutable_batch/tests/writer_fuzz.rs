@@ -18,14 +18,14 @@ use arrow::{
 };
 use arrow_util::bitset::BitSet;
 use data_types::{
+    partition_template::{test_table_partition_override, TemplatePart},
     IsNan, StatValues, Statistics,
-    partition_template::{TemplatePart, test_table_partition_override},
 };
 use hashbrown::HashSet;
-use mutable_batch::{MutableBatch, WritePayload, writer::Writer};
+use mutable_batch::{writer::Writer, MutableBatch, WritePayload};
 use partition::PartitionWrite;
-use rand::TryRngCore;
 use rand::prelude::*;
+use rand::TryRngCore;
 use schema::Projection;
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range, sync::Arc};
 

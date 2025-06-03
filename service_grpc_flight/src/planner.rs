@@ -11,9 +11,9 @@ use flightsql::{FlightSQLCommand, FlightSQLPlanner};
 use futures::stream::Peekable;
 use generated_types::Streaming;
 use iox_query::{
-    QueryNamespace,
     exec::{IOxSessionContext, QueryLanguage},
     frontend::sql::SqlQueryPlanner,
+    QueryNamespace,
 };
 use iox_query_influxql::frontend::planner::InfluxQLQueryPlanner;
 use iox_query_params::StatementParams;

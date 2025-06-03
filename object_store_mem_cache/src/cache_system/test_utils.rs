@@ -10,12 +10,12 @@ use futures_test_utils::{AssertFutureExt, FutureObserver};
 use tokio::sync::Barrier;
 
 use crate::cache_system::{
-    Cache, CacheState, HasSize,
     hook::{
-        EvictResult,
         test_utils::{TestHook, TestHookRecord},
+        EvictResult,
     },
     utils::str_err,
+    Cache, CacheState, HasSize,
 };
 
 /// The extra size of entries when the S3-FIFO is used.

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use observability_deps::tracing::{debug, error, warn};
 use prometheus::proto::{Bucket, Histogram};
 use prometheus::{
-    Encoder, TextEncoder,
     proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType},
+    Encoder, TextEncoder,
 };
 
 /// A `metric::Reporter` that writes data in the prometheus text exposition format

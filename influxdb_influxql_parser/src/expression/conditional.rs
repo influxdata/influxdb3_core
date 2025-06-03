@@ -1,12 +1,12 @@
-use crate::common::{ParseError, ws0};
-use crate::expression::Call;
+use crate::common::{ws0, ParseError};
 use crate::expression::arithmetic::{
-    ArithmeticParsers, Expr, arithmetic, call_expression, var_ref,
+    arithmetic, call_expression, var_ref, ArithmeticParsers, Expr,
 };
+use crate::expression::Call;
 use crate::functions::is_scalar_math_function;
-use crate::internal::{Error as InternalError, ParseResult, expect, verify};
+use crate::internal::{expect, verify, Error as InternalError, ParseResult};
 use crate::keywords::keyword;
-use crate::literal::{Literal, literal_no_regex, literal_regex};
+use crate::literal::{literal_no_regex, literal_regex, Literal};
 use crate::parameter::parameter;
 use crate::select::is_valid_now_call;
 use nom::branch::alt;

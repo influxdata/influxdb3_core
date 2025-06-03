@@ -5,7 +5,7 @@ use arrow::{
     datatypes::{DataType, Int32Type},
     record_batch::RecordBatch,
 };
-use indexmap::{IndexMap, map::Iter};
+use indexmap::{map::Iter, IndexMap};
 use observability_deps::tracing::debug;
 use std::{
     collections::{HashMap, HashSet},
