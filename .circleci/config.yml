@@ -129,7 +129,11 @@ jobs:
       - run:
           name: cargo nextest
           command: |
-            TEST_LOG= RUST_LOG=info RUST_LOG_SPAN_EVENTS=full RUST_BACKTRACE=1 cargo nextest run --workspace --failure-output immediate-final --no-fail-fast
+            cargo nextest run --workspace --failure-output immediate-final --no-fail-fast
+      - run:
+          name: v3 feature gated tests in schema crate
+          command: |
+            cargo nextest run -p schema -F v3
 
 workflows:
   version: 2
