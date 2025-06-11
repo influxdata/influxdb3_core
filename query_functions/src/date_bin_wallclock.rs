@@ -1,17 +1,17 @@
 //! Implementation of the date_bin_wallclock UDF.
 
-use arrow::array::timezone::Tz;
 use arrow::array::TimestampNanosecondBuilder;
+use arrow::array::timezone::Tz;
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use arrow::temporal_conversions::timestamp_ns_to_datetime;
 use chrono::{MappedLocalTime, Offset, TimeZone};
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{exec_err, not_impl_err, Result};
+use datafusion::common::{Result, exec_err, not_impl_err};
 use datafusion::error::DataFusionError;
 use datafusion::functions::datetime::date_bin;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    TIMEZONE_WILDCARD,
+    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD, TypeSignature,
+    Volatility,
 };
 use datafusion::scalar::ScalarValue;
 use std::str::FromStr;
@@ -407,8 +407,8 @@ fn offset_from_local_ns(
 
 /// Functions for creating expressions that call the `date_bin_wallclock` UDF.
 pub mod expr_fn {
-    use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::expr::ScalarFunction;
 
     /// Create a scalar function expression that calls the `date_bin_wallclock` function.
     pub fn date_bin_wallclock(stride: Expr, source: Expr, origin: Expr) -> Expr {

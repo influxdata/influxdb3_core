@@ -2,14 +2,17 @@ use std::{borrow::Borrow, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
-    common::{internal_datafusion_err, stats::Precision, ColumnStatistics, Result, Statistics},
-    physical_plan::{expressions::Column, PhysicalExpr},
+    common::{ColumnStatistics, Result, Statistics, internal_datafusion_err, stats::Precision},
+    physical_plan::{
+        PhysicalExpr,
+        expressions::{Column, Literal},
+    },
     scalar::ScalarValue,
 };
 use itertools::Itertools;
 
 use crate::{
-    chunk_order_field, statistics::partition_statistics::util::pretty_fmt_fields, CHUNK_ORDER_FIELD,
+    CHUNK_ORDER_FIELD, chunk_order_field, statistics::partition_statistics::util::pretty_fmt_fields,
 };
 
 /// Takes in a datasource schema and statistics, and projects the scan schema on top.
@@ -234,7 +237,24 @@ pub(super) fn proj_exec_stats<'a>(
     let mut column_statistics = vec![];
     for (expr, _) in exprs {
         let col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+            // handle columns in schema
             stats.column_statistics[col.index()].clone()
+        } else if let Some(lit_expr) = expr.as_any().downcast_ref::<Literal>() {
+            // handle constants
+            match lit_expr.value() {
+                &ScalarValue::Null => ColumnStatistics {
+                    null_count: Precision::Absent, // we don't know row count
+                    min_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Null),
+                    distinct_count: Precision::Exact(1),
+                },
+                val => ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Exact(val.clone()),
+                    max_value: Precision::Exact(val.to_owned()),
+                    distinct_count: Precision::Exact(1),
+                },
+            }
         } else {
             // TODO stats: estimate more statistics from expressions
             // (expressions should compute their statistics themselves)
@@ -262,7 +282,7 @@ mod tests {
     use super::*;
     use crate::CHUNK_ORDER_COLUMN_NAME;
     use arrow::datatypes::{Field, Schema};
-    use datafusion::physical_plan::expressions::{col, NoOp};
+    use datafusion::physical_plan::expressions::{NoOp, col, lit};
 
     fn build_schema(col_names: Vec<&str>) -> SchemaRef {
         let fields = col_names
@@ -552,9 +572,10 @@ mod tests {
             &project_schema,
         )
         .unwrap_err();
-        assert!(err
-            .message()
-            .contains("project index 1 out of bounds, max field 1"));
+        assert!(
+            err.message()
+                .contains("project index 1 out of bounds, max field 1")
+        );
 
         /* Test: errors for subset projection, when subset=[0] */
         let err = project_select_subset_of_column_statistics(
@@ -772,6 +793,133 @@ mod tests {
             actual.column_statistics[0].null_count.get_value(),
             Some(&42),
             "bigger stats col_a should come first"
+        );
+    }
+
+    #[test]
+    fn test_projection_with_constants() {
+        // build any kinds of stats
+        let (src_stats, src_schema) =
+            build_col_stats(vec![("col_a", 0, 24, 1), ("col_b", 10, 100, 42)]);
+
+        /* Test: if use columns col_a and col_b, you should get back their stats: */
+        let exprs = [
+            (col("col_a", &src_schema).unwrap(), "col_a".to_string()),
+            (col("col_b", &src_schema).unwrap(), "col_b".to_string()),
+        ];
+        let actual = proj_exec_stats(
+            Arc::unwrap_or_clone(Arc::clone(&src_stats)),
+            exprs.iter(),
+            &src_schema,
+        );
+        assert_eq!(
+            actual, src_stats,
+            "proj_exec_stats should extract the proper columns from the physical exprs"
+        );
+
+        /* Test: if use constants, then should get back constant stats: */
+        let exprs = [
+            (lit(10_000), "col_a".to_string()),
+            (lit(1_000_000), "col_b".to_string()),
+        ];
+        let actual = proj_exec_stats(
+            Arc::unwrap_or_clone(Arc::clone(&src_stats)),
+            exprs.iter(),
+            &src_schema,
+        );
+        // min/max are the constants
+        assert_eq!(
+            actual.column_statistics[0].min_value.get_value(),
+            Some(&ScalarValue::Int32(Some(10_000))),
+            "min value should be the constant"
+        );
+        assert_eq!(
+            actual.column_statistics[0].max_value.get_value(),
+            Some(&ScalarValue::Int32(Some(10_000))),
+            "max value should be the constant"
+        );
+        assert_eq!(
+            actual.column_statistics[1].min_value.get_value(),
+            Some(&ScalarValue::Int32(Some(1_000_000))),
+            "min value should be the constant"
+        );
+        assert_eq!(
+            actual.column_statistics[1].max_value.get_value(),
+            Some(&ScalarValue::Int32(Some(1_000_000))),
+            "max value should be the constant"
+        );
+        // should have no nulls
+        assert_eq!(
+            actual.column_statistics[0].null_count.get_value(),
+            Some(&0),
+            "non-null constants should have no nulls"
+        );
+        assert_eq!(
+            actual.column_statistics[1].null_count.get_value(),
+            Some(&0),
+            "non-null constants should have no nulls"
+        );
+        // should have only 1 distinct value
+        assert_eq!(
+            actual.column_statistics[0].distinct_count.get_value(),
+            Some(&1),
+            "constants should have 1 distinct value"
+        );
+        assert_eq!(
+            actual.column_statistics[1].distinct_count.get_value(),
+            Some(&1),
+            "constants should have 1 distinct value"
+        );
+
+        /* Test: if use NULL as a constant, then should get back constant stats: */
+        let exprs = [
+            (lit(ScalarValue::Null), "col_a".to_string()),
+            (lit(ScalarValue::Null), "col_b".to_string()),
+        ];
+        let actual = proj_exec_stats(Arc::unwrap_or_clone(src_stats), exprs.iter(), &src_schema);
+        // min/max are the constants
+        assert_eq!(
+            actual.column_statistics[0].min_value.get_value(),
+            Some(&ScalarValue::Null),
+            "min value should be the constant"
+        );
+        assert_eq!(
+            actual.column_statistics[0].max_value.get_value(),
+            Some(&ScalarValue::Null),
+            "max value should be the constant"
+        );
+        assert_eq!(
+            actual.column_statistics[1].min_value.get_value(),
+            Some(&ScalarValue::Null),
+            "min value should be the constant"
+        );
+        assert_eq!(
+            actual.column_statistics[1].max_value.get_value(),
+            Some(&ScalarValue::Null),
+            "max value should be the constant"
+        );
+        // should have absent stats for Null Count
+        // (since it will be non-zero, and equaling whatever is the row count after projection onto the batch stream)
+        assert_eq!(
+            actual.column_statistics[0].null_count,
+            Precision::Absent,
+            "null constants should have unknown stats for total nulls"
+        );
+        assert_eq!(
+            actual.column_statistics[1].null_count,
+            Precision::Absent,
+            "null constants should have unknown stats for total nulls"
+        );
+        // should have only 1 distinct value
+        assert_eq!(
+            actual.column_statistics[0].distinct_count.get_value(),
+            Some(&1),
+            "constants should have 1 distinct value"
+        );
+        assert_eq!(
+            actual.column_statistics[1].distinct_count.get_value(),
+            Some(&1),
+            "constants should have 1 distinct value"
         );
     }
 }

@@ -7,19 +7,19 @@ mod test {
 
     use data_types::TableId;
     use datafusion::physical_plan::{
-        metrics::{self, MetricValue},
         ExecutionPlan, ExecutionPlanVisitor,
+        metrics::{self, MetricValue},
     };
     use datafusion_util::test_execute_partition;
     use futures::StreamExt;
-    use schema::{merge::SchemaMerger, sort::SortKey, Schema};
+    use schema::{Schema, merge::SchemaMerger, sort::SortKey};
 
     use crate::{
-        exec::{split::StreamSplitExec, Executor},
+        QueryChunk,
+        exec::{Executor, split::StreamSplitExec},
         frontend::reorg::ReorgPlanner,
         provider::{DeduplicateExec, RecordBatchesExec},
         test::TestChunk,
-        QueryChunk,
     };
 
     const ARBITRARY_TABLE_ID: TableId = TableId::new(42);

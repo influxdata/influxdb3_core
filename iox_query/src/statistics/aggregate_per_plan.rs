@@ -17,7 +17,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, visit_execution_plan};
 use datafusion::{physical_plan::ColumnStatistics, scalar::ScalarValue};
 use observability_deps::tracing::trace;
 
@@ -270,10 +270,10 @@ fn statistics_min_max(
 #[cfg(test)]
 mod test {
     use crate::{
+        QueryChunk,
         provider::chunks_to_physical_nodes,
         statistics::{column_statistics_min_max, overlap},
-        test::{format_execution_plan, TestChunk},
-        QueryChunk,
+        test::{TestChunk, format_execution_plan},
     };
 
     use super::*;
@@ -321,19 +321,13 @@ mod test {
         let plan_pq = chunks_to_physical_nodes(&schema, None, vec![parquet_chunk], 1);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan_pq),
-            @r#"
-        - " UnionExec"
-        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]"
-        "#
+            @r#"- " ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]""#
         );
 
         let plan_rb = chunks_to_physical_nodes(&schema, None, vec![record_batch_chunk], 1);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan_rb),
-            @r#"
-        - " UnionExec"
-        - "   RecordBatchesExec: chunks=1, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]"
-        "#
+            @r#"- " RecordBatchesExec: chunks=1, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]""#
         );
 
         // Stats for time

@@ -106,10 +106,10 @@ pub fn walk_expr_mut<B>(
 
 #[cfg(test)]
 mod test {
-    use crate::expression::walk::{walk_expr_mut, walk_expression_mut, ExpressionMut};
+    use crate::expression::walk::{ExpressionMut, walk_expr_mut, walk_expression_mut};
     use crate::expression::{
-        arithmetic_expression, conditional_expression, ConditionalBinary, ConditionalExpression,
-        ConditionalOperator, Expr, VarRef,
+        ConditionalBinary, ConditionalExpression, ConditionalOperator, Expr, VarRef,
+        arithmetic_expression, conditional_expression,
     };
     use crate::literal::Literal;
 
@@ -119,7 +119,7 @@ mod test {
             let (_, ref expr) = conditional_expression(s).unwrap();
             let mut calls = Vec::new();
             let mut call_no = 0;
-            super::walk_expression::<()>(expr, &mut |n| {
+            let _ = super::walk_expression::<()>(expr, &mut |n| {
                 calls.push(format!("{call_no}: {n:?}"));
                 call_no += 1;
                 std::ops::ControlFlow::Continue(())
@@ -134,7 +134,7 @@ mod test {
     #[test]
     fn test_walk_expression_mut_modify() {
         let (_, ref mut expr) = conditional_expression("foo + bar + 5 =~ /str/").unwrap();
-        walk_expression_mut::<()>(expr, &mut |e| {
+        let _ = walk_expression_mut::<()>(expr, &mut |e| {
             match e {
                 ExpressionMut::Arithmetic(n) => match n {
                     Expr::VarRef(VarRef { name, .. }) => *name = format!("c_{name}").into(),
@@ -159,7 +159,7 @@ mod test {
             let (_, expr) = arithmetic_expression(s).unwrap();
             let mut calls = Vec::new();
             let mut call_no = 0;
-            super::walk_expr::<()>(&expr, &mut |n| {
+            let _ = super::walk_expr::<()>(&expr, &mut |n| {
                 calls.push(format!("{call_no}: {n:?}"));
                 call_no += 1;
                 std::ops::ControlFlow::Continue(())
@@ -177,7 +177,7 @@ mod test {
             let (_, mut expr) = arithmetic_expression(s).unwrap();
             let mut calls = Vec::new();
             let mut call_no = 0;
-            super::walk_expr_mut::<()>(&mut expr, &mut |n| {
+            let _ = super::walk_expr_mut::<()>(&mut expr, &mut |n| {
                 calls.push(format!("{call_no}: {n:?}"));
                 call_no += 1;
                 std::ops::ControlFlow::Continue(())
@@ -192,7 +192,7 @@ mod test {
     #[test]
     fn test_walk_expr_mut_modify() {
         let (_, mut expr) = arithmetic_expression("foo + bar + 5").unwrap();
-        walk_expr_mut::<()>(&mut expr, &mut |e| {
+        let _ = walk_expr_mut::<()>(&mut expr, &mut |e| {
             match e {
                 Expr::VarRef(VarRef { name, .. }) => *name = format!("c_{name}").into(),
                 Expr::Literal(Literal::Integer(v)) => *v *= 10,

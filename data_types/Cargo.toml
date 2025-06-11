@@ -13,8 +13,8 @@ workspace = true
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 bytes = "1.10"
-chrono = { version = "0.4.39", default-features = false }
-croaring = "2.3.0"
+chrono = { version = "0.4", default-features = false }
+croaring = "2.3.1"
 influxdb-line-protocol = { path = "../influxdb_line_protocol" }
 iox_time = { path = "../iox_time" }
 generated_types = { path = "../generated_types" }

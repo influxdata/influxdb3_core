@@ -3,15 +3,15 @@
 use std::{pin::Pin, task::Poll};
 
 use ::generated_types::{
-    influxdata::iox::querier::v1::{read_info::QueryType, ReadInfo},
-    metadata::{MetadataKey, MetadataMap, MetadataValue},
     Status,
+    influxdata::iox::querier::v1::{ReadInfo, read_info::QueryType},
+    metadata::{MetadataKey, MetadataMap, MetadataValue},
 };
 use arrow::{
     ipc::{self},
     record_batch::RecordBatch,
 };
-use arrow_flight::{decode::FlightRecordBatchStream, error::FlightError, FlightClient, Ticket};
+use arrow_flight::{FlightClient, Ticket, decode::FlightRecordBatchStream, error::FlightError};
 use futures_util::{Stream, StreamExt};
 use prost::Message;
 use rand::Rng;

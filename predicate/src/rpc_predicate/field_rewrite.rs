@@ -1,16 +1,16 @@
 use crate::Predicate;
 
 use super::FIELD_COLUMN_NAME;
-use arrow::array::{as_boolean_array, as_string_array, ArrayRef, StringArray};
+use arrow::array::{ArrayRef, StringArray, as_boolean_array, as_string_array};
 use arrow::compute::kernels;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::utils::split_conjunction_owned;
 use datafusion::physical_plan::ColumnarValue;
-use datafusion::prelude::{lit, Expr};
+use datafusion::prelude::{Expr, lit};
 use schema::Schema;
 use std::sync::Arc;
 

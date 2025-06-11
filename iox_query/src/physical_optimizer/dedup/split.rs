@@ -1,18 +1,19 @@
 use crate::{
+    QueryChunk,
     config::IoxConfigExt,
     physical_optimizer::chunk_extraction::extract_chunks,
     provider::{
-        chunks_to_physical_nodes, group_potential_duplicates, overlap::timestamp_min_max,
-        DeduplicateExec,
+        DeduplicateExec, chunks_to_physical_nodes, group_potential_duplicates,
+        overlap::timestamp_min_max,
     },
-    QueryChunk,
+    util::union_multiple_children,
 };
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{empty::EmptyExec, union::UnionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
 use hashbrown::HashMap;
 use observability_deps::tracing::warn;
@@ -68,7 +69,7 @@ impl PhysicalOptimizerRule for SplitDedup {
                 return Ok(Transformed::no(plan));
             }
 
-            let out = UnionExec::new(
+            let out = union_multiple_children(
                 groups
                     .into_iter()
                     .map(|GroupWithDedupFlag { group, needs_dedup }| {
@@ -90,9 +91,9 @@ impl PhysicalOptimizerRule for SplitDedup {
                         }
                     })
                     .collect(),
-            );
+            )?;
 
-            Ok(Transformed::yes(Arc::new(out)))
+            Ok(Transformed::yes(out))
         })
         .map(|t| t.data)
     }
@@ -260,14 +261,12 @@ mod tests {
         input:
           - " DeduplicateExec: [tag@0 ASC,time@1 ASC]"
           - "   FilterExec: false"
-          - "     UnionExec"
-          - "       RecordBatchesExec: chunks=1, projection=[tag, time]"
+          - "     RecordBatchesExec: chunks=1, projection=[tag, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag@0 ASC,time@1 ASC]"
             - "   FilterExec: false"
-            - "     UnionExec"
-            - "       RecordBatchesExec: chunks=1, projection=[tag, time]"
+            - "     RecordBatchesExec: chunks=1, projection=[tag, time]"
         "#
         );
     }
@@ -292,11 +291,10 @@ mod tests {
               - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
             output:
               Ok:
-                - " UnionExec"
-                - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "     UnionExec"
-                - "       RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+                - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
+                - "   UnionExec"
+                - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
+                - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -413,13 +411,11 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-              - "   UnionExec"
-              - "     RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
+              - "   RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
             output:
               Ok:
                 - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "   UnionExec"
-                - "     RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
+                - "   RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -447,11 +443,10 @@ mod tests {
               - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
             output:
               Ok:
-                - " UnionExec"
-                - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "     UnionExec"
-                - "       RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+                - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
+                - "   UnionExec"
+                - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
+                - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -523,13 +518,11 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-              - "   UnionExec"
-              - "     RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
+              - "   RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
             output:
               Ok:
                 - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "   UnionExec"
-                - "     RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
+                - "   RecordBatchesExec: chunks=3, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -548,13 +541,10 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-              - "   UnionExec"
-              - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
+              - "   RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
             output:
               Ok:
-                - " UnionExec"
-                - "   UnionExec"
-                - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
+                - " RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -569,14 +559,11 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-              - "   UnionExec"
-              - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
+              - "   RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
             output:
               Ok:
-                - " UnionExec"
-                - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "     UnionExec"
-                - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
+                - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
+                - "   RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -592,14 +579,11 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-              - "   UnionExec"
-              - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
+              - "   RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
             output:
               Ok:
-                - " UnionExec"
-                - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "     UnionExec"
-                - "       RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
+                - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
+                - "   RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
             "#
             );
         }
@@ -638,18 +622,14 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [time@0 ASC]"
-              - "   UnionExec"
-              - "     ParquetExec: file_groups={2 groups: [[1.parquet, 2.parquet, 4.parquet], [3.parquet, 5.parquet]]}, projection=[time]"
+              - "   ParquetExec: file_groups={2 groups: [[1.parquet, 2.parquet, 4.parquet], [3.parquet, 5.parquet]]}, projection=[time]"
             output:
               Ok:
                 - " UnionExec"
-                - "   UnionExec"
-                - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[time]"
+                - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[time]"
                 - "   DeduplicateExec: [time@0 ASC]"
-                - "     UnionExec"
-                - "       ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[time]"
-                - "   UnionExec"
-                - "     ParquetExec: file_groups={2 groups: [[4.parquet], [5.parquet]]}, projection=[time]"
+                - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[time]"
+                - "   ParquetExec: file_groups={2 groups: [[4.parquet], [5.parquet]]}, projection=[time]"
             "#
             );
         }
@@ -681,13 +661,11 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [time@0 ASC]"
-              - "   UnionExec"
-              - "     ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
+              - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
             output:
               Ok:
                 - " DeduplicateExec: [time@0 ASC]"
-                - "   UnionExec"
-                - "     ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
+                - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
             "#
             );
         }

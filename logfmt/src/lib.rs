@@ -8,14 +8,13 @@ use workspace_hack as _;
 
 use humantime::format_rfc3339_micros;
 use observability_deps::tracing::{
-    self,
+    self, Id, Level, Subscriber,
     field::{Field, Visit},
     subscriber::Interest,
-    Id, Level, Subscriber,
 };
 use std::borrow::Cow;
 use std::{io::Write, time::SystemTime};
-use tracing_subscriber::{fmt::MakeWriter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::{Layer, fmt::MakeWriter, layer::Context, registry::LookupSpan};
 use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_FIELD_LENGTH: usize = 8_000; // roughly 8KB, which is half of the total line length allowed
@@ -387,11 +386,7 @@ fn quote_escape_truncate(value: &'_ str, truncate_to: usize) -> Cow<'_, str> {
 
 // Translate the field name from tracing into the logfmt style
 fn translate_field_name(name: &str) -> &str {
-    if name == "message" {
-        "msg"
-    } else {
-        name
-    }
+    if name == "message" { "msg" } else { name }
 }
 
 #[cfg(test)]

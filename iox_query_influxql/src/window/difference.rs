@@ -4,13 +4,10 @@ use arrow::compute::kernels::numeric::sub_wrapping;
 use arrow::compute::shift;
 use arrow::datatypes::Field;
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::function::{
-    ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
-};
+use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
-use datafusion::physical_expr::PhysicalExpr;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -43,11 +40,6 @@ impl WindowUDFImpl for DifferenceUDWF {
 
     fn signature(&self) -> &Signature {
         &self.signature
-    }
-
-    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
-    fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
-        expr_args.input_exprs().into()
     }
 
     fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {

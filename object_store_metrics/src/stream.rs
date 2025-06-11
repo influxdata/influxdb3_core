@@ -231,17 +231,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{io::ErrorKind, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use futures::StreamExt;
     use iox_time::{MockProvider, SystemProvider};
 
     use crate::{
+        LogContext, MetricsWithBytesAndTtfb, StoreType,
         test_utils::{
             assert_counter_value, assert_histogram_hit, assert_histogram_not_hit,
             assert_histogram_total,
         },
-        LogContext, MetricsWithBytesAndTtfb, StoreType,
     };
 
     use super::*;
@@ -580,7 +580,7 @@ mod tests {
         let inner = futures::stream::iter(
             [
                 Ok(Bytes::copy_from_slice(&[1])),
-                Err(std::io::Error::new(ErrorKind::Other, "oh no!")),
+                Err(std::io::Error::other("oh no!")),
                 Ok(Bytes::copy_from_slice(&[2, 3, 4])),
             ]
             .into_iter()
@@ -705,7 +705,7 @@ mod tests {
         let inner = futures::stream::iter(
             [
                 Ok(Bytes::copy_from_slice(&[1])),
-                Err(std::io::Error::new(ErrorKind::Other, "oh no!")),
+                Err(std::io::Error::other("oh no!")),
                 Ok(Bytes::copy_from_slice(&[2, 3, 4])),
             ]
             .into_iter()

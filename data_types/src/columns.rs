@@ -4,12 +4,12 @@ use super::TableId;
 use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use generated_types::influxdata::iox::{catalog, column_type::v1 as proto, gossip};
 use influxdb_line_protocol::FieldValue;
-use schema::{builder::SchemaBuilder, sort::SortKey, InfluxColumnType, InfluxFieldType, Schema};
+use schema::{InfluxColumnType, InfluxFieldType, Schema, builder::SchemaBuilder, sort::SortKey};
 use snafu::Snafu;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     convert::TryFrom,
     ops::Deref,
     sync::Arc,
@@ -91,8 +91,8 @@ impl ColumnsByName {
 
     /// Return the set of column names. Used in combination with a write operation's
     /// column names to determine whether a write would exceed the max allowed columns.
-    pub fn names(&self) -> BTreeSet<&str> {
-        self.0.keys().map(|name| name.as_ref()).collect()
+    pub fn names(&self) -> impl DoubleEndedIterator<Item = &str> + ExactSizeIterator {
+        self.0.keys().map(|name| name.as_ref())
     }
 
     /// Return an iterator of the set of column IDs.
@@ -630,18 +630,20 @@ impl ColumnSet {
     ) -> impl Iterator<Item = (usize, ColumnId)> + 'a {
         let mut left_idx = 0;
         let mut right_idx = 0;
-        std::iter::from_fn(move || loop {
-            let s = self.0.get(left_idx)?;
-            let o = other.get(right_idx)?;
+        std::iter::from_fn(move || {
+            loop {
+                let s = self.0.get(left_idx)?;
+                let o = other.get(right_idx)?;
 
-            match s.cmp(o) {
-                Ordering::Less => left_idx += 1,
-                Ordering::Greater => right_idx += 1,
-                Ordering::Equal => {
-                    let t = left_idx;
-                    left_idx += 1;
-                    right_idx += 1;
-                    return Some((t, *s));
+                match s.cmp(o) {
+                    Ordering::Less => left_idx += 1,
+                    Ordering::Greater => right_idx += 1,
+                    Ordering::Equal => {
+                        let t = left_idx;
+                        left_idx += 1;
+                        right_idx += 1;
+                        return Some((t, *s));
+                    }
                 }
             }
         })

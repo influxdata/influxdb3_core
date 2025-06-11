@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::display::pretty_format_batches;
 use arrow::{
-    array::{new_null_array, ArrayRef, StringArray},
-    compute::kernels::sort::{lexsort, SortColumn, SortOptions},
+    array::{ArrayRef, StringArray, new_null_array},
+    compute::kernels::sort::{SortColumn, SortOptions, lexsort},
     datatypes::Schema,
     error::ArrowError,
     record_batch::RecordBatch,

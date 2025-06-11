@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::{internal_err, DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_plan::metrics::{
@@ -20,14 +20,14 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, Metric,
     Partitioning, PlanProperties, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
-use datafusion::scalar::ScalarValue;
-use futures::{ready, Stream, StreamExt};
+use futures::{Stream, StreamExt, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use observability_deps::tracing::{debug, trace, warn};
 
 use crate::config::IoxConfigExt;
+use crate::physical_optimizer::sort::lexical_range::LexicalRange;
 
 /// ProgressiveEval return a stream of record batches in the order of its inputs.
 /// It will stop when the number of output rows reach the given limit.
@@ -61,9 +61,9 @@ pub(crate) struct ProgressiveEvalExec {
     /// Input plan
     input: Arc<dyn ExecutionPlan>,
 
-    /// Corresponding value ranges of the input plan
+    /// Corresponding value ranges of the input plan, per partition.
     /// None if the value ranges are not available
-    value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
+    value_ranges: Option<Vec<LexicalRange>>,
 
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
@@ -79,14 +79,14 @@ impl ProgressiveEvalExec {
     /// Create a new progressive execution plan
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
+        value_ranges: Option<Vec<LexicalRange>>,
         fetch: Option<usize>,
     ) -> Self {
         let cache = Self::compute_properties(&input);
         Self {
             input,
-            value_ranges,
             metrics: ExecutionPlanMetricsSet::new(),
+            value_ranges,
             fetch,
             cache,
         }
@@ -122,8 +122,17 @@ impl DisplayAs for ProgressiveEvalExec {
                 if let Some(fetch) = self.fetch {
                     write!(f, "fetch={fetch}, ")?;
                 };
-                if let Some(value_ranges) = &self.value_ranges {
-                    write!(f, "input_ranges={value_ranges:?}")?;
+
+                if let Some(lexical_ranges) = &self.value_ranges {
+                    write!(
+                        f,
+                        "input_ranges=[{}]",
+                        lexical_ranges
+                            .iter()
+                            .map(|r| r.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
                 };
 
                 Ok(())
@@ -592,7 +601,6 @@ mod tests {
         _test_progressive_eval(
             &[],
             None,
-            None,
             &["++", "++"],
             0, // 0 input stream
             0, // 0 input stream is prefetched and polled
@@ -603,7 +611,6 @@ mod tests {
         // limit = 0 means select nothing
         _test_progressive_eval(
             &[],
-            None,
             Some(0),
             &["++", "++"],
             0, // 0 input stream
@@ -615,7 +622,6 @@ mod tests {
         // limit = 1 on no data
         _test_progressive_eval(
             &[],
-            None,
             Some(1),
             &["++", "++"],
             0, // 0 input stream
@@ -642,7 +648,6 @@ mod tests {
         // return all
         _test_progressive_eval(
             &[vec![b1.clone()]],
-            None,
             None, // no fetch limit --> return all rows
             &[
                 "+---+---+-------------------------------+",
@@ -664,7 +669,6 @@ mod tests {
         // fetch no rows
         _test_progressive_eval(
             &[vec![b1.clone()]],
-            None,
             Some(0),
             &["++", "++"],
             1,
@@ -676,7 +680,6 @@ mod tests {
         // return only 3 rows from the first record batch
         _test_progressive_eval(
             &[vec![b1.clone()]],
-            None,
             Some(3),
             &[
                 "+---+---+-------------------------------+",
@@ -696,7 +699,6 @@ mod tests {
         // return all because fetch limit is larger
         _test_progressive_eval(
             &[vec![b1.clone()]],
-            None,
             Some(7),
             &[
                 "+---+---+-------------------------------+",
@@ -745,7 +747,6 @@ mod tests {
         // return all by not specifying fetch limit
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
-            None,
             None, // no fetch limit --> return all rows
             &[
                 "+----+---+-------------------------------+",
@@ -773,7 +774,6 @@ mod tests {
         // return all by specifying large limit
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
-            None,
             Some(10), // limit = max num rows --> return all rows
             &[
                 "+----+---+-------------------------------+",
@@ -802,7 +802,6 @@ mod tests {
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],
             None,
-            None,
             &[
                 "+----+---+-------------------------------+",
                 "| a  | b | c                             |",
@@ -829,7 +828,6 @@ mod tests {
         // return all by specifying large limit
         _test_progressive_eval(
             &[vec![b2], vec![b1]],
-            None,
             Some(20),
             &[
                 "+----+---+-------------------------------+",
@@ -881,7 +879,6 @@ mod tests {
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
-            None,
             &[
                 "+----+---+-------------------------------+",
                 "| a  | b | c                             |",
@@ -905,7 +902,6 @@ mod tests {
         // [b2, b1]
         _test_progressive_eval(
             &[vec![b2], vec![b1]],
-            None,
             None,
             &[
                 "+----+---+-------------------------------+",
@@ -956,7 +952,6 @@ mod tests {
         // Fetch limit is 1 --> return only 1 row of the first batch (b2)
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],
-            None,
             Some(1),
             &[
                 "+----+---+-------------------------------+",
@@ -976,7 +971,6 @@ mod tests {
         // Fetch limit is 1 --> return only 1 row of the first batch (b1)
         _test_progressive_eval(
             &[vec![b1], vec![b2]],
-            None,
             Some(1),
             &[
                 "+---+---+-------------------------------+",
@@ -1008,7 +1002,6 @@ mod tests {
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
             None,
-            None,
             &[
                 "+---+",
                 "| a |",
@@ -1030,7 +1023,6 @@ mod tests {
         // The first batch is based upon the order provided, not the minimum value.
         _test_progressive_eval(
             &[vec![b2], vec![b1]], // inverse the order, b2 first
-            None,
             None,
             &[
                 "+---+",
@@ -1065,7 +1057,6 @@ mod tests {
         // Limit 4 --> should slice the second batch seen
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()]],
-            None,
             Some(4),
             &[
                 "+---+",
@@ -1087,7 +1078,6 @@ mod tests {
         // Limit 4 --> should slice the second batch seen
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],  // inverse the order, b2 first
-            None,
             Some(4),
             &[
                 "+---+",
@@ -1109,7 +1099,6 @@ mod tests {
         // Limit 2 --> should slice the first batch seen
         _test_progressive_eval(
             &[vec![b2], vec![b1]],
-            None,
             Some(2),
             &[
                 "+---+",
@@ -1154,7 +1143,6 @@ mod tests {
         // Fetch limit is 3 --> return all 3 rows of the first batch (b2) that covers that limit
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],
-            None,
             Some(3),
             &[
                 "+----+---+-------------------------------+",
@@ -1176,7 +1164,6 @@ mod tests {
         // Fetch limit is 5 --> return all 5 rows of first batch (b1) that covers that limit
         _test_progressive_eval(
             &[vec![b1], vec![b2]],
-            None,
             Some(5),
             &[
                 "+---+---+-------------------------------+",
@@ -1224,7 +1211,6 @@ mod tests {
         // Fetch limit is 4 --> return all rows of first batch b2 and part of b1
         _test_progressive_eval(
             &[vec![b2.clone()], vec![b1.clone()]],
-            None,
             Some(4),
             &[
                 "+----+---+-------------------------------+",
@@ -1247,7 +1233,6 @@ mod tests {
         // Fetch limit is 6 --> return all rows of first batch b1 and part of b2
         _test_progressive_eval(
             &[vec![b1], vec![b2]],
-            None,
             Some(6),
             &[
                 "+----+---+-------------------------------+",
@@ -1306,7 +1291,6 @@ mod tests {
         // Fetch limit is 1 --> return first row of the b1
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()], vec![b3.clone()]],
-            None,
             Some(1),
             &[
                 "+---+---+-------------------------------+",
@@ -1326,7 +1310,6 @@ mod tests {
         // Fetch limit is 7 --> return all rows of the b1 & part of b2, in the order of b1, b2
         _test_progressive_eval(
             &[vec![b1.clone()], vec![b2.clone()], vec![b3.clone()]],
-            None,
             Some(7),
             &[
                 "+----+---+-------------------------------+",
@@ -1352,7 +1335,6 @@ mod tests {
         // Fetch limit is 50 --> return all rows of all batches in the order of b1, b2, b3
         _test_progressive_eval(
             &[vec![b1], vec![b2], vec![b3]],
-            None,
             Some(50),
             &[
                 "+-----+---+-------------------------------+",
@@ -1433,7 +1415,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             Some(0),
             &["++", "++"],
             4, // 4 input streams
@@ -1453,7 +1434,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             Some(4),
             &[
                 "+---+---+-------------------------------+",
@@ -1482,7 +1462,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             Some(5),
             &[
                 "+---+---+-------------------------------+",
@@ -1512,7 +1491,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             Some(8),
             &[
                 "+----+---+-------------------------------+",
@@ -1545,7 +1523,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             Some(12),
             &[
                 "+-----+---+-------------------------------+",
@@ -1582,7 +1559,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             Some(15),
             &[
                 "+------+---+-------------------------------+",
@@ -1621,7 +1597,6 @@ mod tests {
                 vec![b3.clone()],
                 vec![b4.clone()],
             ],
-            None,
             None, // No fetch limit
             &[
                 "+------+---+-------------------------------+",
@@ -1652,7 +1627,6 @@ mod tests {
 
     async fn _test_progressive_eval(
         partitions: &[Vec<RecordBatch>],
-        value_ranges: Option<Vec<(ScalarValue, ScalarValue)>>,
         fetch: Option<usize>,
         expected_result: &[&str],
         expected_num_input_streams: usize,
@@ -1669,11 +1643,7 @@ mod tests {
         };
 
         let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let progressive = Arc::new(ProgressiveEvalExec::new(
-            Arc::new(exec),
-            value_ranges,
-            fetch,
-        ));
+        let progressive = Arc::new(ProgressiveEvalExec::new(Arc::new(exec), None, fetch));
 
         let progressive_clone = Arc::clone(&progressive);
 

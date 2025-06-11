@@ -3,13 +3,13 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/spec/#explain
 
 use crate::common::ws1;
-use crate::internal::{expect, ParseResult};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::statement::{statement, Statement};
+use crate::statement::{Statement, statement};
+use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::{map, opt, value};
 use nom::sequence::preceded;
-use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 /// Represents various options for an `EXPLAIN` statement.
@@ -94,7 +94,7 @@ pub(crate) fn explain_statement(i: &str) -> ParseResult<&str, ExplainStatement> 
 #[cfg(test)]
 mod test {
     use crate::assert_expect_error;
-    use crate::explain::{explain_statement, ExplainOption};
+    use crate::explain::{ExplainOption, explain_statement};
     use assert_matches::assert_matches;
 
     #[test]

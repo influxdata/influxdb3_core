@@ -1,11 +1,11 @@
 //! A panic-safe write abstraction for [`MutableBatch`]
 
 use crate::{
+    MutableBatch,
     column::{Column, ColumnData, NULL_DID},
     noop_validator::NoopValidator,
-    MutableBatch,
 };
-use arrow_util::bitset::{iter_set_positions, iter_set_positions_with_offset, BitSet};
+use arrow_util::bitset::{BitSet, iter_set_positions, iter_set_positions_with_offset};
 use data_types::{IsNan, StatValues, Statistics};
 use hashbrown::hash_map::RawEntryMut;
 use schema::{InfluxColumnType, InfluxFieldType};
@@ -15,9 +15,7 @@ use std::{num::NonZeroU64, ops::Range};
 #[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Unable to insert {inserted} type into column {column} with type {existing}"
-    ))]
+    #[snafu(display("Unable to insert {inserted} type into column {column} with type {existing}"))]
     TypeMismatch {
         column: String,
         existing: InfluxColumnType,

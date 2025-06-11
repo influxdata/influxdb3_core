@@ -81,7 +81,7 @@ static LOG_SETUP: Once = Once::new();
 ///   single-threaded environment.
 pub unsafe fn start_logging(force_dbg: bool) {
     use tracing_log::LogTracer;
-    use tracing_subscriber::{filter::EnvFilter, FmtSubscriber};
+    use tracing_subscriber::{FmtSubscriber, filter::EnvFilter};
 
     // ensure the global has been initialized
     LOG_SETUP.call_once(|| {

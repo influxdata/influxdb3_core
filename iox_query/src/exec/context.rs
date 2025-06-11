@@ -3,18 +3,18 @@
 
 use super::{
     cross_rt_stream::CrossRtStream,
-    gapfill::{plan_gap_fill, GapFill},
+    gapfill::{GapFill, plan_gap_fill},
     sleep::SleepNode,
     split::StreamSplitNode,
 };
 use crate::{
+    Extension,
     analyzer::register_iox_analyzers,
     config::IoxConfigExt,
     exec::{query_tracing::TracedStream, split::StreamSplitExec},
     logical_optimizer::register_iox_logical_optimizers,
     memory_pool::PerQueryMemoryPool,
     physical_optimizer::register_iox_physical_optimizers,
-    Extension,
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -30,15 +30,15 @@ use datafusion::{
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
-        coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
         EmptyRecordBatchStream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
     },
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::*,
 };
 use datafusion::{catalog::Session, config::TableOptions};
 use datafusion_util::config::{
-    iox_file_formats, iox_session_config, table_parquet_options, DEFAULT_CATALOG,
+    DEFAULT_CATALOG, iox_file_formats, iox_session_config, table_parquet_options,
 };
 use executor::DedicatedExecutor;
 use futures::TryStreamExt;

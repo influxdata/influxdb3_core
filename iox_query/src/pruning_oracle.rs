@@ -1,7 +1,7 @@
 //! Implementations of pruning oracle for Server-side Bucketing.
 
 use data_types::partition_template::{
-    bucket_for_tag_value, TablePartitionTemplateOverride, TemplatePart,
+    TablePartitionTemplateOverride, TemplatePart, bucket_for_tag_value,
 };
 use datafusion::scalar::ScalarValue;
 use std::{collections::HashMap, sync::Arc};

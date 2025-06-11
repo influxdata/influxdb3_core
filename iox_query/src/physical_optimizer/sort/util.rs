@@ -1,61 +1,25 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
-    provider::{progressive_eval::ProgressiveEvalExec, DeduplicateExec},
-    statistics::{column_statistics_min_max, compute_stats_column_min_max, overlap},
+    physical_optimizer::sort::lexical_range::LexicalRange,
+    provider::progressive_eval::ProgressiveEvalExec, statistics::overlap,
+    util::union_multiple_children,
 };
-use arrow::compute::{rank, SortOptions};
+use arrow::compute::{SortOptions, rank};
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
-    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
-    error::{DataFusionError, Result},
+    error::Result,
     physical_expr::{LexOrdering, PhysicalSortExpr},
     physical_plan::{
+        ExecutionPlan,
         expressions::{Column, Literal},
         limit::LocalLimitExec,
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor,
     },
     scalar::ScalarValue,
 };
-use observability_deps::tracing::{trace, warn};
-
-/// Compute statistics for the given plans on a given column name
-/// Return none if the statistics are not available
-pub(crate) fn collect_statistics_min_max(
-    plans: &[Arc<dyn ExecutionPlan>],
-    col_name: &str,
-) -> Result<Option<Vec<(ScalarValue, ScalarValue)>>> {
-    // temp solution while waiting for DF's statistics to get mature
-    // Compute min max stats for all inputs of UnionExec on the sorted column
-    // https://github.com/apache/arrow-datafusion/issues/8078
-    let col_stats = plans
-        .iter()
-        .map(|plan| compute_stats_column_min_max(&**plan, col_name))
-        .collect::<Result<Vec<_>>>()?;
-
-    // If min and max not available, return none
-    let mut value_ranges = Vec::with_capacity(col_stats.len());
-    for stats in col_stats {
-        let Some((min, max)) = column_statistics_min_max(stats) else {
-            trace!("-------- min_max not available");
-            return Ok(None);
-        };
-
-        value_ranges.push((min, max));
-    }
-
-    // todo: use this when DF satistics is ready
-    // // Get statistics for the inputs of UnionExec on the sorted column
-    // let Some(value_ranges) = statistics_min_max(plans, col_name)
-    // else {
-    //     return Ok(None);
-    // };
-
-    Ok(Some(value_ranges))
-}
+use observability_deps::tracing::trace;
 
 /// Plans and their corresponding value ranges
 pub(crate) struct PlansValueRanges {
@@ -330,58 +294,6 @@ impl ValueRangeAndColValues {
     }
 }
 
-// This is an optimization for the most recent value query `ORDER BY time DESC/ASC LIMIT n`
-// See: https://github.com/influxdata/influxdb_iox/issues/12205
-// The observation is recent data is mostly in first file,  so the plan should avoid reading the others unless necessary
-//
-/// This function is to split non-overlapped files in the same ParquetExec into different groups/DF partitions and
-///  set the `preserve_partitioning` so they will be executed sequentially. Note that files in same group will are read sequentially.
-/// If we cannot split them, we have to add SortPreservingMerge to keep data outputed in the right sort order
-pub(crate) fn split_files_or_add_sort_preserving_merge(
-    plans: Vec<Arc<dyn ExecutionPlan>>,
-    sort_col_name: &str,
-    sort_options: SortOptions,
-    sort_exprs: &[PhysicalSortExpr],
-    fetch_number: Option<usize>,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    plans
-        .iter()
-        .map(|input| {
-            let mut new_input = Ok(Arc::clone(input));
-            let mut consider_merging_inputs = true;
-
-            // This is a subplan of single ParquetExec of all non-overlapped files
-            if !has_deduplicate(input)? && only_one_parquet_exec(input)? {
-                // Transform the ParquetExec to have one file each group so they can be executed sequentially
-                new_input = transform_parquet_exec_single_file_each_group(
-                    Arc::clone(input),
-                    sort_col_name,
-                    sort_options,
-                );
-
-                if new_input.is_ok() {
-                    consider_merging_inputs = false;
-                }
-            }
-
-            if consider_merging_inputs {
-                // cannot split files, add SortPreservingMerge for multiple input partitions
-                if input.properties().output_partitioning().partition_count() > 1 {
-                    let sort_preserving_merge_exec = Arc::new(
-                        SortPreservingMergeExec::new(sort_exprs.to_vec().into(), Arc::clone(input))
-                            .with_fetch(fetch_number),
-                    );
-                    new_input = Ok(sort_preserving_merge_exec as _)
-                } else {
-                    new_input = Ok(Arc::clone(input))
-                }
-            }
-
-            new_input
-        })
-        .collect::<Result<Vec<_>>>()
-}
-
 /// Add SortPreservingMerge to the plan with many partitions to ensure the order is preserved
 pub(crate) fn add_sort_preserving_merge(
     plans: Vec<Arc<dyn ExecutionPlan>>,
@@ -405,210 +317,6 @@ pub(crate) fn add_sort_preserving_merge(
         .collect::<Result<Vec<_>>>()
 }
 
-/// Transform a ParquetExec with N non-overlapped files of the ParquetExec into N groups each include one file.
-///
-/// The function is only called when the plan does not include DeduplicateExec and includes only one ParquetExec.
-///
-/// This function will return error if
-///   - There are no statsitics for the given column (including the when the column is missing from the file
-///     and produce null values that leads to absent statistics)
-///   - Some files overlap (the min/max time ranges are disjoint)
-///   - There is a DeduplicateExec in the plan which means the data of the plan overlaps
-///
-/// The output ParquetExec's are ordered such that the file with the most recent time ranges is read first
-///
-/// For example
-/// ```text
-/// ParquetExec(groups=[[file1, file2],[file3]])
-/// ```
-/// Is rewritten so each file is in its own group and the files are ordered by time range
-/// ```text
-/// ParquetExec(groups=[[file1], [file2],[file3]])
-/// ```
-pub(crate) fn transform_parquet_exec_single_file_each_group(
-    plan: Arc<dyn ExecutionPlan>,
-    sort_col_name: &str,
-    sort_options: SortOptions,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let mut new_plan = plan
-        .transform_up(|plan| {
-            let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() else {
-                return Ok(Transformed::no(plan));
-            };
-
-            // Extract parittioned files from the ParquetExec
-            let base_config = parquet_exec.base_config();
-            let schema = Arc::clone(&base_config.file_schema);
-            let col_idx = schema.index_of(sort_col_name).map_err(|err| {
-                DataFusionError::Plan(format!(
-                    "Column {} not found in the schema {}: {}",
-                    sort_col_name, schema, err
-                ))
-            })?;
-
-            let mut new_base_config = base_config.clone();
-            let partitioned_file_groups = &base_config.file_groups;
-
-            // All partitioned files of the same file will be replaced with one partitioned file
-            // Hashmap: Path --> PartitionedFile
-            let mut new_partitioned_files = HashMap::new();
-            for group in partitioned_file_groups {
-                for partitioned_file in group {
-                    // if the file is already in the new_partitioned_files, skip it
-                    if new_partitioned_files.contains_key(&partitioned_file.object_meta.location) {
-                        continue;
-                    } else {
-                        let mut partitioned_file = partitioned_file.clone();
-                        partitioned_file.range = None;
-                        new_partitioned_files.insert(
-                            partitioned_file.object_meta.location.clone(),
-                            partitioned_file,
-                        );
-                    }
-                }
-            }
-
-            // convert the hashmap to a vector
-            let new_partitioned_files = new_partitioned_files.into_values().collect::<Vec<_>>();
-
-            // Sort paritioned files by their statistics min
-            let value_ranges = {
-                new_partitioned_files.iter().map(|file| {
-                    let col_stats = &file
-                        .statistics
-                        .as_ref()
-                        .ok_or_else(|| {
-                            DataFusionError::Plan(format!(
-                                "File statistics not available for file: {}",
-                                file.path()
-                            ))
-                        })?
-                        .column_statistics[col_idx];
-
-                    let min = col_stats
-                        .min_value
-                        .get_value()
-                        .ok_or_else(|| {
-                            DataFusionError::Plan(format!(
-                                "Min column ({}) statistics not available for file: {}",
-                                sort_col_name,
-                                file.path()
-                            ))
-                        })?
-                        .clone();
-
-                    let max = col_stats
-                        .max_value
-                        .get_value()
-                        .ok_or_else(|| {
-                            DataFusionError::Plan(format!(
-                                "Max column ({}) statistics not available for file: {}",
-                                sort_col_name,
-                                file.path()
-                            ))
-                        })?
-                        .clone();
-
-                    Ok((min, max))
-                })
-            }
-            .collect::<Result<Vec<_>>>()?;
-
-            let Some(sorted_files_and_value_ranges) =
-                sort_by_value_ranges(new_partitioned_files, value_ranges, sort_options)?
-            else {
-                warn!("Cannot sort non-overlapped files by their value ranges");
-                return Err(datafusion::error::DataFusionError::Internal(
-                    "Cannot sort non-overlapped files by their value ranges".to_string(),
-                ));
-            };
-
-            let new_partitioned_files = sorted_files_and_value_ranges.sorted_vec;
-
-            // Each partitioned file is in its own group
-            let new_partitioned_file_groups = new_partitioned_files
-                .into_iter()
-                .map(|file| vec![file])
-                .collect::<Vec<_>>();
-
-            // Assigned new partitioned file groups to the new base config
-            new_base_config.file_groups = new_partitioned_file_groups;
-
-            // Make a ParquetExecBuilder from the existing ParquetExec
-            // TODO: replace the below with simpler DF's new API when available
-            //       https://github.com/apache/datafusion/issues/12737
-            let mut builder = ParquetExecBuilder::new_with_options(
-                new_base_config,
-                parquet_exec.table_parquet_options().clone(),
-            );
-            if let Some(predicate) = parquet_exec.predicate() {
-                builder = builder.with_predicate(Arc::clone(predicate));
-            }
-            let new_parquet_exec = builder.build();
-
-            Ok(Transformed::yes(
-                Arc::new(new_parquet_exec) as Arc<dyn ExecutionPlan>
-            ))
-        })
-        .map(|t| t.data);
-
-    // If new_plan is SortExec, set its preserve_partitioning to true to keep the transformed files above output sequentially
-    if let Some(sort_exec) = new_plan
-        .as_ref()
-        .ok()
-        .and_then(|plan| plan.as_any().downcast_ref::<SortExec>())
-    {
-        // Set preserve_partitioning to true if its ParquetExec has many output partitions
-        if !sort_exec.preserve_partitioning()
-            && sort_exec
-                .input()
-                .properties()
-                .output_partitioning()
-                .partition_count()
-                > 1
-        {
-            new_plan = Ok(Arc::new(
-                SortExec::new(
-                    sort_exec.expr().to_vec().into(),
-                    Arc::clone(sort_exec.input()),
-                )
-                .with_fetch(sort_exec.fetch())
-                .with_preserve_partitioning(true),
-            ) as _);
-        };
-    }
-
-    new_plan
-}
-
-// Recursively check if there is a `DeduplicateExec` in the plan
-pub(crate) fn has_deduplicate(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
-    plan.exists(|plan| Ok(plan.as_any().downcast_ref::<DeduplicateExec>().is_some()))
-}
-
-/// Recursively check if there is only one ParquetExec
-pub(crate) fn only_one_parquet_exec(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
-    let mut visitor = CountParquetExecVisitor { count: 0 };
-    visit_execution_plan(&**plan, &mut visitor)?;
-    Ok(visitor.count == 1)
-}
-
-#[derive(Debug)]
-struct CountParquetExecVisitor {
-    count: usize,
-}
-
-impl ExecutionPlanVisitor for CountParquetExecVisitor {
-    type Error = datafusion::error::DataFusionError;
-
-    fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
-        if plan.as_any().downcast_ref::<ParquetExec>().is_some() {
-            self.count += 1;
-        }
-        Ok(true)
-    }
-}
-
 /// Add union and then progressive eval on top of the plans
 pub(crate) fn add_union_and_progressive_eval(
     plans: Vec<Arc<dyn ExecutionPlan>>,
@@ -618,12 +326,12 @@ pub(crate) fn add_union_and_progressive_eval(
     assert!(plans.len() > 1);
 
     // make value ranges
-    let value_ranges = (0..plans.len())
-        .map(|_| (value_for_ranges.clone(), value_for_ranges.clone()))
-        .collect::<Vec<_>>();
+    let lexical_range = LexicalRange::new_from_constants(vec![value_for_ranges]);
+    let value_ranges = std::iter::repeat_n(lexical_range, plans.len()).collect::<Vec<_>>();
 
     // Create a union of all the plans
-    let union_exec = Arc::new(UnionExec::new(plans));
+    let union_exec =
+        union_multiple_children(plans).expect("should have at least 1 execution plan node");
     // Create a ProgressiveEval on top of the union
     let progressive_eval = ProgressiveEvalExec::new(union_exec, Some(value_ranges), fetch_number);
 

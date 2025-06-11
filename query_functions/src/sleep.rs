@@ -69,7 +69,7 @@ mod tests {
         common::assert_contains,
         logical_expr::LogicalPlanBuilder,
         physical_plan::common::collect,
-        prelude::{lit, SessionContext},
+        prelude::{SessionContext, lit},
         scalar::ScalarValue,
     };
 

@@ -73,8 +73,6 @@
 
 pub mod builder;
 pub use builder::LineProtocolBuilder;
-#[cfg(feature = "v3")]
-pub mod v3;
 
 use fmt::Display;
 use log::debug;
@@ -152,10 +150,6 @@ pub enum Error {
 
     #[snafu(display(r#"Tag Set Malformed"#))]
     TagSetMalformed,
-
-    #[cfg(feature = "v3")]
-    #[snafu(display(r#"Series Key Malformed"#))]
-    SeriesKeyMalformed,
 
     // TODO: Replace this with specific failures.
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]

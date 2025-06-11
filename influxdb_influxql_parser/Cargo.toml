@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-chrono = { version = "0.4.39", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10" }
 iox_query_params = { path = "../iox_query_params/" }
 nom = { version = "8", default-features = false, features = ["std"] }
