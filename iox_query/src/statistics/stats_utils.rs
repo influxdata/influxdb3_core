@@ -1,6 +1,6 @@
 use arrow::compute::rank;
-use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
+use datafusion::common::stats::Precision;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::projection::ProjectionExec;

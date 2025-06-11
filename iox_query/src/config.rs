@@ -1,7 +1,7 @@
 use std::{any::Any, str::FromStr, sync::Arc, time::Duration};
 
 use datafusion::{
-    common::{extensions_options, Result},
+    common::{Result, extensions_options},
     config::{ConfigEntry, ConfigExtension, ExtensionOptions},
 };
 use meta_data_cache::MetaIndexCache;

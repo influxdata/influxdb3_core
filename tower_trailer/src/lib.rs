@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 
 use futures::ready;
 use http::{Request, Response};
-use http_body::SizeHint;
+use http_body::{Frame, SizeHint};
 use parking_lot::Mutex;
 use pin_project::pin_project;
 use tower::{Layer, Service};
@@ -104,33 +104,23 @@ impl<B: http_body::Body> http_body::Body for WrappedBody<B> {
     type Data = B::Data;
     type Error = B::Error;
 
-    fn poll_data(
-        mut self: Pin<&mut Self>,
+    fn poll_frame(
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-        self.as_mut().project().inner.poll_data(cx)
-    }
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let callbacks = Arc::clone(&self.callbacks.0);
+        let mut data = self.project().inner.poll_frame(cx);
 
-    fn poll_trailers(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<http::header::HeaderMap>, Self::Error>> {
-        let result: Result<Option<http::header::HeaderMap>, Self::Error> =
-            ready!(self.as_mut().project().inner.poll_trailers(cx));
-
-        let res = match result {
-            Ok(trailers) => {
-                let mut trailers = trailers.unwrap_or_default();
-
-                for callback in self.callbacks.0.lock().iter() {
-                    callback(&mut trailers);
+        if let Poll::Ready(Some(Ok(ref mut frame))) = data {
+            if frame.is_trailers() {
+                if let Some(trailers) = frame.trailers_mut() {
+                    for callback in callbacks.lock().iter() {
+                        callback(trailers);
+                    }
                 }
-
-                Ok((!trailers.is_empty()).then_some(trailers))
             }
-            Err(e) => Err(e),
-        };
-        Poll::Ready(res)
+        }
+        data
     }
 
     fn is_end_stream(&self) -> bool {

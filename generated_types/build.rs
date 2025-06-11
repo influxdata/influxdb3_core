@@ -132,7 +132,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         .file_descriptor_set_path(&descriptor_path)
         // protoc in ubuntu builder needs this option
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_with_config(config, &proto_files, &[root])?;
+        .compile_protos_with_config(config, &proto_files, &[root])?;
 
     let descriptor_set = std::fs::read(descriptor_path)?;
 

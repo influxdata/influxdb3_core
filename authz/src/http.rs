@@ -5,6 +5,7 @@ use http::HeaderValue;
 /// We strip off the "authorization" header from the request, to prevent it from being accidentally logged
 /// and we put it in an extension of the request. Extensions are typed and this is the typed wrapper that
 /// holds an (optional) authorization header value.
+#[derive(Clone)]
 pub struct AuthorizationHeaderExtension(Option<HeaderValue>);
 
 impl AuthorizationHeaderExtension {

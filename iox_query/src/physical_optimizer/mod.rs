@@ -18,7 +18,7 @@ use self::{
         order_union_sorted_inputs_for_constants::OrderUnionSortedInputsForConstants,
         parquet_sortness::ParquetSortness,
     },
-    union::{nested_union::NestedUnion, one_union::OneUnion},
+    union::nested_union::NestedUnion,
 };
 
 mod cached_parquet_data;
@@ -27,7 +27,7 @@ mod dedup;
 mod limits;
 mod predicate_pushdown;
 mod projection_pushdown;
-mod sort;
+pub(crate) mod sort;
 mod union;
 
 #[cfg(test)]
@@ -48,7 +48,6 @@ pub fn register_iox_physical_optimizers(mut state: SessionStateBuilder) -> Sessi
         Arc::new(ProjectionPushdown),
         Arc::new(ParquetSortness) as _,
         Arc::new(NestedUnion),
-        Arc::new(OneUnion),
     ];
 
     // Append DataFusion physical rules to the IOx-specific rules

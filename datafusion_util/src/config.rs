@@ -1,12 +1,12 @@
 use std::{fmt::Display, sync::Arc};
 
 use datafusion::config::{ParquetOptions, TableParquetOptions};
+use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::file_format::arrow::ArrowFormatFactory;
 use datafusion::datasource::file_format::avro::AvroFormatFactory;
 use datafusion::datasource::file_format::csv::CsvFormatFactory;
 use datafusion::datasource::file_format::json::JsonFormatFactory;
 use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
-use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::{
     config::ConfigOptions, execution::runtime_env::RuntimeEnv, prelude::SessionConfig,
 };

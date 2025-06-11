@@ -5,11 +5,11 @@ use arrow::array::timezone::Tz;
 use arrow::datatypes::{DataType, TimeUnit};
 
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{internal_err, plan_err, ExprSchema};
+use datafusion::common::{ExprSchema, internal_err, plan_err};
 use datafusion::error::Result;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    TIMEZONE_WILDCARD,
+    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
@@ -315,10 +315,12 @@ mod tests {
         ];
         let result = udf.invoke_batch(&args, args.len());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TZ requires a valid timezone string, got \"NewYork\""));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TZ requires a valid timezone string, got \"NewYork\"")
+        );
     }
 
     #[test]
@@ -354,9 +356,11 @@ mod tests {
 
         let result = udf.invoke_batch(&args, args.len());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TZ expects nanosecond timestamp data, got Int64"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TZ expects nanosecond timestamp data, got Int64")
+        );
     }
 }

@@ -19,13 +19,13 @@ use crate::statement::Statement;
 use crate::string::double_quoted_string;
 use crate::visit_mut::{Recursion, VisitableMut, VisitorMut};
 use crate::{impl_tuple_clause, write_quoted_string};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alphanumeric1, char};
 use nom::combinator::{map, recognize};
 use nom::multi::many1_count;
 use nom::sequence::preceded;
-use nom::Parser;
 use std::fmt;
 use std::fmt::{Display, Formatter, Write};
 

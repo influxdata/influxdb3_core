@@ -108,8 +108,8 @@ use workspace_hack as _;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 mod counter;
 mod cumulative;
@@ -217,7 +217,7 @@ impl Registry {
 
         let mut instruments = self.instruments.lock();
 
-        let instrument = match instruments.entry(name) {
+        match instruments.entry(name) {
             Entry::Occupied(o) => match o.get().as_any().downcast_ref::<I>() {
                 Some(instrument) => instrument.clone(),
                 None => panic!("instrument {name} registered with two different types"),
@@ -227,9 +227,7 @@ impl Registry {
                 v.insert(Box::new(instrument.clone()));
                 instrument
             }
-        };
-
-        instrument
+        }
     }
 
     /// Returns the already registered `Instrument` if any
@@ -526,9 +524,11 @@ mod tests {
         assert_eq!(attributes.0.get("tag1").unwrap(), "foo");
         assert_eq!(observation, &Observation::U64Counter(23));
 
-        assert!(registry
-            .get_instrument::<Metric<U64Counter>>("unregistered")
-            .is_none());
+        assert!(
+            registry
+                .get_instrument::<Metric<U64Counter>>("unregistered")
+                .is_none()
+        );
 
         let counter = registry
             .get_instrument::<Metric<U64Counter>>("foo")

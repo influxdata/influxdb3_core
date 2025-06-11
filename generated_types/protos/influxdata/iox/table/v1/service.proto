@@ -5,7 +5,7 @@ option go_package = "github.com/influxdata/iox/table/v1";
 import "influxdata/iox/partition_template/v1/template.proto";
 import "influxdata/iox/catalog_storage/v1/service.proto";
 import "influxdata/iox/common/v1/common.proto";
-
+import "google/protobuf/timestamp.proto";
 
 service TableService {
   // Get tables within a namespace
@@ -33,6 +33,9 @@ service TableService {
 
   // Disable iceberg for a table within a namespace.
   rpc DisableIceberg(DisableIcebergRequest) returns (DisableIcebergResponse);
+
+  // Delete a table - or, more specifically, mark it as soft-deleted
+  rpc DeleteTable(DeleteTableRequest) returns (DeleteTableResponse);
 }
 
 message CreateTableRequest {
@@ -73,6 +76,9 @@ message Table {
 
   // Whether this table has iceberg exports enabled.
   bool iceberg_enabled = 5;
+
+  // The point in time at which this table was deleted, if it was ever deleted
+  optional google.protobuf.Timestamp deleted_at = 6;
 }
 
 message GetTablesRequest {
@@ -171,3 +177,11 @@ message DisableIcebergRequest {
 }
 
 message DisableIcebergResponse {}
+
+message DeleteTableRequest {
+  int64 table_id = 1;
+}
+
+message DeleteTableResponse {
+  Table table = 1;
+}

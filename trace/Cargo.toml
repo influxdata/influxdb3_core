@@ -10,7 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-chrono = { version = "= 0.4.39", default-features = false }
+chrono = { version = "0.4", default-features = false }
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 rand = "0.9"

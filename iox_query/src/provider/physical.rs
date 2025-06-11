@@ -1,9 +1,10 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
-use crate::statistics::{build_statistics_for_chunks, SchemaBoundStatistics};
+use crate::statistics::{SchemaBoundStatistics, build_statistics_for_chunks};
+use crate::util::union_multiple_children;
 use crate::{
-    provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs, QueryChunk,
-    QueryChunkData, CHUNK_ORDER_COLUMN_NAME,
+    CHUNK_ORDER_COLUMN_NAME, QueryChunk, QueryChunkData,
+    provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs,
 };
 use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef};
 use datafusion::physical_expr::LexOrdering;
@@ -11,18 +12,18 @@ use datafusion::{
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{parquet::ParquetExecBuilder, FileScanConfig},
+        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
     },
     physical_expr::PhysicalSortExpr,
-    physical_plan::{empty::EmptyExec, expressions::Column, union::UnionExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, empty::EmptyExec, expressions::Column},
     scalar::ScalarValue,
 };
 use datafusion_util::config::table_parquet_options;
 use object_store::{DynObjectStore, ObjectMeta, ObjectStore};
 use parquet_file::storage::ParquetExecInput;
-use schema::{sort::SortKey, Schema};
+use schema::{Schema, sort::SortKey};
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
 };
 
@@ -128,7 +129,7 @@ fn combine_sort_key(
 /// Parquet chunks will be turned into a [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) per store, each of them with
 /// [`target_partitions`](datafusion::execution::context::SessionConfig::target_partitions) file groups.
 ///
-/// If this function creates more than one physical node, they will be combined using an [`UnionExec`]. Otherwise, a
+/// If this function creates more than one physical node, they will be combined using an [`UnionExec`](datafusion::physical_plan::union::UnionExec). Otherwise, a
 /// single node will be returned directly.
 ///
 /// If output_sort_key is specified, the ParquetExec will be marked
@@ -199,10 +200,12 @@ pub fn chunks_to_physical_nodes(
     // Remove the chunk order column from the schema if it exists
     let has_chunk_order_col = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).is_ok();
     let (table_partition_cols, schema_without_chunk_order) = if has_chunk_order_col {
-        let table_partition_cols = vec![schema
-            .field_with_name(CHUNK_ORDER_COLUMN_NAME)
-            .unwrap()
-            .clone()];
+        let table_partition_cols = vec![
+            schema
+                .field_with_name(CHUNK_ORDER_COLUMN_NAME)
+                .unwrap()
+                .clone(),
+        ];
         let schema_without_chunk_order = Arc::new(ArrowSchema::new(
             schema
                 .fields
@@ -303,7 +306,7 @@ pub fn chunks_to_physical_nodes(
     }
 
     assert!(!output_nodes.is_empty());
-    Arc::new(UnionExec::new(output_nodes))
+    union_multiple_children(output_nodes).expect("unreachable")
 }
 
 /// Distribute items from the given iterator into `n` containers.
@@ -332,14 +335,14 @@ mod tests {
     use datafusion::{
         common::stats::Precision,
         datasource::physical_plan::ParquetExec,
-        physical_plan::{ColumnStatistics, Statistics},
+        physical_plan::{ColumnStatistics, Statistics, union::UnionExec},
     };
-    use schema::{sort::SortKeyBuilder, InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME};
+    use schema::{InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME, sort::SortKeyBuilder};
 
     use crate::{
         chunk_order_field,
         statistics::build_statistics_for_chunks,
-        test::{format_execution_plan, TestChunk},
+        test::{TestChunk, format_execution_plan},
     };
 
     use super::*;
@@ -449,10 +452,7 @@ mod tests {
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"
-        - " UnionExec"
-        - "   RecordBatchesExec: chunks=1"
-        "#
+            @r#"- " RecordBatchesExec: chunks=1""#
         );
     }
 
@@ -463,18 +463,12 @@ mod tests {
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"
-        - " UnionExec"
-        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}"
-        "#
+            @r#"- " ParquetExec: file_groups={1 group: [[0.parquet]]}""#
         );
 
         // The setup does not provide statsitics for the chunk & must be absent
-        let union_exec = plan.as_any().downcast_ref::<UnionExec>().unwrap();
-        let parquet_exec = union_exec.inputs()[0]
-            .as_any()
-            .downcast_ref::<ParquetExec>()
-            .unwrap();
+        assert!(!plan.as_any().is::<UnionExec>());
+        let parquet_exec = plan.as_any().downcast_ref::<ParquetExec>().unwrap();
 
         // Absent statistics
         let expected_stats = Statistics {
@@ -514,10 +508,7 @@ mod tests {
         );
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"
-        - " UnionExec"
-        - "   ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}"
-        "#
+            @r#"- " ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}""#
         );
     }
 
@@ -631,16 +622,16 @@ mod tests {
             vec![Arc::clone(&record_batch_chunk) as Arc<dyn QueryChunk>],
             1,
         );
-        // remove union
-        let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() else {
-            panic!("plan is not a UnionExec");
-        };
-        let plan_record_batches_exec = Arc::clone(&union_exec.inputs()[0]);
+        // assert is a single node, not a union of children
+        assert!(!plan.as_any().is::<UnionExec>());
+        let plan_record_batches_exec = plan;
         // verify this is a RecordBatchesExec
-        assert!(plan_record_batches_exec
-            .as_any()
-            .downcast_ref::<RecordBatchesExec>()
-            .is_some());
+        assert!(
+            plan_record_batches_exec
+                .as_any()
+                .downcast_ref::<RecordBatchesExec>()
+                .is_some()
+        );
 
         // Build a ParquetExec for parquet_chunk
         //
@@ -651,16 +642,16 @@ mod tests {
             vec![Arc::clone(&parquet_chunk) as Arc<dyn QueryChunk>],
             1,
         );
-        // remove union
-        let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() else {
-            panic!("plan is not a UnionExec");
-        };
-        let plan_parquet_exec = Arc::clone(&union_exec.inputs()[0]);
+        // assert is a single node, not a union of children
+        assert!(!plan.as_any().is::<UnionExec>());
+        let plan_parquet_exec = plan;
         // verify this is a ParquetExec
-        assert!(plan_parquet_exec
-            .as_any()
-            .downcast_ref::<ParquetExec>()
-            .is_some());
+        assert!(
+            plan_parquet_exec
+                .as_any()
+                .downcast_ref::<ParquetExec>()
+                .is_some()
+        );
 
         // Schema of 2 chunks are the same
         assert_eq!(record_batch_chunk.schema(), parquet_chunk.schema());
@@ -801,16 +792,16 @@ mod tests {
             vec![Arc::clone(&parquet_chunk) as Arc<dyn QueryChunk>],
             1,
         );
-        // remove union
-        let Some(union_exec) = plan.as_any().downcast_ref::<UnionExec>() else {
-            panic!("plan is not a UnionExec");
-        };
-        let plan_parquet_exec = Arc::clone(&union_exec.inputs()[0]);
+        // assert is a single node, not a union of children
+        assert!(!plan.as_any().is::<UnionExec>());
+        let plan_parquet_exec = plan;
         // verify this is a ParquetExec
-        assert!(plan_parquet_exec
-            .as_any()
-            .downcast_ref::<ParquetExec>()
-            .is_some());
+        assert!(
+            plan_parquet_exec
+                .as_any()
+                .downcast_ref::<ParquetExec>()
+                .is_some()
+        );
 
         // Verify only one file group and one partitioned file
         let parquet_exec = plan_parquet_exec

@@ -27,12 +27,12 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, ToDFSchema};
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::utils::inspect_expr_pre;
-use datafusion::logical_expr::{expr::Sort, SortExpr};
+use datafusion::logical_expr::{SortExpr, expr::Sort};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
-use datafusion::physical_plan::{collect, EmptyRecordBatchStream, ExecutionPlan};
-use datafusion::prelude::{lit, Column, Expr, SessionContext};
+use datafusion::physical_plan::{EmptyRecordBatchStream, ExecutionPlan, collect};
+use datafusion::prelude::{Column, Expr, SessionContext, lit};
 use datafusion::{
     arrow::{
         datatypes::{Schema, SchemaRef},

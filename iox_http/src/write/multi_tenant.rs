@@ -8,8 +8,8 @@ use data_types::{NamespaceName, OrgBucketMappingError};
 use iox_http_util::Request;
 
 use super::{
-    v2::{V2WriteParseError, WriteParamsV2},
     WriteParams, WriteParseError, WriteRequestUnifier,
+    v2::{V2WriteParseError, WriteParamsV2},
 };
 
 /// Request parsing errors when operating in "single tenant" mode.
@@ -78,7 +78,7 @@ fn parse_v2(req: &Request) -> Result<WriteParams, MultiTenantExtractError> {
 mod tests {
     use assert_matches::assert_matches;
     use data_types::NamespaceNameError;
-    use iox_http_util::{empty_request_body, RequestBuilder};
+    use iox_http_util::{RequestBuilder, empty_request_body};
 
     use crate::write::Precision;
 

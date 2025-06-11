@@ -3,14 +3,14 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     error::Result,
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec, union::UnionExec,
-        ExecutionPlan, PhysicalExpr,
+        ExecutionPlan, PhysicalExpr, empty::EmptyExec, expressions::BinaryExpr, filter::FilterExec,
+        union::UnionExec,
     },
 };
 use datafusion_util::config::table_parquet_options;
@@ -148,9 +148,9 @@ mod tests {
         logical_expr::Operator,
         physical_expr::LexOrdering,
         physical_plan::{
+            PhysicalExpr,
             expressions::{BinaryExpr, Column, Literal},
             placeholder_row::PlaceholderRowExec,
-            PhysicalExpr,
         },
         scalar::ScalarValue,
     };
@@ -275,11 +275,14 @@ mod tests {
         let plan = Arc::new(
             FilterExec::try_new(
                 predicate_tag(&schema),
-                Arc::new(UnionExec::new(vec![Arc::new(UnionExec::new(
-                    (0..2)
-                        .map(|_| Arc::new(PlaceholderRowExec::new(Arc::clone(&schema))) as _)
-                        .collect(),
-                ))])),
+                Arc::new(UnionExec::new(vec![
+                    Arc::new(UnionExec::new(
+                        (0..2)
+                            .map(|_| Arc::new(PlaceholderRowExec::new(Arc::clone(&schema))) as _)
+                            .collect(),
+                    )),
+                    Arc::new(PlaceholderRowExec::new(Arc::clone(&schema))),
+                ])),
             )
             .unwrap(),
         );
@@ -293,6 +296,7 @@ mod tests {
           - "     UnionExec"
           - "       PlaceholderRowExec"
           - "       PlaceholderRowExec"
+          - "     PlaceholderRowExec"
         output:
           Ok:
             - " UnionExec"
@@ -301,6 +305,8 @@ mod tests {
             - "       PlaceholderRowExec"
             - "     FilterExec: tag1@0 = foo"
             - "       PlaceholderRowExec"
+            - "   FilterExec: tag1@0 = foo"
+            - "     PlaceholderRowExec"
         "#
         );
     }

@@ -7,10 +7,10 @@ use data_types::TimestampRange;
 use datafusion::{
     common::tree_node::{TreeNodeRecursion, TreeNodeVisitor},
     error::DataFusionError,
-    logical_expr::{binary_expr, BinaryExpr},
-    prelude::{col, Expr},
+    logical_expr::{BinaryExpr, binary_expr},
+    prelude::{Expr, col},
 };
-use datafusion_util::{lit_timestamptz_nano, make_range_expr, AsExpr};
+use datafusion_util::{AsExpr, lit_timestamptz_nano, make_range_expr};
 use observability_deps::tracing::debug;
 use rpc_predicate::VALUE_COLUMN_NAME;
 use schema::TIME_COLUMN_NAME;

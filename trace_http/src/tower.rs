@@ -14,22 +14,22 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Buf;
 use futures::ready;
 use http::{HeaderValue, Request, Response};
-use http_body::SizeHint;
+use http_body::{Frame, SizeHint};
 use pin_project::{pin_project, pinned_drop};
 use tower::{Layer, Service};
 
 use observability_deps::tracing::{debug, error};
 use trace::span::{SpanEvent, SpanStatus};
-use trace::{span::SpanRecorder, TraceCollector};
+use trace::{TraceCollector, span::SpanRecorder};
 
-use crate::classify::{classify_headers, classify_response, Classification};
+use crate::classify::{Classification, classify_headers, classify_response};
 use crate::ctx::{RequestLogContext, RequestLogContextExt, TraceHeaderParser};
 use crate::metrics::{MetricsRecorder, RequestMetrics};
 use crate::query_variant::QueryVariantExt;
@@ -314,16 +314,20 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
     type Data = B::Data;
     type Error = B::Error;
 
-    fn poll_data(
+    fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-        let maybe_result = ready!(self.as_mut().project().inner.poll_data(cx));
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let maybe_result = ready!(self.as_mut().project().inner.poll_frame(cx));
 
         match maybe_result {
-            Some(Ok(body)) => {
-                self.handle_data(&body);
-                Poll::Ready(Some(Ok(body)))
+            Some(Ok(result)) => {
+                if result.is_trailers() {
+                    self.handle_trailers(result.trailers_ref());
+                } else if let Some(data) = result.data_ref() {
+                    self.handle_data(data);
+                }
+                Poll::Ready(Some(Ok(result)))
             }
             Some(Err(e)) => {
                 self.handle_error();
@@ -353,32 +357,6 @@ impl<B: http_body::Body> http_body::Body for TracedBody<B> {
                 Poll::Ready(None)
             }
         }
-    }
-
-    fn poll_trailers(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<http::header::HeaderMap>, Self::Error>> {
-        let result: Result<Option<http::header::HeaderMap>, Self::Error> =
-            ready!(self.as_mut().project().inner.poll_trailers(cx));
-
-        match &result {
-            Ok(headers) => self.handle_trailers(headers.as_ref()),
-            Err(_) => {
-                let projected = self.as_mut().project();
-
-                projected.was_done_data.store(true, Ordering::SeqCst);
-                projected.was_ready_trailers.store(true, Ordering::SeqCst);
-
-                let span_recorder = projected.span_recorder;
-                let metrics_recorder = projected.metrics_recorder;
-
-                metrics_recorder.set_classification(Classification::ServerErr);
-                span_recorder.error("error getting trailers")
-            }
-        }
-
-        Poll::Ready(result)
     }
 
     fn is_end_stream(&self) -> bool {
@@ -451,7 +429,7 @@ impl<B: http_body::Body> TracedBody<B> {
         let metrics_recorder = projected.metrics_recorder;
 
         metrics_recorder.set_classification(Classification::ServerErr);
-        span_recorder.error("error getting body");
+        span_recorder.error("error getting frame");
         projected.was_done_data.store(true, Ordering::SeqCst);
         projected.was_ready_trailers.store(true, Ordering::SeqCst);
     }

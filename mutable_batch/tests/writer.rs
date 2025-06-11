@@ -3,7 +3,7 @@
 
 use arrow_util::assert_batches_eq;
 use data_types::{StatValues, Statistics};
-use mutable_batch::{writer::Writer, MutableBatch, TimestampSummary};
+use mutable_batch::{MutableBatch, TimestampSummary, writer::Writer};
 use schema::Projection;
 use std::num::NonZeroU64;
 

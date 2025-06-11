@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use generated_types::{
+    Response, Status, StdError,
     influxdata::iox::authz::v1::{self as proto, AuthorizeResponse},
-    transport, Response, Status, StdError,
+    transport,
 };
 use observability_deps::tracing::warn;
 use snafu::Snafu;
@@ -141,21 +142,21 @@ mod test {
     use std::{
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
 
     use assert_matches::assert_matches;
     use generated_types::{
-        transport::{server::TcpIncoming, Server},
         Request,
+        transport::{Server, server::TcpIncoming},
     };
     use test_helpers_authz::Authorizer as AuthorizerServer;
     use tokio::{
         net::TcpListener,
-        task::{spawn, JoinHandle},
+        task::{JoinHandle, spawn},
     };
 
     use super::*;

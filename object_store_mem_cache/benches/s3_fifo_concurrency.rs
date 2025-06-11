@@ -13,7 +13,7 @@ use object_store_mem_cache::cache_system::{
     hook::test_utils::NoOpHook,
     s3_fifo_cache::{S3Config, S3Fifo},
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const WORST_N: usize = 3;
 

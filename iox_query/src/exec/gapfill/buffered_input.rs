@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{as_struct_array, ArrayRef},
+    array::{ArrayRef, as_struct_array},
     datatypes::DataType,
     record_batch::RecordBatch,
     row::{RowConverter, Rows, SortField},
@@ -11,7 +11,7 @@ use arrow::{
 use datafusion::error::{DataFusionError, Result};
 use hashbrown::HashSet;
 
-use super::{params::GapFillParams, FillStrategy};
+use super::{FillStrategy, params::GapFillParams};
 
 /// Encapsulate the logic around how to buffer input records.
 ///

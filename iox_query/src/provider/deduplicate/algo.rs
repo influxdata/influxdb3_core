@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range, sync::Arc};
 
-use arrow::compute::{concat_batches, SortOptions};
+use arrow::compute::{SortOptions, concat_batches};
 use arrow::{
     array::{ArrayRef, UInt64Array},
     compute::TakeOptions,
@@ -13,7 +13,7 @@ use arrow::{
 use arrow_util::optimize::optimize_dictionaries;
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
-use datafusion::physical_plan::{metrics, PhysicalExpr};
+use datafusion::physical_plan::{PhysicalExpr, metrics};
 use observability_deps::tracing::{debug, trace};
 
 /// Handles the deduplication across potentially multiple

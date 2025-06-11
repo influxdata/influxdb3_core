@@ -196,12 +196,12 @@ pub fn write_columnar(mut w: impl Write, batches: &[RecordBatch], options: Optio
 
 #[cfg(test)]
 mod test {
-    use crate::format::influxql::{write_columnar, Options};
+    use crate::format::influxql::{Options, write_columnar};
     use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use generated_types::influxdata::iox::querier::v1::influx_ql_metadata::TagKeyColumn;
     use generated_types::influxdata::iox::querier::v1::InfluxQlMetadata;
+    use generated_types::influxdata::iox::querier::v1::influx_ql_metadata::TagKeyColumn;
     use schema::{TIME_DATA_TIMEZONE, TIME_DATA_TYPE};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -241,30 +241,32 @@ mod test {
             )]),
         ));
 
-        vec![RecordBatch::try_new(
-            schema,
-            vec![
-                strs(&[
-                    Some("cpu"),
-                    Some("cpu"),
-                    Some("cpu"),
-                    Some("disk"),
-                    Some("disk"),
-                ]),
-                times(&[
-                    1157082300000000000,
-                    1157082310000000000,
-                    1157082300000000000,
-                    1157082300000000000,
-                    1157082300000000000,
-                ]),
-                strs(&[Some("cpu0"), Some("cpu0"), Some("cpu1"), None, None]),
-                strs(&[None, None, None, Some("disk1s1"), Some("disk1s2")]),
-                f64s(&[Some(99.1), Some(99.8), Some(99.2), None, None]),
-                i64s(&[None, None, None, Some(2133), Some(4110)]),
-            ],
-        )
-        .unwrap()]
+        vec![
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    strs(&[
+                        Some("cpu"),
+                        Some("cpu"),
+                        Some("cpu"),
+                        Some("disk"),
+                        Some("disk"),
+                    ]),
+                    times(&[
+                        1157082300000000000,
+                        1157082310000000000,
+                        1157082300000000000,
+                        1157082300000000000,
+                        1157082300000000000,
+                    ]),
+                    strs(&[Some("cpu0"), Some("cpu0"), Some("cpu1"), None, None]),
+                    strs(&[None, None, None, Some("disk1s1"), Some("disk1s2")]),
+                    f64s(&[Some(99.1), Some(99.8), Some(99.2), None, None]),
+                    i64s(&[None, None, None, Some(2133), Some(4110)]),
+                ],
+            )
+            .unwrap(),
+        ]
     }
 
     #[test]

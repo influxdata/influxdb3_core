@@ -2,7 +2,7 @@
 use workspace_hack as _;
 
 use chrono::{DateTime, DurationRound, TimeDelta, TimeZone, Timelike, Utc};
-use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
+use parking_lot::{RwLock, lock_api::RwLockUpgradableReadGuard};
 use std::{
     fmt::{Debug, Display},
     future::Future,
@@ -701,9 +701,11 @@ mod test {
 
         assert!(Time::MAX.checked_duration_since(Time::MIN).is_some());
 
-        assert!(Time::from_timestamp_nanos(505)
-            .checked_duration_since(Time::from_timestamp_nanos(506))
-            .is_none());
+        assert!(
+            Time::from_timestamp_nanos(505)
+                .checked_duration_since(Time::from_timestamp_nanos(506))
+                .is_none()
+        );
     }
 
     #[tokio::test]

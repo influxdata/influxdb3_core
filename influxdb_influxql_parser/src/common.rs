@@ -1,19 +1,19 @@
 //! Type and parsers common to many statements.
 
-use crate::expression::conditional::{conditional_expression, ConditionalExpression};
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, verify, ParseResult};
-use crate::keywords::{keyword, Token};
+use crate::expression::conditional::{ConditionalExpression, conditional_expression};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect, verify};
+use crate::keywords::{Token, keyword};
 use crate::literal::unsigned_integer;
-use crate::string::{regex, Regex};
+use crate::string::{Regex, regex};
 use core::fmt;
+use nom::Parser as _;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::{char, multispace1};
 use nom::combinator::{map, opt, recognize, value};
 use nom::multi::{fold_many0, fold_many1, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
-use nom::Parser as _;
 use std::fmt::{Display, Formatter};
 use std::mem;
 use std::ops::{Deref, DerefMut};

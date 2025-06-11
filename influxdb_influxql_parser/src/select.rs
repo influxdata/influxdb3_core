@@ -3,24 +3,24 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-basic-select-statement
 
 use crate::common::{
-    limit_clause, offset_clause, order_by_clause, qualified_measurement_name, where_clause, ws0,
-    ws1, LimitClause, OffsetClause, OrderByClause, ParseError, Parser, QualifiedMeasurementName,
-    WhereClause, ZeroOrMore,
+    LimitClause, OffsetClause, OrderByClause, ParseError, Parser, QualifiedMeasurementName,
+    WhereClause, ZeroOrMore, limit_clause, offset_clause, order_by_clause,
+    qualified_measurement_name, where_clause, ws0, ws1,
 };
 use crate::expression::arithmetic::Expr::Wildcard;
 use crate::expression::arithmetic::{
-    arithmetic, call_expression, var_ref, ArithmeticParsers, Expr, WildcardType,
+    ArithmeticParsers, Expr, WildcardType, arithmetic, call_expression, var_ref,
 };
 use crate::expression::{Call, VarRef};
 use crate::functions::is_now_function;
-use crate::identifier::{identifier, Identifier};
+use crate::identifier::{Identifier, identifier};
 use crate::impl_tuple_clause;
-use crate::internal::{expect, map_fail, verify, ParseResult};
+use crate::internal::{ParseResult, expect, map_fail, verify};
 use crate::keywords::keyword;
-use crate::literal::{duration, literal, number, unsigned_integer, Literal, Number};
+use crate::literal::{Literal, Number, duration, literal, number, unsigned_integer};
 use crate::parameter::parameter;
 use crate::select::MeasurementSelection::Subquery;
-use crate::string::{regex, single_quoted_string, Regex};
+use crate::string::{Regex, regex, single_quoted_string};
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;

@@ -2,7 +2,7 @@ use std::{borrow::Borrow, fmt::Debug, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
-    common::{stats::Precision, ColumnStatistics, Statistics},
+    common::{ColumnStatistics, Statistics, stats::Precision},
     physical_plan::{ExecutionPlan, ExecutionPlanProperties},
 };
 use itertools::Itertools;

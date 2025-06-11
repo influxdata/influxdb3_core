@@ -75,7 +75,7 @@ pub mod longrunning {
 
 use self::protobuf::Any;
 use observability_deps::tracing::error;
-use prost::{bytes::BytesMut, Message};
+use prost::{Message, bytes::BytesMut};
 use std::convert::TryInto;
 
 // A newtype struct to provide conversion into tonic::Status

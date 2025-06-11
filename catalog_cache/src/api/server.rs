@@ -6,15 +6,15 @@ use crate::api::{
     GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V1, LIST_PROTOCOL_V2, NO_VALUE, RequestPath,
 };
 use crate::local::CatalogCache;
+use bytes::Bytes;
 use futures::ready;
-use hyper::body::HttpBody;
 use hyper::header::{ACCEPT, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH, ToStrError};
 use hyper::http::request::Parts;
 use hyper::service::Service;
 use hyper::{HeaderMap, Method, StatusCode};
 use iox_http_util::{
-    Request, RequestBody, Response, ResponseBuilder, bytes_to_response_body, empty_response_body,
-    stream_results_to_response_body,
+    Body, BoxError, Request, RequestBody, Response, ResponseBuilder, bytes_to_response_body,
+    empty_response_body, stream_bytes_to_response_body,
 };
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::convert::Infallible;
@@ -28,8 +28,8 @@ enum Error {
     #[snafu(display("Http error: {source}"), context(false))]
     Http { source: hyper::http::Error },
 
-    #[snafu(display("Hyper error: {source}"), context(false))]
-    Hyper { source: hyper::Error },
+    #[snafu(display("Hyper error: {source}"))]
+    Hyper { source: BoxError },
 
     #[snafu(display("Local cache error: {source}"), context(false))]
     Local { source: crate::local::Error },
@@ -85,14 +85,10 @@ struct ServiceState {
 impl Service<Request> for CatalogCacheService {
     type Response = Response;
 
-    type Error = Infallible;
+    type Error = Infallible; // errors should already be converted to Response
     type Future = CatalogRequestFuture;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&self, req: Request) -> Self::Future {
         let (parts, body) = req.into_parts();
         CatalogRequestFuture {
             parts,
@@ -123,16 +119,18 @@ impl Future for CatalogRequestFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let r = loop {
-            match ready!(Pin::new(&mut self.body).poll_data(cx)) {
-                Some(Ok(b)) => self.buffer.extend_from_slice(&b),
-                Some(Err(e)) => break Err(e.into()),
+            match ready!(Pin::new(&mut self.body).poll_frame(cx)) {
+                Some(Ok(b)) => self
+                    .buffer
+                    .extend_from_slice(b.data_ref().unwrap_or(&Bytes::default())),
+                Some(Err(e)) => break Err(e),
                 None => break Ok(()),
             }
         };
-        Poll::Ready(Ok(match r.and_then(|_| self.call()) {
-            Ok(resp) => resp,
-            Err(e) => e.response(),
-        }))
+        Poll::Ready(match r.context(HyperSnafu).and_then(|_| self.call()) {
+            Ok(resp) => Ok(resp),
+            Err(e) => Ok(e.response()),
+        })
     }
 }
 
@@ -154,17 +152,17 @@ impl CatalogRequestFuture {
                     let response = match self.parts.headers.get(ACCEPT) {
                         Some(x) if x == LIST_PROTOCOL_V2 => {
                             let encoder = v2::ListEncoder::new(entries).with_max_value_size(size);
-                            let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
+                            let stream = futures::stream::iter(encoder);
                             ResponseBuilder::new()
                                 .header(CONTENT_TYPE, &LIST_PROTOCOL_V2)
-                                .body(stream_results_to_response_body(stream))?
+                                .body(stream_bytes_to_response_body(stream))?
                         }
                         _ => {
                             let encoder = v1::ListEncoder::new(entries).with_max_value_size(size);
-                            let stream = futures::stream::iter(encoder.map(Ok::<_, Error>));
+                            let stream = futures::stream::iter(encoder);
                             ResponseBuilder::new()
                                 .header(CONTENT_TYPE, &LIST_PROTOCOL_V1)
-                                .body(stream_results_to_response_body(stream))?
+                                .body(stream_bytes_to_response_body(stream))?
                         }
                     };
                     return Ok(response);
@@ -290,10 +288,15 @@ impl CatalogCacheServer {
 
 /// Test utilities.
 pub mod test_util {
-    use std::{net::SocketAddr, ops::Deref};
+    use std::{fmt::Debug, net::SocketAddr, ops::Deref};
 
-    use hyper::{Server, service::make_service_fn};
-    use tokio::task::JoinHandle;
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto::Builder,
+        server::graceful::GracefulShutdown,
+    };
+    use iox_http_util::box_request;
+    use tokio::{net::TcpListener, select, task::JoinHandle};
     use tokio_util::sync::CancellationToken;
 
     use crate::api::client::CatalogCacheClient;
@@ -312,31 +315,62 @@ pub mod test_util {
 
     impl TestCacheServer {
         /// Create a new [`TestCacheServer`] bound to an ephemeral port
-        pub fn bind_ephemeral(metric_registry: &Arc<metric::Registry>) -> Self {
-            Self::bind(&SocketAddr::from(([127, 0, 0, 1], 0)), metric_registry)
+        pub async fn bind_ephemeral(metric_registry: &Arc<metric::Registry>) -> Self {
+            Self::bind(&SocketAddr::from(([127, 0, 0, 1], 0)), metric_registry).await
         }
 
         /// Create a new [`CatalogCacheServer`] bound to the provided [`SocketAddr`]
-        pub fn bind(addr: &SocketAddr, metric_registry: &Arc<metric::Registry>) -> Self {
+        pub async fn bind(addr: &SocketAddr, metric_registry: &Arc<metric::Registry>) -> Self {
             let server = CatalogCacheServer::new(Arc::new(CatalogCache::default()));
             let service = server.service();
-            let make_service = make_service_fn(move |_conn| {
-                futures::future::ready(Ok::<_, Infallible>(service.clone()))
-            });
 
-            let hyper_server = Server::bind(addr).serve(make_service);
-            let addr = hyper_server.local_addr();
+            // convert hyper::Incoming to the more generic BoxBody
+            let service = hyper::service::service_fn::<_, hyper::body::Incoming, _>(
+                move |request: hyper::Request<_>| service.call(box_request(request)),
+            );
 
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // graceful shutdown guide: https://hyper.rs/guides/1/server/graceful-shutdown/
             let shutdown = CancellationToken::new();
             let signal = shutdown.clone().cancelled_owned();
-            let graceful = hyper_server.with_graceful_shutdown(signal);
-            let handle = Some(tokio::spawn(async move { graceful.await.unwrap() }));
+            let graceful = GracefulShutdown::new();
+
+            let handle = tokio::task::spawn(async move {
+                tokio::pin!(signal);
+                loop {
+                    select! {
+                        _ = signal.as_mut() => break,
+                        res = listener.accept() => {
+                            // server guide: https://hyper.rs/guides/1/server/hello-world/
+                            // we use hyper_util's Builder to handle both http1 and http2
+
+                            let (stream, _) = res.unwrap();
+                            let service = service.clone();
+
+                            let conn = Builder::new(TokioExecutor::new())
+                                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                                .into_owned();
+                            let conn = graceful.watch(conn);
+
+                            tokio::task::spawn(async move {
+                                if let Err(err) = conn
+                                    .await {
+                                        println!("Error serving connection: {:?}", err);
+                                    };
+                            });
+                        },
+                    }
+                }
+                graceful.shutdown().await;
+            });
 
             Self {
                 addr,
                 server,
                 shutdown,
-                handle,
+                handle: Some(handle),
                 metric_registry: Arc::clone(metric_registry),
             }
         }

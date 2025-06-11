@@ -4,17 +4,17 @@ mod measurement_rewrite;
 mod rewrite;
 mod value_rewrite;
 
-use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 use crate::Predicate;
+use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::ToDFSchema;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
-use datafusion::prelude::{lit, Expr};
+use datafusion::prelude::{Expr, lit};
 use futures::{StreamExt, TryStreamExt};
 use observability_deps::tracing::{debug, trace};
 use schema::Schema;

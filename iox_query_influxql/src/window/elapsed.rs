@@ -7,11 +7,8 @@ use arrow::datatypes::IntervalUnit::MonthDayNano;
 use arrow::datatypes::TimeUnit::Nanosecond;
 use arrow::datatypes::{DataType, Field};
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::function::{
-    ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
-};
+use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::{PartitionEvaluator, Signature, Volatility, WindowUDFImpl};
-use datafusion::physical_expr::PhysicalExpr;
 
 #[derive(Debug)]
 pub(super) struct ElapsedUDWF {
@@ -41,11 +38,6 @@ impl WindowUDFImpl for ElapsedUDWF {
 
     fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
         Ok(Field::new(field_args.name(), DataType::Int64, true))
-    }
-
-    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
-    fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
-        expr_args.input_exprs().into()
     }
 
     fn partition_evaluator(

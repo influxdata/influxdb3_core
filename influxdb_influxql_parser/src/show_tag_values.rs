@@ -3,21 +3,21 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-tag-values
 
 use crate::common::{
-    limit_clause, offset_clause, where_clause, ws0, ws1, LimitClause, OffsetClause, OneOrMore,
-    WhereClause,
+    LimitClause, OffsetClause, OneOrMore, WhereClause, limit_clause, offset_clause, where_clause,
+    ws0, ws1,
 };
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, ParseResult};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::show::{on_clause, OnClause};
-use crate::simple_from_clause::{show_from_clause, ShowFromClause};
-use crate::string::{regex, Regex};
+use crate::show::{OnClause, on_clause};
+use crate::simple_from_clause::{ShowFromClause, show_from_clause};
+use crate::string::{Regex, regex};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{map, opt};
 use nom::sequence::{delimited, preceded};
-use nom::Parser;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 

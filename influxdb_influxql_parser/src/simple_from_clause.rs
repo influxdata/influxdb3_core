@@ -1,13 +1,13 @@
 //! Types and parsers for the `FROM` clause common to `DELETE` or `SHOW` schema statements.
 
 use crate::common::{
-    qualified_measurement_name, ws1, MeasurementName, OneOrMore, Parser, QualifiedMeasurementName,
+    MeasurementName, OneOrMore, Parser, QualifiedMeasurementName, qualified_measurement_name, ws1,
 };
-use crate::identifier::{identifier, Identifier};
+use crate::identifier::{Identifier, identifier};
 use crate::internal::ParseResult;
 use crate::keywords::keyword;
-use nom::sequence::{pair, preceded};
 use nom::Parser as _;
+use nom::sequence::{pair, preceded};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 

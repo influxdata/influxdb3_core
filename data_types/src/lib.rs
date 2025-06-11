@@ -25,9 +25,9 @@ pub use service_limits::*;
 
 use generated_types::google::protobuf as google;
 use generated_types::influxdata::iox::{
-    catalog::v1 as catalog_proto, catalog_storage::v1 as catalog_storage_proto,
+    Target, catalog::v1 as catalog_proto, catalog_storage::v1 as catalog_storage_proto,
     schema::v1 as schema_proto, skipped_compaction::v1 as skipped_compaction_proto,
-    table::v1 as table_proto, Target,
+    table::v1 as table_proto,
 };
 use iox_time::Time;
 use observability_deps::tracing::warn;
@@ -520,8 +520,11 @@ pub struct NamespaceConfig {
 pub struct NamespaceSchema {
     /// the namespace id
     pub id: NamespaceId,
-    /// the tables in the namespace by name
-    pub tables: BTreeMap<String, TableSchema>,
+    /// the active table schema in the namespace indexed by their name
+    pub active_tables: BTreeMap<String, TableSchema>,
+
+    /// The soft-deleted tables
+    pub deleted_tables: BTreeSet<TableId>,
 
     /// The partition template to use for new tables in this namespace either created implicitly or
     /// created without specifying a partition template.
@@ -632,7 +635,8 @@ impl NamespaceSchema {
 
         Self {
             id,
-            tables: BTreeMap::new(),
+            active_tables: BTreeMap::new(),
+            deleted_tables: BTreeSet::new(),
             partition_template: partition_template.clone(),
             config: NamespaceConfig {
                 max_tables,
@@ -649,7 +653,7 @@ impl NamespaceSchema {
     pub fn size(&self) -> usize {
         size_of_val(self)
             + self
-                .tables
+                .active_tables
                 .iter()
                 .map(|(k, v)| size_of_val(k) + k.capacity() + v.size())
                 .sum::<usize>()
@@ -658,7 +662,10 @@ impl NamespaceSchema {
 
 impl From<&NamespaceSchema> for schema_proto::NamespaceSchema {
     fn from(schema: &NamespaceSchema) -> Self {
-        namespace_schema_proto(schema.id, schema.tables.iter())
+        namespace_schema_proto(
+            schema.id,
+            schema.active_tables.iter().map(|(n, s)| (n.as_str(), s)),
+        )
     }
 }
 
@@ -667,19 +674,19 @@ impl From<&NamespaceSchema> for schema_proto::NamespaceSchema {
 /// the whole `NamespaceSchema` to use the `From` impl.
 pub fn namespace_schema_proto<'a>(
     id: NamespaceId,
-    tables: impl IntoIterator<Item = (&'a String, &'a TableSchema)>,
+    tables: impl IntoIterator<Item = (&'a str, &'a TableSchema)>,
 ) -> schema_proto::NamespaceSchema {
     schema_proto::NamespaceSchema {
         id: id.get(),
         tables: tables
             .into_iter()
-            .map(|(name, t)| (name.clone(), schema_proto::TableSchema::from(t)))
+            .map(|(name, t)| (name.to_string(), schema_proto::TableSchema::from(t)))
             .collect(),
     }
 }
 
 /// Data object for a table
-#[derive(Debug, Clone, sqlx::FromRow, PartialEq)]
+#[derive(Debug, Clone, sqlx::FromRow, PartialEq, Hash)]
 pub struct Table {
     /// The id of the table
     pub id: TableId,
@@ -704,6 +711,7 @@ impl From<Table> for table_proto::Table {
             namespace_id: value.namespace_id.get(),
             partition_template: value.partition_template.as_proto().cloned(),
             iceberg_enabled: value.iceberg_enabled,
+            deleted_at: value.deleted_at.map(serialize_timestamp),
         }
     }
 }
@@ -847,7 +855,7 @@ impl TableSchema {
 
     /// Return the set of column names for this table. Used in combination with a write operation's
     /// column names to determine whether a write would exceed the max allowed columns.
-    pub fn column_names(&self) -> BTreeSet<&str> {
+    pub fn column_names(&self) -> impl DoubleEndedIterator<Item = &str> + ExactSizeIterator {
         self.columns.names()
     }
 
@@ -875,33 +883,6 @@ impl From<&TableSchema> for schema_proto::TableSchema {
                 })
                 .collect(),
         }
-    }
-}
-
-/// For something that may or may not be just a [`TableSchema`]. Allows for usage of either
-/// BTreeMap<String, [`Table`]> or BTreeMap<String, [`TableSchema`]> without needing to convert
-/// the entire `BTreeMap` from `Table` to `TableSchema`
-pub trait MaybeTableSchema: Send + Sync {
-    /// Maybe extract the inner [`TableSchema`]
-    fn schema_if_active(&self) -> Option<&TableSchema>;
-    /// Maybe extract the inner [`TableSchema`] mutably
-    fn schema_mut_if_active(&mut self) -> Option<&mut TableSchema>;
-    /// Get the Id of the referenced table (should be known even if this doesn't contain a
-    /// [`TableSchema`] itself
-    fn id(&self) -> TableId;
-}
-
-impl MaybeTableSchema for TableSchema {
-    fn schema_if_active(&self) -> Option<&TableSchema> {
-        Some(self)
-    }
-
-    fn schema_mut_if_active(&mut self) -> Option<&mut TableSchema> {
-        Some(self)
-    }
-
-    fn id(&self) -> TableId {
-        self.id
     }
 }
 
@@ -2129,7 +2110,7 @@ impl TableSummary {
     pub fn size(&self) -> usize {
         let size: usize = self.columns.iter().map(|c| c.size()).sum();
         size + mem::size_of::<Self>() // Add size of this struct that points to
-                                      // table and ColumnSummary
+        // table and ColumnSummary
     }
 
     /// Extracts min/max values of the timestamp column, if possible
@@ -3282,7 +3263,8 @@ mod tests {
     fn test_namespace_schema_size() {
         let schema1 = NamespaceSchema {
             id: NamespaceId::new(1),
-            tables: BTreeMap::from([]),
+            active_tables: BTreeMap::new(),
+            deleted_tables: BTreeSet::new(),
             partition_template: Default::default(),
             config: NamespaceConfig {
                 max_tables: MaxTables::try_from(42).unwrap(),
@@ -3293,7 +3275,7 @@ mod tests {
         };
         let schema2 = NamespaceSchema {
             id: NamespaceId::new(1),
-            tables: BTreeMap::from([(
+            active_tables: BTreeMap::from([(
                 String::from("foo"),
                 TableSchema {
                     id: TableId::new(1),
@@ -3301,6 +3283,7 @@ mod tests {
                     partition_template: Default::default(),
                 },
             )]),
+            deleted_tables: BTreeSet::new(),
             partition_template: Default::default(),
             config: NamespaceConfig {
                 max_tables: MaxTables::try_from(42).unwrap(),

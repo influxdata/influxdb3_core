@@ -1,12 +1,7 @@
 // This crate deliberately does not use the same linting rules as the other
 // crates because of all the generated code it contains that we don't have much
 // control over.
-#![expect(
-    clippy::derive_partial_eq_without_eq,
-    clippy::needless_borrows_for_generic_args,
-    clippy::needless_lifetimes,
-    clippy::allow_attributes
-)]
+#![expect(clippy::derive_partial_eq_without_eq, clippy::allow_attributes)]
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -25,7 +20,7 @@ use snafu::{ResultExt, Snafu};
 /// This module imports the generated protobuf code into a Rust module
 /// hierarchy that matches the namespace hierarchy of the protobuf
 /// definitions
-#[expect(clippy::use_self, missing_copy_implementations)]
+#[expect(clippy::use_self)]
 pub mod influxdata {
     pub mod iox {
         pub mod ingester {

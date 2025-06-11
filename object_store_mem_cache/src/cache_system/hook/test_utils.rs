@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::cache_system::{hook::Hook, DynError};
+use crate::cache_system::{DynError, hook::Hook};
 
 use super::{EvictResult, HookDecision};
 

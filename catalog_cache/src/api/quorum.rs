@@ -311,8 +311,8 @@ mod tests {
     async fn test_basic() {
         let local = Arc::new(CatalogCache::default());
         let metric_registry = Arc::new(metric::Registry::new());
-        let r1 = TestCacheServer::bind_ephemeral(&metric_registry);
-        let r2 = TestCacheServer::bind_ephemeral(&metric_registry);
+        let r1 = TestCacheServer::bind_ephemeral(&metric_registry).await;
+        let r2 = TestCacheServer::bind_ephemeral(&metric_registry).await;
 
         let replicas = Arc::new([r1.client(), r2.client()]);
         let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
@@ -418,8 +418,8 @@ mod tests {
     async fn test_read_through() {
         let metric_registry = Arc::new(metric::Registry::new());
         let local = Arc::new(CatalogCache::default());
-        let r1 = TestCacheServer::bind_ephemeral(&metric_registry);
-        let r2 = TestCacheServer::bind_ephemeral(&metric_registry);
+        let r1 = TestCacheServer::bind_ephemeral(&metric_registry).await;
+        let r2 = TestCacheServer::bind_ephemeral(&metric_registry).await;
 
         let replicas = Arc::new([r1.client(), r2.client()]);
         let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
@@ -495,8 +495,8 @@ mod tests {
     async fn test_warm() {
         let metric_registry = Arc::new(metric::Registry::new());
         let local = Arc::new(CatalogCache::default());
-        let r1 = TestCacheServer::bind_ephemeral(&metric_registry);
-        let r2 = TestCacheServer::bind_ephemeral(&metric_registry);
+        let r1 = TestCacheServer::bind_ephemeral(&metric_registry).await;
+        let r2 = TestCacheServer::bind_ephemeral(&metric_registry).await;
 
         let replicas = Arc::new([r1.client(), r2.client()]);
         let quorum = QuorumCatalogCache::new(local, Arc::clone(&replicas));

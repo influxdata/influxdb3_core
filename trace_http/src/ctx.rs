@@ -1,4 +1,4 @@
-use std::num::{NonZeroU128, NonZeroU64, ParseIntError};
+use std::num::{NonZeroU64, NonZeroU128, ParseIntError};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -6,8 +6,8 @@ use http::HeaderMap;
 use observability_deps::tracing::*;
 use snafu::Snafu;
 
-use trace::ctx::{SpanContext, SpanId, TraceId};
 use trace::TraceCollector;
+use trace::ctx::{SpanContext, SpanId, TraceId};
 
 const B3_FLAGS: &str = "X-B3-Flags";
 const B3_SAMPLED_HEADER: &str = "X-B3-Sampled";

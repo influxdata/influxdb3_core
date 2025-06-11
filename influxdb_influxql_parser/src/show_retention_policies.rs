@@ -3,12 +3,12 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-retention-policies
 
 use crate::common::ws1;
-use crate::internal::{expect, ParseResult};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::show::{on_clause, OnClause};
+use crate::show::{OnClause, on_clause};
+use nom::Parser;
 use nom::combinator::opt;
 use nom::sequence::preceded;
-use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 /// Represents a `SHOW RETENTION POLICIES` statement.

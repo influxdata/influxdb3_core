@@ -20,6 +20,9 @@ service NamespaceService {
   // Delete a namespace
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
 
+  // Restore a soft-deleted namespace
+  rpc UndeleteNamespace(UndeleteNamespaceRequest) returns (UndeleteNamespaceResponse);
+
   // Update the name of a namespace
   rpc UpdateNamespaceName(UpdateNamespaceNameRequest) returns (UpdateNamespaceNameResponse);
 
@@ -27,8 +30,7 @@ service NamespaceService {
   rpc UpdateNamespaceRetention(UpdateNamespaceRetentionRequest)
       returns (UpdateNamespaceRetentionResponse);
 
-  // Update a service protection limit of a namespace. For this change to take
-  // effect, all routers MUST be restarted
+  // Update a service protection limit of a namespace
   rpc UpdateNamespaceServiceProtectionLimit(
       UpdateNamespaceServiceProtectionLimitRequest)
       returns (UpdateNamespaceServiceProtectionLimitResponse);
@@ -90,6 +92,13 @@ message DeleteNamespaceRequest {
 }
 
 message DeleteNamespaceResponse { Namespace namespace = 1; }
+
+message UndeleteNamespaceRequest {
+  // ID of the namespace to be undeleted
+  int64 id = 1;
+}
+
+message UndeleteNamespaceResponse { Namespace namespace = 1; }
 
 message UpdateNamespaceNameRequest {
   // ID of the namespace to update
@@ -175,7 +184,7 @@ message Namespace {
 
   // The timestamp at which this namespace was marked for deletion
   // (soft-deleted).
-  // 
+  //
   // An explcitly unset value indicates the namespace is active and not marked
   // for deletion.
   optional google.protobuf.Timestamp deleted_at = 8;

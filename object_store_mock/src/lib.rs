@@ -6,12 +6,12 @@ use std::{
 
 use bytes::Bytes;
 use futures::{
-    stream::{BoxStream, StreamExt},
     Stream,
+    stream::{BoxStream, StreamExt},
 };
 use object_store::{
-    path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
+    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use tokio::sync::Barrier;
 

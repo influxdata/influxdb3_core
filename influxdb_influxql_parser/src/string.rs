@@ -5,7 +5,8 @@
 // amended for InfluxQL.
 
 use crate::impl_tuple_clause;
-use crate::internal::{expect, ParseError, ParseResult};
+use crate::internal::{ParseError, ParseResult, expect};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{is_not, tag, take_till};
 use nom::character::complete::{anychar, char};
@@ -13,7 +14,6 @@ use nom::combinator::{map, value, verify};
 use nom::error::Error;
 use nom::multi::fold_many0;
 use nom::sequence::{delimited, preceded};
-use nom::Parser;
 use std::fmt::{Display, Formatter, Write};
 
 /// Writes `S` to `F`, mapping any characters `FROM` => `TO` their escaped equivalents.

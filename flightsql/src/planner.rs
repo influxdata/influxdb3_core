@@ -9,6 +9,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
+    FlightData, IpcMessage, SchemaAsIpc,
     decode::FlightRecordBatchStream,
     sql::{
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, Any,
@@ -17,7 +18,6 @@ use arrow_flight::{
         CommandGetTables, CommandGetXdbcTypeInfo, CommandStatementQuery,
         DoPutPreparedStatementResult,
     },
-    FlightData, IpcMessage, SchemaAsIpc,
 };
 use arrow_util::flight::prepare_schema_for_flight;
 use bytes::Bytes;
@@ -26,14 +26,14 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
-use futures::{stream::Peekable, TryStreamExt};
+use futures::{TryStreamExt, stream::Peekable};
 use generated_types::Streaming;
-use iox_query::{exec::IOxSessionContext, QueryNamespace};
+use iox_query::{QueryNamespace, exec::IOxSessionContext};
 use observability_deps::tracing::debug;
 use prost::Message;
 use snafu::OptionExt;
 
-use crate::{error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data, Error};
+use crate::{Error, error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data};
 use crate::{FlightSQLCommand, PreparedStatementHandle};
 
 /// Logic for creating plans for various Flight messages against a query database
@@ -69,7 +69,7 @@ impl FlightSQLPlanner {
             FlightSQLCommand::CommandGetSqlInfo(CommandGetSqlInfo { .. }) => {
                 Ok(iox_sql_info_data().schema())
             }
-            FlightSQLCommand::CommandGetCatalogs(req) => Ok(req.clone().into_builder().schema()),
+            FlightSQLCommand::CommandGetCatalogs(req) => Ok(req.into_builder().schema()),
             FlightSQLCommand::CommandGetCrossReference(CommandGetCrossReference { .. }) => {
                 Ok(Arc::clone(&GET_CROSS_REFERENCE_SCHEMA))
             }

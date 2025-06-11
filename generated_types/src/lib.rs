@@ -2,10 +2,9 @@
 // crates because of all the generated code it contains that we don't have much
 // control over.
 #![expect(
+    clippy::clone_on_ref_ptr,
     clippy::derive_partial_eq_without_eq,
     clippy::large_enum_variant,
-    clippy::needless_borrows_for_generic_args,
-    clippy::needless_lifetimes,
     clippy::use_self,
     clippy::allow_attributes,
     missing_copy_implementations
@@ -24,9 +23,9 @@ pub use prost_types::FileDescriptorSet;
 
 // Re-export commonly-used Tonic types
 pub use tonic::{
-    self, async_trait,
-    codegen::{http, StdError},
-    metadata, transport, Code, IntoRequest, Request, Response, Status, Streaming,
+    self, Code, IntoRequest, Request, Response, Status, Streaming, async_trait,
+    codegen::{StdError, http},
+    metadata, transport,
 };
 
 /// This module imports the generated protobuf code into a Rust module
@@ -450,7 +449,7 @@ pub mod influxdata {
                         }
                     }
                 }
-                impl<'a> From<Target> for Option<$proto_type> {
+                impl From<Target> for Option<$proto_type> {
                     fn from(value: Target) -> Self {
                         Some(value.into())
                     }

@@ -1,14 +1,14 @@
 use crate::error;
 use crate::plan::expr_type_evaluator::TypeEvaluator;
 use crate::plan::field::{field_by_name, field_name};
-use crate::plan::field_mapper::{field_and_dimensions, FieldTypeMap};
+use crate::plan::field_mapper::{FieldTypeMap, field_and_dimensions};
 use crate::plan::ir::{DataSource, Field, Interval, Select, SelectQuery, TagSet};
 use crate::plan::var_ref::{influx_type_to_var_ref_data_type, var_ref_data_type_to_influx_type};
-use crate::plan::{util, SchemaProvider};
+use crate::plan::{SchemaProvider, util};
 use datafusion::common::{DataFusionError, Result};
 use influxdb_influxql_parser::common::{MeasurementName, QualifiedMeasurementName, WhereClause};
 use influxdb_influxql_parser::expression::walk::{
-    walk_expr, walk_expr_mut, walk_expression_mut, ExpressionMut,
+    ExpressionMut, walk_expr, walk_expr_mut, walk_expression_mut,
 };
 use influxdb_influxql_parser::expression::{
     AsVarRefExpr, Call, Expr, VarRef, VarRefDataType, WildcardType,
@@ -21,7 +21,7 @@ use influxdb_influxql_parser::select::{
     SelectStatement,
 };
 use influxdb_influxql_parser::time_range::{
-    duration_expr_to_nanoseconds, split_cond, ReduceContext, TimeRange,
+    ReduceContext, TimeRange, duration_expr_to_nanoseconds, split_cond,
 };
 use influxdb_influxql_parser::timestamp::Timestamp;
 use itertools::Itertools;
@@ -1694,10 +1694,10 @@ mod test {
     use super::Result;
     use crate::plan::ir::{Field, Select};
     use crate::plan::rewriter::{
-        find_table_names, has_wildcards, rewrite_select, rewrite_statement, ProjectionType,
-        SelectStatementInfo,
+        ProjectionType, SelectStatementInfo, find_table_names, has_wildcards, rewrite_select,
+        rewrite_statement,
     };
-    use crate::plan::test_utils::{parse_select, MockSchemaProvider};
+    use crate::plan::test_utils::{MockSchemaProvider, parse_select};
     use assert_matches::assert_matches;
     use datafusion::error::DataFusionError;
     use influxdb_influxql_parser::select::SelectStatement;

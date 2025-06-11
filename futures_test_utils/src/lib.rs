@@ -1,15 +1,14 @@
 use std::{
-    future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
-use futures::{task::ArcWake, FutureExt};
+use futures::{FutureExt, task::ArcWake};
 use futures_concurrency::future::FutureExt as _;
 
 // Workaround for "unused crate" lint false positives.

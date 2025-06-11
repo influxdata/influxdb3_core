@@ -307,8 +307,8 @@ mod tests {
     use super::*;
     use rand::rngs::mock::StepRng;
     use std::io::Error;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_backoff() {

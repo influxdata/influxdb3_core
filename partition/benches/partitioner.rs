@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use criterion::{
-    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId,
-    Criterion, Throughput,
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    measurement::WallTime,
 };
 use data_types::partition_template::TablePartitionTemplateOverride;
 use generated_types::influxdata::iox::partition_template::v1::{self as proto, Bucket};

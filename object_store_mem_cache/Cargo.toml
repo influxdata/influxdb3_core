@@ -19,7 +19,7 @@ object_store_metrics = { path = "../object_store_metrics" }
 object_store_mock = { path = "../object_store_mock" }
 object_store_size_hinting = { path = "../object_store_size_hinting" }
 observability_deps = { path = "../observability_deps" }
-tokio = { version = "1.45.0", default-features = false }
+tokio = { version = "1.45.1", default-features = false }
 tracker = { path = "../tracker" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

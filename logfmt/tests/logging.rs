@@ -6,7 +6,7 @@
 #![expect(unused_crate_dependencies)]
 
 use logfmt::LogFmtLayer;
-use observability_deps::tracing::{debug, error, info, span, trace, warn, Level};
+use observability_deps::tracing::{Level, debug, error, info, span, trace, warn};
 use parking_lot::Mutex;
 use regex::Regex;
 use std::{
@@ -144,8 +144,7 @@ fn event_fields_repeated() {
 fn event_fields_errors() {
     let capture = CapturedWriter::new();
 
-    let err: Box<dyn Error + 'static> =
-        io::Error::new(io::ErrorKind::Other, "shaving yak failed!").into();
+    let err: Box<dyn Error + 'static> = io::Error::other("shaving yak failed!").into();
     error!(the_error = err.as_ref(), "This is an error message");
 
     let expected = [

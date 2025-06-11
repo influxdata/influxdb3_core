@@ -129,6 +129,20 @@ impl Client {
         Ok(())
     }
 
+    /// Restore a soft-deleted namespace
+    pub async fn undelete_namespace(
+        &mut self,
+        namespace_id: impl Into<i64> + Send,
+    ) -> Result<Namespace, Error> {
+        let response = self
+            .inner
+            .undelete_namespace(UndeleteNamespaceRequest {
+                id: namespace_id.into(),
+            })
+            .await?;
+        Ok(response.into_inner().namespace.unwrap_field("namespace")?)
+    }
+
     /// Rename a namespace
     pub async fn update_namespace_name(
         &mut self,

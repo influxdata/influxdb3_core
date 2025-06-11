@@ -5,17 +5,16 @@ use crate::{
 };
 use datafusion::{
     common::{
-        internal_datafusion_err,
+        HashMap, internal_datafusion_err,
         tree_node::{Transformed, TreeNodeRecursion},
-        HashMap,
     },
     datasource::{
         listing::{FileRange, PartitionedFile},
-        physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+        physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     },
     error::Result,
     physical_expr::LexOrdering,
-    physical_plan::{sorts::sort::SortExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, sorts::sort::SortExec},
 };
 use itertools::Itertools;
 use object_store::path::Path;
@@ -24,8 +23,10 @@ use observability_deps::tracing::trace;
 /// This function is to split all files in the same ParquetExec into different groups/DF partitions and
 /// set the `preserve_partitioning` so they will be executed sequentially. The files will later be re-ordered
 /// (if non-overlapping) by lexical range.
-#[expect(unused)]
-pub(crate) fn split_parquet_files(
+///
+/// For [`PartitionedFile`]s from the same file source, these have the same (per-file) lexical range.
+/// Therefore regroup these files together.
+pub(crate) fn split_and_regroup_parquet_files(
     plan: Arc<dyn ExecutionPlan>,
     ordering_req: &LexOrdering,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
@@ -34,15 +35,16 @@ pub(crate) fn split_parquet_files(
             .properties()
             .equivalence_properties()
             .ordering_satisfy(ordering_req)
+            || !sort_exec.preserve_partitioning()
         {
             // halt on DAG branch
-            Ok(Transformed::new(plan, false, TreeNodeRecursion::Stop))
+            Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
         } else {
             // continue down
             Ok(Transformed::no(plan))
         }
     } else if plan.as_any().downcast_ref::<DeduplicateExec>().is_some() {
-        Ok(Transformed::new(plan, false, TreeNodeRecursion::Stop))
+        Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
     } else if let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() {
         if let Some(transformed) =
             transform_parquet_exec_to_regrouped_disjoint_ranges(parquet_exec, ordering_req)?
@@ -88,15 +90,6 @@ pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
     parquet_exec: &ParquetExec,
     ordering_req: &LexOrdering,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if parquet_exec
-        .properties()
-        .output_partitioning()
-        .partition_count()
-        == 1
-    {
-        return Ok(None);
-    }
-
     // Extract partitioned files from the ParquetExec
     let base_config = parquet_exec.base_config();
     let files = base_config.file_groups.iter().flatten().collect::<Vec<_>>();
@@ -123,11 +116,11 @@ pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
 
     // reorder partitioned files by lexical indices
     let indices = lexical_ranges.indices();
-    assert_eq!(
-        indices.len(),
-        regrouped_files.len(),
-        "should have every file group listed in the sorted indices"
-    );
+    if indices.len() != regrouped_files.len() {
+        return Err(internal_datafusion_err!(
+            "should have every file group listed in the sorted indices"
+        ));
+    }
     let mut new_partitioned_file_groups = regrouped_files
         .into_iter()
         .enumerate()
@@ -147,7 +140,8 @@ pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
         .map(|(_, filegroup)| filegroup)
         .collect_vec();
 
-    // Assigned new partitioned file groups to the new base config
+    // Assigned new partitioned file groups to the new base config,
+    // and update the output ordering to match the transformed ordering.
     let mut new_base_config = base_config.clone();
     new_base_config.file_groups = new_partitioned_file_groups;
 
@@ -166,6 +160,9 @@ pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
 
 /// Group [`PartitionedFile`] which come from the same file source, into the same
 /// [`Vec<PartitionedFile>`] group.
+///
+/// If the partitioned files (a.k.a. scanned ranges) are adjacent to each other, then combine
+/// into a single range scan.
 ///
 /// Returns an error if the file partitions, from the same file, are overlapping.
 fn group_same_file_sources(files: Vec<&PartitionedFile>) -> Result<Vec<Vec<PartitionedFile>>> {
@@ -194,7 +191,39 @@ fn group_same_file_sources(files: Vec<&PartitionedFile>) -> Result<Vec<Vec<Parti
         group.push(file.clone());
     }
 
-    Ok(map.into_values().collect())
+    Ok(map
+        .into_values()
+        .map(combine_adjacent_ranges_from_same_filegroup)
+        .collect())
+}
+
+/// If the partitioned files (a.k.a. scanned ranges) are adjacent to each other, than combine
+/// into a single range scan.
+///
+/// This is required to handle the limitation that scanned ranges are each given the statistics for the entire file:
+///     * The FileScanConfig uses the same [`FileScanConfig::file_schema`](datafusion::datasource::physical_plan::FileScanConfig::file_schema)
+///         for each partitioned file in the group.
+///     * Therefore the MinMaxStatistics will be the same for each partitioned file.
+///     * Therefore the `MinMaxStatistics::is_sorted` will return false.
+///     * Therefore the [`FileScanConfig::project`](datafusion::datasource::physical_plan::FileScanConfig::project)
+///         will not find a sort ordering for the group. Refer to:
+///         <https://github.com/apache/datafusion/blob/9d06baf45298bc736966d0239fa78ec7a434ca54/datafusion/datasource/src/file_scan_config.rs#L1470>
+///
+fn combine_adjacent_ranges_from_same_filegroup(
+    filegroup: Vec<PartitionedFile>,
+) -> Vec<PartitionedFile> {
+    filegroup.into_iter().fold(vec![], |mut acc, file| {
+        if acc.is_empty() {
+            return vec![file];
+        }
+        let last = acc.len() - 1;
+        if let Some(merged) = merge_adjacent_partitioned_files(&acc[last], &file) {
+            acc[last] = merged;
+        } else {
+            acc.push(file);
+        }
+        acc
+    })
 }
 
 fn overlaps(range0: &FileRange, range1: &FileRange) -> bool {
@@ -203,6 +232,35 @@ fn overlaps(range0: &FileRange, range1: &FileRange) -> bool {
         Ordering::Less => range0.end > range1.start, // range.end is not inclusive
         Ordering::Greater => range1.end > range0.start,
     }
+}
+
+/// Returns a merged file, if the partitioned files are adjacent table scans.
+///
+/// Returns None if the ranged scans cannot be considered as an adjacent, continous singular scan.
+fn merge_adjacent_partitioned_files(
+    f0: &PartitionedFile,
+    f1: &PartitionedFile,
+) -> Option<PartitionedFile> {
+    if is_adjacent(&f0.range, &f1.range) && eq_partitioned_files(f0, f1) {
+        let mut merged = f0.clone();
+        merged.range = Some(FileRange {
+            start: merged.range.expect("exists").start,
+            end: f1.range.clone().expect("exists").end,
+        });
+        Some(merged)
+    } else {
+        None
+    }
+}
+
+fn is_adjacent(range0: &Option<FileRange>, range1: &Option<FileRange>) -> bool {
+    matches!((range0, range1), (Some(range0), Some(range1)) if range0.end == range1.start)
+}
+
+/// Returns true if the [`PartitionedFile`]s are equal, excluding consideration of ranges.
+fn eq_partitioned_files(f0: &PartitionedFile, f1: &PartitionedFile) -> bool {
+    f0.object_meta == f1.object_meta // same file location (unique ID)
+        && f0.partition_values == f1.partition_values // appended values are the same
 }
 
 #[cfg(test)]
@@ -223,11 +281,11 @@ mod tests {
     use schema::sort::SortKey;
 
     use crate::{
+        QueryChunk,
         exec::{Executor, ExecutorConfig},
         physical_optimizer::sort::extract_ranges::min_max_for_partitioned_filegroup,
         provider::ProviderBuilder,
-        test::{format_execution_plan, TestChunk},
-        QueryChunk,
+        test::{TestChunk, format_execution_plan},
     };
 
     fn pretty_str_mins_maxes(mins_maxs: &[Option<(ScalarValue, ScalarValue)>]) -> String {
@@ -255,8 +313,8 @@ mod tests {
     ///     e.g. 8.parquet:0..25000000 then 8.parquet:25000000..100000000
     ///     `range.end` is exclusive
     ///
-    async fn build_test_case_with_nonoverlapping_ranged_scans(
-    ) -> (Arc<Schema>, LexOrdering, Arc<dyn ExecutionPlan>) {
+    async fn build_test_case_with_nonoverlapping_ranged_scans()
+    -> (Arc<Schema>, LexOrdering, Arc<dyn ExecutionPlan>) {
         // DF session setup
         let config = ExecutorConfig {
             target_query_partitions: 4.try_into().unwrap(),
@@ -394,9 +452,7 @@ mod tests {
         };
         insta::assert_yaml_snapshot!(
             format_execution_plan(&regrouped_plan),
-            @r#"
-        - " ParquetExec: file_groups={5 groups: [[8.parquet:0..25000000, 8.parquet:25000000..100000000], [7.parquet:0..100000000], [6.parquet:0..75000000, 6.parquet:75000000..100000000], [5.parquet:0..50000000, 5.parquet:50000000..100000000], [4.parquet:0..100000000]]}, projection=[tag, time]"
-        "#
+            @r#"- " ParquetExec: file_groups={5 groups: [[8.parquet:0..100000000], [7.parquet:0..100000000], [6.parquet:0..100000000], [5.parquet:0..100000000], [4.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC]""#
         );
 
         // Test Case: the regrouped filegroups are non-overlapped.

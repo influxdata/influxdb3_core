@@ -1,9 +1,9 @@
 use crate::error;
+use crate::plan::SchemaProvider;
 use crate::plan::field::field_by_name;
 use crate::plan::field_mapper::map_type;
 use crate::plan::ir::DataSource;
 use crate::plan::var_ref::influx_type_to_var_ref_data_type;
-use crate::plan::SchemaProvider;
 use datafusion::common::Result;
 use influxdb_influxql_parser::expression::{
     Binary, BinaryOperator, Call, Expr, VarRef, VarRefDataType,
@@ -449,8 +449,8 @@ mod test {
 
     #[test]
     fn test_binary_data_type() {
-        use influxdb_influxql_parser::expression::BinaryOperator::*;
         use VarRefDataType::{Boolean, Float, Integer, String, Tag, Timestamp, Unsigned};
+        use influxdb_influxql_parser::expression::BinaryOperator::*;
 
         // Boolean ok
         for op in [BitwiseAnd, BitwiseOr, BitwiseXor] {

@@ -57,8 +57,8 @@ use metric::{
 use object_store::Result;
 
 use crate::{
-    log::{LogContext, LogRecord},
     StoreType,
+    log::{LogContext, LogRecord},
 };
 
 /// The way an [`ObjectStore`] operation finished.

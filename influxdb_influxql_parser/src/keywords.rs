@@ -4,11 +4,11 @@
 
 use crate::internal::{Error, ParseResult};
 use nom::{
+    FindToken, Parser,
     bytes::complete::tag_no_case,
     character::complete::alpha1,
     combinator::{fail, verify},
     sequence::terminated,
-    FindToken, Parser,
 };
 use std::{
     collections::HashSet,

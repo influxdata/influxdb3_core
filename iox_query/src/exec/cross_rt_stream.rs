@@ -9,8 +9,8 @@ use std::{
 
 use datafusion::error::DataFusionError;
 use executor::DedicatedExecutor;
-use futures::{future::BoxFuture, ready, FutureExt, Stream, StreamExt};
-use tokio::sync::mpsc::{channel, Sender};
+use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, ready};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// [`Stream`] that is calculated by one tokio runtime but can safely be pulled from another w/o stalling (esp. when the

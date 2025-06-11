@@ -85,7 +85,7 @@ impl NamespaceSnapshot {
             .map(|t| proto::NamespaceTable {
                 id: t.id.get(),
                 name: t.name.into(),
-                deleted_at: None,
+                deleted_at: t.deleted_at.map(|ts| ts.get()),
             })
             .collect();
         // TODO(marco): wire up binary search to find table by ID
@@ -170,7 +170,7 @@ impl NamespaceSnapshot {
         })
     }
 
-    /// Lookup a [`NamespaceSnapshotTable`] by name
+    /// Lookup a [`NamespaceSnapshotTable`] by name. Does not include deleted entries.
     pub fn lookup_table_by_name(&self, name: &str) -> Result<Option<NamespaceSnapshotTable>> {
         for idx in self.table_names.lookup(name.as_bytes()) {
             let table = self.tables.get(idx).context(TableEncodeSnafu)?;

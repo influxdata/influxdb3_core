@@ -6,17 +6,17 @@ use crate::aggregate::{MODE, PERCENTILE, SPREAD};
 use crate::error;
 use crate::plan::ir::{DataSource, Field, Interval, Select, SelectQuery};
 use crate::plan::planner::select::{
-    fields_to_exprs_no_nulls, make_tag_key_column_meta, plan_with_sort, ProjectionInfo, Selector,
-    SelectorWindowOrderBy,
+    ProjectionInfo, Selector, SelectorWindowOrderBy, fields_to_exprs_no_nulls,
+    make_tag_key_column_meta, plan_with_sort,
 };
 use crate::plan::planner::source_field_names::SourceFieldNamesVisitor;
 use crate::plan::planner_time_range_expression::time_range_to_df_expr;
-use crate::plan::rewriter::{find_table_names, rewrite_statement, ProjectionType};
+use crate::plan::rewriter::{ProjectionType, find_table_names, rewrite_statement};
 use crate::plan::udf::{
     cumulative_sum, derivative, difference, elapsed, find_window_udfs, moving_average,
     non_negative_derivative, non_negative_difference,
 };
-use crate::plan::util::{binary_operator_to_df_operator, rebase_expr, IQLSchema};
+use crate::plan::util::{IQLSchema, binary_operator_to_df_operator, rebase_expr};
 use crate::plan::var_ref::var_ref_data_type_to_data_type;
 use crate::plan::{planner_rewrite_expression, udf};
 use crate::window::{
@@ -31,7 +31,7 @@ use arrow::datatypes::{DataType, Field as ArrowField, Int32Type, Schema as Arrow
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, ToDFSchema};
-use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::datetime::date_bin::DateBinFunc;
 use datafusion::functions::{core::expr_ext::FieldAccessor, expr_fn::now};
@@ -41,26 +41,26 @@ use datafusion::functions_aggregate::{
 };
 use datafusion::functions_array::expr_fn::make_array;
 use datafusion::functions_window::row_number::row_number_udwf;
+use datafusion::logical_expr::SortExpr;
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::normalize_col;
-use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::logical_plan::Analyze;
+use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::utils::{disjunction, expr_as_column_expr, find_aggregate_exprs};
-use datafusion::logical_expr::SortExpr;
 use datafusion::logical_expr::{
-    binary_expr, col, expr, expr::WindowFunction, lit, AggregateUDF, Between, Distinct,
-    EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
-    Operator, PlanType, Projection, ScalarUDF, TableSource, ToStringifiedPlan, Union, WindowFrame,
-    WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
+    AggregateUDF, Between, Distinct, EmptyRelation, Explain, Expr, ExprSchemable, Extension,
+    LogicalPlan, LogicalPlanBuilder, Operator, PlanType, Projection, ScalarUDF, TableSource,
+    ToStringifiedPlan, Union, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowFunctionDefinition, binary_expr, col, expr, expr::WindowFunction, lit,
 };
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{cast, lit_timestamp_nano, when, Column, ExprFunctionExt};
+use datafusion::prelude::{Column, ExprFunctionExt, cast, lit_timestamp_nano, when};
 use datafusion::sql::TableReference;
-use datafusion_util::{lit_dict, AsExpr};
+use datafusion_util::{AsExpr, lit_dict};
 use generated_types::influxdata::iox::querier::v1::InfluxQlMetadata;
 use influxdb_influxql_parser::common::{LimitClause, OffsetClause, OrderByClause};
 use influxdb_influxql_parser::explain::{ExplainOption, ExplainStatement};
-use influxdb_influxql_parser::expression::walk::{walk_expr, walk_expression, Expression};
+use influxdb_influxql_parser::expression::walk::{Expression, walk_expr, walk_expression};
 use influxdb_influxql_parser::expression::{
     Binary, Call, ConditionalBinary, ConditionalExpression, ConditionalOperator, VarRef,
     VarRefDataType,
@@ -68,7 +68,8 @@ use influxdb_influxql_parser::expression::{
 use influxdb_influxql_parser::functions::{
     is_aggregate_function, is_now_function, is_scalar_math_function,
 };
-use influxdb_influxql_parser::parameter::{replace_bind_params_with_values, BindParameterError};
+use influxdb_influxql_parser::literal::Number;
+use influxdb_influxql_parser::parameter::{BindParameterError, replace_bind_params_with_values};
 use influxdb_influxql_parser::select::{FillClause, GroupByClause};
 use influxdb_influxql_parser::show_field_keys::ShowFieldKeysStatement;
 use influxdb_influxql_parser::show_measurements::{
@@ -78,7 +79,7 @@ use influxdb_influxql_parser::show_retention_policies::ShowRetentionPoliciesStat
 use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
 use influxdb_influxql_parser::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
 use influxdb_influxql_parser::simple_from_clause::ShowFromClause;
-use influxdb_influxql_parser::time_range::{split_cond, ReduceContext, TimeRange};
+use influxdb_influxql_parser::time_range::{ReduceContext, TimeRange, split_cond};
 use influxdb_influxql_parser::timestamp::Timestamp;
 use influxdb_influxql_parser::visit::Visitable;
 use influxdb_influxql_parser::{
@@ -91,23 +92,23 @@ use influxdb_influxql_parser::{
 use iox_query::analyzer::default_return_value_for_aggr_fn;
 use iox_query::analyzer::range_predicate::find_time_range;
 use iox_query::config::{IoxConfigExt, MetadataCutoff};
-use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use iox_query::exec::IOxSessionContext;
+use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use iox_query_params::StatementParams;
 use itertools::Itertools;
 use observability_deps::tracing::debug;
-use query_functions::date_bin_wallclock::expr_fn::date_bin_wallclock;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
+use query_functions::date_bin_wallclock::expr_fn::date_bin_wallclock;
 use query_functions::{
     clean_non_meta_escapes,
     selectors::{selector_first, selector_last, selector_max, selector_min},
     tz::TZ_UDF,
 };
 use schema::{
-    InfluxColumnType, InfluxFieldType, Schema, INFLUXQL_MEASUREMENT_COLUMN_NAME,
-    INFLUXQL_METADATA_KEY, TIME_DATA_TIMEZONE,
+    INFLUXQL_MEASUREMENT_COLUMN_NAME, INFLUXQL_METADATA_KEY, InfluxColumnType, InfluxFieldType,
+    Schema, TIME_DATA_TIMEZONE,
 };
-use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fmt::Debug;
 use std::iter;
 use std::ops::{Bound, ControlFlow, Deref, Range};
@@ -485,6 +486,93 @@ impl<'a> Context<'a> {
             self.tz.clone().or_else(TIME_DATA_TIMEZONE),
         ))
     }
+}
+
+/// This struct specifies how to handle non-existent columns when querying
+/// with the `FILL(Number)` clause. The gap-filling value is used to fill
+/// in the missing columns.
+///
+/// ## Fields
+///
+/// `fill_clause`:
+/// Contains the FILL clause specification (e.g., `FILL(3.14)` or `FILL(NULL)`)
+/// that determines what value to use for non-existent columns in result sets.
+///
+/// `data_type`:
+/// Specifies the expected data type for the field in the output result.
+/// This is especially important when the gap-filling value needs type conversion
+/// to match the target column's data type.
+///
+/// ## Note: Cross-Table Data Type Handling
+///
+/// When querying multiple tables, a field may exist in one table but not another.
+/// In such cases, the gap-filling value from `FILL(Number)` must be converted
+/// to match the expected data type of the field in the result set. This struct
+/// provides the information needed for proper type conversion.
+///
+/// [`ProjectionInfo::fields`] stores the data type of the field in the output result.
+///
+/// ## Example
+///
+/// Consider two tables (`cpu` and `disk`) with different field availability:
+///
+/// | Field Name    | Data Type | Available in `cpu` | Available in `disk` |
+/// |---------------|-----------|-------------------|---------------------|
+/// | `usage_idle`  | Float     | ✅               | ❌                  |
+/// | `bytes_free`  | Integer   | ❌               | ✅                  |
+///
+/// For the query:
+///
+/// ```sql
+/// SELECT usage_idle, bytes_free FROM cpu, disk FILL(3.14);
+/// +------------------+----------------------+------------+------------+
+/// | iox::measurement | time                 | usage_idle | bytes_free |
+/// +------------------+----------------------+------------+------------+
+/// | cpu              | 2022-10-31T02:00:00Z | 2.98       | 3          |
+/// | cpu              | 2022-10-31T02:00:00Z | 0.98       | 3          |
+/// | cpu              | 2022-10-31T02:00:00Z | 1.98       | 3          |
+/// | cpu              | 2022-10-31T02:00:10Z | 2.99       | 3          |
+/// | cpu              | 2022-10-31T02:00:10Z | 0.99       | 3          |
+/// | cpu              | 2022-10-31T02:00:10Z | 1.99       | 3          |
+/// | disk             | 2022-10-31T02:00:00Z | 3.14       | 1234       |
+/// | disk             | 2022-10-31T02:00:00Z | 3.14       | 2234       |
+/// | disk             | 2022-10-31T02:00:00Z | 3.14       | 3234       |
+/// | disk             | 2022-10-31T02:00:10Z | 3.14       | 1239       |
+/// | disk             | 2022-10-31T02:00:10Z | 3.14       | 2239       |
+/// | disk             | 2022-10-31T02:00:10Z | 3.14       | 3239       |
+/// +------------------+----------------------+------------+------------+
+/// ```
+///
+/// This struct enables the planner to:
+/// - Use `3.14` (Float) for missing `usage_idle` values in the `disk` table
+/// - Convert `3.14` to `3` (Integer) for missing `bytes_free` values in the `cpu` table
+///
+/// It also handles aggregation queries with time-based grouping:
+///
+/// ```sql
+/// SELECT COUNT(usage_idle), COUNT(bytes_free) FROM cpu, disk
+/// WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z'
+/// GROUP BY TIME(30s) FILL(3.14)
+/// +------------------+----------------------+-------+---------+
+/// | iox::measurement | time                 | count | count_1 |
+/// +------------------+----------------------+-------+---------+
+/// | cpu              | 2022-10-31T02:00:00Z | 6     | 3       |
+/// | cpu              | 2022-10-31T02:00:30Z | 3     | 3       |
+/// | cpu              | 2022-10-31T02:01:00Z | 3     | 3       |
+/// | cpu              | 2022-10-31T02:01:30Z | 3     | 3       |
+/// | disk             | 2022-10-31T02:00:00Z | 3     | 6       |
+/// | disk             | 2022-10-31T02:00:30Z | 3     | 3       |
+/// | disk             | 2022-10-31T02:01:00Z | 3     | 3       |
+/// | disk             | 2022-10-31T02:01:30Z | 3     | 3       |
+/// +------------------+----------------------+-------+---------+
+/// ```
+///
+/// This struct allows the planner to:
+/// - Convert `3.14` (Float) to `3` (Integer) for missing `COUNT(usage_idle)` values
+///   in the `disk` table, and `COUNT(bytes_free)` values in the `cpu` table
+struct VirtualColumnFillConfig {
+    fill_clause: Option<FillClause>,
+    data_type: Option<InfluxColumnType>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -889,7 +977,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let schema = IQLSchema::new_from_fields(input.schema(), fields)?;
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
-        let select_exprs = self.field_list_to_exprs(&ctx.tz, &input, fields, &schema)?;
+        let select_exprs = self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields, &schema)?;
 
         // Wrap the plan in a `LogicalPlan::Projection` from the select expressions
         project(input, select_exprs)
@@ -906,7 +994,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let schema = IQLSchema::new_from_fields(input.schema(), fields)?;
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
-        let mut select_exprs = self.field_list_to_exprs(&ctx.tz, &input, fields, &schema)?;
+        let mut select_exprs =
+            self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields, &schema)?;
 
         // This is a special case, where exactly one column can be projected with a `DISTINCT`
         // clause or the `distinct` function.
@@ -950,7 +1039,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     ) -> Result<LogicalPlan> {
         let schema = IQLSchema::new_from_fields(input.schema(), fields)?;
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
-        let select_exprs = self.field_list_to_exprs(&ctx.tz, &input, fields, &schema)?;
+        let select_exprs = self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields, &schema)?;
 
         let (plan, select_exprs) =
             self.select_aggregate(ctx, input, fields, select_exprs, group_by_tag_set)?;
@@ -971,7 +1060,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let schema = IQLSchema::new_from_fields(input.schema(), fields)?;
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
-        let select_exprs = self.field_list_to_exprs(&ctx.tz, &input, fields, &schema)?;
+        let select_exprs = self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields, &schema)?;
 
         let (plan, select_exprs) = Self::select_window(ctx, input, select_exprs, group_by_tag_set)?;
         let plan = filter_window_nulls(plan)?;
@@ -992,7 +1081,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let schema = IQLSchema::new_from_fields(input.schema(), fields)?;
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
-        let select_exprs = self.field_list_to_exprs(&ctx.tz, &input, fields, &schema)?;
+        let select_exprs = self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields, &schema)?;
 
         let (plan, select_exprs) =
             self.select_aggregate(ctx, input, fields, select_exprs, group_by_tag_set)?;
@@ -1021,7 +1110,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let schema = IQLSchema::new_from_fields(input.schema(), fields)?;
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
-        let select_exprs = self.field_list_to_exprs(&ctx.tz, &input, fields, &schema)?;
+        let select_exprs = self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields, &schema)?;
 
         let (plan, select_exprs) =
             self.select_aggregate(ctx, input, fields, select_exprs, group_by_tag_set)?;
@@ -1126,7 +1215,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
         let select_exprs =
-            self.field_list_to_exprs(&ctx.tz, &plan, fields_vec.as_slice(), &schema)?;
+            self.field_list_to_exprs(&ctx.tz, &ctx.fill, &plan, fields_vec.as_slice(), &schema)?;
 
         // Wrap the plan in a `LogicalPlan::Projection` from the select expressions
         project(plan, select_exprs)
@@ -1198,7 +1287,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
         // Transform InfluxQL AST field expressions to a list of DataFusion expressions.
         let select_exprs =
-            self.field_list_to_exprs(&ctx.tz, &input, fields_vec.as_slice(), &schema)?;
+            self.field_list_to_exprs(&ctx.tz, &ctx.fill, &input, fields_vec.as_slice(), &schema)?;
 
         let plan = if !tag_keys.is_empty() {
             self.select_first(ctx, input, order_by, internal_group_by.as_slice(), 1)?
@@ -1821,19 +1910,21 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 fields_to_exprs_no_nulls(input.schema(), group_by_tag_set).collect::<Vec<_>>()
             };
 
-            let window_func_exprs = vec![Expr::WindowFunction(WindowFunction::new(
-                WindowFunctionDefinition::WindowUDF(row_number_udwf()),
-                vec![],
-            ))
-            .partition_by(partition_by)
-            .order_by(order_by)
-            .window_frame(WindowFrame::new_bounds(
-                WindowFrameUnits::Rows,
-                WindowFrameBound::Preceding(ScalarValue::Null),
-                WindowFrameBound::CurrentRow,
-            ))
-            .build()?
-            .alias(IOX_ROW_ALIAS)];
+            let window_func_exprs = vec![
+                Expr::WindowFunction(WindowFunction::new(
+                    WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+                    vec![],
+                ))
+                .partition_by(partition_by)
+                .order_by(order_by)
+                .window_frame(WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(ScalarValue::Null),
+                    WindowFrameBound::CurrentRow,
+                ))
+                .build()?
+                .alias(IOX_ROW_ALIAS),
+            ];
 
             // Prepare new projection.
             let proj_exprs = input
@@ -1903,6 +1994,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn field_list_to_exprs(
         &self,
         tz: &Option<Arc<str>>,
+        fill: &Option<FillClause>,
         plan: &LogicalPlan,
         fields: &[Field],
         schema: &IQLSchema<'_>,
@@ -1925,7 +2017,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 };
                 new_field
             })
-            .map(|field| self.field_to_df_expr(tz, &field, plan, schema))
+            .map(|field| self.field_to_df_expr(tz, fill, &field, plan, schema))
             .collect()
     }
 
@@ -1935,11 +2027,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn field_to_df_expr(
         &self,
         tz: &Option<Arc<str>>,
+        fill: &Option<FillClause>,
         field: &Field,
         plan: &LogicalPlan,
         schema: &IQLSchema<'_>,
     ) -> Result<Expr> {
-        let expr = self.expr_to_df_expr(tz, ExprScope::Projection, &field.expr, schema)?;
+        let expr = self.expr_to_df_expr(
+            tz,
+            &Some(VirtualColumnFillConfig {
+                fill_clause: *fill,
+                data_type: field.data_type,
+            }),
+            // fill,
+            // &field.data_type,
+            ExprScope::Projection,
+            &field.expr,
+            schema,
+        )?;
         let expr = planner_rewrite_expression::rewrite_field_expr(expr, schema)?;
         normalize_col(expr.data.alias(&field.name), plan)
     }
@@ -1953,7 +2057,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     ) -> Result<Expr> {
         match iql {
             ConditionalExpression::Expr(expr) => {
-                self.expr_to_df_expr(tz, ExprScope::Where, expr, schema)
+                self.expr_to_df_expr(tz, &None, ExprScope::Where, expr, schema)
             }
             ConditionalExpression::Binary(expr) => {
                 self.binary_conditional_to_df_expr(tz, expr, schema)
@@ -1982,6 +2086,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn expr_to_df_expr(
         &self,
         tz: &Option<Arc<str>>,
+        fill_config: &Option<VirtualColumnFillConfig>,
         scope: ExprScope,
         iql: &IQLExpr,
         schema: &IQLSchema<'_>,
@@ -2036,7 +2141,46 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                                 None => column,
                             }
                         }
-                        _ => Expr::Literal(ScalarValue::Null),
+                        _ => {
+                            // For non-existent columns, we need to check if the user specified a gap-filling value.
+                            // See [`VirtualColumnFillConfig`] for more details.
+                            match fill_config {
+                                Some(VirtualColumnFillConfig {
+                                    fill_clause: Some(FillClause::Value(n)),
+                                    data_type,
+                                }) => {
+                                    // The user specified a gap-filling value
+                                    match data_type {
+                                        Some(InfluxColumnType::Field(InfluxFieldType::Integer)) => {
+                                            Expr::Literal(number_to_scalar(n, &DataType::Int64)?)
+                                        }
+                                        Some(InfluxColumnType::Field(InfluxFieldType::Float)) => {
+                                            // Expr::Literal(number_to_scalar(n, &DataType::Float64)?)
+                                            Expr::Literal(number_to_scalar(n, &DataType::Float64)?)
+                                        }
+                                        Some(InfluxColumnType::Tag) => {
+                                            // Do not gap-fill tags
+                                            Expr::Literal(ScalarValue::Null)
+                                        }
+                                        _ => {
+                                            match n {
+                                                // Default to the data type of the gap-filling value
+                                                Number::Integer(_) => Expr::Literal(
+                                                    number_to_scalar(n, &DataType::Int64)?,
+                                                ),
+                                                Number::Float(_) => Expr::Literal(
+                                                    number_to_scalar(n, &DataType::Float64)?,
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // No gap-filling config or value, return NULL
+                                    Expr::Literal(ScalarValue::Null)
+                                }
+                            }
+                        }
                     },
                 })
             }
@@ -2066,9 +2210,11 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             },
             // A DISTINCT <ident> clause should have been replaced by `rewrite_statement`.
             IQLExpr::Distinct(_) => error::internal("distinct expression"),
-            IQLExpr::Call(call) => self.call_to_df_expr(tz, scope, call, schema),
-            IQLExpr::Binary(expr) => self.arithmetic_expr_to_df_expr(tz, scope, expr, schema),
-            IQLExpr::Nested(e) => self.expr_to_df_expr(tz, scope, e, schema),
+            IQLExpr::Call(call) => self.call_to_df_expr(tz, fill_config, scope, call, schema),
+            IQLExpr::Binary(expr) => {
+                self.arithmetic_expr_to_df_expr(tz, fill_config, scope, expr, schema)
+            }
+            IQLExpr::Nested(e) => self.expr_to_df_expr(tz, fill_config, scope, e, schema),
         }
     }
 
@@ -2091,12 +2237,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn call_to_df_expr(
         &self,
         tz: &Option<Arc<str>>,
+        fill_config: &Option<VirtualColumnFillConfig>,
         scope: ExprScope,
         call: &Call,
         schema: &IQLSchema<'_>,
     ) -> Result<Expr> {
         if is_scalar_math_function(call.name.as_str()) {
-            return self.scalar_math_func_to_df_expr(tz, scope, call, schema);
+            return self.scalar_math_func_to_df_expr(tz, fill_config, scope, call, schema);
         }
 
         match scope {
@@ -2108,13 +2255,14 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     error::query(format!("invalid function call in condition: {name}"))
                 }
             }
-            ExprScope::Projection => self.function_to_df_expr(tz, scope, call, schema),
+            ExprScope::Projection => self.function_to_df_expr(tz, fill_config, scope, call, schema),
         }
     }
 
     fn function_to_df_expr(
         &self,
         tz: &Option<Arc<str>>,
+        fill_config: &Option<VirtualColumnFillConfig>,
         scope: ExprScope,
         call: &Call,
         schema: &IQLSchema<'_>,
@@ -2146,22 +2294,42 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
         }
 
+        fn is_literal_null_or_number(expr: &Expr) -> bool {
+            matches!(
+                expr,
+                Expr::Literal(ScalarValue::Null | ScalarValue::Int64(_) | ScalarValue::Float64(_),)
+            )
+        }
+
         let Call { name, args } = call;
 
         match name.as_str() {
             // The DISTINCT function is handled as a `ProjectionType::RawDistinct`
             // query, so the planner only needs to project the single column
             // argument.
-            "distinct" => self.expr_to_df_expr(tz, scope, &args[0], schema),
+            "distinct" => self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema),
             "count" => {
                 let count = count_udaf();
                 let (expr, distinct) = match &args[0] {
-                    IQLExpr::Call(c) if c.name == "distinct" => {
-                        (self.expr_to_df_expr(tz, scope, &c.args[0], schema)?, true)
-                    }
-                    expr => (self.expr_to_df_expr(tz, scope, expr, schema)?, false),
+                    IQLExpr::Call(c) if c.name == "distinct" => (
+                        self.expr_to_df_expr(tz, fill_config, scope, &c.args[0], schema)?,
+                        true,
+                    ),
+                    expr => (
+                        self.expr_to_df_expr(tz, fill_config, scope, expr, schema)?,
+                        false,
+                    ),
                 };
-                if let Expr::Literal(ScalarValue::Null) = expr {
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(count(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2177,8 +2345,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
             "sum" => {
                 let sum = sum_udaf();
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(sum(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2194,8 +2371,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
             "stddev" => {
                 let stddev = stddev_udaf();
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(stddev(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2211,8 +2397,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
             "mean" => {
                 let mean = avg_udaf();
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(mean(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2228,8 +2423,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
             "median" => {
                 let median = median_udaf();
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(median(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2244,8 +2448,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 }))
             }
             "mode" => {
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(mode(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2260,13 +2473,22 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 }))
             }
             "percentile" => {
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(percentile(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
                 check_arg_count(name, args, 2)?;
-                let nexpr = self.expr_to_df_expr(tz, scope, &args[1], schema)?;
+                let nexpr = self.expr_to_df_expr(tz, fill_config, scope, &args[1], schema)?;
                 Ok(Expr::AggregateFunction(expr::AggregateFunction {
                     func: PERCENTILE.clone(),
                     args: vec![expr, nexpr],
@@ -2277,8 +2499,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 }))
             }
             "spread" => {
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(spread(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2293,8 +2524,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 }))
             }
             name @ ("first" | "last" | "min" | "max") => {
-                let expr = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = expr {
+                let expr = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(first(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&expr) {
                     return Ok(expr);
                 }
 
@@ -2313,8 +2553,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count(name, args, 1)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(difference(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
 
@@ -2324,14 +2573,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count_range(name, args, 1, 2)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(elapsed(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
 
                 let mut eargs = vec![arg0];
                 if args.len() > 1 {
-                    let arg1 = self.expr_to_df_expr(tz, scope, &args[1], schema)?;
+                    let arg1 = self.expr_to_df_expr(tz, fill_config, scope, &args[1], schema)?;
                     eargs.push(arg1);
                 }
 
@@ -2341,8 +2599,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count(name, args, 1)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(non_negative_difference(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
 
@@ -2352,14 +2619,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count(name, args, 2)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(moving_average(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
 
                 // arg1 should be an integer.
                 let arg1 = ScalarValue::Int64(Some(
-                    match self.expr_to_df_expr(tz, scope, &args[1], schema)? {
+                    match self.expr_to_df_expr(tz, fill_config, scope, &args[1], schema)? {
                         Expr::Literal(ScalarValue::Int64(Some(v))) => v,
                         Expr::Literal(ScalarValue::UInt64(Some(v))) => v as i64,
                         _ => {
@@ -2376,13 +2652,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count_range(name, args, 1, 2)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(derivative(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
+
                 let mut eargs = vec![arg0];
                 if args.len() > 1 {
-                    let arg1 = self.expr_to_df_expr(tz, scope, &args[1], schema)?;
+                    let arg1 = self.expr_to_df_expr(tz, fill_config, scope, &args[1], schema)?;
                     eargs.push(arg1);
                 }
 
@@ -2392,13 +2678,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count_range(name, args, 1, 2)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(non_negative_derivative(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
+
                 let mut eargs = vec![arg0];
                 if args.len() > 1 {
-                    let arg1 = self.expr_to_df_expr(tz, scope, &args[1], schema)?;
+                    let arg1 = self.expr_to_df_expr(tz, fill_config, scope, &args[1], schema)?;
                     eargs.push(arg1);
                 }
 
@@ -2408,8 +2704,17 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 check_arg_count(name, args, 1)?;
 
                 // arg0 should be a column or function
-                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
-                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                let arg0 = self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema)?;
+
+                // If the expression is a Null or a literal number, we can return it directly
+                // without needing to create an aggregate function.
+                //
+                // So the query plan will look like:
+                //  Int64(NULL)
+                //
+                // Without this check, the query plan will look like:
+                //  coalesce_struct(cumulative_sum(Int64(NULL)), Int64(X))
+                if is_literal_null_or_number(&arg0) {
                     return Ok(arg0);
                 }
 
@@ -2418,7 +2723,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             // The TOP/BOTTOM function is handled as a `ProjectionType::TopBottomSelector`
             // query, so the planner only needs to project the single column
             // argument.
-            "top" | "bottom" => self.expr_to_df_expr(tz, scope, &args[0], schema),
+            "top" | "bottom" => self.expr_to_df_expr(tz, fill_config, scope, &args[0], schema),
 
             _ => error::query(format!("Invalid function '{name}'")),
         }
@@ -2428,6 +2733,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn scalar_math_func_to_df_expr(
         &self,
         tz: &Option<Arc<str>>,
+        fill_config: &Option<VirtualColumnFillConfig>,
         scope: ExprScope,
         call: &Call,
         schema: &IQLSchema<'a>,
@@ -2435,7 +2741,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let mut args = call
             .args
             .iter()
-            .map(|e| self.expr_to_df_expr(tz, scope, e, schema))
+            .map(|e| self.expr_to_df_expr(tz, fill_config, scope, e, schema))
             .collect::<Result<Vec<Expr>>>()?;
 
         let func = self
@@ -2506,14 +2812,15 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     fn arithmetic_expr_to_df_expr(
         &self,
         tz: &Option<Arc<str>>,
+        fill_config: &Option<VirtualColumnFillConfig>,
         scope: ExprScope,
         expr: &Binary,
         schema: &IQLSchema<'_>,
     ) -> Result<Expr> {
         Ok(binary_expr(
-            self.expr_to_df_expr(tz, scope, &expr.lhs, schema)?,
+            self.expr_to_df_expr(tz, fill_config, scope, &expr.lhs, schema)?,
             binary_operator_to_df_operator(expr.op),
-            self.expr_to_df_expr(tz, scope, &expr.rhs, schema)?,
+            self.expr_to_df_expr(tz, fill_config, scope, &expr.rhs, schema)?,
         ))
     }
 
@@ -3663,7 +3970,7 @@ fn find_var_refs(select: &Select) -> BTreeSet<&VarRef> {
     let mut var_refs = BTreeSet::new();
 
     for f in &select.fields {
-        walk_expr(&f.expr, &mut |e| {
+        let _ = walk_expr(&f.expr, &mut |e| {
             if let IQLExpr::VarRef(vr) = e {
                 var_refs.insert(vr);
             }
@@ -3672,7 +3979,7 @@ fn find_var_refs(select: &Select) -> BTreeSet<&VarRef> {
     }
 
     if let Some(condition) = &select.condition {
-        walk_expression(condition, &mut |e| match e {
+        let _ = walk_expression(condition, &mut |e| match e {
             Expression::Arithmetic(e) => walk_expr(e, &mut |e| {
                 if let IQLExpr::VarRef(vr) = e {
                     var_refs.insert(vr);
@@ -3730,7 +4037,7 @@ fn filter_window_nulls(plan: LogicalPlan) -> Result<LogicalPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::test_utils::{parse_select, MockSchemaProvider};
+    use crate::plan::test_utils::{MockSchemaProvider, parse_select};
     use influxdb_influxql_parser::parse_statements;
     use insta::assert_snapshot;
     use schema::SchemaBuilder;

@@ -1,16 +1,16 @@
 use futures::FutureExt;
 use generated_types::{
+    Request, Response, Status,
     influxdata::iox::authz::v1::{
+        AuthorizeRequest, AuthorizeResponse, Permission, ResourceActionPermission,
         iox_authorizer_service_server::{IoxAuthorizerService, IoxAuthorizerServiceServer},
         permission::PermissionOneOf,
         resource_action_permission::{Action, ResourceType, Target},
-        AuthorizeRequest, AuthorizeResponse, Permission, ResourceActionPermission,
     },
-    transport::{self, server::TcpIncoming, Server},
-    Request, Response, Status,
+    transport::{self, Server, server::TcpIncoming},
 };
 use observability_deps::tracing::{error, info};
-use rand::{distr::Alphanumeric, rng, Rng};
+use rand::{Rng, distr::Alphanumeric, rng};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -19,7 +19,7 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::oneshot,
-    task::{spawn, JoinHandle},
+    task::{JoinHandle, spawn},
 };
 
 #[derive(Debug)]
