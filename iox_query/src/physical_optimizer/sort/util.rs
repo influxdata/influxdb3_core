@@ -1,22 +1,23 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    provider::{progressive_eval::ProgressiveEvalExec, DeduplicateExec},
+    provider::{DeduplicateExec, progressive_eval::ProgressiveEvalExec},
     statistics::{column_statistics_min_max, compute_stats_column_min_max, overlap},
 };
-use arrow::compute::{rank, SortOptions};
+use arrow::compute::{SortOptions, rank};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
-    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     error::{DataFusionError, Result},
     physical_expr::{LexOrdering, PhysicalSortExpr},
     physical_plan::{
+        ExecutionPlan, ExecutionPlanVisitor,
         expressions::{Column, Literal},
         limit::LocalLimitExec,
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor,
+        visit_execution_plan,
     },
     scalar::ScalarValue,
 };

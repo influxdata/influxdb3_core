@@ -25,9 +25,9 @@ pub use service_limits::*;
 
 use generated_types::google::protobuf as google;
 use generated_types::influxdata::iox::{
-    catalog::v1 as catalog_proto, catalog_storage::v1 as catalog_storage_proto,
+    Target, catalog::v1 as catalog_proto, catalog_storage::v1 as catalog_storage_proto,
     schema::v1 as schema_proto, skipped_compaction::v1 as skipped_compaction_proto,
-    table::v1 as table_proto, Target,
+    table::v1 as table_proto,
 };
 use iox_time::Time;
 use observability_deps::tracing::warn;
@@ -2129,7 +2129,7 @@ impl TableSummary {
     pub fn size(&self) -> usize {
         let size: usize = self.columns.iter().map(|c| c.size()).sum();
         size + mem::size_of::<Self>() // Add size of this struct that points to
-                                      // table and ColumnSummary
+        // table and ColumnSummary
     }
 
     /// Extracts min/max values of the timestamp column, if possible

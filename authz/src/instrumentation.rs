@@ -80,7 +80,7 @@ where
 mod test {
     use std::collections::VecDeque;
 
-    use metric::{assert_histogram, Attributes, Registry};
+    use metric::{Attributes, Registry, assert_histogram};
     use parking_lot::Mutex;
 
     use super::*;

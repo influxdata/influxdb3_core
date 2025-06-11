@@ -2,14 +2,14 @@
 //!
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-field-keys
 
-use crate::common::{limit_clause, offset_clause, ws1, LimitClause, OffsetClause};
-use crate::internal::{expect, ParseResult};
+use crate::common::{LimitClause, OffsetClause, limit_clause, offset_clause, ws1};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::show::{on_clause, OnClause};
-use crate::simple_from_clause::{show_from_clause, ShowFromClause};
+use crate::show::{OnClause, on_clause};
+use crate::simple_from_clause::{ShowFromClause, show_from_clause};
+use nom::Parser;
 use nom::combinator::opt;
 use nom::sequence::preceded;
-use nom::Parser;
 use std::fmt;
 use std::fmt::Formatter;
 

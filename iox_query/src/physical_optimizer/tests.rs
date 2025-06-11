@@ -10,7 +10,7 @@ use datafusion::{
     common::DFSchema,
     datasource::provider_as_source,
     functions_aggregate::expr_fn::count,
-    logical_expr::{col, lit, Expr, ExprSchemable, LogicalPlanBuilder},
+    logical_expr::{Expr, ExprSchemable, LogicalPlanBuilder, col, lit},
     scalar::ScalarValue,
 };
 use executor::DedicatedExecutor;
@@ -18,10 +18,10 @@ use schema::sort::SortKey;
 use test_helpers::maybe_start_logging;
 
 use crate::{
+    QueryChunk,
     exec::{Executor, ExecutorConfig},
     provider::ProviderBuilder,
-    test::{format_execution_plan, TestChunk},
-    QueryChunk,
+    test::{TestChunk, format_execution_plan},
 };
 
 /// Test that reconstructs specific case where parquet files may unnecessarily be sorted.

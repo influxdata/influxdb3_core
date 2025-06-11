@@ -25,7 +25,7 @@ use datafusion::{
         memory_pool::{MemoryPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
-    logical_expr::{expr_rewriter::normalize_col, Expr, Extension, LogicalPlan},
+    logical_expr::{Expr, Extension, LogicalPlan, expr_rewriter::normalize_col},
 };
 
 pub use context::{
@@ -411,13 +411,13 @@ mod tests {
         error::DataFusionError,
         physical_expr::{EquivalenceProperties, PhysicalSortExpr},
         physical_plan::{
+            DisplayAs, ExecutionPlan, PlanProperties, RecordBatchStream,
             execution_plan::{Boundedness, EmissionType},
             expressions::Column,
             sorts::sort::SortExec,
-            DisplayAs, ExecutionPlan, PlanProperties, RecordBatchStream,
         },
     };
-    use futures::{stream::BoxStream, Stream, StreamExt};
+    use futures::{Stream, StreamExt, stream::BoxStream};
     use metric::{Observation, RawReporter};
 
     use tokio::sync::Barrier;

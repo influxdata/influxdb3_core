@@ -6,17 +6,17 @@ use crate::aggregate::{MODE, PERCENTILE, SPREAD};
 use crate::error;
 use crate::plan::ir::{DataSource, Field, Interval, Select, SelectQuery};
 use crate::plan::planner::select::{
-    fields_to_exprs_no_nulls, make_tag_key_column_meta, plan_with_sort, ProjectionInfo, Selector,
-    SelectorWindowOrderBy,
+    ProjectionInfo, Selector, SelectorWindowOrderBy, fields_to_exprs_no_nulls,
+    make_tag_key_column_meta, plan_with_sort,
 };
 use crate::plan::planner::source_field_names::SourceFieldNamesVisitor;
 use crate::plan::planner_time_range_expression::time_range_to_df_expr;
-use crate::plan::rewriter::{find_table_names, rewrite_statement, ProjectionType};
+use crate::plan::rewriter::{ProjectionType, find_table_names, rewrite_statement};
 use crate::plan::udf::{
     cumulative_sum, derivative, difference, elapsed, find_window_udfs, moving_average,
     non_negative_derivative, non_negative_difference,
 };
-use crate::plan::util::{binary_operator_to_df_operator, rebase_expr, IQLSchema};
+use crate::plan::util::{IQLSchema, binary_operator_to_df_operator, rebase_expr};
 use crate::plan::var_ref::var_ref_data_type_to_data_type;
 use crate::plan::{planner_rewrite_expression, udf};
 use crate::window::{
@@ -31,7 +31,7 @@ use arrow::datatypes::{DataType, Field as ArrowField, Int32Type, Schema as Arrow
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, ToDFSchema};
-use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::datetime::date_bin::DateBinFunc;
 use datafusion::functions::{core::expr_ext::FieldAccessor, expr_fn::now};
@@ -41,26 +41,26 @@ use datafusion::functions_aggregate::{
 };
 use datafusion::functions_array::expr_fn::make_array;
 use datafusion::functions_window::row_number::row_number_udwf;
+use datafusion::logical_expr::SortExpr;
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::normalize_col;
-use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::logical_plan::Analyze;
+use datafusion::logical_expr::logical_plan::builder::project;
 use datafusion::logical_expr::utils::{disjunction, expr_as_column_expr, find_aggregate_exprs};
-use datafusion::logical_expr::SortExpr;
 use datafusion::logical_expr::{
-    binary_expr, col, expr, expr::WindowFunction, lit, AggregateUDF, Between, Distinct,
-    EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
-    Operator, PlanType, Projection, ScalarUDF, TableSource, ToStringifiedPlan, Union, WindowFrame,
-    WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
+    AggregateUDF, Between, Distinct, EmptyRelation, Explain, Expr, ExprSchemable, Extension,
+    LogicalPlan, LogicalPlanBuilder, Operator, PlanType, Projection, ScalarUDF, TableSource,
+    ToStringifiedPlan, Union, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowFunctionDefinition, binary_expr, col, expr, expr::WindowFunction, lit,
 };
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{cast, lit_timestamp_nano, when, Column, ExprFunctionExt};
+use datafusion::prelude::{Column, ExprFunctionExt, cast, lit_timestamp_nano, when};
 use datafusion::sql::TableReference;
-use datafusion_util::{lit_dict, AsExpr};
+use datafusion_util::{AsExpr, lit_dict};
 use generated_types::influxdata::iox::querier::v1::InfluxQlMetadata;
 use influxdb_influxql_parser::common::{LimitClause, OffsetClause, OrderByClause};
 use influxdb_influxql_parser::explain::{ExplainOption, ExplainStatement};
-use influxdb_influxql_parser::expression::walk::{walk_expr, walk_expression, Expression};
+use influxdb_influxql_parser::expression::walk::{Expression, walk_expr, walk_expression};
 use influxdb_influxql_parser::expression::{
     Binary, Call, ConditionalBinary, ConditionalExpression, ConditionalOperator, VarRef,
     VarRefDataType,
@@ -68,7 +68,7 @@ use influxdb_influxql_parser::expression::{
 use influxdb_influxql_parser::functions::{
     is_aggregate_function, is_now_function, is_scalar_math_function,
 };
-use influxdb_influxql_parser::parameter::{replace_bind_params_with_values, BindParameterError};
+use influxdb_influxql_parser::parameter::{BindParameterError, replace_bind_params_with_values};
 use influxdb_influxql_parser::select::{FillClause, GroupByClause};
 use influxdb_influxql_parser::show_field_keys::ShowFieldKeysStatement;
 use influxdb_influxql_parser::show_measurements::{
@@ -78,7 +78,7 @@ use influxdb_influxql_parser::show_retention_policies::ShowRetentionPoliciesStat
 use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
 use influxdb_influxql_parser::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
 use influxdb_influxql_parser::simple_from_clause::ShowFromClause;
-use influxdb_influxql_parser::time_range::{split_cond, ReduceContext, TimeRange};
+use influxdb_influxql_parser::time_range::{ReduceContext, TimeRange, split_cond};
 use influxdb_influxql_parser::timestamp::Timestamp;
 use influxdb_influxql_parser::visit::Visitable;
 use influxdb_influxql_parser::{
@@ -91,23 +91,23 @@ use influxdb_influxql_parser::{
 use iox_query::analyzer::default_return_value_for_aggr_fn;
 use iox_query::analyzer::range_predicate::find_time_range;
 use iox_query::config::{IoxConfigExt, MetadataCutoff};
-use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use iox_query::exec::IOxSessionContext;
+use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
 use iox_query_params::StatementParams;
 use itertools::Itertools;
 use observability_deps::tracing::debug;
-use query_functions::date_bin_wallclock::expr_fn::date_bin_wallclock;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
+use query_functions::date_bin_wallclock::expr_fn::date_bin_wallclock;
 use query_functions::{
     clean_non_meta_escapes,
     selectors::{selector_first, selector_last, selector_max, selector_min},
     tz::TZ_UDF,
 };
 use schema::{
-    InfluxColumnType, InfluxFieldType, Schema, INFLUXQL_MEASUREMENT_COLUMN_NAME,
-    INFLUXQL_METADATA_KEY, TIME_DATA_TIMEZONE,
+    INFLUXQL_MEASUREMENT_COLUMN_NAME, INFLUXQL_METADATA_KEY, InfluxColumnType, InfluxFieldType,
+    Schema, TIME_DATA_TIMEZONE,
 };
-use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fmt::Debug;
 use std::iter;
 use std::ops::{Bound, ControlFlow, Deref, Range};
@@ -1821,19 +1821,21 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 fields_to_exprs_no_nulls(input.schema(), group_by_tag_set).collect::<Vec<_>>()
             };
 
-            let window_func_exprs = vec![Expr::WindowFunction(WindowFunction::new(
-                WindowFunctionDefinition::WindowUDF(row_number_udwf()),
-                vec![],
-            ))
-            .partition_by(partition_by)
-            .order_by(order_by)
-            .window_frame(WindowFrame::new_bounds(
-                WindowFrameUnits::Rows,
-                WindowFrameBound::Preceding(ScalarValue::Null),
-                WindowFrameBound::CurrentRow,
-            ))
-            .build()?
-            .alias(IOX_ROW_ALIAS)];
+            let window_func_exprs = vec![
+                Expr::WindowFunction(WindowFunction::new(
+                    WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+                    vec![],
+                ))
+                .partition_by(partition_by)
+                .order_by(order_by)
+                .window_frame(WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(ScalarValue::Null),
+                    WindowFrameBound::CurrentRow,
+                ))
+                .build()?
+                .alias(IOX_ROW_ALIAS),
+            ];
 
             // Prepare new projection.
             let proj_exprs = input
@@ -3730,7 +3732,7 @@ fn filter_window_nulls(plan: LogicalPlan) -> Result<LogicalPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::test_utils::{parse_select, MockSchemaProvider};
+    use crate::plan::test_utils::{MockSchemaProvider, parse_select};
     use influxdb_influxql_parser::parse_statements;
     use insta::assert_snapshot;
     use schema::SchemaBuilder;

@@ -1,12 +1,12 @@
 //! Process InfluxQL time range expressions
 //!
-use crate::expression::walk::{walk_expression, Expression};
+use crate::expression::walk::{Expression, walk_expression};
 use crate::expression::{
-    lit, Binary, BinaryOperator, ConditionalBinary, ConditionalExpression, Expr, VarRef,
+    Binary, BinaryOperator, ConditionalBinary, ConditionalExpression, Expr, VarRef, lit,
 };
 use crate::functions::is_now_function;
-use crate::literal::{nanos_to_timestamp, Duration, Literal};
-use crate::timestamp::{parse_timestamp, Timestamp};
+use crate::literal::{Duration, Literal, nanos_to_timestamp};
+use crate::timestamp::{Timestamp, parse_timestamp};
 use std::ops::ControlFlow;
 
 /// Result type for operations that return an [`Expr`] and could result in an [`ExprError`].
@@ -740,8 +740,8 @@ fn map_expr_err(expr: &Expr) -> impl Fn(ExprError) -> ExprError + '_ {
 mod test {
     use crate::expression::ConditionalExpression;
     use crate::time_range::{
-        duration_expr_to_nanoseconds, reduce_time_expr, split_cond, ExprError, ExprResult,
-        ReduceContext, TimeRange,
+        ExprError, ExprResult, ReduceContext, TimeRange, duration_expr_to_nanoseconds,
+        reduce_time_expr, split_cond,
     };
     use crate::timestamp::Timestamp;
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Offset, Utc};

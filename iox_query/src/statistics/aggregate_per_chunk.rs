@@ -11,7 +11,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
+use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
 
 /// During the initial partition pruning pass (driving statistics from partition
 /// keys), the row count and null count statistics for each partition

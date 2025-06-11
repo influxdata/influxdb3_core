@@ -6,7 +6,7 @@
 #![expect(unused_crate_dependencies)]
 
 use logfmt::LogFmtLayer;
-use observability_deps::tracing::{debug, error, info, span, trace, warn, Level};
+use observability_deps::tracing::{Level, debug, error, info, span, trace, warn};
 use parking_lot::Mutex;
 use regex::Regex;
 use std::{

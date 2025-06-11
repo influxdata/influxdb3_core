@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use metric::{Attributes, DurationHistogram, MakeMetricObserver, U64Counter, U64Gauge};
 use pin_project::{pin_project, pinned_drop};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -473,7 +473,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::{pin, sync::Barrier};
-    use trace::{ctx::SpanContext, span::SpanStatus, RingBufferTraceCollector};
+    use trace::{RingBufferTraceCollector, ctx::SpanContext, span::SpanStatus};
 
     use super::*;
 
@@ -771,10 +771,12 @@ mod tests {
         assert_eq!(span_acquire.events.len(), 0);
         assert_eq!(span_acquire.ctx.parent_span_id, Some(span_all.ctx.span_id));
 
-        assert!(!traces
-            .spans()
-            .into_iter()
-            .any(|s| s.name == SPAN_NAME_PERMIT));
+        assert!(
+            !traces
+                .spans()
+                .into_iter()
+                .any(|s| s.name == SPAN_NAME_PERMIT)
+        );
     }
 
     /// Check that a given object implements [`Send`].

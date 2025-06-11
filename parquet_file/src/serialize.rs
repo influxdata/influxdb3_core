@@ -16,11 +16,11 @@ use datafusion::{
         file_format::parquet::ParquetSink, listing::ListingTableUrl, physical_plan::FileSinkConfig,
     },
     error::DataFusionError,
-    execution::{memory_pool::MemoryPool, runtime_env::RuntimeEnv, TaskContext},
-    physical_plan::{insert::DataSink, SendableRecordBatchStream},
+    execution::{TaskContext, memory_pool::MemoryPool, runtime_env::RuntimeEnv},
+    physical_plan::{SendableRecordBatchStream, insert::DataSink},
 };
-use datafusion_util::config::{table_parquet_options, BATCH_SIZE};
-use futures::{pin_mut, TryStreamExt};
+use datafusion_util::config::{BATCH_SIZE, table_parquet_options};
+use futures::{TryStreamExt, pin_mut};
 use observability_deps::tracing::{debug, trace, warn};
 use parquet::{
     arrow::ARROW_SCHEMA_META_KEY,
@@ -388,7 +388,7 @@ mod tests {
         common::file_options::parquet_writer::ParquetWriterOptions,
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
     };
-    use datafusion_util::{unbounded_memory_pool, MemoryStream};
+    use datafusion_util::{MemoryStream, unbounded_memory_pool};
     use iox_time::Time;
     use parquet::schema::types::ColumnPath;
     use std::sync::Arc;

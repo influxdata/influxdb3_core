@@ -4,7 +4,7 @@ use crate::exec::IOxSessionContext;
 use crate::memory_pool::Monitor;
 use crate::physical_optimizer::ParquetFileMetrics;
 use data_types::NamespaceId;
-use datafusion::physical_plan::{metrics::MetricValue, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, metrics::MetricValue};
 use iox_query_params::StatementParams;
 use iox_time::{Time, TimeProvider};
 use metric::{
@@ -18,8 +18,8 @@ use std::{
     fmt::Debug,
     ops::DerefMut,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -1282,8 +1282,8 @@ mod test_super {
     use std::sync::atomic::AtomicU64;
 
     use datafusion::physical_plan::{
-        metrics::{MetricValue, MetricsSet},
         DisplayAs, Metric,
+        metrics::{MetricValue, MetricsSet},
     };
     use iox_time::MockProvider;
     use test_helpers::tracing::TracingCapture;

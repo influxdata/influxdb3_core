@@ -53,7 +53,7 @@ use std::{
 };
 
 use arrow::{
-    array::{as_boolean_array, Array, ArrayRef, BooleanArray},
+    array::{Array, ArrayRef, BooleanArray, as_boolean_array},
     compute::{self, filter_record_batch},
     datatypes::SchemaRef,
     record_batch::RecordBatch,
@@ -65,14 +65,14 @@ use datafusion::{
     execution::context::TaskContext,
     logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
     physical_plan::{
-        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
         ColumnarValue, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
         ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream, Statistics,
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
     },
     scalar::ScalarValue,
 };
-use datafusion_util::{watch::WatchedTask, AdapterStream};
+use datafusion_util::{AdapterStream, watch::WatchedTask};
 use futures::StreamExt;
 use observability_deps::tracing::*;
 use parking_lot::Mutex;

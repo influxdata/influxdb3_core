@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
-    common::{stats::Precision, ColumnStatistics, Statistics},
-    physical_expr::{analyze, intervals::utils::check_support, AnalysisContext, ExprBoundaries},
+    common::{ColumnStatistics, Statistics, stats::Precision},
+    physical_expr::{AnalysisContext, ExprBoundaries, analyze, intervals::utils::check_support},
     physical_plan::PhysicalExpr,
 };
 

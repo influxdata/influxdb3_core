@@ -5,17 +5,16 @@ use crate::{
 };
 use datafusion::{
     common::{
-        internal_datafusion_err,
+        HashMap, internal_datafusion_err,
         tree_node::{Transformed, TreeNodeRecursion},
-        HashMap,
     },
     datasource::{
         listing::{FileRange, PartitionedFile},
-        physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+        physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     },
     error::Result,
     physical_expr::LexOrdering,
-    physical_plan::{sorts::sort::SortExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, sorts::sort::SortExec},
 };
 use itertools::Itertools;
 use object_store::path::Path;
@@ -223,11 +222,11 @@ mod tests {
     use schema::sort::SortKey;
 
     use crate::{
+        QueryChunk,
         exec::{Executor, ExecutorConfig},
         physical_optimizer::sort::extract_ranges::min_max_for_partitioned_filegroup,
         provider::ProviderBuilder,
-        test::{format_execution_plan, TestChunk},
-        QueryChunk,
+        test::{TestChunk, format_execution_plan},
     };
 
     fn pretty_str_mins_maxes(mins_maxs: &[Option<(ScalarValue, ScalarValue)>]) -> String {
@@ -255,8 +254,8 @@ mod tests {
     ///     e.g. 8.parquet:0..25000000 then 8.parquet:25000000..100000000
     ///     `range.end` is exclusive
     ///
-    async fn build_test_case_with_nonoverlapping_ranged_scans(
-    ) -> (Arc<Schema>, LexOrdering, Arc<dyn ExecutionPlan>) {
+    async fn build_test_case_with_nonoverlapping_ranged_scans()
+    -> (Arc<Schema>, LexOrdering, Arc<dyn ExecutionPlan>) {
         // DF session setup
         let config = ExecutorConfig {
             target_query_partitions: 4.try_into().unwrap(),

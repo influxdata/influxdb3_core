@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use datafusion::common::{stats::Precision, Statistics};
+use datafusion::common::{Statistics, stats::Precision};
 
 use super::util::make_column_statistics_inexact;
 

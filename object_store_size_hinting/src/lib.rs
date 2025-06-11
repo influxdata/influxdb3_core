@@ -18,8 +18,8 @@ use std::{ops::Range, sync::Arc};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
-    path::Path, Error, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
+    Error, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 
 // Workaround for "unused crate" lint false positives.
@@ -198,7 +198,7 @@ impl ObjectStore for ObjectStoreStripSizeHinting {
 mod tests {
     use chrono::{TimeZone, Utc};
     use futures::StreamExt;
-    use object_store_mock::{object_meta, path, MockCall, MockStore, WrappedGetOptions, DATA};
+    use object_store_mock::{DATA, MockCall, MockStore, WrappedGetOptions, object_meta, path};
 
     use super::*;
 

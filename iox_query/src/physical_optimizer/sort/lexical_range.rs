@@ -5,7 +5,7 @@
 use arrow::array::ArrayRef;
 use arrow::compute::SortOptions;
 use arrow::row::{Row, RowConverter, Rows, SortField};
-use datafusion::common::{internal_err, Result, ScalarValue};
+use datafusion::common::{Result, ScalarValue, internal_err};
 use datafusion::error::DataFusionError;
 use observability_deps::tracing::trace;
 use std::fmt::Display;

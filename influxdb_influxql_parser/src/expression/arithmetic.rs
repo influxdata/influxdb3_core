@@ -1,21 +1,21 @@
 use crate::common::ws0;
 use crate::identifier::unquoted_identifier;
-use crate::internal::{expect, Error, ParseError, ParseResult};
+use crate::internal::{Error, ParseError, ParseResult, expect};
 use crate::keywords::keyword;
-use crate::literal::{literal_regex, Duration};
+use crate::literal::{Duration, literal_regex};
 use crate::timestamp::Timestamp;
 use crate::{
-    identifier::{identifier, Identifier},
+    identifier::{Identifier, identifier},
     literal::Literal,
     parameter::BindParameter,
 };
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{cut, map, opt, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{delimited, pair, preceded, separated_pair, terminated};
-use nom::Parser;
 use num_traits::cast;
 use std::fmt::{Display, Formatter, Write};
 use std::ops::Neg;

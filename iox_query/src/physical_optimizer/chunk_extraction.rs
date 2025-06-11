@@ -5,16 +5,16 @@ use datafusion::{
     datasource::physical_plan::ParquetExec,
     error::DataFusionError,
     physical_plan::{
-        empty::EmptyExec, placeholder_row::PlaceholderRowExec, union::UnionExec,
-        visit_execution_plan, ExecutionPlan, ExecutionPlanVisitor,
+        ExecutionPlan, ExecutionPlanVisitor, empty::EmptyExec, placeholder_row::PlaceholderRowExec,
+        union::UnionExec, visit_execution_plan,
     },
 };
 use observability_deps::tracing::debug;
 use schema::sort::SortKey;
 
 use crate::{
-    provider::{PartitionedFileExt, RecordBatchesExec},
     QueryChunk,
+    provider::{PartitionedFileExt, RecordBatchesExec},
 };
 
 /// List of [`QueryChunk`]s.
@@ -178,7 +178,7 @@ mod tests {
         prelude::{col, lit},
         scalar::ScalarValue,
     };
-    use schema::{merge::SchemaMerger, sort::SortKeyBuilder, SchemaBuilder, TIME_COLUMN_NAME};
+    use schema::{SchemaBuilder, TIME_COLUMN_NAME, merge::SchemaMerger, sort::SortKeyBuilder};
 
     use super::*;
 

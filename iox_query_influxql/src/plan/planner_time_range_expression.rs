@@ -1,6 +1,6 @@
 //! APIs for transforming InfluxQL [expressions][influxdb_influxql_parser::expression::Expr].
 use datafusion::{
-    logical_expr::{lit, Expr as DFExpr},
+    logical_expr::{Expr as DFExpr, lit},
     scalar::ScalarValue,
 };
 use datafusion_util::AsExpr;

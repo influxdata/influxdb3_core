@@ -2,14 +2,14 @@ use std::{borrow::Borrow, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
-    common::{internal_datafusion_err, stats::Precision, ColumnStatistics, Result, Statistics},
-    physical_plan::{expressions::Column, PhysicalExpr},
+    common::{ColumnStatistics, Result, Statistics, internal_datafusion_err, stats::Precision},
+    physical_plan::{PhysicalExpr, expressions::Column},
     scalar::ScalarValue,
 };
 use itertools::Itertools;
 
 use crate::{
-    chunk_order_field, statistics::partition_statistics::util::pretty_fmt_fields, CHUNK_ORDER_FIELD,
+    CHUNK_ORDER_FIELD, chunk_order_field, statistics::partition_statistics::util::pretty_fmt_fields,
 };
 
 /// Takes in a datasource schema and statistics, and projects the scan schema on top.
@@ -262,7 +262,7 @@ mod tests {
     use super::*;
     use crate::CHUNK_ORDER_COLUMN_NAME;
     use arrow::datatypes::{Field, Schema};
-    use datafusion::physical_plan::expressions::{col, NoOp};
+    use datafusion::physical_plan::expressions::{NoOp, col};
 
     fn build_schema(col_names: Vec<&str>) -> SchemaRef {
         let fields = col_names
@@ -552,9 +552,10 @@ mod tests {
             &project_schema,
         )
         .unwrap_err();
-        assert!(err
-            .message()
-            .contains("project index 1 out of bounds, max field 1"));
+        assert!(
+            err.message()
+                .contains("project index 1 out of bounds, max field 1")
+        );
 
         /* Test: errors for subset projection, when subset=[0] */
         let err = project_select_subset_of_column_statistics(

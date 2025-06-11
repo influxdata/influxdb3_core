@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::{internal_datafusion_err, stats::Precision, Result, Statistics},
+    common::{Result, Statistics, internal_datafusion_err, stats::Precision},
     datasource::physical_plan::ParquetExec,
     error::DataFusionError,
     physical_plan::{
+        ExecutionPlan, PhysicalExpr,
         coalesce_batches::CoalesceBatchesExec,
         coalesce_partitions::CoalescePartitionsExec,
         empty::EmptyExec,
@@ -16,7 +17,6 @@ use datafusion::{
         repartition::RepartitionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        ExecutionPlan, PhysicalExpr,
     },
 };
 use fetch::apply_fetch;
@@ -31,7 +31,7 @@ use util::{
     partition_count,
 };
 
-use crate::provider::{progressive_eval::ProgressiveEvalExec, DeduplicateExec, RecordBatchesExec};
+use crate::provider::{DeduplicateExec, RecordBatchesExec, progressive_eval::ProgressiveEvalExec};
 
 mod fetch;
 mod filter;
@@ -475,9 +475,9 @@ mod test {
     use std::fmt::{Display, Formatter};
 
     use crate::test::test_utils::{
-        coalesce_exec, crossjoin_exec, dedupe_exec, file_scan_config, filter_exec, limit_exec,
-        parquet_exec_with_sort_with_statistics, proj_exec, repartition_exec, single_column_schema,
-        sort_exec, spm_exec, union_exec, PartitionedFilesAndRanges, SortKeyRange,
+        PartitionedFilesAndRanges, SortKeyRange, coalesce_exec, crossjoin_exec, dedupe_exec,
+        file_scan_config, filter_exec, limit_exec, parquet_exec_with_sort_with_statistics,
+        proj_exec, repartition_exec, single_column_schema, sort_exec, spm_exec, union_exec,
     };
 
     use super::*;
@@ -492,10 +492,9 @@ mod test {
         logical_expr::Operator,
         physical_expr::{LexOrdering, PhysicalSortExpr},
         physical_plan::{
-            displayable,
-            expressions::{col, lit, BinaryExpr, IsNullExpr, NoOp},
+            Partitioning, displayable,
+            expressions::{BinaryExpr, IsNullExpr, NoOp, col, lit},
             union::InterleaveExec,
-            Partitioning,
         },
     };
     use insta::assert_snapshot;
@@ -1321,9 +1320,10 @@ mod test {
         let dedupe = dedupe_exec(&partitioned_input, &lex_ordering);
         let test_case = TestCase::new(&dedupe, col_name, None);
         let err = test_case.run().unwrap_err();
-        assert!(err
-            .message()
-            .contains("DeduplicateExec only supports a single input stream"));
+        assert!(
+            err.message()
+                .contains("DeduplicateExec only supports a single input stream")
+        );
     }
 
     /// How null counts are handled.
@@ -1743,7 +1743,7 @@ mod test {
         .build_arc() as _;
         let proj_c = col("c", &plan_schema)?; // plan_schema
         let proj_b = col("b", &plan_schema)?; // plan_schema
-                                              // plan reverses the 2 cols, c then b
+        // plan reverses the 2 cols, c then b
         let plan = proj_exec(
             &parquet_exec,
             vec![(proj_c, "c".into()), (proj_b, "b".into())],

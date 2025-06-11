@@ -1,7 +1,7 @@
-use crate::{error, NUMERICS};
+use crate::{NUMERICS, error};
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field};
-use datafusion::common::{downcast_value, DataFusionError, Result, ScalarValue};
+use datafusion::common::{DataFusionError, Result, ScalarValue, downcast_value};
 use datafusion::logical_expr::function::{
     ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
 };

@@ -103,7 +103,7 @@ mod test {
     use super::*;
     use arrow::array::{ArrayRef, StringArray};
     use datafusion::{common::assert_contains, execution::memory_pool::GreedyMemoryPool};
-    use rand::{distr::StandardUniform, rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, distr::StandardUniform, rngs::StdRng};
 
     /// Number of rows to trigger writer flush
     const TEST_MAX_ROW_GROUP_SIZE: usize = 100;
