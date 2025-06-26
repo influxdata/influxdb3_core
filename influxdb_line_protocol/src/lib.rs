@@ -75,6 +75,7 @@ pub mod builder;
 pub use builder::LineProtocolBuilder;
 #[cfg(feature = "v3")]
 pub mod v3;
+pub mod v4;
 
 use fmt::Display;
 use log::debug;
@@ -1101,7 +1102,7 @@ mod test {
     use test_helpers::approximately_equal;
 
     impl FieldValue<'_> {
-        fn unwrap_i64(&self) -> i64 {
+        pub(crate) fn unwrap_i64(&self) -> i64 {
             match self {
                 Self::I64(v) => *v,
                 _ => panic!("field was not an i64"),
