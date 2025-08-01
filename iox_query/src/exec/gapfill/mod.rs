@@ -663,7 +663,9 @@ impl ExecutionPlan for GapFillExec {
 impl DisplayAs for GapFillExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let group_expr: Vec<_> = self.group_expr.iter().map(|e| e.to_string()).collect();
                 let aggr_expr: Vec<_> = self
                     .params
@@ -886,7 +888,7 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_logical_plan(&plan),
             @r#"
-        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
+        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "   TableScan: temps"
         "#
         );

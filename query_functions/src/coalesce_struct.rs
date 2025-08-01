@@ -84,7 +84,7 @@ use arrow::{
 use datafusion::{
     common::{cast::as_struct_array, internal_err},
     error::{DataFusionError, Result},
-    logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, Volatility},
+    logical_expr::{ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     physical_plan::ColumnarValue,
     prelude::Expr,
     scalar::ScalarValue,
@@ -132,9 +132,9 @@ impl ScalarUDFImpl for CoalesceStructUDF {
         Ok(first_dt.clone())
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         #[expect(clippy::manual_try_fold)]
-        args.iter().enumerate().fold(Ok(None), |accu, (pos, arg)| {
+        args.args.iter().enumerate().fold(Ok(None), |accu, (pos, arg)| {
             let Some(accu) = accu? else {return Ok(Some(arg.clone()))};
 
             if accu.data_type() != arg.data_type() {

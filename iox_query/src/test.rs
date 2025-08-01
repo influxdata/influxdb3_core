@@ -40,7 +40,7 @@ use iox_time::SystemProvider;
 use itertools::Itertools;
 use object_store::{ObjectMeta, path::Path};
 use parking_lot::Mutex;
-use parquet_file::storage::ParquetExecInput;
+use parquet_file::storage::DataSourceExecInput;
 use schema::{
     Schema, TIME_COLUMN_NAME, builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey,
 };
@@ -210,7 +210,13 @@ impl QueryNamespace for TestDatabase {
         query_params: StatementParams,
         auth_id: Option<String>,
     ) -> QueryCompletedToken<StateReceived> {
-        QueryLog::new(0, Arc::new(SystemProvider::new()), &metric::Registry::new()).push(
+        QueryLog::new(
+            0,
+            Arc::new(SystemProvider::new()),
+            &metric::Registry::new(),
+            None,
+        )
+        .push(
             NamespaceId::new(1),
             Arc::from("ns"),
             query_type,
@@ -366,7 +372,7 @@ impl TableProvider for TestDatabaseTableProvider {
 #[derive(Debug, Clone)]
 enum TestChunkData {
     RecordBatches(Vec<RecordBatch>),
-    Parquet(ParquetExecInput),
+    Parquet(DataSourceExecInput),
 }
 
 #[derive(Debug, Clone)]
@@ -379,7 +385,7 @@ pub struct TestChunk {
 
     /// Values for stats()
     column_stats: HashMap<String, ColumnStatistics>,
-    num_rows: Option<usize>,
+    num_rows: Option<u64>,
 
     id: ChunkId,
 
@@ -442,6 +448,7 @@ macro_rules! impl_with_column_with_stats {
                 max_value: option_to_precision(max.map(|s| ScalarValue::from(s))),
                 min_value: option_to_precision(min.map(|s| ScalarValue::from(s))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             };
 
             self.add_schema_to_table(new_column_schema, Some(stats))
@@ -488,7 +495,7 @@ impl TestChunk {
         self.with_dummy_parquet_file_and_store("iox://store")
     }
 
-    pub fn with_dummy_parquet_file_and_size(self, size: usize) -> Self {
+    pub fn with_dummy_parquet_file_and_size(self, size: u64) -> Self {
         self.with_dummy_parquet_file_and_store_and_size("iox://store", size)
     }
 
@@ -496,7 +503,7 @@ impl TestChunk {
         self.with_dummy_parquet_file_and_store_and_size(store, 1)
     }
 
-    pub fn with_dummy_parquet_file_and_store_and_size(self, store: &str, size: usize) -> Self {
+    pub fn with_dummy_parquet_file_and_store_and_size(self, store: &str, size: u64) -> Self {
         match self.table_data {
             TestChunkData::RecordBatches(batches) => {
                 assert!(batches.is_empty(), "chunk already has record batches");
@@ -505,7 +512,7 @@ impl TestChunk {
         }
 
         Self {
-            table_data: TestChunkData::Parquet(ParquetExecInput {
+            table_data: TestChunkData::Parquet(DataSourceExecInput {
                 object_store_url: ObjectStoreUrl::parse(store).unwrap(),
                 object_store: Arc::new(object_store::memory::InMemory::new()),
                 object_meta: ObjectMeta {
@@ -591,7 +598,7 @@ impl TestChunk {
         min: Option<&str>,
         max: Option<&str>,
     ) -> Self {
-        self.with_tag_column_with_full_stats(column_name, min, max, 0, None)
+        self.with_tag_column_with_full_stats(column_name, min, max, None)
     }
 
     /// Register a tag column with stats with the test chunk
@@ -600,7 +607,6 @@ impl TestChunk {
         column_name: impl Into<String>,
         min: Option<&str>,
         max: Option<&str>,
-        count: u64,
         distinct_count: Option<NonZeroU64>,
     ) -> Self {
         let null_count = 0;
@@ -608,26 +614,22 @@ impl TestChunk {
             column_name,
             min,
             max,
-            count,
             distinct_count,
             null_count,
         )
     }
 
-    fn update_count(&mut self, count: usize) {
-        match self.num_rows {
-            Some(existing) => assert_eq!(existing, count),
-            None => self.num_rows = Some(count),
-        }
+    pub fn with_row_count(mut self, count: u64) -> Self {
+        self.num_rows = Some(count);
+        self
     }
 
     /// Register a tag column with stats with the test chunk
     pub fn with_tag_column_with_nulls_and_full_stats(
-        mut self,
+        self,
         column_name: impl Into<String>,
         min: Option<&str>,
         max: Option<&str>,
-        count: u64,
         distinct_count: Option<NonZeroU64>,
         null_count: u64,
     ) -> Self {
@@ -640,12 +642,22 @@ impl TestChunk {
         // Construct stats
         let stats = ColumnStatistics {
             null_count: Precision::Exact(null_count as usize),
-            max_value: option_to_precision(max.map(ScalarValue::from)),
-            min_value: option_to_precision(min.map(ScalarValue::from)),
+            max_value: option_to_precision(max.map(|v| {
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some(v.to_owned()))),
+                )
+            })),
+            min_value: option_to_precision(min.map(|v| {
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some(v.to_owned()))),
+                )
+            })),
             distinct_count: option_to_precision(distinct_count.map(|c| c.get() as usize)),
+            sum_value: Precision::Absent,
         };
 
-        self.update_count(count as usize);
         self.add_schema_to_table(new_column_schema, Some(stats))
     }
 
@@ -660,15 +672,14 @@ impl TestChunk {
 
     /// Register a timestamp column with the test chunk
     pub fn with_time_column_with_stats(self, min: Option<i64>, max: Option<i64>) -> Self {
-        self.with_time_column_with_full_stats(min, max, 0, None)
+        self.with_time_column_with_full_stats(min, max, None)
     }
 
     /// Register a timestamp column with full stats with the test chunk
     pub fn with_time_column_with_full_stats(
-        mut self,
+        self,
         min: Option<i64>,
         max: Option<i64>,
-        count: u64,
         distinct_count: Option<NonZeroU64>,
     ) -> Self {
         // make a new schema with the specified column and
@@ -682,9 +693,9 @@ impl TestChunk {
             max_value: option_to_precision(max.map(timestamptz_nano)),
             min_value: option_to_precision(min.map(timestamptz_nano)),
             distinct_count: option_to_precision(distinct_count.map(|c| c.get() as usize)),
+            sum_value: Precision::Absent,
         };
 
-        self.update_count(count as usize);
         self.add_schema_to_table(new_column_schema, Some(stats))
     }
 
@@ -735,6 +746,7 @@ impl TestChunk {
             max_value: option_to_precision(max.map(ScalarValue::from)),
             min_value: option_to_precision(min.map(ScalarValue::from)),
             distinct_count: Precision::Absent,
+            sum_value: Precision::Absent,
         };
 
         self.add_schema_to_table(new_column_schema, Some(stats))
@@ -1139,7 +1151,7 @@ impl QueryChunk for TestChunk {
         self.check_error().unwrap();
 
         Arc::new(DataFusionStatistics {
-            num_rows: option_to_precision(self.num_rows),
+            num_rows: option_to_precision(self.num_rows.map(|c| c as usize)),
             total_byte_size: Precision::Absent,
             column_statistics: self
                 .schema
@@ -1231,16 +1243,16 @@ pub(crate) mod test_utils {
     use arrow::datatypes::DataType;
     use arrow::datatypes::Field;
     use arrow::datatypes::SchemaRef;
-    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::catalog::memory::DataSourceExec;
     use datafusion::{
         common::{Statistics, stats::Precision},
         datasource::{
             listing::PartitionedFile,
-            physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
+            physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource},
         },
         physical_expr::LexOrdering,
         physical_plan::{
-            Partitioning, PhysicalExpr,
+            ExecutionPlan, Partitioning, PhysicalExpr,
             coalesce_batches::CoalesceBatchesExec,
             filter::FilterExec,
             joins::CrossJoinExec,
@@ -1255,6 +1267,7 @@ pub(crate) mod test_utils {
         datasource::object_store::ObjectStoreUrl, physical_plan::ColumnStatistics,
         scalar::ScalarValue,
     };
+    use datafusion_util::config::table_parquet_options;
     use itertools::Itertools;
 
     use std::{
@@ -1285,6 +1298,7 @@ pub(crate) mod test_utils {
                 max_value: Precision::Exact(ScalarValue::Int32(val.max)),
                 min_value: Precision::Exact(ScalarValue::Int32(val.min)),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             }
         }
     }
@@ -1300,11 +1314,11 @@ pub(crate) mod test_utils {
     }
 
     /// Create a single parquet, with a given ordering and using the statistics from the [`SortKeyRange`]
-    pub fn parquet_exec_with_sort_with_statistics(
+    pub fn data_source_exec_parquet_with_sort_with_statistics(
         output_ordering: Vec<LexOrdering>,
         key_ranges: &[&SortKeyRange],
     ) -> Arc<dyn ExecutionPlan> {
-        parquet_exec_with_sort_with_statistics_and_schema(
+        data_source_exec_parquet_with_sort_with_statistics_and_schema(
             &single_column_schema(),
             output_ordering,
             key_ranges,
@@ -1316,9 +1330,9 @@ pub(crate) mod test_utils {
         pub per_file: Vec<RangeForMultipleColumns>,
     }
 
-    /// Create a single parquet exec, with multiple parquet, with a given ordering and using the statistics from the [`SortKeyRange`].
+    /// Create a single `DataSourceExec`, with multiple parquet, with a given ordering and using the statistics from the [`SortKeyRange`].
     /// Assumes a single column schema.
-    pub fn parquet_exec_with_sort_with_statistics_and_schema(
+    pub fn data_source_exec_parquet_with_sort_with_statistics_and_schema(
         schema: &SchemaRef,
         output_ordering: Vec<LexOrdering>,
         key_ranges_for_single_column_multiple_files: &[&SortKeyRange], // VecPerFile<KeyForSingleColumn>
@@ -1330,23 +1344,24 @@ pub(crate) mod test_utils {
                 .collect_vec(),
         };
 
-        let file_scan_config = file_scan_config(schema, output_ordering, per_file_ranges);
+        let file_scan_config =
+            file_scan_config_builder(schema, output_ordering, per_file_ranges).build();
 
-        ParquetExecBuilder::new(file_scan_config).build_arc()
+        DataSourceExec::from_data_source(file_scan_config)
     }
 
     /// Create a file scan config with a given file [`SchemaRef`], ordering,
     /// and [`ColumnStatistics`] for multiple columns.
-    pub fn file_scan_config(
+    pub fn file_scan_config_builder(
         schema: &SchemaRef,
         output_ordering: Vec<LexOrdering>,
         multiple_column_key_ranges_per_file: PartitionedFilesAndRanges,
-    ) -> FileScanConfig {
+    ) -> FileScanConfigBuilder {
         let PartitionedFilesAndRanges { per_file } = multiple_column_key_ranges_per_file;
         let mut statistics = Statistics::new_unknown(schema);
         let mut file_groups = Vec::with_capacity(per_file.len());
 
-        // cummulative statistics for the entire parquet exec, per sort key
+        // cummulative statistics for the entire `DataSourceExec`, per sort key
         let num_sort_keys = per_file[0].len();
         let mut cum_null_count = vec![0; num_sort_keys];
         let mut cum_min = vec![None; num_sort_keys];
@@ -1372,7 +1387,7 @@ pub(crate) mod test_utils {
                     ..Default::default()
                 });
 
-                // update cummulative statistics for entire parquet exec
+                // update cummulative statistics for entire `DataSourceExec`
                 cum_min[col_idx] = match (cum_min[col_idx], min) {
                     (None, x) => x,
                     (x, None) => x,
@@ -1388,15 +1403,15 @@ pub(crate) mod test_utils {
 
             // Create single file with statistics.
             let mut file = PartitionedFile::new(format!("{file_idx}.parquet"), 100);
-            file.statistics = Some(Statistics {
+            file.statistics = Some(Arc::new(Statistics {
                 num_rows: Precision::Absent,
                 total_byte_size: Precision::Absent,
                 column_statistics: per_file_col_stats,
-            });
-            file_groups.push(vec![file]);
+            }));
+            file_groups.push(FileGroup::new(vec![file]));
         }
 
-        // add stats, for the whole parquet exec, for all columns
+        // add stats, for the whole `DataSourceExec`, for all columns
         for col_idx in 0..num_sort_keys {
             statistics.column_statistics[col_idx] = ColumnStatistics {
                 null_count: Precision::Exact(cum_null_count[col_idx]),
@@ -1406,9 +1421,10 @@ pub(crate) mod test_utils {
             };
         }
 
-        FileScanConfig::new(
+        FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test:///").unwrap(),
             Arc::clone(schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
         .with_file_groups(file_groups)
         .with_output_ordering(output_ordering)
@@ -1484,5 +1500,81 @@ pub(crate) mod test_utils {
         right: &Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(CrossJoinExec::new(Arc::clone(left), Arc::clone(right)))
+    }
+}
+
+#[cfg(test)]
+mod meta_test {
+    use super::*;
+
+    #[test]
+    fn test_chunk_stats() {
+        let chunk = TestChunk::new("table")
+            .with_row_count(42)
+            .with_bool_field_column_with_stats("field_b", Some(false), Some(true))
+            .with_f64_field_column_with_stats("field_f", Some(1.0), Some(2.0))
+            .with_u64_field_column_with_stats("field_u", Some(1), Some(2))
+            .with_i64_field_column_with_stats("field_i", Some(1), Some(2))
+            .with_string_field_column_with_stats("field_s", Some("a"), Some("b"))
+            .with_tag_column_with_stats("tag", Some("a"), Some("b"))
+            .with_time_column_with_stats(Some(1), Some(3));
+
+        insta::assert_debug_snapshot!(chunk.stats(), @r#"
+        Statistics {
+            num_rows: Exact(42),
+            total_byte_size: Absent,
+            column_statistics: [
+                ColumnStatistics {
+                    null_count: Absent,
+                    max_value: Exact(Boolean(true)),
+                    min_value: Exact(Boolean(false)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Absent,
+                    max_value: Exact(Float64(2)),
+                    min_value: Exact(Float64(1)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Absent,
+                    max_value: Exact(Int64(2)),
+                    min_value: Exact(Int64(1)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Absent,
+                    max_value: Exact(Utf8("b")),
+                    min_value: Exact(Utf8("a")),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Absent,
+                    max_value: Exact(UInt64(2)),
+                    min_value: Exact(UInt64(1)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Exact(0),
+                    max_value: Exact(Dictionary(Int32, Utf8("b"))),
+                    min_value: Exact(Dictionary(Int32, Utf8("a"))),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Exact(0),
+                    max_value: Exact(TimestampNanosecond(3, None)),
+                    min_value: Exact(TimestampNanosecond(1, None)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+            ],
+        }
+        "#);
     }
 }

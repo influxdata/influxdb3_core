@@ -1,11 +1,11 @@
 use crate::tower::{SetRequestHeadersLayer, SetRequestHeadersService};
 use http::HeaderMap;
 use http::header::HeaderName;
-use http::{HeaderValue, Uri, uri::InvalidUri};
-use std::convert::TryInto;
+use http::{HeaderValue, Uri};
+use iox_http_util::TryIntoUri;
 use std::time::Duration;
 use thiserror::Error;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 /// The connection type used for clients. Use [`Builder`] to create
 /// instances of [`Connection`] objects
@@ -86,7 +86,7 @@ pub enum Error {
 
     /// Client received an unexpected error from the server
     #[error("Invalid URI: {}", .0)]
-    InvalidUri(#[from] InvalidUri),
+    InvalidUri(#[from] http::Error),
 }
 
 // Custom impl to include underlying source (not included in tonic
@@ -149,20 +149,19 @@ impl Builder {
     }
 
     /// Construct the [`Connection`] instance using the specified base URL.
-    pub async fn build<D>(self, dst: D) -> Result<Connection>
-    where
-        D: TryInto<Uri, Error = InvalidUri> + Send,
-    {
-        let endpoint = self.create_endpoint(dst)?;
+    pub async fn build<D: TryIntoUri + Sync + ?Sized>(self, dst: &D) -> Result<Connection> {
+        let uri = dst.try_into_uri()?;
+        let endpoint = self.create_endpoint(uri)?;
         let channel = endpoint.connect().await?;
         Ok(self.compose_middleware(channel, endpoint))
     }
 
-    fn create_endpoint<D>(&self, dst: D) -> Result<Endpoint>
-    where
-        D: TryInto<Uri, Error = InvalidUri> + Send,
-    {
-        let endpoint = Endpoint::from(dst.try_into()?)
+    fn create_endpoint(&self, uri: Uri) -> Result<Endpoint> {
+        // This call can probably be removed when tonic is upgraded to 0.13+.
+        // See <https://github.com/influxdata/influxdb_iox/issues/14683> for more details.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let endpoint = Endpoint::from(uri)
+            .tls_config(ClientTlsConfig::new().with_native_roots())?
             .user_agent(&self.user_agent)?
             .connect_timeout(self.connect_timeout)
             .timeout(self.timeout);
@@ -276,5 +275,11 @@ mod tests {
             .expect("Error making http request");
 
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn build_with_uri() {
+        let uri = Uri::from_static("http://example.com");
+        Builder::default().build(&uri).await.unwrap();
     }
 }

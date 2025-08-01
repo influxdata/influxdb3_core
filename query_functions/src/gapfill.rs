@@ -24,7 +24,9 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
     functions::datetime::date_bin,
-    logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
+    logical_expr::{
+        ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    },
     physical_plan::ColumnarValue,
 };
 use schema::InfluxFieldType;
@@ -81,7 +83,7 @@ impl ScalarUDFImpl for GapFillWrapper {
         self.udf.inner().return_type(arg_types)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Err(DataFusionError::NotImplemented(format!(
             "{} is not yet implemented",
             self.name
@@ -149,7 +151,7 @@ impl ScalarUDFImpl for LocfUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Err(DataFusionError::NotImplemented(format!(
             "{LOCF_UDF_NAME} is not yet implemented"
         )))
@@ -202,7 +204,7 @@ impl ScalarUDFImpl for InterpolateUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Err(DataFusionError::NotImplemented(format!(
             "{INTERPOLATE_UDF_NAME} is not yet implemented"
         )))
@@ -276,7 +278,7 @@ mod test {
     }
 
     fn lit_interval_milliseconds(v: i64) -> Expr {
-        Expr::Literal(ScalarValue::new_interval_mdn(0, 0, v * 1_000_000))
+        Expr::Literal(ScalarValue::new_interval_mdn(0, 0, v * 1_000_000), None)
     }
 
     #[tokio::test]

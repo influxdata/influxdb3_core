@@ -16,7 +16,7 @@ datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }
 futures = "0.3"
 itertools = "0.13"
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 query_functions = { path = "../query_functions"}
 schema = { path = "../schema" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

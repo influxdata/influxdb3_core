@@ -112,7 +112,7 @@ impl ColumnsByName {
         SortKeyIds::from(names.into_iter().map(|name| {
             let name = name.as_ref();
             self.get(name)
-                .unwrap_or_else(|| panic!("column name not found: {}", name))
+                .unwrap_or_else(|| panic!("column name not found: {name}"))
                 .id
                 .get()
         }))
@@ -150,6 +150,21 @@ impl IntoIterator for ColumnsByName {
 impl FromIterator<(Arc<str>, ColumnSchema)> for ColumnsByName {
     fn from_iter<T: IntoIterator<Item = (Arc<str>, ColumnSchema)>>(iter: T) -> Self {
         Self(BTreeMap::from_iter(iter))
+    }
+}
+
+impl FromIterator<Column> for ColumnsByName {
+    fn from_iter<T: IntoIterator<Item = Column>>(iter: T) -> Self {
+        iter.into_iter()
+            .map(
+                |Column {
+                     name,
+                     id,
+                     column_type,
+                     ..
+                 }| (Arc::<str>::from(name), ColumnSchema { id, column_type }),
+            )
+            .collect()
     }
 }
 

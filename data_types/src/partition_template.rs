@@ -509,7 +509,7 @@ fn validate_new_time_format(fmt: &str) -> Result<(), ValidationError> {
     static SUPPORTED_SPECIFIERS_STR: LazyLock<String> = LazyLock::new(|| {
         SUPPORTED_SPEC_CHAR_MAP
             .values()
-            .map(|v| format!("%{}", v))
+            .map(|v| format!("%{v}"))
             .collect::<Vec<_>>()
             .join(", ")
     });
@@ -553,8 +553,7 @@ fn validate_new_time_format(fmt: &str) -> Result<(), ValidationError> {
 
                     if !specs_found_set.insert(n) {
                         return Err(ValidationError::InvalidStrftime(format!(
-                            "Duplicate specifier (%{}) found in time format: \"{}\"",
-                            spec, fmt
+                            "Duplicate specifier (%{spec}) found in time format: \"{fmt}\""
                         )));
                     }
                 } else {
@@ -569,19 +568,18 @@ fn validate_new_time_format(fmt: &str) -> Result<(), ValidationError> {
 
     if specs_found_set.is_empty() {
         return Err(ValidationError::InvalidStrftime(format!(
-            "No specifiers found in time format: \"{}\"",
-            fmt
+            "No specifiers found in time format: \"{fmt}\""
         )));
     }
 
     for spec in &specs_found_set {
-        if let Some(required) = SPEC_DEPS.get(spec) {
-            if !specs_found_set.contains(required) {
-                return Err(ValidationError::MissingRequiredStrfTimeSpecifier(format!(
-                    "Specifier %{} in \"{}\" requires %{}",
-                    SUPPORTED_SPEC_CHAR_MAP[spec], fmt, SUPPORTED_SPEC_CHAR_MAP[required]
-                )));
-            }
+        if let Some(required) = SPEC_DEPS.get(spec)
+            && !specs_found_set.contains(required)
+        {
+            return Err(ValidationError::MissingRequiredStrfTimeSpecifier(format!(
+                "Specifier %{} in \"{}\" requires %{}",
+                SUPPORTED_SPEC_CHAR_MAP[spec], fmt, SUPPORTED_SPEC_CHAR_MAP[required]
+            )));
         }
     }
 
@@ -726,33 +724,26 @@ impl TablePartitionTemplateOverride {
             validate_time_format_in_parts(table_template.parts.as_slice())?;
         }
 
-        let table = Self::try_from_existing(custom_table_template, namespace_template)?;
-
-        Ok(table)
+        match (custom_table_template, namespace_template.0.as_ref()) {
+            (Some(table_proto), _) => Self::try_from_existing(table_proto),
+            (None, Some(namespace_serialization_wrapper)) => {
+                Ok(Self(Some(namespace_serialization_wrapper.clone())))
+            }
+            (None, None) => Ok(Self(None)),
+        }
     }
 
     /// An existing table pulled from the catalog may contain a valid, but since
     /// disallowed partition template that would fail the validation checks
     /// performed by [`TablePartitionTemplateOverride::try_new()`].
     ///
-    /// This function
-    ///
     /// # Errors
     ///
     /// This function will return an error if the custom partition template specified is invalid.
     pub fn try_from_existing(
-        custom_table_template: Option<proto::PartitionTemplate>,
-        namespace_template: &NamespacePartitionTemplateOverride,
+        table_proto: proto::PartitionTemplate,
     ) -> Result<Self, ValidationError> {
-        match (custom_table_template, namespace_template.0.as_ref()) {
-            (Some(table_proto), _) => {
-                Ok(Self(Some(serialization::Wrapper::try_from(table_proto)?)))
-            }
-            (None, Some(namespace_serialization_wrapper)) => {
-                Ok(Self(Some(namespace_serialization_wrapper.clone())))
-            }
-            (None, None) => Ok(Self(None)),
-        }
+        Ok(Self(Some(serialization::Wrapper::try_from(table_proto)?)))
     }
 
     /// Returns the number of parts in this template.
@@ -2470,7 +2461,7 @@ mod tests {
         let ns = NamespacePartitionTemplateOverride::default();
         let got_ns = ns.parts().collect::<Vec<_>>();
         assert_matches!(got_ns.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
-        let table = TablePartitionTemplateOverride::try_from_existing(None, &ns).unwrap();
+        let table = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
         let got_table = table.parts().collect::<Vec<_>>();
         assert_matches!(got_table.as_slice(), [TemplatePart::TimeFormat("%Y-%m-%d")]);
     }
@@ -2478,7 +2469,7 @@ mod tests {
     #[test]
     fn len_of_default_template_is_1() {
         let ns = NamespacePartitionTemplateOverride::default();
-        let t = TablePartitionTemplateOverride::try_from_existing(None, &ns).unwrap();
+        let t = TablePartitionTemplateOverride::try_new(None, &ns).unwrap();
 
         assert_eq!(t.len(), 1);
     }
@@ -2493,7 +2484,7 @@ mod tests {
             })
             .unwrap();
         let table_template =
-            TablePartitionTemplateOverride::try_from_existing(None, &namespace_template).unwrap();
+            TablePartitionTemplateOverride::try_new(None, &namespace_template).unwrap();
 
         assert_eq!(table_template.len(), 1);
         assert_eq!(table_template.0, namespace_template.0);
@@ -2518,7 +2509,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let table_template = TablePartitionTemplateOverride::try_from_existing(
+        let table_template = TablePartitionTemplateOverride::try_new(
             Some(custom_table_template.clone()),
             &namespace_template,
         )
@@ -2641,11 +2632,9 @@ mod tests {
             }],
         };
 
-        let table_template = TablePartitionTemplateOverride::try_from_existing(
-            Some(custom_table_template.clone()),
-            &NamespacePartitionTemplateOverride::default(),
-        )
-        .unwrap();
+        let table_template =
+            TablePartitionTemplateOverride::try_from_existing(custom_table_template.clone())
+                .unwrap();
 
         assert_eq!(table_template.len(), 1);
         assert_eq!(table_template.0.unwrap().inner(), &custom_table_template);
@@ -2659,11 +2648,9 @@ mod tests {
             }],
         };
 
-        let table_template = TablePartitionTemplateOverride::try_from_existing(
-            Some(custom_table_template.clone()),
-            &NamespacePartitionTemplateOverride::default(),
-        )
-        .unwrap();
+        let table_template =
+            TablePartitionTemplateOverride::try_from_existing(custom_table_template.clone())
+                .unwrap();
 
         assert_eq!(table_template.len(), 1);
         assert_eq!(table_template.0.unwrap().inner(), &custom_table_template);
@@ -2715,7 +2702,7 @@ mod tests {
         let namespace_json_str: String = buf.iter().map(extract_sqlite_argument_text).collect();
         assert_eq!(namespace_json_str, expected_json_str);
 
-        let table = TablePartitionTemplateOverride::try_from_existing(None, &namespace).unwrap();
+        let table = TablePartitionTemplateOverride::try_new(None, &namespace).unwrap();
         let mut buf = Default::default();
         let _ = <TablePartitionTemplateOverride as Encode<'_, sqlx::Sqlite>>::encode_by_ref(
             &table, &mut buf,
@@ -2731,15 +2718,13 @@ mod tests {
             + std::mem::size_of::<proto::PartitionTemplate>();
 
         let first_string = "^";
-        let template = TablePartitionTemplateOverride::try_from_existing(
-            Some(proto::PartitionTemplate {
+        let template =
+            TablePartitionTemplateOverride::try_from_existing(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::TagValue(first_string.into())),
                 }],
-            }),
-            &Default::default(),
-        )
-        .expect("failed to create table partition template ");
+            })
+            .expect("failed to create table partition template ");
 
         assert_eq!(
             template.size(),
@@ -2747,15 +2732,13 @@ mod tests {
         );
 
         let second_string = "region";
-        let template = TablePartitionTemplateOverride::try_from_existing(
-            Some(proto::PartitionTemplate {
+        let template =
+            TablePartitionTemplateOverride::try_from_existing(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::TagValue(second_string.into())),
                 }],
-            }),
-            &Default::default(),
-        )
-        .expect("failed to create table partition template ");
+            })
+            .expect("failed to create table partition template ");
 
         assert_eq!(
             template.size(),
@@ -2763,8 +2746,8 @@ mod tests {
         );
 
         let time_string = "year-%Y";
-        let template = TablePartitionTemplateOverride::try_from_existing(
-            Some(proto::PartitionTemplate {
+        let template =
+            TablePartitionTemplateOverride::try_from_existing(proto::PartitionTemplate {
                 parts: vec![
                     proto::TemplatePart {
                         part: Some(proto::template_part::Part::TagValue(second_string.into())),
@@ -2773,10 +2756,8 @@ mod tests {
                         part: Some(proto::template_part::Part::TimeFormat(time_string.into())),
                     },
                 ],
-            }),
-            &Default::default(),
-        )
-        .expect("failed to create table partition template ");
+            })
+            .expect("failed to create table partition template ");
         assert_eq!(
             template.size(),
             BASE_SIZE
@@ -2786,18 +2767,16 @@ mod tests {
                 + time_string.len()
         );
 
-        let template = TablePartitionTemplateOverride::try_from_existing(
-            Some(proto::PartitionTemplate {
+        let template =
+            TablePartitionTemplateOverride::try_from_existing(proto::PartitionTemplate {
                 parts: vec![proto::TemplatePart {
                     part: Some(proto::template_part::Part::Bucket(proto::Bucket {
                         tag_name: second_string.into(),
                         num_buckets: 42,
                     })),
                 }],
-            }),
-            &Default::default(),
-        )
-        .expect("failed to create table partition template");
+            })
+            .expect("failed to create table partition template");
         assert_eq!(
             template.size(),
             BASE_SIZE

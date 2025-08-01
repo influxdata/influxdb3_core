@@ -57,8 +57,7 @@ where
     let parts = template.len();
     if parts > MAXIMUM_NUMBER_OF_TEMPLATE_PARTS {
         panic!(
-            "partition template contains {} parts, which exceeds the maximum of {} parts",
-            parts, MAXIMUM_NUMBER_OF_TEMPLATE_PARTS
+            "partition template contains {parts} parts, which exceeds the maximum of {MAXIMUM_NUMBER_OF_TEMPLATE_PARTS} parts"
         );
     }
 
@@ -1550,18 +1549,14 @@ mod tests {
                         assert_eq!(got_val, &want_val, "identity values differ");
                         assert!(
                             got_val.is_prefix_match_of(want_val),
-                            "prefix mismatch; {:?} is not a prefix of {:?}",
-                            got_val,
-                            want_val,
+                            "prefix mismatch; {got_val:?} is not a prefix of {want_val:?}",
                         );
                     },
                     ColumnValue::Prefix(_) => {
                         let want_val = want_val.expect_string();
                         assert!(
                             got_val.is_prefix_match_of(want_val),
-                            "prefix mismatch; {:?} is not a prefix of {:?}",
-                            got_val,
-                            want_val,
+                            "prefix mismatch; {got_val:?} is not a prefix of {want_val:?}",
                         );
                     },
                     ColumnValue::Datetime{..} => {
@@ -1571,7 +1566,7 @@ mod tests {
                                 assert_eq!(want_begin, *begin);
                                 assert_eq!(want_end, *end);
                             }
-                            _ => panic!("expected datatime column value but got: {:?}", got_val)
+                            _ => panic!("expected datatime column value but got: {got_val:?}")
                         }
                     },
                     ColumnValue::Bucket{id: got_bucket_id, num_buckets: got_num_buckets} => {

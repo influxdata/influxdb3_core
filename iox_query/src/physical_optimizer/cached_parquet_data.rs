@@ -2,13 +2,14 @@ use std::{ops::Range, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
 use datafusion::parquet::file::metadata::ParquetMetaDataReader;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{
-        FileMeta, ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory,
-    },
+    datasource::physical_plan::{FileMeta, ParquetFileMetrics, ParquetFileReaderFactory},
     error::DataFusionError,
     parquet::{
         arrow::async_reader::AsyncFileReader, errors::ParquetError, file::metadata::ParquetMetaData,
@@ -21,8 +22,8 @@ use futures::{FutureExt, future::Shared, prelude::future::BoxFuture};
 use meta_data_cache::MetaIndexCache;
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
 use object_store_size_hinting::hint_size;
-use observability_deps::tracing::warn;
 use parquet_file::ParquetFilePath;
+use tracing::warn;
 
 use crate::{
     config::{IoxCacheExt, IoxConfigExt},
@@ -48,15 +49,32 @@ impl PhysicalOptimizerRule for CachedParquetData {
         }
 
         plan.transform_up(|plan| {
-            let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() else {
+            let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() else {
                 return Ok(Transformed::no(plan));
             };
-            let base_config = parquet_exec.base_config();
-            let mut files = base_config.file_groups.iter().flatten().peekable();
+            let Some(file_scan_config) = data_source_exec
+                .data_source()
+                .as_any()
+                .downcast_ref::<FileScanConfig>()
+            else {
+                return Ok(Transformed::no(plan));
+            };
+            let Some(parquet_source) = file_scan_config
+                .file_source()
+                .as_any()
+                .downcast_ref::<ParquetSource>()
+            else {
+                return Ok(Transformed::no(plan));
+            };
+            let mut files = file_scan_config
+                .file_groups
+                .iter()
+                .flat_map(|g| g.iter())
+                .peekable();
 
             if files.peek().is_none() {
                 // no files
-                return Ok(Transformed::no(plan));
+                return Ok(Transformed::no(Arc::clone(&plan)));
             }
 
             // find object store
@@ -75,7 +93,7 @@ impl PhysicalOptimizerRule for CachedParquetData {
             let iox_cache_ext = config.extensions.get::<IoxCacheExt>();
             let meta_cache = iox_cache_ext.and_then(|e| e.meta_cache.clone());
 
-            let parquet_exec = parquet_exec
+            let parquet_source = parquet_source
                 .clone()
                 .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
                     Arc::clone(&ext.object_store),
@@ -83,7 +101,11 @@ impl PhysicalOptimizerRule for CachedParquetData {
                     meta_cache,
                     config_ext.hint_known_object_size_to_object_store,
                 )));
-            Ok(Transformed::yes(Arc::new(parquet_exec)))
+            Ok(Transformed::yes(DataSourceExec::from_data_source(
+                FileScanConfigBuilder::from(file_scan_config.clone())
+                    .with_source(Arc::new(parquet_source))
+                    .build(),
+            )))
         })
         .map(|t| t.data)
     }
@@ -192,25 +214,33 @@ struct CachedParquetFileReader {
 
 impl AsyncFileReader for CachedParquetFileReader {
     #[inline]
-    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
         self.inner.get_bytes(range)
     }
 
     #[inline]
     fn get_byte_ranges(
         &mut self,
-        ranges: Vec<Range<usize>>,
+        ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
         self.inner.get_byte_ranges(ranges)
     }
 
-    fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>, ParquetError>> {
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>, ParquetError>> {
         Box::pin(async move {
             if let Some(file_uuid) = ParquetFilePath::uuid_from_path(&self.inner.meta.location) {
                 let file_reader = self.inner.clone_with_no_metrics();
                 let file_metas = self
                     .meta_cache
-                    .add_metadata_for_file(&file_uuid, Arc::clone(&self.table_schema), file_reader)
+                    .add_metadata_for_file(
+                        &file_uuid,
+                        Arc::clone(&self.table_schema),
+                        file_reader,
+                        options,
+                    )
                     .await
                     // unfortunately there doesn't seem to be a way to downcast the Arc<DynError> into the
                     // `ParquetError` that DataFusion accepts, so just wrap it as an external error
@@ -229,7 +259,7 @@ impl AsyncFileReader for CachedParquetFileReader {
                 );
                 // no available UUID, try to fetch metadata without caching
                 // NOTE(adam): does this make sense? maybe should throw an error instead?
-                self.inner.get_metadata().await
+                self.inner.get_metadata(options).await
             }
         })
     }
@@ -276,7 +306,7 @@ impl ParquetFileReader {
 }
 
 impl AsyncFileReader for ParquetFileReader {
-    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
         Box::pin(async move {
             Ok(self
                 .get_byte_ranges(vec![range])
@@ -289,7 +319,7 @@ impl AsyncFileReader for ParquetFileReader {
 
     fn get_byte_ranges(
         &mut self,
-        ranges: Vec<Range<usize>>,
+        ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
         Box::pin(async move {
             let data = self
@@ -301,22 +331,33 @@ impl AsyncFileReader for ParquetFileReader {
             ranges
                 .into_iter()
                 .map(|range| {
-                    if range.end > data.len() {
-                        return Err(ParquetError::IndexOutOfBound(range.end, data.len()));
+                    if range.end > data.len() as u64 {
+                        return Err(ParquetError::IndexOutOfBound(
+                            range.end as usize,
+                            data.len(),
+                        ));
                     }
                     if range.start > range.end {
-                        return Err(ParquetError::IndexOutOfBound(range.start, range.end));
+                        return Err(ParquetError::IndexOutOfBound(
+                            range.start as usize,
+                            range.end as usize,
+                        ));
                     }
                     if let Some(file_metrics) = &self.file_metrics {
-                        file_metrics.bytes_scanned.add(range.len());
+                        file_metrics
+                            .bytes_scanned
+                            .add((range.end - range.start) as usize);
                     }
-                    Ok(data.slice(range))
+                    Ok(data.slice((range.start as usize)..(range.end as usize)))
                 })
                 .collect()
         })
     }
 
-    fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>, ParquetError>> {
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>, ParquetError>> {
         Box::pin(async move {
             Ok(Arc::new(
                 self.clone_with_no_metrics().load_metadata().await?,

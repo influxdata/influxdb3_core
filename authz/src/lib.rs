@@ -20,7 +20,7 @@ pub use iox_authorizer::{Error, IoxAuthorizer};
 mod instrumentation;
 pub use instrumentation::AuthorizerInstrumentation;
 mod permission;
-pub use permission::{Action, Permission, Resource, Target};
+pub use permission::{Action, IncompatiblePermissionError, Permission, Resource, Target};
 
 #[cfg(feature = "http")]
 pub mod http;

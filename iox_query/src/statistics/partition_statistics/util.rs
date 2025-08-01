@@ -33,12 +33,14 @@ pub(super) fn make_column_statistics_inexact(
                  min_value,
                  max_value,
                  distinct_count,
+                 sum_value,
              }| {
                 ColumnStatistics {
                     null_count: make_inexact_or_keep_absent(null_count),
                     min_value: make_inexact_or_keep_absent(min_value),
                     max_value: make_inexact_or_keep_absent(max_value),
                     distinct_count: make_inexact_or_keep_absent(distinct_count),
+                    sum_value: make_inexact_or_keep_absent(sum_value),
                 }
             },
         )
@@ -94,5 +96,6 @@ pub(crate) fn merge_col_stats(a: ColumnStatistics, b: &ColumnStatistics) -> Colu
         min_value: a.min_value.min(&b.min_value),
         max_value: a.max_value.max(&b.max_value),
         distinct_count: Precision::Absent,
+        sum_value: Precision::Absent,
     }
 }

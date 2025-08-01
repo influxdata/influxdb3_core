@@ -12,7 +12,7 @@ use std::{
 };
 
 use metric::U64Counter;
-use observability_deps::tracing::{error, warn};
+use tracing::{error, warn};
 
 type PanicFunctionPtr = Arc<Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>>;
 

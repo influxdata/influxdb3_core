@@ -162,6 +162,7 @@ impl RewriteSelect {
         let SelectStatementInfo {
             projection_type,
             extra_intervals,
+            has_integral,
         } = select_statement_info(&fields, &group_by, stmt.fill)
             .map_err(|e| e.context("gather information about select statement"))?;
 
@@ -193,6 +194,7 @@ impl RewriteSelect {
             limit: stmt.limit,
             offset: stmt.offset,
             timezone: stmt.timezone.map(|v| *v),
+            has_integral,
         })
     }
 
@@ -985,6 +987,9 @@ struct FieldChecker {
     /// `true` when the projection contains a `DISTINCT` function or unary `DISTINCT` operator.
     has_distinct: bool,
 
+    /// `true` when the projection contains an `INTEGRAL` function.
+    has_integral: bool,
+
     /// Accumulator for the number of aggregate or window expressions for the statement.
     aggregate_count: usize,
 
@@ -1096,6 +1101,7 @@ impl FieldChecker {
         Ok(SelectStatementInfo {
             projection_type,
             extra_intervals: self.extra_intervals,
+            has_integral: self.has_integral,
         })
     }
 
@@ -1339,17 +1345,7 @@ impl FieldChecker {
 
         set_extra_intervals!(self, 1);
 
-        match args.get(1) {
-            Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
-                return error::query(format!("duration argument must be positive, got {d}"));
-            }
-            None | Some(Expr::Literal(Literal::Duration(_))) => {}
-            Some(got) => {
-                return error::query(format!(
-                    "second argument to {name} must be a duration, got {got:?}"
-                ));
-            }
-        }
+        self.check_duration(name, args, 1)?;
 
         self.check_nested_symbol(name, &args[0])
     }
@@ -1360,17 +1356,7 @@ impl FieldChecker {
 
         set_extra_intervals!(self, 1);
 
-        match args.get(1) {
-            Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
-                return error::query(format!("duration argument must be positive, got {d}"));
-            }
-            None | Some(Expr::Literal(Literal::Duration(_))) => {}
-            Some(got) => {
-                return error::query(format!(
-                    "second argument to {name} must be a duration, got {got:?}"
-                ));
-            }
-        }
+        self.check_duration(name, args, 1)?;
 
         self.check_nested_symbol(name, &args[0])
     }
@@ -1457,12 +1443,10 @@ impl FieldChecker {
 
         set_extra_intervals!(self, v);
 
-        if let Some(v) = lit_integer!(name, args, 2?) {
-            if v < 0 && v != -1 {
-                return error::query(format!(
-                    "{name} hold period must be greater than or equal to 0"
-                ));
-            }
+        if let Some(..=-2) = lit_integer!(name, args, 2?) {
+            return error::query(format!(
+                "{name} hold period must be greater than or equal to 0"
+            ));
         }
 
         self.check_nested_symbol(name, &args[0])
@@ -1479,12 +1463,10 @@ impl FieldChecker {
 
         set_extra_intervals!(self, v);
 
-        if let Some(v) = lit_integer!(name, args, 2?) {
-            if v < 0 && v != -1 {
-                return error::query(format!(
-                    "{name} hold period must be greater than or equal to 0"
-                ));
-            }
+        if let Some(..=-2) = lit_integer!(name, args, 2?) {
+            return error::query(format!(
+                "{name} hold period must be greater than or equal to 0"
+            ));
         }
 
         match lit_string!(name, args, 3?) {
@@ -1502,19 +1484,10 @@ impl FieldChecker {
 
     fn check_integral(&mut self, name: &str, args: &[Expr]) -> Result<()> {
         self.inc_aggregate_count();
+        self.has_integral = true;
         check_exp_args!(name, 1, 2, args);
 
-        match args.get(1) {
-            Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
-                return error::query(format!("duration argument must be positive, got {d}"));
-            }
-            None | Some(Expr::Literal(Literal::Duration(_))) => {}
-            Some(got) => {
-                return error::query(format!(
-                    "second argument to {name} must be a duration, got {got:?}"
-                ));
-            }
-        }
+        self.check_duration(name, args, 1)?;
 
         self.check_symbol(name, &args[0])
     }
@@ -1598,6 +1571,21 @@ impl FieldChecker {
             expr => error::query(format!("expected field argument in {name}(), got {expr:?}")),
         }
     }
+
+    fn check_duration(&mut self, name: &str, args: &[Expr], index: usize) -> Result<()> {
+        match args.get(index) {
+            Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
+                error::query(format!("duration argument must be positive, got {d}"))
+            }
+            None | Some(Expr::Literal(Literal::Duration(_))) => Ok(()),
+            Some(got) => {
+                let n = index + 1;
+                error::query(format!(
+                    "argument {n} to {name} must be a duration, got {got:?}"
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
@@ -1638,6 +1626,8 @@ struct SelectStatementInfo {
     ///
     /// [See also](Select::extra_intervals).
     extra_intervals: usize,
+    /// `true` when the projection contains an `INTEGRAL` function.
+    has_integral: bool,
 }
 
 /// Gather information about the semantics of a [`SelectStatement`] and verify
@@ -1884,7 +1874,7 @@ mod test {
         let sel = parse_select("SELECT derivative(mean(foo)) FROM cpu GROUP BY TIME(30s)");
         select_statement_info(&sel).unwrap();
         let sel = parse_select("SELECT derivative(foo, 2) FROM cpu");
-        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "second argument to derivative must be a duration, got Literal(Integer(2))");
+        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "argument 2 to derivative must be a duration, got Literal(Integer(2))");
         let sel = parse_select("SELECT derivative(foo, -2s) FROM cpu");
         assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "duration argument must be positive, got -2s");
         let sel = parse_select("SELECT derivative(foo, 2s, 1) FROM cpu");
@@ -1898,7 +1888,7 @@ mod test {
         let sel = parse_select("SELECT elapsed(foo, 5s) FROM cpu");
         select_statement_info(&sel).unwrap();
         let sel = parse_select("SELECT elapsed(foo, 2) FROM cpu");
-        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "second argument to elapsed must be a duration, got Literal(Integer(2))");
+        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "argument 2 to elapsed must be a duration, got Literal(Integer(2))");
         let sel = parse_select("SELECT elapsed(foo, -2s) FROM cpu");
         assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "duration argument must be positive, got -2s");
 
@@ -1995,7 +1985,7 @@ mod test {
         let sel = parse_select("SELECT integral(foo, -2s) FROM cpu");
         assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "duration argument must be positive, got -2s");
         let sel = parse_select("SELECT integral(foo, 2) FROM cpu");
-        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "second argument to integral must be a duration, got Literal(Integer(2))");
+        assert_error!(select_statement_info(&sel), DataFusionError::Plan(ref s) if s == "argument 2 to integral must be a duration, got Literal(Integer(2))");
 
         // count_hll
         let sel = parse_select("SELECT count_hll(foo) FROM cpu");

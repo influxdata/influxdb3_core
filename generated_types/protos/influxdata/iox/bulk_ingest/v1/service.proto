@@ -25,9 +25,13 @@ message NewParquetMetadataRequest {
     string namespace_name = 1 [deprecated = true];
     // ID of the namespace the data will be imported into
     int64 namespace_id = 6;
-  };
-  // Name of the table the data will be imported into
-  string table_name = 2;
+  }
+  oneof table_target {
+    // Name of the table the data will be imported into
+    string table_name = 2 [deprecated = true];
+    // ID of the table the data will be imported into
+    int64 table_id = 7;
+  }
 
   // Partition key of this data
   string partition_key = 3;
@@ -68,8 +72,12 @@ message UpsertSortKeyRequest {
     int64 namespace_id = 5;
   }
 
-  // Name of the table in which to upsert the sort key
-  string table_name = 2;
+  oneof table_target {
+    // Name of the table in which to upsert the sort key
+    string table_name = 2 [deprecated = true];
+    // ID of the table in which to upsert the sort key
+    int64 table_id = 6;
+  }
 
   // The partition key for which to upsert the sort key
   string partition_key = 3;

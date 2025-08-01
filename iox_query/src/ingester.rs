@@ -14,9 +14,9 @@ use datafusion::{
     physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, Time},
 };
 use futures::Stream;
-use observability_deps::tracing::trace;
 use parking_lot::Mutex;
 use schema::{Schema, sort::SortKey};
+use tracing::trace;
 
 use crate::{QueryChunk, QueryChunkData};
 

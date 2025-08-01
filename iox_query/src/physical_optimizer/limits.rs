@@ -1,7 +1,8 @@
 use crate::config::IoxConfigExt;
 use crate::provider::DeduplicateExec;
 use datafusion::config::ConfigOptions;
-use datafusion::datasource::physical_plan::ParquetExec;
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
@@ -30,21 +31,19 @@ impl PhysicalOptimizerRule for CheckLimits {
             .get::<IoxConfigExt>()
             .cloned()
             .unwrap_or_default();
-        if let Some(partition_limit) = iox_config.partition_limit_opt() {
-            if partitions > partition_limit {
-                return Err(DataFusionError::ResourcesExhausted(format!(
-                    "Query would process more than {} partitions",
-                    partition_limit
-                )));
-            }
+        if let Some(partition_limit) = iox_config.partition_limit_opt()
+            && partitions > partition_limit
+        {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Query would process more than {partition_limit} partitions"
+            )));
         }
-        if let Some(parquet_file_limit) = iox_config.parquet_file_limit_opt() {
-            if parquet_files > parquet_file_limit {
-                return Err(DataFusionError::ResourcesExhausted(format!(
-                    "Query would process more than {} parquet files",
-                    parquet_file_limit
-                )));
-            }
+        if let Some(parquet_file_limit) = iox_config.parquet_file_limit_opt()
+            && parquet_files > parquet_file_limit
+        {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Query would process more than {parquet_file_limit} parquet files"
+            )));
         }
         Ok(plan)
     }
@@ -100,27 +99,32 @@ impl<'plan> ParquetFileMetricsVisitor<'plan> {
         plan: &'plan (dyn ExecutionPlan + 'plan),
         mut under_dedup: bool,
     ) {
-        if let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() {
-            let file_iter = parquet_exec
-                .base_config()
-                .file_groups
-                .iter()
-                .flatten()
-                .map(|p| p.path());
+        if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+            if let Some(file_scan_config) = data_source_exec
+                .data_source()
+                .as_any()
+                .downcast_ref::<FileScanConfig>()
+            {
+                let file_iter = file_scan_config
+                    .file_groups
+                    .iter()
+                    .flat_map(|g| g.files())
+                    .map(|p| p.path());
 
-            if under_dedup {
+                if under_dedup {
+                    Self::add_parts_and_files_from_iter(
+                        file_iter.clone(),
+                        &mut self.deduplicated_parquet_files,
+                        &mut self.deduplicated_partitions,
+                    );
+                }
+
                 Self::add_parts_and_files_from_iter(
-                    file_iter.clone(),
-                    &mut self.deduplicated_parquet_files,
-                    &mut self.deduplicated_partitions,
+                    file_iter,
+                    &mut self.parquet_files,
+                    &mut self.partitions,
                 );
             }
-
-            Self::add_parts_and_files_from_iter(
-                file_iter,
-                &mut self.parquet_files,
-                &mut self.partitions,
-            );
         } else if plan.as_any().downcast_ref::<DeduplicateExec>().is_some() {
             under_dedup = true;
         }
@@ -153,8 +157,7 @@ mod tests {
     use arrow::datatypes::Schema;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::FileScanConfig;
-    use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
+    use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::LexOrdering;
     use datafusion::physical_plan::Statistics;
@@ -165,25 +168,25 @@ mod tests {
     #[test]
     fn test_metrics() {
         let execs: Vec<Arc<dyn ExecutionPlan>> = vec![
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition1/file11",
                 "1/2/partition1/file12",
                 "1/2/partition1/file13",
                 "1/2/partition1/file14",
             ]),
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition2/file21",
                 "1/2/partition2/file22",
                 "1/2/partition2/file23",
                 "1/2/partition2/file24",
             ]),
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition3/file31",
                 "1/2/partition3/file32",
                 "1/2/partition3/file33",
                 "1/2/partition3/file34",
             ]),
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition4/file41",
                 "1/2/partition4/file42",
                 "1/2/partition4/file43",
@@ -206,25 +209,25 @@ mod tests {
     #[test]
     fn test_single_partition() {
         let execs: Vec<Arc<dyn ExecutionPlan>> = vec![
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition1/file11",
                 "1/2/partition1/file12",
                 "1/2/partition1/file13",
                 "1/2/partition1/file14",
             ]),
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition1/file21",
                 "1/2/partition1/file22",
                 "1/2/partition1/file23",
                 "1/2/partition1/file24",
             ]),
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition1/file31",
                 "1/2/partition1/file32",
                 "1/2/partition1/file33",
                 "1/2/partition1/file34",
             ]),
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition1/file41",
                 "1/2/partition1/file42",
                 "1/2/partition1/file43",
@@ -247,14 +250,14 @@ mod tests {
     #[test]
     fn test_deduplicate_exec() {
         let execs = vec![
-            parquet_exec(&[
+            data_source_exec_parquet(&[
                 "1/2/partition1/file01",
                 "1/2/partition2/file01",
                 "1/2/partition1/file02",
                 "1/2/partition1/file03",
             ]),
             Arc::new(DeduplicateExec::new(
-                parquet_exec(&[
+                data_source_exec_parquet(&[
                     "1/2/partition2/file02",
                     "1/3/partition1/file01",
                     "1/3/partition1/file02",
@@ -282,18 +285,18 @@ mod tests {
     #[test]
     fn test_parquet_files_with_ranges() {
         let execs: Vec<Arc<dyn ExecutionPlan>> = vec![
-            parquet_exec_with_ranges(&[
+            data_source_exec_parquet_with_ranges(&[
                 ("1/2/partition1/file1", (1, 2)),
                 ("1/2/partition1/file2", (1, 2)),
                 ("1/2/partition1/file2", (2, 3)),
                 ("1/2/partition1/file3", (1, 2)),
             ]),
-            parquet_exec_with_ranges(&[
+            data_source_exec_parquet_with_ranges(&[
                 ("1/2/partition1/file2", (1, 2)),
                 ("1/2/partition1/file4", (1, 2)),
             ]),
             Arc::new(DeduplicateExec::new(
-                parquet_exec_with_ranges(&[
+                data_source_exec_parquet_with_ranges(&[
                     ("1/2/partition2/file1", (1, 2)),
                     ("1/2/partition2/file2", (1, 2)),
                     ("1/2/partition2/file2", (2, 3)),
@@ -303,7 +306,7 @@ mod tests {
                 false,
             )),
             Arc::new(DeduplicateExec::new(
-                parquet_exec_with_ranges(&[
+                data_source_exec_parquet_with_ranges(&[
                     ("1/2/partition2/file2", (1, 2)),
                     ("1/2/partition2/file4", (1, 2)),
                 ]),
@@ -324,20 +327,23 @@ mod tests {
         );
     }
 
-    fn parquet_exec(files: &[&'static str]) -> Arc<dyn ExecutionPlan> {
-        parquet_exec_with_optional_ranges(files.iter().map(|f| (*f, None)))
+    fn data_source_exec_parquet(files: &[&'static str]) -> Arc<dyn ExecutionPlan> {
+        data_source_exec_parquet_with_optional_ranges(files.iter().map(|f| (*f, None)))
     }
 
-    fn parquet_exec_with_ranges(files: &[(&'static str, (i64, i64))]) -> Arc<dyn ExecutionPlan> {
-        parquet_exec_with_optional_ranges(files.iter().map(|(f, r)| (*f, Some(*r))))
+    fn data_source_exec_parquet_with_ranges(
+        files: &[(&'static str, (i64, i64))],
+    ) -> Arc<dyn ExecutionPlan> {
+        data_source_exec_parquet_with_optional_ranges(files.iter().map(|(f, r)| (*f, Some(*r))))
     }
 
-    fn parquet_exec_with_optional_ranges(
+    fn data_source_exec_parquet_with_optional_ranges(
         files: impl IntoIterator<Item = (&'static str, Option<(i64, i64)>)>,
     ) -> Arc<dyn ExecutionPlan> {
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),
             Arc::new(Schema::empty()),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
         .with_file_groups(
             files
@@ -347,7 +353,7 @@ mod tests {
                     if let Some((start, end)) = r {
                         file = file.with_range(start, end);
                     }
-                    vec![file]
+                    FileGroup::new(vec![file])
                 })
                 .collect(),
         )
@@ -355,8 +361,8 @@ mod tests {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        });
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        builder.build_arc()
+        })
+        .build();
+        DataSourceExec::from_data_source(file_scan_config)
     }
 }

@@ -181,10 +181,10 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
     /// Attempts to acquire a shared lock without blocking.
     fn try_lock_shared(&self) -> bool {
         let ret = self.inner.try_lock_shared();
-        if let Some(shared) = &self.metrics {
-            if ret {
-                shared.shared_count.inc(1);
-            }
+        if let Some(shared) = &self.metrics
+            && ret
+        {
+            shared.shared_count.inc(1);
         }
         ret
     }
@@ -221,10 +221,10 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
     /// Attempts to acquire an exclusive lock without blocking.
     fn try_lock_exclusive(&self) -> bool {
         let ret = self.inner.try_lock_exclusive();
-        if let Some(shared) = &self.metrics {
-            if ret {
-                shared.exclusive_count.inc(1);
-            }
+        if let Some(shared) = &self.metrics
+            && ret
+        {
+            shared.exclusive_count.inc(1);
         }
         ret
     }
@@ -277,10 +277,10 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
 
     fn try_lock_upgradable(&self) -> bool {
         let ret = self.inner.try_lock_upgradable();
-        if let Some(shared) = &self.metrics {
-            if ret {
-                shared.upgradeable_count.inc(1);
-            }
+        if let Some(shared) = &self.metrics
+            && ret
+        {
+            shared.upgradeable_count.inc(1);
         }
         ret
     }
@@ -309,10 +309,10 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
 
     unsafe fn try_upgrade(&self) -> bool {
         let ret = unsafe { self.inner.try_upgrade() };
-        if let Some(shared) = &self.metrics {
-            if ret {
-                shared.upgrade_count.inc(1);
-            }
+        if let Some(shared) = &self.metrics
+            && ret
+        {
+            shared.upgrade_count.inc(1);
         }
         ret
     }
@@ -356,10 +356,10 @@ unsafe impl<R: lock_api::RawMutex + Sized> lock_api::RawMutex for InstrumentedRa
 
     fn try_lock(&self) -> bool {
         let ret = self.inner.try_lock();
-        if let Some(shared) = &self.metrics {
-            if ret {
-                shared.exclusive_count.inc(1);
-            }
+        if let Some(shared) = &self.metrics
+            && ret
+        {
+            shared.exclusive_count.inc(1);
         }
         ret
     }

@@ -126,14 +126,16 @@ use std::sync::Arc;
 use crate::plan::util::IQLSchema;
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
-use datafusion::common::{Result, ScalarValue, not_impl_err};
-use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
+use datafusion::common::{ExprSchema, Result, ScalarValue, not_impl_err, plan_err};
+use datafusion::logical_expr::expr::{
+    AggregateFunction, AggregateFunctionParams, WindowFunction, WindowFunctionParams,
+};
 use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, Operator, binary_expr, cast, lit};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{Column, when};
-use observability_deps::tracing::trace;
+use datafusion::prelude::{Column, Neg, nvl, try_cast, when};
 use predicate::rpc_predicate::{iox_expr_rewrite, simplify_predicate};
+use tracing::trace;
 
 /// Perform a series of passes to rewrite `expr` in compliance with InfluxQL behavior
 /// in an effort to ensure the query executes without error.
@@ -151,6 +153,10 @@ pub(super) fn rewrite_conditional_expr(
         // make regex matching with invalid types produce false
         .and_then(|expr| expr.data.rewrite(&mut FixRegularExpressions { schema }))
         .map(|expr| log_rewrite(expr, "after fix_regular_expressions"))
+        // make mixed signed integer operations legal
+        // this MUST be done before calling `rewrite_ops`!
+        .and_then(|expr| rewrite_make_mixed_integer_ops_legal(expr.data, schema))
+        .map(|expr| log_rewrite(expr, "after rewrite_make_mixed_integer_ops_legal"))
         // rewrite exprs with incompatible operands to NULL or FALSE
         // (seems like FixRegularExpressions could be combined into this pass)
         .and_then(|expr| rewrite_expr(expr.data, schema))
@@ -190,7 +196,7 @@ pub(super) fn rewrite_conditional_expr(
         .map(|expr| {
             if matches!(
                 expr.data,
-                Expr::Literal(ScalarValue::Null) | Expr::Literal(ScalarValue::Boolean(None))
+                Expr::Literal(ScalarValue::Null, _) | Expr::Literal(ScalarValue::Boolean(None), _)
             ) {
                 lit(false)
             } else {
@@ -227,214 +233,32 @@ fn no(expr: Expr) -> Result<Transformed<Expr>> {
 /// of an InfluxQL query.
 fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>> {
     expr.transform(&|expr: Expr| {
-        match expr.clone() {
-            Expr::BinaryExpr(BinaryExpr {
-                ref left,
-                op,
-                ref right,
-            }) => {
-                let lhs_type = left.get_type(&schema.df_schema)?;
-                let rhs_type = right.get_type(&schema.df_schema)?;
-
-                match (lhs_type, &op, rhs_type) {
-                    //
-                    // NULL types
-                    //
-
-                    // Operations between a NULL and any numeric type should return a NULL result
-                    (
-                        DataType::Null,
-                        _,
-                        DataType::Float64 | DataType::UInt64 | DataType::Int64
-                    ) |
-                    (
-                        DataType::Float64 | DataType::UInt64 | DataType::Int64,
-                        _,
-                        DataType::Null
-                    ) |
-                    // and any operations on NULLs return a NULL, as DataFusion is unable
-                    // to process these expressions.
-                    (
-                        DataType::Null,
-                        _,
-                        DataType::Null
-                    ) => yes(lit(ScalarValue::Null)),
-
-                    // NULL using AND or OR is rewritten as `false`, which the optimiser
-                    // may short circuit.
-                    (
-                        DataType::Null,
-                        Operator::Or | Operator::And,
-                        _
-                    ) => yes(binary_expr(lit(false), op, (**right).clone())),
-                    (
-                        _,
-                        Operator::Or | Operator::And,
-                        DataType::Null
-                    ) => yes(binary_expr((**left).clone(), op, lit(false))),
-
-                    // NULL with other operators is passed through to DataFusion, which is expected
-                    // evaluate to false.
-                    (
-                        DataType::Null,
-                        Operator::Eq | Operator::NotEq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq,
-                        _
-                    ) |
-                    (
-                        _,
-                        Operator::Eq | Operator::NotEq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq,
-                        DataType::Null
-                    ) => no(expr),
-
-                    // Any other operations with NULL should return false
-                    (DataType::Null, ..) | (.., DataType::Null) => yes(lit(false)),
-
-                    //
-                    // Boolean types
-                    //
-                    // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4206
-                    (
-                        DataType::Boolean,
-                        Operator::And | Operator::Or | Operator::Eq | Operator::NotEq | Operator::BitwiseAnd | Operator::BitwiseXor | Operator::BitwiseOr,
-                        DataType::Boolean,
-                    ) => yes(rewrite_boolean((**left).clone(), op, (**right).clone())),
-
-                    //
-                    // Numeric types
-                    //
-                    // The following match arms ensure the appropriate target type is chosen based
-                    // on the data types of the operands. In cases where the operands are mixed
-                    // types, Float64 is the highest priority, followed by UInt64 and then Int64.
-                    //
-
-                    // Float on either side of a binary expression involving numeric types
-                    (
-                        DataType::Float64,
-                        _,
-                        DataType::Float64 | DataType::Int64 | DataType::UInt64
-                    ) |
-                    (
-                        DataType::Int64 | DataType::UInt64,
-                        _,
-                        DataType::Float64
-                    ) => match op {
-                        // Dividing by zero would return a `NULL` in DataFusion and other SQL
-                        // implementations, however, InfluxQL coalesces the result to `0`.
-
-                        // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4268-L4270
-                        Operator::Divide => yes(divide_carefully(left.as_ref().clone(), right.as_ref().clone(), DataType::Float64)?),
-                        _ => no(expr),
-                    },
-                    //
-                    // If either of the types UInt64 and the other is UInt64 or Int64
-                    //
-                    (DataType::UInt64, ..) |
-                    (.., DataType::UInt64) => match op {
-                        Operator::Divide => yes(divide_carefully(left.as_ref().clone(), right.as_ref().clone(), DataType::UInt64)?),
-                        _ => no(expr),
-                    }
-                    //
-                    // Finally, if both sides are Int64
-                    //
-                    (
-                        DataType::Int64,
-                        _,
-                        DataType::Int64
-                    ) => match op {
-                        // Like Float64, dividing by zero should return 0 for InfluxQL, and
-                        // the expression should be promoted to Float64, so cast both sides.
-                        //
-                        // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4331-L4336
-                        Operator::Divide => yes(divide_carefully(cast((**left).clone(), DataType::Float64), cast((**right).clone(), DataType::Float64), DataType::Float64)?),
-                        _ => no(expr),
-                    },
-
-                    //
-                    // String
-                    //
-
-                    // Match any of the operators supported by InfluxQL, when the operands a strings
-                    (
-                        DataType::Utf8,
-                        Operator::Eq | Operator::NotEq | Operator::RegexMatch | Operator::RegexNotMatch | Operator::StringConcat,
-                        DataType::Utf8
-                    ) => no(expr),
-                    // Rewrite the + operator to the string-concatenation operator
-                    (
-                        DataType::Utf8,
-                        Operator::Plus,
-                        DataType::Utf8
-                    ) => yes(binary_expr((**left).clone(), Operator::StringConcat, (**right).clone())),
-
-                    //
-                    // Dictionary (tag column) is treated the same as Utf8
-                    //
-                    (
-                        DataType::Dictionary(..),
-                        Operator::Eq | Operator::NotEq | Operator::RegexMatch | Operator::RegexNotMatch | Operator::StringConcat,
-                        DataType::Utf8
-                    ) |
-                    (
-                        DataType::Utf8,
-                        Operator::Eq | Operator::NotEq | Operator::RegexMatch | Operator::RegexNotMatch | Operator::StringConcat,
-                        DataType::Dictionary(..)
-                    ) => no(expr),
-                    (
-                        DataType::Dictionary(..),
-                        Operator::Plus,
-                        DataType::Utf8
-                    ) |
-                    (
-                        DataType::Utf8,
-                        Operator::Plus,
-                        DataType::Dictionary(..)
-                    ) => no(expr),
-
-                    //
-                    // Timestamp (time-range) expressions should pass through to DataFusion.
-                    //
-                    (DataType::Timestamp(..), ..) => no(expr),
-                    (.., DataType::Timestamp(..)) => no(expr),
-
-                    //
-                    // Two duration literals (represented in Datafusion as Intervals) are allowed as operands
-                    // and should pass through to DataFusion.
-                    //
-                    (DataType::Interval(..), _, DataType::Interval(..)) => no(expr),
-
-                    //
-                    // Unhandled binary expressions with conditional operators
-                    // should return `false`.
-                    //
-                    // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4552-L4557
-                    (
-                        _,
-                        Operator::Eq
-                        | Operator::NotEq
-                        | Operator::Gt
-                        | Operator::GtEq
-                        | Operator::Lt
-                        | Operator::LtEq
-                        // These are deviations to resolve ambiguous behaviour in the original implementation
-                        | Operator::And
-                        | Operator::Or,
-                        _
-                    ) => yes(lit(false)),
-
-                    //
-                    // Everything else should result in `NULL`.
-                    //
-                    // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4558
-                    _ => yes(lit(ScalarValue::Null)),
-                }
-            }
+        match expr {
+            Expr::BinaryExpr(bin_expr) => rewrite_binary_expr(bin_expr, schema),
 
             // Invoking an aggregate or window function on a tag column should return `NULL`
             // to be consistent with OG.
-            Expr::AggregateFunction(AggregateFunction { ref args, .. } )
-            | Expr::WindowFunction(WindowFunction { ref args, .. } ) => match &args[0] {
-               Expr::Column(Column { name, ..  }) if schema.is_tag_field(name) => yes(lit(ScalarValue::Null)),
-               _ => no(expr),
+            Expr::AggregateFunction(AggregateFunction {
+                params: AggregateFunctionParams { ref args, .. },
+                ..
+            }) => match &args[0] {
+                Expr::Column(Column { name, .. }) if schema.is_tag_field(name) => {
+                    yes(lit(ScalarValue::Null))
+                }
+                _ => no(expr),
+            },
+            Expr::WindowFunction(ref windowfun) => {
+                let WindowFunction {
+                    params: WindowFunctionParams { args, .. },
+                    ..
+                } = windowfun.as_ref();
+
+                match &args[0] {
+                    Expr::Column(Column { name, .. }) if schema.is_tag_field(name) => {
+                        yes(lit(ScalarValue::Null))
+                    }
+                    _ => no(expr),
+                }
             }
 
             //
@@ -445,6 +269,268 @@ fn rewrite_expr(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed<Expr>>
             _ => no(expr),
         }
     })
+}
+
+fn rewrite_binary_expr(
+    input_binary_expr: BinaryExpr,
+    schema: &IQLSchema<'_>,
+) -> Result<Transformed<Expr>> {
+    let BinaryExpr { left, op, right } = input_binary_expr;
+    let left = *left;
+    let right = *right;
+
+    let lhs_type = left.get_type(&schema.df_schema)?;
+    let rhs_type = right.get_type(&schema.df_schema)?;
+
+    match (&lhs_type, &op, &rhs_type) {
+        //
+        // NULL types
+        //
+
+        // Operations between a NULL and any numeric type should return a NULL result
+        (
+            DataType::Null,
+            _,
+            DataType::Float64 | DataType::UInt64 | DataType::Int64
+        ) |
+        (
+            DataType::Float64 | DataType::UInt64 | DataType::Int64,
+            _,
+            DataType::Null
+        ) |
+        // and any operations on NULLs return a NULL, as DataFusion is unable
+        // to process these expressions.
+        (
+            DataType::Null,
+            _,
+            DataType::Null
+        ) => yes(lit(ScalarValue::Null)),
+
+        // NULL using AND or OR is rewritten as `false`, which the optimiser
+        // may short circuit.
+        (
+            DataType::Null,
+            Operator::Or | Operator::And,
+            _
+        ) => yes(binary_expr(lit(false), op, right)),
+        (
+            _,
+            Operator::Or | Operator::And,
+            DataType::Null
+        ) => yes(binary_expr(left, op, lit(false))),
+
+        // NULL with other operators is passed through to DataFusion, which is expected
+        // evaluate to false.
+        (
+            DataType::Null,
+            Operator::Eq | Operator::NotEq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq,
+            _
+        ) |
+        (
+            _,
+            Operator::Eq | Operator::NotEq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq,
+            DataType::Null
+        ) => no(binary_expr(left, op, right)),
+
+        // Any other operations with NULL should return false
+        (DataType::Null, ..) | (.., DataType::Null) => yes(lit(false)),
+
+        //
+        // Boolean types
+        //
+        // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4206
+        (
+            DataType::Boolean,
+            Operator::And | Operator::Or | Operator::Eq | Operator::NotEq | Operator::BitwiseAnd | Operator::BitwiseXor | Operator::BitwiseOr,
+            DataType::Boolean,
+        ) => yes(rewrite_boolean(left, op, right)),
+
+        //
+        // Numeric types
+        //
+        // The following match arms ensure the appropriate target type is chosen based
+        // on the data types of the operands. In cases where the operands are mixed
+        // types, Float64 is the highest priority, followed by UInt64 and then Int64.
+        //
+
+        // Float on either side of a binary expression involving numeric types
+        (
+            DataType::Float64,
+            _,
+            DataType::Float64 | DataType::Int64 | DataType::UInt64
+        ) |
+        (
+            DataType::Int64 | DataType::UInt64,
+            _,
+            DataType::Float64
+        ) => match op {
+            // Dividing by zero would return a `NULL` in DataFusion and other SQL
+            // implementations, however, InfluxQL coalesces the result to `0`.
+
+            // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4268-L4270
+            Operator::Divide => yes(divide_carefully(left, right, DataType::Float64)?),
+            _ => no(binary_expr(left, op, right)),
+        },
+
+        // Mixed Int64/UInt64
+        (DataType::UInt64, _, DataType::Int64) | (DataType::Int64, _, DataType::UInt64) => {
+            // we define some helper enums to make the match statement later easier to read (compared to a bunch of
+            // opaque booleans)
+            enum IsLiteral {
+                Yes,
+                No,
+            }
+
+            let lhs_lit = if is_literal(&left) {IsLiteral::Yes} else {IsLiteral::No};
+            let rhs_lit = if is_literal(&right) {IsLiteral::Yes} else {IsLiteral::No};
+
+            enum IntTypes {
+                IU,
+                UI,
+            }
+
+            let int_types = match (&lhs_type, &rhs_type) {
+                (DataType::Int64, DataType::UInt64) => IntTypes::IU,
+                (DataType::UInt64, DataType::Int64) => IntTypes::UI,
+                _ => unreachable!(),
+            };
+
+            let (left, right) = match (int_types, lhs_lit, rhs_lit) {
+                (_, IsLiteral::No, IsLiteral::No) => {
+                    return plan_err!("cannot use {op} between an integer and unsigned, an explicit cast is required");
+                }
+
+                // field and signed literal
+                // NOTE: If an unsigned field is combined with a negative signed literal, that may wrap.
+                //       Apparently that's OK.
+                (IntTypes::UI, IsLiteral::No, IsLiteral::Yes) => {
+                    (left, wrapping_i64_to_u64_cast(right))
+                }
+                (IntTypes::IU, IsLiteral::Yes, IsLiteral::No) => {
+                    (wrapping_i64_to_u64_cast(left), right)
+                }
+
+                // field and unsigned literal
+                (IntTypes::IU, IsLiteral::No, IsLiteral::Yes) | (IntTypes::UI, IsLiteral::Yes, IsLiteral::No) => {
+                    return plan_err!("cannot use {op} with an integer field and unsigned literal");
+                }
+
+                // two literals
+                // => cast both to signed
+                (IntTypes::UI, IsLiteral::Yes, IsLiteral::Yes) => {
+                    (cast(left, DataType::Int64), right)
+                }
+                (IntTypes::IU, IsLiteral::Yes, IsLiteral::Yes) => {
+                    (left, cast(right, DataType::Int64))
+                }
+            };
+
+            // call rewrite again to handle careful division cases
+            rewrite_binary_expr(BinaryExpr { left: Box::new(left), op, right: Box::new(right) }, schema)
+        }
+
+        //
+        // If either of the types UInt64 and the other is UInt64 or Int64
+        //
+        (DataType::UInt64, ..) |
+        (.., DataType::UInt64) => match op {
+            Operator::Divide => yes(divide_carefully(left, right, DataType::UInt64)?),
+            _ => no(binary_expr(left, op, right)),
+        }
+        //
+        // Finally, if both sides are Int64
+        //
+        (
+            DataType::Int64,
+            _,
+            DataType::Int64
+        ) => match op {
+            // Like Float64, dividing by zero should return 0 for InfluxQL, and
+            // the expression should be promoted to Float64, so cast both sides.
+            //
+            // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4331-L4336
+            Operator::Divide => yes(divide_carefully(cast(left, DataType::Float64), cast(right, DataType::Float64), DataType::Float64)?),
+            _ => no(binary_expr(left, op, right)),
+        },
+
+        //
+        // String
+        //
+
+        // Match any of the operators supported by InfluxQL, when the operands a strings
+        (
+            DataType::Utf8,
+            Operator::Eq | Operator::NotEq | Operator::RegexMatch | Operator::RegexNotMatch | Operator::StringConcat,
+            DataType::Utf8
+        ) => no(binary_expr(left, op, right)),
+        // Rewrite the + operator to the string-concatenation operator
+        (
+            DataType::Utf8,
+            Operator::Plus,
+            DataType::Utf8
+        ) => yes(binary_expr(left, Operator::StringConcat, right)),
+
+        //
+        // Dictionary (tag column) is treated the same as Utf8
+        //
+        (
+            DataType::Dictionary(..),
+            Operator::Eq | Operator::NotEq | Operator::RegexMatch | Operator::RegexNotMatch | Operator::StringConcat,
+            DataType::Utf8
+        ) |
+        (
+            DataType::Utf8,
+            Operator::Eq | Operator::NotEq | Operator::RegexMatch | Operator::RegexNotMatch | Operator::StringConcat,
+            DataType::Dictionary(..)
+        ) => no(binary_expr(left, op, right)),
+        (
+            DataType::Dictionary(..),
+            Operator::Plus,
+            DataType::Utf8
+        ) |
+        (
+            DataType::Utf8,
+            Operator::Plus,
+            DataType::Dictionary(..)
+        ) => no(binary_expr(left, op, right)),
+
+        //
+        // Timestamp (time-range) expressions should pass through to DataFusion.
+        //
+        (DataType::Timestamp(..), ..) => no(binary_expr(left, op, right)),
+        (.., DataType::Timestamp(..)) => no(binary_expr(left, op, right)),
+
+        //
+        // Two duration literals (represented in Datafusion as Intervals) are allowed as operands
+        // and should pass through to DataFusion.
+        //
+        (DataType::Interval(..), _, DataType::Interval(..)) => no(binary_expr(left, op, right)),
+
+        //
+        // Unhandled binary expressions with conditional operators
+        // should return `false`.
+        //
+        // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4552-L4557
+        (
+            _,
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::Lt
+            | Operator::LtEq
+            // These are deviations to resolve ambiguous behaviour in the original implementation
+            | Operator::And
+            | Operator::Or,
+            _
+        ) => yes(lit(false)),
+
+        //
+        // Everything else should result in `NULL`.
+        //
+        // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L4558
+        _ => yes(lit(ScalarValue::Null)),
+    }
 }
 
 /// Rewrite conditional operators to `false` and any
@@ -499,6 +585,23 @@ fn divide_carefully(lhs: Expr, rhs: Expr, output_dtype: DataType) -> Result<Expr
         .and(Expr::IsNotNull(Box::new(lhs.clone())));
     let division = binary_expr(lhs, Operator::Divide, rhs);
     when(zero_condition, zero).otherwise(division)
+}
+
+/// Cast from `i64` to `u64` but wrap negative numbers around.
+fn wrapping_i64_to_u64_cast(expr: Expr) -> Expr {
+    // Because the constant optimizer may walk the expression tree, ALL casts in our subexpression MUST be legal.
+    // Hence we use "try cast" here in an elegant way.
+    //
+    // NOTE: currently (arrow 56) casting integers to fixed size binaries isn't supported, otherwise we could use that.
+    nvl(
+        try_cast(expr.clone(), DataType::UInt64),
+        lit(u64::MAX) - try_cast(expr.neg(), DataType::UInt64),
+    )
+}
+
+/// Check if expression is a literal.
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_, _))
 }
 
 /// Rewrite regex conditional expressions to match InfluxQL behaviour.
@@ -557,6 +660,38 @@ fn rewrite_tag_columns(expr: Expr, schema: &IQLSchema<'_>) -> Result<Transformed
     expr.transform(&|expr| match expr {
         Expr::Column(ref c) if schema.is_tag_field(&c.name) => {
             yes(when(expr.clone().is_null(), lit("")).otherwise(expr)?)
+        }
+        e => no(e),
+    })
+}
+
+/// Rewrites all mixed signed-unsigned operations to make them legal.
+///
+/// This is used for comparisons.
+fn rewrite_make_mixed_integer_ops_legal(
+    expr: Expr,
+    schema: &IQLSchema<'_>,
+) -> Result<Transformed<Expr>> {
+    expr.transform(&|expr: Expr| match expr {
+        Expr::BinaryExpr(bin_expr) => {
+            let BinaryExpr { left, op, right } = bin_expr;
+            let left = *left;
+            let right = *right;
+
+            // Do NOT unpack the result here because some operations (like `"foo" + "bar"`) aren't legal yet and will
+            // only get fixed in a later rewrite stage. We're only looking for a specific pattern.
+            let lhs_type_res = left.get_type(&schema.df_schema);
+            let rhs_type_res = right.get_type(&schema.df_schema);
+
+            match (lhs_type_res, rhs_type_res) {
+                (Ok(DataType::UInt64), Ok(DataType::Int64)) => {
+                    yes(binary_expr(left, op, wrapping_i64_to_u64_cast(right)))
+                }
+                (Ok(DataType::Int64), Ok(DataType::UInt64)) => {
+                    yes(binary_expr(wrapping_i64_to_u64_cast(left), op, right))
+                }
+                _ => no(binary_expr(left, op, right)),
+            }
         }
         e => no(e),
     })
@@ -625,9 +760,7 @@ mod test {
         let expr = lit(5_u64) / "unsigned_field".as_expr();
         assert_snapshot!(rewrite(expr), @"CASE WHEN unsigned_field = UInt64(0) AND UInt64(5) IS NOT NULL THEN UInt64(0) ELSE UInt64(5) / unsigned_field END");
         let expr = lit(5_i64) / "unsigned_field".as_expr();
-        assert_snapshot!(rewrite(expr), @"CASE WHEN unsigned_field = UInt64(0) AND Int64(5) IS NOT NULL THEN UInt64(0) ELSE Int64(5) / unsigned_field END");
-        let expr = lit(5_u64) / "integer_field".as_expr();
-        assert_snapshot!(rewrite(expr), @"CASE WHEN integer_field = UInt64(0) AND UInt64(5) IS NOT NULL THEN UInt64(0) ELSE UInt64(5) / integer_field END");
+        assert_snapshot!(rewrite(expr), @"CASE WHEN unsigned_field = UInt64(0) AND nvl(TRY_CAST(Int64(5) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(5)) AS UInt64)) IS NOT NULL THEN UInt64(0) ELSE nvl(TRY_CAST(Int64(5) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(5)) AS UInt64)) / unsigned_field END");
 
         // Int64 values are cast to Float64 to be consistent with InfluxQL
         let expr = lit(5_i64) / "integer_field".as_expr();
@@ -656,7 +789,7 @@ mod test {
         let expr = (lit(5.5) + lit(1_i64)).gt_eq(lit(3_u64) - lit(9_i64));
         assert_eq!(
             rewrite(expr),
-            "Float64(5.5) + Int64(1) >= UInt64(3) - Int64(9)"
+            "Float64(5.5) + Int64(1) >= CAST(UInt64(3) AS Int64) - Int64(9)"
         );
 
         // regular expressions
@@ -729,14 +862,28 @@ mod test {
         // Should rewrite as a string concatenation
         // NOTE: InfluxQL does not allow operations on string fields
 
-        let expr = "string_field".as_expr() + lit("bar");
-        assert_eq!(rewrite(expr), r#"string_field || Utf8("bar")"#);
+        assert_snapshot!(
+            rewrite("string_field".as_expr() + lit("bar")),
+            @r#"string_field || Utf8("bar")"#,
+        );
+        assert_snapshot!(
+            rewrite("string_field".as_expr().eq(lit("bar"))),
+            @r#"string_field = Utf8("bar")"#,
+        );
+        assert_snapshot!(
+            rewrite("string_field".as_expr().gt(lit("bar"))),
+            @"Boolean(false)",
+        );
 
-        let expr = "string_field".as_expr().eq(lit("bar"));
-        assert_eq!(rewrite(expr), r#"string_field = Utf8("bar")"#);
-
-        let expr = "string_field".as_expr().gt(lit("bar"));
-        assert_eq!(rewrite(expr), r#"Boolean(false)"#);
+        // this should "just work"
+        assert_snapshot!(
+            rewrite(lit("foo") + lit("bar")),
+            @r#"Utf8("foobar")"#,
+        );
+        assert_snapshot!(
+            rewrite("string_field".as_expr().eq(lit("foo") + lit("bar"))),
+            @r#"string_field = Utf8("foobar")"#,
+        );
     }
 
     /// Validates operations for boolean operands, with particular attention
@@ -989,16 +1136,16 @@ mod test {
         let expr = regex_match(col("tag0"), lit("^$"));
         assert_eq!(
             rewrite(expr),
-            r#"tag0 IS NULL OR CAST(tag0 AS Utf8) = Utf8("")"#
+            r#"tag0 IS NULL OR tag0 = Dictionary(Int32, Utf8(""))"#
         );
         let expr = regex_match(col("tag0"), lit("^foo$"));
-        assert_eq!(rewrite(expr), r#"CAST(tag0 AS Utf8) = Utf8("foo")"#);
+        assert_eq!(rewrite(expr), r#"tag0 = Dictionary(Int32, Utf8("foo"))"#);
         let expr = regex_not_match(col("tag0"), lit("^$"));
-        assert_eq!(rewrite(expr), r#"CAST(tag0 AS Utf8) != Utf8("")"#);
+        assert_eq!(rewrite(expr), r#"tag0 != Dictionary(Int32, Utf8(""))"#);
         let expr = regex_not_match(col("tag0"), lit("^foo$"));
         assert_eq!(
             rewrite(expr),
-            r#"tag0 IS NULL OR CAST(tag0 AS Utf8) != Utf8("foo")"#
+            r#"tag0 IS NULL OR tag0 != Dictionary(Int32, Utf8("foo"))"#
         );
     }
 
@@ -1027,5 +1174,286 @@ mod test {
 
         let expr = col("string_field").not_eq(lit("foo"));
         assert_eq!(rewrite(expr), r#"string_field != Utf8("foo")"#);
+    }
+
+    /// Test type coercion between signed and unsigned integers.
+    ///
+    /// # Behavior
+    /// - Same-type binary operations are OK.
+    /// - For mixed type field-op-literal operations, signed literals is coerced to the field. Unsigned literals are
+    ///   rejected.
+    /// - Mixed-type field operations are NOT allowed.
+    /// - For mixed type literals, both literals are coerced to "signed", altough it seems that this is a very rare
+    ///   edge case.
+    ///
+    /// After the coercion, special handling for divisions MUST be applied.
+    ///
+    /// # References
+    /// - https://influxdata.slack.com/archives/CRK9M8L5Q/p1751282419440489
+    /// - https://github.com/influxdata/influxql/pull/16
+    /// - https://github.com/influxdata/influxdb/blob/f7703b1316f39911f1fb4bbbbb5450894bf4967d/influxql/query/select_test.go#L3077-L3958
+    /// - https://github.com/influxdata/influxql/blob/8c3e70e7de2b9c819f61c51fd1c9a694bafdc5c7/ast.go#L4475
+    #[test]
+    fn test_signed_unsinged_integer_interaction() {
+        test_helpers::maybe_start_logging();
+
+        let props = execution_props();
+        let schemas = new_schema();
+        let rewrite = |expr: Expr| {
+            let res_field = match rewrite_field_expr(expr.clone(), &schemas) {
+                Ok(t) => format!("ok: {}", t.data),
+                Err(e) => format!("err: {e}"),
+            };
+            let res_condition = match rewrite_conditional_expr(&props, expr, &schemas) {
+                Ok(expr) => format!("ok: {expr}"),
+                Err(e) => format!("err: {e}"),
+            };
+            format!("    field: {res_field}\ncondition: {res_condition}")
+        };
+
+        let i64_lit = || lit(1i64);
+        let u64_lit = || lit(1u64);
+        let i64_field = || "integer_field".as_expr();
+        let u64_field = || "unsigned_field".as_expr();
+
+        // i64_lit + ...
+        assert_snapshot!(
+            rewrite(i64_lit() + i64_lit()),
+            @r"
+            field: ok: Int64(1) + Int64(1)
+        condition: ok: Int64(2)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_lit() + u64_lit()),
+            @r"
+            field: ok: Int64(1) + CAST(UInt64(1) AS Int64)
+        condition: ok: UInt64(2)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_lit() + i64_field()),
+            @r"
+            field: ok: Int64(1) + integer_field
+        condition: ok: Int64(1) + integer_field
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_lit() + u64_field()),
+            @r"
+            field: ok: nvl(TRY_CAST(Int64(1) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(1)) AS UInt64)) + unsigned_field
+        condition: ok: UInt64(1) + unsigned_field
+        ",
+        );
+
+        // i64_lit / ...
+        assert_snapshot!(
+            rewrite(i64_lit() / i64_lit()),
+            @r"
+            field: ok: CASE WHEN CAST(Int64(1) AS Float64) = Float64(0) AND CAST(Int64(1) AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(Int64(1) AS Float64) / CAST(Int64(1) AS Float64) END
+        condition: ok: Float64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_lit() / u64_lit()),
+            @r"
+            field: ok: CASE WHEN CAST(CAST(UInt64(1) AS Int64) AS Float64) = Float64(0) AND CAST(Int64(1) AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(Int64(1) AS Float64) / CAST(CAST(UInt64(1) AS Int64) AS Float64) END
+        condition: ok: UInt64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_lit() / i64_field()),
+            @r"
+            field: ok: CASE WHEN CAST(integer_field AS Float64) = Float64(0) AND CAST(Int64(1) AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(Int64(1) AS Float64) / CAST(integer_field AS Float64) END
+        condition: ok: CASE WHEN CAST(integer_field AS Float64) = Float64(0) THEN Float64(0) ELSE Float64(1) / CAST(integer_field AS Float64) END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_lit() / u64_field()),
+            @r"
+            field: ok: CASE WHEN unsigned_field = UInt64(0) AND nvl(TRY_CAST(Int64(1) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(1)) AS UInt64)) IS NOT NULL THEN UInt64(0) ELSE nvl(TRY_CAST(Int64(1) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(1)) AS UInt64)) / unsigned_field END
+        condition: ok: CASE WHEN unsigned_field = UInt64(0) THEN UInt64(0) ELSE UInt64(1) / unsigned_field END
+        ",
+        );
+
+        // u64_lit + ...
+        assert_snapshot!(
+            rewrite(u64_lit() + i64_lit()),
+            @r"
+            field: ok: CAST(UInt64(1) AS Int64) + Int64(1)
+        condition: ok: UInt64(2)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_lit() + u64_lit()),
+            @r"
+            field: ok: UInt64(1) + UInt64(1)
+        condition: ok: UInt64(2)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_lit() + i64_field()),
+            @r"
+            field: err: Error during planning: cannot use + with an integer field and unsigned literal
+        condition: ok: UInt64(1) + nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64))
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_lit() + u64_field()),
+            @r"
+            field: ok: UInt64(1) + unsigned_field
+        condition: ok: UInt64(1) + unsigned_field
+        ",
+        );
+
+        // u64_lit / ...
+        assert_snapshot!(
+            rewrite(u64_lit() / i64_lit()),
+            @r"
+            field: ok: CASE WHEN CAST(Int64(1) AS Float64) = Float64(0) AND CAST(CAST(UInt64(1) AS Int64) AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(CAST(UInt64(1) AS Int64) AS Float64) / CAST(Int64(1) AS Float64) END
+        condition: ok: UInt64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_lit() / u64_lit()),
+            @r"
+            field: ok: CASE WHEN UInt64(1) = UInt64(0) AND UInt64(1) IS NOT NULL THEN UInt64(0) ELSE UInt64(1) / UInt64(1) END
+        condition: ok: UInt64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_lit() / i64_field()),
+            @r"
+            field: err: Error during planning: cannot use / with an integer field and unsigned literal
+        condition: ok: CASE WHEN nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) = UInt64(0) THEN UInt64(0) ELSE UInt64(1) / nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_lit() / u64_field()),
+            @r"
+            field: ok: CASE WHEN unsigned_field = UInt64(0) AND UInt64(1) IS NOT NULL THEN UInt64(0) ELSE UInt64(1) / unsigned_field END
+        condition: ok: CASE WHEN unsigned_field = UInt64(0) THEN UInt64(0) ELSE UInt64(1) / unsigned_field END
+        ",
+        );
+
+        // i64_field + ...
+        assert_snapshot!(
+            rewrite(i64_field() + i64_lit()),
+            @r"
+            field: ok: integer_field + Int64(1)
+        condition: ok: integer_field + Int64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_field() + u64_lit()),
+            @r"
+            field: err: Error during planning: cannot use + with an integer field and unsigned literal
+        condition: ok: nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) + UInt64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_field() + i64_field()),
+            @r"
+            field: ok: integer_field + integer_field
+        condition: ok: integer_field + integer_field
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_field() + u64_field()),
+            @r"
+            field: err: Error during planning: cannot use + between an integer and unsigned, an explicit cast is required
+        condition: ok: nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) + unsigned_field
+        ",
+        );
+
+        // i64_field / ...
+        assert_snapshot!(
+            rewrite(i64_field() / i64_lit()),
+            @r"
+            field: ok: CASE WHEN CAST(Int64(1) AS Float64) = Float64(0) AND CAST(integer_field AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(integer_field AS Float64) / CAST(Int64(1) AS Float64) END
+        condition: ok: CASE WHEN Boolean(false) THEN Float64(0) ELSE CAST(integer_field AS Float64) END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_field() / u64_lit()),
+            @r"
+            field: err: Error during planning: cannot use / with an integer field and unsigned literal
+        condition: ok: CASE WHEN Boolean(false) THEN UInt64(0) ELSE nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_field() / i64_field()),
+            @r"
+            field: ok: CASE WHEN CAST(integer_field AS Float64) = Float64(0) AND CAST(integer_field AS Float64) IS NOT NULL THEN Float64(0) ELSE CAST(integer_field AS Float64) / CAST(integer_field AS Float64) END
+        condition: ok: CASE WHEN CAST(integer_field AS Float64) = Float64(0) THEN Float64(0) ELSE CAST(integer_field AS Float64) / CAST(integer_field AS Float64) END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(i64_field() / u64_field()),
+            @r"
+            field: err: Error during planning: cannot use / between an integer and unsigned, an explicit cast is required
+        condition: ok: CASE WHEN unsigned_field = UInt64(0) AND nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) IS NOT NULL THEN UInt64(0) ELSE nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) / unsigned_field END
+        ",
+        );
+
+        // u64_field + ...
+        assert_snapshot!(
+            rewrite(u64_field() + i64_lit()),
+            @r"
+            field: ok: unsigned_field + nvl(TRY_CAST(Int64(1) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(1)) AS UInt64))
+        condition: ok: unsigned_field + UInt64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_field() + u64_lit()),
+            @r"
+            field: ok: unsigned_field + UInt64(1)
+        condition: ok: unsigned_field + UInt64(1)
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_field() + i64_field()),
+            @r"
+            field: err: Error during planning: cannot use + between an integer and unsigned, an explicit cast is required
+        condition: ok: unsigned_field + nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64))
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_field() + u64_field()),
+            @r"
+            field: ok: unsigned_field + unsigned_field
+        condition: ok: unsigned_field + unsigned_field
+        ",
+        );
+
+        // u64_field / ...
+        assert_snapshot!(
+            rewrite(u64_field() / i64_lit()),
+            @r"
+            field: ok: CASE WHEN nvl(TRY_CAST(Int64(1) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(1)) AS UInt64)) = UInt64(0) AND unsigned_field IS NOT NULL THEN UInt64(0) ELSE unsigned_field / nvl(TRY_CAST(Int64(1) AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- Int64(1)) AS UInt64)) END
+        condition: ok: CASE WHEN Boolean(false) THEN UInt64(0) ELSE unsigned_field END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_field() / u64_lit()),
+            @r"
+            field: ok: CASE WHEN UInt64(1) = UInt64(0) AND unsigned_field IS NOT NULL THEN UInt64(0) ELSE unsigned_field / UInt64(1) END
+        condition: ok: CASE WHEN Boolean(false) THEN UInt64(0) ELSE unsigned_field END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_field() / i64_field()),
+            @r"
+            field: err: Error during planning: cannot use / between an integer and unsigned, an explicit cast is required
+        condition: ok: CASE WHEN nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) = UInt64(0) AND unsigned_field IS NOT NULL THEN UInt64(0) ELSE unsigned_field / nvl(TRY_CAST(integer_field AS UInt64), UInt64(18446744073709551615) - TRY_CAST((- integer_field) AS UInt64)) END
+        ",
+        );
+        assert_snapshot!(
+            rewrite(u64_field() / u64_field()),
+            @r"
+            field: ok: CASE WHEN unsigned_field = UInt64(0) AND unsigned_field IS NOT NULL THEN UInt64(0) ELSE unsigned_field / unsigned_field END
+        condition: ok: CASE WHEN unsigned_field = UInt64(0) THEN UInt64(0) ELSE unsigned_field / unsigned_field END
+        ",
+        );
     }
 }

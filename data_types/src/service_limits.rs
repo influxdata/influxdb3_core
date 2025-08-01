@@ -3,9 +3,9 @@
 use generated_types::influxdata::iox::namespace::{
     v1 as namespace_proto, v1::update_namespace_service_protection_limit_request::LimitUpdate,
 };
-use observability_deps::tracing::*;
 use std::num::NonZeroUsize;
 use thiserror::Error;
+use tracing::*;
 
 /// Definitions that apply to both MaxColumnsPerTable and MaxTables. Note that the hardcoded
 /// default value specified in the macro invocation must be greater than 0 and fit in an `i32`.

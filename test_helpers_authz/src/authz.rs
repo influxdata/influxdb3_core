@@ -9,7 +9,6 @@ use generated_types::{
     },
     transport::{self, Server, server::TcpIncoming},
 };
-use observability_deps::tracing::{error, info};
 use rand::{Rng, distr::Alphanumeric, rng};
 use std::{
     collections::HashMap,
@@ -21,6 +20,7 @@ use tokio::{
     sync::oneshot,
     task::{JoinHandle, spawn},
 };
+use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct Authorizer {

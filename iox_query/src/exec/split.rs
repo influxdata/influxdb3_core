@@ -74,9 +74,9 @@ use datafusion::{
 };
 use datafusion_util::{AdapterStream, watch::WatchedTask};
 use futures::StreamExt;
-use observability_deps::tracing::*;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::Sender;
+use tracing::*;
 
 /// Implements stream splitting described in `make_stream_split`
 ///
@@ -303,7 +303,9 @@ impl ExecutionPlan for StreamSplitExec {
 impl DisplayAs for StreamSplitExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "StreamSplitExec")
             }
         }
@@ -559,9 +561,10 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow_util::assert_batches_sorted_eq;
     use datafusion::common::DFSchema;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::{
         execution::context::SessionContext,
-        physical_plan::memory::MemoryExec,
         prelude::{col, lit},
     };
     use datafusion_util::test_collect_partition;
@@ -952,9 +955,11 @@ mod tests {
             .expect("must be at least one batch");
 
         let projection = None;
-        let input =
-            MemoryExec::try_new(&partitions, schema, projection).expect("Created MemoryExec");
-        Arc::new(input)
+
+        Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&partitions, schema, projection)
+                .expect("Created MemorySourceConfig"),
+        )))
     }
 
     /// Return a `PhysicalExpr` from a logical `Expr`

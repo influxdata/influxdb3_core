@@ -105,10 +105,7 @@ impl LabelSet {
             .collect::<BTreeMap<String, String>>();
 
         self.0.get(&labels).unwrap_or_else(|| {
-            panic!(
-                "metric exists, but no entry for label set {:?}, have: {:#?}",
-                labels, self
-            )
+            panic!("metric exists, but no entry for label set {labels:?}, have: {self:#?}")
         })
     }
 
@@ -138,7 +135,7 @@ impl Value {
             // Treat Untyped as a counter, as it's returned (only?) for
             // histogram count & sum types.
             Self::Counter(v) | Self::Untyped(v) => **v,
-            _ => panic!("{:?} is not a counter", self),
+            _ => panic!("{self:?} is not a counter"),
         }
     }
 
@@ -150,7 +147,7 @@ impl Value {
     pub fn unwrap_gauge(&self) -> f64 {
         match self {
             Self::Gauge(v) => **v,
-            _ => panic!("{:?} is not a gauge", self),
+            _ => panic!("{self:?} is not a gauge"),
         }
     }
 
@@ -162,7 +159,7 @@ impl Value {
     pub fn unwrap_histogram(&self) -> &Histogram {
         match self {
             Self::Histogram(v) => v,
-            _ => panic!("{:?} is not a histogram", self),
+            _ => panic!("{self:?} is not a histogram"),
         }
     }
 }

@@ -104,7 +104,7 @@ pub unsafe fn start_logging(force_dbg: bool) {
             .with_test_writer()
             .finish();
 
-        observability_deps::tracing::subscriber::set_global_default(subscriber)
+        ::tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
     })
 }

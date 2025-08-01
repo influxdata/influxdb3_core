@@ -107,7 +107,7 @@ fn run_bench(
     } = params;
 
     let metrics = metric::Registry::new();
-    let store = Arc::new(S3Fifo::<Path, Bytes>::new(
+    let store = Arc::new(S3Fifo::<Path, Arc<Bytes>>::new(
         S3Config {
             max_memory_size: ((key_size * n_keys) as f64 * size_fraction).ceil() as usize,
             max_ghost_memory_size: 10_000_000,

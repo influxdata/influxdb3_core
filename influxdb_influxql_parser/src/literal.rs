@@ -258,7 +258,7 @@ static DIVISORS: [(i64, &str); 8] = [
     (NANOS_PER_MIN, "m"),
     (NANOS_PER_SEC, "s"),
     (NANOS_PER_MILLI, "ms"),
-    (NANOS_PER_MICRO, "us"),
+    (NANOS_PER_MICRO, "u"),
     (1, "ns"),
 ];
 
@@ -549,7 +549,7 @@ mod test {
                 + 8 * NANOS_PER_MICRO
                 + 500,
         );
-        assert_eq!(d.to_string(), "20w6d13h11m10s9ms8us500ns");
+        assert_eq!(d.to_string(), "20w6d13h11m10s9ms8u500ns");
     }
 
     #[test]

@@ -36,6 +36,9 @@ service TableService {
 
   // Delete a table - or, more specifically, mark it as soft-deleted
   rpc DeleteTable(DeleteTableRequest) returns (DeleteTableResponse);
+
+  // Rename a table
+  rpc RenameTable(RenameTableRequest) returns (RenameTableResponse);
 }
 
 message CreateTableRequest {
@@ -183,5 +186,14 @@ message DeleteTableRequest {
 }
 
 message DeleteTableResponse {
+  Table table = 1;
+}
+
+message RenameTableRequest {
+  int64 table_id = 1;
+  string new_name = 2;
+}
+
+message RenameTableResponse {
   Table table = 1;
 }

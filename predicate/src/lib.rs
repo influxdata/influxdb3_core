@@ -11,10 +11,10 @@ use datafusion::{
     prelude::{Expr, col},
 };
 use datafusion_util::{AsExpr, lit_timestamptz_nano, make_range_expr};
-use observability_deps::tracing::debug;
 use rpc_predicate::VALUE_COLUMN_NAME;
 use schema::TIME_COLUMN_NAME;
 use std::{collections::BTreeSet, fmt, ops::Not};
+use tracing::debug;
 
 /// This `Predicate` represents the empty predicate (aka that evaluates to true for all rows).
 pub const EMPTY_PREDICATE: Predicate = Predicate {
@@ -363,10 +363,10 @@ impl TryFrom<Expr> for ValueExpr {
             right: _,
         }) = &expr
         {
-            if let Expr::Column(inner) = left.as_ref() {
-                if inner.name == VALUE_COLUMN_NAME {
-                    return Ok(Self { expr });
-                }
+            if let Expr::Column(inner) = left.as_ref()
+                && inner.name == VALUE_COLUMN_NAME
+            {
+                return Ok(Self { expr });
             }
         }
         Err(expr)
@@ -436,7 +436,7 @@ impl TreeNodeVisitor<'_> for RowBasedVisitor {
             | Expr::IsTrue(_)
             | Expr::IsUnknown(_)
             | Expr::Like { .. }
-            | Expr::Literal(_)
+            | Expr::Literal(_, _)
             | Expr::Negative(_)
             | Expr::Not(_)
             | Expr::OuterReferenceColumn(_, _)
@@ -445,8 +445,10 @@ impl TreeNodeVisitor<'_> for RowBasedVisitor {
             | Expr::ScalarSubquery(_)
             | Expr::ScalarVariable(_, _)
             | Expr::SimilarTo { .. }
-            | Expr::TryCast { .. }
-            | Expr::Wildcard { .. } => Ok(TreeNodeRecursion::Continue),
+            | Expr::TryCast { .. } => Ok(TreeNodeRecursion::Continue),
+            // Exhaustive matching requires us to also match deprecated variants
+            #[expect(deprecated)]
+            Expr::Wildcard { .. } => Ok(TreeNodeRecursion::Continue),
             Expr::AggregateFunction { .. }
             | Expr::GroupingSet(_)
             | Expr::WindowFunction { .. }

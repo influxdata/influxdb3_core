@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use futures::future::BoxFuture;
 use iox_time::TimeProvider;
 use metric::DurationHistogram;
-use observability_deps::tracing::{info, warn};
+use tracing::{info, warn};
 
 use crate::cache_system::DynError;
 

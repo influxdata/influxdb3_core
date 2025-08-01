@@ -5,14 +5,14 @@ use std::{
     sync::Arc,
 };
 
-use observability_deps::tracing::{
+use parking_lot::Mutex;
+use serde::Serialize;
+use tracing::{
     self, Event,
     field::Field,
     span::{Attributes, Id, Record},
     subscriber::{DefaultGuard, Subscriber},
 };
-use parking_lot::Mutex;
-use serde::Serialize;
 
 /// A log value.
 #[derive(Debug, Clone, Serialize)]

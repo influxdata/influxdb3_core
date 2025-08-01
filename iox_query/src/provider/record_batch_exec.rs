@@ -25,9 +25,9 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use itertools::Itertools;
-use observability_deps::tracing::trace;
 use schema::sort::SortKey;
 use std::{collections::HashMap, fmt, sync::Arc};
+use tracing::trace;
 
 /// Implements the DataFusion physical plan interface for [`RecordBatch`]es with automatic projection and NULL-column creation.
 ///
@@ -232,12 +232,24 @@ impl ExecutionPlan for RecordBatchesExec {
     fn statistics(&self) -> Result<Statistics, DataFusionError> {
         Ok(self.statistics.clone())
     }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Statistics, DataFusionError> {
+        match partition {
+            None => Ok(self.statistics.clone()),
+            Some(partition) => Ok(self.chunks[partition].stats().as_ref().clone()),
+        }
+    }
 }
 
 impl DisplayAs for RecordBatchesExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "RecordBatchesExec: chunks={}", self.chunks.len(),)?;
                 if !self.schema.fields().is_empty() {
                     write!(f, ", projection={}", ProjectSchemaDisplay(&self.schema))?;

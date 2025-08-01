@@ -97,9 +97,9 @@
 //! [selector functions]: https://docs.influxdata.com/influxdb/v1.8/query_language/functions/#selectors
 use std::any::Any;
 use std::fmt::Debug;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::{
     error::Result as DataFusionResult,
@@ -265,7 +265,7 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
     }
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> DataFusionResult<Box<dyn Accumulator>> {
-        let agg_type = AggType::try_from_return_type(arg.return_type)?;
+        let agg_type = AggType::try_from_return_type(arg.return_field.data_type())?;
         let value_type = agg_type.value_type;
         let timezone = match agg_type.time_type {
             DataType::Timestamp(_, tz) => tz.clone(),
@@ -306,20 +306,17 @@ impl AggregateUDFImpl for SelectorUDAFImpl {
         Ok(accumulator)
     }
 
-    fn state_fields(
-        &self,
-        args: StateFieldsArgs<'_>,
-    ) -> DataFusionResult<Vec<arrow::datatypes::Field>> {
-        let fields = AggType::try_from_return_type(args.return_type)?
+    fn state_fields(&self, args: StateFieldsArgs<'_>) -> DataFusionResult<Vec<FieldRef>> {
+        let fields = AggType::try_from_return_type(args.return_field.data_type())?
             .state_datatypes()
             .into_iter()
             .enumerate()
             .map(|(i, data_type)| {
-                Field::new(
+                Arc::new(Field::new(
                     format_state_name(args.name, &format!("{i}")),
                     data_type,
                     true,
-                )
+                ))
             })
             .collect::<Vec<_>>();
 
@@ -1184,7 +1181,7 @@ mod test {
         pub async fn run_cases_err(selector: AggregateUDF, name: &str) {
             run_case_err(
                 selector.call(vec![]),
-                &format!("Error during planning: Error during planning: {name} does not support zero arguments. No function matches the given name and argument types '{name}()'. You might need to add explicit type casts.\n\tCandidate functions:\n\t{name}(Any, .., Any)"),
+                &format!("Error during planning: '{name}' does not support zero arguments No function matches the given name and argument types '{name}()'. You might need to add explicit type casts.\n\tCandidate functions:\n\t{name}(Any, .., Any)"),
             )
             .await;
 

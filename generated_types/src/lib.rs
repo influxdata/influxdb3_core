@@ -255,7 +255,7 @@ pub mod influxdata {
                         }
                         v if v == Self::NamespaceEvents as u64 => Self::NamespaceEvents,
                         v if v == Self::QueryExecMetadata as u64 => Self::QueryExecMetadata,
-                        _ => return Err(format!("unknown topic id {}", v).into()),
+                        _ => return Err(format!("unknown topic id {v}").into()),
                     })
                 }
             }
@@ -493,14 +493,39 @@ pub mod influxdata {
             NamespaceId
         );
         target_from_impls!(
+            bulk_ingest::v1::upsert_sort_key_request::TableTarget,
+            TableName,
+            TableId
+        );
+        target_from_impls!(
             bulk_ingest::v1::new_parquet_metadata_request::NamespaceTarget,
             NamespaceName,
             NamespaceId
         );
         target_from_impls!(
+            bulk_ingest::v1::new_parquet_metadata_request::TableTarget,
+            TableName,
+            TableId
+        );
+        target_from_impls!(
+            schema::v1::get_schema_request::NamespaceTarget,
+            NamespaceName,
+            NamespaceId
+        );
+        target_from_impls!(
+            schema::v1::get_schema_request::TableTarget,
+            TableName,
+            TableId
+        );
+        target_from_impls!(
             schema::v1::upsert_schema_request::NamespaceTarget,
             NamespaceName,
             NamespaceId
+        );
+        target_from_impls!(
+            schema::v1::upsert_schema_request::TableTarget,
+            TableName,
+            TableId
         );
     }
 

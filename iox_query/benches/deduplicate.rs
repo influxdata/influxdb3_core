@@ -8,9 +8,10 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::expressions::col;
-use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::sorts::sort::sort_batch;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::SessionContext;
@@ -140,7 +141,7 @@ impl DataGenerator {
         for _ in 0..self.num_rows {
             if let Some(tag_num) = self.tag_value() {
                 use std::fmt::Write;
-                write!(&mut temp, "value{}", tag_num).unwrap();
+                write!(&mut temp, "value{tag_num}").unwrap();
                 builder.append_value(&temp);
                 temp.clear();
                 time_builder.append_value(tag_num as i64);
@@ -251,7 +252,9 @@ impl TestScenario {
         let schema = batches[0].schema();
         let projection = None;
         let partitions = vec![batches];
-        let input = Arc::new(MemoryExec::try_new(&partitions, schema, projection).unwrap());
+        let input = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&partitions, schema, projection).unwrap(),
+        )));
 
         // run using a single thread
         let runtime = tokio::runtime::Builder::new_current_thread()

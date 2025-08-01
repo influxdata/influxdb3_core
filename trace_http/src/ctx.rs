@@ -3,8 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use http::HeaderMap;
-use observability_deps::tracing::*;
 use snafu::Snafu;
+use tracing::*;
 
 use trace::TraceCollector;
 use trace::ctx::{SpanContext, SpanId, TraceId};
@@ -107,27 +107,26 @@ impl TraceHeaderParser {
         collector: Option<&Arc<dyn TraceCollector>>,
         headers: &HeaderMap,
     ) -> Result<Option<SpanContext>, ContextError> {
-        if let Some(trace_header) = self.jaeger_trace_context_header_name.as_ref() {
-            if headers.contains_key(trace_header.as_ref()) {
-                return decode_jaeger(collector, headers, trace_header.as_ref()).map(Some);
-            }
+        if let Some(trace_header) = self.jaeger_trace_context_header_name.as_ref()
+            && headers.contains_key(trace_header.as_ref())
+        {
+            return decode_jaeger(collector, headers, trace_header.as_ref()).map(Some);
         }
 
         if headers.contains_key(B3_TRACE_ID_HEADER) {
             return decode_b3(collector, headers).map(Some);
         }
 
-        if let Some(debug_header_name) = self.jaeger_debug_name.as_ref() {
-            if let Some(debug_header_value) = headers.get(debug_header_name.as_ref()) {
-                // create a new trace / span
-                let new_trace_context =
-                    SpanContext::new_with_optional_collector(collector.cloned());
-                // It would be nice to record the debug-name in the span somehow for easy finding in Jaeger
-                // for now, also log it.
-                let trace_id = format!("{:x}", new_trace_context.trace_id.get());
-                trace!(%trace_id, ?debug_header_value, "Created new trace rooted at IOx");
-                return Ok(Some(new_trace_context));
-            }
+        if let Some(debug_header_name) = self.jaeger_debug_name.as_ref()
+            && let Some(debug_header_value) = headers.get(debug_header_name.as_ref())
+        {
+            // create a new trace / span
+            let new_trace_context = SpanContext::new_with_optional_collector(collector.cloned());
+            // It would be nice to record the debug-name in the span somehow for easy finding in Jaeger
+            // for now, also log it.
+            let trace_id = format!("{:x}", new_trace_context.trace_id.get());
+            trace!(%trace_id, ?debug_header_value, "Created new trace rooted at IOx");
+            return Ok(Some(new_trace_context));
         }
 
         Ok(None)

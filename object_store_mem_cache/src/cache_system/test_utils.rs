@@ -54,10 +54,10 @@ pub(crate) async fn test_happy_path(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(move |_k| {
+        Box::new(move || {
             async move {
                 barrier_captured.wait().await;
-                Ok(TestValue(test_size))
+                Ok(Arc::new(TestValue(test_size)))
             }
             .boxed()
         })
@@ -94,7 +94,7 @@ pub(crate) async fn test_panic_loader(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(|_k| {
+        Box::new(|| {
             async move {
                 barrier_captured.wait().await;
                 panic!("foo")
@@ -130,7 +130,7 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let mut fut = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(|_k| {
+        Box::new(|| {
             async move {
                 barrier_captured.wait().await;
                 Err(str_err("my error"))
@@ -168,7 +168,7 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
     let (res, state) = cache
         .get_or_fetch(
             &k1,
-            Box::new(move |_k| async move { Ok(TestValue(test_size)) }.boxed()),
+            Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
         )
         .await;
     assert_eq!(state, CacheState::NewEntry);
@@ -193,7 +193,7 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
     let (res, state) = cache
         .get_or_fetch(
             &k1,
-            Box::new(move |_k| async move { Ok(TestValue(test_size)) }.boxed()),
+            Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
         )
         .await;
     assert_eq!(state, CacheState::WasCached);
@@ -221,10 +221,10 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let mut fut_1 = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(move |_k| {
+        Box::new(move || {
             async move {
                 barrier_captured.wait().await;
-                Ok(TestValue(test_size_1))
+                Ok(Arc::new(TestValue(test_size_1)))
             }
             .boxed()
         })
@@ -234,7 +234,7 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
 
     let mut fut_2 = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(move |_k| { { async move { Ok(TestValue(test_size_2)) } }.boxed() })
+        Box::new(move || { { async move { Ok(Arc::new(TestValue(test_size_2))) } }.boxed() })
     ));
     fut_2.assert_pending().await;
 
@@ -264,12 +264,12 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
         let k1 = Arc::new("k1");
         let mut fut = std::pin::pin!(cache.get_or_fetch(
             &k1,
-            Box::new(move |_k| {
+            Box::new(move || {
                 {
                     let barrier = Arc::clone(&barrier_captured);
                     async move {
                         barrier.wait().await;
-                        Ok(TestValue(1001))
+                        Ok(Arc::new(TestValue(1001)))
                     }
                 }
                 .boxed()
@@ -294,12 +294,12 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let mut fut = cache.get_or_fetch(
         &k1,
-        Box::new(|_k| {
+        Box::new(|| {
             async move {
                 for barrier in barriers_captured.iter() {
                     barrier.wait().await;
                 }
-                Ok(TestValue(1001))
+                Ok(Arc::new(TestValue(1001)))
             }
             .boxed()
         }),
@@ -342,12 +342,12 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let mut fut_1 = cache.get_or_fetch(
         &k1,
-        Box::new(|_k| {
+        Box::new(|| {
             async move {
                 for barrier in barriers_captured.iter() {
                     barrier.wait().await;
                 }
-                Ok(TestValue(1001))
+                Ok(Arc::new(TestValue(1001)))
             }
             .boxed()
         }),
@@ -356,7 +356,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let mut fut_2 = cache
-        .get_or_fetch(&k1, Box::new(|_k| async move { unreachable!() }.boxed()))
+        .get_or_fetch(&k1, Box::new(|| async move { unreachable!() }.boxed()))
         .boxed();
     fut_2.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
@@ -409,7 +409,7 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
                 cache_captured
                     .get_or_fetch(
                         &k1,
-                        Box::new(|_k| {
+                        Box::new(|| {
                             async move {
                                 barrier_captured.wait().await;
                                 panic!("foo")
@@ -457,10 +457,10 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
     let barrier_captured = Arc::clone(&barrier);
     let mut fut = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(move |_k| {
+        Box::new(move || {
             async move {
                 barrier_captured.wait().await;
-                Ok(TestValue(test_size))
+                Ok(Arc::new(TestValue(test_size)))
             }
             .boxed()
         })
@@ -532,7 +532,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
     let barrier_captured = Arc::clone(&barrier);
     let mut fut = std::pin::pin!(cache.get_or_fetch(
         &k1,
-        Box::new(|_k| {
+        Box::new(|| {
             async move {
                 barrier_captured.wait().await;
                 Err(str_err("err"))
@@ -578,7 +578,7 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
     let (res, state) = cache
         .get_or_fetch(
             &k1,
-            Box::new(move |_k| async move { Ok(TestValue(test_size_1)) }.boxed()),
+            Box::new(move || async move { Ok(Arc::new(TestValue(test_size_1))) }.boxed()),
         )
         .await;
     assert_eq!(state, CacheState::NewEntry);
@@ -587,7 +587,7 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
     let (res, state) = cache
         .get_or_fetch(
             &k2,
-            Box::new(move |_k| async move { Ok(TestValue(test_size_2)) }.boxed()),
+            Box::new(move || async move { Ok(Arc::new(TestValue(test_size_2))) }.boxed()),
         )
         .await;
     assert_eq!(state, CacheState::NewEntry);
@@ -605,7 +605,7 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
 }
 
 pub(crate) struct TestSetup {
-    pub(crate) cache: Arc<dyn Cache<&'static str, TestValue>>,
+    pub(crate) cache: Arc<dyn Cache<&'static str, Arc<TestValue>>>,
     pub(crate) observer: Arc<TestHook<&'static str>>,
 }
 

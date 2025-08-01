@@ -164,9 +164,6 @@ impl GapFiller {
     /// Produces a vector of offsets that are the exclusive ends of each series
     /// in the buffered input. It will return the ends of only those series
     /// that can at least be started in the output batch.
-    ///
-    /// Uses [`lexicographical_partition_ranges`](arrow::compute::lexicographical_partition_ranges)
-    /// to partition input rows into series.
     fn plan_output_batch(
         &mut self,
         input_time_array: &TimestampNanosecondArray,

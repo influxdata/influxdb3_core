@@ -5,14 +5,14 @@ use arrow::datatypes::Schema;
 use datafusion::common::{
     ColumnStatistics, Result, ScalarValue, Statistics, internal_datafusion_err,
 };
-use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use itertools::FoldWhile;
 use itertools::Itertools;
-use observability_deps::tracing::trace;
 use std::sync::Arc;
+use tracing::trace;
 
 use crate::physical_optimizer::sort::lexical_range::{
     LexicalRange, NonOverlappingOrderedLexicalRanges,
@@ -24,7 +24,7 @@ use crate::statistics::{column_statistics_min_max, statistics_by_partition};
 ///
 /// Output will have N ranges where N is the number of output partitions
 ///
-/// Returns None if not possible to determine ranges.
+/// Returns None if not possible to determine ranges, or if not disjoint.
 ///
 /// Note that this method confirms that between each partition it is properly ordered, and has non-overlapping ranges.
 /// It does not ensure that within each partition the data is properly sorted.
@@ -32,12 +32,58 @@ use crate::statistics::{column_statistics_min_max, statistics_by_partition};
 /// ```text
 /// ProgressiveEvalExec
 ///   SortExec: expr=[time@1 DESC], preserve_partitioning=[true]
-///      ParquetExec: file_groups={2 groups: [[newer_data.parquet], [old_data.parquet]]}, output_ordering=[time@1 ASC]
+///      DataSourceExec: file_groups={2 groups: [[newer_data.parquet], [old_data.parquet]]}, output_ordering=[time@1 ASC]
 /// ```
 pub(crate) fn extract_disjoint_ranges_from_plan(
     exprs: &LexOrdering,
     input_plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<NonOverlappingOrderedLexicalRanges>> {
+    let Some(ranges_per_partition) = extract_ranges_from_plan(exprs, input_plan)? else {
+        return Ok(None);
+    };
+
+    // determine if using a partial sortkey, due to absence of stats.
+    let cnt_sort_keys_used = ranges_per_partition[0].num_values();
+    let is_partial_sortkey = cnt_sort_keys_used < exprs.len();
+    if cnt_sort_keys_used == 0 {
+        return Ok(None);
+    }
+
+    // collect the sort_options for the keys used
+    let sort_options = exprs
+        .iter()
+        .take(cnt_sort_keys_used)
+        .map(|e| e.options)
+        .collect::<Vec<_>>();
+
+    let Some(nonoverlapping_ranges) =
+        NonOverlappingOrderedLexicalRanges::try_new(&sort_options, ranges_per_partition)?
+    else {
+        return Ok(None);
+    };
+
+    // cannot use only a partial sort key comparison, if the sort key comparison is only constants.
+    // e.g. for sort_keys [col0 desc, col1 desc, col2 asc], applied to 3 partitions:
+    // if we have known lexical ranges for col0 & col1 of:
+    //    * partition1= (a,10)->(a,10)
+    //    * partition2= (a,10)->(a,10)  // touches, but is nonoverlapping
+    //    * partition3= (b,10)->(b,10)  // disjoint
+    // The partial key comparison [col0 desc, col1 desc] looks disjoint (a.k.a. can use ProgressiveEval).
+    //
+    // However, since this is only the partial sort key, we cannot know the correct ordering of partition1 and partition2
+    // since their actual complete sort key values are (a,10,unknown)->(a,10,unknown).
+    if is_partial_sortkey && nonoverlapping_ranges.has_neighbors_with_same_sortkey() {
+        Ok(None)
+    } else {
+        Ok(Some(nonoverlapping_ranges))
+    }
+}
+
+/// Extract [`Vec<LexicalRanges>`] from plan, per partition, regardless of whether disjoint or not.
+pub(crate) fn extract_ranges_from_plan(
+    exprs: &LexOrdering,
+    input_plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Vec<LexicalRange>>> {
     trace!(
         "Extracting lexical ranges for input plan: \n{}",
         displayable(input_plan.as_ref()).indent(true)
@@ -61,7 +107,10 @@ pub(crate) fn extract_disjoint_ranges_from_plan(
     let partitioned_stats = statistics_by_partition(input_plan.as_ref())?;
 
     // add per sort key
-    for sort_expr in exprs.iter() {
+    //
+    // halting once we hit a sort key with missing statistics. This allows us to still detect non-overlapping
+    // based upon the start of a sort key, if this partial sort key is sufficient to cause disjointness (nonoverlapping).
+    for sort_expr in exprs {
         let Some(column) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
             return Ok(None);
         };
@@ -69,32 +118,53 @@ pub(crate) fn extract_disjoint_ranges_from_plan(
             return Ok(None);
         };
 
-        // add per partition
-        for (builder, stats_for_partition) in builders.iter_mut().zip(&partitioned_stats) {
+        // gather min & max stats per partition
+        let mut minmax_values = Vec::with_capacity(partitioned_stats.len());
+        for stats_for_partition in &partitioned_stats {
             let Some((min, max)) = min_max_for_stats_with_sort_options(
                 col_idx,
                 &sort_expr.options,
                 stats_for_partition,
             )?
             else {
-                return Ok(None);
+                // no stats found. halt at this sort key.
+                minmax_values = vec![];
+                break;
             };
+
             if min.is_null() && max.is_null() {
-                return Ok(None);
+                // stats are NULL. halt at this sort key.
+                minmax_values = vec![];
+                break;
             }
-            builder.push(min, max);
+
+            minmax_values.push((min, max));
+        }
+
+        if minmax_values.is_empty() {
+            // do not add for this sort key, and halt.
+            break;
+        } else {
+            // add partition min/max stats to the comparison sort key builder.
+            for (builder, (min, max)) in builders.iter_mut().zip(minmax_values) {
+                builder.push(min, max);
+            }
         }
     }
 
-    let sort_options = exprs.iter().map(|e| e.options).collect::<Vec<_>>();
     let ranges_per_partition = builders
         .into_iter()
         .map(|builder| builder.build())
         .collect::<Vec<_>>();
+    trace!(
+        "Found lexical ranges: {:?}",
+        ranges_per_partition
+            .iter()
+            .map(|lr| lr.to_string())
+            .join(", ")
+    );
 
-    trace!("Found lexical ranges: {:?}", ranges_per_partition);
-
-    NonOverlappingOrderedLexicalRanges::try_new(&sort_options, ranges_per_partition)
+    Ok(Some(ranges_per_partition))
 }
 
 fn partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
@@ -159,7 +229,7 @@ fn min_max_for_stats_with_sort_options(
 /// Returns None if not possible to determine disjoint ranges.
 pub(crate) fn extract_ranges_from_files(
     exprs: &LexOrdering,
-    file_groups: &[Vec<PartitionedFile>],
+    file_groups: &[FileGroup],
     schema: Arc<Schema>,
 ) -> Result<Option<NonOverlappingOrderedLexicalRanges>> {
     trace!(
@@ -170,7 +240,7 @@ pub(crate) fn extract_ranges_from_files(
 
     // one builder for each output partition
     let mut builders = vec![LexicalRange::builder(); num_input_partitions];
-    for sort_expr in exprs.iter() {
+    for sort_expr in exprs {
         let Some(column) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
             return Ok(None);
         };
@@ -200,7 +270,7 @@ pub(crate) fn extract_ranges_from_files(
 /// Return the min and max value for the specified group of partitioned files.
 pub(crate) fn min_max_for_partitioned_filegroup(
     col_name: &str,
-    filegroup: &[PartitionedFile],
+    filegroup: &FileGroup,
     schema: &Arc<Schema>,
 ) -> Result<Option<(ScalarValue, ScalarValue)>> {
     let Some((col_idx, _)) = schema.fields().find(col_name) else {
@@ -236,8 +306,8 @@ pub(crate) fn min_max_for_partitioned_filegroup(
 mod tests {
     use super::*;
     use crate::test::test_utils::{
-        SortKeyRange, parquet_exec_with_sort_with_statistics,
-        parquet_exec_with_sort_with_statistics_and_schema, sort_exec, union_exec,
+        SortKeyRange, data_source_exec_parquet_with_sort_with_statistics,
+        data_source_exec_parquet_with_sort_with_statistics_and_schema, sort_exec, union_exec,
     };
     use std::fmt::{Debug, Display, Formatter};
 
@@ -298,11 +368,11 @@ mod tests {
             .union_sort_union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
           SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
             UnionExec
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2000))
@@ -323,11 +393,11 @@ mod tests {
             .union_sort_union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
           SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
             UnionExec
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2010))
@@ -346,11 +416,11 @@ mod tests {
             .union_sort_union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
           SortExec: expr=[a@0 DESC], preserve_partitioning=[false]
             UnionExec
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2000))
@@ -371,11 +441,11 @@ mod tests {
             .union_sort_union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
           SortExec: expr=[a@0 DESC], preserve_partitioning=[false]
             UnionExec
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2010))
@@ -396,11 +466,11 @@ mod tests {
             .union_sort_union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
           SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
             UnionExec
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST]
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2000))
@@ -423,11 +493,11 @@ mod tests {
             .union_sort_union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
           SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
             UnionExec
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST]
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2010))
@@ -446,8 +516,8 @@ mod tests {
             .union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2000))
@@ -469,8 +539,8 @@ mod tests {
             .union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2010))
@@ -489,8 +559,8 @@ mod tests {
             .union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2000))
@@ -512,8 +582,8 @@ mod tests {
             .union_plan(),
          @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 DESC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 DESC], file_type=parquet
 
         Input Ranges
           (Some(1000))->(Some(2010))
@@ -576,11 +646,11 @@ mod tests {
         ///
         /// ```text
         /// UNION
-        ///     ParquetExec (key_ranges[0])            (range_a)
+        ///     DataSourceExec (key_ranges[0])            (range_a)
         ///     SORT
         ///         UNION
-        ///             ParquetExec (key_ranges[1])    (range_b_1)
-        ///             ParquetExec (key_ranges[2])    (range_b_2)
+        ///             DataSourceExec (key_ranges[1])    (range_b_1)
+        ///             DataSourceExec (key_ranges[2])    (range_b_2)
         /// ```
         fn union_sort_union_plan(self) -> TestResult {
             let Self {
@@ -596,18 +666,18 @@ mod tests {
             let range_b_1 = &input_ranges[1];
             let range_b_2 = &input_ranges[2];
 
-            let datasrc_a = parquet_exec_with_sort_with_statistics_and_schema(
+            let datasrc_a = data_source_exec_parquet_with_sort_with_statistics_and_schema(
                 &schema,
                 vec![lex_ordering.clone()],
                 &[range_a],
             );
 
-            let datasrc_b1 = parquet_exec_with_sort_with_statistics_and_schema(
+            let datasrc_b1 = data_source_exec_parquet_with_sort_with_statistics_and_schema(
                 &schema,
                 vec![lex_ordering.clone()],
                 &[range_b_1],
             );
-            let datasrc_b2 = parquet_exec_with_sort_with_statistics_and_schema(
+            let datasrc_b2 = data_source_exec_parquet_with_sort_with_statistics_and_schema(
                 &schema,
                 vec![lex_ordering.clone()],
                 &[range_b_2],
@@ -633,8 +703,8 @@ mod tests {
         ///
         /// ```text
         /// UNION
-        ///     ParquetExec (key_ranges[0])                (range_a)
-        ///     ParquetExec (key_ranges[1], key_ranges[2]) (range_b_1, range_b_2)
+        ///     DataSourceExec (key_ranges[0])                (range_a)
+        ///     DataSourceExec (key_ranges[1], key_ranges[2]) (range_b_1, range_b_2)
         /// ```
         fn union_plan(self) -> TestResult {
             let Self {
@@ -650,9 +720,11 @@ mod tests {
             let range_a = &input_ranges[0];
             let range_b_1 = &input_ranges[1];
             let range_b_2 = &input_ranges[2];
-            let datasrc_a =
-                parquet_exec_with_sort_with_statistics(vec![lex_ordering.clone()], &[range_a]);
-            let datasrc_b = parquet_exec_with_sort_with_statistics_and_schema(
+            let datasrc_a = data_source_exec_parquet_with_sort_with_statistics(
+                vec![lex_ordering.clone()],
+                &[range_a],
+            );
+            let datasrc_b = data_source_exec_parquet_with_sort_with_statistics_and_schema(
                 &schema,
                 vec![lex_ordering.clone()],
                 &[range_b_1, range_b_2],
@@ -686,18 +758,18 @@ mod tests {
     impl Display for TestResult {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
             let displayable_plan = displayable(self.plan.as_ref()).indent(false);
-            writeln!(f, "{}", displayable_plan)?;
+            writeln!(f, "{displayable_plan}")?;
 
             writeln!(f, "Input Ranges")?;
             for range in &self.input_ranges {
-                writeln!(f, "  {}", range)?;
+                writeln!(f, "  {range}")?;
             }
 
             match self.actual.as_ref() {
                 Some(actual) => {
                     writeln!(f, "Output Ranges: {:?}", actual.indices())?;
                     for range in actual.ordered_ranges() {
-                        writeln!(f, "  {}", range)?;
+                        writeln!(f, "  {range}")?;
                     }
                 }
                 None => {

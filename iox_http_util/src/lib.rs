@@ -18,6 +18,9 @@ use http_body_util::{BodyExt, Empty, Full, StreamBody};
 
 pub use http_body::Body;
 
+mod uri;
+pub use uri::TryIntoUri;
+
 /// Error trait object with constraints for use in async code
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

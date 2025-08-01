@@ -39,6 +39,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// This snapshot also contains soft-deleted namespaces.
 #[derive(Debug, Clone)]
 pub struct RootSnapshot {
+    /// List of encoded namespaces sorted by ID.
     namespaces: MessageList<proto::RootNamespace>,
     /// Hash table of namespaces keyed by name. Does not include soft-deleted entries.
     namespace_names: HashBuckets,
@@ -59,7 +60,8 @@ impl RootSnapshot {
                 deleted_at: ns.deleted_at.as_ref().map(Timestamp::get),
             })
             .collect();
-        // TODO(marco): wire up binary search to find namespace by ID
+
+        // This sort is required for the binary search in `lookup_namespace_by_id` to function.
         namespaces.sort_unstable_by_key(|ns| ns.id);
 
         let mut namespace_names = HashBucketsEncoder::new(namespaces.len());
@@ -96,6 +98,46 @@ impl RootSnapshot {
             let t = self.namespaces.get(idx).context(NamespaceDecodeSnafu)?;
             Ok(t.into())
         })
+    }
+
+    /// Look up a [`RootSnapshotNamespace`] by `NamespaceId` using binary search of the list of
+    /// namespaces. _Does_ include soft-deleted entries.
+    ///
+    /// Hard-deleted namespaces may still appear in the namespace cache, but should NOT appear in
+    /// the root cache, so this method must be used to check actual presence or absence before
+    /// looking up additional namespace information in the namespace cache.
+    ///
+    /// # Performance
+    ///
+    /// This method decodes each record the binary search needs to check, so may not be appropriate
+    /// for performance-sensitive use cases.
+    pub fn lookup_namespace_by_id(&self, id: NamespaceId) -> Result<Option<RootSnapshotNamespace>> {
+        // This requires that the namespaces are sorted by ID, which `encode` does.
+
+        // Search through a slice of indices, as there isn't a way to get a slice of `&T` from
+        // `MessageList` without decoding everything
+        let indices_to_search: Vec<_> = (0..self.namespaces.len()).collect();
+
+        let element_idx = indices_to_search.binary_search_by_key(&id.get(), |&idx| {
+            let namespace_snapshot = self
+                .namespaces
+                .get(idx)
+                // The binary search APIs expect the comparator functions to be infallible. If
+                // decoding of cache records fails, we have bigger problems than only not being
+                // able to do a binary search, so go ahead and panic.
+                .expect("decoding root namespaces for binary search should succeed");
+            namespace_snapshot.id
+        });
+
+        element_idx
+            .ok()
+            .map(|idx| {
+                self.namespaces
+                    .get(idx)
+                    .context(NamespaceDecodeSnafu)
+                    .map(|t| t.into())
+            })
+            .transpose()
     }
 
     /// Lookup a [`RootSnapshotNamespace`] by name. Does not include deleted entries.
@@ -156,5 +198,75 @@ impl From<RootSnapshot> for proto::Root {
             namespaces: Some(value.namespaces.into()),
             namespace_names: Some(value.namespace_names.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_namespace_by_id() {
+        let ns_1 = Namespace {
+            id: NamespaceId::new(1),
+            name: "Namespace1".into(),
+            deleted_at: None,
+            max_columns_per_table: Default::default(),
+            max_tables: Default::default(),
+            partition_template: Default::default(),
+            retention_period_ns: Default::default(),
+            router_version: Default::default(),
+        };
+        // Deliberately don't include an `ns_2` with `NamespaceId` 2 to test that indices aren't
+        // being conflated with `NamespaceId`s.
+        // `ns_3` happens to be soft-deleted; it is still accessible by ID.
+        let ns_3 = Namespace {
+            id: NamespaceId::new(3),
+            name: "Namespace3".into(),
+            deleted_at: Some(Timestamp::new(1)),
+            ..ns_1.clone()
+        };
+
+        // IDs happen to be in order
+        let root = RootSnapshot::encode(vec![ns_1.clone(), ns_3.clone()], 1).unwrap();
+        assert_eq!(
+            ns_1.id,
+            root.lookup_namespace_by_id(ns_1.id).unwrap().unwrap().id()
+        );
+        assert_eq!(
+            ns_3.id,
+            root.lookup_namespace_by_id(ns_3.id).unwrap().unwrap().id()
+        );
+        assert!(
+            root.lookup_namespace_by_id(NamespaceId::new(2))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            root.lookup_namespace_by_id(NamespaceId::new(4))
+                .unwrap()
+                .is_none()
+        );
+
+        // IDs happen to be out of order
+        let root = RootSnapshot::encode(vec![ns_3.clone(), ns_1.clone()], 2).unwrap();
+        assert_eq!(
+            ns_1.id,
+            root.lookup_namespace_by_id(ns_1.id).unwrap().unwrap().id()
+        );
+        assert_eq!(
+            ns_3.id,
+            root.lookup_namespace_by_id(ns_3.id).unwrap().unwrap().id()
+        );
+        assert!(
+            root.lookup_namespace_by_id(NamespaceId::new(2))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            root.lookup_namespace_by_id(NamespaceId::new(4))
+                .unwrap()
+                .is_none()
+        );
     }
 }

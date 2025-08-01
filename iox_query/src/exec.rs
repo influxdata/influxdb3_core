@@ -14,14 +14,14 @@ use metric::Registry;
 use object_store::DynObjectStore;
 use parquet_file::storage::StorageId;
 mod cross_rt_stream;
-use observability_deps::tracing::warn;
+use tracing::warn;
 
 use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 
 use datafusion::{
     self,
     execution::{
-        disk_manager::DiskManagerConfig,
+        disk_manager::{DiskManagerBuilder, DiskManagerMode},
         memory_pool::{MemoryPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
@@ -224,7 +224,9 @@ impl Executor {
         };
 
         let mut builder = RuntimeEnvBuilder::new()
-            .with_disk_manager(DiskManagerConfig::Disabled)
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
             .with_memory_limit(central_mem_pool_limit, 1.0);
 
         if let Some(heap_memory_limit) = config.heap_memory_limit {
@@ -457,7 +459,7 @@ mod tests {
         assert_eq!(
             PoolMetrics::read(&exec.config.metric_registry),
             PoolMetrics {
-                reserved: 800,
+                reserved: 1600,
                 limit: TESTING_MEM_POOL_SIZE as u64,
             },
         );
@@ -509,10 +511,10 @@ mod tests {
         assert_eq!(
             PoolMetrics::read(&exec.config.metric_registry),
             PoolMetrics {
-                // The plan needs 800 bytes of memory. The pre-reserved memory for
+                // The plan needs 1600 bytes of memory. The pre-reserved memory for
                 // this query is 500 bytes as defined in TESTING_PER_QUERY_MEM_POOL_SIZE.
-                // So the central memory pool reserved an additional 300 (800 - 500) bytes.
-                reserved: 300,
+                // So the central memory pool reserved an additional 1100 (1600 - 500) bytes.
+                reserved: 1100,
                 limit: TESTING_CENTRAL_MEM_POOL_SIZE as u64,
             },
         );

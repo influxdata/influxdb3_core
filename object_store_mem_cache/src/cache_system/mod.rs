@@ -93,10 +93,12 @@ impl HasSize for DynError {
     }
 }
 
-/// Result type with value wrapped into [`Arc`]s.
-pub type ArcResult<T> = Result<Arc<T>, DynError>;
+/// Result type for cache requests.
+///
+/// The value (`V`) must be cloneable, so that they can be shared between multiple consumers of the cache.
+pub type CacheRequestResult<V> = Result<V, DynError>;
 
-impl<T> HasSize for ArcResult<T>
+impl<T> HasSize for CacheRequestResult<T>
 where
     T: HasSize,
 {
@@ -108,24 +110,25 @@ where
     }
 }
 
-type CacheFn<K, V> = Box<dyn FnOnce(&K) -> BoxFuture<'static, Result<V, DynError>> + Send>;
+/// Type of the function that is used to fetch a value for a key.
+type CacheFn<V> = Box<dyn FnOnce() -> BoxFuture<'static, CacheRequestResult<V>> + Send>;
 
 #[async_trait]
 pub trait Cache<K, V>: Send + Sync + Debug
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
-    V: HasSize + Send + Sync + 'static,
+    V: Clone + HasSize + Send + Sync + 'static,
 {
     /// Get an existing key or start a new fetch process.
     ///
     /// Fetching is driven by a background tokio task and will make progress even when you do not poll the resulting
     /// future.
-    async fn get_or_fetch(&self, k: &K, f: CacheFn<K, V>) -> (ArcResult<V>, CacheState);
+    async fn get_or_fetch(&self, k: &K, f: CacheFn<V>) -> (CacheRequestResult<V>, CacheState);
 
     /// Get the cached value and return `None` if was not cached.
     ///
     /// Entries that are currently being loaded also result in `None`.
-    fn get(&self, k: &K) -> Option<ArcResult<V>>;
+    fn get(&self, k: &K) -> Option<CacheRequestResult<V>>;
 
     /// Get number of entries in the cache.
     fn len(&self) -> usize;
@@ -138,6 +141,7 @@ where
 }
 
 pub mod hook;
+pub mod loader;
 pub mod reactor;
 pub mod s3_fifo_cache;
 pub mod utils;

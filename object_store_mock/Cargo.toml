@@ -12,7 +12,7 @@ async-trait = { version = "0.1.88", default-features = false }
 bytes = { version = "1.10.1", default-features = false }
 futures = { version = "0.3.31" }
 object_store.workspace = true
-tokio = { version = "1.45.1", default-features = false, features = [
+tokio = { version = "1.47.0", default-features = false, features = [
     "macros",
     "rt-multi-thread",
 ] }

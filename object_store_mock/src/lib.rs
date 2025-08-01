@@ -11,7 +11,7 @@ use futures::{
 };
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use tokio::sync::Barrier;
 
@@ -32,6 +32,7 @@ impl PartialEq for WrappedGetOptions {
             range: self_range,
             version: self_version,
             head: self_head,
+            extensions: self_extensions,
         } = &self.0;
         let GetOptions {
             if_match: other_if_match,
@@ -41,6 +42,7 @@ impl PartialEq for WrappedGetOptions {
             range: other_range,
             version: other_version,
             head: other_head,
+            extensions: other_extensions,
         } = &other.0;
 
         (self_if_match == other_if_match)
@@ -50,6 +52,8 @@ impl PartialEq for WrappedGetOptions {
             && (self_range == other_range)
             && (self_version == other_version)
             && (self_head == other_head)
+            // `len` is the only thing we can check without knowing concrete types
+            && (self_extensions.len() == other_extensions.len())
     }
 }
 
@@ -69,6 +73,7 @@ impl Clone for WrappedGetOptions {
             range: self.0.range.clone(),
             version: self.0.version.clone(),
             head: self.0.head,
+            extensions: self.0.extensions.clone(),
         })
     }
 }
@@ -187,8 +192,8 @@ calls!(
         res = Result<Box<dyn MultipartUpload>>,
     ),
     (
-        name = PutMultipartOpts,
-        params = (Path, PutMultipartOpts),
+        name = PutMultipartOptions,
+        params = (Path, PutMultipartOptions),
         res = Result<Box<dyn MultipartUpload>>,
     ),
     (
@@ -203,12 +208,12 @@ calls!(
     ),
     (
         name = GetRange,
-        params = (Path, Range<usize>),
+        params = (Path, Range<u64>),
         res = Result<Bytes>,
     ),
     (
         name = GetRanges,
-        params = (Path, Vec<Range<usize>>),
+        params = (Path, Vec<Range<u64>>),
         res = Result<Vec<Bytes>>,
     ),
     (
@@ -417,11 +422,11 @@ impl ObjectStore for MockStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         mock!(
             this = self,
-            variant = PutMultipartOpts,
+            variant = PutMultipartOptions,
             record = (location, opts),
             mode = async,
         )
@@ -435,11 +440,11 @@ impl ObjectStore for MockStore {
         mock!(this = self, variant = GetOpts, record = (location, options), mode = async,)
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
         mock!(this = self, variant = GetRange, record = (location, range), mode = async,)
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         mock!(
             this = self,
             variant = GetRanges,
@@ -468,7 +473,7 @@ impl ObjectStore for MockStore {
         )
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix = prefix.cloned();
         mock!(
             this = self,
@@ -482,7 +487,7 @@ impl ObjectStore for MockStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, Result<ObjectMeta>> {
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix = prefix.cloned();
         mock!(
             this = self,
@@ -540,7 +545,7 @@ pub fn object_meta() -> ObjectMeta {
     ObjectMeta {
         location: path(),
         last_modified: Default::default(),
-        size: DATA.len(),
+        size: DATA.len() as u64,
         e_tag: None,
         version: None,
     }
@@ -614,7 +619,7 @@ pub fn get_result_stream() -> GetResult {
                 .boxed(),
         ),
         meta: object_meta(),
-        range: 0..DATA.len(),
+        range: 0..(DATA.len() as u64),
         attributes: Default::default(),
     }
 }

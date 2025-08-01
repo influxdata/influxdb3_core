@@ -16,13 +16,13 @@ siphasher = "1.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-criterion = { version = "0.6", default-features = false, features = [
+criterion = { version = "0.7", default-features = false, features = [
     "async_tokio",
     "rayon",
 ] }
 hashbrown = { workspace = true }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
-rand = "0.9.1"
+rand = "0.9.2"
 
 [[bench]]
 name = "sharder"

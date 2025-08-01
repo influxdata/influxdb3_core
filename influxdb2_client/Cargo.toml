@@ -13,7 +13,7 @@ bytes = "1.10"
 futures = { version = "0.3", default-features = false }
 reqwest = { workspace = true, features = ["stream", "json", "rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.140"
+serde_json = "1.0.141"
 snafu = "0.8"
 url = "2.5.3"
 uuid = { version = "1", features = ["v4"] }
@@ -24,5 +24,5 @@ smallvec = { workspace = true }
 [dev-dependencies] # In alphabetical order
 mockito = { version ="1.7", default-features = false }
 parking_lot = "0.12"
-tokio = { version = "1.45", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.47", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 test_helpers = { path = "../test_helpers" }

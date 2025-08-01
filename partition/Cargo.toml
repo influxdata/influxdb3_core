@@ -22,7 +22,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
-criterion = { version = "0.6", default-features = false, features = ["rayon"] }
+criterion = { version = "0.7", default-features = false, features = ["rayon"] }
 generated_types = { path = "../generated_types" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 paste = "1.0.15"

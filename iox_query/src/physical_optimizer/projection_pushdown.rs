@@ -6,7 +6,10 @@ use std::{
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
+    datasource::{
+        physical_plan::{FileScanConfig, FileScanConfigBuilder},
+        source::DataSourceExec,
+    },
     error::{DataFusionError, Result},
     physical_expr::{LexOrdering, PhysicalSortExpr, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
@@ -21,7 +24,6 @@ use datafusion::{
         union::UnionExec,
     },
 };
-use datafusion_util::config::table_parquet_options;
 
 use crate::provider::{DeduplicateExec, RecordBatchesExec};
 
@@ -59,16 +61,13 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
     let mut columns = Vec::with_capacity(projection_exec.expr().len());
     let mut column_indices = Vec::with_capacity(projection_exec.expr().len());
     for (expr, output_name) in projection_exec.expr() {
-        if let Some(column) = expr.as_any().downcast_ref::<Column>() {
-            if column.name() == output_name {
-                columns.push(column.clone());
-                column_indices.push(column.index());
-            } else {
-                // don't bother w/ renames
-                return Ok(Transformed::no(plan));
-            }
+        if let Some(column) = expr.as_any().downcast_ref::<Column>()
+            && column.name() == output_name
+        {
+            columns.push(column.clone());
+            column_indices.push(column.index());
         } else {
-            // don't bother to deal w/ calculation within projection nodes
+            // don't bother w/ renames or to deal w/ calculation within projection nodes
             return Ok(Transformed::no(plan));
         }
     }
@@ -93,8 +92,15 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             .collect::<Result<Vec<_>>>()?;
         let new_union = UnionExec::new(new_inputs);
         return Ok(Transformed::yes(Arc::new(new_union)));
-    } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
-        let projection = match child_parquet.base_config().projection.as_ref() {
+    } else if let Some(child_parquet) = child_any.downcast_ref::<DataSourceExec>() {
+        let Some(file_scan_config) = child_parquet
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+        else {
+            return Ok(Transformed::no(plan));
+        };
+        let projection = match file_scan_config.projection.as_ref() {
             Some(projection) => column_indices
                 .into_iter()
                 .map(|idx| {
@@ -112,23 +118,18 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             .enumerate()
             .map(|(idx, col)| (col, idx))
             .collect();
-        let output_ordering = child_parquet
-            .base_config()
+        let output_ordering = file_scan_config
             .output_ordering
             .iter()
             .map(|output_ordering| project_output_ordering(output_ordering, &col_map))
             .collect::<Result<_>>()?;
-        let base_config = child_parquet
-            .base_config()
-            .clone()
+        let file_scan_config = FileScanConfigBuilder::from(file_scan_config.clone())
             .with_output_ordering(output_ordering)
-            .with_projection(Some(projection));
-        let mut builder =
-            ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        if let Some(predicate) = child_parquet.predicate() {
-            builder = builder.with_predicate(Arc::clone(predicate));
-        }
-        return Ok(Transformed::yes(builder.build_arc()));
+            .with_projection(Some(projection))
+            .build();
+        return Ok(Transformed::yes(DataSourceExec::from_data_source(
+            file_scan_config,
+        )));
     } else if let Some(child_filter) = child_any.downcast_ref::<FilterExec>() {
         let filter_required_cols = collect_columns(child_filter.predicate());
 
@@ -266,7 +267,6 @@ fn project_output_ordering(
 ) -> Result<LexOrdering> {
     // take longest prefix
     let sort_exprs = output_ordering
-        .inner
         .iter()
         .take_while(|expr| {
             if let Some(col) = expr.expr.as_any().downcast_ref::<Column>() {
@@ -407,7 +407,9 @@ mod tests {
         compute::SortOptions,
         datatypes::{DataType, Field, Schema, SchemaRef},
     };
-    use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::physical_plan::{
+        FileScanConfig, FileScanConfigBuilder, ParquetSource,
+    };
     use datafusion::{
         common::JoinType,
         datasource::object_store::ObjectStoreUrl,
@@ -422,6 +424,7 @@ mod tests {
         },
         scalar::ScalarValue,
     };
+    use datafusion_util::config::table_parquet_options;
     use serde::Serialize;
 
     use crate::{
@@ -697,9 +700,13 @@ mod tests {
         ]));
         let projection = vec![3, 2, 1];
         let schema_projected = Arc::new(schema.project(&projection).unwrap());
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(
+                ParquetSource::new(table_parquet_options())
+                    .with_predicate(expr_string_cmp("tag1", &schema)),
+            ),
         )
         .with_projection(Some(projection))
         .with_output_ordering(vec![
@@ -719,16 +726,14 @@ mod tests {
             ]
             .into(),
         ]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
-            .with_predicate(expr_string_cmp("tag1", &schema));
-        let inner = builder.build();
+        let inner = DataSourceExec::from_data_source(file_scan_config.build());
         let plan = Arc::new(
             ProjectionExec::try_new(
                 vec![
                     (expr_col("tag2", &inner.schema()), String::from("tag2")),
                     (expr_col("tag3", &inner.schema()), String::from("tag3")),
                 ],
-                Arc::new(inner),
+                inner,
             )
             .unwrap(),
         );
@@ -739,24 +744,24 @@ mod tests {
             @r#"
         input:
           - " ProjectionExec: expr=[tag2@2 as tag2, tag3@1 as tag3]"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+          - "   DataSourceExec: file_groups={0 groups: []}, projection=[field, tag3, tag2], output_ordering=[tag3@1 ASC, field@0 ASC, tag2@2 ASC], file_type=parquet, predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
-            - " ParquetExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+            - " DataSourceExec: file_groups={0 groups: []}, projection=[tag2, tag3], output_ordering=[tag3@1 ASC], file_type=parquet, predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         "#
         );
 
-        let parquet_exec = test
+        let data_source_exec = test
             .output_plan()
             .unwrap()
             .as_any()
-            .downcast_ref::<ParquetExec>()
+            .downcast_ref::<DataSourceExec>()
             .unwrap();
         let expected_schema = Schema::new(vec![
             Field::new("tag2", DataType::Utf8, true),
             Field::new("tag3", DataType::Utf8, true),
         ]);
-        assert_eq!(parquet_exec.schema().as_ref(), &expected_schema);
+        assert_eq!(data_source_exec.schema().as_ref(), &expected_schema);
     }
 
     #[test]
@@ -1319,7 +1324,7 @@ mod tests {
                             Arc::new(Column::new("col1", 0)),
                             Arc::new(Column::new("col1", 1)),
                         ],
-                        DataType::Utf8,
+                        Arc::new(Field::new("r", DataType::Utf8, false)),
                     )),
                     "__common_expr".to_string(),
                 ),
@@ -1355,7 +1360,7 @@ mod tests {
                         Arc::new(Column::new("col1", 0)),
                         Arc::new(Column::new("col1", 1)),
                     ],
-                    DataType::Utf8,
+                    Arc::new(Field::new("r", DataType::Utf8, false)),
                 )),
                 "value".to_string(),
             )],
@@ -1413,13 +1418,15 @@ mod tests {
                 Arc::new(Field::new("col2", DataType::Utf8, true)),
                 Arc::new(Field::new("col1", DataType::Int64, false)),
                 Arc::new(Field::new("col2", DataType::Utf8, true)),
-            ]),
+            ])
+            .into(),
         );
         let plan = NestedLoopJoinExec::try_new(
             Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
             Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
             Some(filter),
             &JoinType::Inner,
+            None,
         )
         .unwrap();
         let plan = ProjectionExec::try_new(
@@ -1449,13 +1456,15 @@ mod tests {
                 Arc::new(Field::new("col1", DataType::Int64, false)),
                 Arc::new(Field::new("col1", DataType::Int64, false)),
                 Arc::new(Field::new("col1", DataType::Int64, false)),
-            ]),
+            ])
+            .into(),
         );
         let plan = NestedLoopJoinExec::try_new(
             Arc::new(plan),
             Arc::new(EmptyExec::new(Arc::clone(&table_schema))),
             Some(filter),
             &JoinType::Left,
+            None,
         )
         .unwrap();
         let plan = ProjectionExec::try_new(
@@ -1514,12 +1523,12 @@ mod tests {
             Field::new("field1", DataType::UInt64, true),
             Field::new("field2", DataType::UInt64, true),
         ]));
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfig::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         );
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        let plan = builder.build_arc();
+        let plan = DataSourceExec::from_data_source(file_scan_config);
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(
             plan,
@@ -1553,14 +1562,14 @@ mod tests {
           - " ProjectionExec: expr=[field1@2 as field1]"
           - "   FilterExec: tag2@1 = foo"
           - "     DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
-          - "       ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field1, field2]"
+          - "       DataSourceExec: file_groups={0 groups: []}, projection=[tag1, tag2, field1, field2], file_type=parquet"
         output:
           Ok:
             - " ProjectionExec: expr=[field1@0 as field1]"
             - "   FilterExec: tag2@1 = foo"
             - "     ProjectionExec: expr=[field1@0 as field1, tag2@1 as tag2]"
             - "       DeduplicateExec: [tag1@2 ASC,tag2@1 ASC]"
-            - "         ParquetExec: file_groups={0 groups: []}, projection=[field1, tag2, tag1]"
+            - "         DataSourceExec: file_groups={0 groups: []}, projection=[field1, tag2, tag1], file_type=parquet"
         "#
         );
     }
@@ -1774,7 +1783,7 @@ mod tests {
             let projected_ordering = project_output_ordering(&output_ordering, &col_map);
 
             let projected_ordering = match projected_ordering {
-                Ok(projected_ordering) => format_sort_exprs(&projected_ordering.inner),
+                Ok(projected_ordering) => format_sort_exprs(&projected_ordering),
                 Err(e) => vec![e.to_string()],
             };
 

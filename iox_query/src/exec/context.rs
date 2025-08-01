@@ -42,13 +42,13 @@ use datafusion_util::config::{
 };
 use executor::DedicatedExecutor;
 use futures::TryStreamExt;
-use observability_deps::tracing::debug;
 use query_functions::{register_iox_scalar_functions, selectors::register_selector_aggregates};
 use std::{fmt, num::NonZeroUsize, str::FromStr, sync::Arc};
 use trace::{
     ctx::SpanContext,
     span::{MetaValue, Span, SpanEvent, SpanExt, SpanRecorder},
 };
+use tracing::debug;
 
 // Reuse DataFusion error and Result types for this module
 use crate::memory_pool::{Monitor, MonitoredMemoryPool};

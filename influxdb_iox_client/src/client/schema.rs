@@ -26,16 +26,20 @@ impl Client {
     }
 
     /// Get the schema for a namespace and, optionally, one table within that namespace.
-    pub async fn get_schema(
+    pub async fn get_schema<N, T>(
         &mut self,
-        namespace: &str,
-        table: Option<&str>,
-    ) -> Result<NamespaceSchema, Error> {
+        namespace: N,
+        table: Option<T>,
+    ) -> Result<NamespaceSchema, Error>
+    where
+        Target: From<N>,
+        Target: From<T>,
+    {
         let response = self
             .inner
             .get_schema(GetSchemaRequest {
-                namespace: namespace.to_string(),
-                table: table.map(ToString::to_string),
+                namespace_target: Target::from(namespace).into(),
+                table_target: table.map(|t| Target::from(t).into()),
             })
             .await?;
 
@@ -47,7 +51,7 @@ impl Client {
     pub async fn upsert_schema(
         &mut self,
         namespace: impl Into<Target> + Send,
-        table: &str,
+        table: impl Into<Target> + Send,
         columns: impl Iterator<Item = (&str, ColumnType)> + Send,
     ) -> Result<NamespaceSchema, Error> {
         let columns = columns
@@ -58,7 +62,7 @@ impl Client {
             .inner
             .upsert_schema(UpsertSchemaRequest {
                 namespace_target: namespace.into().into(),
-                table: table.to_string(),
+                table_target: table.into().into(),
                 columns,
             })
             .await?;

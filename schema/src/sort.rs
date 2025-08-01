@@ -6,12 +6,12 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use indexmap::{IndexMap, map::Iter};
-use observability_deps::tracing::debug;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     sync::Arc,
 };
+use tracing::debug;
 
 #[derive(Debug, Default)]
 pub struct SortKeyBuilder {

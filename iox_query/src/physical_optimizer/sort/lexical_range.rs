@@ -5,9 +5,9 @@ use arrow::compute::SortOptions;
 use arrow::row::{Row, RowConverter, Rows, SortField};
 use datafusion::common::{Result, ScalarValue, internal_err};
 use datafusion::error::DataFusionError;
-use observability_deps::tracing::trace;
 use std::fmt::Display;
 use std::sync::Arc;
+use tracing::trace;
 
 /// Represents a range of sort key values within a lexical space.
 ///
@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// * `min --> max`
 /// * `(a_min, b_min) -> (a_max, b_max)`
 /// * `(1,100) --> (3,50)`
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LexicalRange {
     /// The minimum multi-column value in the lexical space (one `ScalarValue`
     /// for each sort key)
@@ -56,12 +56,14 @@ impl LexicalRange {
         LexicalRangeBuilder::new()
     }
 
-    /// Create a new [`LexicalRange`] with the same min and max values.
-    pub fn new_from_constants(constants: Vec<ScalarValue>) -> Self {
-        Self {
-            min: constants.clone(),
-            max: constants,
-        }
+    /// Length of values in range.
+    pub fn num_values(&self) -> usize {
+        assert_eq!(
+            self.min.len(),
+            self.max.len(),
+            "mins and maxes should have the same number of values"
+        );
+        self.min.len()
     }
 }
 
@@ -135,15 +137,19 @@ impl LexicalRangeBuilder {
 ///
 #[derive(Debug)]
 pub struct NonOverlappingOrderedLexicalRanges {
-    /// lexical ranges.
+    /// lexical ranges, per partition.
     ///
     /// These are typically used to represent the value ranges of each
-    /// DataFusion (not IOx) partition
+    /// DataFusion (not IOx) partition.
     value_ranges: Vec<LexicalRange>,
 
     /// Indexes into `value_ranges` that define a non overlapping ordering by
     /// minimum value.
     indices: Vec<usize>,
+
+    /// Indicates that some of the lexical ranges, when ordered by [`Self::indices`],
+    /// has identical sort keys.
+    has_neighbors_with_same_sortkey: bool,
 }
 
 impl Display for NonOverlappingOrderedLexicalRanges {
@@ -183,9 +189,27 @@ impl NonOverlappingOrderedLexicalRanges {
             return Ok(None);
         };
 
+        // determine if any neighboring value_ranges are constants
+        let has_neighbors_with_same_sortkey = if indices.is_empty() {
+            false
+        } else {
+            indices
+                .iter()
+                .enumerate()
+                .skip(1)
+                .fold(false, |acc, (indices_idx, partition_idx)| {
+                    let prev_partition_idx = indices[indices_idx - 1];
+                    acc || (rows.min_value(*partition_idx).unwrap()
+                        == rows.max_value(prev_partition_idx).unwrap()
+                        || rows.max_value(*partition_idx).unwrap()
+                            == rows.min_value(prev_partition_idx).unwrap())
+                })
+        };
+
         Ok(Some(Self {
             value_ranges,
             indices,
+            has_neighbors_with_same_sortkey,
         }))
     }
 
@@ -197,6 +221,12 @@ impl NonOverlappingOrderedLexicalRanges {
     /// Iterator over the in lexical ranges in order
     pub fn ordered_ranges(&self) -> impl Iterator<Item = &LexicalRange> {
         self.indices.iter().map(|i| &self.value_ranges[*i])
+    }
+
+    /// Returns true if any of the neighboring [`Self::value_ranges`], when ordered by [`Self::indices`],
+    /// have the same sort key.
+    pub fn has_neighbors_with_same_sortkey(&self) -> bool {
+        self.has_neighbors_with_same_sortkey
     }
 }
 

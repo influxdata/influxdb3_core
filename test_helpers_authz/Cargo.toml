@@ -8,13 +8,13 @@ license.workspace = true
 [dependencies]
 # Workspace dependencies, in alphabetical order
 generated_types = { path = "../generated_types" }
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # Crates.io dependencies, in alphabetical order
 futures = "0.3"
-rand = "0.9.1"
-tokio = "1.45"
+rand = "0.9.2"
+tokio = "1.47"
 
 [lints]
 workspace = true

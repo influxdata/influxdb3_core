@@ -38,7 +38,6 @@ use iox_query::{
     query_log::{PermitAndToken, QueryCompletedToken, QueryLogEntry, StatePermit, StatePlanned},
 };
 use iox_query::{exec::QueryConfig, query_log::QueryLogEntryState};
-use observability_deps::tracing::{debug, info, warn};
 use prost::Message;
 use request::{IoxGetRequest, RunQuery};
 use service_common::{datafusion_error_to_tonic_code, flight_error_to_tonic_code};
@@ -56,6 +55,7 @@ use trace_http::{
     ctx::{RequestLogContext, RequestLogContextExt},
     query_variant::QueryVariantExt,
 };
+use tracing::{debug, info, warn};
 
 /// The supported names of the grpc header that contain the target database
 /// for FlightSQL requests.
@@ -1186,13 +1186,13 @@ fn get_flightsql_namespace(metadata: &MetadataMap) -> Result<String> {
             let v = v.to_str().context(InvalidDatabaseHeaderSnafu)?;
             if database_name.is_none() {
                 database_name = Some(v);
-            } else if let Some(database_name) = database_name {
-                if database_name != v {
-                    return TooManyFlightSQLDatabasesSnafu {
-                        header_names: found_header_keys,
-                    }
-                    .fail();
+            } else if let Some(database_name) = database_name
+                && database_name != v
+            {
+                return TooManyFlightSQLDatabasesSnafu {
+                    header_names: found_header_keys,
                 }
+                .fail();
             }
         }
     }

@@ -1,7 +1,7 @@
 use arrow::array::Array;
 use arrow::compute::kernels::cmp::lt;
 use arrow::compute::nullif;
-use arrow::datatypes::Field;
+use arrow::datatypes::FieldRef;
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::function::{
     ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
@@ -43,7 +43,7 @@ impl<U: WindowUDFImpl + 'static> WindowUDFImpl for NonNegativeUDWF<U> {
         self.inner.signature()
     }
 
-    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<FieldRef> {
         self.inner.field(field_args)
     }
 

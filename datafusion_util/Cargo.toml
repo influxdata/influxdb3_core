@@ -14,10 +14,10 @@ async-trait = "0.1"
 datafusion = { workspace = true }
 futures = "0.3"
 object_store = { workspace = true }
-observability_deps = { path = "../observability_deps" }
 pin-project = "1.1"
 schema = { path = "../schema" }
-tokio = { version = "1.45", features = ["parking_lot", "sync"] }
+tokio = { version = "1.47", features = ["parking_lot", "sync"] }
 tokio-stream = "0.1"
+tracing = { workspace = true }
 url = "2.5"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

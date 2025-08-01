@@ -16,7 +16,7 @@ use datafusion_util::MemoryStream;
 use exec::IOxSessionContext;
 use futures::TryStreamExt;
 use iox_query_params::StatementParams;
-use parquet_file::storage::ParquetExecInput;
+use parquet_file::storage::DataSourceExecInput;
 use query_log::{QueryCompletedToken, QueryText, StateReceived};
 use schema::{Projection, Schema, sort::SortKey};
 use std::{
@@ -181,8 +181,8 @@ pub enum QueryChunkData {
 
     /// Parquet file.
     ///
-    /// See [`ParquetExecInput`] for details.
-    Parquet(ParquetExecInput),
+    /// See [`DataSourceExecInput`] for details.
+    Parquet(DataSourceExecInput),
 }
 
 impl QueryChunkData {

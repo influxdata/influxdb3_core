@@ -45,7 +45,10 @@ pub enum Error {
 
     #[snafu(display("{}", source))]
     #[snafu(context(false))]
-    DataFusion { source: DataFusionError },
+    DataFusion {
+        #[snafu(source(from(DataFusionError, Box::new)))]
+        source: Box<DataFusionError>,
+    },
 
     #[snafu(display("{}", source))]
     #[snafu(context(false))]
@@ -69,7 +72,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl From<Error> for DataFusionError {
     fn from(value: Error) -> Self {
         match value {
-            Error::DataFusion { source } => source,
+            Error::DataFusion { source } => *source,
             Error::Arrow { source } => Self::ArrowError(source, None),
             value => Self::External(Box::new(value)),
         }

@@ -1,4 +1,4 @@
-use arrow::datatypes::TimeUnit::Nanosecond;
+use arrow::datatypes::{FieldRef, TimeUnit::Nanosecond};
 use assert_matches::assert_matches;
 use std::any::Any;
 use std::sync::Arc;
@@ -66,27 +66,34 @@ impl AggregateUDFImpl for ModeUDF {
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
         let time_data_type = arg.exprs[1].data_type(arg.schema)?;
         Ok(Box::new(ModeAccumulator::new(
-            arg.return_type.clone(),
+            arg.return_field.data_type().clone(),
             time_data_type,
         )))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<Field>> {
-        let item_list =
-            DataType::List(Arc::new(Field::new("item", args.return_type.clone(), true)));
+    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<FieldRef>> {
+        let item_list = DataType::List(Arc::new(Field::new(
+            "item",
+            args.return_field.data_type().clone(),
+            true,
+        )));
         let timestamp_list = DataType::List(Arc::new(Field::new(
             "item",
-            args.input_types[1].clone(),
+            args.input_fields[1].data_type().clone(),
             true,
         )));
 
         Ok(vec![
-            Field::new(format_state_name(args.name, "value"), item_list, true),
-            Field::new(
+            Arc::new(Field::new(
+                format_state_name(args.name, "value"),
+                item_list,
+                true,
+            )),
+            Arc::new(Field::new(
                 format_state_name(args.name, "timestamp"),
                 timestamp_list,
                 true,
-            ),
+            )),
         ])
     }
 }

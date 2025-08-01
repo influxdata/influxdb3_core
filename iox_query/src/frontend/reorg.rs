@@ -5,8 +5,8 @@ use std::sync::Arc;
 use data_types::TableId;
 use datafusion::{logical_expr::LogicalPlan, prelude::col};
 use datafusion_util::lit_timestamptz_nano;
-use observability_deps::tracing::debug;
 use schema::{Schema, TIME_COLUMN_NAME, sort::SortKey};
+use tracing::debug;
 
 use crate::{
     QueryChunk, exec::make_stream_split, provider::ProviderBuilder, util::logical_sort_key_exprs,

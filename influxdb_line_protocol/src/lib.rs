@@ -73,6 +73,7 @@
 
 pub mod builder;
 pub use builder::LineProtocolBuilder;
+pub mod v3;
 
 use fmt::Display;
 use log::debug;
@@ -489,7 +490,7 @@ pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> 
         };
 
         if let Some(Err(r)) = &res {
-            debug!("Error parsing line: '{}'. Error was {:?}", line, r);
+            debug!("Error parsing line: '{line}'. Error was {r:?}");
         }
         res
     })
@@ -1095,7 +1096,7 @@ mod test {
     use test_helpers::approximately_equal;
 
     impl FieldValue<'_> {
-        fn unwrap_i64(&self) -> i64 {
+        pub(crate) fn unwrap_i64(&self) -> i64 {
             match self {
                 Self::I64(v) => *v,
                 _ => panic!("field was not an i64"),
@@ -2364,7 +2365,7 @@ her"#,
     #[test]
     fn test_large_tag_value_with_exact_maximum() {
         let tag_value = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES);
-        let input = format!(r#"foo,tag1=normal,tag={} value=1i 123"#, tag_value);
+        let input = format!(r#"foo,tag1=normal,tag={tag_value} value=1i 123"#);
         let parsed = parse(&input);
         assert!(parsed.is_ok());
         let vals = parsed.unwrap();
@@ -2424,7 +2425,7 @@ her"#,
     #[test]
     fn test_large_field_value_with_exact_maximum() {
         let value = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES);
-        let input = format!("foo,tag1=bar value=\"{}\" 123", value);
+        let input = format!("foo,tag1=bar value=\"{value}\" 123");
 
         let parsed = parse(&input);
 
@@ -2455,7 +2456,7 @@ her"#,
     #[test]
     fn test_large_measurement_name() {
         let measurement = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1);
-        let input = format!("{},tag1=bar value=1i 123", measurement);
+        let input = format!("{measurement},tag1=bar value=1i 123");
 
         let parsed = parse(&input);
 
@@ -2466,7 +2467,7 @@ her"#,
     #[test]
     fn test_large_measurement_name_exact_maximum_length() {
         let measurement = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES);
-        let input = format!("{},tag1=bar value=1i 123", measurement);
+        let input = format!("{measurement},tag1=bar value=1i 123");
 
         let parsed = parse(&input);
         assert!(parsed.is_ok());
@@ -2478,7 +2479,7 @@ her"#,
     #[test]
     fn test_large_tag_name() {
         let tag_name = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1);
-        let input = format!("foo,{}=bar value=1i 123", tag_name);
+        let input = format!("foo,{tag_name}=bar value=1i 123");
 
         let parsed = parse(&input);
 
@@ -2489,7 +2490,7 @@ her"#,
     #[test]
     fn test_large_tag_name_exact_maximum_length() {
         let tag_name = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES);
-        let input = format!("foo,{}=bar value=1i 123", tag_name);
+        let input = format!("foo,{tag_name}=bar value=1i 123");
 
         let parsed = parse(&input);
         assert!(parsed.is_ok());
@@ -2502,7 +2503,7 @@ her"#,
     #[test]
     fn test_large_value_name() {
         let value_name = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1);
-        let input = format!("foo,tag1=bar {}=1i 123", value_name);
+        let input = format!("foo,tag1=bar {value_name}=1i 123");
 
         let parsed = parse(&input);
 
@@ -2513,7 +2514,7 @@ her"#,
     #[test]
     fn test_large_value_name_exact_maximum_length() {
         let value_name = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES);
-        let input = format!("foo,tag1=bar {}=1i 123", value_name);
+        let input = format!("foo,tag1=bar {value_name}=1i 123");
 
         let parsed = parse(&input);
         assert!(parsed.is_ok());

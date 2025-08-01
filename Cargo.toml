@@ -67,23 +67,25 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # If you want to use a local checkout of arrow, see the commented-out "Patching Arrow" section below
-arrow = {version = "=53.3.0", features = ["prettyprint", "chrono-tz"]}
-arrow-buffer = {version = "=53.3.0"}
-arrow-flight = {version = "=53.3.0", features = ["flight-sql-experimental"]}
-arrow-ipc = {version = "=53.3.0"}
+arrow = { version = "55", features = ["prettyprint", "chrono-tz"] }
+arrow-buffer = { version = "55" }
+arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
+arrow-ipc = { version = "55" }
+arrow-schema = { version = "55" }
+bincode = { version = "2", default-features = false, features = ["alloc", "derive"] }
 # Use DataFusion fork
 # See https://github.com/influxdata/arrow-datafusion/pull/53 for contents
 # plus additional patches from https://github.com/influxdata/arrow-datafusion/pull/58
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "de1eb41e301a53e4916a5f1792e403fb68dd6106" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "de1eb41e301a53e4916a5f1792e403fb68dd6106" }
 hashbrown = {version = "0.14.5"}
 http = {version = "1"}
 http-body = {version = "1"}
 http-body-util = {version = "0.1"}
 hyper = {version = "1"}
 hyper-util = {version = "0.1"}
-object_store = {version = "0.11.2", features = ["aws", "azure", "gcp"]}
-parquet = {version = "=53.3.0", features = ["object_store"]}
+object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
+parquet = { version = "55", features = ["object_store"] }
 pbjson = {version = "0.7"}
 pbjson-build = {version = "0.7"}
 pbjson-types = {version = "0.7"}
@@ -95,6 +97,9 @@ reqwest = {version = "0.12", default-features = false }
 smallvec = {version = "1.15.1", features = ["union"] }
 sqlx = { version = "0.8.2", features = ["sqlite"]}
 tower = { version = "0.5" }
+tracing = { version = "0.1", features = ["log", "max_level_trace"] }
+tracing-log = { version = "0.2" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
 
 [workspace.lints.rust]
 missing_copy_implementations = "deny"

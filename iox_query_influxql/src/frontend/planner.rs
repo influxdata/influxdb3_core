@@ -31,8 +31,8 @@ use influxdb_influxql_parser::parse_statements;
 use influxdb_influxql_parser::statement::Statement;
 use influxdb_influxql_parser::visit::{Visitable, Visitor};
 use iox_query::exec::IOxSessionContext;
-use observability_deps::tracing::debug;
 use schema::Schema;
+use tracing::debug;
 
 struct ContextSchemaProvider<'a> {
     state: &'a SessionState,
@@ -165,7 +165,9 @@ impl ExecutionPlan for SchemaExec {
 impl DisplayAs for SchemaExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "SchemaExec")
             }
         }

@@ -42,8 +42,9 @@ async fn test_parquet_should_not_be_resorted() {
 
     // chunks
     let c = TestChunk::new("t")
+        .with_row_count(10_000)
         .with_tag_column("tag")
-        .with_time_column_with_full_stats(Some(0), Some(10), 10_000, None);
+        .with_time_column_with_full_stats(Some(0), Some(10), None);
     let c_mem = c.clone().with_may_contain_pk_duplicates(true);
     let c_file = c
         .clone()
@@ -98,7 +99,7 @@ async fn test_parquet_should_not_be_resorted() {
     - "                     FilterExec: time@1 > 0 AND time@1 > 2"
     - "                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1"
     - "                         RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
-    - "                 ParquetExec: file_groups={16 groups: [[2.parquet:0..125], [3.parquet:0..125], [2.parquet:125..250], [3.parquet:125..250], [2.parquet:250..375], ...]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0 AND time@1 > 2, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0 AND time_null_count@1 != time_row_count@2 AND time_max@0 > 2, required_guarantees=[]"
+    - "                 DataSourceExec: file_groups={16 groups: [[2.parquet:0..125], [3.parquet:0..125], [2.parquet:125..250], [3.parquet:125..250], [2.parquet:250..375], ...]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], file_type=parquet, predicate=time@1 > 0 AND time@1 > 2, pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0 AND time_null_count@1 != row_count@2 AND time_max@0 > 2, required_guarantees=[]"
     "#
     );
 }
@@ -121,9 +122,10 @@ async fn test_parquet_must_resorted() {
 
     // chunks
     let c = TestChunk::new("t")
+        .with_row_count(10_000)
         .with_tag_column("tag")
         .with_f64_field_column("field")
-        .with_time_column_with_full_stats(Some(0), Some(10), 10_000, None)
+        .with_time_column_with_full_stats(Some(0), Some(10), None)
         .with_may_contain_pk_duplicates(false)
         .with_sort_key(SortKey::from_columns([Arc::from("tag"), Arc::from("time")]));
     let schema = c.schema().clone();
@@ -176,7 +178,7 @@ async fn test_parquet_must_resorted() {
     // subranges of the same parquet file can be in multiple groups.
     //
     // Prior to https://github.com/influxdata/influxdb_iox/issues/9450, the plan
-    // called for the ParquetExec to read the files in parallel (using subranges) like:
+    // called for the DataSourceExec to read the files in parallel (using subranges) like:
     // ```
     // {6 groups: [[1.parquet:0..1, 2.parquet:0..16666666], [2.parquet:16666666..33333333],...
     // ```
@@ -194,7 +196,7 @@ async fn test_parquet_must_resorted() {
     - "       ProjectionExec: expr=[tag@0 as tag, field@1 as field]"
     - "         DeduplicateExec: [tag@0 ASC,time@2 ASC]"
     - "           SortPreservingMergeExec: [tag@0 ASC, time@2 ASC, __chunk_order@3 ASC]"
-    - "             ParquetExec: file_groups={6 groups: [[1.parquet:0..1], [2.parquet:0..20000000], [2.parquet:20000000..40000000], [2.parquet:40000000..60000000], [2.parquet:60000000..80000000], ...]}, projection=[tag, field, time, __chunk_order], output_ordering=[tag@0 ASC, time@2 ASC, __chunk_order@3 ASC], predicate=tag@1 > foo AND time@2 > 2, pruning_predicate=tag_null_count@1 != tag_row_count@2 AND tag_max@0 > foo AND time_null_count@4 != time_row_count@5 AND time_max@3 > 2, required_guarantees=[]"
+    - "             DataSourceExec: file_groups={6 groups: [[1.parquet:0..1], [2.parquet:0..20000000], [2.parquet:20000000..40000000], [2.parquet:40000000..60000000], [2.parquet:60000000..80000000], ...]}, projection=[tag, field, time, __chunk_order], output_ordering=[tag@0 ASC, time@2 ASC, __chunk_order@3 ASC], file_type=parquet, predicate=tag@1 > foo AND time@2 > 2, pruning_predicate=tag_null_count@1 != row_count@2 AND tag_max@0 > foo AND time_null_count@4 != row_count@2 AND time_max@3 > 2, required_guarantees=[]"
     "#
     );
 }

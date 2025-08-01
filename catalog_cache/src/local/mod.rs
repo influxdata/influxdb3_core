@@ -94,8 +94,8 @@ impl CatalogCache {
                     return Ok(false);
                 }
                 if let Some(l) = &self.limit {
-                    let new_len = value.data_len();
-                    let cur_len = old.data_len();
+                    let new_len = value.size();
+                    let cur_len = old.size();
                     match new_len > cur_len {
                         true => l.reserve(new_len - cur_len)?,
                         false => l.free(cur_len - new_len),
@@ -108,7 +108,7 @@ impl CatalogCache {
             }
             Entry::Vacant(v) => {
                 if let Some(l) = &self.limit {
-                    l.reserve(value.data_len())?;
+                    l.reserve(value.size())?;
                 }
                 if let Some(v) = &self.observer {
                     v.insert(key, &value, None);
@@ -128,7 +128,7 @@ impl CatalogCache {
                     v.evict(key, old)
                 }
                 if let Some(l) = &self.limit {
-                    l.free(old.data_len())
+                    l.free(old.size())
                 }
                 Some(o.remove().value)
             }
@@ -166,7 +166,7 @@ impl CatalogCache {
             let retain = f(key, entry);
 
             if !retain {
-                let size = entry.value.data_len();
+                let size = entry.value.size();
                 if let Some(v) = &self.observer {
                     v.evict(*key, &entry.value);
                 }

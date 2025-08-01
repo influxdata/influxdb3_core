@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::{
     common::plan_datafusion_err,
     error::Result,
-    logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, Volatility},
+    logical_expr::{ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     physical_plan::ColumnarValue,
 };
 
@@ -68,8 +68,8 @@ impl ScalarUDFImpl for ToTimestampUDF {
         }
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        match args {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        match args.args.as_slice() {
             // call through to arrow cast kernel
             [arg0]
                 if matches!(
@@ -79,7 +79,7 @@ impl ScalarUDFImpl for ToTimestampUDF {
             {
                 arg0.cast_to(&DataType::Timestamp(TimeUnit::Nanosecond, None), None)
             }
-            _ => self.fallback.invoke_batch(args, args.len()),
+            _ => self.fallback.invoke_with_args(args),
         }
     }
 }

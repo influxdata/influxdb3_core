@@ -3,7 +3,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::{
-    datatypes::{DataType, IntervalMonthDayNanoType, SchemaRef},
+    datatypes::{DataType, Field, FieldRef, IntervalMonthDayNanoType, SchemaRef, TimeUnit},
     record_batch::RecordBatch,
 };
 use chrono::Duration;
@@ -11,6 +11,7 @@ use datafusion::{
     common::exec_err,
     error::{DataFusionError, Result},
     functions::datetime::date_bin::DateBinFunc,
+    logical_expr::ScalarFunctionArgs,
     physical_expr::PhysicalExpr,
     physical_plan::{ColumnarValue, expressions::Column},
     scalar::ScalarValue,
@@ -95,12 +96,32 @@ impl GapFillParams {
         if let Some(v) = origin {
             args.push(v)
         }
+        let return_field = Arc::new(Field::new(
+            "r",
+            DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+            false,
+        ));
         let first_ts = first_ts
-            .map(|_| extract_timestamp_nanos(&params.date_bin_udf.invoke_batch(&args, args.len())?))
+            .map(|_| {
+                extract_timestamp_nanos(&params.date_bin_udf.invoke_with_args(
+                    ScalarFunctionArgs {
+                        args: args.clone(),
+                        arg_fields: arg_fields(&args),
+                        number_rows: 1,
+                        return_field: Arc::clone(&return_field),
+                    },
+                )?)
+            })
             .transpose()?;
         args[1] = i64_to_columnar_ts(Some(last_ts), &tz);
-        let last_ts =
-            extract_timestamp_nanos(&params.date_bin_udf.invoke_batch(&args, args.len())?)?;
+        let last_ts = extract_timestamp_nanos(&params.date_bin_udf.invoke_with_args(
+            ScalarFunctionArgs {
+                args: args.clone(),
+                arg_fields: arg_fields(&args),
+                number_rows: 1,
+                return_field: Arc::clone(&return_field),
+            },
+        )?)?;
 
         let gap_expander: Arc<dyn GapExpander + Send + Sync> =
             if params.date_bin_udf.inner().as_any().is::<DateBinFunc>() {
@@ -183,6 +204,13 @@ fn extract_interval_nanos(cv: &ColumnarValue) -> Result<i64> {
             "gap filling expects a stride parameter to be a scalar interval".to_string(),
         )),
     }
+}
+
+fn arg_fields(args: &[ColumnarValue]) -> Vec<FieldRef> {
+    args.iter()
+        .enumerate()
+        .map(|(idx, v)| Arc::new(Field::new(format!("arg_{idx}"), v.data_type(), false)))
+        .collect()
 }
 
 #[cfg(test)]

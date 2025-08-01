@@ -71,17 +71,23 @@ fn collect_new_statistics(
                     ..
                 },
             )| {
-                let (lower, upper) = interval.into_bounds();
-                let (min_value, max_value) = if lower.eq(&upper) {
-                    (Precision::Exact(lower), Precision::Exact(upper))
+                let (min_value, max_value) = if let Some(interval) = interval {
+                    let (lower, upper) = interval.into_bounds();
+                    if lower.eq(&upper) {
+                        (Precision::Exact(lower), Precision::Exact(upper))
+                    } else {
+                        (Precision::Inexact(lower), Precision::Inexact(upper))
+                    }
                 } else {
-                    (Precision::Inexact(lower), Precision::Inexact(upper))
+                    (Precision::Absent, Precision::Absent)
                 };
+
                 ColumnStatistics {
                     null_count: input_column_stats[idx].null_count.to_inexact(),
                     max_value,
                     min_value,
                     distinct_count: distinct_count.to_inexact(),
+                    sum_value: Precision::Absent,
                 }
             },
         )

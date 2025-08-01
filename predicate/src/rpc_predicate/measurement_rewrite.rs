@@ -12,7 +12,7 @@ pub(crate) fn rewrite_measurement_references(
 ) -> DataFusionResult<Transformed<Expr>> {
     Ok(match expr {
         // rewrite col("_measurement") --> "table_name"
-        Expr::Column(Column { relation, name }) if name == MEASUREMENT_COLUMN_NAME => {
+        Expr::Column(Column { relation, name, .. }) if name == MEASUREMENT_COLUMN_NAME => {
             // should not have a qualified foo._measurement
             // reference
             assert!(relation.is_none());

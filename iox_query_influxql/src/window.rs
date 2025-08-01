@@ -7,6 +7,7 @@ mod cumulative_sum;
 mod derivative;
 mod difference;
 mod elapsed;
+mod integral;
 mod moving_average;
 mod non_negative;
 mod percent_row_number;
@@ -36,6 +37,13 @@ pub(crate) static DIFFERENCE: LazyLock<WindowFunctionDefinition> = LazyLock::new
 pub(crate) static ELAPSED: LazyLock<WindowFunctionDefinition> = LazyLock::new(|| {
     WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::new_from_impl(
         elapsed::ElapsedUDWF::new(),
+    )))
+});
+
+/// Definition of the internal `INTEGRAL_WINDOW` user-defined window function.
+pub(crate) static INTEGRAL: LazyLock<WindowFunctionDefinition> = LazyLock::new(|| {
+    WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::new_from_impl(
+        integral::IntegralUDWF::new(),
     )))
 });
 

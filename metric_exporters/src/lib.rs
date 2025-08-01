@@ -6,12 +6,12 @@ use metric::{Attributes, MetricKind, Observation, Registry};
 use std::io::Write;
 use std::sync::Arc;
 
-use observability_deps::tracing::{debug, error, warn};
 use prometheus::proto::{Bucket, Histogram};
 use prometheus::{
     Encoder, TextEncoder,
     proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType},
 };
+use tracing::{debug, error, warn};
 
 /// A `metric::Reporter` that writes data in the prometheus text exposition format
 ///

@@ -43,7 +43,7 @@ impl Client {
             .tables)
     }
 
-    /// Get a  table in the given namespace
+    /// Get a table in the given namespace
     pub async fn get_table(
         &mut self,
         namespace: impl Into<Target> + Send,
@@ -78,5 +78,33 @@ impl Client {
             .await?;
 
         Ok(response.into_inner().table.unwrap_field("table")?)
+    }
+
+    /// Soft delete a table
+    pub async fn soft_delete_table(&mut self, table_id: i64) -> Result<Table, Error> {
+        let response = self
+            .inner
+            .delete_table(DeleteTableRequest { table_id })
+            .await?;
+
+        Ok(response.into_inner().table.unwrap_field("table")?)
+    }
+
+    /// Enable iceberg exports for a table
+    pub async fn enable_iceberg(&mut self, table_id: i64) -> Result<(), Error> {
+        let _ = self
+            .inner
+            .enable_iceberg(EnableIcebergRequest { table_id })
+            .await?;
+        Ok(())
+    }
+
+    /// Disable iceberg exports for a table
+    pub async fn disable_iceberg(&mut self, table_id: i64) -> Result<(), Error> {
+        let _ = self
+            .inner
+            .disable_iceberg(DisableIcebergRequest { table_id })
+            .await?;
+        Ok(())
     }
 }

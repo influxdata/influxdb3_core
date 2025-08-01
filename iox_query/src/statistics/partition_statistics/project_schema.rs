@@ -42,6 +42,7 @@ pub(crate) fn project_schema_onto_datasrc_statistics(
                         max_value: Precision::Exact(ScalarValue::Null),
                         min_value: Precision::Exact(ScalarValue::Null),
                         distinct_count: Precision::Absent,
+                        sum_value: Precision::Absent,
                     });
                 }
             };
@@ -247,12 +248,14 @@ pub(super) fn proj_exec_stats<'a>(
                     min_value: Precision::Exact(ScalarValue::Null),
                     max_value: Precision::Exact(ScalarValue::Null),
                     distinct_count: Precision::Exact(1),
+                    sum_value: Precision::Absent,
                 },
                 val => ColumnStatistics {
                     null_count: Precision::Exact(0),
                     min_value: Precision::Exact(val.clone()),
                     max_value: Precision::Exact(val.to_owned()),
                     distinct_count: Precision::Exact(1),
+                    sum_value: Precision::Absent,
                 },
             }
         } else {
@@ -261,11 +264,11 @@ pub(super) fn proj_exec_stats<'a>(
             ColumnStatistics::new_unknown()
         };
         column_statistics.push(col_stats);
-        if let Ok(data_type) = expr.data_type(projexec_schema) {
-            if let Some(value) = data_type.primitive_width() {
-                primitive_row_size += value;
-                continue;
-            }
+        if let Ok(data_type) = expr.data_type(projexec_schema)
+            && let Some(value) = data_type.primitive_width()
+        {
+            primitive_row_size += value;
+            continue;
         }
         primitive_row_size_possible = false;
     }
@@ -311,6 +314,7 @@ mod tests {
                         max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
                         null_count: Precision::Exact(nulls),
                         distinct_count: Precision::Absent,
+                        sum_value: Precision::Absent,
                     }
                 };
 
@@ -505,6 +509,7 @@ mod tests {
             max_value: Precision::Exact(ScalarValue::Null),
             min_value: Precision::Exact(ScalarValue::Null),
             distinct_count: Precision::Absent,
+            sum_value: Precision::Absent,
         };
         let expected_stats_with_nulls_at_datasrc = Arc::new(Statistics {
             num_rows: expected_stats.num_rows,

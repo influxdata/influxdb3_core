@@ -16,8 +16,8 @@ use datafusion::{
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
 use hashbrown::HashMap;
-use observability_deps::tracing::warn;
 use std::sync::Arc;
+use tracing::warn;
 
 #[derive(Debug, Default)]
 pub struct SplitDedup;
@@ -288,13 +288,13 @@ mod tests {
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
               - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-              - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+              - "     DataSourceExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             output:
               Ok:
                 - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "   UnionExec"
                 - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-                - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "     DataSourceExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             "#
             );
         }
@@ -319,18 +319,18 @@ mod tests {
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
               - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-              - "     ParquetExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time]"
+              - "     DataSourceExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             output:
               Ok:
                 - " UnionExec"
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={2 groups: [[3.parquet, 6.parquet], [5.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "       DataSourceExec: file_groups={2 groups: [[3.parquet, 6.parquet], [5.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "       DataSourceExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             "#
             );
         }
@@ -372,18 +372,18 @@ mod tests {
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
               - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-              - "     ParquetExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time]"
+              - "     DataSourceExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             output:
               Ok:
                 - " UnionExec"
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={2 groups: [[3.parquet, 6.parquet], [5.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "       DataSourceExec: file_groups={2 groups: [[3.parquet, 6.parquet], [5.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "       DataSourceExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             "#
             );
         }
@@ -440,13 +440,13 @@ mod tests {
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
               - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-              - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+              - "     DataSourceExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             output:
               Ok:
                 - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "   UnionExec"
                 - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-                - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "     DataSourceExec: file_groups={1 group: [[3.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             "#
             );
         }
@@ -479,18 +479,18 @@ mod tests {
               - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
               - "   UnionExec"
               - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-              - "     ParquetExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time]"
+              - "     DataSourceExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             output:
               Ok:
                 - " UnionExec"
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={2 groups: [[6.parquet, 5.parquet], [3.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "       DataSourceExec: file_groups={2 groups: [[6.parquet, 5.parquet], [3.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
                 - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
                 - "     UnionExec"
                 - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       ParquetExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time]"
+                - "       DataSourceExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
             "#
             );
         }
@@ -622,14 +622,14 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [time@0 ASC]"
-              - "   ParquetExec: file_groups={2 groups: [[1.parquet, 2.parquet, 4.parquet], [3.parquet, 5.parquet]]}, projection=[time]"
+              - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 2.parquet, 4.parquet], [3.parquet, 5.parquet]]}, projection=[time], file_type=parquet"
             output:
               Ok:
                 - " UnionExec"
-                - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[time]"
+                - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[time], file_type=parquet"
                 - "   DeduplicateExec: [time@0 ASC]"
-                - "     ParquetExec: file_groups={1 group: [[3.parquet]]}, projection=[time]"
-                - "   ParquetExec: file_groups={2 groups: [[4.parquet], [5.parquet]]}, projection=[time]"
+                - "     DataSourceExec: file_groups={1 group: [[3.parquet]]}, projection=[time], file_type=parquet"
+                - "   DataSourceExec: file_groups={2 groups: [[4.parquet], [5.parquet]]}, projection=[time], file_type=parquet"
             "#
             );
         }
@@ -661,11 +661,11 @@ mod tests {
                 @r#"
             input:
               - " DeduplicateExec: [time@0 ASC]"
-              - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
+              - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time], file_type=parquet"
             output:
               Ok:
                 - " DeduplicateExec: [time@0 ASC]"
-                - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time]"
+                - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[time], file_type=parquet"
             "#
             );
         }

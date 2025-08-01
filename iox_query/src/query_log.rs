@@ -4,7 +4,11 @@ use crate::exec::IOxSessionContext;
 use crate::memory_pool::Monitor;
 use crate::physical_optimizer::ParquetFileMetrics;
 use data_types::NamespaceId;
-use datafusion::physical_plan::{ExecutionPlan, metrics::MetricValue};
+use datafusion::physical_plan::{
+    ExecutionPlan,
+    metrics::{MetricValue, MetricsSet},
+};
+use influxdb_iox_client::write::Client as WriteClient;
 use influxdb_line_protocol::LineProtocolBuilder;
 use iox_query_params::StatementParams;
 use iox_time::{Time, TimeProvider};
@@ -12,7 +16,6 @@ use metric::{
     DurationHistogram, Metric, MetricObserver, U64Counter, U64Gauge, U64Histogram,
     U64HistogramOptions,
 };
-use observability_deps::tracing::{info, warn};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -25,6 +28,7 @@ use std::{
     time::Duration,
 };
 use trace::ctx::TraceId;
+use tracing::{info, warn};
 use tracker::InstrumentedAsyncOwnedSemaphorePermit;
 use uuid::Uuid;
 
@@ -215,6 +219,112 @@ pub struct QueryLogEntryState {
     pub deduplicated_partitions: Option<u64>,
 }
 
+impl QueryLogEntryState {
+    /// Convert a query log entry state into the InfluxDB line protocol format.
+    pub fn to_line_protocol(
+        &self,
+        builder: LineProtocolBuilder<Vec<u8>>,
+        measurement_name: &str,
+    ) -> LineProtocolBuilder<Vec<u8>> {
+        // Tags
+
+        let mut lp = builder
+            .measurement(measurement_name)
+            .tag("namespace_id", &self.namespace_id.get().to_string())
+            .tag("namespace_name", &self.namespace_name)
+            .tag("query_type", self.query_type)
+            .tag("phase", self.phase.name());
+
+        lp = match &self.auth_id {
+            Some(auth_id) => lp.tag("auth_id", auth_id.as_str()),
+            None => lp,
+        };
+
+        lp = match &self.trace_id {
+            Some(trace_id) => lp.tag("trace_id", trace_id.get().to_string().as_str()),
+            None => lp,
+        };
+
+        // Fields
+
+        let mut lp = lp
+            .field("running", self.running.to_string().as_str())
+            .field("success", self.success.to_string().as_str())
+            .field("query_text", self.query_text.to_string().as_str())
+            .field("query_params", self.query_params.to_string().as_str())
+            .field("query_issue_time_ns", self.issue_time.timestamp_nanos());
+
+        lp = match self.partitions {
+            Some(partitions) => lp.field("partition_count", partitions),
+            None => lp,
+        };
+
+        lp = match self.parquet_files {
+            Some(parquet_files) => lp.field("parquet_file_count", parquet_files),
+            None => lp,
+        };
+
+        lp = match &self.permit_duration {
+            Some(permit_duration) => {
+                lp.field("permit_duration_ns", permit_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match &self.plan_duration {
+            Some(plan_duration) => lp.field("plan_duration_ns", plan_duration.as_nanos() as u64),
+            None => lp,
+        };
+
+        lp = match &self.execute_duration {
+            Some(execute_duration) => {
+                lp.field("execute_duration_ns", execute_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match &self.end2end_duration {
+            Some(end2end_duration) => {
+                lp.field("end_to_end_duration_ns", end2end_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match &self.compute_duration {
+            Some(compute_duration) => {
+                lp.field("compute_duration_ns", compute_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match self.max_memory {
+            Some(max_memory) => lp.field("max_memory_bytes", max_memory),
+            None => lp,
+        };
+
+        lp = match self.ingester_metrics {
+            Some(im) => lp
+                .field(
+                    "ingester_latency_to_plan_ns",
+                    im.latency_to_plan.as_nanos() as u64,
+                )
+                .field(
+                    "ingester_latency_to_full_data_ns",
+                    im.latency_to_full_data.as_nanos() as u64,
+                )
+                .field("ingester_response_row_count", im.response_rows)
+                .field("ingester_response_size_bytes", im.response_size)
+                .field("ingester_partition_count", im.partition_count),
+            None => lp,
+        };
+
+        match chrono::Utc::now().timestamp_nanos_opt() {
+            Some(ns) => lp.timestamp(ns).close_line(),
+            None => lp.close_line(),
+        }
+    }
+}
+
 /// Unpack an option of a struct into a individual members.
 ///
 /// # Example
@@ -342,17 +452,27 @@ impl QueryLogEntry {
     }
 
     /// Sets new state and call [`emit`](Self::emit).
-    fn set_and_emit(&self, state: QueryLogEntryState, metrics: &Metrics) {
+    fn set_and_emit(
+        &self,
+        state: QueryLogEntryState,
+        metrics: &Metrics,
+        query_log_write_client: Option<Arc<WriteClient>>,
+    ) {
         let mut state = Arc::new(state);
         std::mem::swap(self.state.lock().deref_mut(), &mut state);
-        self.emit(metrics, Some(state));
+        self.emit(metrics, Some(state), query_log_write_client);
     }
 
     /// Emit entry to various systems.
     ///
     /// You should usually call [`set_and_emit`](Self::set_and_emit), but directly calling this method is OK for new
     /// entries (in which case the previous state is `None`).
-    fn emit(&self, metrics: &Metrics, prev_state: Option<Arc<QueryLogEntryState>>) {
+    fn emit(
+        &self,
+        metrics: &Metrics,
+        prev_state: Option<Arc<QueryLogEntryState>>,
+        query_log_write_client: Option<Arc<WriteClient>>,
+    ) {
         let state = self.state();
 
         // sanity-check
@@ -365,6 +485,10 @@ impl QueryLogEntry {
 
         Self::emit_log(&state);
         Self::emit_metrics(metrics, &state, prev_state.as_deref());
+
+        if let Some(query_log_write_client) = query_log_write_client {
+            self.emit_line_protocol(&query_log_write_client, &state, "query_log");
+        }
     }
 
     /// Log entry.
@@ -491,102 +615,33 @@ impl QueryLogEntry {
         record_metric_if_now_set!(deduplicated_partitions, prev_state, metrics);
     }
 
-    /// Convert a query log entry into the InfluxDB line protocol format.
-    pub fn to_line_protocol(
+    pub fn emit_line_protocol(
         &self,
-        builder: LineProtocolBuilder<Vec<u8>>,
+        query_log_write_client: &Arc<WriteClient>,
+        state: &QueryLogEntryState,
         measurement_name: &str,
-    ) -> LineProtocolBuilder<Vec<u8>> {
-        let state = self.state();
+    ) {
+        let lp: Vec<u8> = state
+            .to_line_protocol(LineProtocolBuilder::new(), measurement_name)
+            .build();
+        let mut query_log_write_client = query_log_write_client.as_ref().clone();
 
-        let mut lp = builder
-            .measurement(measurement_name)
-            .tag("namespace_id", &state.namespace_id.get().to_string())
-            .tag("namespace_name", &state.namespace_name)
-            .tag("query_type", state.query_type)
-            .tag("success", state.success.to_string().as_str())
-            .tag("running", state.running.to_string().as_str())
-            .tag("phase", state.phase.name())
-            .field("query_text", state.query_text.to_string().as_str())
-            .field("query_params", state.query_params.to_string().as_str())
-            .field("query_issue_time", state.issue_time.timestamp_nanos());
+        // Using tokio::spawn so all the callers don't have to be async
+        tokio::spawn(async move {
+            // The query logs are auto generated by the querier, so it should
+            // always contain valid UTF-8.
+            // If there are invalid UTF-8 characters, String::from_utf8_lossy()
+            // will replace them with the replacement character to get most of
+            // the information in the query logs across.
+            let lp_string = String::from_utf8_lossy(&lp).into_owned();
 
-        lp = match &state.auth_id {
-            Some(auth_id) => lp.field("auth_id", auth_id.as_str()),
-            None => lp,
-        };
-
-        lp = match &state.trace_id {
-            Some(trace_id) => lp.field("trace_id", trace_id.get().to_string().as_str()),
-            None => lp,
-        };
-
-        lp = match state.partitions {
-            Some(partitions) => lp.field("partitions", partitions),
-            None => lp,
-        };
-
-        lp = match state.parquet_files {
-            Some(parquet_files) => lp.field("parquet_files", parquet_files),
-            None => lp,
-        };
-
-        lp = match &state.permit_duration {
-            Some(permit_duration) => lp.field("permit_duration", permit_duration.as_nanos() as u64),
-            None => lp,
-        };
-
-        lp = match &state.plan_duration {
-            Some(plan_duration) => lp.field("plan_duration", plan_duration.as_nanos() as u64),
-            None => lp,
-        };
-
-        lp = match &state.execute_duration {
-            Some(execute_duration) => {
-                lp.field("execute_duration", execute_duration.as_nanos() as u64)
-            }
-            None => lp,
-        };
-
-        lp = match &state.end2end_duration {
-            Some(end2end_duration) => {
-                lp.field("end2end_duration", end2end_duration.as_nanos() as u64)
-            }
-            None => lp,
-        };
-
-        lp = match &state.compute_duration {
-            Some(compute_duration) => {
-                lp.field("compute_duration", compute_duration.as_nanos() as u64)
-            }
-            None => lp,
-        };
-
-        lp = match state.max_memory {
-            Some(max_memory) => lp.field("max_memory", max_memory),
-            None => lp,
-        };
-
-        lp = match state.ingester_metrics {
-            Some(im) => lp
-                .field(
-                    "ingester_latency_to_plan",
-                    im.latency_to_plan.as_nanos() as u64,
-                )
-                .field(
-                    "ingester_latency_to_full_data",
-                    im.latency_to_full_data.as_nanos() as u64,
-                )
-                .field("ingester_response_rows", im.response_rows)
-                .field("ingester_response_size", im.response_size)
-                .field("ingester_partition_count", im.partition_count),
-            None => lp,
-        };
-
-        match chrono::Utc::now().timestamp_nanos_opt() {
-            Some(ns) => lp.timestamp(ns).close_line(),
-            None => lp.close_line(),
-        }
+            query_log_write_client
+                .write_lp("_internal", lp_string)
+                .await
+                .inspect_err(|e| {
+                    warn!(error=%e, "Failed to write query log entry to line protocol client");
+                })
+        });
     }
 }
 
@@ -612,6 +667,8 @@ pub struct QueryLog {
     time_provider: Arc<dyn TimeProvider>,
     metrics: Arc<Metrics>,
     id_gen: IDGen,
+    /// Optional client to write query logs as line protocol to an external system.
+    query_log_write_client: Option<Arc<WriteClient>>,
 }
 
 impl QueryLog {
@@ -621,12 +678,14 @@ impl QueryLog {
         max_size: usize,
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: &metric::Registry,
+        query_log_write_client: Option<Arc<WriteClient>>,
     ) -> Self {
         Self::new_with_id_gen(
             max_size,
             time_provider,
             metric_registry,
             Box::new(Uuid::new_v4),
+            query_log_write_client,
         )
     }
 
@@ -635,6 +694,7 @@ impl QueryLog {
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: &metric::Registry,
         id_gen: IDGen,
+        query_log_write_client: Option<Arc<WriteClient>>,
     ) -> Self {
         Self {
             log: Mutex::new(VecDeque::with_capacity(max_size)),
@@ -643,6 +703,7 @@ impl QueryLog {
             time_provider,
             metrics: Arc::new(Metrics::new(metric_registry)),
             id_gen,
+            query_log_write_client,
         }
     }
 
@@ -684,13 +745,14 @@ impl QueryLog {
                 deduplicated_partitions: Default::default(),
             })),
         });
-        entry.emit(&self.metrics, None);
+        entry.emit(&self.metrics, None, self.query_log_write_client.clone());
 
         let token = QueryCompletedToken {
             entry: Some(Arc::clone(&entry)),
             time_provider: Arc::clone(&self.time_provider),
             metrics: Arc::clone(&self.metrics),
             state: Default::default(),
+            query_log_write_client: self.query_log_write_client.clone(),
         };
 
         if self.max_size == 0 {
@@ -813,6 +875,9 @@ where
 
     /// Current state.
     state: S,
+
+    /// Optional client to write query logs as line protocol to an external system.
+    query_log_write_client: Option<Arc<WriteClient>>,
 }
 
 #[expect(private_bounds)]
@@ -867,7 +932,7 @@ where
         set_relative(state.issue_time, now, &mut state.end2end_duration);
         state.running = false;
 
-        entry.set_and_emit(state, &self.metrics);
+        entry.set_and_emit(state, &self.metrics, self.query_log_write_client.clone());
     }
 }
 
@@ -896,7 +961,7 @@ impl QueryCompletedToken<StateReceived> {
             Some(u64::try_from(deduplicated_parquet_files).expect("Is this computer 128-bit??"));
         state.deduplicated_partitions =
             Some(u64::try_from(deduplicated_partitions).expect("Is this computer 128-bit??"));
-        entry.set_and_emit(state, &self.metrics);
+        entry.set_and_emit(state, &self.metrics, self.query_log_write_client.clone());
 
         QueryCompletedToken {
             entry: Some(entry),
@@ -906,6 +971,7 @@ impl QueryCompletedToken<StateReceived> {
                 plan,
                 memory_monitor: Arc::clone(ctx.memory_monitor()),
             },
+            query_log_write_client: self.query_log_write_client.clone(),
         }
     }
 
@@ -937,7 +1003,7 @@ impl QueryCompletedToken<StatePlanned> {
             set_relative(origin, now, &mut state.permit_duration);
         }
         state.phase = QueryPhase::Permit;
-        entry.set_and_emit(state, &self.metrics);
+        entry.set_and_emit(state, &self.metrics, self.query_log_write_client.clone());
 
         QueryCompletedToken {
             entry: Some(entry),
@@ -947,6 +1013,7 @@ impl QueryCompletedToken<StatePlanned> {
                 plan: Arc::clone(&self.state.plan),
                 memory_monitor: Arc::clone(&self.state.memory_monitor),
             },
+            query_log_write_client: self.query_log_write_client.clone(),
         }
     }
 }
@@ -1053,10 +1120,12 @@ fn set_relative(origin: Time, now: Time, target: &mut Option<Duration>) {
 fn collect_compute_duration(plan: &dyn ExecutionPlan) -> Duration {
     let mut total = Duration::ZERO;
 
-    if let Some(metrics) = plan.metrics() {
-        if let Some(nanos) = metrics.elapsed_compute() {
-            total += Duration::from_nanos(nanos as u64);
-        }
+    if let Some(nanos) = plan
+        .metrics()
+        .as_ref()
+        .and_then(MetricsSet::elapsed_compute)
+    {
+        total += Duration::from_nanos(nanos as u64);
     }
 
     for child in plan.children() {
@@ -1388,6 +1457,102 @@ mod test_super {
     use test_helpers::tracing::TracingCapture;
 
     use super::*;
+
+    #[test]
+    fn test_to_line_protocol_basic() {
+        let Test {
+            time_provider: _,
+            metric_registry: _,
+            token: _,
+            entry,
+            start_state: _,
+        } = Test::default();
+
+        // Test basic line protocol output
+        let lp_builder = entry
+            .state()
+            .as_ref()
+            .to_line_protocol(LineProtocolBuilder::new(), "query_log_test");
+        let lp = lp_builder.build();
+
+        insta::assert_snapshot!(
+            format_line_protocol(&lp),
+            @r#"query_log_test,namespace_id=1,namespace_name=ns,query_type=sql,phase=cancel running="false",success="false",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i,end_to_end_duration_ns=0u 1000000000000000000"#
+        );
+    }
+
+    #[test]
+    fn test_to_line_protocol_with_optional_fields() {
+        let Test {
+            time_provider,
+            metric_registry: _,
+            token,
+            entry,
+            start_state: _,
+        } = Test::default();
+
+        // Advance through phases to populate optional fields
+        time_provider.inc(Duration::from_millis(1));
+        let ctx = IOxSessionContext::with_testing();
+        let token = token.planned(&ctx, plan());
+
+        time_provider.inc(Duration::from_millis(2));
+        let token = token.permit();
+
+        time_provider.inc(Duration::from_millis(5));
+        token.success();
+
+        // Test line protocol with populated fields
+        let lp_builder = entry
+            .state()
+            .as_ref()
+            .to_line_protocol(LineProtocolBuilder::new(), "query_log_test");
+        let lp = lp_builder.build();
+        insta::assert_snapshot!(
+            format_line_protocol(&lp),
+            @r#"query_log_test,namespace_id=1,namespace_name=ns,query_type=sql,phase=success running="false",success="true",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i,partition_count=0u,parquet_file_count=0u,permit_duration_ns=2000000u,plan_duration_ns=1000000u,execute_duration_ns=5000000u,end_to_end_duration_ns=8000000u,compute_duration_ns=1337000000u,max_memory_bytes=0i,ingester_latency_to_plan_ns=0u,ingester_latency_to_full_data_ns=0u,ingester_response_row_count=0u,ingester_response_size_bytes=0u,ingester_partition_count=0u 1000000000000000000"#);
+    }
+
+    #[test]
+    fn test_to_line_protocol_with_auth_and_trace() {
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_millis(100).unwrap()));
+        let metric_registry = metric::Registry::default();
+        let log = QueryLog::new_with_id_gen(
+            10,
+            time_provider,
+            &metric_registry,
+            Box::new(|| Uuid::from_u128(1)),
+            None,
+        );
+
+        // Create entry with auth_id and trace_id
+        let namespace_id = NamespaceId::new(1);
+        let namespace_name = Arc::from("ns");
+        let auth_id = Some("user123".to_string());
+        let trace_id = TraceId::new(42);
+
+        let token = log.push(
+            namespace_id,
+            namespace_name,
+            "sql",
+            Box::new("SELECT 1"),
+            params! {},
+            auth_id,
+            trace_id,
+        );
+
+        let lp_builder = token
+            .entry()
+            .state()
+            .as_ref()
+            .to_line_protocol(LineProtocolBuilder::new(), "query_log_test");
+        let lp = lp_builder.build();
+
+        insta::assert_snapshot!(
+            format_line_protocol(&lp),
+            @r#"query_log_test,namespace_id=1,namespace_name=ns,query_type=sql,phase=received,auth_id=user123,trace_id=42 running="true",success="false",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i 1000000000000000000"#
+        );
+    }
 
     #[test]
     fn test_token_end2end_success() {
@@ -6084,6 +6249,7 @@ mod test_super {
                 Arc::clone(&time_provider) as _,
                 &metric_registry,
                 Box::new(move || Uuid::from_u128(id_counter.fetch_add(1, Ordering::SeqCst) as _)),
+                None,
             );
             let auth_id = auth_id.map(|s| s.into());
 
@@ -6232,5 +6398,20 @@ mod test_super {
         let mut reporter = metric_exporters::PrometheusTextEncoder::new(&mut out);
         registry.report(&mut reporter);
         String::from_utf8(out).expect("valid utf8")
+    }
+
+    /// Converts the line protocol to human readable format,
+    /// and ensures the timestamp is deterministic.
+    fn format_line_protocol(lp: &[u8]) -> String {
+        // Convert to string and fix the timestamp to be deterministic
+        let lp_str = String::from_utf8_lossy(lp);
+
+        // Find the last space (which separates the timestamp from the rest)
+        if let Some(last_space_idx) = lp_str.rfind(' ') {
+            let (prefix, _timestamp) = lp_str.split_at(last_space_idx);
+            format!("{prefix} 1000000000000000000")
+        } else {
+            lp_str.to_string()
+        }
     }
 }

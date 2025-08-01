@@ -1,3 +1,4 @@
+use bincode::{Decode, Encode};
 use indexmap::{Equivalent, IndexSet};
 use std::hash::Hash;
 
@@ -133,6 +134,63 @@ where
             None => false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+/// Encode implementation, with trait bounds for `T`.
+impl<T> Encode for OrderedSet<T>
+where
+    T: Encode + Eq + Hash + HasSize,
+{
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        // Encode IndexSet entries as a hand-rolled vec
+        // refer to https://github.com/bincode-org/bincode/blob/trunk/docs/spec.md#linear-collections-vec-arrays-etc
+        Encode::encode(&(self.set.len() as u8), encoder)?;
+        for entry in &self.set {
+            Encode::encode(entry, encoder)?;
+        }
+
+        Encode::encode(&self.memory_size, encoder)?;
+        Encode::encode(&self.tombstone_counter, encoder)?;
+        Encode::encode(&self.n_tombstones, encoder)?;
+        Ok(())
+    }
+}
+
+impl<T, Q> Decode<Q> for OrderedSet<T>
+where
+    T: Decode<Q> + Encode + Hash + Eq + HasSize,
+{
+    fn decode<D: bincode::de::Decoder<Context = Q>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let set_len: u8 = Decode::decode(decoder)?;
+        // Manually reconstruct the IndexSet from decoded entries
+        // since IndexSet does not implement Decode.
+        let mut set = IndexSet::new();
+        for _ in 0..set_len {
+            let entry: Entry<T> = Decode::decode(decoder)?;
+            set.insert(entry);
+        }
+
+        let memory_size: usize = Decode::decode(decoder)?;
+        let tombstone_counter: u64 = Decode::decode(decoder)?;
+        let n_tombstones: usize = Decode::decode(decoder)?;
+
+        Ok(Self {
+            set,
+            memory_size,
+            tombstone_counter,
+            n_tombstones,
+        })
+    }
 }
 
 impl<T> std::fmt::Debug for OrderedSet<T>
@@ -162,19 +220,32 @@ where
     }
 }
 
+const DATA_ENTRY: u8 = 1;
+const TOMBSTONE_ENTRY: u8 = 2;
+
 /// Underlying entry of [`OrderedSet`].
 #[derive(PartialEq, Eq, Hash)]
+#[repr(u8)]
 enum Entry<T>
 where
     T: Eq + Hash,
 {
     /// Actual data.
-    Data(T),
+    Data(T) = DATA_ENTRY,
 
     /// A tombstone with a unique ID.
     ///
-    /// The unique ID prevents two twostones from being equal and also spreads the hash values.
-    Tombstone(u64),
+    /// The unique ID prevents two tombstones from being equal and also spreads the hash values.
+    Tombstone(u64) = TOMBSTONE_ENTRY,
+}
+
+impl<T> Entry<T>
+where
+    T: Eq + Hash,
+{
+    fn discriminant(&self) -> u8 {
+        unsafe { *(self as *const Self as *const u8) }
+    }
 }
 
 impl<T> Equivalent<Entry<T>> for Entry<&T>
@@ -187,5 +258,118 @@ where
             Entry::Tombstone(idx) => Entry::Tombstone(*idx),
         };
         self.equivalent(&key)
+    }
+}
+
+/// Encode implementation, with trait bounds for `T`.
+impl<T> Encode for Entry<T>
+where
+    T: Encode + Eq + Hash,
+{
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        // Encode the variant discriminant first
+        Encode::encode(&self.discriminant(), encoder)?;
+
+        // Encode the actual data based on the variant
+        match self {
+            Self::Data(data) => Encode::encode(data, encoder)?,
+            Self::Tombstone(id) => Encode::encode(id, encoder)?,
+        }
+
+        Ok(())
+    }
+}
+
+impl<T, Q> Decode<Q> for Entry<T>
+where
+    T: Decode<Q> + Encode + Eq + Hash,
+{
+    fn decode<D: bincode::de::Decoder<Context = Q>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        // Read the variant discriminant first
+        let variant: u8 = Decode::decode(decoder)?;
+
+        match variant {
+            DATA_ENTRY => {
+                // Data variant
+                let data: T = Decode::decode(decoder)?;
+                Ok(Self::Data(data))
+            }
+            TOMBSTONE_ENTRY => {
+                // Tombstone variant
+                let id: u64 = Decode::decode(decoder)?;
+                Ok(Self::Tombstone(id))
+            }
+            _ => Err(bincode::error::DecodeError::OtherString(format!(
+                "Invalid variant {variant} for Entry enum, expected 0 or 1",
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bincode::{Decode, Encode};
+
+    // Simple test type that implements all required traits
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+    struct TestData(String);
+
+    impl HasSize for TestData {
+        fn size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    #[test]
+    fn test_ordered_set_encode_decode_with_data_and_tombstones() {
+        // Create an OrderedSet and populate it with data
+        let mut ordered_set = OrderedSet::default();
+
+        // Add some data entries
+        ordered_set.push_back(TestData("first".to_string()));
+        ordered_set.push_back(TestData("second".to_string()));
+        ordered_set.push_back(TestData("third".to_string()));
+        ordered_set.push_back(TestData("fourth".to_string()));
+
+        // Remove some entries to create tombstones
+        assert!(ordered_set.remove(&TestData("second".to_string())));
+        assert!(ordered_set.remove(&TestData("fourth".to_string())));
+
+        // Verify the state before encoding
+        let original_memory_size = ordered_set.memory_size();
+        let original_len = ordered_set.len();
+        let original_n_tombstones = ordered_set.n_tombstones;
+        let original_tombstone_counter = ordered_set.tombstone_counter;
+        assert_eq!(original_memory_size, "first".len() + "third".len());
+        assert_eq!(original_len, 4); // 2 data + 2 tombstones
+        assert_eq!(original_n_tombstones, 2);
+        assert_eq!(original_tombstone_counter, 2);
+
+        // Encode the OrderedSet
+        let encoded = bincode::encode_to_vec(&ordered_set, bincode::config::standard())
+            .expect("Failed to encode OrderedSet");
+
+        // Decode the OrderedSet
+        let (decoded_set, _): (OrderedSet<TestData>, usize) =
+            bincode::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("Failed to decode OrderedSet");
+
+        // Verify the decoded state matches the original
+        assert_eq!(decoded_set.memory_size(), original_memory_size);
+        assert_eq!(decoded_set.len(), original_len);
+        assert_eq!(decoded_set.n_tombstones, original_n_tombstones);
+        assert_eq!(decoded_set.tombstone_counter, original_tombstone_counter);
+
+        // Verify that Data & Tombstone entries are correctly decoded
+        assert!(
+            matches!(decoded_set.set[0], Entry::Data(ref data) if data == &TestData("first".to_string()))
+        );
+        assert!(matches!(decoded_set.set[1], Entry::Tombstone(_)));
     }
 }

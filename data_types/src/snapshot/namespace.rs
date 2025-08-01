@@ -202,6 +202,21 @@ impl NamespaceSnapshot {
     pub fn deleted_at(&self) -> Option<Timestamp> {
         self.deleted_at
     }
+
+    /// Returns the partition template if any
+    pub fn partition_template(&self) -> Option<&PartitionTemplate> {
+        self.partition_template.as_ref()
+    }
+
+    /// Returns the maximum number of tables allowed in this namespace
+    pub fn max_tables(&self) -> i32 {
+        self.max_tables
+    }
+
+    /// Returns the maximum number of columns allowed per table in this namespace
+    pub fn max_columns_per_table(&self) -> i32 {
+        self.max_columns_per_table
+    }
 }
 
 /// Table information stored within [`NamespaceSnapshot`]

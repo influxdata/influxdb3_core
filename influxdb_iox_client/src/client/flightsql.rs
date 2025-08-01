@@ -541,10 +541,10 @@ impl FlightSqlClient {
         let mut stream = self
             .do_put_with_cmd(cmd.as_any(), futures_util::stream::iter([Ok(params_batch)]))
             .await?;
-        if let Ok(Some(put_result)) = stream.try_next().await {
-            if let Ok(Some(handle)) = self.unpack_prepared_statement_handle(&put_result) {
-                return Ok(handle);
-            }
+        if let Ok(Some(put_result)) = stream.try_next().await
+            && let Ok(Some(handle)) = self.unpack_prepared_statement_handle(&put_result)
+        {
+            return Ok(handle);
         }
         Ok(cmd.prepared_statement_handle)
     }

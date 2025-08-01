@@ -29,8 +29,6 @@ use generated_types::influxdata::iox::{
     schema::v1 as schema_proto, skipped_compaction::v1 as skipped_compaction_proto,
     table::v1 as table_proto,
 };
-use iox_time::Time;
-use observability_deps::tracing::warn;
 use schema::TIME_COLUMN_NAME;
 use snafu::Snafu;
 use std::{
@@ -44,6 +42,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use tracing::warn;
 use uuid::Uuid;
 
 /// Errors deserialising a protobuf serialised [`ParquetFile`].
@@ -185,7 +184,16 @@ impl std::fmt::Display for TableId {
     }
 }
 
-/// A sequence number from an ingester
+impl From<TableId> for Target {
+    fn from(value: TableId) -> Self {
+        Self::Id(value.get())
+    }
+}
+
+/// A sequence number from a write to an ingester, used to
+/// provide an order to the writes within a single ingester.
+///
+/// Writes are sequenced per-partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SequenceNumber(u64);
 
@@ -246,6 +254,23 @@ impl From<iox_time::Time> for Timestamp {
 impl From<Timestamp> for iox_time::Time {
     fn from(time: Timestamp) -> Self {
         Self::from_timestamp_nanos(time.get())
+    }
+}
+
+impl From<google::Timestamp> for Timestamp {
+    fn from(ts: google::Timestamp) -> Self {
+        let time = ts.seconds * 1_000_000_000 + ts.nanos as i64;
+        Timestamp::new(time)
+    }
+}
+
+impl From<Timestamp> for google::Timestamp {
+    fn from(ts: Timestamp) -> Self {
+        let time = iox_time::Time::from(ts);
+        google::Timestamp {
+            seconds: time.timestamp(),
+            nanos: time.timestamp_subsec_nanos() as i32,
+        }
     }
 }
 
@@ -425,22 +450,9 @@ impl From<NamespaceWithStorage> for catalog_storage_proto::NamespaceWithStorage 
             partition_template: value.partition_template.as_proto().cloned(),
             size_bytes: value.size_bytes,
             table_count: value.table_count as i32,
-            deleted_at: value.deleted_at.map(serialize_timestamp),
+            deleted_at: value.deleted_at.map(google::Timestamp::from),
         }
     }
-}
-
-fn serialize_timestamp(ts: Timestamp) -> google::Timestamp {
-    let time = Time::from(ts);
-    google::Timestamp {
-        seconds: time.timestamp(),
-        nanos: time.timestamp_subsec_nanos() as i32,
-    }
-}
-
-fn deserialize_timestamp(ts: google::Timestamp) -> Timestamp {
-    let time = ts.seconds * 1_000_000_000 + ts.nanos as i64;
-    Timestamp::new(time)
 }
 
 /// Errors converting from a catalog_storage proto v1 NamespaceWithStorage or TableWithStorage to
@@ -488,7 +500,7 @@ impl TryFrom<catalog_storage_proto::NamespaceWithStorage> for NamespaceWithStora
             partition_template,
             size_bytes: value.size_bytes,
             table_count: value.table_count as i64,
-            deleted_at: value.deleted_at.map(deserialize_timestamp),
+            deleted_at: value.deleted_at.map(Timestamp::from),
         })
     }
 }
@@ -711,7 +723,7 @@ impl From<Table> for table_proto::Table {
             namespace_id: value.namespace_id.get(),
             partition_template: value.partition_template.as_proto().cloned(),
             iceberg_enabled: value.iceberg_enabled,
-            deleted_at: value.deleted_at.map(serialize_timestamp),
+            deleted_at: value.deleted_at.map(google::Timestamp::from),
         }
     }
 }
@@ -746,7 +758,7 @@ impl From<TableWithStorage> for catalog_storage_proto::TableWithStorage {
             namespace_id: value.namespace_id.get(),
             partition_template: value.partition_template.as_proto().cloned(),
             size_bytes: value.size_bytes,
-            deleted_at: value.deleted_at.map(serialize_timestamp),
+            deleted_at: value.deleted_at.map(google::Timestamp::from),
             column_count: value.column_count,
         }
     }
@@ -770,7 +782,7 @@ impl TryFrom<catalog_storage_proto::TableWithStorage> for TableWithStorage {
             namespace_id: NamespaceId::new(value.namespace_id),
             partition_template,
             size_bytes: value.size_bytes,
-            deleted_at: value.deleted_at.map(deserialize_timestamp),
+            deleted_at: value.deleted_at.map(Timestamp::from),
             column_count: value.column_count,
         })
     }
@@ -2280,9 +2292,7 @@ impl FileRange {
     pub fn split_at(&self, point: i64) -> (Self, Self) {
         assert!(
             self.min < point && point <= self.max,
-            "point ({}) must be within range ({:?})",
-            point,
-            self
+            "point ({point}) must be within range ({self:?})"
         );
 
         // Calculate the proportion of the capacity that goes to the first (left) range

@@ -3,20 +3,22 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     config::ConfigOptions,
-    datasource::physical_plan::{FileScanConfig, ParquetExec, parquet::ParquetExecBuilder},
+    datasource::{
+        physical_plan::{FileGroup, FileScanConfig},
+        source::DataSourceExec,
+    },
     error::Result,
     physical_expr::LexOrdering,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{ExecutionPlan, sorts::sort::SortExec},
 };
-use datafusion_util::config::table_parquet_options;
-use observability_deps::tracing::warn;
+use tracing::warn;
 
 use crate::config::IoxConfigExt;
 
 /// Trade wider fan-out of not having to sort parquet files.
 ///
-/// This will fan-out [`ParquetExec`] nodes beyond [`target_partitions`] if it is under a node that desires sorting, e.g.:
+/// This will fan-out [`DataSourceExec`] nodes beyond [`target_partitions`] if it is under a node that desires sorting, e.g.:
 ///
 /// - [`SortExec`] itself
 /// - any other node that requires sorting, e.g. [`DeduplicateExec`]
@@ -122,24 +124,35 @@ impl TreeNodeRewriter for ParquetSortnessRewriter<'_> {
     }
 
     fn f_up(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
-        let Some(parquet_exec) = node.as_any().downcast_ref::<ParquetExec>() else {
-            // not a parquet exec
+        let Some(data_source_exec) = node.as_any().downcast_ref::<DataSourceExec>() else {
+            // not a `DataSourceExec`
+            return Ok(Transformed::no(node));
+        };
+        let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+        else {
+            // not a `DataSourceExec`
             return Ok(Transformed::no(node));
         };
 
-        let base_config = parquet_exec.base_config();
-        if base_config.output_ordering.is_empty() {
+        if file_scan_config.output_ordering.is_empty() {
             // no output ordering requested
             return Ok(Transformed::no(node));
         }
 
-        if base_config.file_groups.iter().all(|g| g.len() < 2) {
+        if file_scan_config.file_groups.iter().all(|g| g.len() < 2) {
             // already flat
             return Ok(Transformed::no(node));
         }
 
         // Protect against degenerative plans
-        let n_files = base_config.file_groups.iter().map(Vec::len).sum::<usize>();
+        let n_files = file_scan_config
+            .file_groups
+            .iter()
+            .map(|g| g.len())
+            .sum::<usize>();
         let max_parquet_fanout = self
             .config
             .extensions
@@ -155,25 +168,20 @@ impl TreeNodeRewriter for ParquetSortnessRewriter<'_> {
             return Ok(Transformed::no(node));
         }
 
-        let base_config = FileScanConfig {
-            file_groups: base_config
+        let file_scan_config = FileScanConfig {
+            file_groups: file_scan_config
                 .file_groups
                 .iter()
                 .flat_map(|g| g.iter())
-                .map(|f| vec![f.clone()])
+                .map(|f| FileGroup::new(vec![f.clone()]))
                 .collect(),
-            ..base_config.clone()
+            ..file_scan_config.clone()
         };
-        let mut builder =
-            ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        if let Some(predicate) = parquet_exec.predicate() {
-            builder = builder.with_predicate(Arc::clone(predicate));
-        }
-        let new_parquet_exec = builder.build();
+        let new_data_source_exec = DataSourceExec::from_data_source(file_scan_config);
 
         // did this help?
-        if new_parquet_exec.properties().output_ordering() == Some(self.desired_ordering) {
-            Ok(Transformed::yes(Arc::new(new_parquet_exec)))
+        if new_data_source_exec.properties().output_ordering() == Some(self.desired_ordering) {
+            Ok(Transformed::yes(new_data_source_exec))
         } else {
             Ok(Transformed::no(node))
         }
@@ -184,13 +192,20 @@ impl TreeNodeRewriter for ParquetSortnessRewriter<'_> {
 mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
     use datafusion::{
-        datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl},
+        common::{ColumnStatistics, Statistics, stats::Precision},
+        datasource::{
+            listing::PartitionedFile,
+            object_store::ObjectStoreUrl,
+            physical_plan::{FileScanConfigBuilder, ParquetSource},
+        },
         physical_expr::PhysicalSortExpr,
         physical_plan::{
             expressions::Column, placeholder_row::PlaceholderRowExec, sorts::sort::SortExec,
             union::UnionExec,
         },
+        scalar::ScalarValue,
     };
+    use datafusion_util::config::table_parquet_options;
 
     use crate::{
         CHUNK_ORDER_COLUMN_NAME, chunk_order_field,
@@ -203,29 +218,33 @@ mod tests {
     #[test]
     fn test_happy_path_sort() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
         .with_table_partition_cols(vec![])
-        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)])
+        .build();
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
-                .with_fetch(Some(42)),
+            SortExec::new(
+                ordering(["col2", "col1"], &schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r#"
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         "#
         );
     }
@@ -233,18 +252,19 @@ mod tests {
     #[test]
     fn test_happy_path_dedup() {
         let schema = schema_with_chunk_order();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
         .with_output_ordering(vec![ordering(
             ["col2", "col1", CHUNK_ORDER_COLUMN_NAME],
             &schema,
-        )]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        )])
+        .build();
         let plan = Arc::new(DeduplicateExec::new(
-            builder.build_arc(),
+            DataSourceExec::from_data_source(file_scan_config),
             ordering(["col2", "col1"], &schema),
             true,
         ));
@@ -254,11 +274,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC], file_type=parquet"
         "#
         );
     }
@@ -266,17 +286,24 @@ mod tests {
     #[test]
     fn test_sort_partitioning() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)], vec![file(3)]])
-        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        .with_file_groups(vec![
+            FileGroup::new(vec![file(1), file(2)]),
+            FileGroup::new(vec![file(3)]),
+        ])
+        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)])
+        .build();
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
-                .with_preserve_partitioning(true)
-                .with_fetch(Some(42)),
+            SortExec::new(
+                ordering(["col2", "col1"], &schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .with_preserve_partitioning(true)
+            .with_fetch(Some(42)),
         );
 
         assert_unknown_partitioning(plan.properties().output_partitioning().clone(), 2);
@@ -287,12 +314,12 @@ mod tests {
             test,
             @r#"
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[true]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet, 2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[true], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[true]"
-            - "   ParquetExec: file_groups={3 groups: [[1.parquet], [2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[true], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+            - "   DataSourceExec: file_groups={3 groups: [[1.parquet], [2.parquet], [3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         "#
         );
 
@@ -309,29 +336,36 @@ mod tests {
     #[test]
     fn test_parquet_already_flat() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1)], vec![file(2)]])
-        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)]);
+        .with_file_groups(vec![
+            FileGroup::new(vec![file(1)]),
+            FileGroup::new(vec![file(2)]),
+        ])
+        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)])
+        .build();
 
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
-                .with_fetch(Some(42)),
+            SortExec::new(
+                ordering(["col2", "col1"], &schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r#"
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         "#
         );
     }
@@ -339,16 +373,20 @@ mod tests {
     #[test]
     fn test_parquet_has_different_ordering() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
-        .with_output_ordering(vec![ordering(["col1", "col2"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
+        .with_output_ordering(vec![ordering(["col1", "col2"], &schema)])
+        .build();
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
-                .with_fetch(Some(42)),
+            SortExec::new(
+                ordering(["col2", "col1"], &schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
@@ -356,11 +394,11 @@ mod tests {
             @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC], file_type=parquet"
         output:
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC], file_type=parquet"
         "#
         );
     }
@@ -368,15 +406,19 @@ mod tests {
     #[test]
     fn test_parquet_has_no_ordering() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
+        .build();
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
-                .with_fetch(Some(42)),
+            SortExec::new(
+                ordering(["col2", "col1"], &schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
@@ -384,11 +426,11 @@ mod tests {
             @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], file_type=parquet"
         output:
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], file_type=parquet"
         "#
         );
     }
@@ -396,16 +438,20 @@ mod tests {
     #[test]
     fn test_fanout_limit() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2), file(3)]])
-        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2), file(3)])])
+        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)])
+        .build();
         let plan = Arc::new(
-            SortExec::new(ordering(["col2", "col1"], &schema), builder.build_arc())
-                .with_fetch(Some(42)),
+            SortExec::new(
+                ordering(["col2", "col1"], &schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .with_fetch(Some(42)),
         );
         let opt = ParquetSortness;
         let mut config = ConfigOptions::default();
@@ -417,12 +463,12 @@ mod tests {
             OptimizationTest::new_with_config(plan, opt, &config),
             @r#"
         input:
-          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+          - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         output:
           Ok:
-            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+            - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false], sort_prefix=[col2@1 ASC, col1@0 ASC]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet, 3.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         "#
         );
     }
@@ -451,25 +497,26 @@ mod tests {
     }
 
     #[test]
-    fn test_does_not_touch_freestanding_parquet_exec() {
+    fn test_does_not_touch_freestanding_data_source_exec() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
-        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        let plan = builder.build_arc();
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
+        .with_output_ordering(vec![ordering(["col2", "col1"], &schema)])
+        .build();
+        let plan = DataSourceExec::from_data_source(file_scan_config);
         let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r#"
         input:
-          - " ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+          - " DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         output:
           Ok:
-            - " ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC]"
+            - " DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col2@1 ASC, col1@0 ASC], file_type=parquet"
         "#
         );
     }
@@ -477,14 +524,15 @@ mod tests {
     #[test]
     fn test_ignore_outer_sort_if_inner_preform_resort() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
-        .with_output_ordering(vec![ordering(["col1", "col2"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        let plan = builder.build_arc();
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
+        .with_output_ordering(vec![ordering(["col1", "col2"], &schema)])
+        .build();
+        let plan = DataSourceExec::from_data_source(file_scan_config);
         let plan =
             Arc::new(SortExec::new(ordering(["col2", "col1"], &schema), plan).with_fetch(Some(42)));
         let plan =
@@ -496,12 +544,12 @@ mod tests {
         input:
           - " SortExec: TopK(fetch=42), expr=[col1@0 ASC, col2@1 ASC], preserve_partitioning=[false]"
           - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
+          - "     DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC], file_type=parquet"
         output:
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col1@0 ASC, col2@1 ASC], preserve_partitioning=[false]"
             - "   SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
+            - "     DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC], file_type=parquet"
         "#
         );
     }
@@ -509,14 +557,15 @@ mod tests {
     #[test]
     fn test_honor_inner_sort_even_if_outer_preform_resort() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
-        .with_output_ordering(vec![ordering(["col1", "col2"], &schema)]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        let plan = builder.build_arc();
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
+        .with_output_ordering(vec![ordering(["col1", "col2"], &schema)])
+        .build();
+        let plan = DataSourceExec::from_data_source(file_scan_config);
         let plan =
             Arc::new(SortExec::new(ordering(["col1", "col2"], &schema), plan).with_fetch(Some(42)));
         let plan =
@@ -527,13 +576,13 @@ mod tests {
             @r#"
         input:
           - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-          - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC, col2@1 ASC], preserve_partitioning=[false]"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
+          - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC, col2@1 ASC], preserve_partitioning=[false], sort_prefix=[col1@0 ASC, col2@1 ASC]"
+          - "     DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC], file_type=parquet"
         output:
           Ok:
             - " SortExec: TopK(fetch=42), expr=[col2@1 ASC, col1@0 ASC], preserve_partitioning=[false]"
-            - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC, col2@1 ASC], preserve_partitioning=[false]"
-            - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC]"
+            - "   SortExec: TopK(fetch=42), expr=[col1@0 ASC, col2@1 ASC], preserve_partitioning=[false], sort_prefix=[col1@0 ASC, col2@1 ASC]"
+            - "     DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3], output_ordering=[col1@0 ASC, col2@1 ASC], file_type=parquet"
         "#
         );
     }
@@ -542,17 +591,18 @@ mod tests {
     fn test_issue_idpe_17556() {
         let schema = schema_with_chunk_order();
 
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
-        .with_file_groups(vec![vec![file(1), file(2)]])
+        .with_file_groups(vec![FileGroup::new(vec![file(1), file(2)])])
         .with_output_ordering(vec![ordering(
             ["col2", "col1", CHUNK_ORDER_COLUMN_NAME],
             &schema,
-        )]);
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        let plan_parquet = builder.build_arc();
+        )])
+        .build();
+        let plan_parquet = DataSourceExec::from_data_source(file_scan_config);
         let plan_batches = Arc::new(RecordBatchesExec::new(vec![], Arc::clone(&schema), None));
 
         let plan = Arc::new(UnionExec::new(vec![plan_batches, plan_parquet]));
@@ -569,22 +619,22 @@ mod tests {
           - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
           - "   UnionExec"
           - "     RecordBatchesExec: chunks=0, projection=[col1, col2, col3, __chunk_order]"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
+          - "     DataSourceExec: file_groups={1 group: [[1.parquet, 2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [col2@1 ASC,col1@0 ASC]"
             - "   UnionExec"
             - "     RecordBatchesExec: chunks=0, projection=[col1, col2, col3, __chunk_order]"
-            - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC]"
+            - "     DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[col1, col2, col3, __chunk_order], output_ordering=[col2@1 ASC, col1@0 ASC, __chunk_order@3 ASC], file_type=parquet"
         "#
         );
     }
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("col1", DataType::Utf8, true),
-            Field::new("col2", DataType::Utf8, true),
-            Field::new("col3", DataType::Utf8, true),
+            Field::new("col1", DataType::Int64, false),
+            Field::new("col2", DataType::Int64, false),
+            Field::new("col3", DataType::Int64, false),
         ]))
     }
 
@@ -599,8 +649,20 @@ mod tests {
         ))
     }
 
-    fn file(n: u128) -> PartitionedFile {
-        PartitionedFile::new(format!("{n}.parquet"), 0)
+    fn file(n: i64) -> PartitionedFile {
+        let mut stats = Statistics::default();
+
+        // for all columns including chunk order col
+        for _ in 0..(schema().fields().len() + 1) {
+            stats = stats.add_column_statistics(
+                ColumnStatistics::default()
+                    .with_min_value(Precision::Exact(ScalarValue::from(n)))
+                    .with_max_value(Precision::Exact(ScalarValue::from(n)))
+                    .with_null_count(Precision::Exact(0)),
+            );
+        }
+
+        PartitionedFile::new(format!("{n}.parquet"), 0).with_statistics(Arc::new(stats))
     }
 
     fn ordering<const N: usize>(cols: [&str; N], schema: &SchemaRef) -> LexOrdering {

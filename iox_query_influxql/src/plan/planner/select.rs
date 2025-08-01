@@ -380,14 +380,14 @@ impl<'a> Selector<'a> {
     fn identifier(expr: &'a IQLExpr) -> Result<&'a Identifier> {
         match expr {
             IQLExpr::VarRef(v) => Ok(&v.name),
-            e => error::internal(format!("invalid column identifier: {}", e)),
+            e => error::internal(format!("invalid column identifier: {e}")),
         }
     }
 
     fn literal_int(expr: &'a IQLExpr) -> Result<i64> {
         match expr {
             IQLExpr::Literal(Literal::Integer(n)) => Ok(*n),
-            e => error::internal(format!("invalid integer literal: {}", e)),
+            e => error::internal(format!("invalid integer literal: {e}")),
         }
     }
 
@@ -395,7 +395,7 @@ impl<'a> Selector<'a> {
         match expr {
             IQLExpr::Literal(Literal::Integer(n)) => Ok(*n as f64),
             IQLExpr::Literal(Literal::Float(n)) => Ok(*n),
-            e => error::internal(format!("invalid integer literal: {}", e)),
+            e => error::internal(format!("invalid integer literal: {e}")),
         }
     }
 }

@@ -10,10 +10,8 @@ pub(super) struct SourceFieldNamesVisitor<'a>(pub(super) &'a mut BTreeSet<String
 impl Visitor for SourceFieldNamesVisitor<'_> {
     type Error = DataFusionError;
     fn pre_visit_var_ref(self, varref: &VarRef) -> Result<Recursion<Self>, Self::Error> {
-        if let Some(dt) = varref.data_type {
-            if dt.is_field_type() {
-                self.0.insert(varref.name.clone().take());
-            }
+        if varref.data_type.is_some_and(|dt| dt.is_field_type()) {
+            self.0.insert(varref.name.clone().take());
         }
         Ok(Recursion::Continue(self))
     }

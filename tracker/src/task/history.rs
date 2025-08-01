@@ -2,8 +2,8 @@ use super::registry::AbstractTaskRegistry;
 use super::{TaskId, TaskRegistration, TaskTracker};
 use hashbrown::HashMap;
 use hashbrown::hash_map::Entry;
-use observability_deps::tracing::*;
 use std::hash::Hash;
+use tracing::*;
 
 /// A wrapper around a TaskRegistry that automatically retains a history
 #[derive(Debug)]

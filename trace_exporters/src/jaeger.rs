@@ -8,8 +8,8 @@ use std::{
 use async_trait::async_trait;
 
 use iox_time::TimeProvider;
-use observability_deps::tracing::*;
 use trace::span::Span;
+use tracing::*;
 
 use crate::thrift::agent::{AgentSyncClient, TAgentSyncClient};
 use crate::thrift::jaeger;

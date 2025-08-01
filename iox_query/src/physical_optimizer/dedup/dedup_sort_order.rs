@@ -162,6 +162,7 @@ impl PhysicalOptimizerRule for DedupSortOrder {
 #[cfg(test)]
 mod tests {
     use schema::{SchemaBuilder, TIME_COLUMN_NAME, sort::SortKey};
+    use test_helpers::maybe_start_logging;
 
     use crate::{
         QueryChunk,
@@ -204,11 +205,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         "#
         );
     }
@@ -230,11 +231,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@2 ASC,tag1@1 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC], file_type=parquet"
         "#
         );
     }
@@ -256,11 +257,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC, __chunk_order@4 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC, __chunk_order@4 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@2 ASC,tag1@1 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC, __chunk_order@4 ASC]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC, __chunk_order@4 ASC], file_type=parquet"
         "#
         );
     }
@@ -282,11 +283,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[time@3 ASC, tag1@1 ASC, tag2@2 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[time@3 ASC, tag1@1 ASC, tag2@2 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [time@3 ASC,tag1@1 ASC,tag2@2 ASC]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[time@3 ASC, tag1@1 ASC, tag2@2 ASC]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[time@3 ASC, tag1@1 ASC, tag2@2 ASC], file_type=parquet"
         "#
         );
     }
@@ -308,11 +309,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,zzz@4 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, zzz], output_ordering=[tag2@2 ASC, tag1@1 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, zzz], output_ordering=[tag2@2 ASC, tag1@1 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@2 ASC,tag1@1 ASC,zzz@4 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, zzz]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, zzz], file_type=parquet"
         "#
         );
     }
@@ -338,11 +339,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,zzz@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time], output_ordering=[tag1@0 ASC]"
+          - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time], output_ordering=[tag1@0 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,zzz@2 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time], output_ordering=[tag1@0 ASC, tag2@1 ASC, zzz@2 ASC, time@3 ASC]"
+            - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time], output_ordering=[tag1@0 ASC, tag2@1 ASC, zzz@2 ASC, time@3 ASC], file_type=parquet"
         "#
         );
     }
@@ -371,11 +372,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         "#
         );
     }
@@ -403,11 +404,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], output_ordering=[tag2@2 ASC, tag1@1 ASC, time@3 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@2 ASC,tag1@1 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         "#
         );
     }
@@ -430,11 +431,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@2 ASC,tag1@1 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
         "#
         );
     }
@@ -484,21 +485,23 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,tag3@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, time]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, time], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@1 ASC,tag3@2 ASC,tag1@0 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, time], output_ordering=[tag2@1 ASC, tag3@2 ASC, tag1@0 ASC, time@3 ASC]"
+            - "   DataSourceExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, time], output_ordering=[tag2@1 ASC, tag3@2 ASC, tag1@0 ASC, time@3 ASC], file_type=parquet"
         "#
         );
     }
 
     #[test]
     fn test_three_chunks_single_chunk_has_extra_col1() {
+        maybe_start_logging();
+
         let chunk1 = TestChunk::new("table")
             .with_id(1)
-            .with_tag_column("tag1")
-            .with_time_column()
+            .with_tag_column_with_stats("tag1", Some("a"), Some("a"))
+            .with_time_column_with_stats(Some(1), Some(1))
             .with_dummy_parquet_file()
             .with_sort_key(SortKey::from_columns([
                 Arc::from("tag1"),
@@ -506,8 +509,8 @@ mod tests {
             ]));
         let chunk2 = TestChunk::new("table")
             .with_id(2)
-            .with_tag_column("tag1")
-            .with_time_column()
+            .with_tag_column_with_stats("tag1", Some("b"), Some("b"))
+            .with_time_column_with_stats(Some(2), Some(2))
             .with_dummy_parquet_file()
             .with_sort_key(SortKey::from_columns([
                 Arc::from("tag1"),
@@ -515,9 +518,9 @@ mod tests {
             ]));
         let chunk3 = TestChunk::new("table")
             .with_id(3)
-            .with_tag_column("tag1")
-            .with_tag_column("tag2")
-            .with_time_column()
+            .with_tag_column_with_stats("tag1", Some("c"), Some("c"))
+            .with_tag_column_with_stats("tag2", Some("c"), Some("c"))
+            .with_time_column_with_stats(Some(3), Some(3))
             .with_dummy_parquet_file()
             .with_sort_key(SortKey::from_columns([
                 Arc::from("tag2"),
@@ -532,11 +535,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,time@2 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], output_ordering=[tag2@1 ASC, tag1@0 ASC, time@2 ASC]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], output_ordering=[tag2@1 ASC, tag1@0 ASC, time@2 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@1 ASC,tag1@0 ASC,time@2 ASC]"
-            - "   ParquetExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], output_ordering=[tag2@1 ASC, tag1@0 ASC, time@2 ASC]"
+            - "   DataSourceExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], output_ordering=[tag2@1 ASC, tag1@0 ASC, time@2 ASC], file_type=parquet"
         "#
         );
     }
@@ -545,9 +548,9 @@ mod tests {
     fn test_three_chunks_single_chunk_has_extra_col2() {
         let chunk1 = TestChunk::new("table")
             .with_id(1)
-            .with_tag_column("tag1")
-            .with_tag_column("tag2")
-            .with_time_column()
+            .with_tag_column_with_stats("tag1", Some("a1"), Some("a1"))
+            .with_tag_column_with_stats("tag2", Some("a2"), Some("a2"))
+            .with_time_column_with_stats(Some(1), Some(1))
             .with_dummy_parquet_file()
             .with_sort_key(SortKey::from_columns([
                 Arc::from("tag1"),
@@ -555,9 +558,9 @@ mod tests {
             ]));
         let chunk2 = TestChunk::new("table")
             .with_id(2)
-            .with_tag_column("tag1")
-            .with_tag_column("tag2")
-            .with_time_column()
+            .with_tag_column_with_stats("tag1", Some("b1"), Some("b1"))
+            .with_tag_column_with_stats("tag2", Some("b2"), Some("b2"))
+            .with_time_column_with_stats(Some(2), Some(2))
             .with_dummy_parquet_file()
             .with_sort_key(SortKey::from_columns([
                 Arc::from("tag1"),
@@ -565,9 +568,9 @@ mod tests {
             ]));
         let chunk3 = TestChunk::new("table")
             .with_id(3)
-            .with_tag_column("tag1")
-            .with_tag_column("tag2")
-            .with_time_column()
+            .with_tag_column_with_stats("tag1", Some("c1"), Some("c1"))
+            .with_tag_column_with_stats("tag2", Some("c2"), Some("c2"))
+            .with_time_column_with_stats(Some(3), Some(3))
             .with_dummy_parquet_file()
             .with_sort_key(SortKey::from_columns([
                 Arc::from("tag2"),
@@ -582,11 +585,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,time@2 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], output_ordering=[tag2@1 ASC, tag1@0 ASC, time@2 ASC]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet, 3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], output_ordering=[tag2@1 ASC, tag1@0 ASC, time@2 ASC], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag2@1 ASC,tag1@0 ASC,time@2 ASC]"
-            - "   ParquetExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, time]"
+            - "   DataSourceExec: file_groups={3 groups: [[1.parquet], [3.parquet], [2.parquet]]}, projection=[tag1, tag2, time], file_type=parquet"
         "#
         );
     }
@@ -638,11 +641,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag3@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag3, tag2, time]"
+          - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag3, tag2, time], file_type=parquet"
         output:
           Ok:
             - " DeduplicateExec: [tag1@0 ASC,tag3@1 ASC,tag2@2 ASC,time@3 ASC]"
-            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag3, tag2, time], output_ordering=[tag1@0 ASC, tag3@1 ASC, tag2@2 ASC, time@3 ASC]"
+            - "   DataSourceExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag3, tag2, time], output_ordering=[tag1@0 ASC, tag3@1 ASC, tag2@2 ASC, time@3 ASC], file_type=parquet"
         "#
         );
     }

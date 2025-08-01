@@ -10,9 +10,9 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use hashbrown::HashMap;
-use observability_deps::tracing::debug;
 use std::{fmt, sync::Arc};
 use trace::span::{Span, SpanRecorder};
+use tracing::debug;
 
 const PER_PARTITION_TRACING_ENABLE_ENV: &str = "INFLUXDB_IOX_PER_PARTITION_TRACING";
 fn per_partition_tracing() -> bool {
@@ -171,18 +171,19 @@ pub fn send_metrics_to_tracing(
                 // - these metrics correspond to a partition
                 // - per partition tracing is enabled
                 // - the partition has at least one timestamp recorded
-                if per_partition_tracing && timestamp_found {
-                    if let Some(partition) = partition {
-                        let mut partition_span =
-                            operator_span.child(format!("{operator_name} ({partition})"));
+                if per_partition_tracing
+                    && timestamp_found
+                    && let Some(partition) = partition
+                {
+                    let mut partition_span =
+                        operator_span.child(format!("{operator_name} ({partition})"));
 
-                        partition_span.start = Some(start_ts.unwrap_or(parent_start_ts));
-                        partition_span.end = Some(end_ts.unwrap_or(parent_end_ts));
+                    partition_span.start = Some(start_ts.unwrap_or(parent_start_ts));
+                    partition_span.end = Some(end_ts.unwrap_or(parent_end_ts));
 
-                        partition_metrics.add_to_span(&mut partition_span);
+                    partition_metrics.add_to_span(&mut partition_span);
 
-                        partition_span.export();
-                    }
+                    partition_span.export();
                 }
             }
         }

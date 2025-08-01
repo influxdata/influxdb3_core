@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use metric::{U64Counter, U64Gauge};
-use observability_deps::tracing::debug;
+use tracing::debug;
 
 use crate::cache_system::{DynError, hook::Hook};
 

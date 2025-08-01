@@ -14,6 +14,7 @@ service CatalogService {
   rpc RootSnapshot(RootSnapshotRequest) returns (RootSnapshotResponse);
 
   rpc NamespaceCreate(NamespaceCreateRequest) returns (NamespaceCreateResponse);
+  rpc NamespaceCreateOrGet(NamespaceCreateOrGetRequest) returns (NamespaceCreateOrGetResponse);
   rpc NamespaceUpdateRetentionPeriod(NamespaceUpdateRetentionPeriodRequest) returns (NamespaceUpdateRetentionPeriodResponse);
   rpc NamespaceList(NamespaceListRequest) returns (stream NamespaceListResponse);
   rpc NamespaceGetById(NamespaceGetByIdRequest) returns (NamespaceGetByIdResponse);
@@ -25,6 +26,7 @@ service CatalogService {
   rpc NamespaceSnapshotByName(NamespaceSnapshotByNameRequest) returns (NamespaceSnapshotByNameResponse);
   rpc NamespaceRename(NamespaceRenameRequest) returns (NamespaceRenameResponse);
   rpc NamespaceUndelete(NamespaceUndeleteRequest) returns (NamespaceUndeleteResponse);
+  rpc NamespaceDeleteOld(NamespaceDeleteOldRequest) returns (NamespaceDeleteOldResponse);
 
   rpc TableCreate(TableCreateRequest) returns (TableCreateResponse);
   rpc TableGetById(TableGetByIdRequest) returns (TableGetByIdResponse);
@@ -61,6 +63,7 @@ service CatalogService {
   rpc PartitionListOldStyle(PartitionListOldStyleRequest) returns (stream PartitionListOldStyleResponse);
   rpc PartitionDeleteByRetention(PartitionDeleteByRetentionRequest) returns (stream PartitionDeleteByRetentionResponse);
   rpc PartitionSnapshot(PartitionSnapshotRequest) returns (PartitionSnapshotResponse);
+  rpc PartitionMigrate(PartitionMigrateRequest) returns (PartitionMigrateResponse);
 
   rpc ParquetFileFlagForDeleteByRetention(ParquetFileFlagForDeleteByRetentionRequest) returns (stream ParquetFileFlagForDeleteByRetentionResponse);
   rpc ParquetFileDeleteOldIdsOnly(ParquetFileDeleteOldIdsOnlyRequest) returns (stream ParquetFileDeleteOldIdsOnlyResponse);
@@ -82,6 +85,8 @@ service CatalogService {
 
   rpc ParquetFileListByTableId(ParquetFileListByTableIdRequest) returns (stream ParquetFileListByTableIdResponse);
   rpc ParquetFileListByNamespaceId(ParquetFileListByNamespaceIdRequest) returns (stream ParquetFileListByNamespaceIdResponse);
+  rpc ParquetFileFindOldestAndCountWithoutPartitionHashId(ParquetFileFindOldestAndCountWithoutPartitionHashIdRequest) returns (ParquetFileFindOldestAndCountWithoutPartitionHashIdResponse);
+  rpc ParquetFileMigrate(ParquetFileMigrateRequest) returns (ParquetFileMigrateResponse);
 
   rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
 }
@@ -101,6 +106,17 @@ message NamespaceCreateRequest {
 }
 
 message NamespaceCreateResponse {
+  Namespace namespace = 1;
+}
+
+message NamespaceCreateOrGetRequest {
+  string name = 1;
+  influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 2;
+  optional int64 retention_period_ns = 3;
+  ServiceProtectionLimits service_protection_limits = 4;
+}
+
+message NamespaceCreateOrGetResponse {
   Namespace namespace = 1;
 }
 
@@ -230,6 +246,15 @@ message NamespaceUndeleteResponse {
   Namespace namespace = 1;
 }
 
+message NamespaceDeleteOldRequest {
+  int64 older_than = 1;
+  uint32 limit = 2;
+}
+
+message NamespaceDeleteOldResponse {
+  repeated int64 deleted_ids = 1;
+}
+
 message TableCreateRequest {
   string name = 1;
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 2;
@@ -259,13 +284,16 @@ message TableGetByNamespaceAndNameResponse {
 
 message TableListByNamespaceIdRequest {
   int64 namespace_id = 1;
+  SoftDeletedRows deleted = 2;
 }
 
 message TableListByNamespaceIdResponse {
   Table table = 1;
 }
 
-message TableListRequest {}
+message TableListRequest {
+  SoftDeletedRows deleted = 1;
+}
 
 message TableListResponse {
   Table table = 1;
@@ -511,6 +539,14 @@ message PartitionSnapshotResponse {
   uint64 generation = 2;
 }
 
+message PartitionMigrateRequest {
+  int64 partition_id = 1;
+}
+
+message PartitionMigrateResponse {
+  bytes partition_hash_id = 1;
+}
+
 message ParquetFileFlagForDeleteByRetentionRequest {}
 
 message ParquetFileFlagForDeleteByRetentionResponse {
@@ -620,6 +656,22 @@ message ParquetFileListByNamespaceIdRequest {
 }
 
 message ParquetFileListByNamespaceIdResponse {
+  ParquetFile file = 1;
+}
+
+message ParquetFileFindOldestAndCountWithoutPartitionHashIdRequest {}
+
+message ParquetFileFindOldestAndCountWithoutPartitionHashIdResponse {
+  optional ParquetFile oldest = 1;
+  int64 count = 2;
+}
+
+message ParquetFileMigrateRequest {
+  ObjectStoreId object_store_id = 1;
+  bytes partition_hash_id = 2;
+}
+
+message ParquetFileMigrateResponse {
   ParquetFile file = 1;
 }
 

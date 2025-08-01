@@ -2,15 +2,18 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
-    datasource::physical_plan::ParquetExec,
+    datasource::{
+        physical_plan::{FileScanConfig, ParquetSource},
+        source::DataSourceExec,
+    },
     error::DataFusionError,
     physical_plan::{
         ExecutionPlan, ExecutionPlanVisitor, empty::EmptyExec, placeholder_row::PlaceholderRowExec,
         union::UnionExec, visit_execution_plan,
     },
 };
-use observability_deps::tracing::debug;
 use schema::sort::SortKey;
+use tracing::debug;
 
 use crate::{
     QueryChunk,
@@ -29,7 +32,7 @@ pub type QueryChunks = Vec<Arc<dyn QueryChunk>>;
 /// sort key can be reconstructed. However this is usually OK because it does not have any effect anyways.
 ///
 /// Note that this only works on the direct output of [`chunks_to_physical_nodes`]. If the plan is wrapped into
-/// additional nodes (like de-duplication, filtering, projection) then NO data will be returned. Also [`ParquetExec`]
+/// additional nodes (like de-duplication, filtering, projection) then NO data will be returned. Also [`DataSourceExec`]
 /// MUST NOT have a predicate attached.
 ///
 ///
@@ -115,19 +118,37 @@ impl ExecutionPlanVisitor for ExtractChunksVisitor {
             for chunk in record_batches_exec.chunks() {
                 self.add_chunk(Arc::clone(chunk));
             }
-        } else if let Some(parquet_exec) = plan_any.downcast_ref::<ParquetExec>() {
-            if parquet_exec.predicate().is_some() {
+        } else if let Some(data_source_exec) = plan_any.downcast_ref::<DataSourceExec>() {
+            let Some(file_scan_config) = data_source_exec
+                .data_source()
+                .as_any()
+                .downcast_ref::<FileScanConfig>()
+            else {
                 return Err(DataFusionError::External(
-                    String::from("ParquetExec has predicate").into(),
+                    String::from("not a file-based data source").into(),
+                ));
+            };
+            let Some(parquet_source) = file_scan_config
+                .file_source()
+                .as_any()
+                .downcast_ref::<ParquetSource>()
+            else {
+                return Err(DataFusionError::External(
+                    String::from("not parquet files").into(),
+                ));
+            };
+            if parquet_source.predicate().is_some() {
+                return Err(DataFusionError::External(
+                    String::from("ParquetSource has predicate").into(),
                 ));
             }
 
-            self.add_schema_from_exec(parquet_exec).map_err(|e| {
-                DataFusionError::Context("add schema from ParquetExec".to_owned(), Box::new(e))
+            self.add_schema_from_exec(data_source_exec).map_err(|e| {
+                DataFusionError::Context("add schema from DataSourceExec".to_owned(), Box::new(e))
             })?;
 
-            for group in &parquet_exec.base_config().file_groups {
-                for file in group {
+            for group in &file_scan_config.file_groups {
+                for file in group.files() {
                     let ext = file
                         .extensions
                         .as_ref()
@@ -169,10 +190,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use data_types::ChunkId;
     use datafusion::common::DFSchema;
+    use datafusion::datasource::physical_plan::FileScanConfigBuilder;
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
-        config::TableParquetOptions,
-        datasource::physical_plan::parquet::ParquetExecBuilder,
         execution::context::SessionContext,
         physical_plan::{expressions::Literal, filter::FilterExec},
         prelude::{col, lit},
@@ -303,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preserve_parquet_exec_schema() {
+    fn test_preserve_data_source_exec_parquet_schema() {
         let chunk = chunk(1).with_dummy_parquet_file();
         let schema_ext = SchemaBuilder::new().tag("zzz").build().unwrap();
         let schema = SchemaMerger::new()
@@ -323,13 +343,26 @@ mod tests {
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         let plan = plan
             .transform_down(|plan| {
-                if let Some(exec) = plan.as_any().downcast_ref::<ParquetExec>() {
-                    let builder = ParquetExecBuilder::new_with_options(
-                        exec.base_config().clone(),
-                        TableParquetOptions::default(),
-                    )
-                    .with_predicate(Arc::new(Literal::new(ScalarValue::from(false))));
-                    return Ok(Transformed::yes(builder.build_arc()));
+                if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+                    let file_scan_config = exec
+                        .data_source()
+                        .as_any()
+                        .downcast_ref::<FileScanConfig>()
+                        .unwrap();
+                    let parquet_source = file_scan_config
+                        .file_source()
+                        .as_any()
+                        .downcast_ref::<ParquetSource>()
+                        .unwrap();
+                    return Ok(Transformed::yes(DataSourceExec::from_data_source(
+                        FileScanConfigBuilder::from(file_scan_config.clone())
+                            .with_source(Arc::new(
+                                parquet_source.clone().with_predicate(Arc::new(Literal::new(
+                                    ScalarValue::from(false),
+                                ))),
+                            ))
+                            .build(),
+                    )));
                 }
                 Ok(Transformed::no(plan))
             })

@@ -5,7 +5,7 @@ use std::{any::Any, collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 
-use observability_deps::tracing::info;
+use tracing::info;
 
 use crate::span::Span;
 

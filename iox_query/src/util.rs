@@ -137,7 +137,7 @@ pub fn calculate_field_intervals(
     session_state: &SessionState,
     schema: ArrowSchemaRef,
     expr: Expr,
-) -> Result<Vec<Interval>, DataFusionError> {
+) -> Result<Vec<Option<Interval>>, DataFusionError> {
     // make unknown boundaries for each column
     // TODO use upstream code when https://github.com/apache/arrow-datafusion/pull/8377 is merged
     let fields = schema.fields();
@@ -149,7 +149,7 @@ pub fn calculate_field_intervals(
             let interval = Interval::make_unbounded(field.data_type())?;
             Ok(ExprBoundaries {
                 column,
-                interval,
+                interval: Some(interval),
                 distinct_count: Precision::Absent,
             })
         })
@@ -179,7 +179,7 @@ pub fn calculate_field_interval(
     schema: ArrowSchemaRef,
     expr: Expr,
     name: &str,
-) -> Result<Interval, DataFusionError> {
+) -> Result<Option<Interval>, DataFusionError> {
     let idx = schema.index_of(name)?;
     let mut intervals = calculate_field_intervals(session_state, Arc::clone(&schema), expr)?;
     Ok(intervals.swap_remove(idx))
@@ -244,8 +244,11 @@ mod tests {
         // 2020-01-02T00:00:00Z == 1577923200000000000
         assert_eq!(
             vec![
-                time_interval(Some(1577836800000000000), Some(1577923200000000000i64 - 1),),
-                f64_interval(Some(1000000.0), Some(next_down(2000000.0)))
+                Some(time_interval(
+                    Some(1577836800000000000),
+                    Some(1577923200000000000i64 - 1),
+                )),
+                Some(f64_interval(Some(1000000.0), Some(next_down(2000000.0))))
             ],
             intervals
         );
@@ -263,10 +266,7 @@ mod tests {
         // must be a predicate (boolean expression)
         let expr = lit("test").eq(lit("foo"));
         let intervals = calculate_field_intervals(&session_state, schema, expr).unwrap();
-        assert_eq!(
-            vec![time_interval(None, None), f64_interval(None, None)],
-            intervals
-        );
+        assert_eq!(vec![None, None], intervals);
     }
 
     #[test]
@@ -291,7 +291,10 @@ mod tests {
             calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "time")
                 .unwrap();
         assert_eq!(
-            time_interval(Some(1577836800000000000), Some(1577923200000000000 - 1),),
+            Some(time_interval(
+                Some(1577836800000000000),
+                Some(1577923200000000000 - 1),
+            )),
             interval
         );
 
@@ -299,7 +302,7 @@ mod tests {
             calculate_field_interval(&session_state, Arc::clone(&schema), expr.clone(), "a")
                 .unwrap();
         assert_eq!(
-            f64_interval(Some(1000000.0), Some(next_down(2000000.0))),
+            Some(f64_interval(Some(1000000.0), Some(next_down(2000000.0)))),
             interval
         );
 

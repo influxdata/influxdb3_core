@@ -6,13 +6,16 @@ use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
 use metric::U64Counter;
 use object_store::{
     AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload,
-    PutResult, Result, path::Path,
+    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, Result, path::Path,
 };
 use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
 use object_store_size_hinting::{extract_size_hint, hint_size};
 
-use crate::cache_system::{Cache, s3_fifo_cache::S3FifoCache};
+use crate::cache_system::{
+    Cache,
+    s3_fifo_cache::{S3Config, S3FifoCache},
+};
 use crate::{
     cache_system::{
         HasSize,
@@ -34,7 +37,7 @@ impl CacheValue {
     async fn fetch(
         store: &DynObjectStore,
         location: &Path,
-        size_hint: Option<usize>,
+        size_hint: Option<u64>,
     ) -> Result<Self> {
         let options = match size_hint {
             Some(size) => hint_size(size),
@@ -43,6 +46,13 @@ impl CacheValue {
         let res = store.get_opts(location, options).await?;
         let meta = res.meta.clone();
         let data = res.bytes().await?;
+
+        // HACK: `Bytes` is a view-based type and may reference and underlying larger buffer. Maybe that causes
+        //        https://github.com/influxdata/influxdb_iox/issues/13765 (there it was a catalog issue, but we
+        //        seem to have a similar issue with the disk cache interaction?) . So we "unshare" the buffer by
+        //        round-tripping it through an owned type.
+        let data = Bytes::from(data.to_vec());
+
         Ok(Self { data, meta })
     }
 }
@@ -117,14 +127,16 @@ impl MemCacheObjectStoreParams<'_> {
         } = self;
 
         let cache = Arc::new(S3FifoCache::new(
-            memory_limit.get(),
-            s3_fifo_ghost_memory_limit.get(),
-            s3fifo_main_threshold as f64 / 100.0,
-            Arc::new(HookChain::new([Arc::new(ObserverHook::new(
-                CACHE_NAME,
-                metrics,
-                Some(memory_limit.get() as u64),
-            )) as _])),
+            S3Config {
+                max_memory_size: memory_limit.get(),
+                max_ghost_memory_size: s3_fifo_ghost_memory_limit.get(),
+                move_to_main_threshold: s3fifo_main_threshold as f64 / 100.0,
+                hook: Arc::new(HookChain::new([Arc::new(ObserverHook::new(
+                    CACHE_NAME,
+                    metrics,
+                    Some(memory_limit.get() as u64),
+                )) as _])),
+            },
             metrics,
         ));
 
@@ -140,27 +152,27 @@ impl MemCacheObjectStoreParams<'_> {
 pub struct MemCacheObjectStore {
     store: Arc<DynObjectStore>,
     hit_metrics: HitMetrics,
-    cache: Arc<dyn Cache<Path, CacheValue>>,
+    cache: Arc<dyn Cache<Path, Arc<CacheValue>>>,
 }
 
 impl MemCacheObjectStore {
     async fn get_or_fetch(
         &self,
         location: &Path,
-        size_hint: Option<usize>,
+        size_hint: Option<u64>,
     ) -> Result<(Arc<CacheValue>, CacheState)> {
         let captured_store = Arc::clone(&self.store);
+        let captured_location = Arc::new(location.clone());
         let (res, state) = self
             .cache
             .get_or_fetch(
-                &Arc::new(location.clone()),
-                Box::new(move |location| {
-                    let location = location.clone();
-
+                &Arc::clone(&captured_location),
+                Box::new(move || {
                     async move {
-                        CacheValue::fetch(&captured_store, &location, size_hint)
+                        CacheValue::fetch(&captured_store, &captured_location, size_hint)
                             .await
                             .map_err(|e| Arc::new(e) as _)
+                            .map(Arc::new)
                     }
                     .boxed()
                 }),
@@ -207,7 +219,7 @@ impl ObjectStore for MemCacheObjectStore {
     async fn put_multipart_opts(
         &self,
         _location: &Path,
-        _opts: PutMultipartOpts,
+        _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         Err(Error::NotImplemented)
     }
@@ -217,7 +229,7 @@ impl ObjectStore for MemCacheObjectStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let (options, size_hint) = extract_size_hint(options)?;
+        let (options, size_hint) = extract_size_hint(options);
 
         // be rather conservative
         if any_options_set(&options) {
@@ -229,12 +241,12 @@ impl ObjectStore for MemCacheObjectStore {
         Ok(GetResult {
             payload: GetResultPayload::Stream(futures::stream::iter([Ok(v.data.clone())]).boxed()),
             meta: v.meta.clone(),
-            range: 0..v.data.len(),
+            range: 0..(v.data.len() as u64),
             attributes: Attributes::from_iter([(ATTR_CACHE_STATE, AttributeValue::from(state))]),
         })
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
         Ok(self
             .get_ranges(location, &[range])
             .await?
@@ -243,13 +255,13 @@ impl ObjectStore for MemCacheObjectStore {
             .expect("requested one range"))
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         let (v, _state) = self.get_or_fetch(location, None).await?;
 
         ranges
             .iter()
             .map(|range| {
-                if range.end > v.data.len() {
+                if range.end > (v.data.len() as u64) {
                     return Err(Error::Generic {
                         store: STORE_NAME,
                         source: format!(
@@ -270,7 +282,7 @@ impl ObjectStore for MemCacheObjectStore {
                         .into(),
                     });
                 }
-                Ok(v.data.slice(range.clone()))
+                Ok(v.data.slice((range.start as usize)..(range.end as usize)))
             })
             .collect()
     }
@@ -294,7 +306,7 @@ impl ObjectStore for MemCacheObjectStore {
             .boxed()
     }
 
-    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         futures::stream::iter([Err(Error::NotImplemented)]).boxed()
     }
 
@@ -302,7 +314,7 @@ impl ObjectStore for MemCacheObjectStore {
         &self,
         _prefix: Option<&Path>,
         _offset: &Path,
-    ) -> BoxStream<'_, Result<ObjectMeta>> {
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         futures::stream::iter([Err(Error::NotImplemented)]).boxed()
     }
 

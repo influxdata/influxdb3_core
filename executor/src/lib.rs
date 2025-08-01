@@ -31,7 +31,7 @@ use futures::{
     future::{BoxFuture, Shared},
 };
 
-use observability_deps::tracing::warn;
+use tracing::warn;
 
 pub use io::{register_current_runtime_for_io, register_io_runtime, spawn_io};
 

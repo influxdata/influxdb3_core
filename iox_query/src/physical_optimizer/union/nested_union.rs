@@ -86,7 +86,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "Cannot calculate EquivalenceProperties for a union with no inputs")]
+    #[should_panic(expected = "index out of bounds: the len is 0 but the index is 0")]
     fn test_union_empty() {
         // empty UnionExecs cannot be created in the first place
         UnionExec::new(vec![]);

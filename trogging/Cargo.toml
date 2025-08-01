@@ -12,10 +12,10 @@ workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive", "env"], optional = true }
 logfmt = { path = "../logfmt" }
-observability_deps = { path = "../observability_deps" }
 thiserror = "2.0.12"
-tracing-log = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 synchronized-writer = "1"

@@ -25,9 +25,9 @@ use http_body::{Frame, SizeHint};
 use pin_project::{pin_project, pinned_drop};
 use tower::{Layer, Service};
 
-use observability_deps::tracing::{debug, error};
 use trace::span::{SpanEvent, SpanStatus};
 use trace::{TraceCollector, span::SpanRecorder};
+use tracing::{debug, error};
 
 use crate::classify::{Classification, classify_headers, classify_response};
 use crate::ctx::{RequestLogContext, RequestLogContextExt, TraceHeaderParser};

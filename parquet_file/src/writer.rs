@@ -6,9 +6,9 @@ use datafusion::{
     error::DataFusionError,
     execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
 };
-use observability_deps::tracing::warn;
 use parquet::{arrow::ArrowWriter, errors::ParquetError, file::properties::WriterProperties};
 use thiserror::Error;
+use tracing::warn;
 
 /// Errors related to [`TrackedMemoryArrowWriter`]
 #[derive(Debug, Error)]
@@ -19,7 +19,14 @@ pub enum Error {
 
     /// Could not allocate sufficient memory
     #[error("failed to allocate buffer while writing parquet: {0}")]
-    OutOfMemory(#[from] DataFusionError),
+    OutOfMemory(Box<DataFusionError>),
+}
+
+// Manual impl, see https://github.com/dtolnay/thiserror/issues/415
+impl From<DataFusionError> for Error {
+    fn from(e: DataFusionError) -> Self {
+        Self::OutOfMemory(Box::new(e))
+    }
 }
 
 /// Results!
@@ -70,7 +77,7 @@ impl<W: Write + Send> TrackedMemoryArrowWriter<W> {
         let reservation_result = self
             .reservation
             .try_resize(in_progress_size)
-            .map_err(Error::OutOfMemory);
+            .map_err(Error::from);
 
         // Log any errors
         if let Err(e) = &reservation_result {

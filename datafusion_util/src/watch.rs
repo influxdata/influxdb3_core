@@ -6,9 +6,9 @@ use std::{
 };
 
 use datafusion::{arrow::record_batch::RecordBatch, common::DataFusionError};
-use observability_deps::tracing::debug;
 use pin_project::{pin_project, pinned_drop};
 use tokio::task::{JoinError, JoinHandle};
+use tracing::debug;
 
 use crate::sender::AbstractSender;
 

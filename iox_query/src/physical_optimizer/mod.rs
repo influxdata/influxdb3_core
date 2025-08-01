@@ -13,11 +13,7 @@ use self::{
     limits::CheckLimits,
     predicate_pushdown::PredicatePushdown,
     projection_pushdown::ProjectionPushdown,
-    sort::{
-        order_union_sorted_inputs::OrderUnionSortedInputs,
-        order_union_sorted_inputs_for_constants::OrderUnionSortedInputsForConstants,
-        parquet_sortness::ParquetSortness,
-    },
+    sort::{order_union_sorted_inputs::OrderUnionSortedInputs, parquet_sortness::ParquetSortness},
     union::nested_union::NestedUnion,
 };
 
@@ -60,12 +56,10 @@ pub fn register_iox_physical_optimizers(mut state: SessionStateBuilder) -> Sessi
     );
 
     // Add a rule to optimize plan that use ProgressiveEval
-    // for limit query
+    // for limit query, and for show tag values query
     optimizers.push(Arc::new(OrderUnionSortedInputs));
-    // for show tag values query
-    optimizers.push(Arc::new(OrderUnionSortedInputsForConstants));
 
-    // install cached parquet readers AFTER DataFusion (re-)creates ParquetExec's
+    // install cached parquet readers AFTER DataFusion (re-)creates DataSourceExec's
     optimizers.push(Arc::new(CachedParquetData));
 
     // Perform the limits check last giving the other rules the best chance

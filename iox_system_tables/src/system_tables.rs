@@ -215,7 +215,9 @@ impl<T: IoxSystemTable + 'static> ExecutionPlan for SystemTableExecutionPlan<T> 
 impl<T> DisplayAs for SystemTableExecutionPlan<T> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => f
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => f
                 .debug_struct("SystemTableExecutionPlan")
                 .field("projection", &self.projection)
                 .field("filters", &self.filters)

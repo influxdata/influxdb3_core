@@ -13,15 +13,16 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::{
     config::{ParquetOptions, TableParquetOptions},
     datasource::{
-        file_format::parquet::ParquetSink, listing::ListingTableUrl, physical_plan::FileSinkConfig,
+        file_format::parquet::ParquetSink,
+        listing::ListingTableUrl,
+        physical_plan::{FileSink, FileSinkConfig},
     },
     error::DataFusionError,
     execution::{TaskContext, memory_pool::MemoryPool, runtime_env::RuntimeEnv},
-    physical_plan::{SendableRecordBatchStream, insert::DataSink},
+    physical_plan::SendableRecordBatchStream,
 };
 use datafusion_util::config::{BATCH_SIZE, table_parquet_options};
 use futures::{TryStreamExt, pin_mut};
-use observability_deps::tracing::{debug, trace, warn};
 use parquet::{
     arrow::ARROW_SCHEMA_META_KEY,
     basic::Compression,
@@ -29,6 +30,7 @@ use parquet::{
     file::{metadata::KeyValue, properties::WriterProperties},
 };
 use thiserror::Error;
+use tracing::{debug, trace, warn};
 
 use crate::{
     metadata::{IoxMetadata, METADATA_KEY},
@@ -65,7 +67,7 @@ pub enum CodecError {
     /// Of note: a ResourcesExhaused error likely means the buffer
     /// used for parquet data became too large.
     #[error(transparent)]
-    DataFusion(#[from] DataFusionError),
+    DataFusion(Box<DataFusionError>),
 
     /// Serialising the [`IoxMetadata`] to protobuf-encoded bytes failed.
     #[error("failed to serialize iox metadata: {0}")]
@@ -88,7 +90,7 @@ impl From<CodecError> for DataFusionError {
             | CodecError::MetadataSerialisation(_)
             | CodecError::CloneSink(_)) => Self::External(Box::new(e)),
             CodecError::Writer(e) => Self::ParquetError(e),
-            CodecError::DataFusion(e) => e,
+            CodecError::DataFusion(e) => *e,
         }
     }
 }
@@ -99,6 +101,13 @@ impl From<crate::writer::Error> for CodecError {
             crate::writer::Error::Writer(e) => Self::Writer(e),
             crate::writer::Error::OutOfMemory(e) => Self::DataFusion(e),
         }
+    }
+}
+
+// Manual impl, see https://github.com/dtolnay/thiserror/issues/415
+impl From<DataFusionError> for CodecError {
+    fn from(e: DataFusionError) -> Self {
+        Self::DataFusion(Box::new(e))
     }
 }
 
@@ -249,8 +258,7 @@ pub async fn to_parquet_upload(
     runtime: Arc<RuntimeEnv>,
     parallel_writer_options: ParallelParquetWriterOptions,
 ) -> Result<parquet::format::FileMetaData, CodecError> {
-    let table_path = ListingTableUrl::parse(format!("file:///{}", upload_input.path()))
-        .map_err(CodecError::DataFusion)?;
+    let table_path = ListingTableUrl::parse(format!("file:///{}", upload_input.path()))?;
     let object_store_url = upload_input.object_store_url();
 
     // TODO: add fix upstream in the ParquetSink code.
@@ -278,22 +286,21 @@ pub async fn to_parquet_upload(
 
     // make sink
     let sink_config = FileSinkConfig {
+        original_url: object_store_url.to_string(),
         object_store_url: object_store_url.clone(),
-        file_groups: vec![], // I believe this is unused in the ParquetSink path (is used for other DataSink impls).
+        file_group: Default::default(), // I believe this is unused in the ParquetSink path (is used for other DataSink impls).
         table_paths: vec![table_path], // Sink location used by the demuxer. Single location means no splitting; not a collection of outputs.
         output_schema: batches.schema(),
         table_partition_cols: vec![], // should be empty, since we want sink to be a single parquet
         insert_op: InsertOp::Overwrite, // always overwrite (we always write to a new file anyways)
         keep_partition_by_columns: false,
+        file_extension: "parquet".into(),
     };
     let sink = ParquetSink::new(sink_config, parquet_options);
 
     // run sink write_all task
     let task_context = Arc::new(TaskContext::default().with_runtime(runtime));
-    let num_rows = sink
-        .write_all(batches, &task_context)
-        .await
-        .map_err(CodecError::DataFusion)?;
+    let num_rows = sink.write_all(batches, &task_context).await?;
 
     if num_rows == 0 {
         // throw warning if all input batches are empty
@@ -385,7 +392,7 @@ mod tests {
         CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, TableId, Timestamp,
     };
     use datafusion::{
-        common::file_options::parquet_writer::ParquetWriterOptions,
+        DATAFUSION_VERSION, common::file_options::parquet_writer::ParquetWriterOptions,
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
     };
     use datafusion_util::{MemoryStream, unbounded_memory_pool};
@@ -483,8 +490,12 @@ mod tests {
             "should have same writer_version"
         );
         assert_eq!(
-            a.key_value_metadata(),
-            b.key_value_metadata(),
+            a.key_value_metadata()
+                .cloned()
+                .map(|mut kv_vec| kv_vec.sort()),
+            b.key_value_metadata()
+                .cloned()
+                .map(|mut kv_vec| kv_vec.sort()),
             "should have same key_value_metadata"
         );
         assert_eq!(
@@ -528,11 +539,6 @@ mod tests {
             "should have same statistics_enabled"
         );
         assert_eq!(
-            a.max_statistics_size(&column_path),
-            b.max_statistics_size(&column_path),
-            "should have same max_statistics_size"
-        );
-        assert_eq!(
             a.bloom_filter_properties(&column_path),
             b.bloom_filter_properties(&column_path),
             "should have same bloom_filter_properties"
@@ -541,10 +547,17 @@ mod tests {
 
     #[test]
     fn test_writer_properties_are_identical() {
-        let kv_meta = vec![KeyValue {
-            key: "iox-metadata-key".into(),
-            value: None,
-        }];
+        let kv_meta = vec![
+            // the default behavior for WriterPropertiesBuilder requires ARROW_SCHEMA_META_KEY
+            KeyValue {
+                key: ARROW_SCHEMA_META_KEY.into(),
+                value: None,
+            },
+            KeyValue {
+                key: "iox-metadata-key".into(),
+                value: None,
+            },
+        ];
 
         // use writer_props() for writer props
         let single_threaded_props = writer_props(kv_meta.clone()).unwrap();
@@ -563,9 +576,12 @@ mod tests {
         // will have different created_by (parquet-rs vs datafusion)
         assert_eq!(
             single_threaded_props.created_by(),
-            "parquet-rs version 53.3.0"
+            parquet::file::properties::DEFAULT_CREATED_BY,
         );
-        assert_eq!(parallel_props.created_by(), "datafusion version 44.0.0");
+        assert_eq!(
+            parallel_props.created_by(),
+            format!("datafusion version {DATAFUSION_VERSION}")
+        );
 
         // assert they are the same
         assert_writer_properties_are_eq(single_threaded_props, parallel_props);

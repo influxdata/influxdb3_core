@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use object_store::{GetRange, path::Path};
-use observability_deps::tracing::debug;
+use tracing::debug;
 
 use crate::{OpResult, StoreType};
 
@@ -90,9 +90,7 @@ impl LogRecord {
             offset = offset.as_ref().map(|p| p.as_ref()),
             from = from.as_ref().map(|p| p.as_ref()),
             to = to.as_ref().map(|p| p.as_ref()),
-            get_range = get_range
-                .as_ref()
-                .map(observability_deps::tracing::field::display),
+            get_range = get_range.as_ref().map(tracing::field::display),
             duration_secs = duration.map(|d| d.as_secs_f64()),
             bytes,
             headers_secs = d_headers.map(|d| d.as_secs_f64()),

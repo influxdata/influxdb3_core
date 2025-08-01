@@ -6,9 +6,9 @@
 use crate::QueryChunk;
 use data_types::TimestampMinMax;
 use datafusion::scalar::ScalarValue;
-use observability_deps::tracing::debug;
 use schema::TIME_COLUMN_NAME;
 use std::sync::Arc;
+use tracing::debug;
 
 /// Groups query chunks into disjoint sets of overlapped time range.
 /// Does not preserve or guarantee any ordering.

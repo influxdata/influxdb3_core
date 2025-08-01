@@ -3,7 +3,10 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
+    datasource::{
+        physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource},
+        source::DataSourceExec,
+    },
     error::Result,
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
@@ -13,7 +16,6 @@ use datafusion::{
         union::UnionExec,
     },
 };
-use datafusion_util::config::table_parquet_options;
 
 use crate::provider::DeduplicateExec;
 
@@ -52,12 +54,23 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                         .collect::<Result<Vec<_>>>()?;
                     let new_union = UnionExec::new(new_inputs);
                     return Ok(Transformed::yes(Arc::new(new_union)));
-                } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
-                    let mut builder = ParquetExecBuilder::new_with_options(
-                        child_parquet.base_config().clone(),
-                        table_parquet_options(),
-                    );
-                    let existing = child_parquet
+                } else if let Some(child_parquet) = child_any.downcast_ref::<DataSourceExec>() {
+                    let Some(file_scan_config) = child_parquet
+                        .data_source()
+                        .as_any()
+                        .downcast_ref::<FileScanConfig>()
+                    else {
+                        return Ok(Transformed::no(plan));
+                    };
+                    let Some(parquet_source) = file_scan_config
+                        .file_source()
+                        .as_any()
+                        .downcast_ref::<ParquetSource>()
+                    else {
+                        return Ok(Transformed::no(plan));
+                    };
+                    let mut builder = parquet_source.clone();
+                    let existing = parquet_source
                         .predicate()
                         .map(split_conjunction)
                         .unwrap_or_default();
@@ -71,8 +84,12 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                         builder = builder.with_predicate(predicate);
                     }
 
-                    let mut new_node: Arc<dyn ExecutionPlan> = builder.build_arc();
-                    if !child_parquet
+                    let mut new_node: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+                        FileScanConfigBuilder::from(file_scan_config.clone())
+                            .with_source(Arc::new(builder))
+                            .build(),
+                    );
+                    if !parquet_source
                         .table_parquet_options()
                         .global
                         .pushdown_filters
@@ -154,6 +171,7 @@ mod tests {
         },
         scalar::ScalarValue,
     };
+    use datafusion_util::config::table_parquet_options;
     use schema::sort::SortKeyBuilder;
 
     use crate::{physical_optimizer::test_util::OptimizationTest, util::arrow_sort_key_exprs};
@@ -165,27 +183,31 @@ mod tests {
         // basically just the same as the test_parquet but with pushdown disabled to ensure the
         // FilterExec is still preserved if so
         let schema = schema();
-        let base_config = FileScanConfig::new(
-            ObjectStoreUrl::parse("test://").unwrap(),
-            Arc::clone(&schema),
-        );
         let mut table_opts = table_parquet_options();
         table_opts.global.pushdown_filters = false;
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_opts)
-            .with_predicate(predicate_tag(&schema));
-        let plan =
-            Arc::new(FilterExec::try_new(predicate_mixed(&schema), builder.build_arc()).unwrap());
+        let file_scan_config = FileScanConfig::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_opts).with_predicate(predicate_tag(&schema))),
+        );
+        let plan = Arc::new(
+            FilterExec::try_new(
+                predicate_mixed(&schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .unwrap(),
+        );
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r#"
         input:
           - " FilterExec: tag1@0 = field@2"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+          - "   DataSourceExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], file_type=parquet, predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
             - " FilterExec: tag1@0 = field@2"
-            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+            - "   DataSourceExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], file_type=parquet, predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_null_count@2 != row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         "#
         );
     }
@@ -314,24 +336,30 @@ mod tests {
     #[test]
     fn test_parquet() {
         let schema = schema();
-        let base_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfig::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
+            Arc::new(
+                ParquetSource::new(table_parquet_options()).with_predicate(predicate_tag(&schema)),
+            ),
         );
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
-            .with_predicate(predicate_tag(&schema));
-        let plan =
-            Arc::new(FilterExec::try_new(predicate_mixed(&schema), builder.build_arc()).unwrap());
+        let plan = Arc::new(
+            FilterExec::try_new(
+                predicate_mixed(&schema),
+                DataSourceExec::from_data_source(file_scan_config),
+            )
+            .unwrap(),
+        );
         let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r#"
         input:
           - " FilterExec: tag1@0 = field@2"
-          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+          - "   DataSourceExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], file_type=parquet, predicate=tag1@0 = foo, pruning_predicate=tag1_null_count@2 != row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         output:
           Ok:
-            - " ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_null_count@2 != tag1_row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
+            - " DataSourceExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], file_type=parquet, predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_null_count@2 != row_count@3 AND tag1_min@0 <= foo AND foo <= tag1_max@1, required_guarantees=[tag1 in (foo)]"
         "#
         );
     }

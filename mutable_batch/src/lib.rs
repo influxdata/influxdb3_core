@@ -245,7 +245,7 @@ impl MutableBatch {
     /// Returns a reference to the column at the specified index
     pub fn column_by_index(&self, idx: usize) -> Result<&Column> {
         self.columns.get(idx).with_context(|| ColumnNotFoundSnafu {
-            column: format!("index {}", idx),
+            column: format!("index {idx}"),
         })
     }
 
