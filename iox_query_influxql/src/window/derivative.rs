@@ -1,14 +1,11 @@
-use crate::{error, NUMERICS};
+use crate::{NUMERICS, error};
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, IntervalUnit::MonthDayNano, TimeUnit};
 use datafusion::common::{Result, ScalarValue};
-use datafusion::logical_expr::function::{
-    ExpressionArgs, PartitionEvaluatorArgs, WindowUDFFieldArgs,
-};
+use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::{
-    PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl, TIMEZONE_WILDCARD,
+    PartitionEvaluator, Signature, TIMEZONE_WILDCARD, TypeSignature, Volatility, WindowUDFImpl,
 };
-use datafusion::physical_expr::PhysicalExpr;
 use observability_deps::tracing::warn;
 use std::sync::Arc;
 
@@ -62,11 +59,6 @@ impl WindowUDFImpl for DerivativeUDWF {
 
     fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
         Ok(Field::new(field_args.name(), DataType::Float64, true))
-    }
-
-    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
-    fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
-        expr_args.input_exprs().into()
     }
 
     fn partition_evaluator(

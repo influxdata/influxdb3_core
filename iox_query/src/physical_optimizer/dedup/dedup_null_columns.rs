@@ -11,7 +11,7 @@ use schema::sort::SortKeyBuilder;
 
 use crate::{
     physical_optimizer::chunk_extraction::extract_chunks,
-    provider::{chunks_to_physical_nodes, DeduplicateExec},
+    provider::{DeduplicateExec, chunks_to_physical_nodes},
     util::arrow_sort_key_exprs,
 };
 
@@ -101,12 +101,12 @@ mod tests {
     use schema::SchemaBuilder;
 
     use crate::{
+        QueryChunk,
         physical_optimizer::{
             dedup::test_util::{chunk, dedup_plan, dedup_plan_with_chunk_order_col},
             test_util::OptimizationTest,
         },
         test::TestChunk,
-        QueryChunk,
     };
 
     use super::*;
@@ -141,13 +141,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   UnionExec"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
+          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-            - "   UnionExec"
-            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
+            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time]"
         "#
         );
     }
@@ -163,13 +161,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-          - "   UnionExec"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-            - "   UnionExec"
-            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -194,13 +190,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,zzz@2 ASC,time@3 ASC]"
-          - "   UnionExec"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
+          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@0 ASC]"
-            - "   UnionExec"
-            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
+            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag1, tag2, zzz, time]"
         "#
         );
     }
@@ -234,13 +228,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,tag3@2 ASC,tag4@3 ASC,time@4 ASC]"
-          - "   UnionExec"
-          - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
+          - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag1@0 ASC,tag2@1 ASC,tag3@2 ASC,time@4 ASC]"
-            - "   UnionExec"
-            - "     ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
+            - "   ParquetExec: file_groups={2 groups: [[1.parquet], [2.parquet]]}, projection=[tag1, tag2, tag3, tag4, time]"
         "#
         );
     }
@@ -267,13 +259,11 @@ mod tests {
             @r#"
         input:
           - " DeduplicateExec: [tag2@0 ASC,tag1@1 ASC,tag3@2 ASC,time@3 ASC]"
-          - "   UnionExec"
-          - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag2, tag1, tag3, time]"
+          - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag2, tag1, tag3, time]"
         output:
           Ok:
             - " DeduplicateExec: [tag2@0 ASC,tag1@1 ASC,time@3 ASC]"
-            - "   UnionExec"
-            - "     ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag2, tag1, tag3, time]"
+            - "   ParquetExec: file_groups={1 group: [[1.parquet]]}, projection=[tag2, tag1, tag3, time]"
         "#
         );
     }

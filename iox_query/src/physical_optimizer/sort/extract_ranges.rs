@@ -3,12 +3,12 @@
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
 use datafusion::common::{
-    internal_datafusion_err, ColumnStatistics, Result, ScalarValue, Statistics,
+    ColumnStatistics, Result, ScalarValue, Statistics, internal_datafusion_err,
 };
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::LexOrdering;
-use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use itertools::FoldWhile;
 use itertools::Itertools;
 use observability_deps::tracing::trace;
@@ -25,7 +25,15 @@ use crate::statistics::{column_statistics_min_max, statistics_by_partition};
 /// Output will have N ranges where N is the number of output partitions
 ///
 /// Returns None if not possible to determine ranges.
-#[cfg_attr(not(test), expect(unused))]
+///
+/// Note that this method confirms that between each partition it is properly ordered, and has non-overlapping ranges.
+/// It does not ensure that within each partition the data is properly sorted.
+/// This nuance is important to support plans where the within parition data get immediately sorted:
+/// ```text
+/// ProgressiveEvalExec
+///   SortExec: expr=[time@1 DESC], preserve_partitioning=[true]
+///      ParquetExec: file_groups={2 groups: [[newer_data.parquet], [old_data.parquet]]}, output_ordering=[time@1 ASC]
+/// ```
 pub(crate) fn extract_disjoint_ranges_from_plan(
     exprs: &LexOrdering,
     input_plan: &Arc<dyn ExecutionPlan>,
@@ -35,7 +43,6 @@ pub(crate) fn extract_disjoint_ranges_from_plan(
         displayable(input_plan.as_ref()).indent(true)
     );
 
-    // if the ordering does not match, then we cannot confirm proper ranges
     if !input_plan
         .properties()
         .equivalence_properties()
@@ -72,6 +79,9 @@ pub(crate) fn extract_disjoint_ranges_from_plan(
             else {
                 return Ok(None);
             };
+            if min.is_null() && max.is_null() {
+                return Ok(None);
+            }
             builder.push(min, max);
         }
     }
@@ -226,8 +236,8 @@ pub(crate) fn min_max_for_partitioned_filegroup(
 mod tests {
     use super::*;
     use crate::test::test_utils::{
-        parquet_exec_with_sort_with_statistics, parquet_exec_with_sort_with_statistics_and_schema,
-        sort_exec, union_exec, SortKeyRange,
+        SortKeyRange, parquet_exec_with_sort_with_statistics,
+        parquet_exec_with_sort_with_statistics_and_schema, sort_exec, union_exec,
     };
     use std::fmt::{Debug, Display, Formatter};
 

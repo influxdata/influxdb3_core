@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, marker::PhantomData};
 
-use generated_types::influxdata::iox::querier::v1::{read_info::QueryType, QueryParam, ReadInfo};
+use generated_types::influxdata::iox::querier::v1::{QueryParam, ReadInfo, read_info::QueryType};
 use iox_query_params::StatementParam;
 
 use super::{Client, IOxRecordBatchStream};

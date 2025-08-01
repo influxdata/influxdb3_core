@@ -1,6 +1,6 @@
 //! Data point building and writing
 
-use snafu::{ensure, Snafu};
+use snafu::{Snafu, ensure};
 use std::{collections::BTreeMap, io};
 
 /// Errors that occur while building `DataPoint`s

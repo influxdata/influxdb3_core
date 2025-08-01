@@ -262,7 +262,7 @@ mod test {
     use arrow::record_batch::RecordBatch;
     use datafusion::common::assert_contains;
     use datafusion::error::Result;
-    use datafusion::prelude::{col, Expr, SessionContext};
+    use datafusion::prelude::{Expr, SessionContext, col};
     use datafusion::scalar::ScalarValue;
     use datafusion_util::lit_timestamptz_nano;
     use schema::TIME_DATA_TIMEZONE;
@@ -345,9 +345,10 @@ mod test {
             .unwrap();
         let res = df.collect().await;
         let expected = "interpolate is not yet implemented";
-        assert!(res
-            .expect_err("should be an error")
-            .to_string()
-            .contains(expected));
+        assert!(
+            res.expect_err("should be an error")
+                .to_string()
+                .contains(expected)
+        );
     }
 }

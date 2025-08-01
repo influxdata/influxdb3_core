@@ -1,5 +1,5 @@
 //! Tools to make working with [`object_store`] a bit easier.
-use object_store::{path::Error as PathError, Error, GetOptions};
+use object_store::{Error, GetOptions, path::Error as PathError};
 
 use crate::cache_system::DynError;
 

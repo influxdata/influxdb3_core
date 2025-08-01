@@ -857,7 +857,7 @@ mod tests {
     use assert_matches::assert_matches;
     use data_types::IsNan;
     use proptest::prelude::*;
-    use tests::arbitrary::{arbitrary_column, densify, MAX_ROWS};
+    use tests::arbitrary::{MAX_ROWS, arbitrary_column, densify};
 
     use super::*;
 
@@ -935,10 +935,11 @@ mod tests {
         // Before the split
         let batch = RecordBatch::try_new(
             schema.clone().into(),
-            vec![col
-                .clone()
-                .try_into_arrow()
-                .expect("failed to covert column to arrow")],
+            vec![
+                col.clone()
+                    .try_into_arrow()
+                    .expect("failed to covert column to arrow"),
+            ],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -960,10 +961,11 @@ mod tests {
         // After the split, the input column
         let batch = RecordBatch::try_new(
             schema.clone().into(),
-            vec![col
-                .clone()
-                .try_into_arrow()
-                .expect("failed to covert column to arrow")],
+            vec![
+                col.clone()
+                    .try_into_arrow()
+                    .expect("failed to covert column to arrow"),
+            ],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(
@@ -981,10 +983,11 @@ mod tests {
         // After the split, the split off column
         let batch = RecordBatch::try_new(
             schema.into(),
-            vec![col2
-                .clone()
-                .try_into_arrow()
-                .expect("failed to covert column to arrow")],
+            vec![
+                col2.clone()
+                    .try_into_arrow()
+                    .expect("failed to covert column to arrow"),
+            ],
         )
         .expect("failed to build record batch");
         assert_batches_eq!(

@@ -6,11 +6,12 @@ use std::{
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
-    datasource::physical_plan::{parquet::ParquetExecBuilder, ParquetExec},
+    datasource::physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
     error::{DataFusionError, Result},
-    physical_expr::{utils::collect_columns, LexOrdering, PhysicalSortExpr},
+    physical_expr::{LexOrdering, PhysicalSortExpr, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
+        ExecutionPlan, PhysicalExpr,
         empty::EmptyExec,
         expressions::Column,
         filter::FilterExec,
@@ -18,7 +19,6 @@ use datafusion::{
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
         union::UnionExec,
-        ExecutionPlan, PhysicalExpr,
     },
 };
 use datafusion_util::config::table_parquet_options;
@@ -415,17 +415,17 @@ mod tests {
         logical_expr::Operator,
         physical_expr::{EquivalenceProperties, ScalarFunctionExpr},
         physical_plan::{
+            DisplayAs, PhysicalExpr, PlanProperties,
             execution_plan::{Boundedness, EmissionType},
             expressions::{BinaryExpr, IsNullExpr, Literal},
-            joins::{utils::JoinFilter, HashJoinExec, NestedLoopJoinExec, PartitionMode},
-            DisplayAs, PhysicalExpr, PlanProperties,
+            joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode, utils::JoinFilter},
         },
         scalar::ScalarValue,
     };
     use serde::Serialize;
 
     use crate::{
-        physical_optimizer::test_util::{assert_unknown_partitioning, OptimizationTest},
+        physical_optimizer::test_util::{OptimizationTest, assert_unknown_partitioning},
         test::TestChunk,
     };
 
@@ -702,21 +702,23 @@ mod tests {
             Arc::clone(&schema),
         )
         .with_projection(Some(projection))
-        .with_output_ordering(vec![vec![
-            PhysicalSortExpr {
-                expr: expr_col("tag3", &schema_projected),
-                options: Default::default(),
-            },
-            PhysicalSortExpr {
-                expr: expr_col("field", &schema_projected),
-                options: Default::default(),
-            },
-            PhysicalSortExpr {
-                expr: expr_col("tag2", &schema_projected),
-                options: Default::default(),
-            },
-        ]
-        .into()]);
+        .with_output_ordering(vec![
+            vec![
+                PhysicalSortExpr {
+                    expr: expr_col("tag3", &schema_projected),
+                    options: Default::default(),
+                },
+                PhysicalSortExpr {
+                    expr: expr_col("field", &schema_projected),
+                    options: Default::default(),
+                },
+                PhysicalSortExpr {
+                    expr: expr_col("tag2", &schema_projected),
+                    options: Default::default(),
+                },
+            ]
+            .into(),
+        ]);
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options())
             .with_predicate(expr_string_cmp("tag1", &schema));
         let inner = builder.build();
@@ -1518,7 +1520,6 @@ mod tests {
         );
         let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
         let plan = builder.build_arc();
-        let plan = Arc::new(UnionExec::new(vec![plan]));
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(
             plan,
@@ -1552,16 +1553,14 @@ mod tests {
           - " ProjectionExec: expr=[field1@2 as field1]"
           - "   FilterExec: tag2@1 = foo"
           - "     DeduplicateExec: [tag1@0 ASC,tag2@1 ASC]"
-          - "       UnionExec"
-          - "         ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field1, field2]"
+          - "       ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field1, field2]"
         output:
           Ok:
             - " ProjectionExec: expr=[field1@0 as field1]"
             - "   FilterExec: tag2@1 = foo"
             - "     ProjectionExec: expr=[field1@0 as field1, tag2@1 as tag2]"
             - "       DeduplicateExec: [tag1@2 ASC,tag2@1 ASC]"
-            - "         UnionExec"
-            - "           ParquetExec: file_groups={0 groups: []}, projection=[field1, tag2, tag1]"
+            - "         ParquetExec: file_groups={0 groups: []}, projection=[field1, tag2, tag1]"
         "#
         );
     }

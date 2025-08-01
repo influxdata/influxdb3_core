@@ -62,38 +62,39 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 authors = ["IOx Project Developers"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # If you want to use a local checkout of arrow, see the commented-out "Patching Arrow" section below
-arrow = { version = "53.0.0", features = ["prettyprint", "chrono-tz"] }
-arrow-buffer = { version = "53.0.0" }
-arrow-flight = { version = "53.0.0", features = ["flight-sql-experimental"] }
-arrow-ipc = { version = "53.0.0" }
+arrow = {version = "=53.3.0", features = ["prettyprint", "chrono-tz"]}
+arrow-buffer = {version = "=53.3.0"}
+arrow-flight = {version = "=53.3.0", features = ["flight-sql-experimental"]}
+arrow-ipc = {version = "=53.3.0"}
 # Use DataFusion fork
 # See https://github.com/influxdata/arrow-datafusion/pull/53 for contents
 # plus additional patches from https://github.com/influxdata/arrow-datafusion/pull/58
 datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
 datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "1c10b8b635831e87cb043a1e3fa8eb89be430d54" }
 hashbrown = {version = "0.14.5"}
-http = {version = "0.2.12"}
-http-body = { version = "0.4.6" }
-hyper = { version = "0.14.31" }
-object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
-parquet = {version = "53.0.0", features = ["object_store"] }
-pbjson = {version = "0.6.0"}
-pbjson-build = {version = "0.6.2"}
-pbjson-types = {version = "0.6.0"}
+http = {version = "1"}
+http-body = {version = "1"}
+http-body-util = {version = "0.1"}
+hyper = {version = "1"}
+hyper-util = {version = "0.1"}
+object_store = {version = "0.11.2", features = ["aws", "azure", "gcp"]}
+parquet = {version = "=53.3.0", features = ["object_store"]}
+pbjson = {version = "0.7"}
+pbjson-build = {version = "0.7"}
+pbjson-types = {version = "0.7"}
 proptest = {version = "1", default-features = false, features = ["std"] }
-prost = {version = "0.12.6"}
-prost-build = {version = "0.12.6"}
-prost-types = {version = "0.12.6"}
-reqwest = { version = "0.11", default-features = false }
-smallvec = {version = "1.13.2", features = ["union"] }
+prost = {version = "0.13"}
+prost-build = {version = "0.13"}
+prost-types = {version = "0.13"}
+reqwest = {version = "0.12", default-features = false }
+smallvec = {version = "1.15.1", features = ["union"] }
 sqlx = { version = "0.8.2", features = ["sqlite"]}
 tower = { version = "0.5" }
-tower-http = {version = "0.4", features = ["catch-panic"] }
 
 [workspace.lints.rust]
 missing_copy_implementations = "deny"
@@ -165,21 +166,3 @@ opt-level = 3
 # arrow-data = { path = "../arrow-rs/arrow-data" }
 # arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
 # arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
-
-## Use patch of  arrow-rs with an older version of tonic
-## until we have upgraded hyper: https://github.com/influxdata/influxdb_iox/issues/9340
-## see https://github.com/influxdata/arrow-rs/pull/5
-[patch.crates-io]
-arrow = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-array = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-buffer = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-cast = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-data = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-ipc = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-schema = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-select = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-string = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-ord = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-arrow-flight = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-parquet = { git = "https://github.com/influxdata/arrow-rs.git", rev = "eae176c21b1ef915227294e8a8a201b6f266031a" }
-object_store = { git = "https://github.com/influxdata/arrow-rs.git", rev = "c946cd81fa12e6588a3be33be08e3d8e9a2770e7" }

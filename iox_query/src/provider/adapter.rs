@@ -10,7 +10,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::physical_plan::{
-    metrics::BaselineMetrics, RecordBatchStream, SendableRecordBatchStream,
+    RecordBatchStream, SendableRecordBatchStream, metrics::BaselineMetrics,
 };
 use datafusion::{error::DataFusionError, scalar::ScalarValue};
 use futures::Stream;

@@ -1,10 +1,10 @@
 use std::borrow::Cow;
-use std::num::{NonZeroU128, NonZeroU64};
+use std::num::{NonZeroU64, NonZeroU128};
 use std::sync::Arc;
 
 use rand::Rng;
 
-use crate::{span::Span, TraceCollector};
+use crate::{TraceCollector, span::Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceId(pub NonZeroU128);

@@ -16,10 +16,10 @@ use std::{
 };
 use thiserror::Error;
 use tracing_subscriber::{
-    fmt::{self, writer::BoxMakeWriter, MakeWriter},
+    EnvFilter, Layer,
+    fmt::{self, MakeWriter, writer::BoxMakeWriter},
     layer::SubscriberExt,
     registry::LookupSpan,
-    EnvFilter, Layer,
 };
 
 /// Maximum length of a log line.
@@ -429,8 +429,8 @@ mod tests {
 
     use crate::test_util::*;
     use observability_deps::tracing::{debug, error};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn simple_logging() {

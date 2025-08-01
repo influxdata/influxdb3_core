@@ -50,7 +50,7 @@ tokio = { version = "1.45", features = [
 ] }
 tokio-stream = "0.1.17"
 thiserror = "2.0.12"
-tonic-reflection = { version = "0.11.0" }
+tonic-reflection = { version = "0.12" }
 
 [dev-dependencies]
 insta = { version = "1" }

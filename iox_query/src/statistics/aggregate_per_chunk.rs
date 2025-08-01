@@ -11,7 +11,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-use crate::{QueryChunk, CHUNK_ORDER_COLUMN_NAME};
+use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
 
 /// During the initial partition pruning pass (driving statistics from partition
 /// keys), the row count and null count statistics for each partition
@@ -194,7 +194,7 @@ pub fn build_statistics_for_chunks(
 
     let chunks: Vec<_> = chunks.iter().collect();
 
-    let statistics = chunks
+    chunks
         .iter()
         .fold(DFStatsAggregator::new(&schema), |mut agg, chunk| {
             agg.update(&chunk.stats(), chunk.schema().as_arrow().as_ref());
@@ -220,9 +220,7 @@ pub fn build_statistics_for_chunks(
 
             agg
         })
-        .build();
-
-    statistics
+        .build()
 }
 
 #[cfg(test)]

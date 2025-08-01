@@ -1,6 +1,6 @@
 use arrow::{datatypes::Field, record_batch::RecordBatch};
-use hashbrown::hash_map::RawEntryMut;
 use hashbrown::HashMap;
+use hashbrown::hash_map::RawEntryMut;
 use snafu::Snafu;
 
 use crate::interner::SchemaInterner;
@@ -236,8 +236,8 @@ impl SchemaMerger<'_> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::builder::SchemaBuilder;
     use crate::InfluxFieldType::Integer;
+    use crate::builder::SchemaBuilder;
 
     use super::*;
 
@@ -521,21 +521,31 @@ mod tests {
             .unwrap()
             .build();
         assert_eq!(vec!["a", "b", "time"], s_merged.primary_key());
-        assert!(s_merged
-            .iter()
-            .any(|(t, f)| f.name() == "a" && matches!(t, Tag)));
-        assert!(s_merged
-            .iter()
-            .any(|(t, f)| f.name() == "b" && matches!(t, Tag)));
-        assert!(s_merged
-            .iter()
-            .any(|(t, f)| f.name() == "time" && matches!(t, Timestamp)));
-        assert!(s_merged
-            .iter()
-            .any(|(t, f)| f.name() == "f1" && matches!(t, Field(Float))));
-        assert!(s_merged
-            .iter()
-            .any(|(t, f)| f.name() == "f2" && matches!(t, Field(String))));
+        assert!(
+            s_merged
+                .iter()
+                .any(|(t, f)| f.name() == "a" && matches!(t, Tag))
+        );
+        assert!(
+            s_merged
+                .iter()
+                .any(|(t, f)| f.name() == "b" && matches!(t, Tag))
+        );
+        assert!(
+            s_merged
+                .iter()
+                .any(|(t, f)| f.name() == "time" && matches!(t, Timestamp))
+        );
+        assert!(
+            s_merged
+                .iter()
+                .any(|(t, f)| f.name() == "f1" && matches!(t, Field(Float)))
+        );
+        assert!(
+            s_merged
+                .iter()
+                .any(|(t, f)| f.name() == "f2" && matches!(t, Field(String)))
+        );
         assert_eq!(5, s_merged.len());
     }
 

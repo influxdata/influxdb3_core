@@ -1,7 +1,7 @@
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     error::Result,
-    logical_expr::{binary_expr, expr::Case, BinaryExpr, Cast, Like, Operator},
+    logical_expr::{BinaryExpr, Cast, Like, Operator, binary_expr, expr::Case},
     prelude::Expr,
 };
 

@@ -7,10 +7,10 @@
 use criterion as _;
 use workspace_hack as _;
 
-use hashbrown::{hash_map::Entry, HashMap, HashSet};
-use influxdb_line_protocol::{parse_lines, FieldValue, ParsedLine};
-use mutable_batch::writer::{ColumnInsertValidator, Writer};
+use hashbrown::{HashMap, HashSet, hash_map::Entry};
+use influxdb_line_protocol::{FieldValue, ParsedLine, parse_lines};
 use mutable_batch::MutableBatch;
+use mutable_batch::writer::{ColumnInsertValidator, Writer};
 use snafu::{ResultExt, Snafu};
 
 /// A limit on the number of errors to return from a partial LP write.

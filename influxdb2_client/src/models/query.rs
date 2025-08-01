@@ -1,7 +1,7 @@
 //! Query
 
-use crate::models::ast::Package;
 use crate::models::File;
+use crate::models::ast::Package;
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use std::collections::HashMap;

@@ -2,14 +2,14 @@
 //!
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/manage-database/#delete-series-with-delete
 
-use crate::common::{where_clause, ws0, ws1, WhereClause};
-use crate::internal::{expect, ParseResult};
+use crate::common::{WhereClause, where_clause, ws0, ws1};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
-use crate::simple_from_clause::{delete_from_clause, DeleteFromClause};
+use crate::simple_from_clause::{DeleteFromClause, delete_from_clause};
+use nom::Parser;
 use nom::branch::alt;
 use nom::combinator::{map, opt};
 use nom::sequence::{pair, preceded};
-use nom::Parser;
 use std::fmt::{Display, Formatter};
 
 /// Represents a `DELETE` statement.

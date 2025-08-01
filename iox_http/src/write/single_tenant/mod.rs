@@ -21,9 +21,9 @@ use thiserror::Error;
 use crate::write::v1::V1_NAMESPACE_RP_SEPARATOR;
 
 use super::{
+    WriteParams, WriteParseError, WriteRequestUnifier,
     v1::{RetentionPolicy, V1WriteParseError, WriteParamsV1},
     v2::{V2WriteParseError, WriteParamsV2},
-    WriteParams, WriteParseError, WriteRequestUnifier,
 };
 
 /// Request parsing errors when operating in "single tenant" mode.
@@ -172,9 +172,9 @@ async fn parse_v2(
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use authz::{http::AuthorizationHeaderExtension, Authorization, Permission};
+    use authz::{Authorization, Permission, http::AuthorizationHeaderExtension};
     use hyper::header::HeaderValue;
-    use iox_http_util::{empty_request_body, RequestBuilder};
+    use iox_http_util::{RequestBuilder, empty_request_body};
     use parking_lot::Mutex;
 
     use crate::write::Precision;

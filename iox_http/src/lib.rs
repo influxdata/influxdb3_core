@@ -8,4 +8,6 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+pub mod client;
+pub use client::hyper0_client;
 pub mod write;

@@ -14,10 +14,10 @@ use datafusion::{
         arrow::async_reader::AsyncFileReader, errors::ParquetError, file::metadata::ParquetMetaData,
     },
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{metrics::ExecutionPlanMetricsSet, ExecutionPlan},
+    physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet},
 };
 use executor::spawn_io;
-use futures::{future::Shared, prelude::future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::Shared, prelude::future::BoxFuture};
 use meta_data_cache::MetaIndexCache;
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
 use object_store_size_hinting::hint_size;

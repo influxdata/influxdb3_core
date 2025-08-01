@@ -3,17 +3,17 @@
 //! [sql]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-measurements
 
 use crate::common::{
-    limit_clause, offset_clause, qualified_measurement_name, where_clause, ws0, ws1, LimitClause,
-    OffsetClause, QualifiedMeasurementName, WhereClause,
+    LimitClause, OffsetClause, QualifiedMeasurementName, WhereClause, limit_clause, offset_clause,
+    qualified_measurement_name, where_clause, ws0, ws1,
 };
-use crate::identifier::{identifier, Identifier};
-use crate::internal::{expect, ParseResult};
+use crate::identifier::{Identifier, identifier};
+use crate::internal::{ParseResult, expect};
 use crate::keywords::keyword;
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::combinator::{map, opt, value};
 use nom::sequence::{pair, preceded, terminated};
-use nom::Parser;
 use std::fmt;
 use std::fmt::Formatter;
 

@@ -4,7 +4,8 @@ use crate::exec::IOxSessionContext;
 use crate::memory_pool::Monitor;
 use crate::physical_optimizer::ParquetFileMetrics;
 use data_types::NamespaceId;
-use datafusion::physical_plan::{metrics::MetricValue, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, metrics::MetricValue};
+use influxdb_line_protocol::LineProtocolBuilder;
 use iox_query_params::StatementParams;
 use iox_time::{Time, TimeProvider};
 use metric::{
@@ -18,8 +19,8 @@ use std::{
     fmt::Debug,
     ops::DerefMut,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -488,6 +489,104 @@ impl QueryLogEntry {
         record_metric_if_now_set!(ingester_metrics, prev_state, metrics);
         record_metric_if_now_set!(deduplicated_parquet_files, prev_state, metrics);
         record_metric_if_now_set!(deduplicated_partitions, prev_state, metrics);
+    }
+
+    /// Convert a query log entry into the InfluxDB line protocol format.
+    pub fn to_line_protocol(
+        &self,
+        builder: LineProtocolBuilder<Vec<u8>>,
+        measurement_name: &str,
+    ) -> LineProtocolBuilder<Vec<u8>> {
+        let state = self.state();
+
+        let mut lp = builder
+            .measurement(measurement_name)
+            .tag("namespace_id", &state.namespace_id.get().to_string())
+            .tag("namespace_name", &state.namespace_name)
+            .tag("query_type", state.query_type)
+            .tag("success", state.success.to_string().as_str())
+            .tag("running", state.running.to_string().as_str())
+            .tag("phase", state.phase.name())
+            .field("query_text", state.query_text.to_string().as_str())
+            .field("query_params", state.query_params.to_string().as_str())
+            .field("query_issue_time", state.issue_time.timestamp_nanos());
+
+        lp = match &state.auth_id {
+            Some(auth_id) => lp.field("auth_id", auth_id.as_str()),
+            None => lp,
+        };
+
+        lp = match &state.trace_id {
+            Some(trace_id) => lp.field("trace_id", trace_id.get().to_string().as_str()),
+            None => lp,
+        };
+
+        lp = match state.partitions {
+            Some(partitions) => lp.field("partitions", partitions),
+            None => lp,
+        };
+
+        lp = match state.parquet_files {
+            Some(parquet_files) => lp.field("parquet_files", parquet_files),
+            None => lp,
+        };
+
+        lp = match &state.permit_duration {
+            Some(permit_duration) => lp.field("permit_duration", permit_duration.as_nanos() as u64),
+            None => lp,
+        };
+
+        lp = match &state.plan_duration {
+            Some(plan_duration) => lp.field("plan_duration", plan_duration.as_nanos() as u64),
+            None => lp,
+        };
+
+        lp = match &state.execute_duration {
+            Some(execute_duration) => {
+                lp.field("execute_duration", execute_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match &state.end2end_duration {
+            Some(end2end_duration) => {
+                lp.field("end2end_duration", end2end_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match &state.compute_duration {
+            Some(compute_duration) => {
+                lp.field("compute_duration", compute_duration.as_nanos() as u64)
+            }
+            None => lp,
+        };
+
+        lp = match state.max_memory {
+            Some(max_memory) => lp.field("max_memory", max_memory),
+            None => lp,
+        };
+
+        lp = match state.ingester_metrics {
+            Some(im) => lp
+                .field(
+                    "ingester_latency_to_plan",
+                    im.latency_to_plan.as_nanos() as u64,
+                )
+                .field(
+                    "ingester_latency_to_full_data",
+                    im.latency_to_full_data.as_nanos() as u64,
+                )
+                .field("ingester_response_rows", im.response_rows)
+                .field("ingester_response_size", im.response_size)
+                .field("ingester_partition_count", im.partition_count),
+            None => lp,
+        };
+
+        match chrono::Utc::now().timestamp_nanos_opt() {
+            Some(ns) => lp.timestamp(ns).close_line(),
+            None => lp.close_line(),
+        }
     }
 }
 
@@ -1282,8 +1381,8 @@ mod test_super {
     use std::sync::atomic::AtomicU64;
 
     use datafusion::physical_plan::{
-        metrics::{MetricValue, MetricsSet},
         DisplayAs, Metric,
+        metrics::{MetricValue, MetricsSet},
     };
     use iox_time::MockProvider;
     use test_helpers::tracing::TracingCapture;

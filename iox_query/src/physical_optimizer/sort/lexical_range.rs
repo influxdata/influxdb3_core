@@ -1,11 +1,9 @@
-#![expect(dead_code)] // Part of https://github.com/influxdata/influxdb_iox/issues/13572
-
 //! [`NonOverlappingOrderedLexicalRanges`] represents ranges of lexically ordered values.
 
 use arrow::array::ArrayRef;
 use arrow::compute::SortOptions;
 use arrow::row::{Row, RowConverter, Rows, SortField};
-use datafusion::common::{internal_err, Result, ScalarValue};
+use datafusion::common::{Result, ScalarValue, internal_err};
 use datafusion::error::DataFusionError;
 use observability_deps::tracing::trace;
 use std::fmt::Display;
@@ -331,7 +329,10 @@ impl ConvertedRows {
     ///      output = true
     ///
     /// (0 -> 13)  (12 -> 20)  (21 -> 30) => disjoint=false
-    ///      output = None
+    ///      output = false
+    ///
+    /// (1 -> 1)  (1 -> 1)  (1 -> 1) => disjoint=true for constants
+    ///      output = true
     ///
     fn are_disjoint(&self, ordered_by_min_partition_indices: &[usize]) -> bool {
         for index_index in 1..ordered_by_min_partition_indices.len() {
@@ -345,7 +346,13 @@ impl ConvertedRows {
             let end_exclusive = self.max_row(index) >= self.min_row(prev_index)
                 && self.max_row(index) > self.max_row(prev_index);
 
-            if !(start_exclusive && end_exclusive) {
+            // are constants
+            let curr_constant = self.min_row(index) == self.max_row(index);
+            let prev_constant = self.min_row(prev_index) == self.max_row(prev_index);
+            let constants_are_equal =
+                curr_constant && prev_constant && self.min_row(index) == self.min_row(prev_index);
+
+            if !((start_exclusive && end_exclusive) || constants_are_equal) {
                 trace!(
                     "ranges are not disjoint: {:?} <= {:?}",
                     self.min_value(index),
@@ -977,6 +984,208 @@ mod tests {
                     (TestSortOption::DescNullsFirst, vec![2, 0, 1]).into(),
                     (TestSortOption::DescNullsLast, vec![2, 0, 1]).into(),
                 ],
+            },
+        ];
+
+        cases.into_iter().for_each(|test_case| test_case.run());
+    }
+
+    #[test]
+    fn test_disjointness_constants() {
+        let cases = [
+            /* All sort keys are constant */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "all_sort_keys_constant_across_partitions",
+                expected_ranges_per_partition: vec![
+                    "(10,same,1)->(10,same,1)",
+                    "(10,same,1)->(10,same,1)",
+                    "(10,same,1)->(10,same,1)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![0, 1, 2]).into(),
+                    (TestSortOption::AscNullsLast, vec![0, 1, 2]).into(),
+                    (TestSortOption::DescNullsFirst, vec![0, 1, 2]).into(),
+                    (TestSortOption::DescNullsLast, vec![0, 1, 2]).into(),
+                ],
+            },
+            /* First two sort keys are constant, 3rd is disjoint (non-overlapping) */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(2), Some(2)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(3), Some(3)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "last_sort_key_is_disjoint_across_partitions",
+                expected_ranges_per_partition: vec![
+                    "(10,same,2)->(10,same,2)",
+                    "(10,same,1)->(10,same,1)",
+                    "(10,same,3)->(10,same,3)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![1, 0, 2]).into(),
+                    (TestSortOption::AscNullsLast, vec![1, 0, 2]).into(),
+                    (TestSortOption::DescNullsFirst, vec![2, 0, 1]).into(),
+                    (TestSortOption::DescNullsLast, vec![2, 0, 1]).into(),
+                ],
+            },
+            /* First two sort keys are constant, 3rd is overlapping */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(2), Some(2)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(0), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(0), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "last_sort_key_is_overlapping_across_partitions",
+                expected_ranges_per_partition: vec![
+                    "(10,same,2)->(10,same,2)",
+                    "(10,same,0)->(10,same,1)",
+                    "(10,same,0)->(10,same,1)",
+                ],
+                expect_disjoint: false,
+                expected_ordered_indices: vec![],
+            },
+            /* First two sort keys are constant, 3rd is touching */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(2), Some(2)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "last_sort_key_is_touching_but_nonoverlapping_across_partitions",
+                expected_ranges_per_partition: vec![
+                    "(10,same,2)->(10,same,2)",
+                    "(10,same,1)->(10,same,1)",
+                    "(10,same,1)->(10,same,1)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![1, 2, 0]).into(),
+                    (TestSortOption::AscNullsLast, vec![1, 2, 0]).into(),
+                    (TestSortOption::DescNullsFirst, vec![0, 1, 2]).into(),
+                    (TestSortOption::DescNullsLast, vec![0, 1, 2]).into(),
+                ],
+            },
+            /* Last two sort keys are constant, 1st is disjoint (non-overlapping) */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(30), Some(30)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(20), Some(20)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "first_sort_key_is_disjoint_across_partitions",
+                expected_ranges_per_partition: vec![
+                    "(30,same,1)->(30,same,1)",
+                    "(10,same,1)->(10,same,1)",
+                    "(20,same,1)->(20,same,1)",
+                ],
+                expect_disjoint: true,
+                expected_ordered_indices: vec![
+                    (TestSortOption::AscNullsFirst, vec![1, 2, 0]).into(),
+                    (TestSortOption::AscNullsLast, vec![1, 2, 0]).into(),
+                    (TestSortOption::DescNullsFirst, vec![0, 2, 1]).into(),
+                    (TestSortOption::DescNullsLast, vec![0, 2, 1]).into(),
+                ],
+            },
+            /* Last two sort keys are constant, 1st is overlapping */
+            TestCase {
+                partitions: vec![
+                    build_partition_with_multiple_sort_keys(
+                        (Some(30), Some(30)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(10), Some(10)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                    build_partition_with_multiple_sort_keys(
+                        (Some(20), Some(31)),
+                        (Some("same"), Some("same")),
+                        (Some(1), Some(1)),
+                    ),
+                ],
+                num_sort_keys: 3,
+                name: "first_sort_key_is_disjoint_across_partitions",
+                expected_ranges_per_partition: vec![
+                    "(30,same,1)->(30,same,1)",
+                    "(10,same,1)->(10,same,1)",
+                    "(20,same,1)->(31,same,1)",
+                ],
+                expect_disjoint: false,
+                expected_ordered_indices: vec![],
             },
         ];
 

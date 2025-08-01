@@ -5,13 +5,11 @@ use crate::api::{GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE, R
 use crate::{CacheKey, CacheValue};
 use futures::prelude::*;
 use futures::stream::BoxStream;
-use hyper::client::connect::dns::{GaiResolver, Name};
 use hyper::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH, ToStrError};
 use hyper::service::Service;
-use iox_http_util::empty_request_body;
-
+use hyper_util::{client::legacy::connect::dns::GaiResolver, service::TowerToHyperService};
 use metric::DurationHistogram;
-use reqwest::dns::{Resolve, Resolving};
+use reqwest::dns::{Name, Resolve, Resolving};
 use reqwest::{Client, StatusCode, Url};
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use std::sync::Arc;
@@ -276,7 +274,7 @@ impl CatalogCacheClient {
             builder = builder.body(data);
         } else {
             builder = builder.header(&NO_VALUE, "true");
-            builder = builder.body(empty_request_body());
+            builder = builder.body(reqwest::Body::default());
         }
 
         let response = builder
@@ -323,14 +321,17 @@ impl CatalogCacheClient {
 /// A custom [`Resolve`] that collects [`ResolverMetrics`]
 #[derive(Debug, Clone)]
 struct Resolver {
-    resolver: GaiResolver,
+    resolver: TowerToHyperService<GaiResolver>,
     metrics: Arc<ResolverMetrics>,
 }
 
 impl Resolver {
     fn new(registry: &metric::Registry) -> Self {
         Self {
-            resolver: GaiResolver::new(),
+            // the `GaiResolver` still uses the old `tower::Service`,
+            // therefore, use the `TowerToHyperService` adapter
+            // to make into a `hyper::Service`
+            resolver: TowerToHyperService::new(GaiResolver::new()),
             metrics: Arc::new(ResolverMetrics::new(registry)),
         }
     }
@@ -338,9 +339,15 @@ impl Resolver {
 
 impl Resolve for Resolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let mut s = self.clone();
+        let s = self.clone();
         let metrics = Arc::clone(&self.metrics);
         let start = Instant::now();
+
+        // `reqwest::dns::Name` is a wrapper around the `hyper` name.
+        // need to translate to the `hyper_util` `Name` (which is a wrapper around the `hyper` name)
+        use hyper_util::client::legacy::connect::dns::Name as LegacyName;
+        let name: LegacyName = name.as_str().parse().expect("name is valid");
+
         Box::pin(async move {
             let r = s.resolver.call(name).await;
             metrics.record(start.elapsed());

@@ -30,8 +30,6 @@ message NamespaceMessage {
 // If the receiving peer already knows of this namespace and its tracked version
 // value is greater, this is a no-op.
 message NamespaceCreated {
-  //TODO(adam): move namespace_name to "mutable fields" section (keep field number the same)
-  string namespace_name = 1;
   int64 namespace_id = 2;
 
   // Immutable fields.
@@ -48,6 +46,7 @@ message NamespaceCreated {
   // If these values differ, the receiving node MUST use the values associated
   // with the greater `router_version` value (between the cached & received
   // values).
+  string namespace_name = 1;
   uint64 max_columns_per_table = 4;
   uint64 max_tables = 5;
   optional int64 retention_period_ns = 6;

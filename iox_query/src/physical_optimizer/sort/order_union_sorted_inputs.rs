@@ -5,23 +5,16 @@ use datafusion::{
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{
-        displayable, expressions::Column, sorts::sort_preserving_merge::SortPreservingMergeExec,
-        union::UnionExec, ExecutionPlan,
-    },
+    physical_plan::{ExecutionPlan, sorts::sort_preserving_merge::SortPreservingMergeExec},
 };
-use observability_deps::tracing::{trace, warn};
+use itertools::Itertools;
 
-use crate::{
-    physical_optimizer::sort::util::{
-        accepted_union_exec, collect_statistics_min_max, sort_plans_by_value_ranges,
-        split_files_or_add_sort_preserving_merge,
-    },
-    provider::progressive_eval::ProgressiveEvalExec,
-};
+use crate::provider::progressive_eval::ProgressiveEvalExec;
+use crate::provider::reorder_partitions::ReorderPartitionsExec;
 
-use super::util::{
-    has_deduplicate, only_one_parquet_exec, transform_parquet_exec_single_file_each_group,
+use super::{
+    extract_ranges::extract_disjoint_ranges_from_plan,
+    regroup_files::split_and_regroup_parquet_files,
 };
 
 /// IOx specific optimization that eliminates a `SortPreservingMerge` by reordering inputs in terms
@@ -51,44 +44,12 @@ use super::util::{
 /// - ProgressiveEvalExec only outputs data in their input order of the streams and not do any
 ///   merges. Thus in order to output data in the right sort order, these three conditions must be
 ///   true:
-///     1. Each input stream must sorted on the same column DESC or ASC accordingly
-///     2. The streams must be sorted on the column DESC or ASC accordingly
-///     3. The streams must not overlap in the values of that column.
+///     1. Each input streams (a.k.a. partitions) be must sorted on the same sort key
+///     2. For partitions 0..N, they must be sorted across partitions using the same sort key
+///     3. The partitioned streams must not overlap in the values of the sort key
 ///
-/// Example: for col_name ranges:
-///   |--- r1---|-- r2 ---|-- r3 ---|-- r4 --|
 ///
-/// Here is what the input look like:
-/// (Note this optimization is focusing on query `order by time DESC/ASC limit n` without aggregation):
-///
-///   SortPreservingMergeExec: time@2 DESC, fetch=1
-///     UnionExec
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r3
-///         ...
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r1
-///         ...
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r4
-///         ...
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r2  -- assuming this SortExec has 2 output sorted streams
-///          ...
-///
-/// The streams do not overlap in time, and they are already sorted by time DESC.
-///
-/// The output will be the same except that all the input streams will be sorted by time DESC too and looks like
-///
-///   SortPreservingMergeExec: time@2 DESC, fetch=1
-///     UnionExec
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r1
-///         ...
-///       SortPreservingMergeExec:                                                  -- need this extra to merge the 2 streams into one
-///          SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r2
-///             ...
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r3
-///         ...
-///       SortExec: expr=col_name@2 DESC  <--- input stream with col_name range r4
-///          ...
-///
-
+/// Refer to [`swap_spm_for_progeval`] for supported plan transformations.
 #[derive(Debug)]
 pub(crate) struct OrderUnionSortedInputs;
 
@@ -106,103 +67,10 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
                 return Ok(Transformed::no(plan));
             };
 
-            // Check if the sortExpr is only on one column
-            let sort_expr = sort_preserving_merge_exec.expr();
-            if sort_expr.len() != 1 {
-                trace!(
-                    ?sort_expr,
-                    "sortExpr is not on one column. No optimization"
-                );
-                return Ok(Transformed::no(plan));
-            };
-            let Some(sorted_col) = sort_expr[0].expr.as_any().downcast_ref::<Column>() else {
-                trace!(
-                    ?sort_expr,
-                    "sortExpr is not on pure column but expression. No optimization"
-                );
-                return Ok(Transformed::no(plan));
-            };
-            let sort_options = sort_expr[0].options;
-
-            let mut input_value_ranges = None;
-            // Find UnionExec
-            let transformed_input_plan: Option<Arc<dyn ExecutionPlan>> = if let Some(union_exec) = accepted_union_exec(sort_preserving_merge_exec) {
-                // Check all inputs of UnionExec must be already sorted and on the same sort_expr of SortPreservingMergeExec
-                let Some(union_output_ordering) = union_exec.properties().output_ordering() else {
-                    warn!(plan=%displayable(plan.as_ref()).indent(false), "Union input to SortPreservingMerge is not sorted");
-                    return Ok(Transformed::no(plan));
-                };
-
-                // Check if the first PhysicalSortExpr is the same as the sortExpr[0] in SortPreservingMergeExec
-                if sort_expr[0] != union_output_ordering[0] {
-                    // this happens in production https://github.com/influxdata/influxdb_iox/issues/10641
-                    trace!(?sort_expr, ?union_output_ordering, plan=%displayable(plan.as_ref()).indent(false),
-                        "Sort order of SortPreservingMerge and its children are different");
-                    return Ok(Transformed::no(plan));
-                }
-
-                let Some(value_ranges) = collect_statistics_min_max(union_exec.inputs(), sorted_col.name())?
-                else {
-                    return Ok(Transformed::no(plan));
-                };
-
-                // Sort the inputs by their value ranges
-                trace!("value_ranges: {:?}", value_ranges);
-                let Some(plans_value_ranges) =
-                    sort_plans_by_value_ranges(union_exec.inputs().to_vec(), value_ranges, sort_options)?
-                else {
-                    trace!("inputs are not sorted by value ranges. No optimization");
-                    return Ok(Transformed::no(plan));
-                };
-
-                // If each input of UnionExec outputs many sorted streams, data of different streams may overlap and
-                // even if they do not overlapped, their streams can be in any order. We need to (sort) merge them first
-                // to have a single output stream out to guarantee the output is sorted.
-                let new_inputs = split_files_or_add_sort_preserving_merge(plans_value_ranges.plans, sorted_col.name(), sort_options, sort_expr, sort_preserving_merge_exec.fetch())?;
-                input_value_ranges = Some(plans_value_ranges.value_ranges);
-
-                Some(Arc::new(UnionExec::new(new_inputs)))
-
-            } else { // No union under SortPreservingMergeExec
-
-                // No union means underneath SortPreservingMergeExec is one input. Still optimize using ProgressiveEval if
-                // it is a LIMIT plan of all non-overlapped parquet files. It means we need to check for:
-                //   1. limit
-                //   2. no DeduplicateExec
-                //   3. one ParquetExec
-                //   4. and all files of that ParquetExec are non-overlapped
-
-                let input = sort_preserving_merge_exec.input();
-                let is_limit_query = sort_preserving_merge_exec.fetch().is_some();
-
-                // three top conditions meet
-                let try_transform = is_limit_query && !has_deduplicate(input)? && only_one_parquet_exec(input)?;
-
-                let transformed_input_plan = if try_transform {
-                    // get statistics of the files
-                    input_value_ranges = collect_statistics_min_max(&[Arc::clone(input)], sorted_col.name())?;
-                    // transform the files if the files are non-overlapped
-                    transform_parquet_exec_single_file_each_group(Arc::clone(input), sorted_col.name(), sort_options).ok()
-                } else {
-                    None
-                };
-
-                transformed_input_plan
-            };
-
-            let Some(transformed_input_plan) = transformed_input_plan else {
-                return Ok(Transformed::no(plan));
-            };
-
-            // Replace SortPreservingMergeExec with ProgressiveEvalExec
-            let progresive_eval_exec = Arc::new(ProgressiveEvalExec::new(
-                transformed_input_plan,
-                input_value_ranges,
-                sort_preserving_merge_exec.fetch(),
-            ));
-
-            Ok(Transformed::yes(progresive_eval_exec))
-        }).map(|t| t.data)
+            // Assess a possible SPM->ProgressiveEval swap.
+            swap_spm_for_progeval(sort_preserving_merge_exec, Arc::clone(&plan))
+        })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {
@@ -212,6 +80,99 @@ impl PhysicalOptimizerRule for OrderUnionSortedInputs {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Handles 2 scenarios:
+///     * (1) when the regrouping & reordering of the parquet exec is sufficient to use ProgressiveEval
+///     * (2) when the reordering of the partitions, (with or without parquet exec changes), is sufficient to use ProgressiveEval
+///
+///
+/// Using sort key ranges are non-overlapping and ordered:
+///   |---r0--|--- r1---|-- r2 ---|-- r3 ---|-- r4 --|
+///
+/// Where r3 and r4 are from different [`PartitionedFile`](datafusion::datasource::listing::PartitionedFile)
+/// within the same parquet.
+///
+///
+/// Starting with this structure:
+///   ```text
+///   SortPreservingMergeExec: expr=[a@0 DESC, b@2 ASC]
+///     ...
+///       ParquetExec: file_groups={4 groups: [[2.parquet],[3.parquet:1..100],[3.parquet:100..200],[1.parquet,0.parquet]]} output_ordering=[a@0 DESC, b@2 ASC]
+///   ```
+///
+/// This function creates a progressive eval by regrouping & reordering of the parquet exec:
+///   ```text
+///   ProgressiveEvalExec:
+///     ...
+///       ParquetExec: file_groups={4 groups: [[0.parquet],[1.parquet],[2.parquet],[3.parquet:1..200]]} output_ordering=[a@0 DESC, b@2 ASC]
+///   ```
+///
+///
+/// Starting with this structure:
+///   ```text
+///   SortPreservingMergeExec: expr=[a@0 DESC, b@2 ASC]
+///     ...
+///       UnionExec
+///         ParquetExec: file_groups={2 groups: [[1.parquet,3.parquet:1..100],[3.parquet:100..200]]} output_ordering=[a@0 DESC, b@2 ASC]  <--- 2 partitions with ranges r1 then r3, & r4
+///         ParquetExec: file_groups={1 group: [[2.parquet,0.parquet]]} output_ordering=[a@0 DESC, b@2 ASC]  <--- 1 partition with ranges r2 then r0
+///   ```
+///
+/// This function creates a progressive eval by re-ordering the partitioned via the ReorderPartitionsExec (** NOT transforming the union inputs **):
+///   ```text
+///   ProgressiveEvalExec:
+///     ReorderPartitionsExec: mapped_partition_indices=[2, 0, 3, 1]
+///       ...
+///         UnionExec
+///           ParquetExec: file_groups={2 groups: [[1.parquet],[3.parquet:1..200]]} output_ordering=[a@0 DESC, b@2 ASC]  <--- 2 partitions with ranges r1, & r3/r4
+///           ParquetExec: file_groups={2 groups: [[0.parquet],[2.parquet]]} output_ordering=[a@0 DESC, b@2 ASC]  <--- 2 partitions with ranges r0 & r2
+///   ```
+/// Where ReorderPartitionsExec::execute(partition=0) will pull from its input partition 2 (a.k.a. `0.parquet`).
+///
+///
+/// ProgressiveEval will then pull from each partition in order, covering ranges r0..=r4
+///
+///
+/// Proper lexical ordering must be obtainable from the following transformation:
+///     * regrouping and reordering within each ParquetExec. (Not across parquet exec.)
+///     * mapping from input to output partition using the [`ReorderPartitionsExec`]
+///
+fn swap_spm_for_progeval(
+    original_spm: &SortPreservingMergeExec,
+    return_unaltered_plan: Arc<dyn ExecutionPlan>,
+) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    let ordering_req = original_spm.expr();
+
+    // Step 1: Split and regroup partitioned file scans. Also re-orders the scan partitions.
+    // This step maximizes our chances of getting a disjoint, nonoverlapping lexical ranges.
+    let input = Arc::clone(original_spm.input())
+        .transform_down(|plan| split_and_regroup_parquet_files(plan, ordering_req))
+        .map(|t| t.data)?;
+
+    // Step 2: try to extract the lexical ranges for the input partitions
+    let Some(lexical_ranges) = extract_disjoint_ranges_from_plan(ordering_req, &input)? else {
+        return Ok(Transformed::no(return_unaltered_plan));
+    };
+
+    // Step 3: if needed, re-order the partitions
+    let ordered_input = if lexical_ranges.indices().is_sorted() {
+        input
+    } else {
+        Arc::new(ReorderPartitionsExec::new(
+            input,
+            lexical_ranges.indices().to_owned(),
+            ordering_req.clone(),
+        )) as Arc<dyn ExecutionPlan>
+    };
+
+    // Step 4: Replace SortPreservingMergeExec with ProgressiveEvalExec
+    let progresive_eval_exec = Arc::new(ProgressiveEvalExec::new(
+        ordered_input,
+        Some(lexical_ranges.ordered_ranges().cloned().collect_vec()),
+        original_spm.fetch(),
+    ));
+
+    Ok(Transformed::yes(progresive_eval_exec))
 }
 
 #[cfg(test)]
@@ -224,141 +185,30 @@ mod test {
         logical_expr::{LogicalPlanBuilder, Operator},
         physical_expr::{LexOrdering, PhysicalSortExpr},
         physical_plan::{
+            ExecutionPlan, Partitioning, PhysicalExpr,
             expressions::{BinaryExpr, Column},
             limit::GlobalLimitExec,
             projection::ProjectionExec,
             repartition::RepartitionExec,
             sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
             union::UnionExec,
-            ExecutionPlan, Partitioning, PhysicalExpr,
         },
         prelude::{col, lit},
         scalar::ScalarValue,
     };
     use executor::DedicatedExecutor;
-    use schema::{sort::SortKey, InfluxFieldType, SchemaBuilder as IOxSchemaBuilder};
+    use schema::{InfluxFieldType, SchemaBuilder as IOxSchemaBuilder, sort::SortKey};
 
     use crate::{
+        CHUNK_ORDER_COLUMN_NAME, QueryChunk,
         exec::{Executor, ExecutorConfig},
         physical_optimizer::{
-            sort::{
-                order_union_sorted_inputs::OrderUnionSortedInputs,
-                util::{has_deduplicate, only_one_parquet_exec},
-            },
-            test_util::OptimizationTest,
+            sort::order_union_sorted_inputs::OrderUnionSortedInputs, test_util::OptimizationTest,
         },
-        provider::{chunks_to_physical_nodes, DeduplicateExec, ProviderBuilder, RecordBatchesExec},
+        provider::{DeduplicateExec, ProviderBuilder, RecordBatchesExec, chunks_to_physical_nodes},
         statistics::{column_statistics_min_max, compute_stats_column_min_max},
-        test::{format_execution_plan, TestChunk},
-        QueryChunk, CHUNK_ORDER_COLUMN_NAME,
+        test::{TestChunk, format_execution_plan},
     };
-
-    // ------------------------------------------------------------------
-    // Test only one ParquetExec & no deduplicate
-    // ------------------------------------------------------------------
-    #[test]
-    fn test_one_parquet_exec_and_has_dedup() {
-        test_helpers::maybe_start_logging();
-
-        let schema = schema();
-
-        let final_sort_exprs = [("time", SortOp::Desc)];
-
-        let target_partition = 3;
-        let plan_parquet_1 = PlanBuilder::parquet_exec_non_overlapped_chunks(
-            &schema,
-            5,
-            1000,
-            200,
-            target_partition,
-        );
-        insta::assert_yaml_snapshot!(
-            plan_parquet_1.formatted(),
-            @r#"- " ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
-        );
-
-        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan = plan_parquet_1.clone().build();
-        assert!(only_one_parquet_exec(&plan).unwrap());
-        assert!(!has_deduplicate(&plan).unwrap());
-
-        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan_sort_1 = plan_parquet_1.sort_with_preserve_partitioning(final_sort_exprs);
-        let plan = plan_sort_1.clone().build();
-        assert!(only_one_parquet_exec(&plan).unwrap());
-        assert!(!has_deduplicate(&plan).unwrap());
-
-        // ------------------------------------------------------------------
-        // Sort plan of a parquet overlapped files
-        // Two overlapped files [2001, 2202] and [2201, 2402]
-        let plan_parquet_2 = PlanBuilder::parquet_exec_overlapped_chunks(&schema, 3, 2001, 200, 2);
-        insta::assert_yaml_snapshot!(
-            plan_parquet_2.formatted(),
-            @r#"- " ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]""#
-        );
-
-        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan = plan_parquet_2.clone().build();
-        assert!(only_one_parquet_exec(&plan).unwrap());
-        assert!(!has_deduplicate(&plan).unwrap());
-
-        // sort expression for deduplication
-        let sort_exprs = [
-            ("col2", SortOp::Asc),
-            ("col1", SortOp::Asc),
-            ("time", SortOp::Asc),
-        ];
-        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan_spm_2 = plan_parquet_2.sort_preserving_merge(sort_exprs);
-        let plan = plan_spm_2.clone().build();
-        assert!(only_one_parquet_exec(&plan).unwrap());
-        assert!(!has_deduplicate(&plan).unwrap());
-
-        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan_dedup_2 = plan_spm_2.deduplicate(sort_exprs, false);
-        let plan = plan_dedup_2.clone().build();
-        assert!(only_one_parquet_exec(&plan).unwrap());
-        assert!(has_deduplicate(&plan).unwrap());
-
-        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan_sort_2 = plan_dedup_2.sort(final_sort_exprs);
-        let plan = plan_sort_2.clone().build();
-        assert!(only_one_parquet_exec(&plan).unwrap());
-        assert!(has_deduplicate(&plan).unwrap());
-
-        // union 2 plan
-        //   - "   UnionExec"
-        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan_union = plan_sort_1.union(plan_sort_2);
-        let plan = plan_union.clone().build();
-        assert!(!only_one_parquet_exec(&plan).unwrap());
-        assert!(has_deduplicate(&plan).unwrap());
-
-        //   - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
-        //   - "   UnionExec"
-        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-        //   - "       ParquetExec: file_groups={3 groups: [[0.parquet, 3.parquet], [1.parquet, 4.parquet], [2.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        //   - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-        //   - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-        //   - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-        let plan_spm = plan_union.sort_preserving_merge(final_sort_exprs);
-        let plan = plan_spm.clone().build();
-        assert!(!only_one_parquet_exec(&plan).unwrap());
-        assert!(has_deduplicate(&plan).unwrap());
-    }
 
     // ------------------------------------------------------------------
     // Positive tests: the right structure found -> plan optimized
@@ -414,17 +264,18 @@ mod test {
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
-            - "     UnionExec"
-            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "             UnionExec"
-            - "               SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "   ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "     ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "       UnionExec"
+            - "         SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "         SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "           DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "               UnionExec"
+            - "                 SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                   RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -483,17 +334,18 @@ mod test {
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(Int64(2001), Int64(3500)), (Int64(1000), Int64(2000))]"
-            - "     UnionExec"
-            - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "             UnionExec"
-            - "               SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "   ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "     ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "       UnionExec"
+            - "         SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "         SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "           DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "               UnionExec"
+            - "                 SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                   RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -551,7 +403,7 @@ mod test {
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   ProgressiveEvalExec: input_ranges=[(Int64(1000), Int64(2000)), (Int64(2001), Int64(3500))]"
+            - "   ProgressiveEvalExec: input_ranges=[(1000)->(2000), (2001)->(3500)]"
             - "     UnionExec"
             - "       SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
@@ -614,17 +466,18 @@ mod test {
           - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "           UnionExec"
-            - "             SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -689,17 +542,18 @@ mod test {
           - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(Int64(2001), Int64(3500)), (Int64(1000), Int64(2000))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "           UnionExec"
-            - "             SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -752,7 +606,7 @@ mod test {
           - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(Int64(1000), Int64(2000)), (Int64(2001), Int64(3500))]"
+            - " ProgressiveEvalExec: input_ranges=[(1000)->(2000), (2001)->(3500)]"
             - "   UnionExec"
             - "     SortExec: expr=[field1@2 ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
@@ -866,20 +720,21 @@ mod test {
           - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(2000, None))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ProjectionExec: expr=[time@3 as time]"
-            - "         DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "           SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "             UnionExec"
-            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ProjectionExec: expr=[time@3 as time]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ProjectionExec: expr=[time@3 as time]"
+            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@0 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ProjectionExec: expr=[time@3 as time]"
+            - "           DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "               UnionExec"
+            - "                 SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                   RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "                 SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                   ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -979,17 +834,18 @@ mod test {
           - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "           UnionExec"
-            - "             SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1800)->(1999), (1600)->(1799), (1400)->(1599), (1200)->(1399), (1000)->(1199)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[5, 0, 1, 2, 3, 4]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "         ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -1095,18 +951,19 @@ mod test {
           - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "           UnionExec"
-            - "             SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "             SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1800)->(1999), (1600)->(1799), (1400)->(1599), (1200)->(1399), (1000)->(1199)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[5, 0, 1, 2, 3, 4]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "         ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -1219,18 +1076,19 @@ mod test {
           - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(3500, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "         SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "           UnionExec"
-            - "             SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "             SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "               ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(1999)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ParquetExec: file_groups={1 group: [[0.parquet, 1.parquet, 2.parquet, 3.parquet, 4.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -1328,14 +1186,15 @@ mod test {
           - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
         output:
           Ok:
-            - " ProgressiveEvalExec: input_ranges=[(TimestampNanosecond(2001, None), TimestampNanosecond(2602, None)), (TimestampNanosecond(1000, None), TimestampNanosecond(1999, None))]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "         SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "           ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
-            - "       ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(2602), (1800)->(1999), (1600)->(1799), (1400)->(1599), (1200)->(1399), (1000)->(1199)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[5, 0, 1, 2, 3, 4]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[true]"
+            - "         ParquetExec: file_groups={5 groups: [[4.parquet], [3.parquet], [2.parquet], [1.parquet], [0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, projection=[col1, col2, field1, time, __chunk_order]"
         "#
         );
     }
@@ -1393,14 +1252,15 @@ mod test {
           - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [time@3 DESC NULLS LAST, field1@2 DESC NULLS LAST]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST, field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST, field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       UnionExec"
-            - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - " ProgressiveEvalExec: input_ranges=[(2001,2001)->(3500,3500), (1000,1000)->(2000,2000)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST, field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
             - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST, field1@2 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         UnionExec"
+            - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -1561,15 +1421,16 @@ mod test {
         output:
           Ok:
             - " GlobalLimitExec: skip=0, fetch=1"
-            - "   SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
-            - "     UnionExec"
-            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "         UnionExec"
-            - "           SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "             RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "   ProgressiveEvalExec: input_ranges=[(2000)->(3500), (1000)->(2000)]"
+            - "     ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "       UnionExec"
+            - "         SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
             - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "         SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "           UnionExec"
+            - "             SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "             ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -1742,20 +1603,21 @@ mod test {
           - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         output:
           Ok:
-            - " SortPreservingMergeExec: [time@1 DESC NULLS LAST]"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@1 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ProjectionExec: expr=[field1@2 + field1@2 as field, time@3 as time]"
-            - "         ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
-            - "     SortExec: expr=[time@1 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       ProjectionExec: expr=[field1@2 + field1@2 as field, time@3 as time]"
-            - "         DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "           SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
-            - "             UnionExec"
-            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "               SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "                 ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@1 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ProjectionExec: expr=[field1@2 + field1@2 as field, time@3 as time]"
+            - "           ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+            - "       SortExec: expr=[time@1 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         ProjectionExec: expr=[field1@2 + field1@2 as field, time@3 as time]"
+            - "           DeduplicateExec: [col1@0 ASC NULLS LAST,col2@1 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "             SortPreservingMergeExec: [col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "               UnionExec"
+            - "                 SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                   RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "                 SortExec: expr=[col1@0 ASC NULLS LAST, col2@1 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                   ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "#
         );
     }
@@ -1881,21 +1743,22 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r#"
-        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(90, None), TimestampNanosecond(100, None)), (TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
-        - "   UnionExec"
-        - "     SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[false]"
-        - "       ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
-        - "         DeduplicateExec: [tag@0 ASC,time@1 ASC]"
-        - "           SortPreservingMergeExec: [tag@0 ASC, time@1 ASC, __chunk_order@2 ASC]"
-        - "             UnionExec"
-        - "               SortExec: expr=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], preserve_partitioning=[true]"
-        - "                 CoalesceBatchesExec: target_batch_size=8192"
-        - "                   FilterExec: time@1 > 0"
-        - "                     RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1"
-        - "                       RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
-        - "               ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
-        - "     SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
-        - "       ParquetExec: file_groups={5 groups: [[4.parquet], [5.parquet], [6.parquet], [7.parquet], [8.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(90)->(100), (65)->(69), (60)->(64), (55)->(58), (50)->(54), (45)->(49)]"
+        - "   ReorderPartitionsExec: mapped_partition_indices=[5, 0, 1, 2, 3, 4]"
+        - "     UnionExec"
+        - "       SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
+        - "         ParquetExec: file_groups={5 groups: [[4.parquet:0..100000000], [5.parquet:0..100000000], [6.parquet:0..100000000], [7.parquet:0..100000000], [8.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - "       SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[false]"
+        - "         ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
+        - "           DeduplicateExec: [tag@0 ASC,time@1 ASC]"
+        - "             SortPreservingMergeExec: [tag@0 ASC, time@1 ASC, __chunk_order@2 ASC]"
+        - "               UnionExec"
+        - "                 SortExec: expr=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], preserve_partitioning=[true]"
+        - "                   CoalesceBatchesExec: target_batch_size=8192"
+        - "                     FilterExec: time@1 > 0"
+        - "                       RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1"
+        - "                         RecordBatchesExec: chunks=1, projection=[tag, time, __chunk_order]"
+        - "                 ParquetExec: file_groups={4 groups: [[2.parquet:0..500], [3.parquet:0..500], [2.parquet:500..1000], [3.parquet:500..1000]]}, projection=[tag, time, __chunk_order], output_ordering=[tag@0 ASC, time@1 ASC, __chunk_order@2 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         "#
         );
 
@@ -1905,7 +1768,6 @@ mod test {
                 .unwrap()
                 .filter(expr)
                 .unwrap()
-                // order by time ASC
                 .sort(vec![col("time").sort(true, true)])
                 .unwrap()
                 // limit
@@ -1923,10 +1785,10 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r#"
-        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None)), (TimestampNanosecond(90, None), TimestampNanosecond(100, None))]"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(45)->(49), (50)->(54), (55)->(58), (60)->(64), (65)->(69), (90)->(100)]"
         - "   UnionExec"
         - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
-        - "       ParquetExec: file_groups={5 groups: [[8.parquet], [7.parquet], [6.parquet], [5.parquet], [4.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - "       ParquetExec: file_groups={5 groups: [[8.parquet:0..100000000], [7.parquet:0..100000000], [6.parquet:0..100000000], [5.parquet:0..100000000], [4.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[false]"
         - "       ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
         - "         DeduplicateExec: [tag@0 ASC,time@1 ASC]"
@@ -2036,9 +1898,9 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r#"
-        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(65)->(69), (60)->(64), (55)->(58), (50)->(54), (45)->(49)]"
         - "   SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
-        - "     ParquetExec: file_groups={5 groups: [[1.parquet], [2.parquet], [3.parquet], [4.parquet], [5.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - "     ParquetExec: file_groups={5 groups: [[1.parquet:0..100000000], [2.parquet:0..100000000], [3.parquet:0..100000000], [4.parquet:0..100000000], [5.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         "#
         );
 
@@ -2066,9 +1928,9 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r#"
-        - " ProgressiveEvalExec: fetch=1, input_ranges=[(TimestampNanosecond(45, None), TimestampNanosecond(69, None))]"
+        - " ProgressiveEvalExec: fetch=1, input_ranges=[(45)->(49), (50)->(54), (55)->(58), (60)->(64), (65)->(69)]"
         - "   SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
-        - "     ParquetExec: file_groups={5 groups: [[5.parquet], [4.parquet], [3.parquet], [2.parquet], [1.parquet]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - "     ParquetExec: file_groups={5 groups: [[5.parquet:0..100000000], [4.parquet:0..100000000], [3.parquet:0..100000000], [2.parquet:0..100000000], [1.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], predicate=time@1 > 0, pruning_predicate=time_null_count@1 != time_row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         "#
         );
     }

@@ -1,6 +1,6 @@
 use datafusion::common::tree_node::Transformed;
 use datafusion::error::Result as DataFusionResult;
-use datafusion::prelude::{lit, Column, Expr};
+use datafusion::prelude::{Column, Expr, lit};
 
 use super::MEASUREMENT_COLUMN_NAME;
 

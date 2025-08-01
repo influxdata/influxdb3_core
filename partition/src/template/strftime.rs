@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use chrono::{format::StrftimeItems, TimeZone, Utc};
+use chrono::{TimeZone, Utc, format::StrftimeItems};
 
 use crate::PartitionKeyError;
 
@@ -52,9 +52,7 @@ where
         self.last_idx += 1;
         self.last_idx %= N;
 
-        let v = self.buf[self.last_idx].get_or_insert_with(Default::default);
-
-        v
+        (self.buf[self.last_idx].get_or_insert_with(Default::default)) as _
     }
 
     /// Drop the last buffer entry.

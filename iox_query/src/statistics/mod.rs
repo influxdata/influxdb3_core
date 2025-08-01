@@ -1,6 +1,6 @@
 /// Computes aggregate [`Statistics`](datafusion::common) for a set of [`QueryChunk`](crate)s.
 mod aggregate_per_chunk;
-pub use aggregate_per_chunk::{build_statistics_for_chunks, NULL_COLUMN_INDICATOR};
+pub use aggregate_per_chunk::{NULL_COLUMN_INDICATOR, build_statistics_for_chunks};
 
 /// Computes [`Statistics`](datafusion::common) for a single [`QueryChunk`](crate),
 /// providing Absent/default stats for any schema column not found in the chunk.

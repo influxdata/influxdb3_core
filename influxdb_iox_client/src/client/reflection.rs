@@ -2,10 +2,10 @@ use client_util::connection::GrpcConnection;
 use futures::stream;
 use futures_util::TryStreamExt;
 use generated_types::Request as GrpcRequest;
-use tonic_reflection::pb::server_reflection_client::ServerReflectionClient;
-use tonic_reflection::pb::server_reflection_request::MessageRequest;
-use tonic_reflection::pb::server_reflection_response::MessageResponse;
-use tonic_reflection::pb::ServerReflectionRequest;
+use tonic_reflection::pb::v1alpha::{
+    ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+    server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+};
 
 use crate::connection::Connection;
 use crate::error::Error;

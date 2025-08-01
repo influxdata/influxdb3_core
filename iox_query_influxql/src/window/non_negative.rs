@@ -46,7 +46,7 @@ impl<U: WindowUDFImpl + 'static> WindowUDFImpl for NonNegativeUDWF<U> {
     fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
         self.inner.field(field_args)
     }
-    /// Include this as a workaround for <https://github.com/apache/datafusion/issues/13168>
+
     fn expressions(&self, expr_args: ExpressionArgs<'_>) -> Vec<Arc<dyn PhysicalExpr>> {
         self.inner.expressions(expr_args)
     }

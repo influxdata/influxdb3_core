@@ -25,7 +25,7 @@ use hashbrown::HashMap;
 
 use self::interpolate::Segment;
 
-use super::{params::GapFillParams, FillStrategy, GapExpander};
+use super::{FillStrategy, GapExpander, params::GapFillParams};
 
 /// Provides methods to the [`GapFillStream`](super::stream::GapFillStream)
 /// module that fill gaps in buffered input.
@@ -114,7 +114,7 @@ impl GapFiller {
     /// This offset is used by ['BufferedInput`] to determine how many
     /// rows need to be buffered.
     ///
-    /// [`BufferedInput`]: super::BufferedInput
+    /// [`BufferedInput`]: super::buffered_input::BufferedInput
     pub(super) fn last_output_row_offset(&self) -> usize {
         self.cursor.next_input_offset + self.batch_size - 1
     }
@@ -1043,10 +1043,10 @@ mod tests {
     use schema::{InfluxColumnType, TIME_DATA_TIMEZONE};
 
     use crate::exec::gapfill::{
+        FillStrategy,
         algo::{AggrColState, Cursor},
         date_bin_gap_expander::DateBinGapExpander,
         params::GapFillParams,
-        FillStrategy,
     };
 
     #[test]

@@ -357,14 +357,16 @@ pub fn iter_set_positions_with_offset(
     let skew = offset % 8;
     in_progress &= 0xFF << skew;
 
-    std::iter::from_fn(move || loop {
-        if in_progress != 0 {
-            let bit_pos = in_progress.trailing_zeros();
-            in_progress ^= 1 << bit_pos;
-            return Some((byte_idx * 8) + (bit_pos as usize));
+    std::iter::from_fn(move || {
+        loop {
+            if in_progress != 0 {
+                let bit_pos = in_progress.trailing_zeros();
+                in_progress ^= 1 << bit_pos;
+                return Some((byte_idx * 8) + (bit_pos as usize));
+            }
+            byte_idx += 1;
+            in_progress = *bytes.get(byte_idx)?;
         }
-        byte_idx += 1;
-        in_progress = *bytes.get(byte_idx)?;
     })
 }
 

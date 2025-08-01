@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic() {
         let metric_registry = Arc::new(metric::Registry::new());
-        let serve = TestCacheServer::bind_ephemeral(&metric_registry);
+        let serve = TestCacheServer::bind_ephemeral(&metric_registry).await;
         let client = serve.client();
 
         let key = CacheKey::Partition(1);
@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_size() {
         let metric_registry = Arc::new(metric::Registry::new());
-        let serve = TestCacheServer::bind_ephemeral(&metric_registry);
+        let serve = TestCacheServer::bind_ephemeral(&metric_registry).await;
         let client = serve.client();
 
         let v1 = CacheValue::new("123".into(), 2);
