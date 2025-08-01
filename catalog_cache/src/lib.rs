@@ -156,8 +156,15 @@ impl CacheValue {
 
     /// The size of the data stored for this cache value.
     #[inline]
-    pub fn data_len(&self) -> usize {
-        self.data.as_ref().map_or(0, |d| d.len())
+    pub fn size(&self) -> usize {
+        let Self {
+            data,
+            // generation is not heap-allocated
+            generation: _,
+            etag,
+        } = self;
+
+        data.as_ref().map_or(0, |d| d.len()) + etag.as_ref().map_or(0, |e| e.len())
     }
 
     /// The generation of this cache data

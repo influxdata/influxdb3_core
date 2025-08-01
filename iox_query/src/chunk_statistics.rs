@@ -154,6 +154,7 @@ where
                     min_value,
                     max_value,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 }
             }
             _ => {
@@ -195,11 +196,10 @@ where
 
                 // If the column is a tag, and there is any server-side bucketing information,
                 // add the bucket info to the pruning oracle builder.
-                if t == InfluxColumnType::Tag {
-                    if let Some(bucket_info) = bucket_info {
-                        pruning_oracle_builder
-                            .insert(Arc::from(field.name().to_string()), bucket_info);
-                    }
+                if t == InfluxColumnType::Tag
+                    && let Some(bucket_info) = bucket_info
+                {
+                    pruning_oracle_builder.insert(Arc::from(field.name().to_string()), bucket_info);
                 }
 
                 ColumnStatistics {
@@ -207,6 +207,7 @@ where
                     min_value,
                     max_value,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 }
             }
         };
@@ -316,6 +317,7 @@ mod tests {
                         min_value: Precision::Exact(dict("aaa")),
                         max_value: Precision::Exact(dict("bbb")),
                         distinct_count: Precision::Absent,
+                        sum_value: Precision::Absent,
                     },
                     // tag2
                     ColumnStatistics::default(),
@@ -329,6 +331,7 @@ mod tests {
                         min_value: Precision::Exact(ScalarValue::from(10i64)),
                         max_value: Precision::Exact(ScalarValue::from(20i64)),
                         distinct_count: Precision::Absent,
+                        sum_value: Precision::Absent,
                     },
                     // field_string
                     ColumnStatistics::default(),
@@ -340,6 +343,7 @@ mod tests {
                         min_value: Precision::Exact(timestamptz_nano(10)),
                         max_value: Precision::Exact(timestamptz_nano(20)),
                         distinct_count: Precision::Absent,
+                        sum_value: Precision::Absent,
                     },
                 ],
             };
@@ -380,6 +384,7 @@ mod tests {
                     min_value: Precision::Exact(timestamptz_nano(10)),
                     max_value: Precision::Exact(timestamptz_nano(20)),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -417,6 +422,7 @@ mod tests {
                     min_value: Precision::Exact(timestamptz_nano(12)),
                     max_value: Precision::Exact(timestamptz_nano(22)),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };

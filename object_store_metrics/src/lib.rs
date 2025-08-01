@@ -13,7 +13,7 @@ use iox_time::TimeProvider;
 
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 
 use crate::{
@@ -292,7 +292,7 @@ impl ObjectStore for ObjectStoreMetrics {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         let recorder = MetricsWithBytesRecorder::new(
             Arc::clone(&self.put_multipart_opts),
@@ -336,7 +336,7 @@ impl ObjectStore for ObjectStoreMetrics {
         wrap_getresult_res(res, recorder).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
         let mut recorder = MetricsWithBytesRecorder::new(
             Arc::clone(&self.get_range),
             &self.time_provider,
@@ -352,7 +352,7 @@ impl ObjectStore for ObjectStoreMetrics {
         res
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         let mut recorder = MetricsWithBytesRecorder::new(
             Arc::clone(&self.get_ranges),
             &self.time_provider,
@@ -422,7 +422,7 @@ impl ObjectStore for ObjectStoreMetrics {
             .boxed()
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let recorder = MetricsWithCountRecorder::new(
             Arc::clone(&self.list),
             &self.time_provider,
@@ -446,7 +446,7 @@ impl ObjectStore for ObjectStoreMetrics {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, Result<ObjectMeta>> {
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         let recorder = MetricsWithCountRecorder::new(
             Arc::clone(&self.list_with_offset),
             &self.time_provider,
@@ -1688,7 +1688,7 @@ mod tests {
         let capture = capture();
         let path = path();
         let store = MockStore::new()
-            .mock_next(MockCall::PutMultipartOpts {
+            .mock_next(MockCall::PutMultipartOptions {
                 params: (path.clone(), Default::default()),
                 barriers: vec![],
                 res: Ok(multipart_upload_ok()),
@@ -2470,12 +2470,15 @@ mod tests {
     async fn test_getranges() {
         let capture = capture();
         let path = path();
-        let ranges = &[0..2, 1..2, 0..1];
+        let ranges_usize = [0..2usize, 1..2, 0..1];
+        let ranges_u64 = ranges_usize
+            .clone()
+            .map(|r| (r.start as u64)..(r.end as u64));
         let store = MockStore::new()
             .mock_next(MockCall::GetRanges {
-                params: (path.clone(), ranges.to_vec()),
+                params: (path.clone(), ranges_u64.to_vec()),
                 barriers: vec![],
-                res: Ok(ranges
+                res: Ok(ranges_usize
                     .iter()
                     .map(|r| Bytes::from_static(&DATA[r.clone()]))
                     .collect()),
@@ -2486,7 +2489,7 @@ mod tests {
         let time = Arc::new(MockProvider::new(Time::MIN));
         let store = ObjectStoreMetrics::new(store, time, "bananas", &metrics, Bucket::None);
 
-        store.get_ranges(&path, ranges).await.unwrap();
+        store.get_ranges(&path, &ranges_u64).await.unwrap();
 
         assert_counter_value(
             &metrics,
@@ -3009,7 +3012,7 @@ mod tests {
                 res: Ok(GetResult {
                     payload: GetResultPayload::File(file, PathBuf::from(path.to_string())),
                     meta: object_meta(),
-                    range: 0..DATA.len(),
+                    range: 0..(DATA.len() as u64),
                     attributes: Default::default(),
                 }),
             })

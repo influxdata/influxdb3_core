@@ -13,10 +13,11 @@ use arrow::{
 use bytes::Bytes;
 use data_types::TransitionPartitionId;
 use datafusion::{
+    catalog::memory::DataSourceExec,
     datasource::{
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
+        physical_plan::{FileScanConfigBuilder, ParquetSource},
     },
     error::DataFusionError,
     execution::runtime_env::RuntimeEnv,
@@ -27,7 +28,6 @@ use datafusion_util::config::{
     iox_session_config, register_iox_object_store, table_parquet_options,
 };
 use object_store::{DynObjectStore, ObjectMeta, PutPayload};
-use observability_deps::tracing::*;
 use schema::Projection;
 use std::{
     fmt::Display,
@@ -36,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tracing::*;
 
 /// Errors returned during a Parquet "put" operation, covering [`RecordBatch`]
 /// pull from the provided stream, encoding, and finally uploading the bytes to
@@ -97,14 +98,14 @@ impl std::fmt::Display for StorageId {
     }
 }
 
-/// Inputs required to build a [`ParquetExec`] for one or multiple files.
+/// Inputs required to build a [`DataSourceExec`] for one or multiple files.
 ///
 /// The files shall be grouped by [`object_store_url`](Self::object_store_url). For each each object store, you shall
-/// create one [`ParquetExec`] and put each file into its own "file group".
+/// create one [`DataSourceExec`] and put each file into its own "file group".
 ///
-/// [`ParquetExec`]: datafusion::datasource::physical_plan::ParquetExec
+/// [`DataSourceExec`]: datafusion::datasource::memory::DataSourceExec
 #[derive(Debug, Clone)]
-pub struct ParquetExecInput {
+pub struct DataSourceExecInput {
     /// Store where the file is located.
     pub object_store_url: ObjectStoreUrl,
 
@@ -115,7 +116,7 @@ pub struct ParquetExecInput {
     pub object_meta: ObjectMeta,
 }
 
-impl ParquetExecInput {
+impl DataSourceExecInput {
     /// Read parquet file into [`RecordBatch`]es.
     ///
     /// This should only be used for testing purposes.
@@ -127,12 +128,16 @@ impl ParquetExecInput {
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         // Compute final (output) schema after selection
         let schema = Arc::new(projection.project_schema(&schema).as_ref().clone());
-        let base_config = FileScanConfig::new(self.object_store_url.clone(), schema)
-            .with_file(PartitionedFile::from(self.object_meta.clone()));
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        let exec = builder.build();
+        let file_scan_config = FileScanConfigBuilder::new(
+            self.object_store_url.clone(),
+            schema,
+            Arc::new(ParquetSource::new(table_parquet_options())),
+        )
+        .with_file(PartitionedFile::from(self.object_meta.clone()))
+        .build();
+        let exec = DataSourceExec::from_data_source(file_scan_config);
         let exec_schema = exec.schema();
-        datafusion::physical_plan::collect(Arc::new(exec), session_ctx.task_ctx())
+        datafusion::physical_plan::collect(exec, session_ctx.task_ctx())
             .await
             .inspect(|batches| {
                 for batch in batches {
@@ -166,7 +171,7 @@ impl ParquetUploadInput {
         object_store: Arc<DynObjectStore>,
     ) -> Result<Self, DataFusionError> {
         Ok(Self {
-            object_store_url: ObjectStoreUrl::parse(format!("iox://{}/", id))?,
+            object_store_url: ObjectStoreUrl::parse(format!("iox://{id}/"))?,
             object_store_path: ParquetFilePath::from((partition_id, meta)).object_store_path(),
             object_store,
         })
@@ -283,7 +288,7 @@ impl ParquetStorage {
         partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
         runtime: Arc<RuntimeEnv>,
-    ) -> Result<(IoxParquetMetaData, usize), UploadError> {
+    ) -> Result<(IoxParquetMetaData, u64), UploadError> {
         let start = Instant::now();
 
         // Stream the record batches into a parquet file.
@@ -309,7 +314,7 @@ impl ParquetStorage {
         // Derive the correct object store path from the metadata.
         let path = ParquetFilePath::from((partition_id, meta)).object_store_path();
 
-        let file_size = data.len();
+        let file_size = data.len() as u64;
         let data = Bytes::from(data);
         let playload = PutPayload::from_bytes(data);
 
@@ -362,7 +367,7 @@ impl ParquetStorage {
         partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
         runtime: Arc<RuntimeEnv>,
-    ) -> Result<(IoxParquetMetaData, usize), UploadError> {
+    ) -> Result<(IoxParquetMetaData, u64), UploadError> {
         let upload_input = ParquetUploadInput::try_new(
             partition_id,
             meta,
@@ -408,13 +413,17 @@ impl ParquetStorage {
         Ok((parquet_meta, file_size))
     }
 
-    /// Inputs for [`ParquetExec`].
+    /// Inputs for [`DataSourceExec`].
     ///
-    /// See [`ParquetExecInput`] for more information.
+    /// See [`DataSourceExecInput`] for more information.
     ///
-    /// [`ParquetExec`]: datafusion::datasource::physical_plan::ParquetExec
-    pub fn parquet_exec_input(&self, path: &ParquetFilePath, file_size: usize) -> ParquetExecInput {
-        ParquetExecInput {
+    /// [`DataSourceExec`]: datafusion::datasource::memory::DataSourceExec
+    pub fn data_source_exec_input(
+        &self,
+        path: &ParquetFilePath,
+        file_size: u64,
+    ) -> DataSourceExecInput {
+        DataSourceExecInput {
             object_store_url: ObjectStoreUrl::parse(format!("iox://{}/", self.id))
                 .expect("valid object store URL"),
             object_store: Arc::clone(&self.object_store),
@@ -1082,7 +1091,7 @@ mod tests {
         meta: &IoxMetadata,
         batch: RecordBatch,
         upload_type: UploadType,
-    ) -> (IoxParquetMetaData, usize) {
+    ) -> (IoxParquetMetaData, u64) {
         let stream = Box::pin(MemoryStream::new(vec![batch]));
         let runtime = Arc::new(RuntimeEnv {
             memory_pool: unbounded_memory_pool(),
@@ -1113,11 +1122,11 @@ mod tests {
         meta: &IoxMetadata,
         selection: Projection<'_>,
         expected_schema: SchemaRef,
-        file_size: usize,
+        file_size: u64,
     ) -> Result<RecordBatch, DataFusionError> {
         let path: ParquetFilePath = (partition_id, meta).into();
         store
-            .parquet_exec_input(&path, file_size)
+            .data_source_exec_input(&path, file_size)
             .read_to_batches(expected_schema, selection, &store.test_df_context())
             .await
             .map(|mut batches| {

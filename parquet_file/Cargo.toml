@@ -21,7 +21,7 @@ generated_types = { path = "../generated_types" }
 hex = "0.4.3"
 iox_time = { path = "../iox_time" }
 object_store = { workspace = true }
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 parquet = { workspace = true }
 pbjson-types = { workspace = true }
 prost = { workspace = true }
@@ -29,7 +29,7 @@ schema = { path = "../schema" }
 snafu = "0.8"
 thiserror = "2.0.12"
 thrift = "0.17"
-tokio = { version = "1.45", features = [
+tokio = { version = "1.47", features = [
     "macros",
     "parking_lot",
     "rt",
@@ -42,5 +42,5 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
 assert_matches = "1"
-rand = "0.9.1"
+rand = "0.9.2"
 test_helpers = { version = "0.1.0", path = "../test_helpers" }

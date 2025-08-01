@@ -11,7 +11,6 @@ workspace = true
 [dependencies] # In alphabetical order
 async-trait = "0.1.88"
 dotenvy = "0.15.7"
-observability_deps = { path = "../observability_deps" }
 ordered-float = "5.0.0"
 parking_lot = "0.12"
 prometheus-parse = "0.2.5"
@@ -19,7 +18,8 @@ reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
 serde =  { version = "1.0", features = ["derive"] }
 tempfile = "3.20.0"
 thiserror = "2.0.12"
-tokio = { version = "1.45.1", default-features = false, features = ["time"] }
-tracing-log = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.47.0", default-features = false, features = ["time"] }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

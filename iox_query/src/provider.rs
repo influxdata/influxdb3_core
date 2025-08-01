@@ -20,8 +20,8 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
-use observability_deps::tracing::trace;
 use schema::{Schema, sort::SortKey};
+use tracing::trace;
 
 use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk, chunk_order_field, util::arrow_sort_key_exprs};
 
@@ -197,7 +197,7 @@ impl TableProvider for ChunkTableProvider {
     /// Project (keep only columns needed in the rest of the plan)
     ///   Filter (optional, apply any push down predicates)
     ///     Deduplicate (optional, if chunks overlap)
-    ///       ... Scan of Chunks (RecordBatchExec / ParquetExec / UnionExec, etc) ...
+    ///       ... Scan of Chunks (RecordBatchExec / DataSourceExec / UnionExec, etc) ...
     /// ```
     async fn scan(
         &self,
@@ -358,7 +358,7 @@ mod test {
         - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "       DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -374,7 +374,7 @@ mod test {
         - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "       DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -394,7 +394,7 @@ mod test {
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "         DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -407,7 +407,7 @@ mod test {
         - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "       DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
     }
@@ -452,7 +452,7 @@ mod test {
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   UnionExec"
         - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "     ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "     DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -467,7 +467,7 @@ mod test {
         - " ProjectionExec: expr=[tag1@1 as tag1, time@3 as time]"
         - "   UnionExec"
         - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "     ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "     DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -495,7 +495,7 @@ mod test {
         - "   FilterExec: false AND tag1@1 = CAST(foo AS Dictionary(Int32, Utf8))"
         - "     UnionExec"
         - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "       ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "       DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -507,7 +507,7 @@ mod test {
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
         - "   UnionExec"
         - "     RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "     ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "     DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
     }
@@ -557,7 +557,7 @@ mod test {
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "         DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -574,7 +574,7 @@ mod test {
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "         DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -597,7 +597,7 @@ mod test {
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "         DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
 
@@ -611,7 +611,7 @@ mod test {
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
-        - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
+        - "         DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
         );
     }

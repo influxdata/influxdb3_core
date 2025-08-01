@@ -80,6 +80,7 @@ impl AsExpr for str {
         Expr::Column(Column {
             relation: None,
             name: self.into(),
+            spans: Default::default(),
         })
     }
 }

@@ -9,12 +9,12 @@ pub use config::*;
 // Re-export tracing_subscriber
 pub use tracing_subscriber;
 
-use observability_deps::tracing::{self, Subscriber};
 use std::{
     cmp::min,
     io::{self, IsTerminal, Write},
 };
 use thiserror::Error;
+use tracing::{self, Subscriber};
 use tracing_subscriber::{
     EnvFilter, Layer,
     fmt::{self, MakeWriter, writer::BoxMakeWriter},
@@ -326,9 +326,9 @@ pub mod test_util {
     /// Utilities for testing logging and tracing.
     use super::*;
 
-    use observability_deps::tracing::{self, debug, error, info, trace, warn};
     use std::sync::{Arc, Mutex};
     use synchronized_writer::SynchronizedWriter;
+    use tracing::{self, debug, error, info, trace, warn};
     use tracing_subscriber::fmt::MakeWriter;
 
     /// Log writer suitable for using in tests.
@@ -428,9 +428,9 @@ mod tests {
     use super::*;
 
     use crate::test_util::*;
-    use observability_deps::tracing::{debug, error};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::{debug, error};
 
     #[test]
     fn simple_logging() {

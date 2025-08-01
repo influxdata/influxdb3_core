@@ -1,7 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{VecDeque, vec_deque};
 
 use crate::cache_system::HasSize;
 
+#[derive(bincode::Encode)]
 pub(crate) struct Fifo<T>
 where
     T: HasSize,
@@ -16,6 +17,10 @@ where
 {
     pub(crate) fn memory_size(&self) -> usize {
         self.memory_size
+    }
+
+    pub(crate) fn iter(&self) -> vec_deque::Iter<'_, T> {
+        self.queue.iter()
     }
 
     pub(crate) fn push_back(&mut self, o: T) {
@@ -54,5 +59,20 @@ where
         f.debug_struct("Fifo")
             .field("memory_size", &self.memory_size)
             .finish_non_exhaustive()
+    }
+}
+
+// bincode Decode implementation for Fifo
+impl<T, Q> bincode::Decode<Q> for Fifo<T>
+where
+    T: bincode::Decode<Q> + HasSize + bincode::Encode,
+{
+    fn decode<D: bincode::de::Decoder<Context = Q>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let queue: std::collections::VecDeque<T> = bincode::Decode::decode(decoder)?;
+        let memory_size: usize = bincode::Decode::decode(decoder)?;
+
+        Ok(Self { queue, memory_size })
     }
 }

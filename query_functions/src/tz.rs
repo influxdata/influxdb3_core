@@ -2,16 +2,15 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::timezone::Tz;
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{ExprSchema, internal_err, plan_err};
+use datafusion::common::{internal_err, plan_err};
 use datafusion::error::Result;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TIMEZONE_WILDCARD, TypeSignature, Volatility,
 };
-use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 
 pub(crate) const TZ_UDF_NAME: &str = "tz";
@@ -76,45 +75,44 @@ impl ScalarUDFImpl for TzUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        internal_err!("tz should call return_type_from_exprs")
+        internal_err!("tz should call return_type_from_args")
     }
 
-    fn return_type_from_exprs(
-        &self,
-        args: &[Expr],
-        _schema: &dyn ExprSchema,
-        _arg_types: &[DataType],
-    ) -> Result<DataType> {
-        match args.len() {
-            1 => Ok(DataType::Timestamp(
-                TimeUnit::Nanosecond,
-                Some(Arc::from("UTC")),
-            )),
+    fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
+        match args.arg_fields.len() {
+            1 => Ok(Arc::new(Field::new(
+                self.name(),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                false,
+            ))),
             2 => {
-                let Expr::Literal(ScalarValue::Utf8(Some(tz))) = &args[1] else {
+                let Some(ScalarValue::Utf8(Some(tz))) = &args.scalar_arguments[1] else {
                     return plan_err!(
                         "tz requires its second argument to be a timezone string, got {:?}",
-                        &args[1]
+                        &args.scalar_arguments[1]
                     );
                 };
-
                 Self::is_valid_timezone(tz)?;
 
-                Ok(DataType::Timestamp(
-                    TimeUnit::Nanosecond,
-                    Some(Arc::from(tz.as_str())),
-                ))
+                Ok(Arc::new(Field::new(
+                    self.name(),
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from(tz.as_str()))),
+                    false,
+                )))
             }
             _ => {
-                plan_err!("tz expects 1 or 2 arguments, got {:?}", args.len())
+                plan_err!(
+                    "tz expects 1 or 2 arguments, got {:?}",
+                    args.arg_fields.len()
+                )
             }
         }
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        let new_tz = match args.len() {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let new_tz = match args.args.len() {
             1 => "UTC",
-            2 => match &args[1] {
+            2 => match &args.args[1] {
                 ColumnarValue::Scalar(ScalarValue::Utf8(tz)) => match tz {
                     Some(tz) => {
                         Self::is_valid_timezone(tz)?;
@@ -131,7 +129,7 @@ impl ScalarUDFImpl for TzUDF {
             _ => return plan_err!("TZ expects one or two arguments"),
         };
 
-        match &args[0] {
+        match &args.args[0] {
             ColumnarValue::Scalar(scalar) => match scalar {
                 ScalarValue::TimestampNanosecond(epoch_nanos, _) => Ok(ColumnarValue::Scalar(
                     ScalarValue::TimestampNanosecond(*epoch_nanos, Some(Arc::from(new_tz))),
@@ -175,7 +173,19 @@ mod tests {
             Some(TODAY),
             None,
         ))];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("UTC")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -192,7 +202,19 @@ mod tests {
             Some(TODAY),
             Some(Arc::from("UTC")),
         ))];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("UTC")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -205,7 +227,19 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("UTC".into()))),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("UTC")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -222,7 +256,19 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("America/New_York".into()))),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("America/New_York")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -238,7 +284,19 @@ mod tests {
             )),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("America/New_York".into()))),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("America/New_York")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -255,7 +313,16 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("+05:00".into()))),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -271,7 +338,19 @@ mod tests {
             )),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("+05:00".into()))),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("+05:00")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -292,10 +371,21 @@ mod tests {
             ColumnarValue::Array(arr),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("Europe/Brussels".to_owned()))),
         ];
-        // let result = udf.invoke_batch(&args, args.len());
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("Europe/Brussels")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Array(array) => as_timestamp_nanosecond_array(&array).unwrap().clone(),
-            _ => panic!("Expected scalar value"),
+            _ => panic!("Expected array"),
         };
 
         let mut expected =
@@ -313,7 +403,16 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(TODAY), None)),
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("NewYork".into()))),
         ];
-        let result = udf.invoke_batch(&args, args.len());
+        let arg_fields = arg_to_fields(&args);
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 13,
+            return_field: return_field(DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some(Arc::from("NewYork")),
+            )),
+        });
         assert!(result.is_err());
         assert!(
             result
@@ -330,7 +429,13 @@ mod tests {
             Some(100),
             None,
         ))];
-        let result = udf.invoke_batch(&args, args.len());
+        let arg_fields = arg_to_fields(&args);
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 13,
+            return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains(
             "TZ expects a nanosecond timestamp as the first parameter, got Timestamp(Second, None)"
@@ -341,7 +446,13 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::TimestampSecond(Some(100), None)),
             ColumnarValue::Scalar(ScalarValue::Int64(Some(100))),
         ];
-        let result = udf.invoke_batch(&args, args.len());
+        let arg_fields = arg_to_fields(&args);
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 13,
+            return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains(
             "TZ expects the second argument to be a string defining the desired timezone"
@@ -353,8 +464,14 @@ mod tests {
             Some(TODAY + 2 * 1_000_000_000),
         ]));
         let args = vec![ColumnarValue::Array(arr)];
+        let arg_fields = arg_to_fields(&args);
 
-        let result = udf.invoke_batch(&args, args.len());
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 13,
+            return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        });
         assert!(result.is_err());
         assert!(
             result
@@ -362,5 +479,16 @@ mod tests {
                 .to_string()
                 .contains("TZ expects nanosecond timestamp data, got Int64")
         );
+    }
+
+    fn arg_to_fields(args: &[ColumnarValue]) -> Vec<FieldRef> {
+        args.iter()
+            .enumerate()
+            .map(|(idx, val)| Arc::new(Field::new(format!("arg_{idx}"), val.data_type(), false)))
+            .collect()
+    }
+
+    fn return_field(dt: DataType) -> FieldRef {
+        Arc::new(Field::new("r", dt, false))
     }
 }

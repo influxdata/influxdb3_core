@@ -60,7 +60,7 @@ macro_rules! assert_counter {
             .expect("failed to find metric with provided attributes")
             .fetch();
 
-        $(assert_eq!(counter, $value, "counter value mismatch");)*
+        $(assert_eq!(counter, $value, "counter value mismatch for {}", $name);)*
     };
 }
 

@@ -123,6 +123,7 @@ impl<'a> DFStatsAggregator<'a> {
                 max_value: update_max_value,
                 min_value: update_min_value,
                 distinct_count: _update_distinct_count,
+                sum_value: _sum_value,
             } = update_col;
 
             *base_null_count = base_null_count.add(update_null_count);
@@ -163,6 +164,7 @@ impl<'a> DFStatsAggregator<'a> {
                     max_value: col.max_value.unwrap_or(Precision::Absent),
                     min_value: col.min_value.unwrap_or(Precision::Absent),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 })
                 .collect(),
         }
@@ -212,6 +214,7 @@ pub fn build_statistics_for_chunks(
                             max_value: Precision::Exact(order.clone()),
                             min_value: Precision::Exact(order),
                             distinct_count: Precision::Exact(1),
+                            sum_value: Precision::Absent,
                         }],
                     },
                     schema,
@@ -264,12 +267,14 @@ mod test {
                     max_value: Precision::Absent,
                     min_value: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(0),
                     max_value: Precision::Absent,
                     min_value: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -297,12 +302,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(1_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("e".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -317,6 +324,7 @@ mod test {
                 max_value: Precision::Exact(ScalarValue::Utf8(Some("g".to_owned()))),
                 min_value: Precision::Exact(ScalarValue::Utf8(Some("c".to_owned()))),
                 distinct_count: Precision::Exact(42),
+                sum_value: Precision::Absent,
             }],
         };
         agg.update(&update_stats, &update_schema);
@@ -331,12 +339,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(1_001_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("g".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -364,12 +374,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(1_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("e".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -388,12 +400,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("g".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("c".to_owned()))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(10_000_000),
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(99))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(40))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -409,12 +423,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(40))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(1_001_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("g".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -442,12 +458,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(1_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("e".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -463,12 +481,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Absent,
                     max_value: Precision::Absent,
                     min_value: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -491,12 +511,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(1_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("e".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Exact(42),
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -509,12 +531,14 @@ mod test {
                     max_value: Precision::Exact(ScalarValue::UInt64(Some(100))),
                     min_value: Precision::Exact(ScalarValue::UInt64(Some(50))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 ColumnStatistics {
                     null_count: Precision::Exact(2_000),
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("e".to_owned()))),
                     min_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_owned()))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -647,27 +671,37 @@ mod test {
         let expected_stats = [
             ColumnStatistics {
                 null_count: Precision::Absent,
-                max_value: Precision::Exact(ScalarValue::Utf8(Some("MT".to_string()))),
-                min_value: Precision::Exact(ScalarValue::Utf8(Some("AL".to_string()))),
+                max_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("MT".to_string()))),
+                )),
+                min_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("AL".to_string()))),
+                )),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::Int64(Some(100))),
                 min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(20), None)),
                 min_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(10), None)),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::Int64(Some(6))),
                 min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
         ];
 
@@ -730,27 +764,37 @@ mod test {
         let expected_stats = [
             ColumnStatistics {
                 null_count: Precision::Absent,
-                max_value: Precision::Exact(ScalarValue::Utf8(Some("WA".to_string()))),
-                min_value: Precision::Exact(ScalarValue::Utf8(Some("AL".to_string()))),
+                max_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("WA".to_string()))),
+                )),
+                min_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("AL".to_string()))),
+                )),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::Int64(Some(100))),
                 min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(80), None)),
                 min_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(10), None)),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::Int64(Some(15))),
                 min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
         ];
 

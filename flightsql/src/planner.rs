@@ -29,9 +29,9 @@ use datafusion::{
 use futures::{TryStreamExt, stream::Peekable};
 use generated_types::Streaming;
 use iox_query::{QueryNamespace, exec::IOxSessionContext};
-use observability_deps::tracing::debug;
 use prost::Message;
 use snafu::OptionExt;
+use tracing::debug;
 
 use crate::{Error, error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data};
 use crate::{FlightSQLCommand, PreparedStatementHandle};

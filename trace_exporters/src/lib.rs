@@ -201,10 +201,10 @@ fn jaeger_exporter(config: &TracingConfig) -> Result<Arc<AsyncExporter>> {
 
     // add hostname
     const TAG_HOSTNAME: &str = "hostname";
-    if !tags.iter().any(|t| t.key() == TAG_HOSTNAME) {
-        if let Ok(hostname) = std::env::var("HOSTNAME") {
-            tags.push(JaegerTag::new(TAG_HOSTNAME, hostname));
-        }
+    if !tags.iter().any(|t| t.key() == TAG_HOSTNAME)
+        && let Ok(hostname) = std::env::var("HOSTNAME")
+    {
+        tags.push(JaegerTag::new(TAG_HOSTNAME, hostname));
     }
 
     // commit tags

@@ -9,7 +9,10 @@ use crate::{NUMERICS, error, plan::util::find_exprs_in_exprs};
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
-    logical_expr::{Expr, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
+    logical_expr::{
+        Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+        expr::ScalarFunction,
+    },
     physical_plan::ColumnarValue,
 };
 use std::{
@@ -78,7 +81,7 @@ impl ScalarUDFImpl for MovingAverageUDF {
         Ok(DataType::Float64)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{MOVING_AVERAGE_UDF_NAME} should not exist in the final logical plan"
         ))
@@ -132,7 +135,7 @@ impl ScalarUDFImpl for DifferenceUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{DIFFERENCE_UDF_NAME} should not exist in the final logical plan"
         ))
@@ -181,7 +184,7 @@ impl ScalarUDFImpl for ElapsedUDF {
         Ok(DataType::Int64)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{ELAPSED_UDF_NAME} should not exist in the final logical plan"
         ))
@@ -229,7 +232,7 @@ impl ScalarUDFImpl for NonNegativeDifferenceUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{NON_NEGATIVE_DIFFERENCE_UDF_NAME} should not exist in the final logical plan"
         ))
@@ -248,6 +251,80 @@ static NON_NEGATIVE_DIFFERENCE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
             NUMERICS
                 .iter()
                 .map(|dt| TypeSignature::Exact(vec![dt.clone()]))
+                .collect(),
+            Volatility::Immutable,
+        ),
+    }))
+});
+
+const INTEGRAL_UDF_NAME: &str = "integral";
+
+#[derive(Debug)]
+struct IntegralUDF {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for IntegralUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        INTEGRAL_UDF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        error::internal(format!(
+            "{INTEGRAL_UDF_NAME} should not exist in the final logical plan"
+        ))
+    }
+}
+
+/// Create an expression to represent the `INTEGRAL` function.
+///
+/// INTEGRAL is represented as a SUM wrapping an internal integral window function.
+pub(crate) fn integral(args: Vec<Expr>) -> Expr {
+    INTEGRAL.call(args)
+}
+
+pub(crate) fn is_integral_udf(expr: &Expr) -> bool {
+    let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr else {
+        return false;
+    };
+    func.name() == INTEGRAL_UDF_NAME
+}
+
+pub(crate) fn find_integral_udfs(exprs: &[Expr]) -> Vec<Expr> {
+    find_exprs_in_exprs(exprs, &is_integral_udf)
+}
+
+/// Definition of the `INTEGRAL` function.
+static INTEGRAL: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::from(IntegralUDF {
+        signature: Signature::one_of(
+            NUMERICS
+                .iter()
+                .flat_map(|dt| {
+                    vec![
+                        TypeSignature::Exact(vec![dt.clone()]),
+                        TypeSignature::Exact(vec![
+                            dt.clone(),
+                            DataType::Duration(TimeUnit::Nanosecond),
+                        ]),
+                        TypeSignature::Exact(vec![
+                            dt.clone(),
+                            DataType::Interval(IntervalUnit::MonthDayNano),
+                        ]),
+                    ]
+                })
                 .collect(),
             Volatility::Immutable,
         ),
@@ -278,7 +355,7 @@ impl ScalarUDFImpl for DerivativeUDF {
         Ok(DataType::Float64)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{DERIVATIVE_UDF_NAME} should not exist in the final logical plan"
         ))
@@ -339,7 +416,7 @@ impl ScalarUDFImpl for NonNegativeDerivativeUDF {
         Ok(DataType::Float64)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{NON_NEGATIVE_DERIVATIVE_UDF_NAME} should not exist in the final logical plan"
         ))
@@ -404,7 +481,7 @@ impl ScalarUDFImpl for CumulativeSumUDF {
         Ok(arg_types[0].clone())
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         error::internal(format!(
             "{CUMULATIVE_SUM_UDF_NAME} should not exist in the final logical plan"
         ))

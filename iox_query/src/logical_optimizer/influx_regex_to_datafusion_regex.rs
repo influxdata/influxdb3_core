@@ -32,16 +32,6 @@ impl OptimizerRule for InfluxRegexToDataFusionRegex {
         "influx_regex_to_datafusion_regex"
     }
 
-    fn try_optimize(
-        &self,
-        _plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> datafusion::error::Result<Option<LogicalPlan>> {
-        Err(DataFusionError::Internal(
-            "Should have called InfluxRegexToDataFusionRegex::rewrite".into(),
-        ))
-    }
-
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::BottomUp)
     }
@@ -84,7 +74,7 @@ impl TreeNodeRewriter for InfluxRegexToDataFusionRegex {
                 if (args.len() == 2)
                     && ((name == REGEX_MATCH_UDF_NAME) || (name == REGEX_NOT_MATCH_UDF_NAME))
                 {
-                    if let Expr::Literal(ScalarValue::Utf8(Some(s))) = &args[1] {
+                    if let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = &args[1] {
                         let s = clean_non_meta_escapes(s);
                         let op = match name {
                             REGEX_MATCH_UDF_NAME => Operator::RegexMatch,

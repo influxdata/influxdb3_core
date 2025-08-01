@@ -23,7 +23,7 @@ pub fn overlap(value_ranges: &[(ScalarValue, ScalarValue)]) -> Result<bool, Data
     let value_ranges_iter = value_ranges.iter().flat_map(|(min, max)| {
         // panics if min > max
         if min > max {
-            panic!("min ({:?}) > max ({:?})", min, max);
+            panic!("min ({min:?}) > max ({max:?})");
         }
         vec![min.clone(), max.clone()]
     });

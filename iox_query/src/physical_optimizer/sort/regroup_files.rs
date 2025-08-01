@@ -10,7 +10,8 @@ use datafusion::{
     },
     datasource::{
         listing::{FileRange, PartitionedFile},
-        physical_plan::{ParquetExec, parquet::ParquetExecBuilder},
+        physical_plan::{FileGroup, FileScanConfig},
+        source::DataSourceExec,
     },
     error::Result,
     physical_expr::LexOrdering,
@@ -18,9 +19,9 @@ use datafusion::{
 };
 use itertools::Itertools;
 use object_store::path::Path;
-use observability_deps::tracing::trace;
+use tracing::trace;
 
-/// This function is to split all files in the same ParquetExec into different groups/DF partitions and
+/// This function is to split all files in the same ParquetSource into different groups/DF partitions and
 /// set the `preserve_partitioning` so they will be executed sequentially. The files will later be re-ordered
 /// (if non-overlapping) by lexical range.
 ///
@@ -30,36 +31,29 @@ pub(crate) fn split_and_regroup_parquet_files(
     plan: Arc<dyn ExecutionPlan>,
     ordering_req: &LexOrdering,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() {
-        if !sort_exec
+    if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>()
+        && (!sort_exec
             .properties()
             .equivalence_properties()
             .ordering_satisfy(ordering_req)
-            || !sort_exec.preserve_partitioning()
-        {
-            // halt on DAG branch
-            Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
-        } else {
-            // continue down
-            Ok(Transformed::no(plan))
-        }
+            || !sort_exec.preserve_partitioning())
+    {
+        // halt on DAG branch
+        Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
     } else if plan.as_any().downcast_ref::<DeduplicateExec>().is_some() {
         Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
-    } else if let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() {
-        if let Some(transformed) =
-            transform_parquet_exec_to_regrouped_disjoint_ranges(parquet_exec, ordering_req)?
-        {
-            Ok(Transformed::yes(transformed))
-        } else {
-            Ok(Transformed::no(plan))
-        }
+    } else if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some(transformed) =
+            transform_data_source_exec_to_regrouped_disjoint_ranges(data_source_exec, ordering_req)?
+    {
+        Ok(Transformed::yes(transformed))
     } else {
         Ok(Transformed::no(plan))
     }
 }
 
-/// Transform a ParquetExec with N files in various groupings,
-/// into a ParquetExec into N groups each include one file. This singular file
+/// Transform a DataSourceExec with N files in various groupings,
+/// into a DataSourceExec into N groups each include one file. This singular file
 /// may actually be multiple ranged-scans of the same file.
 ///
 /// This function will return None if
@@ -67,33 +61,44 @@ pub(crate) fn split_and_regroup_parquet_files(
 ///     and produce null values that leads to absent statistics)
 ///   - Some files overlap (the min/max ranges cannot be made disjoint)
 ///
-/// The output ParquetExec's are ordered to match the provided [`LexOrdering`].
+/// The output DataSourceExec's are ordered to match the provided [`LexOrdering`].
 ///
 /// For example:
 /// ```text
-/// ParquetExec(groups=[[file1,file2], [file3]])
+/// DataSourceExec(groups=[[file1,file2], [file3]])
 /// ```
 /// Is rewritten so each file is in its own group and the files are lex ordered.
 /// ```text
-/// ParquetExec(groups=[[file1], [file2], [file3]])
+/// DataSourceExec(groups=[[file1], [file2], [file3]])
 /// ```
 ///
 /// For example with ranged scans:
 /// ```text
-/// ParquetExec(groups=[[file1:0..10,file2], [file1:10..20]])
+/// DataSourceExec(groups=[[file1:0..10,file2], [file1:10..20]])
 /// ```
 /// Is rewritten to group the ranged scans together.
 /// ```text
-/// ParquetExec(groups=[[file1:0..10,file1:10..20], [file2]])
+/// DataSourceExec(groups=[[file1:0..10,file1:10..20], [file2]])
 /// ```
-pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
-    parquet_exec: &ParquetExec,
+pub(crate) fn transform_data_source_exec_to_regrouped_disjoint_ranges(
+    data_source_exec: &DataSourceExec,
     ordering_req: &LexOrdering,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    // Extract partitioned files from the ParquetExec
-    let base_config = parquet_exec.base_config();
-    let files = base_config.file_groups.iter().flatten().collect::<Vec<_>>();
-    let schema = Arc::clone(&base_config.file_schema);
+    let Some(cfg) = data_source_exec
+        .data_source()
+        .as_any()
+        .downcast_ref::<FileScanConfig>()
+    else {
+        return Ok(None);
+    };
+
+    // Extract partitioned files from the DataSourceExec
+    let files = cfg
+        .file_groups
+        .iter()
+        .flat_map(|g| g.iter())
+        .collect::<Vec<_>>();
+    let schema = Arc::clone(&cfg.file_schema);
 
     // Regroup partitioned files from same file source
     let regrouped_files = group_same_file_sources(files)?;
@@ -142,20 +147,10 @@ pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
 
     // Assigned new partitioned file groups to the new base config,
     // and update the output ordering to match the transformed ordering.
-    let mut new_base_config = base_config.clone();
-    new_base_config.file_groups = new_partitioned_file_groups;
+    let mut new_file_scan_config = cfg.clone();
+    new_file_scan_config.file_groups = new_partitioned_file_groups;
 
-    // TODO: replace with datasource exec
-    let mut builder = ParquetExecBuilder::new_with_options(
-        new_base_config,
-        parquet_exec.table_parquet_options().clone(),
-    );
-    if let Some(predicate) = parquet_exec.predicate() {
-        builder = builder.with_predicate(Arc::clone(predicate));
-    }
-    let new_parquet_exec = builder.build();
-
-    Ok(Some(Arc::new(new_parquet_exec) as Arc<dyn ExecutionPlan>))
+    Ok(Some(DataSourceExec::from_data_source(new_file_scan_config)))
 }
 
 /// Group [`PartitionedFile`] which come from the same file source, into the same
@@ -165,7 +160,7 @@ pub(crate) fn transform_parquet_exec_to_regrouped_disjoint_ranges(
 /// into a single range scan.
 ///
 /// Returns an error if the file partitions, from the same file, are overlapping.
-fn group_same_file_sources(files: Vec<&PartitionedFile>) -> Result<Vec<Vec<PartitionedFile>>> {
+fn group_same_file_sources(files: Vec<&PartitionedFile>) -> Result<Vec<FileGroup>> {
     let mut map: HashMap<&Path, Vec<PartitionedFile>> = HashMap::with_capacity(files.len());
 
     for file in files {
@@ -194,6 +189,7 @@ fn group_same_file_sources(files: Vec<&PartitionedFile>) -> Result<Vec<Vec<Parti
     Ok(map
         .into_values()
         .map(combine_adjacent_ranges_from_same_filegroup)
+        .map(FileGroup::new)
         .collect())
 }
 
@@ -271,7 +267,7 @@ mod tests {
 
     use arrow::{compute::SortOptions, datatypes::Schema};
     use datafusion::{
-        datasource::{physical_plan::ParquetExec, provider_as_source},
+        datasource::provider_as_source,
         logical_expr::LogicalPlanBuilder,
         physical_expr::{LexOrdering, PhysicalSortExpr},
         physical_plan::expressions::col,
@@ -326,27 +322,28 @@ mod tests {
 
         // chunks
         let c = TestChunk::new("t")
+            .with_row_count(1_000_000)
             .with_tag_column("tag")
             .with_sort_key(SortKey::from_columns([Arc::from("tag"), Arc::from("time")]))
             .with_dummy_parquet_file_and_size(100000000)
             .with_may_contain_pk_duplicates(false);
 
         // add 5 non-overlapping files
-        let c_file_3 =
-            c.clone()
-                .with_time_column_with_full_stats(Some(65), Some(69), 1_000_000, None);
-        let c_file_4 =
-            c.clone()
-                .with_time_column_with_full_stats(Some(60), Some(64), 1_000_000, None);
-        let c_file_5 =
-            c.clone()
-                .with_time_column_with_full_stats(Some(55), Some(58), 1_000_000, None);
-        let c_file_6 =
-            c.clone()
-                .with_time_column_with_full_stats(Some(50), Some(54), 1_000_000, None);
-        let c_file_7 =
-            c.clone()
-                .with_time_column_with_full_stats(Some(45), Some(49), 1_000_000, None);
+        let c_file_3 = c
+            .clone()
+            .with_time_column_with_full_stats(Some(65), Some(69), None);
+        let c_file_4 = c
+            .clone()
+            .with_time_column_with_full_stats(Some(60), Some(64), None);
+        let c_file_5 = c
+            .clone()
+            .with_time_column_with_full_stats(Some(55), Some(58), None);
+        let c_file_6 = c
+            .clone()
+            .with_time_column_with_full_stats(Some(50), Some(54), None);
+        let c_file_7 = c
+            .clone()
+            .with_time_column_with_full_stats(Some(45), Some(49), None);
 
         // Schema & provider
         let schema = c_file_3.schema().clone();
@@ -370,7 +367,7 @@ mod tests {
         .build()
         .unwrap();
 
-        // Reproducer: use the same starting ParquetExec as the test case
+        // Reproducer: use the same starting DataSourceExec as the test case
         let plan = state.create_physical_plan(&plan).await.unwrap();
 
         // Reproducer: use the same ordering as the test case
@@ -383,25 +380,29 @@ mod tests {
         (arrow_schema, sort_ordering, plan)
     }
 
-    /// Reproducer for the starting point of the parquet exec (without regrouping) for
+    /// Reproducer for the starting point of the `DataSourceExec` (without regrouping) for
     /// the test case [`order_union_sorted_inputs::tests::test_many_partition_files`].
     #[tokio::test]
     async fn test_repartitioned_files_are_overlapping_without_regrouping() {
-        // Reproducer: the same starting ParquetExec as the test case
+        // Reproducer: the same starting DataSourceExec as the test case
         let (arrow_schema, _, plan) = build_test_case_with_nonoverlapping_ranged_scans().await;
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"
-        - " ParquetExec: file_groups={4 groups: [[4.parquet:0..100000000, 8.parquet:0..25000000], [8.parquet:25000000..100000000, 5.parquet:0..50000000], [5.parquet:50000000..100000000, 6.parquet:0..75000000], [6.parquet:75000000..100000000, 7.parquet:0..100000000]]}, projection=[tag, time]"
-        "#
+            @r#"- " DataSourceExec: file_groups={4 groups: [[4.parquet:0..100000000, 8.parquet:0..25000000], [8.parquet:25000000..100000000, 5.parquet:0..50000000], [5.parquet:50000000..100000000, 6.parquet:0..75000000], [6.parquet:75000000..100000000, 7.parquet:0..100000000]]}, projection=[tag, time], file_type=parquet""#
         );
 
-        // Reproducer: the ParquetExec has a total of 8 partitioned file scans.
-        let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() else {
-            unreachable!()
-        };
-        let base_config = parquet_exec.base_config();
-        let partitioned_files = base_config.file_groups.iter().flatten().collect::<Vec<_>>();
+        // Reproducer: the DataSourceExec has a total of 8 partitioned file scans.
+        let data_source_exec = plan.as_any().downcast_ref::<DataSourceExec>().unwrap();
+        let file_scan_config = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        let partitioned_files = file_scan_config
+            .file_groups
+            .iter()
+            .flat_map(|g| g.iter())
+            .collect::<Vec<_>>();
         assert_eq!(partitioned_files.len(), 8);
 
         // Test Case: the partitioned file fragements provide min/max stats that are overlapped,
@@ -409,8 +410,12 @@ mod tests {
         let min_maxes = partitioned_files
             .into_iter()
             .map(|f| {
-                min_max_for_partitioned_filegroup("time", &vec![f.clone()], &arrow_schema)
-                    .expect("should get min/max")
+                min_max_for_partitioned_filegroup(
+                    "time",
+                    &FileGroup::new(vec![f.clone()]),
+                    &arrow_schema,
+                )
+                .expect("should get min/max")
             })
             .collect_vec();
         insta::assert_yaml_snapshot!(
@@ -429,39 +434,40 @@ mod tests {
     /// Such that the SPM can be replaced with a progressive eval.
     #[tokio::test]
     async fn test_after_regrouping_have_nonoverlapping_file_groups() {
-        // Reproducer: the same starting ParquetExec as the test case
+        // Reproducer: the same starting DataSourceExec as the test case
         let (arrow_schema, sort_ordering, plan) =
             build_test_case_with_nonoverlapping_ranged_scans().await;
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"
-        - " ParquetExec: file_groups={4 groups: [[4.parquet:0..100000000, 8.parquet:0..25000000], [8.parquet:25000000..100000000, 5.parquet:0..50000000], [5.parquet:50000000..100000000, 6.parquet:0..75000000], [6.parquet:75000000..100000000, 7.parquet:0..100000000]]}, projection=[tag, time]"
-        "#
+            @r#"- " DataSourceExec: file_groups={4 groups: [[4.parquet:0..100000000, 8.parquet:0..25000000], [8.parquet:25000000..100000000, 5.parquet:0..50000000], [5.parquet:50000000..100000000, 6.parquet:0..75000000], [6.parquet:75000000..100000000, 7.parquet:0..100000000]]}, projection=[tag, time], file_type=parquet""#
         );
 
         // Test Case: partitioned files will be regrouped based on same file source
         // e.g. file `8.parquet` range scans are together: `[8.parquet:0..25000000, 8.parquet:25000000..100000000]`
-        let Some(parquet_exec) = plan.as_any().downcast_ref::<ParquetExec>() else {
-            unreachable!()
-        };
-        let Some(regrouped_plan) =
-            transform_parquet_exec_to_regrouped_disjoint_ranges(parquet_exec, &sort_ordering)
-                .unwrap()
-        else {
+        let data_source_exec = plan.as_any().downcast_ref::<DataSourceExec>().unwrap();
+        let Some(regrouped_plan) = transform_data_source_exec_to_regrouped_disjoint_ranges(
+            data_source_exec,
+            &sort_ordering,
+        )
+        .unwrap() else {
             panic!("should regroup into nonoverlapping (disjoint) file groups");
         };
         insta::assert_yaml_snapshot!(
             format_execution_plan(&regrouped_plan),
-            @r#"- " ParquetExec: file_groups={5 groups: [[8.parquet:0..100000000], [7.parquet:0..100000000], [6.parquet:0..100000000], [5.parquet:0..100000000], [4.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC]""#
+            @r#"- " DataSourceExec: file_groups={5 groups: [[8.parquet:0..100000000], [7.parquet:0..100000000], [6.parquet:0..100000000], [5.parquet:0..100000000], [4.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet""#
         );
 
         // Test Case: the regrouped filegroups are non-overlapped.
-        let Some(regrouped_parquet_exec) = regrouped_plan.as_any().downcast_ref::<ParquetExec>()
-        else {
-            unreachable!()
-        };
-        let base_config = regrouped_parquet_exec.base_config();
-        let min_maxes = base_config
+        let regrouped_data_source_exec = regrouped_plan
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .unwrap();
+        let file_scan_config = regrouped_data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        let min_maxes = file_scan_config
             .file_groups
             .iter()
             .map(|file_group| {

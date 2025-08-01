@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use crate::display::pretty_format_batches;
 use arrow::{
-    array::{ArrayRef, StringArray, new_null_array},
+    array::{
+        ArrayRef, Float32Array, Float64Array, RecordBatchOptions, StringArray, downcast_array,
+        new_null_array,
+    },
     compute::kernels::sort::{SortColumn, SortOptions, lexsort},
-    datatypes::Schema,
+    datatypes::{DataType, Schema},
     error::ArrowError,
     record_batch::RecordBatch,
 };
@@ -228,11 +231,6 @@ static REGEX_LINESEP: LazyLock<Regex> =
 ///   `         |` -> `    |`
 static REGEX_COL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+\|").expect("col regex"));
 
-/// Matches line like `required_guarantees=[state in (CA, MA)]`
-static REGEX_REQUIRE_GUARANTEES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"required_guarantees=\[([^\]]*)\]").expect("require guarantees regex")
-});
-
 /// Matches line like `metrics=[foo=1, bar=2]`
 static REGEX_METRICS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"metrics=\[([^\]]*)\]").expect("metrics regex"));
@@ -241,11 +239,11 @@ static REGEX_METRICS: LazyLock<Regex> =
 static REGEX_TIMING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[0-9]+(\.[0-9]+)?.s").expect("timing regex"));
 
-/// Matches things like `FilterExec: .*` and `ParquetExec: .*`
+/// Matches things like `FilterExec: .*` and `DataSourceExec: .*`
 ///
 /// Should be used in combination w/ [`REGEX_TIME_OP`].
 static REGEX_FILTER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new("(?P<prefix>(FilterExec)|(ParquetExec): )(?P<expr>.*)").expect("filter regex")
+    Regex::new("(?P<prefix>(FilterExec)|(DataSourceExec): )(?P<expr>.*)").expect("filter regex")
 });
 
 /// Matches things like `time@3 < -9223372036854775808` and `time_min@2 > 1641031200399937022`
@@ -275,7 +273,7 @@ fn normalize_time_ops(s: &str) -> String {
 }
 
 /// A query to run with optional annotations
-#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Default, Clone)]
 pub struct Normalizer {
     /// If true, results are sorted first
     pub sorted_compare: bool,
@@ -300,18 +298,16 @@ pub struct Normalizer {
     /// if `true`, render tables without borders.
     pub no_table_borders: bool,
 
-    /// if `true`, normalize require guarantees in explain plans
-    /// with deterministics order
-    ///
-    /// Example: `required_guarantees=[state in (MA, CA)]`
-    ///   is normalized to `required_guarantees=[state in (CA, MA)]`
-    ///
-    /// Can be removed after <https://github.com/apache/datafusion/issues/12473>
-    /// is available which does the normalization in the explain plan itself.
-    pub normalized_required_guarantees: bool,
+    /// If true, do not compare the time column when comparing points
+    // This value is not used other than to indicate that the time column should be ignored
+    // by the insta test framework.
+    pub ignore_time_column: bool,
 
     /// If set, round floats to the specified number of decimal places
     pub rounded_floats: Option<usize>,
+
+    /// Formatter to turn [`RecordBatch`]es into text.
+    pub formatter: Formatter,
 }
 
 impl Normalizer {
@@ -321,23 +317,84 @@ impl Normalizer {
 
     /// Take the output of running the query and apply the specified normalizations to them
     pub fn normalize_results(&self, mut results: Vec<RecordBatch>) -> Vec<String> {
+        let Self {
+            sorted_compare,
+            sorted_tags: _,
+            normalized_uuids: _,
+            normalized_metrics: _,
+            normalized_filters: _,
+            no_table_borders: _,
+            ignore_time_column: _,
+            rounded_floats,
+            formatter,
+        } = self;
+
         // compare against sorted results, if requested
-        if self.sorted_compare && !results.is_empty() {
+        if *sorted_compare && !results.is_empty() {
             let schema = results[0].schema();
             let batch =
                 arrow::compute::concat_batches(&schema, &results).expect("concatenating batches");
             results = vec![sort_record_batch(batch)];
         }
 
-        let mut current_results = pretty_format_batches(&results)
-            .unwrap()
-            .trim()
-            .lines()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+        if let Some(rounded_floats) = rounded_floats {
+            let factor_u64 = 10u64.pow(*rounded_floats as u32);
+            let factor_f32 = factor_u64 as f32;
+            let factor_f64 = factor_u64 as f64;
+
+            results = results
+                .into_iter()
+                .map(|batch| {
+                    let (schema, columns, row_count) = batch.into_parts();
+
+                    let columns = columns
+                        .into_iter()
+                        .map(|array| match array.data_type() {
+                            DataType::Float32 => Arc::new(Float32Array::from_iter(
+                                downcast_array::<Float32Array>(&array)
+                                    .iter()
+                                    .map(|x| x.map(|x| (x * factor_f32).round() / factor_f32)),
+                            )) as _,
+                            DataType::Float64 => Arc::new(Float64Array::from_iter(
+                                downcast_array::<Float64Array>(&array)
+                                    .iter()
+                                    .map(|x| x.map(|x| (x * factor_f64).round() / factor_f64)),
+                            )) as _,
+                            _ => array,
+                        })
+                        .collect();
+
+                    RecordBatch::try_new_with_options(
+                        schema,
+                        columns,
+                        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+                    )
+                    .expect("creating new record batch")
+                })
+                .collect::<Vec<_>>();
+        }
+
+        let txt = formatter.format(results);
+        self.normalize_text(txt)
+    }
+
+    pub fn normalize_text(&self, txt: Vec<String>) -> Vec<String> {
+        let Self {
+            sorted_compare: _,
+            sorted_tags: _,
+            normalized_uuids,
+            normalized_metrics,
+            normalized_filters,
+            no_table_borders: _,
+            rounded_floats: _,
+            ignore_time_column: _,
+            formatter: _,
+        } = self;
+
+        let mut current_results = txt;
 
         // normalize UUIDs, if requested
-        if self.normalized_uuids {
+        if *normalized_uuids {
             let mut seen: HashMap<String, u128> = HashMap::new();
             current_results = current_results
                 .into_iter()
@@ -365,7 +422,7 @@ impl Normalizer {
         }
 
         // normalize metrics, if requested
-        if self.normalized_metrics {
+        if *normalized_metrics {
             current_results = current_results
                 .into_iter()
                 .map(|s| {
@@ -399,12 +456,12 @@ impl Normalizer {
         //
         // Converts:
         // FilterExec: time@2 < -9223372036854775808 OR time@2 > 1640995204240217000
-        // ParquetExec: limit=None, partitions={...}, predicate=time@2 > 1640995204240217000, pruning_predicate=time@2 > 1640995204240217000, output_ordering=[...], projection=[...]
+        // DataSourceExec: limit=None, partitions={...}, predicate=time@2 > 1640995204240217000, pruning_predicate=time@2 > 1640995204240217000, output_ordering=[...], projection=[...]
         //
         // to
         // FilterExec: time@2 < <REDACTED> OR time@2 > <REDACTED>
-        // ParquetExec: limit=None, partitions={...}, predicate=time@2 > <REDACTED>, pruning_predicate=time@2 > <REDACTED>, output_ordering=[...], projection=[...]
-        if self.normalized_filters {
+        // DataSourceExec: limit=None, partitions={...}, predicate=time@2 > <REDACTED>, pruning_predicate=time@2 > <REDACTED>, output_ordering=[...], projection=[...]
+        if *normalized_filters {
             current_results = current_results
                 .into_iter()
                 .map(|s| {
@@ -422,55 +479,104 @@ impl Normalizer {
                 .collect();
         }
 
-        // normalize require guarantees, if requested
-        // e.g required_guarantees=[state in (MA, CA)] -> required_guarantees=[state in (CA, MA)]
-        if self.normalized_required_guarantees {
-            current_results = current_results
-                .into_iter()
-                .map(|s| {
-                    REGEX_REQUIRE_GUARANTEES
-                        .replace_all(&s, |c: &Captures<'_>| {
-                            // split xxx(yyy) into xxx and (yyy)
-                            // find '(' and split the string into two parts xxx and (yyy)
-                            let (prefix, suffix) = c[1].split_once('(').unwrap_or((&c[1], ""));
-
-                            // remove ( and ) from suffix
-                            let suffix = suffix.trim_matches(|c| c == '(' || c == ')');
-
-                            // split suffix by ', ' and sort the elements
-                            let mut guarantees: Vec<_> = suffix.split(", ").collect();
-                            guarantees.sort();
-
-                            format!(
-                                "required_guarantees=[{}({})]",
-                                prefix,
-                                guarantees.join(", ")
-                            )
-                        })
-                        .to_string()
-                })
-                .collect();
-        }
-
         current_results
     }
 
     /// Adds information on what normalizations were applied to the input
     pub fn add_description(&self, output: &mut Vec<String>) {
-        if self.sorted_compare {
+        let Self {
+            sorted_compare,
+            sorted_tags,
+            normalized_uuids,
+            normalized_metrics,
+            normalized_filters,
+            no_table_borders,
+            rounded_floats,
+            ignore_time_column,
+            formatter: _,
+        } = self;
+
+        if *sorted_compare {
             output.push("-- Results After Sorting".into())
         }
-        if self.normalized_uuids {
+        if *sorted_tags {
+            output.push("-- Results After TagSorting".into())
+        }
+        if *normalized_uuids {
             output.push("-- Results After Normalizing UUIDs".into())
         }
-        if self.normalized_metrics {
+        if *normalized_metrics {
             output.push("-- Results After Normalizing Metrics".into())
         }
-        if self.normalized_filters {
+        if *normalized_filters {
             output.push("-- Results After Normalizing Filters".into())
         }
-        if self.no_table_borders {
+        if *no_table_borders {
             output.push("-- Results After No Table Borders".into())
+        }
+        if *ignore_time_column {
+            output.push("-- Results After Ignoring Time Column".into())
+        }
+        if let Some(rounded_floats) = rounded_floats {
+            output.push(format!(
+                "-- Results After Rounding Floats to {} Decimal Places",
+                *rounded_floats
+            ))
         }
     }
 }
+
+#[derive(Clone)]
+pub struct Formatter {
+    f: Arc<dyn Fn(Vec<RecordBatch>) -> Vec<String> + Send + Sync>,
+    name: &'static str,
+}
+
+impl Formatter {
+    pub fn new<F>(f: F, name: &'static str) -> Self
+    where
+        F: Fn(Vec<RecordBatch>) -> Vec<String> + Send + Sync + 'static,
+    {
+        Self {
+            f: Arc::new(f),
+            name,
+        }
+    }
+
+    pub fn format(&self, batches: Vec<RecordBatch>) -> Vec<String> {
+        (self.f)(batches)
+    }
+}
+
+impl Default for Formatter {
+    fn default() -> Self {
+        Self::new(
+            |batches| {
+                pretty_format_batches(&batches)
+                    .unwrap()
+                    .trim()
+                    .lines()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            },
+            "arrow",
+        )
+    }
+}
+
+impl std::fmt::Debug for Formatter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { f: _, name } = self;
+        f.debug_struct("Formatter")
+            .field("name", name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq<Self> for Formatter {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Formatter {}

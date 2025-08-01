@@ -16,10 +16,10 @@ generated_types = { path = "../generated_types" }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy", "server-graceful"] }
 iox_http_util = { path = "../iox_http_util" }
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 reqwest = { workspace = true }
 snafu = "0.8"
-tokio = { version = "1.45", default-features = false, features = [
+tokio = { version = "1.47", default-features = false, features = [
     "macros",
     "rt",
 ] }
@@ -29,7 +29,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 metric = { path = "../metric" }
 
 [dev-dependencies]
-criterion = "0.6.0"
+criterion = "0.7.0"
 data_types = { path = "../data_types" }
 
 [[bench]]

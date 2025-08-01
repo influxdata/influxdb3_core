@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, Statistics};
+use datafusion::scalar::ScalarValue;
 
 use crate::QueryChunk;
 
@@ -39,17 +40,25 @@ impl SchemaBoundStatistics {
         let chunk_schema = chunk.schema();
 
         // A vector of absent stats for all columns in the schema
-        let mut schema_col_stats_for_chunk = vec![
-            ColumnStatistics {
-                null_count: Precision::Absent,
-                max_value: Precision::Absent,
-                min_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-            };
-            self.schema.fields().len()
-        ];
+        let mut schema_col_stats_for_chunk = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let null_val =
+                    ScalarValue::try_from(f.data_type()).expect("works for all IOx types");
 
-        // Fill stats of columns in the chunk
+                ColumnStatistics {
+                    null_count: chunk_stats.num_rows,
+                    max_value: Precision::Exact(null_val.clone()),
+                    min_value: Precision::Exact(null_val),
+                    distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Fill stats of columns in the chunk, or fallback values
         let arrow_schema = chunk_schema.as_arrow();
         let fields = arrow_schema.fields();
         fields.iter().enumerate().for_each(|(idx, f)| {
@@ -74,7 +83,6 @@ impl SchemaBoundStatistics {
 mod test {
     use super::*;
     use crate::{CHUNK_ORDER_COLUMN_NAME, test::TestChunk};
-    use datafusion::scalar::ScalarValue;
     use schema::{InfluxFieldType, SchemaBuilder};
 
     #[test]
@@ -82,6 +90,7 @@ mod test {
         // parquet chunk with columns in schema: tag, field, time, CHUNK_ORDER_COLUMN_NAME
         let parquet_chunk = Arc::new(
             TestChunk::new("t")
+                .with_row_count(42)
                 .with_tag_column_with_stats("tag", Some("AL"), Some("MT"))
                 .with_i64_field_column_with_stats("field", Some(0), Some(100))
                 .with_time_column_with_stats(Some(10), Some(20))
@@ -103,46 +112,50 @@ mod test {
         let schema_bound = SchemaBoundStatistics::new(super_schema);
 
         let parquet_chunk = Arc::clone(&parquet_chunk) as Arc<dyn QueryChunk>;
-        let stats = schema_bound.chunk_column_statistics(&parquet_chunk);
+        let actual_stats = schema_bound.chunk_column_statistics(&parquet_chunk);
 
-        let expected_stats = [
-            // another_tag: absent
-            ColumnStatistics {
-                null_count: Precision::Absent,
-                max_value: Precision::Absent,
-                min_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-            },
-            // tag: AL, MT
-            ColumnStatistics {
-                null_count: Precision::Exact(0),
-                max_value: Precision::Exact(ScalarValue::Utf8(Some("MT".to_string()))),
-                min_value: Precision::Exact(ScalarValue::Utf8(Some("AL".to_string()))),
-                distinct_count: Precision::Absent,
-            },
-            // field: 0, 100
-            ColumnStatistics {
-                null_count: Precision::Absent,
-                max_value: Precision::Exact(ScalarValue::Int64(Some(100))),
-                min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
-                distinct_count: Precision::Absent,
-            },
-            // another_field: absent
-            ColumnStatistics {
-                null_count: Precision::Absent,
-                max_value: Precision::Absent,
-                min_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-            },
-            // time
-            ColumnStatistics {
-                null_count: Precision::Exact(0),
-                max_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(20), None)),
-                min_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(10), None)),
-                distinct_count: Precision::Absent,
-            },
-        ];
-
-        assert_eq!(stats.column_statistics, expected_stats);
+        insta::assert_debug_snapshot!(actual_stats, @r#"
+        Statistics {
+            num_rows: Exact(42),
+            total_byte_size: Absent,
+            column_statistics: [
+                ColumnStatistics {
+                    null_count: Exact(42),
+                    max_value: Exact(Dictionary(Int32, Utf8(NULL))),
+                    min_value: Exact(Dictionary(Int32, Utf8(NULL))),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Exact(0),
+                    max_value: Exact(Dictionary(Int32, Utf8("MT"))),
+                    min_value: Exact(Dictionary(Int32, Utf8("AL"))),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Absent,
+                    max_value: Exact(Int64(100)),
+                    min_value: Exact(Int64(0)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Exact(42),
+                    max_value: Exact(Int64(NULL)),
+                    min_value: Exact(Int64(NULL)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+                ColumnStatistics {
+                    null_count: Exact(0),
+                    max_value: Exact(TimestampNanosecond(20, None)),
+                    min_value: Exact(TimestampNanosecond(10, None)),
+                    sum_value: Absent,
+                    distinct_count: Absent,
+                },
+            ],
+        }
+        "#);
     }
 }

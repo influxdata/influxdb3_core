@@ -166,14 +166,16 @@ impl ExecutionPlan for ReorderPartitionsExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        self.input.statistics()
+        self.input.partition_statistics(None)
     }
 }
 
 impl DisplayAs for ReorderPartitionsExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "ReorderPartitionsExec: ")?;
                 write!(
                     f,

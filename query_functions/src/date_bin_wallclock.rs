@@ -2,16 +2,16 @@
 
 use arrow::array::TimestampNanosecondBuilder;
 use arrow::array::timezone::Tz;
-use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
+use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
 use arrow::temporal_conversions::timestamp_ns_to_datetime;
 use chrono::{MappedLocalTime, Offset, TimeZone};
 use datafusion::common::cast::as_timestamp_nanosecond_array;
-use datafusion::common::{Result, exec_err, not_impl_err};
+use datafusion::common::{Result, exec_err, internal_err, not_impl_err};
 use datafusion::error::DataFusionError;
 use datafusion::functions::datetime::date_bin;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD, TypeSignature,
-    Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TIMEZONE_WILDCARD,
+    TypeSignature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
 use std::str::FromStr;
@@ -147,22 +147,38 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
         Ok(args[1].clone())
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        let (interval, source, origin) = match args {
-            [interval, source] => (interval, source, None),
-            [interval, source, origin] => (interval, source, Some(origin)),
-            _ => return exec_err!("DATE_BIN_WALLCLOCK invalid number of arguments"),
-        };
-        let DataType::Timestamp(_, tz) = source.data_type() else {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows,
+            return_field,
+        } = args;
+
+        if args.len() != arg_fields.len() {
+            return internal_err!("args and fields do not align");
+        }
+
+        let ((interval_arg, internal_field), (source_arg, source_field), origin) =
+            match args.as_slice() {
+                [interval, source] => ((interval, &arg_fields[0]), (source, &arg_fields[1]), None),
+                [interval, source, origin] => (
+                    (interval, &arg_fields[0]),
+                    (source, &arg_fields[1]),
+                    Some((origin, &arg_fields[2])),
+                ),
+                _ => return exec_err!("DATE_BIN_WALLCLOCK invalid number of arguments"),
+            };
+        let DataType::Timestamp(_, tz) = source_arg.data_type() else {
             return exec_err!(
                 "DATE_BIN_WALLCLOCK expects a timestamp value, not {:?}",
-                source.data_type()
+                source_arg.data_type()
             );
         };
-        let origin = origin.map(|origin| match origin {
+        let origin = origin.map(|(origin_arg, origin_field)| match origin_arg {
             ColumnarValue::Scalar(scalar) => {
                 match scalar {
-                    ScalarValue::TimestampNanosecond(origin, _) => Ok(*origin),
+                    ScalarValue::TimestampNanosecond(origin, _) => Ok((*origin, origin_field)),
                     v => exec_err!(
                         "DATE_BIN_WALLCLOCK expects origin argument to be a TIMESTAMP with nanosecond precision but got {}",
                         v.data_type()
@@ -176,29 +192,46 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
             // date_bin_wallclock works exactly the same as date_bin for
             // UTC like times. Pass execution off to date_bin.
             return match origin {
-                Some(origin) => {
+                Some((origin, origin_field)) => {
                     // DATE_BIN_WALLCLOCK requires that the origin parameter has no time zone,
                     // according to the signature this isn't valid for DATE_BIN. The value doesn't
                     // need adjusting but set the timezone to match the times array.
-                    self.date_bin.invoke_batch(
-                        &[
-                            interval.clone(),
-                            source.clone(),
-                            ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(origin, tz)),
+                    self.date_bin.invoke_with_args(ScalarFunctionArgs {
+                        args: vec![
+                            interval_arg.clone(),
+                            source_arg.clone(),
+                            ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
+                                origin,
+                                tz.clone(),
+                            )),
                         ],
-                        args.len(),
-                    )
+                        arg_fields: vec![
+                            Arc::clone(internal_field),
+                            Arc::clone(source_field),
+                            Arc::new(
+                                origin_field
+                                    .as_ref()
+                                    .clone()
+                                    .with_data_type(DataType::Timestamp(TimeUnit::Nanosecond, tz)),
+                            ),
+                        ],
+                        number_rows,
+                        return_field,
+                    })
                 }
-                None => self
-                    .date_bin
-                    .invoke_batch(&[interval.clone(), source.clone()], args.len()),
+                None => self.date_bin.invoke_with_args(ScalarFunctionArgs {
+                    args: vec![interval_arg.clone(), source_arg.clone()],
+                    arg_fields: vec![Arc::clone(internal_field), Arc::clone(source_field)],
+                    number_rows,
+                    return_field,
+                }),
             };
         }
 
         let arrowtz = Tz::from_str(tz.as_ref().unwrap().as_ref())
             .map_err(|err| DataFusionError::ArrowError(err, None))?;
 
-        let interval_ns = match &interval {
+        let interval_ns = match &interval_arg {
             ColumnarValue::Scalar(scalar) => {
                 let ScalarValue::IntervalMonthDayNano(interval) = scalar else {
                     return exec_err!("DATE_BIN_WALLCLOCK invalid interval type");
@@ -216,7 +249,7 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
             }
         };
 
-        let (wallclocks, utc_offsets) = match source {
+        let (wallclocks, utc_offsets) = match source_arg {
             ColumnarValue::Scalar(scalar) => {
                 let ScalarValue::TimestampNanosecond(maybe_utc_ns, _) = scalar else {
                     return exec_err!("DATE_BIN_WALLCLOCK invalid scalar type");
@@ -252,19 +285,34 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
                 (ColumnarValue::Array(Arc::new(wallclock.finish())), offset)
             }
         };
+        let wallclocks_field = Arc::new(Field::new("wallclocks", wallclocks.data_type(), false));
 
         let result = match origin {
-            Some(origin) => self.date_bin.invoke_batch(
-                &[
-                    interval.clone(),
+            Some((origin, origin_field)) => self.date_bin.invoke_with_args(ScalarFunctionArgs {
+                args: vec![
+                    interval_arg.clone(),
                     wallclocks,
                     ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(origin, None)),
                 ],
-                args.len(),
-            )?,
-            None => self
-                .date_bin
-                .invoke_batch(&[interval.clone(), wallclocks], args.len())?,
+                arg_fields: vec![
+                    Arc::clone(internal_field),
+                    wallclocks_field,
+                    Arc::new(
+                        origin_field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+                    ),
+                ],
+                number_rows,
+                return_field,
+            })?,
+            None => self.date_bin.invoke_with_args(ScalarFunctionArgs {
+                args: vec![interval_arg.clone(), wallclocks],
+                arg_fields: vec![Arc::clone(internal_field), wallclocks_field],
+                number_rows,
+                return_field,
+            })?,
         };
 
         let result = match result {
@@ -423,7 +471,7 @@ pub mod expr_fn {
 mod tests {
     use arrow::{
         array::{IntervalMonthDayNanoArray, TimestampNanosecondArray},
-        datatypes::IntervalMonthDayNano,
+        datatypes::{FieldRef, IntervalMonthDayNano},
     };
 
     use super::*;
@@ -442,7 +490,16 @@ mod tests {
                 None,
             )),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -452,16 +509,29 @@ mod tests {
     #[test]
     fn scalar_value_with_timezone() {
         let udf = DateBinWallclockUDF::default();
+        let tz = Arc::from("America/New_York");
         let args = vec![
             ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(
                 IntervalMonthDayNano::new(0, 1, 0),
             ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY + 60 * 60 * 1_000_000_000),
-                Some(Arc::from("America/New_York")),
+                Some(Arc::clone(&tz)),
             )),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::clone(&tz)),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -469,7 +539,7 @@ mod tests {
             result,
             ScalarValue::TimestampNanosecond(
                 Some(MAYDAY - 20 * 60 * 60 * 1_000_000_000),
-                Some(Arc::from("America/New_York"))
+                Some(Arc::clone(&tz))
             ),
         );
     }
@@ -477,16 +547,29 @@ mod tests {
     #[test]
     fn at_boundary_for_timezone() {
         let udf = DateBinWallclockUDF::default();
+        let tz = Arc::from("Europe/Paris");
         let args = vec![
             ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(
                 IntervalMonthDayNano::new(0, 1, 0),
             ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY - 2 * 60 * 60 * 1_000_000_000),
-                Some(Arc::from("Europe/Paris")),
+                Some(Arc::clone(&tz)),
             )),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::clone(&tz)),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -494,7 +577,7 @@ mod tests {
             result,
             ScalarValue::TimestampNanosecond(
                 Some(MAYDAY - 2 * 60 * 60 * 1_000_000_000),
-                Some(Arc::from("Europe/Paris"))
+                Some(Arc::clone(&tz))
             ),
         );
     }
@@ -502,20 +585,33 @@ mod tests {
     #[test]
     fn with_origin() {
         let udf = DateBinWallclockUDF::default();
+        let tz = Arc::from("Europe/London");
         let args = vec![
             ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(
                 IntervalMonthDayNano::new(0, 1, 0),
             ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY),
-                Some(Arc::from("Europe/London")),
+                Some(Arc::clone(&tz)),
             )),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY - 24 * 60 * 60 * 1_000_000_000),
                 None,
             )),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::clone(&tz)),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -523,7 +619,7 @@ mod tests {
             result,
             ScalarValue::TimestampNanosecond(
                 Some(MAYDAY - 60 * 60 * 1_000_000_000),
-                Some(Arc::from("Europe/London"))
+                Some(Arc::clone(&tz))
             ),
         );
     }
@@ -531,20 +627,33 @@ mod tests {
     #[test]
     fn with_origin_in_future() {
         let udf = DateBinWallclockUDF::default();
+        let tz = Arc::from("Europe/London");
         let args = vec![
             ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(
                 IntervalMonthDayNano::new(0, 1, 0),
             ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY + 60 * 60 * 1_000_000_000),
-                Some(Arc::from("Europe/London")),
+                Some(Arc::clone(&tz)),
             )),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY + 24 * 60 * 60 * 1_000_000_000),
                 None,
             )),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 13,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::clone(&tz)),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Scalar(scalar) => scalar,
             _ => panic!("Expected scalar value"),
         };
@@ -552,7 +661,7 @@ mod tests {
             result,
             ScalarValue::TimestampNanosecond(
                 Some(MAYDAY - 60 * 60 * 1_000_000_000),
-                Some(Arc::from("Europe/London"))
+                Some(Arc::clone(&tz))
             ),
         );
     }
@@ -574,7 +683,19 @@ mod tests {
             ))),
             ColumnarValue::Array(arr),
         ];
-        let result = match udf.invoke_batch(&args, args.len()).unwrap() {
+        let arg_fields = arg_to_fields(&args);
+        let result = match udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args,
+                arg_fields,
+                number_rows: 3,
+                return_field: return_field(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some(Arc::from("Europe/Paris")),
+                )),
+            })
+            .unwrap()
+        {
             ColumnarValue::Array(arr) => as_timestamp_nanosecond_array(&arr).unwrap().clone(),
             _ => panic!("Expected array value"),
         };
@@ -592,6 +713,7 @@ mod tests {
     #[test]
     fn array_interval_error() {
         let udf = DateBinWallclockUDF::default();
+        let tz = Arc::from("UTC");
         let arr = Arc::new(IntervalMonthDayNanoArray::from(vec![
             Some(IntervalMonthDayNano {
                 months: 0,
@@ -609,10 +731,19 @@ mod tests {
             ColumnarValue::Array(arr),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY + 60 * 60 * 1_000_000_000),
-                Some(Arc::from("UTC")),
+                Some(Arc::clone(&tz)),
             )),
         ];
-        let result = udf.invoke_batch(&args, args.len());
+        let arg_fields = arg_to_fields(&args);
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 3,
+            return_field: return_field(DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some(Arc::clone(&tz)),
+            )),
+        });
         assert_eq!(
             result.unwrap_err().to_string(),
             "This feature is not implemented: DATE_BIN only supports literal values for the stride argument, not arrays"
@@ -622,6 +753,7 @@ mod tests {
     #[test]
     fn array_origin_error() {
         let udf = DateBinWallclockUDF::default();
+        let tz = Arc::from("UTC");
         let arr = Arc::new(TimestampNanosecondArray::from(vec![
             Some(MAYDAY + 60 * 60 * 1_000_000_000),
             None,
@@ -633,11 +765,20 @@ mod tests {
             ))),
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                 Some(MAYDAY + 60 * 60 * 1_000_000_000),
-                Some(Arc::from("UTC")),
+                Some(Arc::clone(&tz)),
             )),
             ColumnarValue::Array(arr),
         ];
-        let result = udf.invoke_batch(&args, args.len());
+        let arg_fields = arg_to_fields(&args);
+        let result = udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 3,
+            return_field: return_field(DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some(Arc::clone(&tz)),
+            )),
+        });
         assert_eq!(
             result.unwrap_err().to_string(),
             "This feature is not implemented: DATE_BIN_WALLCLOCK only supports literal values for the origin argument, not arrays"
@@ -662,7 +803,17 @@ mod tests {
                 None,
             )),
         ];
-        udf.invoke_batch(&args, args.len()).unwrap();
+        let arg_fields = arg_to_fields(&args);
+        udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 13,
+            return_field: return_field(DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some(Arc::from("Etc/Universal")),
+            )),
+        })
+        .unwrap();
     }
 
     /// A UDF that is a stub `date_bin` which checks that the `source`
@@ -711,8 +862,8 @@ mod tests {
             Ok(arg_types[1].clone())
         }
 
-        fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-            let [_, source, origin] = args else {
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let [_, source, origin] = args.args.as_slice() else {
                 panic!("Expected three arguments");
             };
             assert_eq!(source.data_type(), origin.data_type());
@@ -722,5 +873,16 @@ mod tests {
             assert!(tz.is_some());
             Ok(source.clone())
         }
+    }
+
+    fn arg_to_fields(args: &[ColumnarValue]) -> Vec<FieldRef> {
+        args.iter()
+            .enumerate()
+            .map(|(idx, val)| Arc::new(Field::new(format!("arg_{idx}"), val.data_type(), false)))
+            .collect()
+    }
+
+    fn return_field(dt: DataType) -> FieldRef {
+        Arc::new(Field::new("r", dt, false))
     }
 }

@@ -13,21 +13,21 @@ use arrow::{
 };
 use arrow_util::test_util::batches_to_lines;
 use datafusion::{
+    datasource::{memory::MemorySourceConfig, source::DataSourceExec},
     error::Result,
     execution::runtime_env::RuntimeEnvBuilder,
     functions::datetime::date_bin::DateBinFunc,
     physical_plan::{
         collect,
         expressions::{col as phys_col, lit as phys_lit},
-        memory::MemoryExec,
     },
     prelude::{SessionConfig, SessionContext},
     scalar::ScalarValue,
 };
 use futures::executor::block_on;
-use observability_deps::tracing::debug;
 use schema::{InfluxColumnType, InfluxFieldType};
 use test_helpers::assert_error;
+use tracing::debug;
 
 #[test]
 fn test_gapfill_simple() {
@@ -1367,7 +1367,7 @@ impl TestRecords {
             });
         for i in 0..num_other {
             fields.push(Field::new(
-                format!("other_{}", i),
+                format!("other_{i}"),
                 (&InfluxColumnType::Field(InfluxFieldType::Integer)).into(),
                 true,
             ));
@@ -1513,7 +1513,11 @@ impl TestCase {
             "input_batch_size is {input_batch_size}, output_batch_size is {}",
             self.output_batch_size
         );
-        let input = Arc::new(MemoryExec::try_new(&[batches], Arc::clone(&schema), None)?);
+        let input = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+            &[batches],
+            Arc::clone(&schema),
+            None,
+        )?)));
         let plan = Arc::new(GapFillExec::try_new(
             input,
             group_expr,

@@ -3,7 +3,7 @@
 
 use crate::{
     ParquetFilePath,
-    storage::{ParquetExecInput, ParquetStorage},
+    storage::{DataSourceExecInput, ParquetStorage},
 };
 use data_types::{ObjectStoreId, ParquetFile, TimestampMinMax};
 use schema::Schema;
@@ -60,14 +60,15 @@ impl ParquetChunk {
     }
 
     /// Return stream of data read from parquet file
-    /// Inputs for [`ParquetExec`].
+    /// Inputs for [`DataSourceExec`].
     ///
-    /// See [`ParquetExecInput`] for more information.
+    /// See [`DataSourceExecInput`] for more information.
     ///
-    /// [`ParquetExec`]: datafusion::datasource::physical_plan::ParquetExec
-    pub fn parquet_exec_input(&self) -> ParquetExecInput {
+    /// [`DataSourceExec`]: datafusion::datasource::memory::DataSourceExec
+    pub fn data_source_exec_input(&self) -> DataSourceExecInput {
         let path: ParquetFilePath = self.parquet_file.as_ref().into();
-        self.store.parquet_exec_input(&path, self.file_size_bytes())
+        self.store
+            .data_source_exec_input(&path, self.file_size_bytes())
     }
 
     /// The total number of rows in all row groups in this chunk.
@@ -76,8 +77,8 @@ impl ParquetChunk {
     }
 
     /// Size of the parquet file in object store
-    pub fn file_size_bytes(&self) -> usize {
-        self.parquet_file.file_size_bytes as usize
+    pub fn file_size_bytes(&self) -> u64 {
+        self.parquet_file.file_size_bytes as u64
     }
 
     /// return time range

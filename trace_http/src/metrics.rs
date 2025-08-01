@@ -114,7 +114,7 @@ impl RequestMetrics {
                     }
                     if let (Some(path), Some(method)) = (&key.path, &key.method) {
                         // help Grafana because you can only repeat a single variable, not a cross-product of the two
-                        attributes.insert("method_path", format!("{} {}", method, path));
+                        attributes.insert("method_path", format!("{method} {path}"));
                     }
 
                     let metrics =

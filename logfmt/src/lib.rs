@@ -7,13 +7,13 @@ use regex as _;
 use workspace_hack as _;
 
 use humantime::format_rfc3339_micros;
-use observability_deps::tracing::{
+use std::borrow::Cow;
+use std::{io::Write, time::SystemTime};
+use tracing::{
     self, Id, Level, Subscriber,
     field::{Field, Visit},
     subscriber::Interest,
 };
-use std::borrow::Cow;
-use std::{io::Write, time::SystemTime};
 use tracing_subscriber::{Layer, fmt::MakeWriter, layer::Context, registry::LookupSpan};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -171,10 +171,10 @@ impl<W: Write> FieldPrinter<W> {
         )
         .ok();
 
-        if let Some(module_path) = metadata.module_path() {
-            if metadata.target() != module_path {
-                write!(self.writer, " module_path=\"{module_path}\"").ok();
-            }
+        if let Some(module_path) = metadata.module_path()
+            && metadata.target() != module_path
+        {
+            write!(self.writer, " module_path=\"{module_path}\"").ok();
         }
         if let (Some(file), Some(line)) = (metadata.file(), metadata.line()) {
             write!(self.writer, " location=\"{file}:{line}\"").ok();

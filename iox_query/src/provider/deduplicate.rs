@@ -26,8 +26,8 @@ use datafusion::{
     },
 };
 use futures::StreamExt;
-use observability_deps::tracing::{debug, trace};
 use tokio::sync::mpsc;
+use tracing::{debug, trace};
 
 /// # DeduplicateExec
 ///
@@ -316,14 +316,16 @@ impl ExecutionPlan for DeduplicateExec {
 
     fn statistics(&self) -> Result<Statistics> {
         // use a guess from our input but they are NOT exact
-        Ok(self.input.statistics()?.to_inexact())
+        Ok(self.input.partition_statistics(None)?.to_inexact())
     }
 }
 
 impl DisplayAs for DeduplicateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let expr: Vec<String> = self.sort_keys.iter().map(|e| e.to_string()).collect();
                 write!(f, "DeduplicateExec: [{}]", expr.join(","))
             }
@@ -404,8 +406,10 @@ mod test {
         record_batch::RecordBatch,
     };
     use arrow_util::assert_batches_eq;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-    use datafusion::physical_plan::{expressions::col, memory::MemoryExec};
+    use datafusion::physical_plan::expressions::col;
     use datafusion_util::test_collect;
 
     use super::*;
@@ -1212,7 +1216,7 @@ mod test {
         //      DeduplicateExec: [tag1@1 DESC NULLS LAST,tag2@2]
         //          UnionExec
         //              RecordBatchesExec
-        //              ParquetExec
+        //              DataSourceExec
         //
         // t1 | t2 | f1
         // ---+----+----
@@ -1670,8 +1674,7 @@ mod test {
             // output should be the same regardless of how the input is split
             assert_eq!(
                 results_strings, split_results_strings,
-                "start_size: {}",
-                start_size
+                "start_size: {start_size}"
             );
         }
         results
@@ -1684,7 +1687,9 @@ mod test {
         // Setup in memory stream
         let schema = input[0].schema();
         let projection = None;
-        let input = Arc::new(MemoryExec::try_new(&[input], schema, projection).unwrap());
+        let input = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[input], schema, projection).unwrap(),
+        )));
 
         // Create and run the deduplicator
         let exec = Arc::new(DeduplicateExec::new(input, sort_keys, false));

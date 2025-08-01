@@ -262,8 +262,7 @@ pub fn split_cond(
                         },
                         expr => {
                             return ControlFlow::Break(error::map::internal(format!(
-                                "expected Timestamp, got: {}",
-                                expr
+                                "expected Timestamp, got: {expr}"
                             )));
                         }
                     };
@@ -344,10 +343,10 @@ pub fn split_cond(
 /// Search `cond` for expressions involving the `time` column.
 pub fn has_time_range(cond: &ConditionalExpression) -> bool {
     walk_expression(cond, &mut |e| {
-        if let Expression::Conditional(cond) = e {
-            if is_time_field(cond) {
-                return ControlFlow::Break(());
-            }
+        if let Expression::Conditional(cond) = e
+            && is_time_field(cond)
+        {
+            return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
     })
@@ -701,12 +700,10 @@ fn reduce_binary_lhs_string(
 ///
 /// [go]: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5751-L5753
 fn is_time_field(cond: &ConditionalExpression) -> bool {
-    if let ConditionalExpression::Expr(expr) = cond {
-        if let Expr::VarRef(VarRef { ref name, .. }) = **expr {
-            name.eq_ignore_ascii_case("time")
-        } else {
-            false
-        }
+    if let ConditionalExpression::Expr(expr) = cond
+        && let Expr::VarRef(VarRef { ref name, .. }) = **expr
+    {
+        name.eq_ignore_ascii_case("time")
     } else {
         false
     }

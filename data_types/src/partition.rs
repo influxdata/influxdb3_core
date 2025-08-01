@@ -76,7 +76,7 @@ impl std::fmt::Display for TransitionPartitionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Catalog(old_partition_id) => write!(f, "{}", old_partition_id.0),
-            Self::Hash(partition_hash_id) => write!(f, "{}", partition_hash_id),
+            Self::Hash(partition_hash_id) => write!(f, "{partition_hash_id}"),
         }
     }
 }
@@ -398,7 +398,7 @@ pub struct PartitionHashId(Arc<[u8; PARTITION_HASH_ID_SIZE_BYTES]>);
 impl std::fmt::Display for PartitionHashId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for byte in &*self.0 {
-            write!(f, "{:02x}", byte)?;
+            write!(f, "{byte:02x}")?;
         }
         Ok(())
     }
@@ -410,7 +410,7 @@ impl std::fmt::Display for PartitionHashId {
 /// output, etc easier to read.
 impl std::fmt::Debug for PartitionHashId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 

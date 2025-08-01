@@ -6,12 +6,12 @@ use crate::{CacheKey, CacheValue};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use futures::{StreamExt, pin_mut};
-use observability_deps::tracing::info;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 /// Error for [`QuorumCatalogCache`]
 #[expect(missing_docs)]
@@ -302,6 +302,7 @@ pub struct WarmupStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::client::Error as ClientError;
     use crate::api::server::test_util::TestCacheServer;
     use std::future::Future;
     use std::task::Context;
@@ -638,5 +639,61 @@ mod tests {
             },
         );
         assert_eq!(local.list().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_network_timeout() {
+        let local = Arc::new(CatalogCache::default());
+        let metric_registry = Arc::new(metric::Registry::new());
+
+        // Create a client with an invalid address that will cause timeouts
+        // Instead of using a real TestCacheServer
+        let invalid_client1 = CatalogCacheClient::builder(
+            "http://non-exist-iox-shared-catalog-1:9090"
+                .parse()
+                .unwrap(),
+            Arc::clone(&metric_registry),
+        )
+        .build()
+        .expect("Failed to create client with invalid address");
+        let invalid_client2 = CatalogCacheClient::builder(
+            "http://non-exist-iox-shared-catalog-2:9090"
+                .parse()
+                .unwrap(),
+            Arc::clone(&metric_registry),
+        )
+        .build()
+        .expect("Failed to create client with invalid address");
+
+        let replicas = Arc::new([invalid_client1, invalid_client2]);
+        let quorum = QuorumCatalogCache::new(Arc::clone(&local), Arc::clone(&replicas));
+
+        // Attempt to put a value should result in NoRemote error due to timeout
+        let key = CacheKey::Root;
+        let value = CacheValue::new("test_namespace".into(), 1);
+        let err = tokio::time::timeout(
+            // Mimic a timeout scenario
+            std::time::Duration::from_secs(2), // the default client timeout limit is 1s
+            quorum.put(key, value),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::NoRemote { source: ClientError::Put { source } } if source.is_timeout() || source.is_connect()),
+            "Expected NoRemote error with timeout or connection issue, got: {err:?}"
+        );
+        assert!(
+            format!("{:?}", err.to_string()).contains("error sending request"),
+            "Unexpected error message: Failed to communicate with any remote replica: Put Reqwest error: {err:?}"
+        );
+
+        // Get should also fail with a Quorum error
+        let err = quorum.get(key).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Quorum { .. }),
+            "Expected Quorum error, got: {err}"
+        );
     }
 }

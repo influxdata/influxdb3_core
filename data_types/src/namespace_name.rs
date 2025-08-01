@@ -129,7 +129,7 @@ impl<'a> NamespaceName<'a> {
             return Err(OrgBucketMappingError::NoOrgBucketSpecified);
         }
 
-        Ok(Self::new(format!("{}_{}", org, bucket))?)
+        Ok(Self::new(format!("{org}_{bucket}"))?)
     }
 }
 

@@ -2,7 +2,7 @@
 
 #![warn(missing_docs)]
 
-use observability_deps::tracing::{debug, warn};
+use tracing::{debug, warn};
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;

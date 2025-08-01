@@ -6,7 +6,6 @@
 #![expect(unused_crate_dependencies)]
 
 use logfmt::LogFmtLayer;
-use observability_deps::tracing::{Level, debug, error, info, span, trace, warn};
 use parking_lot::Mutex;
 use regex::Regex;
 use std::{
@@ -15,6 +14,7 @@ use std::{
     io::{self, Cursor},
     sync::LazyLock,
 };
+use tracing::{Level, debug, error, info, span, trace, warn};
 use tracing_subscriber::{self, fmt::MakeWriter, prelude::*};
 
 /// Compares the captured messages with the expected messages,
@@ -288,11 +288,6 @@ fn normalize_spans(lines: Vec<String>) -> Vec<String> {
     // doesn't also match span=21423
     let re = Regex::new(r" span=(\d+) ").unwrap();
 
-    // This collect isn't needless: the `fold` below moves `lines`, so this
-    // iterator can't borrow `lines`, we need to collect into a `Vec` to
-    // stop borrowing `lines`.
-    // See https://github.com/rust-lang/rust-clippy/issues/7336
-    #[expect(clippy::needless_collect)]
     let span_ids: Vec<String> = lines
         .iter()
         .flat_map(|line| re.find_iter(line))

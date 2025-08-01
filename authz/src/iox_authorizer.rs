@@ -4,8 +4,8 @@ use generated_types::{
     influxdata::iox::authz::v1::{self as proto, AuthorizeResponse},
     transport,
 };
-use observability_deps::tracing::warn;
 use snafu::Snafu;
+use tracing::warn;
 
 use super::{Authorization, Authorizer, Permission};
 

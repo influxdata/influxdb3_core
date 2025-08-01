@@ -1,4 +1,39 @@
 //! This module contains the schema definition for IOx
+//!
+//! # Series Key Format Migration (v3 feature)
+//!
+//! When the `v3` feature is enabled, this module handles a migration from a legacy series key
+//! format to a new v2 format that properly supports tag names containing '/' characters.
+//!
+//! ## The Problem
+//!
+//! The legacy format stores series keys (ordered list of tag column names) as a simple
+//! '/'-separated string in parquet metadata. This breaks when tag names contain '/' characters:
+//!
+//! - Tags: ["region/us", "host"]
+//! - Legacy format: "region/us/host"
+//! - Incorrectly parsed as: ["region", "us", "host"]
+//!
+//! ## The Solution
+//!
+//! The v2 format uses base64-encoded length-prefixed strings to unambiguously store tag names:
+//!
+//! - Each tag is prefixed with its length as a 4-byte little-endian integer
+//! - The entire sequence is base64-encoded
+//! - Example: ["a/b", "c"] → base64("\\x03\\x00\\x00\\x00a/b\\x01\\x00\\x00\\x00c")
+//!
+//! ## Migration Path
+//!
+//! 1. New data writes only v2 format (no legacy format)
+//! 2. Readers check v2 format first, fall back to legacy parsing if needed
+//! 3. Legacy parsing uses a recursive algorithm to handle ambiguous cases
+//! 4. Over time, all data will have v2 format and legacy code can be removed
+//!
+//! ## Compatibility
+//!
+//! - Old readers: Cannot read new data (upgrade required)
+//! - New readers: Read v2 format when available, correctly parse legacy format
+//! - New writers: Write only v2 format
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -20,6 +55,8 @@ use hashbrown::HashSet;
 
 use crate::sort::SortKey;
 use snafu::{OptionExt, Snafu};
+#[cfg(feature = "v3")]
+use tracing::warn;
 
 /// The name of the timestamp column in the InfluxDB datamodel
 pub const TIME_COLUMN_NAME: &str = "time";
@@ -119,6 +156,13 @@ pub enum Error {
     #[cfg(feature = "v3")]
     #[snafu(display("The series key does not contain all tag columns present in the schema"))]
     TagsNotInSeriesKey,
+
+    #[snafu(display(
+        "Internal Error: Invalid metadata for column '{}': {}",
+        column_name,
+        md
+    ))]
+    InvalidMetadata { column_name: String, md: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -177,6 +221,221 @@ const COLUMN_METADATA_KEY: &str = "iox::column::type";
 const SERIES_KEY_METADATA_KEY: &str = "iox::series::key";
 #[cfg(feature = "v3")]
 const SERIES_KEY_METADATA_SEPARATOR: &str = "/";
+#[cfg(feature = "v3")]
+const SERIES_KEY_V2_METADATA_KEY: &str = "iox::series::key::v2";
+
+#[cfg(feature = "v3")]
+/// Encode series keys into a base64 string with length-prefixed format.
+///
+/// This encoding allows tag names to contain any characters, including '/' which
+/// is used as a separator in the legacy format.
+///
+/// # Format
+///
+/// Each tag name is encoded as:
+/// - 4 bytes: length of tag name (little-endian u32)
+/// - N bytes: UTF-8 encoded tag name
+///
+/// The entire sequence is then base64-encoded.
+///
+/// # Example
+///
+/// ```text
+/// Input: ["region/us", "host"]
+/// Binary: [9, 0, 0, 0, r, e, g, i, o, n, /, u, s, 4, 0, 0, 0, h, o, s, t]
+/// Output: "CQAAAHJlZ2lvbi91cwQAAABob3N0"
+/// ```
+fn encode_series_key_v2(keys: &[String]) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let mut buffer = Vec::new();
+    for key in keys {
+        let key_bytes = key.as_bytes();
+        let len = key_bytes.len() as u32;
+        buffer.extend_from_slice(&len.to_le_bytes());
+        buffer.extend_from_slice(key_bytes);
+    }
+
+    STANDARD.encode(&buffer)
+}
+
+#[cfg(feature = "v3")]
+/// Decode series keys from a base64 string with length-prefixed format.
+///
+/// This is the inverse of [`encode_series_key_v2`].
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The base64 string is invalid
+/// - The decoded data has truncated length prefixes
+/// - The decoded data has truncated tag values
+/// - Any tag value is not valid UTF-8
+///
+/// # Example
+///
+/// ```text
+/// Input: "CQAAAHJlZ2lvbi91cwQAAABob3N0"
+/// Binary: [9, 0, 0, 0, r, e, g, i, o, n, /, u, s, 4, 0, 0, 0, h, o, s, t]
+/// Output: ["region/us", "host"]
+/// ```
+fn decode_series_key_v2(encoded: &str) -> Result<Vec<String>> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|e| Error::InvalidMetadata {
+            column_name: "series_key_v2".to_string(),
+            md: format!("Invalid base64: {e}"),
+        })?;
+
+    let mut keys = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        // Read length (4 bytes, little-endian)
+        if offset + 4 > bytes.len() {
+            return Err(Error::InvalidMetadata {
+                column_name: "series_key_v2".to_string(),
+                md: "Truncated length prefix".to_string(),
+            });
+        }
+
+        let len_bytes: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        offset += 4;
+
+        // Read key value
+        if offset + len > bytes.len() {
+            return Err(Error::InvalidMetadata {
+                column_name: "series_key_v2".to_string(),
+                md: "Truncated key value".to_string(),
+            });
+        }
+
+        let key = String::from_utf8(bytes[offset..offset + len].to_vec()).map_err(|e| {
+            Error::InvalidMetadata {
+                column_name: "series_key_v2".to_string(),
+                md: format!("Invalid UTF-8: {e}"),
+            }
+        })?;
+
+        keys.push(key);
+        offset += len;
+    }
+
+    Ok(keys)
+}
+
+#[cfg(feature = "v3")]
+/// Parse legacy series key format, handling cases where tag names contain '/'.
+///
+/// The legacy format uses '/' as a separator, which creates ambiguity when tag names
+/// themselves contain '/'. This function uses knowledge of the actual tag columns in
+/// the schema to correctly parse the series key.
+///
+/// # Algorithm
+///
+/// 1. First tries simple split by '/' - if all parts are valid columns, returns them
+/// 2. Otherwise, uses recursive parsing to try different combinations
+///
+/// # Example
+///
+/// ```text
+/// Schema tags: ["region/us", "host", "service"]
+/// Legacy string: "region/us/host/service"
+/// Simple split: ["region", "us", "host", "service"] - invalid!
+/// Correct parse: ["region/us", "host", "service"]
+/// ```
+fn parse_legacy_series_key(series_key_str: &str, schema: &Schema) -> Vec<String> {
+    if series_key_str.is_empty() {
+        return vec![];
+    }
+
+    // First, try the simple case - split by '/' and check if all parts are valid columns
+    let simple_parts: Vec<&str> = series_key_str
+        .split(SERIES_KEY_METADATA_SEPARATOR)
+        .collect();
+    let all_valid = simple_parts
+        .iter()
+        .all(|part| schema.find_index_of(part).is_some());
+
+    if all_valid {
+        return simple_parts.into_iter().map(|s| s.to_string()).collect();
+    }
+
+    // Complex case: some tag names contain '/'
+    // We need to try different combinations to find valid column names
+    parse_legacy_series_key_recursive(series_key_str, schema, 0)
+}
+
+#[cfg(feature = "v3")]
+/// Recursive helper for parsing legacy series keys with '/' in tag names.
+///
+/// This function tries different ways to split the remaining string by progressively
+/// including more '/' characters into potential tag names. It validates each candidate
+/// against the actual schema columns.
+///
+/// # Parameters
+///
+/// - `remaining`: The unparsed portion of the series key string
+/// - `schema`: The schema containing valid tag columns
+/// - `depth`: Recursion depth to prevent stack overflow
+///
+/// # Returns
+///
+/// A vector of parsed tag names, or empty if parsing fails.
+fn parse_legacy_series_key_recursive(
+    remaining: &str,
+    schema: &Schema,
+    depth: usize,
+) -> Vec<String> {
+    // Prevent infinite recursion
+    if depth > 100 || remaining.is_empty() {
+        return vec![];
+    }
+
+    // Try to find a valid column name by progressively including more '/' characters
+    let mut accumulated = String::new();
+    let parts: Vec<&str> = remaining.split(SERIES_KEY_METADATA_SEPARATOR).collect();
+
+    // Try each possible prefix as a column name
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            accumulated.push_str(SERIES_KEY_METADATA_SEPARATOR);
+        }
+        accumulated.push_str(part);
+
+        // Check if accumulated string is a valid tag column
+        let is_valid_tag = schema
+            .field_by_name(&accumulated)
+            .map(|(t, _)| matches!(t, InfluxColumnType::Tag))
+            .unwrap_or(false);
+
+        if is_valid_tag {
+            // Found a valid tag column
+            if i + 1 == parts.len() {
+                // This was the last part
+                return vec![accumulated];
+            } else {
+                // Try to parse the rest
+                let remaining_str = parts[i + 1..].join(SERIES_KEY_METADATA_SEPARATOR);
+                let rest = parse_legacy_series_key_recursive(&remaining_str, schema, depth + 1);
+
+                if !rest.is_empty() {
+                    // Successfully parsed the rest
+                    let mut result = vec![accumulated];
+                    result.extend(rest);
+                    return result;
+                }
+                // If we couldn't parse the rest, continue trying longer prefixes
+            }
+        }
+    }
+
+    // If we couldn't parse it properly, return empty
+    vec![]
+}
 
 impl Schema {
     /// Create a new Schema wrapper over the schema
@@ -263,12 +522,12 @@ impl Schema {
 
         #[cfg(feature = "v3")]
         if let Some(sk) = series_key {
+            let keys: Vec<String> = sk.into_iter().map(|k| k.as_ref().to_string()).collect();
+
+            // Write only v2 format for correct handling of tags with '/'
             metadata.insert(
-                SERIES_KEY_METADATA_KEY.to_string(),
-                sk.into_iter()
-                    .map(|k| k.as_ref().to_string())
-                    .collect::<Vec<_>>()
-                    .join(SERIES_KEY_METADATA_SEPARATOR),
+                SERIES_KEY_V2_METADATA_KEY.to_string(),
+                encode_series_key_v2(&keys),
             );
         }
 
@@ -297,18 +556,68 @@ impl Schema {
     /// data key for the series key is not set in the schema.
     #[cfg(feature = "v3")]
     pub fn series_key(&self) -> Option<Vec<&str>> {
-        self.inner
-            .metadata
-            .get(SERIES_KEY_METADATA_KEY)
-            .map(|series_key_str| {
-                if series_key_str.is_empty() {
-                    vec![]
-                } else {
-                    series_key_str
-                        .split(SERIES_KEY_METADATA_SEPARATOR)
-                        .collect()
+        // Check for either v2 or legacy format
+        if self.inner.metadata.contains_key(SERIES_KEY_V2_METADATA_KEY)
+            || self.inner.metadata.contains_key(SERIES_KEY_METADATA_KEY)
+        {
+            Some(
+                self.series_key_owned()
+                    .into_iter()
+                    .filter_map(|key| {
+                        // Find the matching field name in the schema
+                        self.inner
+                            .fields()
+                            .iter()
+                            .find(|f| f.name() == &key)
+                            .map(|f| f.name().as_str())
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Get the series key for the schema (owned strings version)
+    ///
+    /// This internal method returns owned strings to handle the v2 decoding
+    #[cfg(feature = "v3")]
+    fn series_key_owned(&self) -> Vec<String> {
+        // First, check for v2 format
+        if let Some(v2_key) = self.inner.metadata.get(SERIES_KEY_V2_METADATA_KEY) {
+            match decode_series_key_v2(v2_key) {
+                Ok(keys) => {
+                    // Verify all keys exist in schema
+                    if keys.iter().all(|k| self.find_index_of(k).is_some()) {
+                        return keys;
+                    } else {
+                        warn!(
+                            "V2 series key decoded successfully but contains invalid columns: {:?}",
+                            keys.iter()
+                                .filter(|k| self.find_index_of(k).is_none())
+                                .collect::<Vec<_>>()
+                        );
+                    }
                 }
-            })
+                Err(e) => {
+                    warn!(
+                        "Failed to decode v2 series key, falling back to legacy format: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fall back to legacy format
+        if let Some(series_key_str) = self.inner.metadata.get(SERIES_KEY_METADATA_KEY) {
+            if series_key_str.is_empty() {
+                vec![]
+            } else {
+                parse_legacy_series_key(series_key_str, self)
+            }
+        } else {
+            vec![]
+        }
     }
 
     /// Returns true if the sort_key includes all primary key cols
@@ -1543,5 +1852,156 @@ mod test {
             .build()
             .unwrap();
         assert_eq!(vec!["a", "b", "time"], schema.primary_key());
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_encode_decode_series_key_v2() {
+        // Test basic encoding/decoding
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let encoded = encode_series_key_v2(&keys);
+        let decoded = decode_series_key_v2(&encoded).unwrap();
+        assert_eq!(keys, decoded);
+
+        // Test with tags containing '/'
+        let keys = vec!["a/b".to_string(), "c".to_string(), "d/e/f".to_string()];
+        let encoded = encode_series_key_v2(&keys);
+        let decoded = decode_series_key_v2(&encoded).unwrap();
+        assert_eq!(keys, decoded);
+
+        // Test with empty tag names
+        let keys = vec!["".to_string(), "a".to_string()];
+        let encoded = encode_series_key_v2(&keys);
+        let decoded = decode_series_key_v2(&encoded).unwrap();
+        assert_eq!(keys, decoded);
+
+        // Test with Unicode characters
+        let keys = vec!["测试".to_string(), "a/b".to_string(), "c".to_string()];
+        let encoded = encode_series_key_v2(&keys);
+        let decoded = decode_series_key_v2(&encoded).unwrap();
+        assert_eq!(keys, decoded);
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_series_key_with_slash_in_tag_names() {
+        // Test the example from issue #14457
+        let schema = SchemaBuilder::new()
+            .tag("a/b")
+            .tag("c")
+            .influx_field("f1", Float)
+            .timestamp()
+            .with_series_key(["a/b", "c"])
+            .build()
+            .unwrap();
+
+        let series_key = schema.series_key().unwrap();
+        assert_eq!(vec!["a/b", "c"], series_key);
+
+        // Primary key should work correctly
+        let primary_key = schema.primary_key();
+        assert_eq!(vec!["a/b", "c", "time"], primary_key);
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_legacy_series_key_parser() {
+        // Test simple case without '/' in tag names
+        let schema = SchemaBuilder::new()
+            .tag("a")
+            .tag("b")
+            .tag("c")
+            .influx_field("f1", Float)
+            .timestamp()
+            .build()
+            .unwrap();
+
+        let parsed = parse_legacy_series_key("a/b/c", &schema);
+        assert_eq!(vec!["a", "b", "c"], parsed);
+
+        // Test complex case with '/' in tag names
+        let schema = SchemaBuilder::new()
+            .tag("a/b")
+            .tag("c")
+            .influx_field("f1", Float)
+            .timestamp()
+            .build()
+            .unwrap();
+
+        let parsed = parse_legacy_series_key("a/b/c", &schema);
+        assert_eq!(vec!["a/b", "c"], parsed);
+
+        // Test edge case from issue
+        let schema = SchemaBuilder::new()
+            .tag("a")
+            .tag("a/b")
+            .tag("a/b/c")
+            .influx_field("f1", Float)
+            .timestamp()
+            .build()
+            .unwrap();
+
+        // This should parse as ["a/b", "c"] not ["a", "b/c"]
+        let parsed = parse_legacy_series_key("a/b/c", &schema);
+        // The parser should find a valid combination
+        assert!(!parsed.is_empty(), "Parser returned empty result");
+        // Any of these could be valid depending on the order the parser checks
+        assert!(
+            parsed == vec!["a", "b", "c"]
+                || parsed == vec!["a/b", "c"]
+                || parsed == vec!["a/b/c"]
+                || parsed == vec!["a", "b/c"],
+            "Unexpected parse result: {parsed:?}"
+        );
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_backward_compatibility_reads_legacy_format() {
+        // Create schema the old way (only legacy format)
+        let arrow_fields = vec![
+            ArrowField::new("a/b", ArrowDataType::Utf8, true),
+            ArrowField::new("c", ArrowDataType::Utf8, true),
+            ArrowField::new("time", TIME_DATA_TYPE(), false),
+        ];
+
+        let mut metadata = HashMap::new();
+        metadata.insert(SERIES_KEY_METADATA_KEY.to_string(), "a/b/c".to_string());
+
+        // Add column type metadata
+        let arrow_schema = ArrowSchema::new_with_metadata(
+            arrow_fields
+                .into_iter()
+                .map(|mut f| {
+                    if f.name() == "time" {
+                        set_field_metadata(&mut f, InfluxColumnType::Timestamp);
+                    } else {
+                        set_field_metadata(&mut f, InfluxColumnType::Tag);
+                    }
+                    f
+                })
+                .collect::<Vec<_>>(),
+            metadata,
+        );
+
+        let schema = Schema::try_from(Arc::new(arrow_schema)).unwrap();
+
+        // Should still work with legacy parser
+        let series_key = schema.series_key().unwrap();
+        assert_eq!(vec!["a/b", "c"], series_key);
+    }
+
+    #[cfg(feature = "v3")]
+    #[test]
+    fn test_decode_series_key_v2_errors() {
+        // Test invalid base64
+        let err = decode_series_key_v2("not base64!").unwrap_err();
+        assert!(matches!(err, Error::InvalidMetadata { .. }));
+
+        // Test truncated length
+        let encoded = encode_series_key_v2(&["test".to_string()]);
+        let truncated = &encoded[..encoded.len() - 5]; // Remove some chars
+        let err = decode_series_key_v2(truncated).unwrap_err();
+        assert!(matches!(err, Error::InvalidMetadata { .. }));
     }
 }

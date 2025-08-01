@@ -5,13 +5,13 @@
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
-use observability_deps::tracing::warn;
 use rand::prelude::*;
 use rand::rng;
 use snafu::Snafu;
 use std::ops::ControlFlow;
 use std::time::Duration;
 use tokio::time::Instant;
+use tracing::warn;
 
 /// Exponential backoff with jitter
 ///
@@ -305,10 +305,37 @@ impl Deadline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::mock::StepRng;
     use std::io::Error;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A simple RNG that always returns the same value
+    struct ConstantRng {
+        value: u64,
+    }
+
+    impl ConstantRng {
+        fn new(value: u64) -> Self {
+            Self { value }
+        }
+    }
+
+    impl RngCore for ConstantRng {
+        fn next_u32(&mut self) -> u32 {
+            (self.value >> 32) as u32
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.value
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            let bytes = self.value.to_le_bytes();
+            for (i, byte) in dest.iter_mut().enumerate() {
+                *byte = bytes[i % 8];
+            }
+        }
+    }
 
     #[test]
     fn test_backoff() {
@@ -326,7 +353,7 @@ mod tests {
         let assert_fuzzy_eq = |a: f64, b: f64| assert!((b - a).abs() < 0.0001, "{a} != {b}");
 
         // Create a static rng that takes the minimum of the range
-        let rng = Box::new(StepRng::new(0, 0));
+        let rng = Box::new(ConstantRng::new(0));
         let mut backoff = Backoff::new_with_rng(&config, Some(rng));
 
         for _ in 0..20 {
@@ -334,7 +361,7 @@ mod tests {
         }
 
         // Create a static rng that takes the maximum of the range
-        let rng = Box::new(StepRng::new(u64::MAX, 0));
+        let rng = Box::new(ConstantRng::new(u64::MAX));
         let mut backoff = Backoff::new_with_rng(&config, Some(rng));
 
         for i in 0..20 {
@@ -343,7 +370,7 @@ mod tests {
         }
 
         // Create a static rng that takes the mid point of the range
-        let rng = Box::new(StepRng::new(u64::MAX / 2, 0));
+        let rng = Box::new(ConstantRng::new(u64::MAX / 2));
         let mut backoff = Backoff::new_with_rng(&config, Some(rng));
 
         let mut value = init_backoff_secs;
@@ -354,7 +381,7 @@ mod tests {
         }
 
         // deadline
-        let rng = Box::new(StepRng::new(u64::MAX, 0));
+        let rng = Box::new(ConstantRng::new(u64::MAX));
         let deadline = Duration::from_secs_f64(init_backoff_secs);
         let mut backoff = Backoff::new_with_rng(
             &BackoffConfig {
@@ -369,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_overflow() {
-        let rng = Box::new(StepRng::new(u64::MAX, 0));
+        let rng = Box::new(ConstantRng::new(u64::MAX));
         let cfg = BackoffConfig {
             init_backoff: Duration::MAX,
             max_backoff: Duration::MAX,
@@ -381,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_max_backoff_smaller_init() {
-        let rng = Box::new(StepRng::new(u64::MAX, 0));
+        let rng = Box::new(ConstantRng::new(u64::MAX));
         let cfg = BackoffConfig {
             init_backoff: Duration::from_secs(2),
             max_backoff: Duration::from_secs(1),
@@ -424,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_constant_backoff() {
-        let rng = Box::new(StepRng::new(u64::MAX, 0));
+        let rng = Box::new(ConstantRng::new(u64::MAX));
         let cfg = BackoffConfig {
             init_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(1),

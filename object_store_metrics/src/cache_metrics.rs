@@ -7,9 +7,9 @@ use futures::stream::BoxStream;
 use metric::{Registry, U64Histogram, U64HistogramOptions};
 use object_store::{
     Attributes, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, path::Path,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
-use observability_deps::tracing::debug;
+use tracing::debug;
 use tracker::{LockMetrics, Mutex};
 
 use crate::{
@@ -61,7 +61,7 @@ enum HasFilter {
 
 impl HasFilter {
     /// Register a cache MISS for the given object store path and object size (in bytes).
-    fn register_miss(&self, store_type: &StoreType, location: &Path, size: usize) {
+    fn register_miss(&self, store_type: &StoreType, location: &Path, size: u64) {
         match self {
             Self::Yes {
                 once_contained,
@@ -82,15 +82,15 @@ impl HasFilter {
                 };
 
                 if maybe_seen {
-                    bytes_thrashed.record(size as u64);
+                    bytes_thrashed.record(size);
                     debug!(state="MISS", thrashed=true, store_type=store_type.0.as_ref(), %location, "object store cache");
                 } else {
-                    bytes_novel.record(size as u64);
+                    bytes_novel.record(size);
                     debug!(state="MISS", thrashed=false, store_type=store_type.0.as_ref(), %location, "object store cache");
                 }
             }
             Self::No { bytes_miss } => {
-                bytes_miss.record(size as u64);
+                bytes_miss.record(size);
                 debug!(state="MISS", store_type=store_type.0.as_ref(), %location, "object store cache");
             }
         }
@@ -203,7 +203,7 @@ impl ObjectStoreCacheMetrics {
     }
 
     /// Register where the parquet object was found.
-    fn register_get(&self, location: &Path, size: usize, result_attributes: &Attributes) {
+    fn register_get(&self, location: &Path, size: u64, result_attributes: &Attributes) {
         if let Some(state) = result_attributes
             .get(&ATTR_CACHE_STATE)
             .and_then(|val| CacheState::try_from(val).ok())
@@ -214,11 +214,11 @@ impl ObjectStoreCacheMetrics {
                         .register_miss(&self.store_type, location, size);
                 }
                 CacheState::AlreadyLoading => {
-                    self.bytes_cache_miss_already_loading.record(size as u64);
+                    self.bytes_cache_miss_already_loading.record(size);
                     debug!(state="MISS_ALREADY_LOADING", store_type=self.store_type.0.as_ref(), %location, "object store cache");
                 }
                 CacheState::WasCached => {
-                    self.bytes_cache_hit.record(size as u64);
+                    self.bytes_cache_hit.record(size);
                     debug!(state="HIT", store_type=self.store_type.0.as_ref(), %location, "object store cache");
                 }
             }
@@ -282,6 +282,9 @@ fn expected_false_positive_rate(num_items: usize, key_size: usize) -> Option<f64
     // p = (1 - exp(-k / (m / n))) ^ k
     // p = (1 - exp(-k / ( (2^(8*k)) / n))) ^ k
 
+    // Just a small preference - the small `* -1_f64` below is clearer than just adding a negative
+    // before it, and we want this to be clear and easy to understand
+    #[expect(clippy::neg_multiply)]
     // (2^(8*k))
     2_u128
         .checked_pow(8 * (key_size as u32))
@@ -318,7 +321,7 @@ impl ObjectStore for ObjectStoreCacheMetrics {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -337,13 +340,13 @@ impl ObjectStore for ObjectStoreCacheMetrics {
         res
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
         // currently we use GET RANGE for reading ranges on already fetched (in whole GET) objects.
         // therefore, no metrics are recorded.
         self.inner.get_range(location, range).await
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         // currently we use GET RANGE for reading ranges on already fetched (in whole GET) objects.
         // therefore, no metrics are recorded.
         self.inner.get_ranges(location, ranges).await
@@ -372,7 +375,7 @@ impl ObjectStore for ObjectStoreCacheMetrics {
         self.inner.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
@@ -380,7 +383,7 @@ impl ObjectStore for ObjectStoreCacheMetrics {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, Result<ObjectMeta>> {
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner.list_with_offset(prefix, offset)
     }
 

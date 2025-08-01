@@ -90,7 +90,7 @@ fn get_list_entries_short(size: usize) -> Vec<ListEntry> {
     for i in 0..size {
         entries.push(ListEntry::new(
             CacheKey::Partition(i as i64),
-            CacheValue::new(Bytes::from(format!("data_{}", i)), 0),
+            CacheValue::new(Bytes::from(format!("data_{i}")), 0),
         ));
     }
     entries
@@ -100,7 +100,7 @@ fn encode_partition_snapshot(i: usize) -> Bytes {
     let namespace_id = NamespaceId::new(3);
     let table_id = TableId::new(4);
     let partition_id = PartitionId::new(i as i64);
-    let partition_key = PartitionKey::from(format!("arbitrary_{}", i));
+    let partition_key = PartitionKey::from(format!("arbitrary_{i}"));
     let expected_partition_hash_id = PartitionHashId::new(table_id, &partition_key);
     let generation = 6;
     let parquet_file_defaults = ParquetFile {

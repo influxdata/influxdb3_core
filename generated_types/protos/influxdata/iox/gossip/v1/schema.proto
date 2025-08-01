@@ -54,6 +54,12 @@ message TableUpdated {
 
   // The set of columns in this update.
   repeated Column columns = 4;
+
+  // the router_version of the namespace that holds this table at the point in time
+  // immediately after the change necessitating this message was applied (this field
+  // should follow the same rules about what value to hold (and when) as the
+  // TableDropped.router_version field)
+  int64 router_version = 6;
 }
 
 // Initialisation of a new table occurred.
@@ -87,6 +93,12 @@ message TableDropped {
 
   // The id of the namespace which contains the dropped table
   int64 namespace_id = 3;
+
+  // The router_version of the namespace which this table belongs to. The value for
+  // this field should be the same as the value that was set in the catalog as a part
+  // of the table deletion transaction. So if a table deletion made the router version
+  // go from 4 -> 5, this should be 5.
+  int64 router_version = 4;
 }
 
 // Representation of a column schema within a table.

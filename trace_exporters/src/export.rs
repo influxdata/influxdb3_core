@@ -14,8 +14,8 @@ use futures::{
 use tokio::sync::mpsc;
 use tokio::task::JoinError;
 
-use observability_deps::tracing::{error, info, warn};
 use trace::{TraceCollector, span::Span};
+use tracing::{error, info, warn};
 
 /// Size of the exporter buffer
 const CHANNEL_SIZE: usize = 100_000;

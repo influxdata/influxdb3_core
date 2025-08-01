@@ -149,6 +149,7 @@ fn is_comparison(op: Operator) -> bool {
         Operator::Minus => false,
         Operator::Multiply => false,
         Operator::Divide => false,
+        Operator::IntegerDivide => false,
         Operator::Modulo => false,
         Operator::And => true,
         Operator::Or => true,
@@ -160,8 +161,20 @@ fn is_comparison(op: Operator) -> bool {
         Operator::RegexNotIMatch => true,
         Operator::StringConcat => false,
         // array containment operators
+        Operator::AtAt => true,
+        Operator::Arrow => true,
+        Operator::LongArrow => true,
         Operator::ArrowAt => true,
         Operator::AtArrow => true,
+        // The operators below are not used for InfluxRPC queries and thus
+        // they will not be used
+        Operator::HashArrow => true,
+        Operator::HashLongArrow => true,
+        Operator::HashMinus => true,
+        Operator::AtQuestion => true,
+        Operator::Question => true,
+        Operator::QuestionAnd => true,
+        Operator::QuestionPipe => true,
         // regex pattern matches (*~, etc)
         Operator::LikeMatch => true,
         Operator::ILikeMatch => true,
@@ -248,7 +261,7 @@ fn is_col_not_null(expr: &Expr) -> Option<&str> {
 }
 
 fn is_lit(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(_))
+    matches!(expr, Expr::Literal(_, _))
 }
 
 /// returns the column name for an expression like `col = <lit>`

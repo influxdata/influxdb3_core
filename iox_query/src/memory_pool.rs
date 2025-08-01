@@ -448,9 +448,15 @@ mod tests {
         // Try to grow query 3's PerQueryMemoryPool by 100 bytes, which should fail
         let result = q3_pool.try_grow(&dummy_reservation, 100);
         assert_error!(result.as_ref(), DataFusionError::ResourcesExhausted(_));
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: central_reservation_2 consumed 20 bytes, central_reservation_1 consumed 15 bytes. Error: Failed to allocate additional 90 bytes for central_reservation_3 with 0 bytes already allocated for this reservation - 65 bytes remain available for the total pool"
+        insta::assert_snapshot!(
+            // reservations are numbered non-deterministically, so we need to normalize that
+            regex::Regex::new("#[0-9]+").unwrap().replace_all(result.unwrap_err().to_string().as_str(), ""),
+            @r"
+        Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as:
+          central_reservation_2(can spill: false) consumed 20.0 B,
+          central_reservation_1(can spill: false) consumed 15.0 B.
+        Error: Failed to allocate additional 90.0 B for central_reservation_3 with 0.0 B already allocated for this reservation - 65.0 B remain available for the total pool
+        "
         );
 
         // Verify that the reserved memory for query 3 is 0 bytes since the allocation failed.

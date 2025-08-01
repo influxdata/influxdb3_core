@@ -35,11 +35,11 @@ fn get_result(data: &'static [u8], path: &Path) -> GetResult {
         meta: ObjectMeta {
             location: path.clone(),
             last_modified: Default::default(),
-            size: data.len(),
+            size: data.len() as u64,
             e_tag: Some(format!("etag-{path}")),
             version: None,
         },
-        range: 0..data.len(),
+        range: 0..data.len() as u64,
         attributes: Default::default(),
     }
 }
@@ -222,14 +222,14 @@ where
     let data = b"foo";
 
     Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
-        params: (location.clone(), hint_size(data.len()).into()),
+        params: (location.clone(), hint_size(data.len() as u64).into()),
         barriers: vec![],
         res: Ok(get_result(data, &location)),
     });
 
     let data = setup
         .outer()
-        .get_opts(&location, hint_size(data.len()))
+        .get_opts(&location, hint_size(data.len() as u64))
         .await
         .unwrap()
         .bytes()

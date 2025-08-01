@@ -52,7 +52,11 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
         // https://github.com/apache/arrow-datafusion/search?q=NotImplemented
         | DataFusionError::NotImplemented(_)
         | DataFusionError::Plan(_) => tonic::Code::InvalidArgument,
-        DataFusionError::Context(_,_) => unreachable!("handled in chain traversal above"),
+        // cases handled by `find_root` / `Error::source`
+        DataFusionError::Collection(_)
+        | DataFusionError::Context(_,_)
+        | DataFusionError::Diagnostic(_, _)
+        | DataFusionError::Shared(_) => unreachable!("handled in chain traversal above"),
         // External errors are mostly traversed by the DataFusion already except for some IOx errors
         DataFusionError::ArrowError(e, _) => arrow_error_to_tonic_code(e),
         DataFusionError::External(e) => {
@@ -120,9 +124,11 @@ fn parquet_error_to_tonic_code(e: &ParquetError) -> tonic::Code {
         ParquetError::External(e) => dyn_error_to_tonic_code(e.as_ref()),
         ParquetError::NYI(_) => tonic::Code::Unimplemented,
         ParquetError::IndexOutOfBound(_, _) => tonic::Code::OutOfRange,
-        ParquetError::EOF(_) | ParquetError::ArrowError(_) | ParquetError::General(_) => {
-            tonic::Code::Internal
-        }
+        ParquetError::EOF(_)
+        | ParquetError::ArrowError(_)
+        | ParquetError::General(_)
+        | ParquetError::NeedMoreData(_)
+        | _ => tonic::Code::Internal,
     }
 }
 
@@ -230,7 +236,7 @@ mod test {
             tonic::Code::Unimplemented,
         );
         do_transl_test(
-            FlightError::Tonic(tonic::Status::new(tonic::Code::DataLoss, "foo")),
+            FlightError::Tonic(Box::new(tonic::Status::new(tonic::Code::DataLoss, "foo"))),
             tonic::Code::DataLoss,
         );
         do_transl_test(

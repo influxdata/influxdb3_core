@@ -9,9 +9,9 @@ use generated_types::influxdata::iox::querier::v1 as proto;
 use generated_types::influxdata::iox::querier::v1::read_info::QueryType;
 
 use iox_query_params::StatementParams;
-use observability_deps::tracing::trace;
 use prost::Message;
 use serde::Deserialize;
+use tracing::trace;
 
 use snafu::{ResultExt, Snafu};
 use std::fmt::{Debug, Display, Formatter};

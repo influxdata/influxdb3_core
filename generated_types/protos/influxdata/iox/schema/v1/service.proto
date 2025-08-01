@@ -1,8 +1,9 @@
 syntax = "proto3";
 package influxdata.iox.schema.v1;
-option go_package = "github.com/influxdata/iox/schema/v1";
 
 import "influxdata/iox/column_type/v1/type.proto";
+
+option go_package = "github.com/influxdata/iox/schema/v1";
 
 service SchemaService {
   // Get the schema for a namespace and, optionally, a table within that namespace
@@ -15,11 +16,16 @@ service SchemaService {
 
 message GetSchemaRequest {
   // The namespace for which to fetch the schema
-  string namespace = 1;
-
+  oneof namespace_target {
+    string namespace_name = 1 [deprecated = true];
+    int64 namespace_id = 3;
+  }
   // If specified, the table in the namespace for which to fetch the schema. If not specified, the
   // schemas for all tables in this namespace will be returned.
-  optional string table = 2;
+  oneof table_target {
+    string table_name = 2 [deprecated = true];
+    int64 table_id = 4;
+  }
 }
 
 message GetSchemaResponse {
@@ -35,7 +41,10 @@ message UpsertSchemaRequest {
   }
 
   // The table for which to upsert the schema
-  string table = 2;
+  oneof table_target {
+    string table_name = 2 [deprecated = true];
+    int64 table_id = 5;
+  }
 
   // Map of Column Name -> Column Type to upsert into this table's schema
   map<string, influxdata.iox.column_type.v1.ColumnType> columns = 3;

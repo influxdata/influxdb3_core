@@ -138,8 +138,8 @@ use arrow::{
 };
 use arrow_flight::FlightData;
 use futures::{Stream, StreamExt, stream::BoxStream};
-use observability_deps::tracing::{info, warn};
 use tokio::time::{Interval, MissedTickBehavior};
+use tracing::{info, warn};
 
 /// Keep alive underlying response stream by sending regular empty [`RecordBatch`]es.
 pub(crate) struct KeepAliveStream<E>
@@ -181,12 +181,10 @@ where
                     }
                     res = state.inner.next() => {
                         // peek at content to detect schema transmission
-                        if let Some(Ok(data)) = &res {
-                            if let Some(schema) = decode_schema(data) {
-                                if check_schema(&schema) {
-                                    state.schema = Some(Arc::new(schema));
-                                }
-                            }
+                        if let Some(Ok(data)) = &res &&
+                           let Some(schema) = decode_schema(data) &&
+                           check_schema(&schema) {
+                            state.schema = Some(Arc::new(schema));
                         }
 
                         state.ticker.reset();

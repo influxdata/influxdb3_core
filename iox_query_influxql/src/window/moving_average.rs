@@ -1,7 +1,7 @@
 use crate::{NUMERICS, error};
 use arrow::array::{Array, ArrayRef, Int64Array};
-use arrow::datatypes::{DataType, Field};
-use datafusion::common::{DataFusionError, Result, ScalarValue, downcast_value};
+use arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::common::{Result, ScalarValue, downcast_value};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::{
     PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
@@ -41,8 +41,12 @@ impl WindowUDFImpl for MovingAverageUDWF {
         &self.signature
     }
 
-    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
-        Ok(Field::new(field_args.name(), DataType::Float64, true))
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<FieldRef> {
+        Ok(Arc::new(Field::new(
+            field_args.name(),
+            DataType::Float64,
+            true,
+        )))
     }
 
     fn partition_evaluator(

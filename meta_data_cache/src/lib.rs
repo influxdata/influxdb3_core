@@ -1,7 +1,7 @@
 //! Metadata Index Cache Implementation.
 #![warn(missing_docs)]
 
-use observability_deps::tracing::warn;
+use tracing::warn;
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
@@ -19,7 +19,10 @@ use datafusion::{
     error::DataFusionError,
     execution::context::ExecutionProps,
     logical_expr::{Expr, utils::conjunction},
-    parquet::{arrow::async_reader::AsyncFileReader, file::metadata::ParquetMetaData},
+    parquet::{
+        arrow::{arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
+        file::metadata::ParquetMetaData,
+    },
     physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
     scalar::ScalarValue,
 };
@@ -27,7 +30,9 @@ use datafusion_util::create_physical_expr_from_schema;
 use futures::FutureExt;
 use metric::U64Counter;
 use object_store_mem_cache::cache_system::{
-    Cache, DynError, HasSize, hook::observer::ObserverHook, s3_fifo_cache::S3FifoCache,
+    Cache, DynError, HasSize,
+    hook::observer::ObserverHook,
+    s3_fifo_cache::{S3Config, S3FifoCache},
 };
 
 const CACHE_NAME: &str = "parquet_metadata";
@@ -63,14 +68,16 @@ impl MetaIndexCacheParams<'_> {
         } = self;
 
         let cache = Arc::new(S3FifoCache::new(
-            memory_limit.get(),
-            s3_fifo_ghost_memory_limit.get(),
-            s3fifo_main_threshold as f64 / 100.0,
-            Arc::new(ObserverHook::new(
-                CACHE_NAME,
-                metrics,
-                Some(memory_limit.get() as u64),
-            )) as _,
+            S3Config {
+                max_memory_size: memory_limit.get(),
+                max_ghost_memory_size: s3_fifo_ghost_memory_limit.get(),
+                move_to_main_threshold: s3fifo_main_threshold as f64 / 100.0,
+                hook: Arc::new(ObserverHook::new(
+                    CACHE_NAME,
+                    metrics,
+                    Some(memory_limit.get() as u64),
+                )) as _,
+            },
             metrics,
         ));
 
@@ -142,7 +149,7 @@ impl StatsCachedMetrics {
 ///        for 3 different options
 #[derive(Debug)]
 pub struct MetaIndexCache {
-    file_index: Arc<S3FifoCache<ObjectStoreId, FileMetas>>,
+    file_index: Arc<S3FifoCache<ObjectStoreId, Arc<FileMetas>, ()>>,
 
     // cache metrics
     col_stats_metrics: Arc<StatsCachedMetrics>,
@@ -158,16 +165,18 @@ impl MetaIndexCache {
         file_uuid: &ObjectStoreId,
         table_schema: SchemaRef,
         mut reader: R,
+        arrow_reader_options: Option<&ArrowReaderOptions>,
     ) -> Result<Arc<FileMetas>, DynError> {
         let cache_column_stats = self.cache_column_stats;
+        let arrow_reader_options = arrow_reader_options.cloned();
         let (res, _state) = self
             .file_index
             .get_or_fetch(
                 file_uuid,
-                Box::new(move |_any| {
+                Box::new(move || {
                     async move {
                         let parquet_metadata = reader
-                            .get_metadata()
+                            .get_metadata(arrow_reader_options.as_ref())
                             .await
                             .map_err(|e| Arc::new(e) as DynError)?;
                         // get statistics from metadata
@@ -178,10 +187,10 @@ impl MetaIndexCache {
                                     .ok()
                             })
                             .flatten();
-                        Ok(FileMetas {
+                        Ok(Arc::new(FileMetas {
                             col_metas,
                             parquet_metadata,
-                        })
+                        }))
                     }
                     .boxed()
                 }),
@@ -235,17 +244,16 @@ impl MetaIndexCache {
         file_uuid: &ObjectStoreId,
         col_index: usize,
     ) -> Option<Option<ColStats>> {
-        if let Some(file_meta) = self.get_file_stats(file_uuid) {
-            if let Some(ref col_metas) = file_meta.col_metas {
-                if col_index < col_metas.len() {
-                    if col_metas[col_index].is_some() {
-                        self.col_stats_metrics.has_col_stats();
-                    } else {
-                        self.col_stats_metrics.has_no_col_stats();
-                    }
-                    return Some(col_metas[col_index].clone());
-                }
+        if let Some(file_meta) = self.get_file_stats(file_uuid)
+            && let Some(ref col_metas) = file_meta.col_metas
+            && col_index < col_metas.len()
+        {
+            if col_metas[col_index].is_some() {
+                self.col_stats_metrics.has_col_stats();
+            } else {
+                self.col_stats_metrics.has_no_col_stats();
             }
+            return Some(col_metas[col_index].clone());
         }
         self.col_stats_metrics.has_no_col_stats();
         None
@@ -630,6 +638,7 @@ mod tests {
     use datafusion::{
         common::{ColumnStatistics, Statistics, stats::Precision},
         parquet::{
+            arrow::arrow_reader::ArrowReaderOptions,
             errors::ParquetError,
             file::metadata::FileMetaData,
             schema::types::{SchemaDescriptor, Type},
@@ -646,24 +655,21 @@ mod tests {
     }
 
     impl AsyncFileReader for MockFileReader {
-        fn get_bytes(
-            &mut self,
-            _range: Range<usize>,
-        ) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
+        fn get_bytes(&mut self, _range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
             Box::pin(async move { unimplemented!() })
         }
 
         fn get_byte_ranges(
             &mut self,
-            _ranges: Vec<Range<usize>>,
+            _ranges: Vec<Range<u64>>,
         ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
             Box::pin(async move { unimplemented!() })
         }
 
-        fn get_metadata(
-            &mut self,
-        ) -> futures::future::BoxFuture<'_, datafusion::parquet::errors::Result<Arc<ParquetMetaData>>>
-        {
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>, ParquetError>> {
             Box::pin(async move { Ok(Arc::clone(&self.0)) })
         }
     }
@@ -712,12 +718,12 @@ mod tests {
             .file_index
             .get_or_fetch(
                 file_uuid,
-                Box::new(|_| {
+                Box::new(|| {
                     async move {
-                        Ok(FileMetas {
+                        Ok(Arc::new(FileMetas {
                             parquet_metadata: parquet_1.into(),
                             col_metas: Some(ColStats::from_statistics(file_stats_1)),
-                        })
+                        }))
                     }
                     .boxed()
                 }),
@@ -975,7 +981,7 @@ mod tests {
         let parquet_1 = dummy_parquet_metadata();
         let (schema_1, _file_stats_1, _expected_col_stats_1) = create_df_stats_3_columns();
         let _ = meta_index
-            .add_metadata_for_file(&file_1, schema_1, MockFileReader::new(parquet_1))
+            .add_metadata_for_file(&file_1, schema_1, MockFileReader::new(parquet_1), None)
             .await;
 
         // add stats for file 2 with 4 columns (one more column from the previous file)
@@ -984,7 +990,7 @@ mod tests {
         // specific metadata content doesn't matter
         let parquet_2 = dummy_parquet_metadata();
         let _ = meta_index
-            .add_metadata_for_file(&file_2, schema_2, MockFileReader::new(parquet_2))
+            .add_metadata_for_file(&file_2, schema_2, MockFileReader::new(parquet_2), None)
             .await;
         // length of the file index should be 2
         assert_eq!(meta_index.len(), 2);
@@ -1031,6 +1037,7 @@ mod tests {
                     max_value: Precision::Exact(ScalarValue::Int64(Some(10))),
                     null_count: Precision::Exact(0),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // column without stats
                 ColumnStatistics {
@@ -1038,6 +1045,7 @@ mod tests {
                     max_value: Precision::Absent,
                     null_count: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // column with null stats
                 ColumnStatistics {
@@ -1045,6 +1053,7 @@ mod tests {
                     max_value: Precision::Exact(null_utf8),
                     null_count: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };
@@ -1095,6 +1104,7 @@ mod tests {
                     max_value: Precision::Exact(ScalarValue::Int64(Some(110))),
                     null_count: Precision::Exact(0),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // column without stats
                 ColumnStatistics {
@@ -1102,6 +1112,7 @@ mod tests {
                     max_value: Precision::Absent,
                     null_count: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // column with null stats
                 ColumnStatistics {
@@ -1109,6 +1120,7 @@ mod tests {
                     max_value: Precision::Exact(null_utf8),
                     null_count: Precision::Absent,
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // column with stats
                 ColumnStatistics {
@@ -1116,6 +1128,7 @@ mod tests {
                     max_value: Precision::Exact(ScalarValue::Utf8(Some("b".to_string()))),
                     null_count: Precision::Exact(0),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ],
         };

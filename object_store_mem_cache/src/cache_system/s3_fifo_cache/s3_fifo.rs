@@ -1,3 +1,4 @@
+use bincode::{Decode, Encode};
 use dashmap::DashMap;
 use std::{
     fmt::{Debug, Formatter},
@@ -10,7 +11,7 @@ use std::{
 use tracker::{LockMetrics, Mutex};
 
 use crate::cache_system::{
-    HasSize,
+    DynError, HasSize,
     hook::{EvictResult, Hook},
 };
 
@@ -23,7 +24,7 @@ where
     K: ?Sized,
 {
     key: Arc<K>,
-    value: Arc<V>,
+    value: V,
     generation: u64,
     freq: AtomicU8,
 }
@@ -32,7 +33,7 @@ impl<K, V> S3FifoEntry<K, V>
 where
     K: ?Sized,
 {
-    pub(crate) fn value(&self) -> &Arc<V> {
+    pub(crate) fn value(&self) -> &V {
         &self.value
     }
 }
@@ -50,6 +51,46 @@ where
             freq: _,
         } = self;
         key.size() + value.size()
+    }
+}
+
+impl<K, V> Encode for S3FifoEntry<K, V>
+where
+    K: Encode + Sized + HasSize,
+    V: Encode + HasSize,
+{
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        self.key.encode(encoder)?;
+        self.value.encode(encoder)?;
+        self.generation.encode(encoder)?;
+        self.freq.load(Ordering::SeqCst).encode(encoder)?;
+        Ok(())
+    }
+}
+
+// bincode Decode implementation for S3FifoEntry
+impl<K, V, Q> Decode<Q> for S3FifoEntry<K, V>
+where
+    K: Decode<Q> + Encode + Sized + HasSize,
+    V: Decode<Q> + Encode + HasSize,
+{
+    fn decode<D: bincode::de::Decoder<Context = Q>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let key: Arc<K> = Decode::decode(decoder)?;
+        let value: V = Decode::decode(decoder)?;
+        let generation: u64 = Decode::decode(decoder)?;
+        let freq_val: u8 = Decode::decode(decoder)?;
+
+        Ok(Self {
+            key,
+            value,
+            generation,
+            freq: AtomicU8::new(freq_val),
+        })
     }
 }
 
@@ -106,6 +147,59 @@ where
         }
     }
 
+    /// Create new S3Fifo from a deserialized snapshot.
+    ///
+    /// This function deserializes a snapshot and creates a new S3Fifo instance
+    /// with the restored state, including rebuilding the entries map.
+    ///
+    /// # Parameters
+    /// - `config`: The S3 FIFO configuration. See [`S3Config`] for details.
+    /// - `snapshot_data`: The serialized cache state data, typically created by [`snapshot`](Self::snapshot).
+    /// - `shared_seed`: See [`deserialize_snapshot`](Self::deserialize_snapshot) for
+    ///   an explanation of how this context parameter is used during deserialization.
+    ///
+    /// # Returns
+    /// A new S3Fifo instance with the restored state.
+    ///
+    /// # Errors
+    /// Returns a `DynError` if deserialization fails.
+    pub fn new_from_snapshot<Q>(
+        config: S3Config<K>,
+        metric_registry: &metric::Registry,
+        snapshot_data: &[u8],
+        shared_seed: &Q,
+    ) -> Result<Self, DynError>
+    where
+        Q: Clone,
+        K: Decode<Q> + Eq + Hash + Send + Sync + 'static + HasSize + Encode,
+        // the value (`V`) should be bincode encoded and decoded
+        V: Decode<Q> + HasSize + Send + Sync + 'static + Encode,
+    {
+        // Deserialize the locked state - all migration and legacy handling is in VersionedState
+        let locked_state = Self::deserialize_snapshot(snapshot_data, shared_seed.clone())?;
+
+        // Create the entries map from the deserialized state
+        let entries = DashMap::new();
+
+        // Rebuild entries from main queue
+        for entry in locked_state.main.iter() {
+            entries.insert(Arc::clone(&entry.key), Arc::clone(entry));
+        }
+
+        // Rebuild entries from small queue
+        for entry in locked_state.small.iter() {
+            entries.insert(Arc::clone(&entry.key), Arc::clone(entry));
+        }
+
+        // Create the S3Fifo instance
+        let lock_metrics = Arc::new(LockMetrics::new(metric_registry, &[("lock", "s3fifo")]));
+        Ok(Self {
+            locked_state: lock_metrics.new_mutex(locked_state),
+            entries,
+            config,
+        })
+    }
+
     /// Gets entry from the set, or inserts it if it does not exist yet.
     ///
     /// # Hook Interaction
@@ -122,7 +216,7 @@ where
     ///
     /// Does NOT block read methods like [`get`](Self::get), [`len`](Self::len), and [`is_empty`](Self::is_empty),
     /// except for short-lived internal locks within [`DashMap`].
-    pub fn get_or_put(&self, key: Arc<K>, value: Arc<V>, generation: u64) -> CacheEntry<K, V> {
+    pub fn get_or_put(&self, key: Arc<K>, value: V, generation: u64) -> CacheEntry<K, V> {
         // Lock the state BEFORE checking `self.entries`. We won't prevent concurrent reads with it but we prevent that
         // concurrent writes could check `entries`, find the key absent and then double-insert the data into the locked state.
         let mut guard = self.locked_state.lock();
@@ -210,6 +304,74 @@ where
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Create a snapshot of the locked state.
+    ///
+    /// This function serializes the [`S3Fifo`] inner state using bincode, allowing for
+    /// persistence and recovery of the cache state.
+    ///
+    /// The state serialized will be versioned as [`Version::latest`], corresponding to the
+    /// current [`S3Fifo`] inner state implementation ([`S3Fifo::locked_state`]).
+    ///
+    /// # Returns
+    /// A `Vec<u8>` containing the serialized locked state.
+    ///
+    /// # Errors
+    /// Returns a [`DynError`] if serialization fails.
+    pub fn snapshot(&self) -> Result<Vec<u8>, DynError>
+    where
+        K: Encode + Sized + Eq + Hash + HasSize + Send + Sync + 'static,
+        V: Encode + HasSize + Send + Sync + 'static,
+    {
+        // Serialize the versioned snapshot while holding the lock
+        // This is safe because bincode serialization is typically fast
+        let guard = self.locked_state.lock();
+        let versioned_snapshot = VersionedSnapshot {
+            version: Version::latest(),
+            state: &*guard,
+        };
+
+        bincode::encode_to_vec(versioned_snapshot, bincode::config::standard())
+            .map_err(|e| crate::cache_system::utils::str_err(&e.to_string()))
+    }
+
+    /// Deserialize a snapshot to the locked state.
+    ///
+    /// The `shared_seed` parameter provides context for bincode's
+    /// [`Decode<Context>`](bincode::Decode) trait implementation. This is useful
+    /// when the deserialization process needs additional information beyond what's
+    /// stored in the serialized data itself. For example, it could provide lookup
+    /// tables, configuration, or other contextual data that types need during
+    /// deserialization.
+    ///
+    /// # Errors
+    /// Returns a [`DynError`] if deserialization fails.
+    fn deserialize_snapshot<Q>(
+        snapshot_data: &[u8],
+        shared_seed: Q,
+    ) -> Result<LockedState<K, V>, DynError>
+    where
+        Q: Clone,
+        K: Decode<Q> + Eq + Hash + Send + Sync + 'static + HasSize + Encode,
+        V: Decode<Q> + HasSize + Send + Sync + 'static + Encode,
+    {
+        // Use bincode's decode
+        let (versioned_snapshot, _): (VersionedSnapshot<LockedState<K, V>>, usize) =
+            bincode::decode_from_slice_with_context(
+                snapshot_data,
+                bincode::config::standard(),
+                shared_seed,
+            )
+            .map_err(|e| crate::cache_system::utils::str_err(&e.to_string()))?;
+
+        Ok(versioned_snapshot.state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ghost_len(&self) -> usize {
+        let guard = self.locked_state.lock();
+        guard.ghost.len()
+    }
 }
 
 /// Calls [`drop`] but isn't inlined, so it is easier to see on profiles.
@@ -246,6 +408,80 @@ where
     }
 }
 
+const VERSION_V1: u8 = 1;
+#[cfg(test)]
+const VERSION_TEST: u8 = 42;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+/// Version of S3Fifo inner state (e.g. [`S3Fifo::locked_state`]).
+pub(crate) enum Version {
+    V1 = VERSION_V1,
+
+    #[cfg(test)]
+    Test = VERSION_TEST,
+}
+
+impl Version {
+    /// Returns the latest version.
+    fn latest() -> Self {
+        Self::V1
+    }
+}
+
+/// Handles the versioning of snapshot data.
+pub(crate) struct VersionedSnapshot<S> {
+    /// The [`Version`] of this S3Fifo inner state.
+    version: Version,
+
+    /// The inner state (`S`), which may be different from the current S3Fifo state
+    /// when migrating across versions. (e.g. deserializing older state `S` snapshots).
+    state: S,
+}
+
+impl<S> Encode for VersionedSnapshot<S>
+where
+    S: Encode,
+{
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        let version: u8 = self.version as u8;
+        version.encode(encoder)?;
+        Encode::encode(&self.state, encoder)?;
+        Ok(())
+    }
+}
+
+impl<K, V, Q> Decode<Q> for VersionedSnapshot<LockedState<K, V>>
+where
+    Q: Clone,
+    K: Decode<Q> + Encode + Eq + Hash + HasSize + Sized + Send + Sync + 'static,
+    V: Decode<Q> + Encode + HasSize + Send + Sync + 'static,
+{
+    fn decode<D: bincode::de::Decoder<Context = Q>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let version: u8 = Decode::decode(decoder)?;
+
+        // In the future, we can add version-specific deserialization logic
+        // with other `S` implementations for VersionedSnapshot<S>.
+        // Then the migration would be done in the match arm.
+        match version {
+            VERSION_V1 => {
+                let locked_state: LockedState<K, V> = Decode::decode(decoder)?;
+
+                Ok(Self {
+                    version: Version::V1,
+                    state: locked_state,
+                })
+            }
+            _ => unreachable!("Unsupported version: {}", version),
+        }
+    }
+}
+
 /// Mutable part of [`S3Fifo`] that is locked for [`get_or_put`](S3Fifo::get_or_put).
 struct LockedState<K, V>
 where
@@ -268,6 +504,45 @@ where
             .field("small", &self.small)
             .field("ghost", &self.ghost)
             .finish()
+    }
+}
+
+/// Encode implementation, with trait bounds for `<K, V>`.
+impl<K, V> Encode for LockedState<K, V>
+where
+    K: Encode + Sized + Eq + Hash + HasSize + Send + Sync + 'static,
+    V: Encode + HasSize + Send + Sync + 'static,
+{
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        Encode::encode(&self.main, encoder)?;
+        Encode::encode(&self.small, encoder)?;
+        Encode::encode(&self.ghost, encoder)?;
+        Ok(())
+    }
+}
+
+// bincode Decode implementation for LockedState using Context
+// This handles the locked state decoding with bincode's native decoder
+impl<K, V, Q> Decode<Q> for LockedState<K, V>
+where
+    Q: Clone,
+    K: Decode<Q> + Encode + Eq + Hash + HasSize + Sized + Send + Sync + 'static,
+    V: Decode<Q> + Encode + HasSize + Send + Sync + 'static,
+{
+    fn decode<D: bincode::de::Decoder<Context = Q>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        // using bincode encoding & decoding
+        let main: Fifo<CacheEntry<K, V>> = Decode::decode(decoder)?;
+        let small: Fifo<CacheEntry<K, V>> = Decode::decode(decoder)?;
+
+        // Use bincode::serde::Compat for OrderedSet since it uses serde derives
+        let ghost: OrderedSet<Arc<K>> = Decode::decode(decoder)?;
+
+        Ok(Self { main, small, ghost })
     }
 }
 
@@ -516,15 +791,10 @@ mod tests {
 
         fn drop_val<T>(self, val: T, barrier: Arc<Barrier>);
 
-        fn get_or_put_handle<K, V>(
-            &self,
-            s3: &Arc<S3Fifo<K, V>>,
-            k: Arc<K>,
-            v: Arc<V>,
-        ) -> Self::Handle
+        fn get_or_put_handle<K, V>(&self, s3: &Arc<S3Fifo<K, V>>, k: Arc<K>, v: V) -> Self::Handle
         where
             K: Eq + Hash + HasSize + Send + Sync + 'static,
-            V: HasSize + Send + Sync + 'static;
+            V: Clone + HasSize + Send + Sync + 'static;
     }
 
     impl<'scope> ScopeExt for &'scope std::thread::Scope<'scope, '_> {
@@ -536,20 +806,109 @@ mod tests {
             handle.join().unwrap();
         }
 
-        fn get_or_put_handle<K, V>(
-            &self,
-            s3: &Arc<S3Fifo<K, V>>,
-            k: Arc<K>,
-            v: Arc<V>,
-        ) -> Self::Handle
+        fn get_or_put_handle<K, V>(&self, s3: &Arc<S3Fifo<K, V>>, k: Arc<K>, v: V) -> Self::Handle
         where
             K: Eq + Hash + HasSize + Send + Sync + 'static,
-            V: HasSize + Send + Sync + 'static,
+            V: Clone + HasSize + Send + Sync + 'static,
         {
             let s3_captured = Arc::clone(s3);
             self.spawn(move || {
                 s3_captured.get_or_put(k, v, 0);
             })
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_migration {
+    use super::*;
+
+    #[derive(Debug, Encode, Decode)]
+    pub(crate) struct TestNewLockedState<K, V> {
+        entries: Vec<(K, V)>,
+    }
+
+    impl<K, V> TestNewLockedState<K, V>
+    where
+        K: Clone + Eq + Hash + HasSize + Send + Sync + 'static + Sized + Debug,
+        V: Clone + HasSize + Send + Sync + 'static + Debug,
+    {
+        /// This migrate from the old `LockedState` to the new `TestNewLockedState`.
+        fn migrate_from_locked_state(locked_state: LockedState<K, V>) -> Self {
+            let entries = locked_state
+                .main
+                .iter()
+                .chain(locked_state.small.iter())
+                .map(|entry| {
+                    let key = Arc::unwrap_or_clone(Arc::clone(&entry.key));
+                    let value = entry.value.clone();
+                    (key, value)
+                })
+                .collect::<Vec<_>>();
+
+            Self { entries }
+        }
+    }
+
+    /// How to implement the migration during deserialization.
+    impl<K, V, Q> Decode<Q> for VersionedSnapshot<TestNewLockedState<K, V>>
+    where
+        K: Decode<Q> + Encode + Clone + Eq + Hash + HasSize + Sized + Send + Sync + 'static + Debug,
+        V: Decode<Q> + Encode + Clone + HasSize + Send + Sync + 'static + Debug,
+        Q: Clone,
+    {
+        fn decode<D: bincode::de::Decoder<Context = Q>>(
+            decoder: &mut D,
+        ) -> Result<Self, bincode::error::DecodeError> {
+            let version: u8 = Decode::decode(decoder)?;
+
+            match version {
+                VERSION_V1 => {
+                    // Found the older version, with an older State.
+                    //
+                    // This does require us to keep the older types & deserialization code,
+                    // for Version::latest - 1.
+                    let locked_state: LockedState<K, V> = Decode::decode(decoder)?;
+                    let new_state = TestNewLockedState::migrate_from_locked_state(locked_state);
+
+                    Ok(Self {
+                        version: Version::Test,
+                        state: new_state,
+                    })
+                }
+                #[cfg(test)]
+                VERSION_TEST => {
+                    // Found current versioned state => deserialize.
+                    let new_state: TestNewLockedState<K, V> = Decode::decode(decoder)?;
+
+                    Ok(Self {
+                        version: Version::Test,
+                        state: new_state,
+                    })
+                }
+
+                _ => unreachable!("Unsupported version: {}", version),
+            }
+        }
+    }
+
+    pub(crate) fn assert_versioned_snapshot<K, V>(
+        snapshot: &VersionedSnapshot<TestNewLockedState<K, V>>,
+        entries: &[(K, V)],
+        expected_version: Version,
+    ) where
+        K: Decode<()> + Encode + Eq + Hash + HasSize + Sized + Send + Sync + 'static + Debug,
+        V: Decode<()> + Encode + PartialEq + HasSize + Send + Sync + 'static + Debug,
+    {
+        assert_eq!(snapshot.version, expected_version, "Unexpected version");
+        assert!(
+            !snapshot.state.entries.is_empty(),
+            "Snapshot should not be empty"
+        );
+        assert_eq!(
+            &snapshot.state.entries[..],
+            entries,
+            "Snapshot entries do not match"
+        );
     }
 }

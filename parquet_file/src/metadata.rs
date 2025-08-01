@@ -95,7 +95,6 @@ use data_types::{
 };
 use generated_types::influxdata::iox::ingester::v1 as proto;
 use iox_time::Time;
-use observability_deps::tracing::{debug, trace};
 use parquet::{
     arrow::parquet_to_arrow_schema,
     file::{
@@ -119,6 +118,7 @@ use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use std::{convert::TryInto, fmt::Debug, mem, sync::Arc};
 use thiserror::Error;
 use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol, TOutputProtocol};
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 /// Current version for serialized metadata.
@@ -466,7 +466,7 @@ impl IoxMetadata {
         &self,
         partition_id: PartitionId,
         partition_hash_id: Option<PartitionHashId>,
-        file_size_bytes: usize,
+        file_size_bytes: u64,
         metadata: &IoxParquetMetaData,
         column_id_map: F,
     ) -> ParquetFileParams

@@ -1,6 +1,4 @@
 use async_trait::async_trait;
-use dashmap::DashMap;
-use futures::future::{BoxFuture, FutureExt, Shared};
 use object_store_metrics::cache_state::CacheState;
 use std::{
     fmt::Debug,
@@ -15,103 +13,162 @@ use std::{
 // for benchmarks
 pub use s3_fifo::{S3Config, S3Fifo};
 
+use crate::cache_system::DynError;
+
 use super::{
-    ArcResult, Cache, CacheFn, DynError, HasSize,
+    Cache, CacheFn, CacheRequestResult, HasSize,
     hook::{EvictResult, Hook},
-    utils::{CatchUnwindDynErrorExt, TokioTask},
+    loader::{Load, Loader},
+    utils::CatchUnwindDynErrorExt,
 };
 
 mod fifo;
 mod ordered_set;
 mod s3_fifo;
 
-type CacheFut<V> = Shared<BoxFuture<'static, Result<(Arc<V>, CacheState), DynError>>>;
+enum S3CacheResponse<V, D>
+where
+    V: Clone + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    /// Respond with [`Load`] which can be used to either await the future ([`Load::into_future`].await),
+    /// or access associated data via [`Load::data`].
+    NewEntry(Load<V, D>),
 
-enum S3CacheResponse<V> {
-    NewEntry(CacheFut<V>),
-    AlreadyLoading(CacheFut<V>),
-    WasCached(ArcResult<V>),
+    /// Respond with [`Load`] which can be used to either await the future ([`Load::into_future`].await),
+    /// or access associated data via [`Load::data`].
+    AlreadyLoading(Load<V, D>),
+
+    /// Respond with value (`V`).
+    WasCached(CacheRequestResult<V>),
 }
 
+/// A cache based upon the [`S3Fifo`] algorithm.
+///
+/// Caching is based upon a key (`K`) and return a value (`V`).
 #[derive(Debug)]
-pub struct S3FifoCache<K, V>
+pub struct S3FifoCache<K, V, D>
 where
     K: Clone + Eq + Hash + HasSize + Send + Sync + Debug + 'static,
-    V: HasSize + Send + Sync + Debug + 'static,
+    V: Clone + HasSize + Send + Sync + Debug + 'static,
+    D: Clone + Send + Sync + 'static,
 {
     cache: Arc<S3Fifo<K, V>>,
-    gen_counter: AtomicU64,
-    unresolved_futures: Arc<DashMap<Arc<K>, CacheFut<V>>>,
+    gen_counter: Arc<AtomicU64>,
+    loader: Loader<K, V, D>,
     hook: Arc<dyn Hook<K>>,
 }
 
-impl<K, V> S3FifoCache<K, V>
+impl<K, V, D> S3FifoCache<K, V, D>
 where
     K: Clone + Eq + Hash + HasSize + Send + Sync + Debug + 'static,
-    V: HasSize + Send + Sync + Debug + 'static,
+    V: Clone + HasSize + Send + Sync + Debug + 'static,
+    D: Clone + Send + Sync + 'static,
 {
-    pub fn new(
-        max_memory_size: usize,
-        max_ghost_memory_size: usize,
-        move_to_main_threshold: f64,
-        hook: Arc<dyn Hook<K>>,
-        metric_registry: &metric::Registry,
-    ) -> Self {
+    /// Create a new S3FifoCache from an [`S3Config`].
+    pub fn new(config: S3Config<K>, metric_registry: &metric::Registry) -> Self {
+        let hook = Arc::clone(&config.hook);
         Self {
-            cache: Arc::new(S3Fifo::new(
-                S3Config {
-                    max_memory_size,
-                    max_ghost_memory_size,
-                    move_to_main_threshold,
-                    hook: Arc::clone(&hook),
-                },
-                metric_registry,
-            )),
-            gen_counter: AtomicU64::new(0),
-            unresolved_futures: Arc::new(DashMap::default()),
+            cache: Arc::new(S3Fifo::new(config, metric_registry)),
+            gen_counter: Default::default(),
+            loader: Default::default(),
             hook,
         }
     }
 
-    fn get_or_fetch_impl<F, Fut>(&self, k: &K, f: F) -> S3CacheResponse<V>
+    /// Create a new S3FifoCache from a snapshot.
+    ///
+    /// This function deserializes a snapshot and creates a new cache instance
+    /// with the restored state.
+    ///
+    /// # Parameters
+    /// - `config`: The S3 FIFO configuration. See [`S3Config`] for details.
+    /// - `snapshot_data`: The serialized cache state data, typically created by [`snapshot`](Self::snapshot).
+    /// - `shared_seed`: Provides context for bincode's deserialization process.
+    ///   See [`S3Fifo::deserialize_snapshot`] for details on how this parameter
+    ///   is used with bincode's [`Decode<Context>`](bincode::Decode) trait.
+    ///   It's recommended to use a seed (`Q`) which is cheap to clone.
+    ///
+    /// # Returns
+    /// A new [`S3FifoCache`] instance with the restored state.
+    ///
+    /// # Errors
+    /// Returns a [`DynError`] if deserialization fails.
+    pub fn new_from_snapshot<Q>(
+        config: S3Config<K>,
+        metric_registry: &metric::Registry,
+        snapshot_data: &[u8],
+        shared_seed: &Q,
+    ) -> Result<Self, DynError>
     where
-        F: FnOnce(&K) -> Fut,
-        Fut: Future<Output = Result<V, DynError>> + Send + 'static,
+        Q: Clone,
+        K: bincode::Encode + bincode::Decode<Q>,
+        V: bincode::Encode + bincode::Decode<Q>,
     {
-        // fast path
+        let hook = Arc::clone(&config.hook);
+        let cache = Arc::new(S3Fifo::new_from_snapshot::<Q>(
+            config,
+            metric_registry,
+            snapshot_data,
+            shared_seed,
+        )?);
+
+        Ok(Self {
+            cache,
+            gen_counter: Default::default(),
+            loader: Default::default(),
+            hook,
+        })
+    }
+
+    /// Create a snapshot of the S3Fifo cache state.
+    ///
+    /// This function serializes the locked_state using bincode, allowing for
+    /// persistence and recovery of the cache state.
+    ///
+    /// # Returns
+    /// A `Vec<u8>` containing the serialized cache state.
+    ///
+    /// # Errors
+    /// Returns a [`DynError`] if serialization fails.
+    pub fn snapshot(&self) -> Result<Vec<u8>, DynError>
+    where
+        K: bincode::Encode,
+        V: bincode::Encode,
+    {
+        self.cache.snapshot()
+    }
+
+    /// Get the value (`V`) from the cache.
+    /// If the entry does not exist, run the future (`F`) that returns a value (`Arc<V>`).
+    ///
+    /// The value (`V`) is inserted after completion of a future. Some data (`D`) may be accessable earlier,
+    /// before the future finishes, using the [`Load::data`].
+    fn get_or_fetch_impl<F, Fut>(&self, k: &K, f: F, d: D) -> S3CacheResponse<V, D>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = CacheRequestResult<V>> + Send + 'static,
+    {
+        // fast path to already-featched value
         if let Some(entry) = self.cache.get(k) {
-            return S3CacheResponse::WasCached(Ok(Arc::clone(entry.value())));
+            return S3CacheResponse::WasCached(Ok(entry.value().clone()));
         }
 
         // slow path
-        let generation = self.gen_counter.fetch_add(1, Ordering::Relaxed);
-        let k = Arc::new(k.clone());
-        let fut = f(&k);
+        let gen_counter_captured = Arc::clone(&self.gen_counter);
+        let k_captured = Arc::new(k.clone());
         let hook_captured = Arc::clone(&self.hook);
         let cache_captured = Arc::downgrade(&self.cache);
-        let unresolved_futures_captured = Arc::downgrade(&self.unresolved_futures);
-        let k_captured = Arc::clone(&k);
-        let fut = async move {
-            // check cache first because between the "fast path" and inserting the future in the "slow path", a very
-            // fast loader might have been succeeded
-            {
-                if let Some(cache) = cache_captured.upgrade() {
-                    match cache.get(&k_captured) {
-                        None => {}
-                        Some(v) => {
-                            return Ok((Arc::clone(v.value()), CacheState::AlreadyLoading));
-                        }
-                    }
-                }
-            }
-
-            // now we can actually inform the hook
+        let fut = move || async move {
+            // now we inform the hook of insertion
+            let generation = gen_counter_captured.fetch_add(1, Ordering::SeqCst);
             hook_captured.insert(generation, &k_captured);
 
-            // run actual future
-            let fetch_res = fut.catch_unwind_dyn_error().await.map(Arc::new);
+            // get the actual value (`V`)
+            let fut = f();
+            let fetch_res = fut.catch_unwind_dyn_error().await;
 
-            // store results
+            // insert into cache
             match &fetch_res {
                 Ok(v) => {
                     if let Some(cache) = cache_captured.upgrade() {
@@ -121,7 +178,7 @@ where
                         // - Tell tokio that this is potentially expensive. This is due to the fact that inserting new values
                         //   may free existing ones and the relevant allocator accounting can be rather pricey.
                         let k = Arc::clone(&k_captured);
-                        let v = Arc::clone(v);
+                        let v = v.clone();
                         tokio::task::spawn_blocking(move || {
                             cache.get_or_put(k, v, generation);
                         })
@@ -140,66 +197,47 @@ where
                 }
             }
 
-            // forget this very future
-            // NOTE: do this AFTER storing the result!
-            if let Some(unresolved_futures) = unresolved_futures_captured.upgrade() {
-                unresolved_futures.remove(&k_captured);
-            }
-
-            // return to the caller(s) (potentially multiple that wait for this future)
-            fetch_res.map(|v| (v, CacheState::NewEntry))
+            fetch_res
         };
+        let load = self.loader.load(k.clone(), fut, d);
 
-        match self.unresolved_futures.entry(Arc::clone(&k)) {
-            dashmap::Entry::Occupied(o) => {
-                // race, entry was created in the meantime, this is fine, just use the existing one
-                S3CacheResponse::AlreadyLoading(o.get().clone())
-            }
-            dashmap::Entry::Vacant(v) => {
-                // the entry wasn't know yet
-                //
-                // Note that it might be within the actual cache in the meantime, so we have to check for that
-                // within the future again to prevent needless loading.
-                let fut = TokioTask::spawn(fut).boxed().shared();
-                v.insert(fut.clone());
-                S3CacheResponse::NewEntry(fut)
-            }
+        // if already loading => then we don't have to spawn a task for insertion into cache (once loading is done).
+        if load.already_loading() {
+            S3CacheResponse::AlreadyLoading(load)
+        } else {
+            S3CacheResponse::NewEntry(load)
         }
     }
 }
 
 #[async_trait]
-impl<K, V> Cache<K, V> for S3FifoCache<K, V>
+impl<K, V> Cache<K, V> for S3FifoCache<K, V, ()>
 where
     K: Clone + Debug + Eq + Hash + HasSize + Send + Sync + 'static,
-    V: Debug + HasSize + Send + Sync + 'static,
+    V: Clone + Debug + HasSize + Send + Sync + 'static,
 {
-    async fn get_or_fetch(&self, k: &K, f: CacheFn<K, V>) -> (ArcResult<V>, CacheState) {
-        match self.get_or_fetch_impl(k, f) {
+    async fn get_or_fetch(&self, k: &K, f: CacheFn<V>) -> (CacheRequestResult<V>, CacheState) {
+        match self.get_or_fetch_impl(k, f, ()) {
             S3CacheResponse::NewEntry(fut) => {
                 let res = fut.await;
 
                 // Due to the lock gap between the "unresolved futures" and the cache, the future may determine that
                 // data was already cached/loading. We try to read the from the inner state.
                 match res {
-                    Ok((v, state)) => (Ok(v), state),
+                    Ok(v) => (Ok(v), CacheState::NewEntry),
                     Err(e) => (Err(e), CacheState::NewEntry),
                 }
             }
             S3CacheResponse::AlreadyLoading(fut) => {
                 let res = fut.await;
-
-                // we know it was "already loading", so the inner state has lower priority
-                let res = res.map(|(v, _state)| v);
-
                 (res, CacheState::AlreadyLoading)
             }
             S3CacheResponse::WasCached(res) => (res, CacheState::WasCached),
         }
     }
 
-    fn get(&self, k: &K) -> Option<ArcResult<V>> {
-        self.cache.get(k).map(|entry| Ok(Arc::clone(entry.value())))
+    fn get(&self, k: &K) -> Option<CacheRequestResult<V>> {
+        self.cache.get(k).map(|entry| Ok(entry.value().clone()))
     }
 
     fn len(&self) -> usize {
@@ -221,8 +259,14 @@ mod tests {
 
     use crate::cache_system::{
         hook::test_utils::{NoOpHook, TestHook, TestHookRecord},
+        s3_fifo_cache::s3_fifo::{
+            Version, VersionedSnapshot,
+            test_migration::{TestNewLockedState, assert_versioned_snapshot},
+        },
         test_utils::{TestSetup, TestValue, gen_cache_tests, runtime_shutdown},
     };
+
+    use futures::future::FutureExt;
 
     #[test]
     fn test_runtime_shutdown() {
@@ -231,11 +275,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_ghost_set_is_limited() {
-        let cache = S3FifoCache::<Arc<str>, Arc<str>>::new(
-            10,
-            10,
-            0.1,
-            Arc::new(NoOpHook::default()),
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
+            S3Config {
+                max_memory_size: 10,
+                max_ghost_memory_size: 10,
+                move_to_main_threshold: 0.1,
+                hook: Arc::new(NoOpHook::default()),
+            },
             &metric::Registry::new(),
         );
         let k1 = Arc::from("x");
@@ -243,7 +289,7 @@ mod tests {
         let (res, state) = cache
             .get_or_fetch(
                 &k1,
-                Box::new(|_| futures::future::ready(Ok(Arc::from("value"))).boxed()),
+                Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
             )
             .await;
         assert_eq!(state, CacheState::NewEntry);
@@ -256,7 +302,7 @@ mod tests {
             let (res, state) = cache
                 .get_or_fetch(
                     &k,
-                    Box::new(|_| futures::future::ready(Ok(Arc::from("value"))).boxed()),
+                    Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
                 )
                 .await;
             assert_eq!(state, CacheState::NewEntry);
@@ -269,11 +315,13 @@ mod tests {
     #[tokio::test]
     async fn test_evict_previously_heavy_used_key() {
         let hook = Arc::new(TestHook::default());
-        let cache = S3FifoCache::<Arc<str>, TestValue>::new(
-            10,
-            10,
-            0.5,
-            Arc::clone(&hook) as _,
+        let cache = S3FifoCache::<Arc<str>, Arc<TestValue>, ()>::new(
+            S3Config {
+                max_memory_size: 10,
+                max_ghost_memory_size: 10,
+                move_to_main_threshold: 0.5,
+                hook: Arc::clone(&hook) as _,
+            },
             &metric::Registry::new(),
         );
 
@@ -284,7 +332,7 @@ mod tests {
             let (res, _state) = cache
                 .get_or_fetch(
                     &k_heavy,
-                    Box::new(|_| futures::future::ready(Ok(TestValue(5))).boxed()),
+                    Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
                 )
                 .await;
             res.unwrap();
@@ -298,7 +346,7 @@ mod tests {
             let (res, _state) = cache
                 .get_or_fetch(
                     &k_new,
-                    Box::new(|_| futures::future::ready(Ok(TestValue(5))).boxed()),
+                    Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
                 )
                 .await;
             res.unwrap();
@@ -325,13 +373,299 @@ mod tests {
         let observer = Arc::new(TestHook::default());
         TestSetup {
             cache: Arc::new(S3FifoCache::new(
-                10_000,
-                10_000,
-                0.25,
-                Arc::clone(&observer) as _,
+                S3Config {
+                    max_memory_size: 10_000,
+                    max_ghost_memory_size: 10_000,
+                    move_to_main_threshold: 0.25,
+                    hook: Arc::clone(&observer) as _,
+                },
                 &metric::Registry::new(),
             )),
             observer,
         }
+    }
+
+    // Snapshot functionality tests
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
+    struct SnapshotTestKey(String);
+
+    impl HasSize for SnapshotTestKey {
+        fn size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, bincode::Encode)]
+    struct SnapshotTestValue(Vec<u8>);
+
+    impl HasSize for SnapshotTestValue {
+        fn size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    // bincode Decode implementation for SnapshotTestValue
+    impl<Q> bincode::Decode<Q> for SnapshotTestValue {
+        fn decode<D: bincode::de::Decoder<Context = Q>>(
+            decoder: &mut D,
+        ) -> Result<Self, bincode::error::DecodeError> {
+            let value: Vec<u8> = bincode::Decode::decode(decoder)?;
+            Ok(Self(value))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_serialization_roundtrip() {
+        let metric_registry = metric::Registry::new();
+        let hook: Arc<dyn Hook<SnapshotTestKey>> = Arc::new(NoOpHook::default());
+
+        // Test with multiple entries to ensure comprehensive serialization
+        let test_data = vec![
+            (
+                SnapshotTestKey("key1".to_string()),
+                SnapshotTestValue(vec![10, 20, 30]),
+            ),
+            (
+                SnapshotTestKey("key2".to_string()),
+                SnapshotTestValue(vec![40, 50]),
+            ),
+            (
+                SnapshotTestKey("key3".to_string()),
+                SnapshotTestValue(vec![60, 70, 80, 90]),
+            ),
+            (
+                SnapshotTestKey("key4".to_string()),
+                SnapshotTestValue(vec![100, 110, 120]),
+            ),
+        ];
+
+        // Create the cache with size limits such that we populate the ghost set too
+        // such that the OrderedSet (de)serialization is tested.
+        let key_size = test_data[0].0.size();
+        let value_size = Arc::new(test_data[0].1.clone()).size();
+        let cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> = S3FifoCache::new(
+            S3Config {
+                max_memory_size: ((key_size + value_size) as f32 * 2.9).round() as usize,
+                max_ghost_memory_size: (key_size as f32 * 1.9).round() as usize,
+                move_to_main_threshold: 0.1,
+                hook: Arc::clone(&hook),
+            },
+            &metric_registry,
+        );
+
+        // Insert all test data
+        for (key, value) in &test_data {
+            let value_clone = value.clone();
+            let (res, _) = cache
+                .get_or_fetch(
+                    key,
+                    Box::new(move || async move { Ok(value_clone) }.boxed()),
+                )
+                .await;
+            res.unwrap();
+        }
+
+        // Create snapshot
+        let snapshot = cache.snapshot().unwrap();
+        assert!(!snapshot.is_empty(), "Snapshot should contain data");
+
+        // Verify that the last inserted entries is still accessible in the original cache
+        assert_eq!(cache.len(), 2, "Cache should contain 2 entries");
+        for (key, expected_value) in &test_data[2..] {
+            let retrieved_value = cache.get(key).unwrap().unwrap();
+            assert_eq!(
+                &retrieved_value, expected_value,
+                "Value mismatch for key: {key:?}",
+            );
+        }
+
+        // assert that we had 1 ghost entry (& therefore these tests cover the OrderedSet serialization)
+        assert_eq!(
+            cache.cache.ghost_len(),
+            1,
+            "Cache should have 1 ghost entry"
+        );
+
+        // Create a new cache from the snapshot
+        let restored_cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> =
+            S3FifoCache::new_from_snapshot(
+                S3Config {
+                    max_memory_size: 1000,
+                    max_ghost_memory_size: 500,
+                    move_to_main_threshold: 0.1,
+                    hook: Arc::clone(&hook),
+                },
+                &metric_registry,
+                &snapshot,
+                &(),
+            )
+            .unwrap();
+
+        // Verify last two entries are preserved in the restored cache
+        assert_eq!(
+            restored_cache.len(),
+            2,
+            "Restored cache should contain 2 entries"
+        );
+        for (key, expected_value) in &test_data[2..] {
+            let retrieved_value = restored_cache.get(key).unwrap().unwrap();
+            assert_eq!(
+                &retrieved_value, expected_value,
+                "Value mismatch in restored cache for key: {key:?}"
+            );
+        }
+
+        // Verify the cache lengths match
+        assert_eq!(
+            cache.len(),
+            restored_cache.len(),
+            "Cache lengths should match after restore"
+        );
+
+        // assert that we had 1 ghost entry in restored cache (OrderedSet deserialization)
+        assert_eq!(
+            restored_cache.cache.ghost_len(),
+            1,
+            "Restored cache should have 1 ghost entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_versioning() {
+        let metric_registry = metric::Registry::new();
+        let hook: Arc<dyn Hook<SnapshotTestKey>> = Arc::new(NoOpHook::default());
+
+        // Test with multiple entries to ensure comprehensive serialization
+        let test_data = vec![
+            (
+                SnapshotTestKey("key1".to_string()),
+                SnapshotTestValue(vec![10, 20, 30]),
+            ),
+            (
+                SnapshotTestKey("key2".to_string()),
+                SnapshotTestValue(vec![40, 50]),
+            ),
+            (
+                SnapshotTestKey("key3".to_string()),
+                SnapshotTestValue(vec![60, 70, 80, 90]),
+            ),
+            (
+                SnapshotTestKey("key4".to_string()),
+                SnapshotTestValue(vec![100, 110, 120]),
+            ),
+        ];
+
+        // Create the cache with all entries.
+        let cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> = S3FifoCache::new(
+            S3Config {
+                max_memory_size: 10_000,
+                max_ghost_memory_size: 10_000,
+                move_to_main_threshold: 0.1,
+                hook: Arc::clone(&hook),
+            },
+            &metric_registry,
+        );
+
+        // Insert all test data
+        for (key, value) in &test_data {
+            let value_clone = value.clone();
+            let (res, _) = cache
+                .get_or_fetch(
+                    key,
+                    Box::new(move || async move { Ok(value_clone) }.boxed()),
+                )
+                .await;
+            res.unwrap();
+        }
+
+        // Create snapshot
+        let snapshot = cache.snapshot().unwrap();
+        assert!(!snapshot.is_empty(), "Snapshot should contain data");
+
+        // Snapshot can be deserialized into new version.
+        // (This would be the code used in the S3Fifo::deserialize_snapshot).
+        let (versioned_snapshot, _): (
+            VersionedSnapshot<TestNewLockedState<SnapshotTestKey, SnapshotTestValue>>,
+            usize,
+        ) = bincode::decode_from_slice_with_context(&snapshot, bincode::config::standard(), ())
+            .unwrap();
+
+        // Assert that we migrated to the new/updated Test version.
+        assert_versioned_snapshot(&versioned_snapshot, &test_data, Version::Test);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_restore_from_v1_static_data() {
+        let snapshot_data = &[
+            // oldest entry is in the ghost queue (a.k.a. OrderedSet)
+            (
+                SnapshotTestKey("key2".to_string()),
+                SnapshotTestValue(vec![40, 50]),
+            ),
+            // two entries are in the Fifo cache queue
+            (
+                SnapshotTestKey("key3".to_string()),
+                SnapshotTestValue(vec![60, 70, 80, 90]),
+            ),
+            (
+                SnapshotTestKey("key4".to_string()),
+                SnapshotTestValue(vec![100, 110, 120]),
+            ),
+        ];
+
+        // Static snapshot data representing a Version::V1 snapshot
+        // of the above `snapshot_data`.
+        //
+        // The snapshot format for V1 is:
+        // [version_byte(1), serialized_locked_state...]
+        let v1_snapshot_data: &[u8] = &[
+            1, 0, 0, 2, 4, 107, 101, 121, 51, 4, 60, 70, 80, 90, 2, 0, 4, 107, 101, 121, 52, 3,
+            100, 110, 120, 3, 0, 159, 1, 1, 4, 107, 101, 121, 50, 28, 0, 0,
+        ];
+
+        // Verify that the V1 snapshot data starts with VERSION_V1 (1)
+        assert_eq!(
+            v1_snapshot_data[0], 1,
+            "V1 snapshot should start with VERSION_V1 (1)"
+        );
+
+        // Create a new cache from the static V1 snapshot data
+        // This tests that S3FifoCache::new_from_snapshot can restore from V1 format
+        let metric_registry = metric::Registry::new();
+        let hook: Arc<dyn Hook<SnapshotTestKey>> = Arc::new(NoOpHook::default());
+        let restored_cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> =
+            S3FifoCache::new_from_snapshot(
+                S3Config {
+                    max_memory_size: 10_000,
+                    max_ghost_memory_size: 10_000,
+                    move_to_main_threshold: 0.1,
+                    hook: Arc::clone(&hook),
+                },
+                &metric_registry,
+                v1_snapshot_data,
+                &(),
+            )
+            .unwrap();
+
+        // Verify last two entries are preserved in the restored cache
+        assert_eq!(
+            restored_cache.len(),
+            2,
+            "Restored cache should contain 2 entries"
+        );
+        for (key, expected_value) in &snapshot_data[1..] {
+            let retrieved_value = restored_cache.get(key).unwrap().unwrap();
+            assert_eq!(
+                &retrieved_value, expected_value,
+                "Value mismatch in restored cache for key: {key:?}"
+            );
+        }
+
+        // assert that we had 1 ghost entry in restored cache (OrderedSet deserialization)
+        assert_eq!(
+            restored_cache.cache.ghost_len(),
+            1,
+            "Restored cache should have 1 ghost entry"
+        );
     }
 }

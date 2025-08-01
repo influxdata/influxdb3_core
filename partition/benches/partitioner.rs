@@ -183,13 +183,11 @@ fn bench(
     // Un-normalise the path, adjusting back to the crate root.
     let file_path = format!("{}/../{}", env!("CARGO_MANIFEST_DIR"), file_path);
     let path = Path::new(&file_path);
-    let partition_template = TablePartitionTemplateOverride::try_from_existing(
-        Some(proto::PartitionTemplate {
+    let partition_template =
+        TablePartitionTemplateOverride::try_from_existing(proto::PartitionTemplate {
             parts: partition_template,
-        }),
-        &Default::default(),
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     // Read the benchmark data
     let data = std::fs::read_to_string(path).unwrap();

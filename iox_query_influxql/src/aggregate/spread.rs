@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::AggregateUDFImpl;
 use datafusion::logical_expr::function::StateFieldsArgs;
@@ -49,21 +49,23 @@ impl AggregateUDFImpl for SpreadUDF {
     }
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(SpreadAccumulator::new(arg.return_type.clone())?))
+        Ok(Box::new(SpreadAccumulator::new(
+            arg.return_field.data_type().clone(),
+        )?))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<arrow::datatypes::Field>> {
+    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<FieldRef>> {
         Ok(vec![
-            Field::new(
+            Arc::new(Field::new(
                 format_state_name(args.name, "max"),
-                args.return_type.clone(),
+                args.return_field.data_type().clone(),
                 true,
-            ),
-            Field::new(
+            )),
+            Arc::new(Field::new(
                 format_state_name(args.name, "min"),
-                args.return_type.clone(),
+                args.return_field.data_type().clone(),
                 true,
-            ),
+            )),
         ])
     }
 }

@@ -7,20 +7,18 @@ use crate::{
     provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs,
 };
 use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef};
+use datafusion::catalog::memory::DataSourceExec;
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::physical_expr::LexOrdering;
 use datafusion::{
-    datasource::{
-        listing::PartitionedFile,
-        object_store::ObjectStoreUrl,
-        physical_plan::{FileScanConfig, parquet::ParquetExecBuilder},
-    },
+    datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl},
     physical_expr::PhysicalSortExpr,
     physical_plan::{ExecutionPlan, empty::EmptyExec, expressions::Column},
     scalar::ScalarValue,
 };
 use datafusion_util::config::table_parquet_options;
 use object_store::{DynObjectStore, ObjectMeta, ObjectStore};
-use parquet_file::storage::ParquetExecInput;
+use parquet_file::storage::DataSourceExecInput;
 use schema::{Schema, sort::SortKey};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -36,7 +34,7 @@ pub struct PartitionedFileExt {
 }
 
 /// Holds a list of chunks that all have the same "URL" and
-/// will be scanned using the same ParquetExec.
+/// will be scanned using the same DataSourceExec.
 ///
 /// Also tracks the overall sort key which is provided to DataFusion
 /// plans
@@ -44,7 +42,7 @@ pub struct PartitionedFileExt {
 struct ParquetChunkList {
     object_store: Arc<dyn ObjectStore>,
     chunks: Vec<(ObjectMeta, Arc<dyn QueryChunk>)>,
-    /// Sort key to place on the ParquetExec, validated to be
+    /// Sort key to place on the DataSourceExec, validated to be
     /// compatible with all chunk sort keys
     sort_key: Option<SortKey>,
 }
@@ -126,22 +124,27 @@ fn combine_sort_key(
 ///
 /// Record batch chunks will be turned into a single [`RecordBatchesExec`].
 ///
-/// Parquet chunks will be turned into a [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) per store, each of them with
-/// [`target_partitions`](datafusion::execution::context::SessionConfig::target_partitions) file groups.
+/// Parquet chunks will be turned into a [`DataSourceExec`] per store, each of them with
+/// [`target_partitions`] file groups.
 ///
-/// If this function creates more than one physical node, they will be combined using an [`UnionExec`](datafusion::physical_plan::union::UnionExec). Otherwise, a
+/// If this function creates more than one physical node, they will be combined using an [`UnionExec`]. Otherwise, a
 /// single node will be returned directly.
 ///
-/// If output_sort_key is specified, the ParquetExec will be marked
+/// If output_sort_key is specified, the [`DataSourceExec`] will be marked
 /// with that sort key, otherwise it will be computed from the input chunks. TODO check if this is helpful or not
 ///
 /// # Empty Inputs
 /// For empty inputs (i.e. no chunks), this will create a single [`EmptyExec`] node with appropriate schema.
 ///
 /// # Predicates
-/// The give `predicate` will only be applied to [`ParquetExec`](datafusion::datasource::physical_plan::ParquetExec) nodes since they are the only node type benifiting from
+/// The give `predicate` will only be applied to [`DataSourceExec`] nodes since they are the only node type benifiting from
 /// pushdown ([`RecordBatchesExec`] has NO builtin filter function). Delete predicates are NOT applied at all. The
 /// caller is responsible for wrapping the output node into appropriate filter nodes.
+///
+///
+/// [`DataSourceExec`]: datafusion::datasource::memory::DataSourceExec
+/// [`target_partitions`]: datafusion::execution::context::SessionConfig::target_partitions
+/// [`UnionExec`]: datafusion::physical_plan::union::UnionExec
 pub fn chunks_to_physical_nodes(
     // schema that includes all columns of all given chunks. This schema may just cover a subset of columns of the Table
     schema: &SchemaRef,
@@ -161,7 +164,7 @@ pub fn chunks_to_physical_nodes(
             QueryChunkData::RecordBatches(_) => {
                 record_batch_chunks.push(Arc::clone(chunk));
             }
-            QueryChunkData::Parquet(ParquetExecInput {
+            QueryChunkData::Parquet(DataSourceExecInput {
                 object_store_url,
                 object_store,
                 object_meta,
@@ -278,31 +281,34 @@ pub fn chunks_to_physical_nodes(
                         object_store: Arc::clone(&object_store),
                         table_schema: Arc::clone(&schema_without_chunk_order),
                     })),
-                    statistics: Some(chunk_stats),
+                    statistics: Some(Arc::new(chunk_stats)),
                     metadata_size_hint: None,
                 }
             }),
             target_partitions,
-        );
+        )
+        .into_iter()
+        .map(FileGroup::new)
+        .collect();
 
         // No sort order is represented by an empty Vec
         let output_ordering = output_ordering
             .map(|sort_order| vec![sort_order])
             .unwrap_or_default();
 
-        // Build base_config for the ParquetExec
-        let base_config = FileScanConfig::new(
+        // Build file_scan_config for the DataSourceExec
+        let file_scan_config = FileScanConfigBuilder::new(
             object_store_url,
-            // file_schema is the schema of all files in the ParquetExec which is a superset of each file's schema
+            // file_schema is the schema of all files in the DataSourceExec which is a superset of each file's schema
             Arc::clone(&schema_without_chunk_order),
+            Arc::new(ParquetSource::new(table_parquet_options())),
         )
         .with_file_groups(file_groups)
         .with_statistics(statistics)
         .with_table_partition_cols(table_partition_cols.clone())
         .with_output_ordering(output_ordering);
 
-        let builder = ParquetExecBuilder::new_with_options(base_config, table_parquet_options());
-        output_nodes.push(builder.build_arc());
+        output_nodes.push(DataSourceExec::from_data_source(file_scan_config.build()));
     }
 
     assert!(!output_nodes.is_empty());
@@ -332,9 +338,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
     use datafusion::{
         common::stats::Precision,
-        datasource::physical_plan::ParquetExec,
+        datasource::{physical_plan::FileScanConfig, source::DataSourceExec},
         physical_plan::{ColumnStatistics, Statistics, union::UnionExec},
     };
     use schema::{InfluxFieldType, SchemaBuilder, TIME_COLUMN_NAME, sort::SortKeyBuilder};
@@ -463,12 +470,12 @@ mod tests {
         let plan = chunks_to_physical_nodes(&schema, None, vec![Arc::new(chunk)], 2);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"- " ParquetExec: file_groups={1 group: [[0.parquet]]}""#
+            @r#"- " DataSourceExec: file_groups={1 group: [[0.parquet]]}, file_type=parquet""#
         );
 
-        // The setup does not provide statsitics for the chunk & must be absent
+        // The setup does not provide statistics for the chunk & must be absent
         assert!(!plan.as_any().is::<UnionExec>());
-        let parquet_exec = plan.as_any().downcast_ref::<ParquetExec>().unwrap();
+        let data_source_exec = plan.as_any().downcast_ref::<DataSourceExec>().unwrap();
 
         // Absent statistics
         let expected_stats = Statistics {
@@ -477,21 +484,26 @@ mod tests {
             column_statistics: vec![],
         };
 
-        // statistics of the parquet exec
-        let stats = parquet_exec.statistics().unwrap();
+        // statistics of the `DataSourceExec`
+        let stats = data_source_exec.partition_statistics(None).unwrap();
         assert_eq!(stats, expected_stats);
 
         // statistics of the file scan config
-        let file_stats = &parquet_exec.base_config().statistics;
+        let cfg = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        let file_stats = &cfg.file_source().statistics().unwrap();
         assert_eq!(*file_stats, expected_stats);
 
         // File groups
         // One group with one file
-        assert_eq!(parquet_exec.base_config().file_groups.len(), 1);
-        assert_eq!(parquet_exec.base_config().file_groups[0].len(), 1);
-        let pf = &parquet_exec.base_config().file_groups[0][0];
+        assert_eq!(cfg.file_groups.len(), 1);
+        assert_eq!(cfg.file_groups[0].len(), 1);
+        let pf = &cfg.file_groups[0][0];
         let pf_stats = pf.statistics.as_ref().unwrap();
-        assert_eq!(*pf_stats, expected_stats);
+        assert_eq!(pf_stats.as_ref(), &expected_stats);
     }
 
     #[test]
@@ -508,7 +520,7 @@ mod tests {
         );
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
-            @r#"- " ParquetExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}""#
+            @r#"- " DataSourceExec: file_groups={2 groups: [[0.parquet, 2.parquet], [1.parquet]]}, file_type=parquet""#
         );
     }
 
@@ -527,8 +539,8 @@ mod tests {
             format_execution_plan(&plan),
             @r#"
         - " UnionExec"
-        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}"
-        - "   ParquetExec: file_groups={1 group: [[1.parquet]]}"
+        - "   DataSourceExec: file_groups={1 group: [[0.parquet]]}, file_type=parquet"
+        - "   DataSourceExec: file_groups={1 group: [[1.parquet]]}, file_type=parquet"
         "#
         );
     }
@@ -545,7 +557,7 @@ mod tests {
             @r#"
         - " UnionExec"
         - "   RecordBatchesExec: chunks=1"
-        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}"
+        - "   DataSourceExec: file_groups={1 group: [[0.parquet]]}, file_type=parquet"
         "#
         );
     }
@@ -573,14 +585,14 @@ mod tests {
             @r#"
         - " UnionExec"
         - "   RecordBatchesExec: chunks=1, projection=[tag, __chunk_order]"
-        - "   ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, __chunk_order], output_ordering=[__chunk_order@1 ASC]"
+        - "   DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, __chunk_order], output_ordering=[__chunk_order@1 ASC], file_type=parquet"
         "#
         );
     }
 
     // reproducer of https://github.com/influxdata/idpe/issues/18287
     #[test]
-    fn reproduce_schema_bug_in_parquet_exec() {
+    fn reproduce_schema_bug_in_data_source_exec() {
         // schema with one tag, one field, time and CHUNK_ORDER_COLUMN_NAME
         let schema: SchemaRef = SchemaBuilder::new()
             .tag("tag")
@@ -594,6 +606,7 @@ mod tests {
         // create a test chunk with one tag, one filed, time and CHUNK_ORDER_COLUMN_NAME
         let record_batch_chunk = Arc::new(
             TestChunk::new("t")
+                .with_row_count(42)
                 .with_tag_column_with_stats("tag", Some("AL"), Some("MT"))
                 .with_time_column_with_stats(Some(10), Some(20))
                 .with_i64_field_column_with_stats("field", Some(0), Some(100))
@@ -603,6 +616,7 @@ mod tests {
         // create them same test chunk but with a parquet file
         let parquet_chunk = Arc::new(
             TestChunk::new("t")
+                .with_row_count(42)
                 .with_tag_column_with_stats("tag", Some("AL"), Some("MT"))
                 .with_i64_field_column_with_stats("field", Some(0), Some(100))
                 .with_time_column_with_stats(Some(10), Some(20))
@@ -633,9 +647,9 @@ mod tests {
                 .is_some()
         );
 
-        // Build a ParquetExec for parquet_chunk
+        // Build a DataSourceExec for parquet_chunk
         //
-        // Use chunks_to_physical_nodes to build a plan with UnionExec on top of ParquetExec
+        // Use chunks_to_physical_nodes to build a plan with UnionExec on top of DataSourceExec
         let plan = chunks_to_physical_nodes(
             &schema,
             None,
@@ -644,23 +658,14 @@ mod tests {
         );
         // assert is a single node, not a union of children
         assert!(!plan.as_any().is::<UnionExec>());
-        let plan_parquet_exec = plan;
-        // verify this is a ParquetExec
-        assert!(
-            plan_parquet_exec
-                .as_any()
-                .downcast_ref::<ParquetExec>()
-                .is_some()
-        );
+        // verify this is a DataSourceExec
+        let data_source_exec = plan.as_any().downcast_ref::<DataSourceExec>().unwrap();
 
         // Schema of 2 chunks are the same
         assert_eq!(record_batch_chunk.schema(), parquet_chunk.schema());
 
         // Schema of the corresponding plans are also the same
-        assert_eq!(
-            plan_record_batches_exec.schema(),
-            plan_parquet_exec.schema()
-        );
+        assert_eq!(plan_record_batches_exec.schema(), plan.schema());
 
         // Statistics of 2 chunks are the same
         let record_batch_stats =
@@ -681,19 +686,18 @@ mod tests {
         // to modify DF to compute stats for table_partition_cols
         //
         // Here both parquet's plan stats and FileScanConfig stats
-        //
-        // Cast to ParquetExec to get statistics
-        let plan_parquet_exec = plan_parquet_exec
-            .as_any()
-            .downcast_ref::<ParquetExec>()
-            .unwrap();
         // stats of the parquet plan generally computed from propagating stats from input plans/chunks/columns
-        let parquet_plan_stats = plan_parquet_exec.statistics().unwrap();
+        let parquet_plan_stats = data_source_exec.partition_statistics(None).unwrap();
         // stats stored in FileScanConfig
-        let parqet_file_stats = &plan_parquet_exec.base_config().statistics;
+        let cfg = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+        let parqet_file_stats = &cfg.file_source().statistics().unwrap();
 
         // stats of IOx specific recod batch plan
-        let record_batch_plan_stats = plan_record_batches_exec.statistics().unwrap();
+        let record_batch_plan_stats = plan_record_batches_exec.partition_statistics(None).unwrap();
 
         // Record batch plan stats is the same as parquet file stats and includes everything
         assert_eq!(record_batch_plan_stats, *parqet_file_stats);
@@ -704,21 +708,30 @@ mod tests {
         let col_stats = vec![
             ColumnStatistics {
                 null_count: Precision::Absent,
-                max_value: Precision::Exact(ScalarValue::Utf8(Some("MT".to_string()))),
-                min_value: Precision::Exact(ScalarValue::Utf8(Some("AL".to_string()))),
+                max_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("MT".to_string()))),
+                )),
+                min_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("AL".to_string()))),
+                )),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::Int64(Some(100))),
                 min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(20), None)),
                 min_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(10), None)),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
         ];
         //
@@ -729,6 +742,7 @@ mod tests {
             max_value: Precision::Exact(ScalarValue::Int64(Some(6))),
             min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
             distinct_count: Precision::Absent,
+            sum_value: Precision::Absent,
         });
         //
         // Add CHUNK_ORDER_COLUMN_NAME without stats
@@ -738,16 +752,17 @@ mod tests {
             max_value: Precision::Absent,
             min_value: Precision::Absent,
             distinct_count: Precision::Absent,
+            sum_value: Precision::Absent,
         });
         //
         let expected_parquet_plan_stats = Statistics {
-            num_rows: Precision::Exact(0),
+            num_rows: Precision::Exact(42),
             total_byte_size: Precision::Absent,
             column_statistics: parquet_plan_stats_col_stats,
         };
         //
         let expected_parquet_file_stats = Statistics {
-            num_rows: Precision::Exact(0),
+            num_rows: Precision::Exact(42),
             total_byte_size: Precision::Absent,
             column_statistics: parquet_file_col_stats,
         };
@@ -776,6 +791,7 @@ mod tests {
         // create them same test chunk but with a parquet file
         let parquet_chunk = Arc::new(
             TestChunk::new("t")
+                .with_row_count(42)
                 .with_tag_column_with_stats("tag", Some("AL"), Some("MT"))
                 .with_i64_field_column_with_stats("field", Some(0), Some(100))
                 .with_time_column_with_stats(Some(10), Some(20))
@@ -783,9 +799,9 @@ mod tests {
                 .with_dummy_parquet_file(),
         );
 
-        // Build a ParquetExec for parquet_chunk
+        // Build a DataSourceExec for parquet_chunk
         //
-        // Use chunks_to_physical_nodes to build a plan with UnionExec on top of ParquetExec
+        // Use chunks_to_physical_nodes to build a plan with UnionExec on top of DataSourceExec
         let plan = chunks_to_physical_nodes(
             &schema,
             None,
@@ -794,24 +810,19 @@ mod tests {
         );
         // assert is a single node, not a union of children
         assert!(!plan.as_any().is::<UnionExec>());
-        let plan_parquet_exec = plan;
-        // verify this is a ParquetExec
-        assert!(
-            plan_parquet_exec
-                .as_any()
-                .downcast_ref::<ParquetExec>()
-                .is_some()
-        );
+        // verify this is a DataSourceExec
+        let data_source_exec = plan.as_any().downcast_ref::<DataSourceExec>().unwrap();
 
         // Verify only one file group and one partitioned file
-        let parquet_exec = plan_parquet_exec
+        let cfg = data_source_exec
+            .data_source()
             .as_any()
-            .downcast_ref::<ParquetExec>()
+            .downcast_ref::<FileScanConfig>()
             .unwrap();
-        assert_eq!(parquet_exec.base_config().file_groups.len(), 1);
-        assert_eq!(parquet_exec.base_config().file_groups[0].len(), 1);
+        assert_eq!(cfg.file_groups.len(), 1);
+        assert_eq!(cfg.file_groups[0].len(), 1);
         // PartitionedFile
-        let pf = &parquet_exec.base_config().file_groups[0][0];
+        let pf = &cfg.file_groups[0][0];
         // stats of PartitionedFile
         let pf_stats = pf.statistics.as_ref().unwrap();
 
@@ -819,29 +830,38 @@ mod tests {
         let col_stats = vec![
             ColumnStatistics {
                 null_count: Precision::Exact(0),
-                max_value: Precision::Exact(ScalarValue::Utf8(Some("MT".to_string()))),
-                min_value: Precision::Exact(ScalarValue::Utf8(Some("AL".to_string()))),
+                max_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("MT".to_string()))),
+                )),
+                min_value: Precision::Exact(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("AL".to_string()))),
+                )),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Absent,
                 max_value: Precision::Exact(ScalarValue::Int64(Some(100))),
                 min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
             ColumnStatistics {
                 null_count: Precision::Exact(0),
                 max_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(20), None)),
                 min_value: Precision::Exact(ScalarValue::TimestampNanosecond(Some(10), None)),
                 distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
             },
         ];
         let expected_pf_stats = Statistics {
-            num_rows: Precision::Exact(0),
+            num_rows: Precision::Exact(42),
             total_byte_size: Precision::Absent,
             column_statistics: col_stats,
         };
 
-        assert_eq!(*pf_stats, expected_pf_stats);
+        assert_eq!(pf_stats.as_ref(), &expected_pf_stats);
     }
 }

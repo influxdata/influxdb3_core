@@ -2,7 +2,8 @@ use std::{any::Any, str::FromStr, sync::Arc, time::Duration};
 
 use datafusion::{
     common::{Result, extensions_options},
-    config::{ConfigEntry, ConfigExtension, ExtensionOptions},
+    config::{ConfigEntry, ConfigExtension, ConfigField, ExtensionOptions, Visit},
+    error::DataFusionError,
 };
 use meta_data_cache::MetaIndexCache;
 
@@ -147,8 +148,24 @@ impl std::fmt::Display for MetadataCutoff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Relative(delta) => write!(f, "-{}", delta.as_nanos()),
-            Self::Absolute(dt) => write!(f, "{}", dt),
+            Self::Absolute(dt) => write!(f, "{dt}"),
         }
+    }
+}
+
+impl ConfigField for MetadataCutoff {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        *self = value.parse().map_err(|e| {
+            DataFusionError::Context(
+                format!("Error parsing '{value}' as ConfigField"),
+                Box::new(DataFusionError::External(Box::new(e))),
+            )
+        })?;
+        Ok(())
     }
 }
 

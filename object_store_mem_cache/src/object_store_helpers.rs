@@ -13,6 +13,7 @@ pub fn any_options_set(options: &GetOptions) -> bool {
         range,
         version,
         head,
+        extensions: _,
     } = options;
 
     if if_match.is_some() {

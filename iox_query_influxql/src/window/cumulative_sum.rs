@@ -1,6 +1,6 @@
 use crate::NUMERICS;
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::Field;
+use arrow::datatypes::{Field, FieldRef};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::{
@@ -48,12 +48,12 @@ impl WindowUDFImpl for CumulativeSumUDWF {
         Ok(Box::new(CumulativeSumPartitionEvaluator {}))
     }
 
-    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<Field> {
-        Ok(Field::new(
+    fn field(&self, field_args: WindowUDFFieldArgs<'_>) -> Result<FieldRef> {
+        Ok(Arc::new(Field::new(
             field_args.name(),
-            field_args.input_types()[0].clone(),
+            field_args.input_fields()[0].data_type().clone(),
             true,
-        ))
+        )))
     }
 }
 

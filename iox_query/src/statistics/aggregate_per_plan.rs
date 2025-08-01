@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use datafusion::common::stats::Precision;
-use datafusion::datasource::physical_plan::ParquetExec;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -19,7 +19,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, visit_execution_plan};
 use datafusion::{physical_plan::ColumnStatistics, scalar::ScalarValue};
-use observability_deps::tracing::trace;
+use tracing::trace;
 
 use crate::provider::{DeduplicateExec, RecordBatchesExec};
 
@@ -109,13 +109,16 @@ impl ExecutionPlanVisitor for StatisticsVisitor<'_> {
         {
             self.statistics.push_back(ColumnStatistics::new_unknown());
         }
-        // ParquetExec (leaf): compute its statistics and push it to the stack
-        else if plan.as_any().downcast_ref::<ParquetExec>().is_some() {
+        // DataSourceExec (leaf): compute its statistics and push it to the stack
+        else if plan.as_any().downcast_ref::<DataSourceExec>().is_some() {
             // get index of the given column in the schema
             let statistics = match plan.schema().index_of(self.column_name) {
                 Ok(col_index) => {
-                    let col_stats = plan.statistics()?.column_statistics.swap_remove(col_index);
-                    // ParquetExec statistics may not be exact due to filter
+                    let col_stats = plan
+                        .partition_statistics(None)?
+                        .column_statistics
+                        .swap_remove(col_index);
+                    // DataSourceExec statistics may not be exact due to filter
                     // pushdown, but the values in the plan are guaranteed to be
                     // within the min/max.
                     Self::convert_min_max_to_exact(col_stats)
@@ -135,7 +138,10 @@ impl ExecutionPlanVisitor for StatisticsVisitor<'_> {
         else if plan.as_any().downcast_ref::<RecordBatchesExec>().is_some() {
             // get index of the given column in the schema
             let statistics = match plan.schema().index_of(self.column_name) {
-                Ok(col_index) => plan.statistics()?.column_statistics.swap_remove(col_index),
+                Ok(col_index) => plan
+                    .partition_statistics(None)?
+                    .column_statistics
+                    .swap_remove(col_index),
                 // This is the case of alias, do not optimize by returning no statistics
                 Err(_) => {
                     trace!(
@@ -226,7 +232,13 @@ fn statistics_min_max(
     // Get statistics for each plan
     let plans_schema_and_stats = plans
         .iter()
-        .map(|plan| Ok((Arc::clone(plan), plan.schema(), plan.statistics()?)))
+        .map(|plan| {
+            Ok((
+                Arc::clone(plan),
+                plan.schema(),
+                plan.partition_statistics(None)?,
+            ))
+        })
         .collect::<Result<Vec<_>, DataFusionError>>();
 
     // If any without statistics, return none
@@ -240,7 +252,7 @@ fn statistics_min_max(
         // get index of the sorted column in the schema
         let Ok(sorted_col_index) = input_schema.index_of(column_name) else {
             // panic that the sorted column is not in the schema
-            panic!("sorted column {} is not in the schema", column_name);
+            panic!("sorted column {column_name} is not in the schema");
         };
 
         let column_stats = input_stats.column_statistics;
@@ -277,7 +289,7 @@ mod test {
     };
 
     use super::*;
-    use arrow::datatypes::SchemaRef;
+    use arrow::datatypes::{DataType, SchemaRef};
     use datafusion::error::DataFusionError;
     use itertools::Itertools;
     use schema::{InfluxFieldType, SchemaBuilder};
@@ -321,7 +333,7 @@ mod test {
         let plan_pq = chunks_to_physical_nodes(&schema, None, vec![parquet_chunk], 1);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan_pq),
-            @r#"- " ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]""#
+            @r#"- " DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time], file_type=parquet""#
         );
 
         let plan_rb = chunks_to_physical_nodes(&schema, None, vec![record_batch_chunk], 1);
@@ -353,16 +365,28 @@ mod test {
         let tag_stats = compute_stats_column_min_max(&*plan_pq, "tag").unwrap();
         let min_max = column_statistics_min_max(tag_stats).unwrap();
         let expected_tag_stats = (
-            ScalarValue::Utf8(Some("MA".to_string())),
-            ScalarValue::Utf8(Some("VT".to_string())),
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some("MA".to_string()))),
+            ),
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some("VT".to_string()))),
+            ),
         );
         assert_eq!(min_max, expected_tag_stats);
         // record batch
         let tag_stats = compute_stats_column_min_max(&*plan_rb, "tag").unwrap();
         let min_max = column_statistics_min_max(tag_stats).unwrap();
         let expected_tag_stats = (
-            ScalarValue::Utf8(Some("Boston".to_string())),
-            ScalarValue::Utf8(Some("DC".to_string())),
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some("Boston".to_string()))),
+            ),
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some("DC".to_string()))),
+            ),
         );
         assert_eq!(min_max, expected_tag_stats);
 
@@ -482,12 +506,24 @@ mod test {
             statistics_min_max(&[Arc::clone(&plan1), Arc::clone(&plan2)], "tag").unwrap();
         let expected_tag_stats = [
             (
-                ScalarValue::Utf8(Some("MA".to_string())),
-                ScalarValue::Utf8(Some("VT".to_string())),
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("MA".to_string()))),
+                ),
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("VT".to_string()))),
+                ),
             ),
             (
-                ScalarValue::Utf8(Some("Boston".to_string())),
-                ScalarValue::Utf8(Some("DC".to_string())),
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("Boston".to_string()))),
+                ),
+                ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("DC".to_string()))),
+                ),
             ),
         ];
         assert_eq!(tag_stats, expected_tag_stats);

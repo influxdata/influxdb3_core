@@ -6,7 +6,7 @@ use std::{
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::{
     error::{DataFusionError, Result},
-    logical_expr::{ScalarUDF, ScalarUDFImpl, Signature, Volatility},
+    logical_expr::{ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
     physical_plan::ColumnarValue,
 };
 
@@ -35,7 +35,7 @@ impl ScalarUDFImpl for SleepUDF {
         Ok(DataType::Null)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Err(DataFusionError::Internal(
             "sleep function should have been replaced by optimizer pass to avoid thread blocking"
                 .to_owned(),

@@ -14,7 +14,7 @@ use arrow_util::optimize::optimize_dictionaries;
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::{PhysicalExpr, metrics};
-use observability_deps::tracing::{debug, trace};
+use tracing::{debug, trace};
 
 /// Handles the deduplication across potentially multiple
 /// [`RecordBatch`]es which are already sorted on a primary key,
@@ -252,10 +252,10 @@ impl RecordBatchDeduplicator {
         // If the last column is time, swap time with its previous column (if any) which is
         // the column with the highest cardinality
         let len = columns.len();
-        if len > 1 {
-            if let DataType::Timestamp(TimeUnit::Nanosecond, _) = columns[len - 1].data_type() {
-                columns.swap(len - 2, len - 1);
-            }
+        if len > 1
+            && let DataType::Timestamp(TimeUnit::Nanosecond, _) = columns[len - 1].data_type()
+        {
+            columns.swap(len - 2, len - 1);
         }
         // Reverse the list
         columns.reverse();

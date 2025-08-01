@@ -3,7 +3,6 @@ use std::{fmt::Display, sync::Arc};
 use datafusion::config::{ParquetOptions, TableParquetOptions};
 use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::file_format::arrow::ArrowFormatFactory;
-use datafusion::datasource::file_format::avro::AvroFormatFactory;
 use datafusion::datasource::file_format::csv::CsvFormatFactory;
 use datafusion::datasource::file_format::json::JsonFormatFactory;
 use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
@@ -34,7 +33,7 @@ pub fn iox_session_config() -> SessionConfig {
     options.execution.time_zone = TIME_DATA_TIMEZONE().map(|s| s.to_string());
     options.optimizer.repartition_sorts = true;
     options.optimizer.prefer_existing_union = true;
-    // ParquetExec now returns estimates rather than actual
+    // DataSourceExec now returns estimates rather than actual
     // row counts, so we must use estimates rather than exact to optimize partitioning
     // Related to https://github.com/apache/datafusion/issues/8078
     options
@@ -59,12 +58,11 @@ pub fn iox_file_formats() -> Vec<Arc<dyn FileFormatFactory>> {
         Arc::new(JsonFormatFactory::new()),
         Arc::new(CsvFormatFactory::new()),
         Arc::new(ArrowFormatFactory::new()),
-        Arc::new(AvroFormatFactory::new()),
     ]
 }
 
 /// Return a TableParquetOptions object configured for IOx
-/// This is a workaround until DataFusion supports retrieving these options from the ParquetExec
+/// This is a workaround until DataFusion supports retrieving these options from the DataSourceExec
 /// <https://github.com/apache/arrow-datafusion/issues/9908>
 pub fn table_parquet_options() -> TableParquetOptions {
     TableParquetOptions {

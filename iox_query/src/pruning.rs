@@ -15,11 +15,11 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_util::{create_pruning_predicate, lit_timestamptz_nano};
-use observability_deps::tracing::{debug, trace, warn};
 use query_functions::group_by::Aggregate;
 use schema::{Schema, TIME_COLUMN_NAME};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::{debug, trace, warn};
 
 /// Reason why a chunk could not be pruned.
 ///
@@ -674,38 +674,41 @@ mod test {
 
         // No nulls, can't prune as it has values that are more and less than 'bar'
         let c1 = Arc::new(
-            TestChunk::new("chunk1").with_tag_column_with_nulls_and_full_stats(
-                "column1",
-                Some("a"),
-                Some("z"),
-                100,
-                None,
-                0,
-            ),
+            TestChunk::new("chunk1")
+                .with_row_count(100)
+                .with_tag_column_with_nulls_and_full_stats(
+                    "column1",
+                    Some("a"),
+                    Some("z"),
+                    None,
+                    0,
+                ),
         ) as Arc<dyn QueryChunk>;
 
         // Has no nulls, can prune it out based on statistics alone
         let c2 = Arc::new(
-            TestChunk::new("chunk2").with_tag_column_with_nulls_and_full_stats(
-                "column1",
-                Some("a"),
-                Some("b"),
-                100,
-                None,
-                0,
-            ),
+            TestChunk::new("chunk2")
+                .with_row_count(100)
+                .with_tag_column_with_nulls_and_full_stats(
+                    "column1",
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    0,
+                ),
         ) as Arc<dyn QueryChunk>;
 
         // Has nulls, can still can prune it out based on statistics alone
         let c3 = Arc::new(
-            TestChunk::new("chunk3").with_tag_column_with_nulls_and_full_stats(
-                "column1",
-                Some("a"),
-                Some("b"),
-                100,
-                None,
-                1, // that one peksy null!
-            ),
+            TestChunk::new("chunk3")
+                .with_row_count(100)
+                .with_tag_column_with_nulls_and_full_stats(
+                    "column1",
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    1, // that one peksy null!
+                ),
         ) as Arc<dyn QueryChunk>;
 
         let filters = vec![
@@ -740,14 +743,15 @@ mod test {
             //
             // No nulls, so can't prune
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("A"),
-                    Some("A"),
-                    100,
-                    None,
-                    0,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("A"),
+                        Some("A"),
+                        None,
+                        0,
+                    ),
             ),
             // Statistics for the "my_tag=NULL" partition.
             //
@@ -755,20 +759,22 @@ mod test {
             // All nulls, should be pruned
             Arc::new(
                 TestChunk::new("bananas_table")
-                    .with_tag_column_with_nulls_and_full_stats("my_tag", None, None, 10, None, 10),
+                    .with_row_count(10)
+                    .with_tag_column_with_nulls_and_full_stats("my_tag", None, None, None, 10),
             ),
             // Statistics for the my_tag=B partition
             //
             // Has a single NULL value, but not all the values are NULL, so can't prune
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("B"),
-                    Some("B"),
-                    100,
-                    None,
-                    1,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("B"),
+                        Some("B"),
+                        None,
+                        1,
+                    ),
             ),
         ];
 
@@ -1063,32 +1069,35 @@ mod test {
         let partitions: [Arc<dyn QueryChunk>; 3] = [
             // Statistics for the my_tag=A partition
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("A"),
-                    Some("A"),
-                    100,
-                    None,
-                    0,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("A"),
+                        Some("A"),
+                        None,
+                        0,
+                    ),
             ),
             // These statistics are for the "my_tag=NULL" partition.
             //
             // It necessarily contains only NULL values (in this case, 1 row).
             Arc::new(
                 TestChunk::new("bananas_table")
-                    .with_tag_column_with_nulls_and_full_stats("my_tag", None, None, 1, None, 1),
+                    .with_row_count(1)
+                    .with_tag_column_with_nulls_and_full_stats("my_tag", None, None, None, 1),
             ),
             // Statistics for the my_tag=B partition
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("B"),
-                    Some("B"),
-                    100,
-                    None,
-                    0,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("B"),
+                        Some("B"),
+                        None,
+                        0,
+                    ),
             ),
         ];
 
@@ -1112,13 +1121,7 @@ mod test {
         let got = prune_summaries(pruning_stats, &expr).unwrap();
 
         // Only the first partition should be returned.
-        //
-        // BUG: this should be `[true, false, false]`, meaning only the one
-        // partition my_tag=A is relevant, not my_tag=B.
-        //
-        // See https://github.com/influxdata/influxdb_iox/issues/10826 /
-        // https://github.com/apache/arrow-datafusion/issues/7869
-        assert_eq!(got.as_slice(), [true, false, true]);
+        assert_eq!(got.as_slice(), [true, false, false]);
 
         // When all the partitions has values, i.e. no NULL values, the pruning
         // works as expected.
@@ -1133,36 +1136,39 @@ mod test {
         let partitions: [Arc<dyn QueryChunk>; 3] = [
             // Statistics for the my_tag=A partition
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("A"),
-                    Some("A"),
-                    100,
-                    None,
-                    0,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("A"),
+                        Some("A"),
+                        None,
+                        0,
+                    ),
             ),
             // Statistics for the my_tag=B partition
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("B"),
-                    Some("B"),
-                    100,
-                    None,
-                    0,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("B"),
+                        Some("B"),
+                        None,
+                        0,
+                    ),
             ),
             // Statistics for the my_tag=C partition
             Arc::new(
-                TestChunk::new("bananas_table").with_tag_column_with_nulls_and_full_stats(
-                    "my_tag",
-                    Some("C"),
-                    Some("C"),
-                    100,
-                    None,
-                    0,
-                ),
+                TestChunk::new("bananas_table")
+                    .with_row_count(100)
+                    .with_tag_column_with_nulls_and_full_stats(
+                        "my_tag",
+                        Some("C"),
+                        Some("C"),
+                        None,
+                        0,
+                    ),
             ),
         ];
 

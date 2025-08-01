@@ -1,7 +1,7 @@
 use crate::error;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, as_list_array};
-use arrow::datatypes::{DataType, Field};
-use datafusion::common::{DataFusionError, Result, ScalarValue, downcast_value};
+use arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::common::{Result, ScalarValue, downcast_value};
 use datafusion::logical_expr::function::StateFieldsArgs;
 use datafusion::logical_expr::{
     Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility, function::AccumulatorArgs,
@@ -55,20 +55,27 @@ impl AggregateUDFImpl for PercentileUDF {
 
     fn accumulator(&self, arg: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
         Ok(Box::new(PercentileAccumulator::new(
-            arg.return_type.clone(),
+            arg.return_field.data_type().clone(),
         )))
     }
 
-    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<arrow::datatypes::Field>> {
-        let value_list =
-            DataType::List(Arc::new(Field::new("item", args.return_type.clone(), true)));
+    fn state_fields(&self, args: StateFieldsArgs<'_>) -> Result<Vec<FieldRef>> {
+        let value_list = DataType::List(Arc::new(Field::new(
+            "item",
+            args.return_field.data_type().clone(),
+            true,
+        )));
         Ok(vec![
-            Field::new(format_state_name(args.name, "value"), value_list, true),
-            Field::new(
+            Arc::new(Field::new(
+                format_state_name(args.name, "value"),
+                value_list,
+                true,
+            )),
+            Arc::new(Field::new(
                 format_state_name(args.name, "count"),
                 DataType::Float64,
                 true,
-            ),
+            )),
         ])
     }
 }

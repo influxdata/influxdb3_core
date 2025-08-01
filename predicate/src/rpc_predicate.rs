@@ -16,10 +16,10 @@ use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::prelude::{Expr, lit};
 use futures::{StreamExt, TryStreamExt};
-use observability_deps::tracing::{debug, trace};
 use schema::Schema;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tracing::{debug, trace};
 
 use self::field_rewrite::FieldProjectionRewriter;
 use self::measurement_rewrite::rewrite_measurement_references;

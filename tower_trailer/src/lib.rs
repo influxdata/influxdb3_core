@@ -111,13 +111,12 @@ impl<B: http_body::Body> http_body::Body for WrappedBody<B> {
         let callbacks = Arc::clone(&self.callbacks.0);
         let mut data = self.project().inner.poll_frame(cx);
 
-        if let Poll::Ready(Some(Ok(ref mut frame))) = data {
-            if frame.is_trailers() {
-                if let Some(trailers) = frame.trailers_mut() {
-                    for callback in callbacks.lock().iter() {
-                        callback(trailers);
-                    }
-                }
+        if let Poll::Ready(Some(Ok(ref mut frame))) = data
+            && frame.is_trailers()
+            && let Some(trailers) = frame.trailers_mut()
+        {
+            for callback in callbacks.lock().iter() {
+                callback(trailers);
             }
         }
         data

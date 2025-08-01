@@ -19,12 +19,12 @@ influxdb_influxql_parser = { path = "../influxdb_influxql_parser" }
 iox_query = { path = "../iox_query" }
 iox_query_params = { path = "../iox_query_params" }
 itertools = "0.13.0"
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 predicate = { path = "../predicate" }
 query_functions = { path = "../query_functions" }
 regex = "1"
 schema = { path = "../schema" }
-serde_json = "1.0.140"
+serde_json = "1.0.141"
 thiserror = "2.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

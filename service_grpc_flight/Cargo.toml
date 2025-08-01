@@ -16,7 +16,7 @@ datafusion = { workspace = true }
 error_reporting = { path = "../error_reporting" }
 flightsql = { path = "../flightsql" }
 generated_types = { path = "../generated_types" }
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 iox_query = { path = "../iox_query" }
 iox_query_influxql = { path = "../iox_query_influxql" }
 iox_query_params = { path = "../iox_query_params" }
@@ -32,9 +32,9 @@ bytes = "1.10"
 futures = "0.3"
 prost = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.140"
+serde_json = "1.0.141"
 snafu = "0.8"
-tokio = { version = "1.45", features = [
+tokio = { version = "1.47", features = [
     "macros",
     "net",
     "parking_lot",

@@ -16,9 +16,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::scalar::ScalarValue;
-use observability_deps::tracing::warn;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 // remap protobuf types for convenience
 mod proto {
@@ -424,9 +424,9 @@ impl std::fmt::Display for StatementParam {
         match self {
             Self::Null => write!(f, "NULL"),
             Self::Boolean(b) => write!(f, "{}", b.to_string().to_uppercase()),
-            Self::UInt64(u) => write!(f, "{}", u),
-            Self::Int64(i) => write!(f, "{}", i),
-            Self::Float64(fl) => write!(f, "{}", fl),
+            Self::UInt64(u) => write!(f, "{u}"),
+            Self::Int64(i) => write!(f, "{i}"),
+            Self::Float64(fl) => write!(f, "{fl}"),
             Self::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
         }
     }

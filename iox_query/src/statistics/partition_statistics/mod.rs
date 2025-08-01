@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::{
     common::{ColumnStatistics, Result, Statistics, internal_datafusion_err, stats::Precision},
-    datasource::physical_plan::ParquetExec,
+    datasource::{physical_plan::FileScanConfig, source::DataSourceExec},
     error::DataFusionError,
     physical_plan::{
         ExecutionPlan, PhysicalExpr,
@@ -12,7 +12,6 @@ use datafusion::{
         empty::EmptyExec,
         filter::FilterExec,
         limit::{GlobalLimitExec, LocalLimitExec},
-        memory::MemoryExec,
         placeholder_row::PlaceholderRowExec,
         projection::ProjectionExec,
         repartition::RepartitionExec,
@@ -63,36 +62,17 @@ impl PartitionStatistics for EmptyExec {
     }
 }
 
-impl PartitionStatistics for MemoryExec {
+impl PartitionStatistics for DataSourceExec {
     fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
-        Ok(unknown_statistics_by_partition(self))
-    }
-}
+        let Some(cfg) = self.data_source().as_any().downcast_ref::<FileScanConfig>() else {
+            return Ok(unknown_statistics_by_partition(self));
+        };
 
-impl PartitionStatistics for PlaceholderRowExec {
-    fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
-        // all partitions have the same single row, and same stats.
-        // refer to `PlaceholderRowExec::execute`.
-        let data = self.statistics()?.into();
-        Ok(vec![data; partition_count(self)])
-    }
-}
-
-impl PartitionStatistics for ParquetExec {
-    /// Returns [`Statistics`] per partition for the parquet scan.
-    ///
-    /// Note that the file statistics are only available on a per file basis from the
-    /// [`PartitionedFile.statistics`](datafusion::datasource::listing::PartitionedFile).
-    /// For a ranged scan, the statistics are an outer bounds.
-    ///
-    /// TODO: determine if the per entire file stats, for a ranged scan, can be modified based on row_group statistics.
-    fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
-        let file_schema = &self.base_config().file_schema;
+        let file_schema = &cfg.file_schema;
         let target_schema = Arc::clone(&self.schema());
 
         // get per partition (a.k.a. file group)
-        let per_partition = self
-            .base_config()
+        let per_partition = cfg
             .file_groups
             .iter()
             .map(|file_group| {
@@ -119,6 +99,15 @@ impl PartitionStatistics for ParquetExec {
             .try_collect()?;
 
         Ok(per_partition)
+    }
+}
+
+impl PartitionStatistics for PlaceholderRowExec {
+    fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
+        // all partitions have the same single row, and same stats.
+        // refer to `PlaceholderRowExec::execute`.
+        let data = self.partition_statistics(None)?.into();
+        Ok(vec![data; partition_count(self)])
     }
 }
 
@@ -313,13 +302,11 @@ impl PartitionStatistics for AggregateExec {
 pub fn statistics_by_partition(plan: &dyn ExecutionPlan) -> Result<PartitionedStatistics> {
     if let Some(exec) = plan.as_any().downcast_ref::<EmptyExec>() {
         exec.statistics_by_partition()
-    } else if let Some(exec) = plan.as_any().downcast_ref::<MemoryExec>() {
-        exec.statistics_by_partition()
     } else if let Some(exec) = plan.as_any().downcast_ref::<PlaceholderRowExec>() {
         exec.statistics_by_partition()
     } else if let Some(exec) = plan.as_any().downcast_ref::<RecordBatchesExec>() {
         exec.statistics_by_partition()
-    } else if let Some(exec) = plan.as_any().downcast_ref::<ParquetExec>() {
+    } else if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
         exec.statistics_by_partition()
     } else if let Some(exec) = plan.as_any().downcast_ref::<UnionExec>() {
         exec.statistics_by_partition()
@@ -536,9 +523,10 @@ mod test {
     use std::fmt::{Display, Formatter};
 
     use crate::test::test_utils::{
-        PartitionedFilesAndRanges, SortKeyRange, coalesce_exec, crossjoin_exec, dedupe_exec,
-        file_scan_config, filter_exec, limit_exec, parquet_exec_with_sort_with_statistics,
-        proj_exec, repartition_exec, single_column_schema, sort_exec, spm_exec, union_exec,
+        PartitionedFilesAndRanges, SortKeyRange, coalesce_exec, crossjoin_exec,
+        data_source_exec_parquet_with_sort_with_statistics, dedupe_exec, file_scan_config_builder,
+        filter_exec, limit_exec, proj_exec, repartition_exec, single_column_schema, sort_exec,
+        spm_exec, union_exec,
     };
 
     use super::*;
@@ -548,7 +536,7 @@ mod test {
     };
     use datafusion::{
         common::ColumnStatistics,
-        datasource::physical_plan::parquet::ParquetExecBuilder,
+        datasource::memory::MemorySourceConfig,
         error::DataFusionError,
         logical_expr::Operator,
         physical_expr::{LexOrdering, PhysicalSortExpr},
@@ -633,7 +621,7 @@ mod test {
     impl Display for TestCase<'_> {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
             let displayable_plan = displayable(self.input_plan.as_ref()).indent(false);
-            writeln!(f, "{}", displayable_plan)?;
+            writeln!(f, "{displayable_plan}")?;
 
             writeln!(f, "Expected column statistics per partition:")?;
             for partition in 0..self.input_partition_cnt() {
@@ -644,7 +632,7 @@ mod test {
                         partition, expected_per_partition[partition]
                     )?;
                 } else {
-                    writeln!(f, "    partition {:?}:  None", partition)?;
+                    writeln!(f, "    partition {partition:?}:  None")?;
                 }
             }
 
@@ -716,7 +704,7 @@ mod test {
         ];
 
         /* Test Case: parquet */
-        let plan = parquet_exec_with_sort_with_statistics(
+        let plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             ranges_per_partition,
         );
@@ -724,7 +712,7 @@ mod test {
         assert_snapshot!(
             test_case.run()?,
             @r"
-        ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+        DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -760,21 +748,19 @@ mod test {
         );
 
         /* Test Case: memory exec */
-        // note: memory exec is a collection of record batches, and has absent stats (beacause batches are not read at planning time)
+        // note: memory exec is a collection of record batches, and has absent stats (because batches are not read at planning time)
         let a: ArrayRef = Arc::new(Int64Array::from(vec![10, 20]));
         let batch = RecordBatch::try_from_iter(vec![("a", a)])?;
         let partitions = &[vec![batch.clone()], vec![batch]];
         assert_eq!(partitions.len(), 2, "should have 2 partitions");
-        let plan = Arc::new(MemoryExec::try_new(
-            partitions,
-            single_column_schema(),
-            Some(vec![0]),
-        )?) as _;
+        let plan = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(partitions, single_column_schema(), Some(vec![0])).unwrap(),
+        ))) as _;
         let test_case = TestCase::new(&plan, col_name, None);
         assert_snapshot!(
             test_case.run()?,
             @r"
-        MemoryExec: partitions=2, partition_sizes=[1, 1]
+        DataSourceExec: partitions=2, partition_sizes=[1, 1]
 
         Expected column statistics per partition:
             partition 0:  None
@@ -863,11 +849,11 @@ mod test {
         ];
 
         /* Test Case: union */
-        let left_plan = parquet_exec_with_sort_with_statistics(
+        let left_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[0..1],
         );
-        let right_plan = parquet_exec_with_sort_with_statistics(
+        let right_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[1..],
         );
@@ -877,8 +863,8 @@ mod test {
             test_case.run()?,
             @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -893,7 +879,7 @@ mod test {
 
         /* Test Case: sorts, with preserve partitioning */
         let preserve_partitioning = true;
-        let input = parquet_exec_with_sort_with_statistics(
+        let input = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             ranges_per_partition,
         );
@@ -903,7 +889,7 @@ mod test {
             test_case.run()?,
             @r"
         SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -923,7 +909,7 @@ mod test {
             test_case.run()?,
             @r"
         CoalesceBatchesExec: target_batch_size=10
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -943,7 +929,7 @@ mod test {
             test_case.run()?,
             @r"
         LocalLimitExec: fetch=2
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -966,7 +952,7 @@ mod test {
             test_case.run()?,
             @r"
         ProjectionExec: expr=[a@0 as a]
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -990,7 +976,7 @@ mod test {
             test_case.run()?,
             @r"
         ProjectionExec: expr=[a@0 as a]
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -1015,7 +1001,7 @@ mod test {
             test_case.run()?,
             @r"
         ProjectionExec: expr=[a@0 + 2 as foo]
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -1035,7 +1021,7 @@ mod test {
             test_case.run()?,
             @r"
         FilterExec: NoOp IS NULL
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -1051,7 +1037,7 @@ mod test {
         /* Test Case: deduplicate -- if we give single-partitioned input */
         // THIS IS HOW WE CONSTRUCT OUR PLANS.
         let input_partition = &ranges_per_partition[0..1];
-        let partitioned_input = parquet_exec_with_sort_with_statistics(
+        let partitioned_input = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[0..1],
         );
@@ -1062,7 +1048,7 @@ mod test {
             test_case.run()?,
             @r"
         DeduplicateExec: [a@0 ASC]
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000))
@@ -1102,7 +1088,7 @@ mod test {
         ];
 
         // Expected result from all test cases.
-        let partitioned_input = parquet_exec_with_sort_with_statistics(
+        let partitioned_input = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             ranges_per_partition,
         );
@@ -1119,7 +1105,7 @@ mod test {
             test_case.run()?,
             @r"
         SortPreservingMergeExec: [a@0 ASC]
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(3500))
@@ -1135,7 +1121,7 @@ mod test {
             test_case.run()?,
             @r"
         SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(3500))
@@ -1182,7 +1168,7 @@ mod test {
         }];
 
         /* Test Case: Repartitioning */
-        let partitioned_input = parquet_exec_with_sort_with_statistics(
+        let partitioned_input = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             ranges_per_partition,
         );
@@ -1195,7 +1181,7 @@ mod test {
             test_case.run()?,
             @r"
         RepartitionExec: partitioning=Hash([], 4), input_partitions=3
-          ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(3500))
@@ -1219,14 +1205,17 @@ mod test {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let partitioning = Partitioning::Hash(vec![], 4);
         let left_plan = repartition_exec(
-            &parquet_exec_with_sort_with_statistics(
+            &data_source_exec_parquet_with_sort_with_statistics(
                 vec![lex_ordering.clone()],
                 &ranges_per_partition[0..1],
             ),
             partitioning.clone(),
         );
         let right_plan = repartition_exec(
-            &parquet_exec_with_sort_with_statistics(vec![lex_ordering], &ranges_per_partition[1..]),
+            &data_source_exec_parquet_with_sort_with_statistics(
+                vec![lex_ordering],
+                &ranges_per_partition[1..],
+            ),
             partitioning,
         );
         Ok(Arc::new(InterleaveExec::try_new(vec![
@@ -1261,11 +1250,11 @@ mod test {
         ];
 
         /* Test Case: Joins */
-        let left_plan = parquet_exec_with_sort_with_statistics(
+        let left_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[0..1],
         );
-        let right_plan = parquet_exec_with_sort_with_statistics(
+        let right_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[1..],
         );
@@ -1275,8 +1264,8 @@ mod test {
             test_case.run()?,
             @r"
         CrossJoinExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  None
@@ -1295,9 +1284,9 @@ mod test {
             @r"
         InterleaveExec
           RepartitionExec: partitioning=Hash([], 4), input_partitions=1
-            ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+            DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
           RepartitionExec: partitioning=Hash([], 4), input_partitions=2
-            ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+            DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  None
@@ -1314,7 +1303,7 @@ mod test {
 
         /* Test Case: None will override later merges with partitions having stats */
         // (because None means cannot determine all of the subplan stats)
-        let partitioned_input = parquet_exec_with_sort_with_statistics(
+        let partitioned_input = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             ranges_per_partition,
         );
@@ -1328,12 +1317,12 @@ mod test {
             @r"
         SortPreservingMergeExec: [a@0 ASC]
           UnionExec
-            ParquetExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+            DataSourceExec: file_groups={3 groups: [[0.parquet], [1.parquet], [2.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
             InterleaveExec
               RepartitionExec: partitioning=Hash([], 4), input_partitions=1
-                ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+                DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
               RepartitionExec: partitioning=Hash([], 4), input_partitions=2
-                ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+                DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  None
@@ -1374,7 +1363,7 @@ mod test {
 
         /* Test Case: deduplicate -- if we give multiple-partitioned input */
         // This is an invalid plan (refer to DeduplicateExec::execute).
-        let partitioned_input = parquet_exec_with_sort_with_statistics(
+        let partitioned_input = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             ranges_per_partition,
         );
@@ -1414,11 +1403,11 @@ mod test {
         ];
 
         /* Test Case: keeps null counts separate with pass thru */
-        let left_plan = parquet_exec_with_sort_with_statistics(
+        let left_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[0..1],
         );
-        let right_plan = parquet_exec_with_sort_with_statistics(
+        let right_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
             &ranges_per_partition[1..],
         );
@@ -1428,8 +1417,8 @@ mod test {
             test_case.run()?,
             @r"
         UnionExec
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-          ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(2000)) null_count=1
@@ -1455,8 +1444,8 @@ mod test {
             @r"
         SortPreservingMergeExec: [a@0 ASC]
           UnionExec
-            ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-            ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+            DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+            DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(3500)) null_count=8
@@ -1474,24 +1463,24 @@ mod test {
     ///     DeduplicateExec
     ///         SPM
     ///             Union
-    ///                 ParquetExec (ranges_per_partition_for_parquetexec_1)
-    ///                 ParquetExec (ranges_per_partition_for_parquetexec_2)
-    ///     ParquetExec (ranges_per_partition_for_parquetexec_3)
+    ///                 DataSourceExec (ranges_per_partition_for_DataSourceExec_1)
+    ///                 DataSourceExec (ranges_per_partition_for_DataSourceExec_2)
+    ///     DataSourceExec (ranges_per_partition_for_DataSourceExec_3)
     ///
     fn build_test_case_two_unions_and_dedupe(
-        ranges_per_partition_for_parquetexec_1: &[&SortKeyRange],
-        ranges_per_partition_for_parquetexec_2: &[&SortKeyRange],
-        ranges_per_partition_for_parquetexec_3: &[&SortKeyRange],
+        ranges_per_partition_for_data_source_exec_1: &[&SortKeyRange],
+        ranges_per_partition_for_data_source_exec_2: &[&SortKeyRange],
+        ranges_per_partition_for_data_source_exec_3: &[&SortKeyRange],
         lex_ordering: &LexOrdering,
     ) -> Arc<dyn ExecutionPlan> {
-        // first union, of parquet execs 1 and 2
-        let left_plan = parquet_exec_with_sort_with_statistics(
+        // first union, of `DataSourceExec`s 1 and 2
+        let left_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
-            ranges_per_partition_for_parquetexec_1,
+            ranges_per_partition_for_data_source_exec_1,
         );
-        let right_plan = parquet_exec_with_sort_with_statistics(
+        let right_plan = data_source_exec_parquet_with_sort_with_statistics(
             vec![lex_ordering.clone()],
-            ranges_per_partition_for_parquetexec_2,
+            ranges_per_partition_for_data_source_exec_2,
         );
         let union = union_exec(vec![left_plan, right_plan]);
 
@@ -1501,16 +1490,16 @@ mod test {
         //  DeduplicateExec
         //      SPM
         //          Union
-        //              ParquetExec
-        //              ParquetExec
+        //              DataSourceExec
+        //              DataSourceExec
         let union_then_spm_then_dedupe = dedupe_exec(&spm_exec(&union, lex_ordering), lex_ordering);
 
-        // second union, with the 3rd parquet exec
+        // second union, with the 3rd `DataSourceExec`
         union_exec(vec![
             union_then_spm_then_dedupe,
-            parquet_exec_with_sort_with_statistics(
+            data_source_exec_parquet_with_sort_with_statistics(
                 vec![lex_ordering.clone()],
-                ranges_per_partition_for_parquetexec_3,
+                ranges_per_partition_for_data_source_exec_3,
             ),
         ])
     }
@@ -1524,8 +1513,8 @@ mod test {
             Default::default(),
         )]);
 
-        /* Test Case: the SPM+Deduped parquet exec are overlapping each other, but are disjoint from the 3rd partion exec */
-        let ranges_per_partition_for_parquetexec_1 = &[
+        /* Test Case: the SPM+Deduped `DataSourceExec` are overlapping each other, but are disjoint from the 3rd partion exec */
+        let ranges_per_partition_for_data_source_exec_1 = &[
             &SortKeyRange {
                 min: Some(1000),
                 max: Some(2000),
@@ -1537,20 +1526,20 @@ mod test {
                 null_count: 2,
             },
         ];
-        let ranges_per_partition_for_parquetexec_2 = &[&SortKeyRange {
-            min: Some(2001), // parquet_execs 1 and parquet_execs 2 overlap, and will be deduped
+        let ranges_per_partition_for_data_source_exec_2 = &[&SortKeyRange {
+            min: Some(2001), // DataSourceExec 1 and DataSourceExec 2 overlap, and will be deduped
             max: Some(3000),
             null_count: 1,
         }];
-        let ranges_per_partition_for_parquetexec_3 = &[&SortKeyRange {
+        let ranges_per_partition_for_data_source_exec_3 = &[&SortKeyRange {
             min: Some(4001), // parquet 3 is not overlapping with the others
             max: Some(4500),
             null_count: 1,
         }];
         let plan = build_test_case_two_unions_and_dedupe(
-            ranges_per_partition_for_parquetexec_1,
-            ranges_per_partition_for_parquetexec_2,
-            ranges_per_partition_for_parquetexec_3,
+            ranges_per_partition_for_data_source_exec_1,
+            ranges_per_partition_for_data_source_exec_2,
+            ranges_per_partition_for_data_source_exec_3,
             &lex_ordering,
         );
 
@@ -1578,9 +1567,9 @@ mod test {
           DeduplicateExec: [a@0 ASC]
             SortPreservingMergeExec: [a@0 ASC]
               UnionExec
-                ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-                ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
-          ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC]
+                DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+                DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a], output_ordering=[a@0 ASC], file_type=parquet
 
         Expected column statistics per partition:
             partition 0:  (Some(1000))->(Some(3500)) null_count=7
@@ -1660,23 +1649,24 @@ mod test {
         let multiple_column_key_ranges_per_file = PartitionedFilesAndRanges {
             per_file: vec![ranges_for_file_0.clone(), ranges_for_file_1.clone()],
         };
-        let filegroups_config = file_scan_config(
+        let filegroups_config = file_scan_config_builder(
             &file_schema,
             vec![lex_ordering_on_c],
             multiple_column_key_ranges_per_file,
         );
 
         // use a plan with only col C
-        let parquet_exec = ParquetExecBuilder::new(filegroups_config.with_projection(Some(vec![2])))
-            .build_arc() as _;
+        let data_source_exec = DataSourceExec::from_data_source(
+            filegroups_config.with_projection(Some(vec![2])).build(),
+        ) as _;
         let projected = col(col_name, &plan_schema)?; // plan_schema
-        let plan = proj_exec(&parquet_exec, vec![(projected, "C".into())]);
+        let plan = proj_exec(&data_source_exec, vec![(projected, "C".into())]);
         insta::assert_snapshot!(
             displayable(plan.as_ref()).indent(true),
             @r"
-            ProjectionExec: expr=[C@0 as C]
-              ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[C], output_ordering=[C@0 ASC]
-            ",
+        ProjectionExec: expr=[C@0 as C]
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[C], output_ordering=[C@0 ASC], file_type=parquet
+        ",
         );
 
         // Test Case: show that plan schema is different from file schema
@@ -1694,13 +1684,14 @@ mod test {
             plan_schema,
             "plan schema should only have col C"
         );
-        let Some(parquet_exec) = plan.children()[0].as_any().downcast_ref::<ParquetExec>() else {
-            unreachable!()
-        };
+        let data_source_exec = plan.children()[0]
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .unwrap();
         assert_eq!(
-            parquet_exec.schema(),
+            data_source_exec.schema(),
             plan_schema,
-            "parquet exec plan schema should only have col C"
+            "`DataSourceExec` plan schema should only have col C"
         );
 
         /* Test Case: the statistics_by_partition will still extract the proper file_stats for col C */
@@ -1791,30 +1782,31 @@ mod test {
         let multiple_column_key_ranges_per_file = PartitionedFilesAndRanges {
             per_file: vec![ranges_for_file_0.clone(), ranges_for_file_1.clone()],
         };
-        let filegroups_config = file_scan_config(
+        let filegroups_config_builder = file_scan_config_builder(
             &file_schema, // file_schema
             vec![lex_ordering_on_c],
             multiple_column_key_ranges_per_file,
         );
 
         // make plan config, using a plan with only cols b & c
-        let parquet_exec = ParquetExecBuilder::new(
-            filegroups_config.with_projection(Some(vec![1, 2])),
-        )
-        .build_arc() as _;
+        let data_source_exec = DataSourceExec::from_data_source(
+            filegroups_config_builder
+                .with_projection(Some(vec![1, 2]))
+                .build(),
+        ) as _;
         let proj_c = col("c", &plan_schema)?; // plan_schema
         let proj_b = col("b", &plan_schema)?; // plan_schema
         // plan reverses the 2 cols, c then b
         let plan = proj_exec(
-            &parquet_exec,
+            &data_source_exec,
             vec![(proj_c, "c".into()), (proj_b, "b".into())],
         );
         insta::assert_snapshot!(
             displayable(plan.as_ref()).indent(true),
             @r"
-            ProjectionExec: expr=[c@1 as c, b@0 as b]
-              ParquetExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[b, c], output_ordering=[c@1 ASC, b@0 ASC]
-            ",
+        ProjectionExec: expr=[c@1 as c, b@0 as b]
+          DataSourceExec: file_groups={2 groups: [[0.parquet], [1.parquet]]}, projection=[b, c], output_ordering=[c@1 ASC, b@0 ASC], file_type=parquet
+        ",
         );
 
         /* Test Case: the statistics_by_partition will still extract the proper file_stats for both cols c and b */
@@ -1843,6 +1835,7 @@ mod test {
                         300_000
                     ))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // col b, partition 0
                 ColumnStatistics {
@@ -1850,6 +1843,7 @@ mod test {
                     min_value: Precision::Exact(datafusion::scalar::ScalarValue::Int32(Some(2000))),
                     max_value: Precision::Exact(datafusion::scalar::ScalarValue::Int32(Some(3000))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ]
         );
@@ -1875,6 +1869,7 @@ mod test {
                         700_000
                     ))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
                 // col b, partition 1
                 ColumnStatistics {
@@ -1882,6 +1877,7 @@ mod test {
                     min_value: Precision::Exact(datafusion::scalar::ScalarValue::Int32(Some(1000))),
                     max_value: Precision::Exact(datafusion::scalar::ScalarValue::Int32(Some(2000))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ]
         );
@@ -1929,13 +1925,16 @@ mod test {
         let multiple_column_key_ranges_per_file = PartitionedFilesAndRanges {
             per_file: vec![ranges_for_file],
         };
-        let filegroups_config = file_scan_config(
+        let filegroups_config_builder = file_scan_config_builder(
             &file_schema, // file_schema
             vec![],
             multiple_column_key_ranges_per_file,
         );
-        let scan = ParquetExecBuilder::new(filegroups_config.with_projection(Some(vec![0, 1, 2])))
-            .build_arc() as _;
+        let scan = DataSourceExec::from_data_source(
+            filegroups_config_builder
+                .with_projection(Some(vec![0, 1, 2]))
+                .build(),
+        ) as _;
 
         // make projection which modifies columns and aliases to an existing columns
         let pass_thru_c = col("c", &file_schema)?;
@@ -1951,9 +1950,9 @@ mod test {
         insta::assert_snapshot!(
             displayable(plan.as_ref()).indent(true),
             @r"
-            ProjectionExec: expr=[a@0 - 1 as b, c@2 as c]
-              ParquetExec: file_groups={1 group: [[0.parquet]]}, projection=[a, b, c]
-            ",
+        ProjectionExec: expr=[a@0 - 1 as b, c@2 as c]
+          DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[a, b, c], file_type=parquet
+        ",
         );
         assert_eq!(
             plan.schema(),
@@ -1980,6 +1979,7 @@ mod test {
                         300_000
                     ))),
                     distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
                 },
             ]
         );

@@ -6,8 +6,9 @@ use crate::api::{
     GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V1, LIST_PROTOCOL_V2, NO_VALUE, RequestPath,
 };
 use crate::local::CatalogCache;
-use bytes::Bytes;
-use futures::ready;
+use bytes::{Bytes, BytesMut};
+use futures::stream::FusedStream;
+use futures::{Stream, ready};
 use hyper::header::{ACCEPT, CONTENT_TYPE, ETAG, HeaderValue, IF_NONE_MATCH, ToStrError};
 use hyper::http::request::Parts;
 use hyper::service::Service;
@@ -18,6 +19,7 @@ use iox_http_util::{
 };
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -153,6 +155,7 @@ impl CatalogRequestFuture {
                         Some(x) if x == LIST_PROTOCOL_V2 => {
                             let encoder = v2::ListEncoder::new(entries).with_max_value_size(size);
                             let stream = futures::stream::iter(encoder);
+                            let stream = BatchedBytesStream::new(stream, size);
                             ResponseBuilder::new()
                                 .header(CONTENT_TYPE, &LIST_PROTOCOL_V2)
                                 .body(stream_bytes_to_response_body(stream))?
@@ -235,17 +238,16 @@ fn check_preconditions(
     value: &CacheValue,
     headers: &HeaderMap,
 ) -> Result<Option<StatusCode>, Error> {
-    if let Some(v) = headers.get(&GENERATION_NOT_MATCH) {
-        if value.generation == parse_generation(v)? {
-            return Ok(Some(StatusCode::NOT_MODIFIED));
-        }
+    if let Some(v) = headers.get(&GENERATION_NOT_MATCH)
+        && value.generation == parse_generation(v)?
+    {
+        return Ok(Some(StatusCode::NOT_MODIFIED));
     }
-    if let Some(etag) = &value.etag {
-        if let Some(v) = headers.get(&IF_NONE_MATCH) {
-            if etag.as_bytes() == v.as_bytes() {
-                return Ok(Some(StatusCode::NOT_MODIFIED));
-            }
-        }
+    if let Some(etag) = &value.etag
+        && let Some(v) = headers.get(&IF_NONE_MATCH)
+        && etag.as_bytes() == v.as_bytes()
+    {
+        return Ok(Some(StatusCode::NOT_MODIFIED));
     }
 
     Ok(None)
@@ -283,6 +285,77 @@ impl CatalogCacheServer {
     /// Returns a reference to the [`CatalogCache`] of this server
     pub fn cache(&self) -> &Arc<CatalogCache> {
         &self.state.cache
+    }
+}
+
+/// Stream that batches a number of small response elements into a
+/// single, larger, buffer. The input values are never split and are
+/// batched until whilst the combined size is below the given batch
+/// size. This stream will only produce a value that is larger than the
+/// batch size if one was returned from the inner stream.
+#[derive(Debug)]
+struct BatchedBytesStream<S: fmt::Debug> {
+    inner: S,
+    batch_size: usize,
+    buf: Option<BytesMut>,
+}
+
+impl<S: fmt::Debug> BatchedBytesStream<S> {
+    /// Create a new BatchedBytesStream wrapping inner.
+    fn new(inner: S, batch_size: usize) -> Self {
+        Self {
+            inner,
+            batch_size,
+            buf: Some(BytesMut::with_capacity(batch_size)),
+        }
+    }
+}
+
+impl<S, B> Stream for BatchedBytesStream<S>
+where
+    B: AsRef<[u8]>,
+    S: Stream<Item = B> + fmt::Debug + Send + Sync + Unpin,
+{
+    type Item = BytesMut;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.buf.is_none() {
+            return Poll::Ready(None);
+        }
+        loop {
+            let s = Pin::new(&mut this.inner);
+            match ready!(s.poll_next(cx)) {
+                Some(b) => {
+                    let b = b.as_ref();
+                    let buf = this.buf.as_mut().unwrap();
+                    if buf.len() + b.len() > this.batch_size {
+                        let mut nbuf = BytesMut::with_capacity(this.batch_size);
+                        nbuf.extend_from_slice(b);
+                        return Poll::Ready(this.buf.replace(nbuf));
+                    } else {
+                        this.buf.as_mut().unwrap().extend_from_slice(b);
+                    }
+                }
+                None => {
+                    return Poll::Ready(
+                        this.buf
+                            .take()
+                            .and_then(|buf| (!buf.is_empty()).then_some(buf)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl<S, B> FusedStream for BatchedBytesStream<S>
+where
+    B: AsRef<[u8]>,
+    S: Stream<Item = B> + fmt::Debug + Send + Sync + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.buf.is_none()
     }
 }
 
@@ -357,7 +430,7 @@ pub mod test_util {
                             tokio::task::spawn(async move {
                                 if let Err(err) = conn
                                     .await {
-                                        println!("Error serving connection: {:?}", err);
+                                        println!("Error serving connection: {err:?}");
                                     };
                             });
                         },
@@ -407,5 +480,52 @@ pub mod test_util {
                 x.abort()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures::stream::StreamExt;
+
+    #[tokio::test]
+    async fn test_batched_bytes_stream() {
+        let bufs = [
+            "1234567890",
+            "1234567890",
+            "1234567890",
+            "1234567890",
+            "1234567890",
+            "1234567890",
+        ];
+        let mut stream = BatchedBytesStream::new(futures::stream::iter(&bufs), 55);
+
+        assert_eq!(
+            stream.next().await.unwrap().as_ref(),
+            b"12345678901234567890123456789012345678901234567890"
+        );
+        assert_eq!(stream.next().await.unwrap().as_ref(), b"1234567890");
+        assert!(stream.next().await.is_none());
+
+        let bufs = [
+            "1234567890",
+            "123456789012345678901234567890",
+            "1234567890",
+            "1234567890",
+            "12345",
+        ];
+        let mut stream = BatchedBytesStream::new(futures::stream::iter(&bufs), 25);
+
+        assert_eq!(stream.next().await.unwrap().as_ref(), b"1234567890");
+        assert_eq!(
+            stream.next().await.unwrap().as_ref(),
+            b"123456789012345678901234567890"
+        );
+        assert_eq!(
+            stream.next().await.unwrap().as_ref(),
+            b"1234567890123456789012345"
+        );
+        assert!(stream.next().await.is_none());
     }
 }

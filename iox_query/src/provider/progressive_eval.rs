@@ -24,7 +24,7 @@ use futures::{Stream, StreamExt, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use observability_deps::tracing::{debug, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::config::IoxConfigExt;
 use crate::physical_optimizer::sort::lexical_range::LexicalRange;
@@ -117,7 +117,9 @@ impl ProgressiveEvalExec {
 impl DisplayAs for ProgressiveEvalExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "ProgressiveEvalExec: ")?;
                 if let Some(fetch) = self.fetch {
                     write!(f, "fetch={fetch}, ")?;
@@ -263,7 +265,7 @@ impl ExecutionPlan for ProgressiveEvalExec {
     }
 
     fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        self.input.statistics()
+        self.input.partition_statistics(None)
     }
 }
 
@@ -511,12 +513,12 @@ impl Stream for ProgressiveEvalStream {
             // This input stream has data, return its next record batch
             Some(Ok(mut batch)) => {
                 self.produced += batch.num_rows();
-                if let Some(fetch) = self.fetch {
-                    if self.produced > fetch {
-                        batch = batch.slice(0, batch.num_rows() - (self.produced - fetch));
-                        self.produced = fetch;
-                    }
-                };
+                if let Some(fetch) = self.fetch
+                    && self.produced > fetch
+                {
+                    batch = batch.slice(0, batch.num_rows() - (self.produced - fetch));
+                    self.produced = fetch;
+                }
                 Poll::Ready(Some(Ok(batch)))
             }
             // This input stream has an error, return the error and set aborted to true to stop polling next round
@@ -583,10 +585,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-    use datafusion::physical_plan::memory::MemoryExec;
     use datafusion::physical_plan::metrics::{MetricValue, Timestamp};
     use datafusion::physical_plan::{Partitioning, PlanProperties};
     use futures::{Future, FutureExt};
@@ -1642,8 +1645,10 @@ mod tests {
             partitions[0][0].schema()
         };
 
-        let exec = MemoryExec::try_new(partitions, schema, None).unwrap();
-        let progressive = Arc::new(ProgressiveEvalExec::new(Arc::new(exec), None, fetch));
+        let exec = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(partitions, schema, None).unwrap(),
+        )));
+        let progressive = Arc::new(ProgressiveEvalExec::new(exec, None, fetch));
 
         let progressive_clone = Arc::clone(&progressive);
 
@@ -1685,8 +1690,10 @@ mod tests {
         let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b)]).unwrap();
 
         let schema = b1.schema();
-        let exec = MemoryExec::try_new(&[vec![b1], vec![b2]], schema, None).unwrap();
-        let progressive = Arc::new(ProgressiveEvalExec::new(Arc::new(exec), None, None));
+        let exec = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![b1], vec![b2]], schema, None).unwrap(),
+        )));
+        let progressive = Arc::new(ProgressiveEvalExec::new(exec, None, None));
 
         let collected = collect(Arc::<ProgressiveEvalExec>::clone(&progressive), task_ctx)
             .await
@@ -1854,7 +1861,9 @@ mod tests {
             f: &mut std::fmt::Formatter<'_>,
         ) -> std::fmt::Result {
             match t {
-                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                DisplayFormatType::Default
+                | DisplayFormatType::Verbose
+                | DisplayFormatType::TreeRender => {
                     write!(f, "BlockingExec",)
                 }
             }

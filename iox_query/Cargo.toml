@@ -29,23 +29,24 @@ datafusion_util = { path = "../datafusion_util" }
 executor = { path = "../executor" }
 futures = "0.3"
 hashbrown = { workspace = true }
-indexmap = { version = "2.9", features = ["std"] }
+indexmap = { version = "2.10", features = ["std"] }
 influxdb-line-protocol = { path = "../influxdb_line_protocol" }
 itertools = "0.13.0"
 iox_query_params = { path = "../iox_query_params" }
 iox_time = { path = "../iox_time" }
+influxdb_iox_client = { path = "../influxdb_iox_client" }
 jemalloc_stats = { path = "../jemalloc_stats" }
 meta_data_cache = { path = "../meta_data_cache" }
 metric = { path = "../metric" }
 object_store = { workspace = true }
 object_store_size_hinting = { path = "../object_store_size_hinting" }
-observability_deps = { path = "../observability_deps" }
+tracing = { workspace = true }
 parking_lot = "0.12"
 parquet_file = { path = "../parquet_file" }
 query_functions = { path = "../query_functions" }
 schema = { path = "../schema" }
 snafu = "0.8"
-tokio = { version = "1.45", features = ["macros", "parking_lot"] }
+tokio = { version = "1.47", features = ["macros", "parking_lot"] }
 tokio-stream = "0.1"
 trace = { path = "../trace" }
 tracker = { path = "../tracker" }
@@ -53,10 +54,11 @@ uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order
-criterion = { version = "0.6", default-features = false, features = ["rayon"] }
+criterion = { version = "0.7", default-features = false, features = ["rayon"] }
 insta = { version = "1", features = ["yaml"] }
 metric_exporters = { path = "../metric_exporters" }
 rand = "0.9"
+regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 test_helpers = { path = "../test_helpers" }
 
