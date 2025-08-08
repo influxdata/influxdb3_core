@@ -38,6 +38,19 @@ workspace-members = [
 ]
 third-party = [
     { name = "criterion" },
+    { name = "tikv-jemalloc-sys" },
+    # Exclude crypto libraries to control provider selection per-crate
+    # This allows us to use ring consistently without hakari forcing aws-lc-rs
+    { name = "rustls" },
+    { name = "rustls-webpki" },
+    { name = "tokio-rustls" },
+    { name = "hyper-rustls" },
+    { name = "rustls-pemfile" },
+    { name = "rustls-native-certs" },
+    { name = "webpki-roots" },
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "ring" },
 ]
 
 #
