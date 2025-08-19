@@ -54,7 +54,7 @@ use super::field::FieldIndexes;
 /// `SeriesSet` 1 would produce 2 series (one for each field):
 ///
 /// {_field=Field1, TagA=a, TagB=b} timestamps = {100, 200, 300} values = {1, 2, 3}
-/// {_field=Field2, TagA=a, TagB=b} timestamps = {100, 200, 300} values = {100, 200, 300}
+/// {_field=Field2, TagA=a, TagB=b} timestamps = {100, 200, 300} values = {10, 20, 30}
 ///
 /// `SeriesSet` 2 would produce a single series for `Field1` (no
 /// series is created for `Field2` because there are no values for
