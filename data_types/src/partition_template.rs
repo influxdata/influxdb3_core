@@ -180,7 +180,7 @@ use std::{
     cmp::min,
     collections::{HashMap, HashSet},
     fmt::{Display, Formatter, Write},
-    ops::{Add, Range},
+    ops::Range,
     sync::{Arc, LazyLock},
 };
 
@@ -1470,7 +1470,7 @@ impl PartitionDuration {
     }
 }
 
-impl<Tz: chrono::TimeZone> Add<PartitionDuration> for chrono::DateTime<Tz> {
+impl<Tz: chrono::TimeZone> std::ops::Add<PartitionDuration> for chrono::DateTime<Tz> {
     type Output = Self;
     /// Add a [`PartitionDuration`] to a [`chrono::DateTime`].
     fn add(self, rhs: PartitionDuration) -> Self::Output {
