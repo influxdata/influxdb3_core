@@ -263,11 +263,10 @@ fn field_family_normal_char(i: &str) -> IResult<&str, &str> {
         if c == ':' {
             // Peek to see if the next char is also a colon, and if not,
             // keep consuming.
-            if let Some((_, next_ch)) = iter.peek() {
-                if *next_ch != ':' {
+            if let Some((_, next_ch)) = iter.peek()
+                && *next_ch != ':' {
                     continue;
                 }
-            }
         }
 
         // If we don't make progress, exit the loop.

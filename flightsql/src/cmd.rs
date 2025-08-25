@@ -143,7 +143,7 @@ impl Display for PreparedStatementHandle {
             write!(
                 f,
                 ",{}",
-                pretty_format_batches(&[batch.clone()]).map_err(|_| std::fmt::Error)?
+                pretty_format_batches(std::slice::from_ref(batch)).map_err(|_| std::fmt::Error)?
             )?
         };
         write!(f, ")")

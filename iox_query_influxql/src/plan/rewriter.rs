@@ -279,15 +279,14 @@ impl RewriteSelect {
         let (fields, mut group_by) = if has_field_wildcard || has_group_by_wildcard {
             let (field_set, mut tag_set) = from_field_and_dimensions(s, from)?;
 
-            if !has_group_by_wildcard {
-                if let Some(group_by) = &stmt.group_by {
+            if !has_group_by_wildcard
+                && let Some(group_by) = &stmt.group_by {
                     // Remove any explicitly listed tags in the GROUP BY clause, so they are not
                     // expanded by any wildcards specified in the SELECT projection list
                     group_by.tag_names().for_each(|ident| {
                         tag_set.remove(ident.as_str());
                     });
                 }
-            }
 
             let fields = if has_field_wildcard {
                 let var_refs = if field_set.is_empty() {
