@@ -546,7 +546,7 @@ mod test {
 
         // simple plan
         let plan = provider
-            .scan(&state, None, &[pred.clone()], None)
+            .scan(&state, None, std::slice::from_ref(&pred), None)
             .await
             .unwrap();
         insta::assert_yaml_snapshot!(
@@ -563,7 +563,7 @@ mod test {
 
         // projection
         let plan = provider
-            .scan(&state, Some(&vec![1, 3]), &[pred.clone()], None)
+            .scan(&state, Some(&vec![1, 3]), std::slice::from_ref(&pred), None)
             .await
             .unwrap();
         insta::assert_yaml_snapshot!(

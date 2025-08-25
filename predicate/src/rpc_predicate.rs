@@ -532,7 +532,6 @@ mod tests {
             .unwrap()
     }
 
-    #[expect(dead_code)]
     const fn assert_send<T: Send>() {}
 
     // `InfluxRpcPredicate` shall be `Send`, otherwise we will have problems constructing plans for InfluxRPC

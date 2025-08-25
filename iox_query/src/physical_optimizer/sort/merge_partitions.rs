@@ -100,17 +100,16 @@ pub fn merge_partitions_after_parallelized_sorting(
                 } else {
                     // If all lexical ranges are the same, then the partitions are a result of repartitioning. Insert an SPM above the sort.
                     if let Some(lexical_ranges) = extract_ranges_from_plan(ordering_req, &ctx.plan)?
+                        && lexical_ranges.iter().dedup().collect_vec().len() == 1
                     {
-                        if lexical_ranges.iter().dedup().collect_vec().len() == 1 {
-                            let plan = add_sort_preserving_merge(
-                                Arc::clone(&ctx.plan),
-                                sort_exec.expr(),
-                                sort_exec.fetch(),
-                            )?;
-                            let mut new_ctx = MergePartitionsContext::new_default(plan);
-                            new_ctx.data.has_merged_parallelized_sort = true;
-                            return Ok(Transformed::yes(new_ctx));
-                        }
+                        let plan = add_sort_preserving_merge(
+                            Arc::clone(&ctx.plan),
+                            sort_exec.expr(),
+                            sort_exec.fetch(),
+                        )?;
+                        let mut new_ctx = MergePartitionsContext::new_default(plan);
+                        new_ctx.data.has_merged_parallelized_sort = true;
+                        return Ok(Transformed::yes(new_ctx));
                     };
 
                     Ok(Transformed::no(ctx))

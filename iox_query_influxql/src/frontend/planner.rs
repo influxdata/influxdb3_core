@@ -97,9 +97,10 @@ impl SchemaExec {
     fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
         let eq_properties = match input.properties().output_ordering() {
             None => EquivalenceProperties::new(schema),
-            Some(output_ordering) => {
-                EquivalenceProperties::new_with_orderings(schema, &[output_ordering.clone()])
-            }
+            Some(output_ordering) => EquivalenceProperties::new_with_orderings(
+                schema,
+                std::slice::from_ref(output_ordering),
+            ),
         };
 
         let output_partitioning = input.output_partitioning().clone();

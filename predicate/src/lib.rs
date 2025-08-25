@@ -5,8 +5,6 @@ pub mod rpc_predicate;
 
 use data_types::TimestampRange;
 use datafusion::{
-    common::tree_node::{TreeNodeRecursion, TreeNodeVisitor},
-    error::DataFusionError,
     logical_expr::{BinaryExpr, binary_expr},
     prelude::{Expr, col},
 };
@@ -362,12 +360,10 @@ impl TryFrom<Expr> for ValueExpr {
             op: _,
             right: _,
         }) = &expr
+            && let Expr::Column(inner) = left.as_ref()
+            && inner.name == VALUE_COLUMN_NAME
         {
-            if let Expr::Column(inner) = left.as_ref()
-                && inner.name == VALUE_COLUMN_NAME
-            {
-                return Ok(Self { expr });
-            }
+            return Ok(Self { expr });
         }
         Err(expr)
     }
@@ -388,75 +384,6 @@ impl ValueExpr {
 impl From<ValueExpr> for Expr {
     fn from(value_expr: ValueExpr) -> Self {
         value_expr.expr
-    }
-}
-
-/// Recursively walk an expression tree, checking if the expression is
-/// row-based.
-///
-/// A row-based function takes one row in and produces
-/// one value as output.
-///
-/// Note that even though a predicate expression  like `col < 5` can be used to
-/// filter rows, the expression itself is row-based (produces a single boolean).
-///
-/// Examples of non row based expressions are Aggregate and
-/// Window function which produce different cardinality than their
-/// input.
-struct RowBasedVisitor {
-    row_based: bool,
-}
-
-impl Default for RowBasedVisitor {
-    fn default() -> Self {
-        Self { row_based: true }
-    }
-}
-
-impl TreeNodeVisitor<'_> for RowBasedVisitor {
-    type Node = Expr;
-
-    fn f_down(&mut self, expr: &Expr) -> Result<TreeNodeRecursion, DataFusionError> {
-        match expr {
-            Expr::Alias(_)
-            | Expr::Between { .. }
-            | Expr::BinaryExpr { .. }
-            | Expr::Case { .. }
-            | Expr::Cast { .. }
-            | Expr::Column(_)
-            | Expr::Exists { .. }
-            | Expr::InList { .. }
-            | Expr::InSubquery { .. }
-            | Expr::IsFalse(_)
-            | Expr::IsNotFalse(_)
-            | Expr::IsNotNull(_)
-            | Expr::IsNotTrue(_)
-            | Expr::IsNotUnknown(_)
-            | Expr::IsNull(_)
-            | Expr::IsTrue(_)
-            | Expr::IsUnknown(_)
-            | Expr::Like { .. }
-            | Expr::Literal(_, _)
-            | Expr::Negative(_)
-            | Expr::Not(_)
-            | Expr::OuterReferenceColumn(_, _)
-            | Expr::Placeholder { .. }
-            | Expr::ScalarFunction { .. }
-            | Expr::ScalarSubquery(_)
-            | Expr::ScalarVariable(_, _)
-            | Expr::SimilarTo { .. }
-            | Expr::TryCast { .. } => Ok(TreeNodeRecursion::Continue),
-            // Exhaustive matching requires us to also match deprecated variants
-            #[expect(deprecated)]
-            Expr::Wildcard { .. } => Ok(TreeNodeRecursion::Continue),
-            Expr::AggregateFunction { .. }
-            | Expr::GroupingSet(_)
-            | Expr::WindowFunction { .. }
-            | Expr::Unnest(_) => {
-                self.row_based = false;
-                Ok(TreeNodeRecursion::Stop)
-            }
-        }
     }
 }
 

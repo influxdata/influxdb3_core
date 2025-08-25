@@ -188,8 +188,10 @@ impl DeduplicateExec {
         sort_keys: &LexOrdering,
     ) -> PlanProperties {
         trace!("Deduplicate output ordering: {:?}", sort_keys);
-        let eq_properties =
-            EquivalenceProperties::new_with_orderings(input.schema(), &[sort_keys.clone()]);
+        let eq_properties = EquivalenceProperties::new_with_orderings(
+            input.schema(),
+            std::slice::from_ref(sort_keys),
+        );
 
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
@@ -921,7 +923,7 @@ mod test {
             "|    |    | 1.0 |",
             "+----+----+-----+",
         ];
-        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+        assert_batches_eq!(&expected_input_batch, std::slice::from_ref(&b1));
 
         // sort on t1, t2
         let sort_keys = vec![
@@ -1084,7 +1086,7 @@ mod test {
             "| b  |    | 1.0 |",
             "+----+----+-----+",
         ];
-        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+        assert_batches_eq!(&expected_input_batch, std::slice::from_ref(&b1));
 
         // sort on t1, t2
         let sort_keys = vec![
@@ -1251,7 +1253,7 @@ mod test {
             "| b  | a  | 1.0 |",
             "+----+----+-----+",
         ];
-        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+        assert_batches_eq!(&expected_input_batch, std::slice::from_ref(&b1));
 
         // sort on t1, t2
         let sort_keys = vec![

@@ -73,16 +73,15 @@ impl TreeNodeRewriter for InfluxRegexToDataFusionRegex {
                 let name = func.name();
                 if (args.len() == 2)
                     && ((name == REGEX_MATCH_UDF_NAME) || (name == REGEX_NOT_MATCH_UDF_NAME))
+                    && let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = &args[1]
                 {
-                    if let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = &args[1] {
-                        let s = clean_non_meta_escapes(s);
-                        let op = match name {
-                            REGEX_MATCH_UDF_NAME => Operator::RegexMatch,
-                            REGEX_NOT_MATCH_UDF_NAME => Operator::RegexNotMatch,
-                            _ => unreachable!(),
-                        };
-                        return Ok(Transformed::yes(binary_expr(args.remove(0), op, lit(s))));
-                    }
+                    let s = clean_non_meta_escapes(s);
+                    let op = match name {
+                        REGEX_MATCH_UDF_NAME => Operator::RegexMatch,
+                        REGEX_NOT_MATCH_UDF_NAME => Operator::RegexNotMatch,
+                        _ => unreachable!(),
+                    };
+                    return Ok(Transformed::yes(binary_expr(args.remove(0), op, lit(s))));
                 }
 
                 Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
