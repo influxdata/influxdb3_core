@@ -21,7 +21,7 @@ generated_types = { path = "../generated_types" }
 murmur3 = "0.5.2"
 tracing = { workspace = true }
 ordered-float = "5"
-percent-encoding = "2.3.2"
+percent-encoding = "2.3.1"
 prost = { workspace = true }
 schema = { path = "../schema" }
 serde_json = "1.0"
