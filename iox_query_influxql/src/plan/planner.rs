@@ -704,6 +704,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 .tag_names()
                 .map(|ident| ident.as_str())
                 .sorted()
+                .dedup()
                 .collect()
         } else {
             vec![]
