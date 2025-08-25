@@ -107,9 +107,10 @@ fn simplify_predicate_inner(expr: Expr) -> Result<Transformed<Expr>> {
                     return Ok(Transformed::yes(*right));
                 }
             } else if let (Some(coll), Some(colr)) = (is_col_op_lit(&left), is_col_not_null(&right))
-                && colr == coll {
-                    return Ok(Transformed::yes(*left));
-                };
+                && colr == coll
+            {
+                return Ok(Transformed::yes(*left));
+            };
 
             Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
                 left,
