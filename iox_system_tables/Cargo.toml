@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 arrow.workspace = true
-async-trait = "0.1.88"
+async-trait = "0.1.89"
 datafusion.workspace = true
 futures = "0.3"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

@@ -41,7 +41,7 @@ pub(crate) static ELAPSED: LazyLock<WindowFunctionDefinition> = LazyLock::new(||
 });
 
 /// Definition of the internal `INTEGRAL_WINDOW` user-defined window function.
-pub(crate) static INTEGRAL: LazyLock<WindowFunctionDefinition> = LazyLock::new(|| {
+pub(crate) static INTEGRAL_WINDOW: LazyLock<WindowFunctionDefinition> = LazyLock::new(|| {
     WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::new_from_impl(
         integral::IntegralUDWF::new(),
     )))

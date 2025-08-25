@@ -85,9 +85,6 @@ pub(super) struct Select {
     ///
     /// [time_zone_clause]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-time-zone-clause
     pub(super) timezone: Option<chrono_tz::Tz>,
-
-    /// `true` when the projection contains an `INTEGRAL` function.
-    pub(super) has_integral: bool,
 }
 
 impl From<Select> for SelectStatement {

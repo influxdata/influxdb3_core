@@ -1,8 +1,8 @@
 //! Snapshot definition for tables
-use crate::snapshot::list::MessageList;
 use crate::{
     Column, ColumnId, ColumnTypeProtoError, NamespaceId, Partition, PartitionId, PartitionKey,
     Table, TableId, Timestamp,
+    snapshot::list::{GetId, MessageList, SortedById},
 };
 use bytes::Bytes;
 use generated_types::influxdata::iox::catalog_cache::v1 as proto;
@@ -52,6 +52,18 @@ pub enum Error {
 /// Result for [`TableSnapshot`]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl GetId for proto::TablePartition {
+    fn id(&self) -> i64 {
+        self.id
+    }
+}
+
+impl GetId for proto::TableColumn {
+    fn id(&self) -> i64 {
+        self.id
+    }
+}
+
 /// A snapshot of a table
 #[derive(Debug, Clone)]
 pub struct TableSnapshot {
@@ -74,7 +86,7 @@ impl TableSnapshot {
         columns: Vec<Column>,
         generation: u64,
     ) -> Result<Self> {
-        let columns: Vec<_> = columns
+        let columns: SortedById<_> = columns
             .into_iter()
             .map(|c| proto::TableColumn {
                 id: c.id.get(),
@@ -83,7 +95,7 @@ impl TableSnapshot {
             })
             .collect();
 
-        let partitions: Vec<_> = partitions
+        let partitions: SortedById<_> = partitions
             .into_iter()
             .map(|p| proto::TablePartition {
                 id: p.id.get(),
@@ -95,8 +107,8 @@ impl TableSnapshot {
             table_id: table.id,
             namespace_id: table.namespace_id,
             table_name: table.name.into(),
-            partitions: MessageList::encode(&partitions).context(PartitionEncodeSnafu)?,
-            columns: MessageList::encode(&columns).context(ColumnEncodeSnafu)?,
+            partitions: MessageList::encode(partitions).context(PartitionEncodeSnafu)?,
+            columns: MessageList::encode(columns).context(ColumnEncodeSnafu)?,
             partition_template: table.partition_template.as_proto().cloned(),
             iceberg_enabled: table.iceberg_enabled,
             generation,
@@ -192,6 +204,11 @@ impl TableSnapshot {
     /// Returns the [`TableId`] of this snapshot
     pub fn table_id(&self) -> TableId {
         self.table_id
+    }
+
+    /// When this table was deleted if any
+    pub fn deleted_at(&self) -> Option<Timestamp> {
+        self.deleted_at
     }
 }
 

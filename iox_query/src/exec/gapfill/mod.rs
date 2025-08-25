@@ -35,7 +35,7 @@ use datafusion::{
 };
 use datafusion_util::ThenWithOpt;
 pub use gap_expander::{ExpandedValue, GapExpander};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, slice};
 use std::{
     convert::Infallible,
     fmt::{self, Debug},
@@ -550,7 +550,7 @@ impl GapFillExec {
         let eq_properties = match input.properties().output_ordering() {
             None => EquivalenceProperties::new(schema),
             Some(output_ordering) => {
-                EquivalenceProperties::new_with_orderings(schema, &[output_ordering.clone()])
+                EquivalenceProperties::new_with_orderings(schema, slice::from_ref(output_ordering))
             }
         };
 

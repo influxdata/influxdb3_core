@@ -25,9 +25,9 @@ pub use service_limits::*;
 
 use generated_types::google::protobuf as google;
 use generated_types::influxdata::iox::{
-    Target, catalog::v1 as catalog_proto, catalog_storage::v1 as catalog_storage_proto,
-    schema::v1 as schema_proto, skipped_compaction::v1 as skipped_compaction_proto,
-    table::v1 as table_proto,
+    Target, catalog::v1 as catalog_proto, catalog::v2 as catalog_v2_proto,
+    catalog_storage::v1 as catalog_storage_proto, schema::v1 as schema_proto,
+    skipped_compaction::v1 as skipped_compaction_proto, table::v1 as table_proto,
 };
 use schema::TIME_COLUMN_NAME;
 use snafu::Snafu;
@@ -380,6 +380,13 @@ impl NamespaceVersion {
     /// Returns the inner version value as its primitive type.
     pub fn get(&self) -> i64 {
         self.0
+    }
+}
+
+impl Add<i64> for NamespaceVersion {
+    type Output = Self;
+    fn add(self, rhs: i64) -> Self {
+        Self(self.0 + rhs)
     }
 }
 
@@ -747,6 +754,8 @@ pub struct TableWithStorage {
     pub deleted_at: Option<Timestamp>,
     /// The total number of active columns in this table.
     pub column_count: i64,
+    /// Whether this table is enabled for an iceberg export.
+    pub iceberg_enabled: bool,
 }
 
 /// Serialise a [`TableWithStorage`] object into its protobuf representation.
@@ -760,6 +769,7 @@ impl From<TableWithStorage> for catalog_storage_proto::TableWithStorage {
             size_bytes: value.size_bytes,
             deleted_at: value.deleted_at.map(google::Timestamp::from),
             column_count: value.column_count,
+            iceberg_enabled: value.iceberg_enabled,
         }
     }
 }
@@ -784,6 +794,7 @@ impl TryFrom<catalog_storage_proto::TableWithStorage> for TableWithStorage {
             size_bytes: value.size_bytes,
             deleted_at: value.deleted_at.map(Timestamp::from),
             column_count: value.column_count,
+            iceberg_enabled: value.iceberg_enabled,
         })
     }
 }
@@ -958,6 +969,52 @@ impl From<skipped_compaction_proto::SkippedCompaction> for SkippedCompaction {
             limit_num_files_first_in_partition: skipped_compaction
                 .limit_num_files_first_in_partition,
         }
+    }
+}
+
+/// Pre-computed retention info for efficient retention queries on a partition.
+/// Stores the computed retention boundaries for both parquet files and partitions
+/// to eliminate O(namespaces × partitions) retention query complexity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct PartitionRetention {
+    /// The partition this retention info applies to
+    pub partition_id: PartitionId,
+    /// The namespace this partition belongs to
+    pub namespace_id: NamespaceId,
+    /// Cached namespace retention period to avoid joins.
+    /// NULL when we don't want to slow down partition creation.
+    pub retention_period_ns: Option<i64>,
+    /// When files in this partition start becoming eligible for deletion.
+    /// NULL indicates this needs to be computed.
+    pub retention_start_time_ns: Option<i64>,
+    /// When files in this partition finish becoming eligible for deletion.
+    /// Currently always NULL for parquet file retention.
+    pub retention_end_time_ns: Option<i64>,
+}
+
+impl From<PartitionRetention> for catalog_v2_proto::PartitionRetention {
+    fn from(retention: PartitionRetention) -> Self {
+        Self {
+            partition_id: retention.partition_id.get(),
+            namespace_id: retention.namespace_id.get(),
+            retention_period_ns: retention.retention_period_ns,
+            retention_start_time_ns: retention.retention_start_time_ns,
+            retention_end_time_ns: retention.retention_end_time_ns,
+        }
+    }
+}
+
+impl TryFrom<catalog_v2_proto::PartitionRetention> for PartitionRetention {
+    type Error = &'static str;
+
+    fn try_from(retention: catalog_v2_proto::PartitionRetention) -> Result<Self, Self::Error> {
+        Ok(Self {
+            partition_id: PartitionId::new(retention.partition_id),
+            namespace_id: NamespaceId::new(retention.namespace_id),
+            retention_period_ns: retention.retention_period_ns,
+            retention_start_time_ns: retention.retention_start_time_ns,
+            retention_end_time_ns: retention.retention_end_time_ns,
+        })
     }
 }
 
@@ -3440,6 +3497,7 @@ mod tests {
             size_bytes: 1,
             deleted_at: None,
             column_count: 1,
+            iceberg_enabled: false,
         };
         let catalog_proto_table =
             catalog_storage_proto::TableWithStorage::from(table_active.clone());
@@ -3455,6 +3513,7 @@ mod tests {
             size_bytes: 2,
             deleted_at: Some(Timestamp::new(1_000_000_001)),
             column_count: 2,
+            iceberg_enabled: false,
         };
         let catalog_proto_table =
             catalog_storage_proto::TableWithStorage::from(table_deleted.clone());

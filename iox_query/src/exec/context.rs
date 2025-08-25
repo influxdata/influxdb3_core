@@ -662,11 +662,6 @@ impl IOxSessionContext {
     }
 
     /// Record an event on the span recorder
-    pub fn record_event(&mut self, name: &'static str) {
-        self.recorder.event(SpanEvent::new(name));
-    }
-
-    /// Record an event on the span recorder
     pub fn set_metadata(&mut self, name: &'static str, value: impl Into<MetaValue>) {
         self.recorder.set_metadata(name, value);
     }

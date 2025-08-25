@@ -27,7 +27,6 @@ members = [
     "mutable_batch",
     "object_store_mem_cache",
     "object_store_metrics",
-    "observability_deps",
     "panic_logging",
     "parquet_file",
     "predicate",

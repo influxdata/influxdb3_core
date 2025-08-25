@@ -16,6 +16,17 @@ impl U64HistogramOptions {
     pub fn new(thresholds: impl IntoIterator<Item = u64>) -> Self {
         let mut buckets: Vec<_> = thresholds.into_iter().collect();
         buckets.sort_unstable();
+        buckets.windows(2).for_each(|window| {
+            let (lower, upper) = (window[0], window[1]);
+            assert!(lower != upper, "thresholds must be unique");
+        });
+        assert!(
+            buckets
+                .last()
+                .map(|last| last == &u64::MAX)
+                .unwrap_or_default(),
+            "last bucket must be u64::MAX",
+        );
         Self { buckets }
     }
 }
@@ -162,11 +173,11 @@ mod tests {
 
     #[test]
     fn test_histogram() {
-        let buckets = [20, 40, 50];
+        let buckets = [20, 40, 50, u64::MAX];
         let options = U64HistogramOptions::new(buckets);
         let histogram = U64Histogram::create(&options);
 
-        let buckets = |expected: &[u64; 3], total: u64| -> Observation {
+        let buckets = |expected: &[u64; 4], total: u64| -> Observation {
             Observation::U64Histogram(HistogramObservation {
                 total,
                 buckets: expected
@@ -178,25 +189,25 @@ mod tests {
             })
         };
 
-        assert_eq!(histogram.observe(), buckets(&[0, 0, 0], 0));
+        assert_eq!(histogram.observe(), buckets(&[0, 0, 0, 0], 0));
 
         histogram.record(30);
 
-        assert_eq!(histogram.observe(), buckets(&[0, 1, 0], 30));
+        assert_eq!(histogram.observe(), buckets(&[0, 1, 0, 0], 30));
 
         histogram.record(50);
 
-        assert_eq!(histogram.observe(), buckets(&[0, 1, 1], 80));
+        assert_eq!(histogram.observe(), buckets(&[0, 1, 1, 0], 80));
 
         histogram.record(51);
 
-        // Exceeds max bucket - ignored
-        assert_eq!(histogram.observe(), buckets(&[0, 1, 1], 80));
+        // max bucket
+        assert_eq!(histogram.observe(), buckets(&[0, 1, 1, 1], 131));
 
         histogram.record(0);
         histogram.record(0);
 
-        assert_eq!(histogram.observe(), buckets(&[2, 1, 1], 80));
+        assert_eq!(histogram.observe(), buckets(&[2, 1, 1, 1], 131));
 
         // Now test the percentile reporting function
         let options = U64HistogramOptions::new(vec![0, 1, 2, 4, 8, 16, 32, u64::MAX]);
@@ -253,5 +264,29 @@ mod tests {
         assert_eq!(histogram.percentile(25), 1);
         assert_eq!(histogram.percentile(49), 1);
         assert_eq!(histogram.percentile(50), 2);
+    }
+
+    #[test]
+    fn test_histogram_option_sorts_input() {
+        let options = U64HistogramOptions::new([u64::MAX, 1, 2]);
+        assert_eq!(options.buckets, &[1, 2, u64::MAX]);
+    }
+
+    #[test]
+    #[should_panic(expected = "thresholds must be unique")]
+    fn test_histogram_option_panic_with_duplicates() {
+        U64HistogramOptions::new([3, u64::MAX, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "last bucket must be u64::MAX")]
+    fn test_histogram_option_panic_empty() {
+        U64HistogramOptions::new(std::iter::empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "last bucket must be u64::MAX")]
+    fn test_histogram_option_panic_no_duration_max() {
+        U64HistogramOptions::new([1, 3]);
     }
 }

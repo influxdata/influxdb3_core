@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     hash::{HashBuckets, HashBucketsEncoder},
-    list::MessageList,
+    list::{GetId, MessageList, SortedById},
 };
 
 /// Error for [`NamespaceSnapshot`]
@@ -57,6 +57,12 @@ pub enum Error {
 /// Result for [`NamespaceSnapshot`]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl GetId for proto::NamespaceTable {
+    fn id(&self) -> i64 {
+        self.id
+    }
+}
+
 /// A snapshot of a namespace
 #[derive(Debug, Clone)]
 pub struct NamespaceSnapshot {
@@ -80,7 +86,7 @@ impl NamespaceSnapshot {
         tables: impl IntoIterator<Item = Table>,
         generation: u64,
     ) -> Result<Self> {
-        let mut tables: Vec<_> = tables
+        let tables: SortedById<_> = tables
             .into_iter()
             .map(|t| proto::NamespaceTable {
                 id: t.id.get(),
@@ -88,8 +94,6 @@ impl NamespaceSnapshot {
                 deleted_at: t.deleted_at.map(|ts| ts.get()),
             })
             .collect();
-        // TODO(marco): wire up binary search to find table by ID
-        tables.sort_unstable_by_key(|t| t.id);
 
         let mut table_names = HashBucketsEncoder::new(tables.len());
         for (index, table) in tables.iter().enumerate() {
@@ -108,7 +112,7 @@ impl NamespaceSnapshot {
             deleted_at: namespace.deleted_at,
             partition_template: namespace.partition_template.as_proto().cloned(),
             router_version: namespace.router_version,
-            tables: MessageList::encode(&tables).context(TableEncodeSnafu)?,
+            tables: MessageList::encode(tables).context(TableEncodeSnafu)?,
             table_names: table_names.finish(),
             generation,
         })
@@ -170,10 +174,30 @@ impl NamespaceSnapshot {
         })
     }
 
+    /// Look up a [`NamespaceSnapshotTable`] by `TableId` using binary search of the list of
+    /// tables. _Does_ include soft-deleted entries.
+    ///
+    /// Hard-deleted tables may still appear in the table cache, but should NOT appear in
+    /// the namespace snapshot's tables, so this method must be used to check actual presence or
+    /// absence before looking up additional table information in the table cache.
+    ///
+    /// # Performance
+    ///
+    /// This method decodes each record the binary search needs to check, so may not be appropriate
+    /// for performance-sensitive use cases.
+    pub fn lookup_table_by_id(&self, id: TableId) -> Result<Option<NamespaceSnapshotTable>> {
+        // This requires that the tables are sorted by ID, which `encode` does.
+        Ok(self
+            .tables
+            .get_by_id(id.get())
+            .context(TableDecodeSnafu)?
+            .map(|t| t.into()))
+    }
+
     /// Lookup a [`NamespaceSnapshotTable`] by name. Does not include deleted entries.
     pub fn lookup_table_by_name(&self, name: &str) -> Result<Option<NamespaceSnapshotTable>> {
         for idx in self.table_names.lookup(name.as_bytes()) {
-            let table = self.tables.get(idx).context(TableEncodeSnafu)?;
+            let table = self.tables.get(idx).context(TableDecodeSnafu)?;
             if table.name == name.as_bytes() {
                 return Ok(Some(table.into()));
             }
@@ -198,7 +222,7 @@ impl NamespaceSnapshot {
             .map(|x| Duration::from_nanos(x as _))
     }
 
-    /// When this file was deleted if any
+    /// When this namespace was deleted if any
     pub fn deleted_at(&self) -> Option<Timestamp> {
         self.deleted_at
     }

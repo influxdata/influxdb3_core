@@ -22,7 +22,7 @@ comfy-table = { version = "7.1", default-features = false }
 hashbrown = { workspace = true }
 num-traits = "0.2"
 parquet = { workspace = true }
-regex = "1.11.1"
+regex = "1.11.2"
 snafu = "0.8"
 uuid = "1"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

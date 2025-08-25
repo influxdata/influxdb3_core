@@ -131,6 +131,7 @@ fn encode_partition_snapshot(i: usize) -> Bytes {
         Default::default(),
         Default::default(),
         Default::default(),
+        None, // max_time
     );
     // Create associated Parquet files:
     let parquet_files = vec![

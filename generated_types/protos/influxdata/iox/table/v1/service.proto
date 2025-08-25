@@ -84,15 +84,54 @@ message Table {
   optional google.protobuf.Timestamp deleted_at = 6;
 }
 
+enum TableStatusFilter {
+  TABLE_STATUS_FILTER_UNSPECIFIED = 0;
+  TABLE_STATUS_FILTER_ACTIVE = 1;
+  TABLE_STATUS_FILTER_DELETED = 2;
+}
+
+message TableStatusFilterList {
+  repeated TableStatusFilter inner = 1;
+}
+
 message GetTablesRequest {
   oneof target {
     // Name of the namespace to list tables for.
     string namespace_name = 1 [deprecated = true];
     // The unique ID of the namespace to list tables for.
     int64 namespace_id = 2;
-  }
-}
+  };
 
+  // How to filter deleted tables in the response of this request
+  // If there is nothing in this field, the returned tables aren't filtered at all;
+  // everything is returned.
+  // If there are items in this field, however, the only tables that are returned
+  // are those whose statuses are contained in this field.
+  //
+  // So, by default, no filtering is done.
+  //
+  // But if someone specified [Active, Deleted] in this field, that would return all
+  // tables which are either active or deleted. At time of writing, that includes all
+  // tables that can exist. However, at some point in the future, we may want to extend
+  // the granularity of this endpoint and allow customers to see all tables that are in
+  // the process of being deleted, or maybe all tables that are in the process of being
+  // created, or maybe we'll need to add some other status like 'hidden'. Who knows.
+  //
+  // With the `SoftDeleted` method of filtering, adding more statuses would cause
+  // exponential blowup with the number of variants that could occur, since we'd want to
+  // support any combination of statuses. With this, however, that extension becomes way
+  // easier and more backwards-compatible.
+  //
+  // We also want this to be, essentialy, an optional list because it allows us to be
+  // be sure that the client is always explicitly specifying their list of filters. If
+  // they leave a repeated field unspecified, we can't tell whether they just don't know
+  // about the filters or if they explicitly want no filters. But making it an optional
+  // allows us to force people to specify their filters, which is very nice for ensuring
+  // everyone is doing what they want.
+  //
+  // It also, for now, allows us to keep backwards-compatibilty, which is important.
+  optional TableStatusFilterList filters = 3;
+}
 message GetTableRequest {
   oneof namespace_target {
     // Name of the namespace to get a table from.
@@ -183,6 +222,9 @@ message DisableIcebergResponse {}
 
 message DeleteTableRequest {
   int64 table_id = 1;
+  // ID of the namespace this table is in. If not specified, the request may be slower as it will
+  // need to do more lookups.
+  int64 namespace_id = 2;
 }
 
 message DeleteTableResponse {
@@ -192,6 +234,9 @@ message DeleteTableResponse {
 message RenameTableRequest {
   int64 table_id = 1;
   string new_name = 2;
+  // ID of the namespace this table is in. If not specified, the request may be slower as it will
+  // need to do more lookups.
+  int64 namespace_id = 3;
 }
 
 message RenameTableResponse {

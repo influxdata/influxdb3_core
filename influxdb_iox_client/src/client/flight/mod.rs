@@ -28,6 +28,8 @@ pub mod generated_types {
     pub use generated_types::influxdata::iox::querier::v1::*;
 }
 
+pub use ::generated_types::tonic::codec::CompressionEncoding;
+
 /// Error responses when querying an IOx namespace using the IOx Flight API.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -236,6 +238,20 @@ impl Client {
     /// Add the specified header with value to all subsequent requests
     pub fn add_header(&mut self, key: &str, value: &str) -> Result<(), Error> {
         Ok(self.inner.add_header(key, value)?)
+    }
+
+    /// Accept compression.
+    ///
+    /// This is a set and the server will pick one option from it (plus the option "no compression").
+    pub fn accept_compressed(&mut self, encoding: CompressionEncoding) {
+        *self.inner.inner_mut() = self.inner.inner_mut().clone().accept_compressed(encoding);
+    }
+
+    /// Send compression.
+    ///
+    /// Only ONE compression can be send. Ask your server operator which encodings are supported.
+    pub fn send_compressed(&mut self, encoding: CompressionEncoding) {
+        *self.inner.inner_mut() = self.inner.inner_mut().clone().send_compressed(encoding);
     }
 
     /// Create a new [`QueryBuilder`] to construct a query, optionally with parameters, on the

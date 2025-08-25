@@ -126,21 +126,6 @@ impl Backoff {
         }
     }
 
-    /// Fade this backoff over to a different backoff config.
-    pub fn fade_to(&mut self, config: &BackoffConfig) {
-        // Note: `new` won't have the same RNG, but this doesn't matter
-        let new = Self::new(config);
-
-        *self = Self {
-            init_backoff: new.init_backoff,
-            next_backoff_secs: self.next_backoff_secs,
-            max_backoff_secs: new.max_backoff_secs,
-            base: new.base,
-            deadline: new.deadline,
-            rng: self.rng.take(),
-        };
-    }
-
     /// Perform an async operation that retries with a backoff
     pub async fn retry_with_backoff<F, F1, B, E>(
         &mut self,

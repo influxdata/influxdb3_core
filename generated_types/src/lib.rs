@@ -7,6 +7,7 @@
     clippy::large_enum_variant,
     clippy::use_self,
     clippy::allow_attributes,
+    clippy::uninlined_format_args,
     missing_copy_implementations
 )]
 

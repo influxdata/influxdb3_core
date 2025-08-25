@@ -13,14 +13,15 @@ use crate::plan::planner::source_field_names::SourceFieldNamesVisitor;
 use crate::plan::planner_time_range_expression::time_range_to_df_expr;
 use crate::plan::rewriter::{ProjectionType, find_table_names, rewrite_statement};
 use crate::plan::udf::{
-    cumulative_sum, derivative, difference, elapsed, find_integral_udfs, find_window_udfs,
-    integral, is_integral_udf, moving_average, non_negative_derivative, non_negative_difference,
+    INTEGRAL_UDF_NAME, cumulative_sum, derivative, difference, elapsed, find_integral_udfs,
+    find_window_udfs, integral, is_integral_udf, moving_average, non_negative_derivative,
+    non_negative_difference,
 };
 use crate::plan::util::{IQLSchema, binary_operator_to_df_operator, rebase_expr};
 use crate::plan::var_ref::var_ref_data_type_to_data_type;
 use crate::plan::{planner_rewrite_expression, udf};
 use crate::window::{
-    CUMULATIVE_SUM, DERIVATIVE, DIFFERENCE, ELAPSED, INTEGRAL, MOVING_AVERAGE,
+    CUMULATIVE_SUM, DERIVATIVE, DIFFERENCE, ELAPSED, INTEGRAL_WINDOW, MOVING_AVERAGE,
     NON_NEGATIVE_DERIVATIVE, NON_NEGATIVE_DIFFERENCE, PERCENT_ROW_NUMBER,
 };
 use arrow::array::{
@@ -208,9 +209,6 @@ struct Context<'a> {
     /// The set of tags specified in the top-level `SELECT` statement
     /// which represent the tag set used for grouping output.
     root_group_by_tags: &'a [&'a str],
-
-    /// `true` when the projection contains an `INTEGRAL` function.
-    has_integral: bool,
 }
 
 impl<'a> Context<'a> {
@@ -232,7 +230,6 @@ impl<'a> Context<'a> {
             interval: select.interval,
             extra_intervals: select.extra_intervals,
             root_group_by_tags,
-            has_integral: select.has_integral,
         }
     }
 
@@ -256,7 +253,6 @@ impl<'a> Context<'a> {
             interval: select.interval,
             extra_intervals: select.extra_intervals,
             root_group_by_tags: self.root_group_by_tags,
-            has_integral: select.has_integral,
         }
     }
 
@@ -269,14 +265,6 @@ impl<'a> Context<'a> {
             },
             false,
         )
-    }
-
-    /// Returns true if the current context has an extended
-    /// time range to provide leading data for window functions
-    /// to produce the result for the first window.
-    #[expect(dead_code)]
-    fn has_extended_time_range(&self) -> bool {
-        self.extra_intervals > 0 && self.interval.is_some()
     }
 
     /// Return the time range of the context, including any
@@ -704,6 +692,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 .tag_names()
                 .map(|ident| ident.as_str())
                 .sorted()
+                .dedup()
                 .collect()
         } else {
             vec![]
@@ -1325,10 +1314,11 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
     ) -> Result<(LogicalPlan, Vec<Expr>)> {
         // If SELECT contains INTEGRAL, go ahead and process it first.
         // See select_integral_window for details
-        if ctx.has_integral {
+        let num_integrals = find_integral_udfs(&select_exprs).len();
+        if num_integrals > 0 {
             (input, select_exprs) =
-                self.select_integral_window(ctx, input, select_exprs, group_by_tag_set)?;
-        }
+                self.select_integral_window(ctx, input, select_exprs, group_by_tag_set)?
+        };
         // Find a list of unique aggregate expressions from the projection.
         //
         // For example, a projection such as:
@@ -1513,7 +1503,14 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let num_exprs = aggr_exprs.len();
         // this specifies how we should handle the empty values in the gapfill that we need to add
         // to handle the GROUP BY clause below (if one exists)
+        //
+        // InfluxQL docs state that INTEGRAL does not support FILL. However, the behavior in 1.x is
+        // more complex depending on the choice of fill option and the presence of other aggregates
+        // in the query.
         let fill_strategy = match fill_option {
+            // When the query contains all INTEGRAL aggregates, the query behaves as if the fill
+            // clause is `fill(none)` regardless of what the fill clause actually specifies.
+            _ if num_integrals == num_exprs => None,
             // If the user specified that nulls should be filled with a specific value, then we
             // need to take the value they gave us (`val`) and convert it to the correct type to
             // give to the gapfill
@@ -1549,6 +1546,22 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             ),
             // with these, we just fill everything in the same way.
             Some(FillClause::Previous) => Some(vec![FillStrategy::PrevNullAsMissing; num_exprs]),
+            // When INTEGRAL is used with other aggregates and `fill(linear)`, InfluxDB 1.0 fills
+            // the integral column with nulls instead of calculating linear interpolation.
+            Some(FillClause::Linear) if num_integrals > 0 => Some(
+                aggr_exprs
+                    .iter()
+                    .map(|expr| {
+                        Ok(if is_integral_aggr_expr(expr) {
+                            FillStrategy::Default(default_return_value_for_aggr_fn(
+                                expr, &schema, None,
+                            )?)
+                        } else {
+                            FillStrategy::LinearInterpolate
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
             Some(FillClause::Linear) => Some(vec![FillStrategy::LinearInterpolate; num_exprs]),
             // If they specified Fill(NONE), then we don't want to gapfill any values because the
             // `NONE` specifies that all rows with null values should be removed.
@@ -1574,7 +1587,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
         // Combine the aggregate columns and group by expressions, which represents
         // the final projection from the aggregate operator.
-        let aggr_projection_exprs = [aggr_group_by_exprs, aggr_exprs].concat();
+        let aggr_projection_exprs = [aggr_group_by_exprs, aggr_exprs.clone()].concat();
 
         let fill_if_null = match fill_option {
             Some(FillClause::Value(v)) => Some(v),
@@ -1594,6 +1607,25 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 rebase_expr(expr, &aggr_projection_exprs, &fill_if_null, &plan).map(|t| t.data)
             })
             .collect::<Result<Vec<Expr>>>()?;
+
+        // the integral window function produces null values to adhere to DataFusion's RecordBatch
+        // size invariant. To match 1.x behavior, we need to strip these nulls out when the query
+        // has a `GROUP BY time` and there are no other aggregate functions.
+        let plan = if num_integrals > 0
+            && num_integrals == num_exprs
+            && ctx.group_by.and_then(|gb| gb.time_dimension()).is_some()
+            && let Some(filter_nulls) = disjunction(
+                aggr_exprs
+                    .into_iter()
+                    .map(|expr| Ok(expr_as_column_expr(&expr, &plan)?.is_not_null()))
+                    .collect::<Result<Vec<Expr>>>()?,
+            ) {
+            LogicalPlanBuilder::from(plan)
+                .filter(filter_nulls)?
+                .build()?
+        } else {
+            plan
+        };
 
         Ok((plan, select_exprs_post_aggr))
     }
@@ -1967,7 +1999,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 Expr::ScalarFunction(ScalarFunction { args, .. }) if is_integral_udf(e) => {
                     let alias = e.schema_name().to_string();
                     Ok(Expr::WindowFunction(Box::new(WindowFunction {
-                        fun: INTEGRAL.clone(),
+                        fun: INTEGRAL_WINDOW.clone(),
                         params: WindowFunctionParams {
                             args: vec![
                                 args[0].clone(),
@@ -4285,6 +4317,16 @@ fn remove_aggr_count_from_error(error: DataFusionError) -> DataFusionError {
         }
         _ => error,
     }
+}
+
+fn is_integral_aggr_expr(expr: &Expr) -> bool {
+    if let Expr::AggregateFunction(expr::AggregateFunction { func, params }) = expr
+        && func.name() == "sum"
+        && let [Expr::Column(Column { name, .. })] = params.args.as_slice()
+    {
+        return name.starts_with(&format!("{INTEGRAL_UDF_NAME}(")) && name.ends_with(")");
+    };
+    false
 }
 
 #[cfg(test)]

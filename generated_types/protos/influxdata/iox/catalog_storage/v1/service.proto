@@ -219,4 +219,6 @@ message TableWithStorage {
 
     // Total number of active columns in this table.
     int64 column_count = 7;
+    
+    bool iceberg_enabled = 8;
 }

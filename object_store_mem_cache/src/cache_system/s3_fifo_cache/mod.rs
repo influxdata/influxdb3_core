@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use object_store_metrics::cache_state::CacheState;
 use std::{
     fmt::Debug,
@@ -208,31 +209,64 @@ where
             S3CacheResponse::NewEntry(load)
         }
     }
+
+    /// Returns an iterator of all keys currently in the [`S3Fifo`] cache.
+    ///
+    /// Note that the keys listed in the cache are those which have returned from the
+    /// [`CacheFn`] function, i.e. they are the keys that have been successfully fetched.
+    pub fn list(&self) -> impl Iterator<Item = Arc<K>> {
+        self.cache.keys()
+    }
 }
 
 #[async_trait]
-impl<K, V> Cache<K, V> for S3FifoCache<K, V, ()>
+impl<K, V, D> Cache<K, V, D> for S3FifoCache<K, V, D>
 where
     K: Clone + Debug + Eq + Hash + HasSize + Send + Sync + 'static,
     V: Clone + Debug + HasSize + Send + Sync + 'static,
+    D: Clone + Debug + Send + Sync + 'static,
 {
-    async fn get_or_fetch(&self, k: &K, f: CacheFn<V>) -> (CacheRequestResult<V>, CacheState) {
-        match self.get_or_fetch_impl(k, f, ()) {
-            S3CacheResponse::NewEntry(fut) => {
-                let res = fut.await;
+    /// Get an existing key or start a new fetch process.
+    ///
+    /// Returns a future that resolves to the value [`CacheRequestResult<V>`].
+    /// If data is loading, provides early access data (`D`).
+    ///
+    /// For a given key, this function will return a value immediately if it is already cached.
+    /// If it is not cached and not already loading, it will start a new fetch process
+    /// using the early access data (`D`) provided by the caller.
+    ///
+    /// If a fetch process is already in progress, it will return a different early access (`D`)
+    /// which is tied to the ongoing fetch process.
+    fn get_or_fetch(
+        &self,
+        k: &K,
+        f: CacheFn<V>,
+        d: D,
+    ) -> (
+        BoxFuture<'static, CacheRequestResult<V>>,
+        Option<D>,
+        CacheState,
+    ) {
+        match self.get_or_fetch_impl(k, f, d) {
+            S3CacheResponse::NewEntry(load) => {
+                let early_access = load.data().clone();
+                let fut = load.into_future();
 
-                // Due to the lock gap between the "unresolved futures" and the cache, the future may determine that
-                // data was already cached/loading. We try to read the from the inner state.
-                match res {
-                    Ok(v) => (Ok(v), CacheState::NewEntry),
-                    Err(e) => (Err(e), CacheState::NewEntry),
-                }
+                (Box::pin(fut), Some(early_access), CacheState::NewEntry)
             }
-            S3CacheResponse::AlreadyLoading(fut) => {
-                let res = fut.await;
-                (res, CacheState::AlreadyLoading)
+            S3CacheResponse::AlreadyLoading(load) => {
+                let early_access = load.data().clone();
+                let fut = load.into_future();
+
+                (
+                    Box::pin(fut),
+                    Some(early_access),
+                    CacheState::AlreadyLoading,
+                )
             }
-            S3CacheResponse::WasCached(res) => (res, CacheState::WasCached),
+            S3CacheResponse::WasCached(res) => {
+                (Box::pin(async move { res }), None, CacheState::WasCached)
+            }
         }
     }
 
@@ -255,6 +289,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::panic;
+
     use super::*;
 
     use crate::cache_system::{
@@ -286,27 +322,25 @@ mod tests {
         );
         let k1 = Arc::from("x");
 
-        let (res, state) = cache
-            .get_or_fetch(
-                &k1,
-                Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
-            )
-            .await;
+        let (res, _, state) = cache.get_or_fetch(
+            &k1,
+            Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
+            (),
+        );
         assert_eq!(state, CacheState::NewEntry);
-        res.unwrap();
+        res.await.unwrap();
 
         assert_ne!(Arc::strong_count(&k1), 1);
 
         for i in 0..100 {
             let k = Arc::from(i.to_string());
-            let (res, state) = cache
-                .get_or_fetch(
-                    &k,
-                    Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
-                )
-                .await;
+            let (res, _, state) = cache.get_or_fetch(
+                &k,
+                Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
+                (),
+            );
             assert_eq!(state, CacheState::NewEntry);
-            res.unwrap();
+            res.await.unwrap();
         }
 
         assert_eq!(Arc::strong_count(&k1), 1);
@@ -329,13 +363,12 @@ mod tests {
 
         // make it heavy
         for _ in 0..2 {
-            let (res, _state) = cache
-                .get_or_fetch(
-                    &k_heavy,
-                    Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
-                )
-                .await;
-            res.unwrap();
+            let (res, _, _state) = cache.get_or_fetch(
+                &k_heavy,
+                Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
+                (),
+            );
+            res.await.unwrap();
         }
 
         // add new keys
@@ -343,13 +376,12 @@ mod tests {
 
         // make them heavy enough to evict old data
         for _ in 0..2 {
-            let (res, _state) = cache
-                .get_or_fetch(
-                    &k_new,
-                    Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
-                )
-                .await;
-            res.unwrap();
+            let (res, _, _state) = cache.get_or_fetch(
+                &k_new,
+                Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
+                (),
+            );
+            res.await.unwrap();
         }
 
         // old heavy key is gone
@@ -372,7 +404,7 @@ mod tests {
     fn setup() -> TestSetup {
         let observer = Arc::new(TestHook::default());
         TestSetup {
-            cache: Arc::new(S3FifoCache::new(
+            cache: Arc::new(S3FifoCache::<_, _, ()>::new(
                 S3Config {
                     max_memory_size: 10_000,
                     max_ghost_memory_size: 10_000,
@@ -456,13 +488,12 @@ mod tests {
         // Insert all test data
         for (key, value) in &test_data {
             let value_clone = value.clone();
-            let (res, _) = cache
-                .get_or_fetch(
-                    key,
-                    Box::new(move || async move { Ok(value_clone) }.boxed()),
-                )
-                .await;
-            res.unwrap();
+            let (res, _, _state) = cache.get_or_fetch(
+                key,
+                Box::new(move || async move { Ok(value_clone) }.boxed()),
+                (),
+            );
+            res.await.unwrap();
         }
 
         // Create snapshot
@@ -569,13 +600,12 @@ mod tests {
         // Insert all test data
         for (key, value) in &test_data {
             let value_clone = value.clone();
-            let (res, _) = cache
-                .get_or_fetch(
-                    key,
-                    Box::new(move || async move { Ok(value_clone) }.boxed()),
-                )
-                .await;
-            res.unwrap();
+            let (res, _, _state) = cache.get_or_fetch(
+                key,
+                Box::new(move || async move { Ok(value_clone) }.boxed()),
+                (),
+            );
+            res.await.unwrap();
         }
 
         // Create snapshot
@@ -667,5 +697,162 @@ mod tests {
             1,
             "Restored cache should have 1 ghost entry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_fetch_with_early_access() {
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, Arc<str>>::new(
+            S3Config {
+                max_memory_size: 1000,
+                max_ghost_memory_size: 500,
+                move_to_main_threshold: 0.1,
+                hook: Arc::new(NoOpHook::default()),
+            },
+            &metric::Registry::new(),
+        );
+
+        let key = Arc::from("test_key");
+        let early_access_data = Arc::from("early_data");
+        let final_value = Arc::from("final_value");
+
+        /* Test case 1: New entry - should return future and early access data */
+        let final_value_clone = Arc::clone(&final_value);
+        let (got_fut, got_early_access, got_state) = cache.get_or_fetch(
+            &key,
+            Box::new(move || {
+                let value = Arc::clone(&final_value_clone);
+                async move {
+                    // Simulate some async work
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok(value)
+                }
+                .boxed()
+            }),
+            Arc::clone(&early_access_data),
+        );
+
+        // Verify return signature for new entry
+        assert_eq!(got_state, CacheState::NewEntry);
+        assert!(matches!(got_early_access, Some(e) if Arc::ptr_eq(&e, &early_access_data)));
+
+        // Await the future and verify it returns the expected value
+        let result = got_fut.await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), final_value);
+
+        /* Test case 2: Already cached - should return immediate result with no early access */
+        let (got_fut, got_early_access, got_state) = cache.get_or_fetch(
+            &key,
+            Box::new(|| async { panic!("should not be called") }.boxed()),
+            Arc::from("unused_early_data"),
+        );
+
+        // Verify return signature for cached entry
+        assert_eq!(got_state, CacheState::WasCached);
+        assert!(got_early_access.is_none());
+
+        // Await the future and verify it returns the cached value
+        let result = got_fut.await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), final_value);
+
+        /* Test case 3: Already loading - simulate concurrent access */
+        let key = Arc::from("new_test_key");
+        let early_access_data = Arc::from("new_early_data");
+        let final_value = Arc::from("new_final_value");
+
+        // Start first request (this will be loading)
+        let final_value_clone = Arc::clone(&final_value);
+        let (got_fut_1, got_early_access_1, got_state_1) = cache.get_or_fetch(
+            &key,
+            Box::new(move || {
+                let value = Arc::clone(&final_value_clone);
+                async move {
+                    // Simulate longer async work
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok(value)
+                }
+                .boxed()
+            }),
+            Arc::clone(&early_access_data),
+        );
+
+        // Start second request while first is still loading
+        let different_early_access = Arc::from("different_early_data");
+        let (got_fut_2, got_early_access_2, state_2) = cache.get_or_fetch(
+            &key,
+            Box::new(|| async { panic!("should not be called") }.boxed()),
+            different_early_access,
+        );
+
+        // Verify return signatures
+        assert_eq!(got_state_1, CacheState::NewEntry);
+        assert!(matches!(got_early_access_1, Some(e) if Arc::ptr_eq(&e, &early_access_data)));
+
+        assert_eq!(state_2, CacheState::AlreadyLoading);
+        // The second request should get the early access data from the ongoing load
+        assert!(matches!(got_early_access_2, Some(e) if Arc::ptr_eq(&e, &early_access_data)));
+
+        // Both futures should resolve to the same value
+        let (result1, result2) = tokio::join!(got_fut_1, got_fut_2);
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_eq!(result1.unwrap(), final_value);
+        assert_eq!(result2.unwrap(), final_value);
+    }
+
+    #[tokio::test]
+    async fn test_list_fn_only_includes_fully_loaded_entries() {
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
+            S3Config {
+                max_memory_size: 1000,
+                max_ghost_memory_size: 500,
+                move_to_main_threshold: 0.1,
+                hook: Arc::new(NoOpHook::default()),
+            },
+            &metric::Registry::new(),
+        );
+
+        let key1 = Arc::from("key1".to_string());
+        let key2 = Arc::from("key2".to_string());
+
+        // Add first entry
+        let (res1, _, _) = cache.get_or_fetch(
+            &key1,
+            Box::new(|| futures::future::ready(Ok(Arc::from("value1"))).boxed()),
+            (),
+        );
+        res1.await.unwrap();
+
+        // Add second entry
+        let (res2, _, _) = cache.get_or_fetch(
+            &key2,
+            Box::new(|| {
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    Ok(Arc::from("value2"))
+                }
+                .boxed()
+            }),
+            (),
+        );
+
+        // List keys in the cache
+        let keys: Vec<Arc<str>> = cache.list().map(Arc::unwrap_or_clone).collect();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&key1), "key1 should be in the cache");
+        assert!(
+            !keys.contains(&key2),
+            "key2 should not be in the cache::list() yet, since still loading"
+        );
+
+        // wait until second entry is loaded
+        res2.await.unwrap();
+
+        // Now both keys should be in the cache::list()
+        let keys: Vec<Arc<str>> = cache.list().map(Arc::unwrap_or_clone).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&key1), "key1 should be in the cache");
+        assert!(keys.contains(&key2), "key2 should be in the cache");
     }
 }

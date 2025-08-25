@@ -7,7 +7,7 @@ use crate::{Namespace, NamespaceId, Timestamp};
 
 use super::{
     hash::{HashBuckets, HashBucketsEncoder},
-    list::MessageList,
+    list::{GetId, MessageList, SortedById},
 };
 
 /// Error for [`RootSnapshot`]
@@ -33,6 +33,12 @@ pub enum Error {
 /// Result for [`RootSnapshot`]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl GetId for proto::RootNamespace {
+    fn id(&self) -> i64 {
+        self.id
+    }
+}
+
 /// A snapshot of root.
 ///
 /// # Soft Deletion
@@ -52,7 +58,7 @@ impl RootSnapshot {
         namespaces: impl IntoIterator<Item = Namespace>,
         generation: u64,
     ) -> Result<Self> {
-        let mut namespaces: Vec<_> = namespaces
+        let namespaces: SortedById<_> = namespaces
             .into_iter()
             .map(|ns| proto::RootNamespace {
                 id: ns.id.get(),
@@ -60,9 +66,6 @@ impl RootSnapshot {
                 deleted_at: ns.deleted_at.as_ref().map(Timestamp::get),
             })
             .collect();
-
-        // This sort is required for the binary search in `lookup_namespace_by_id` to function.
-        namespaces.sort_unstable_by_key(|ns| ns.id);
 
         let mut namespace_names = HashBucketsEncoder::new(namespaces.len());
         for (index, ns) in namespaces.iter().enumerate() {
@@ -73,7 +76,7 @@ impl RootSnapshot {
         }
 
         Ok(Self {
-            namespaces: MessageList::encode(&namespaces).context(NamespaceEncodeSnafu)?,
+            namespaces: MessageList::encode(namespaces).context(NamespaceEncodeSnafu)?,
             namespace_names: namespace_names.finish(),
             generation,
         })
@@ -113,31 +116,11 @@ impl RootSnapshot {
     /// for performance-sensitive use cases.
     pub fn lookup_namespace_by_id(&self, id: NamespaceId) -> Result<Option<RootSnapshotNamespace>> {
         // This requires that the namespaces are sorted by ID, which `encode` does.
-
-        // Search through a slice of indices, as there isn't a way to get a slice of `&T` from
-        // `MessageList` without decoding everything
-        let indices_to_search: Vec<_> = (0..self.namespaces.len()).collect();
-
-        let element_idx = indices_to_search.binary_search_by_key(&id.get(), |&idx| {
-            let namespace_snapshot = self
-                .namespaces
-                .get(idx)
-                // The binary search APIs expect the comparator functions to be infallible. If
-                // decoding of cache records fails, we have bigger problems than only not being
-                // able to do a binary search, so go ahead and panic.
-                .expect("decoding root namespaces for binary search should succeed");
-            namespace_snapshot.id
-        });
-
-        element_idx
-            .ok()
-            .map(|idx| {
-                self.namespaces
-                    .get(idx)
-                    .context(NamespaceDecodeSnafu)
-                    .map(|t| t.into())
-            })
-            .transpose()
+        Ok(self
+            .namespaces
+            .get_by_id(id.get())
+            .context(NamespaceDecodeSnafu)?
+            .map(|ns| ns.into()))
     }
 
     /// Lookup a [`RootSnapshotNamespace`] by name. Does not include deleted entries.

@@ -14,6 +14,26 @@ use datafusion::logical_expr::{
 use crate::delta_time;
 use crate::{NUMERICS, error};
 
+/// Takes an error message string and a list of ScalarValue variables, and constructs a format! call
+/// that includes the data types of the variables at the end of the message.
+///
+/// Example:
+/// ```ignore
+/// let value = ScalarValue::Int64(Some(42));
+/// let msg = format_column_types!("unsupported type", value);
+/// assert_eq!(msg, "unsupported type (value=Int64)");
+/// ```
+macro_rules! format_column_types {
+    ($msg:expr, $first:ident $(, $rest:ident)* $(,)?) => {
+        format!(
+            concat!($msg, " (", stringify!($first), "={}" $(, ", ", stringify!($rest), "={}")*, ")"),
+            $first.data_type() $(, $rest.data_type())*
+        )
+    };
+}
+
+const INTEGRAL_WINDOW_NAME: &str = "integral_window";
+
 #[derive(Debug)]
 pub(super) struct IntegralUDWF {
     signature: Signature,
@@ -60,7 +80,7 @@ impl WindowUDFImpl for IntegralUDWF {
     }
 
     fn name(&self) -> &str {
-        "integral"
+        INTEGRAL_WINDOW_NAME
     }
 
     fn signature(&self) -> &Signature {
@@ -137,61 +157,73 @@ impl PartitionEvaluator for TrapezoidalRulePartitionEvaluator {
         };
 
         // track the `GROUP BY time` window
-        let mut window_edge =
-            // when duration is zero, there is no `GROUP BY time` clause.
-            // set to null and ignore.
-            if duration == ZERO_DURATION {
-                ScalarValue::TimestampNanosecond(None, None)
+        let mut window_start;
+        let mut window_end;
+        // when duration is zero, there is no `GROUP BY time` clause.
+        // set to null and ignore.
+        if duration == ZERO_DURATION {
+            (window_start, window_end) = (
+                ScalarValue::TimestampNanosecond(None, None),
+                ScalarValue::TimestampNanosecond(None, None),
+            );
+        }
+        // otherwise calculate the first window bounds
+        else {
+            let window_bounds =
+                calc_window(&ScalarValue::try_from_array(&times, 0)?, &duration, &offset)?;
+            if ascending {
+                (window_start, window_end) = window_bounds;
+            } else {
+                (window_end, window_start) = window_bounds;
             }
-            // otherwise calculate the first window bounds
-            else {
-                let (window_start, window_end) =
-                    calc_window(&ScalarValue::try_from_array(&times, 0)?, &duration, &offset)?;
-                if ascending { window_end } else { window_start }
-            };
+        }
 
         // calculate all subsequent values
         for idx in 1..array.len() {
             let value = ScalarValue::try_from_array(&array, idx)?;
             let time = ScalarValue::try_from_array(&times, idx)?;
+
             // ignore null values and pass through to output
             if value.is_null() {
                 areas.push(ScalarValue::Float64(None));
                 continue;
             }
             // if timestamp is the same as last value, skip.
-            // we emit a zero to satisfy the DataFusion RecordBatch size invariant
+            // we emit a null to satisfy the DataFusion RecordBatch size invariant
             if last_time == time {
                 last_value = value.clone();
-                last_idx = idx;
-                areas.push(ScalarValue::Float64(Some(0.0)));
+                areas.push(ScalarValue::Float64(None));
                 continue;
             }
             // handle window boundary of `group by time`
             if duration != ZERO_DURATION
                 && (if ascending {
-                    time >= window_edge
+                    time >= window_end
                 } else {
-                    time <= window_edge
+                    time <= window_end
                 })
             {
                 // if the previous point is not on the window boundary, interpolate the area at the end
                 // of the window and add it to the area of the previous non-null point
-                if last_time != window_edge {
+                if last_time != window_end {
                     let value =
-                        calc_linear(&window_edge, (&last_value, &last_time), (&value, &time))?;
+                        calc_linear(&window_end, (&last_value, &last_time), (&value, &time))?;
                     areas[last_idx] = areas[last_idx].add(ScalarValue::Float64(Some(
                         0.5 * sum_values(&value, &last_value)?
-                            * delta_time(&window_edge, &last_time, &unit)?,
+                            * delta_time(&window_end, &last_time, &unit)?,
                     )))?;
                     // save end of this window as previous point, so that the first point of the
                     // new window will interpolate from the window boundary
+                    last_time = window_end.clone();
                     last_value = value.clone();
-                    last_time = window_edge.clone();
                 }
                 // calculate the next window
-                let (window_start, window_end) = calc_window(&time, &duration, &offset)?;
-                window_edge = if ascending { window_end } else { window_start };
+                let window_bounds = calc_window(&time, &duration, &offset)?;
+                if ascending {
+                    (window_start, window_end) = window_bounds;
+                } else {
+                    (window_end, window_start) = window_bounds;
+                };
             }
             //normal operation: calculate area and emit to output
             areas.push(ScalarValue::Float64(Some(
@@ -200,6 +232,10 @@ impl PartitionEvaluator for TrapezoidalRulePartitionEvaluator {
             last_value = value.clone();
             last_time = time.clone();
             last_idx = idx;
+        }
+        // if the last point is at the start time, we skip it because there is no area.
+        if last_time == window_start {
+            areas[last_idx] = ScalarValue::Float64(None);
         }
         Ok(Arc::new(ScalarValue::iter_to_array(areas)?))
     }
@@ -228,19 +264,36 @@ fn calc_linear(
             ScalarValue::TimestampNanosecond(Some(prev_time), _),
             ScalarValue::TimestampNanosecond(Some(next_time), _),
         ) => (window_time, prev_time, next_time),
-        _ => return error::internal("unsupported time type for integral"),
+        _ => {
+            return error::internal(format_column_types!(
+                "unsupported time type for integral",
+                time,
+                prev_time,
+                next_time
+            ));
+        }
     };
     let prev_value = match prev_value {
         ScalarValue::Float64(Some(val)) => *val,
         ScalarValue::Int64(Some(val)) => *val as f64,
         ScalarValue::UInt64(Some(val)) => *val as f64,
-        _ => return error::internal("integral attempted on unsupported values"),
+        _ => {
+            return error::internal(format_column_types!(
+                "integral attempted on unsupported values",
+                prev_value
+            ));
+        }
     };
     let next_value = match next_value {
         ScalarValue::Float64(Some(val)) => *val,
         ScalarValue::Int64(Some(val)) => *val as f64,
         ScalarValue::UInt64(Some(val)) => *val as f64,
-        _ => return error::internal("integral attempted on unsupported values"),
+        _ => {
+            return error::internal(format_column_types!(
+                "integral attempted on unsupported values",
+                next_value
+            ));
+        }
     };
     // compute y = mx + b
     let m = (next_value - prev_value) / ((next_time - prev_time) as f64);
@@ -258,13 +311,22 @@ fn calc_window(
     offset: &ScalarValue,
 ) -> Result<(ScalarValue, ScalarValue)> {
     let ScalarValue::TimestampNanosecond(Some(time), tz) = time else {
-        return error::internal("unsupported time type for integral window calculation");
+        return error::internal(format_column_types!(
+            "unsupported time type for integral window calculation",
+            time
+        ));
     };
     let ScalarValue::DurationNanosecond(Some(offset)) = offset else {
-        return error::internal("unsupported offset type for integral window calculation");
+        return error::internal(format_column_types!(
+            "unsupported offset type for integral window calculation",
+            offset
+        ));
     };
     let ScalarValue::DurationNanosecond(Some(duration)) = duration else {
-        return error::internal("unsupported offset type for integral window calculation");
+        return error::internal(format_column_types!(
+            "unsupported duration type for integral window calculation",
+            duration
+        ));
     };
     // subtract the offset to the time so we calculate the correct base interval
     let time = time - offset;
@@ -286,11 +348,49 @@ fn calc_window(
 
 /// Computes a sum of two numeric [ScalarValue]s as 64-bit floating point numbers.
 fn sum_values(value: &ScalarValue, last_value: &ScalarValue) -> Result<f64> {
-    match value
-        .cast_to(&DataType::Float64)?
-        .add(last_value.cast_to(&DataType::Float64)?)?
-    {
-        ScalarValue::Float64(Some(val)) => Ok(val),
-        _ => error::internal("integral sum expected to be a float"),
+    let value = match value {
+        ScalarValue::Float64(Some(val)) => *val,
+        ScalarValue::Int64(Some(val)) => *val as f64,
+        ScalarValue::UInt64(Some(val)) => *val as f64,
+        _ => {
+            return error::internal(format_column_types!(
+                "integral attempted on unsupported values",
+                value
+            ));
+        }
+    };
+    let last_value = match last_value {
+        ScalarValue::Float64(Some(val)) => *val,
+        ScalarValue::Int64(Some(val)) => *val as f64,
+        ScalarValue::UInt64(Some(val)) => *val as f64,
+        _ => {
+            return error::internal(format_column_types!(
+                "integral attempted on unsupported values",
+                last_value
+            ));
+        }
+    };
+    Ok(value + last_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::ScalarValue;
+
+    #[test]
+    fn test_format_column_types_macro() {
+        // Test with one variable
+        let value = ScalarValue::Int64(Some(42));
+        let msg1 = format_column_types!("unsupported type", value);
+        assert_eq!(msg1, "unsupported type (value=Int64)");
+
+        // Test with two variables
+        let prev_value = ScalarValue::Float64(Some(3.5));
+        let msg2 = format_column_types!("unsupported types", value, prev_value);
+        assert_eq!(msg2, "unsupported types (value=Int64, prev_value=Float64)");
+
+        // Test with trailing comma
+        let msg3 = format_column_types!("unsupported types", value, prev_value,);
+        assert_eq!(msg3, "unsupported types (value=Int64, prev_value=Float64)");
     }
 }

@@ -610,6 +610,10 @@ pub struct Partition {
     /// The time at which this partition was created, or `None` if this partition was created before
     /// this field existed.
     created_at: Option<Timestamp>,
+
+    /// The maximum time of data that can exist in this partition based on the partition template.
+    /// This is calculated when the partition is created and used for efficient retention queries.
+    pub max_time: Option<i64>,
 }
 
 impl Partition {
@@ -627,6 +631,7 @@ impl Partition {
         new_file_at: Option<Timestamp>,
         cold_compact_at: Option<Timestamp>,
         created_at: Option<Timestamp>,
+        max_time: Option<i64>,
     ) -> Self {
         Self {
             id,
@@ -637,6 +642,7 @@ impl Partition {
             new_file_at,
             cold_compact_at,
             created_at,
+            max_time,
         }
     }
 

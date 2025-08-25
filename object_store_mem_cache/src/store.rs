@@ -126,7 +126,7 @@ impl MemCacheObjectStoreParams<'_> {
             s3_fifo_ghost_memory_limit,
         } = self;
 
-        let cache = Arc::new(S3FifoCache::new(
+        let cache = Arc::new(S3FifoCache::<_, _, ()>::new(
             S3Config {
                 max_memory_size: memory_limit.get(),
                 max_ghost_memory_size: s3_fifo_ghost_memory_limit.get(),
@@ -152,7 +152,7 @@ impl MemCacheObjectStoreParams<'_> {
 pub struct MemCacheObjectStore {
     store: Arc<DynObjectStore>,
     hit_metrics: HitMetrics,
-    cache: Arc<dyn Cache<Path, Arc<CacheValue>>>,
+    cache: Arc<dyn Cache<Path, Arc<CacheValue>, ()>>,
 }
 
 impl MemCacheObjectStore {
@@ -163,21 +163,20 @@ impl MemCacheObjectStore {
     ) -> Result<(Arc<CacheValue>, CacheState)> {
         let captured_store = Arc::clone(&self.store);
         let captured_location = Arc::new(location.clone());
-        let (res, state) = self
-            .cache
-            .get_or_fetch(
-                &Arc::clone(&captured_location),
-                Box::new(move || {
-                    async move {
-                        CacheValue::fetch(&captured_store, &captured_location, size_hint)
-                            .await
-                            .map_err(|e| Arc::new(e) as _)
-                            .map(Arc::new)
-                    }
-                    .boxed()
-                }),
-            )
-            .await;
+        let (res, _, state) = self.cache.get_or_fetch(
+            &Arc::clone(&captured_location),
+            Box::new(move || {
+                async move {
+                    CacheValue::fetch(&captured_store, &captured_location, size_hint)
+                        .await
+                        .map_err(|e| Arc::new(e) as _)
+                        .map(Arc::new)
+                }
+                .boxed()
+            }),
+            (),
+        );
+        let res = res.await;
 
         match state {
             CacheState::WasCached => &self.hit_metrics.cached,

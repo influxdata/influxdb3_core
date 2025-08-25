@@ -114,16 +114,31 @@ where
 type CacheFn<V> = Box<dyn FnOnce() -> BoxFuture<'static, CacheRequestResult<V>> + Send>;
 
 #[async_trait]
-pub trait Cache<K, V>: Send + Sync + Debug
+pub trait Cache<K, V, D>: Send + Sync + Debug
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
     V: Clone + HasSize + Send + Sync + 'static,
+    D: Clone + Send + Sync + 'static,
 {
     /// Get an existing key or start a new fetch process.
     ///
     /// Fetching is driven by a background tokio task and will make progress even when you do not poll the resulting
     /// future.
-    async fn get_or_fetch(&self, k: &K, f: CacheFn<V>) -> (CacheRequestResult<V>, CacheState);
+    ///
+    /// Returns a future that resolves to the value [`CacheRequestResult<V>`].
+    /// If data is loading, provides early access data (`D`).
+    ///
+    /// The early access data (`D`) may be used by metrics, logging, or other purposes.
+    fn get_or_fetch(
+        &self,
+        k: &K,
+        f: CacheFn<V>,
+        d: D,
+    ) -> (
+        BoxFuture<'static, CacheRequestResult<V>>,
+        Option<D>,
+        CacheState,
+    );
 
     /// Get the cached value and return `None` if was not cached.
     ///
