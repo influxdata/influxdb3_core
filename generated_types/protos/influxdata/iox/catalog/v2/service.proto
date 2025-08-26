@@ -29,7 +29,12 @@ service CatalogService {
   rpc NamespaceDeleteOld(NamespaceDeleteOldRequest) returns (NamespaceDeleteOldResponse);
 
   rpc TableCreate(TableCreateRequest) returns (TableCreateResponse);
-  rpc TableGetById(TableGetByIdRequest) returns (TableGetByIdResponse);
+  rpc TableGetByIdAndNamespace(TableGetByIdAndNamespaceRequest) returns (TableGetByIdAndNamespaceResponse);
+  // Returns a table record regardless of its soft-deleted status. Essentially deprecated in favor
+  // of `TableGetByIdAndNamespace`.
+  rpc TableGetById(TableGetByIdRequest) returns (TableGetByIdResponse) {
+    option deprecated = true;
+  };
   rpc TableGetByNamespaceAndName(TableGetByNamespaceAndNameRequest) returns (TableGetByNamespaceAndNameResponse);
   rpc TableListByNamespaceId(TableListByNamespaceIdRequest) returns (stream TableListByNamespaceIdResponse);
   rpc TableList(TableListRequest) returns (stream TableListResponse);
@@ -48,12 +53,14 @@ service CatalogService {
   rpc ColumnList(ColumnListRequest) returns (stream ColumnListResponse);
 
   rpc PartitionCreateOrGet(PartitionCreateOrGetRequest) returns (PartitionCreateOrGetResponse);
+  rpc PartitionCreateOrGetBatch(PartitionCreateOrGetBatchRequest) returns (stream PartitionCreateOrGetBatchResponse);
   rpc PartitionGetByIdBatch(PartitionGetByIdBatchRequest) returns (stream PartitionGetByIdBatchResponse);
   rpc PartitionListByTableId(PartitionListByTableIdRequest) returns (stream PartitionListByTableIdResponse);
   rpc PartitionListIds(PartitionListIdsRequest) returns (stream PartitionListIdsResponse);
   rpc PartitionCasSortKey(PartitionCasSortKeyRequest) returns (PartitionCasSortKeyResponse);
   rpc PartitionRecordSkippedCompaction(PartitionRecordSkippedCompactionRequest) returns (PartitionRecordSkippedCompactionResponse);
   rpc PartitionGetInSkippedCompactions(PartitionGetInSkippedCompactionsRequest) returns (stream PartitionGetInSkippedCompactionsResponse);
+  rpc PartitionGetInSkippedCompactionsV2(stream PartitionGetInSkippedCompactionsV2Request) returns (stream PartitionGetInSkippedCompactionsV2Response);
   rpc PartitionListSkippedCompactions(PartitionListSkippedCompactionsRequest) returns (stream PartitionListSkippedCompactionsResponse);
   rpc PartitionDeleteSkippedCompactions(PartitionDeleteSkippedCompactionsRequest) returns (PartitionDeleteSkippedCompactionsResponse);
   rpc PartitionMostRecentN(PartitionMostRecentNRequest) returns (stream PartitionMostRecentNResponse);
@@ -64,6 +71,15 @@ service CatalogService {
   rpc PartitionDeleteByRetention(PartitionDeleteByRetentionRequest) returns (stream PartitionDeleteByRetentionResponse);
   rpc PartitionSnapshot(PartitionSnapshotRequest) returns (PartitionSnapshotResponse);
   rpc PartitionMigrate(PartitionMigrateRequest) returns (PartitionMigrateResponse);
+
+  // Partition retention methods
+  rpc PartitionRetentionUpsert(PartitionRetentionUpsertRequest) returns (PartitionRetentionUpsertResponse);
+  rpc PartitionRetentionGetByPartitionId(PartitionRetentionGetByPartitionIdRequest) returns (PartitionRetentionGetByPartitionIdResponse);
+  rpc PartitionRetentionListPartitionsNeedingComputation(PartitionRetentionListPartitionsNeedingComputationRequest) returns (stream PartitionRetentionListPartitionsNeedingComputationResponse);
+  rpc PartitionRetentionReconcileMissingPartitions(PartitionRetentionReconcileMissingPartitionsRequest) returns (PartitionRetentionReconcileMissingPartitionsResponse);
+  rpc PartitionRetentionListPartitionsForParquetRetention(PartitionRetentionListPartitionsForParquetRetentionRequest) returns (stream PartitionRetentionListPartitionsForParquetRetentionResponse);
+  rpc PartitionRetentionListPartitionsForPartitionRetention(PartitionRetentionListPartitionsForPartitionRetentionRequest) returns (stream PartitionRetentionListPartitionsForPartitionRetentionResponse);
+  rpc PartitionRetentionInvalidateByNamespaceId(PartitionRetentionInvalidateByNamespaceIdRequest) returns (PartitionRetentionInvalidateByNamespaceIdResponse);
 
   rpc ParquetFileFlagForDeleteByRetention(ParquetFileFlagForDeleteByRetentionRequest) returns (stream ParquetFileFlagForDeleteByRetentionResponse);
   rpc ParquetFileDeleteOldIdsOnly(ParquetFileDeleteOldIdsOnlyRequest) returns (stream ParquetFileDeleteOldIdsOnlyResponse);
@@ -265,6 +281,16 @@ message TableCreateResponse {
   Table table = 1;
 }
 
+message TableGetByIdAndNamespaceRequest {
+  int64 table_id = 1;
+  int64 namespace_id = 2;
+  SoftDeletedRows deleted = 3;
+}
+
+message TableGetByIdAndNamespaceResponse {
+  Table table = 1;
+}
+
 message TableGetByIdRequest {
   int64 id = 1;
 }
@@ -334,6 +360,7 @@ message TableSoftDeleteRequest {
 
 message TableSoftDeleteResponse {
   Table table = 1;
+  int64 router_version = 2;
 }
 
 message TableRenameRequest {
@@ -343,6 +370,7 @@ message TableRenameRequest {
 
 message TableRenameResponse {
   Table table = 1;
+  int64 router_version = 2;
 }
 
 message TableUndeleteRequest {
@@ -351,6 +379,7 @@ message TableUndeleteRequest {
 
 message TableUndeleteResponse {
   Table table = 1;
+  int64 router_version = 2;
 }
 
 message ColumnCreateOrGetRequest {
@@ -402,6 +431,15 @@ message PartitionCreateOrGetRequest {
 }
 
 message PartitionCreateOrGetResponse {
+  Partition partition = 1;
+}
+
+message PartitionCreateOrGetBatchRequest {
+  repeated string keys = 1;
+  int64 table_id = 2;
+}
+
+message PartitionCreateOrGetBatchResponse {
   Partition partition = 1;
 }
 
@@ -464,7 +502,15 @@ message PartitionGetInSkippedCompactionsRequest {
   repeated int64 partition_ids = 1;
 }
 
+message PartitionGetInSkippedCompactionsV2Request {
+  int64 partition_id = 1;
+}
+
 message PartitionGetInSkippedCompactionsResponse {
+  SkippedCompaction skipped_compaction = 1;
+}
+
+message PartitionGetInSkippedCompactionsV2Response {
   SkippedCompaction skipped_compaction = 1;
 }
 
@@ -735,6 +781,7 @@ message Partition {
   optional int64 new_file_at = 6;
   optional int64 cold_compact_at = 7;
   optional int64 created_at = 8;
+  optional int64 max_time = 9;
 }
 
 message SkippedCompaction {
@@ -809,4 +856,75 @@ message ParquetFile {
   ColumnSet column_set = 13;
   int64 max_l0_created_at = 14;
   ParquetFileSource source = 17;
+}
+
+// Partition retention messages
+message PartitionRetention {
+  int64 partition_id = 1;
+  int64 namespace_id = 2;
+  optional int64 retention_period_ns = 3;
+  optional int64 retention_start_time_ns = 4;
+  optional int64 retention_end_time_ns = 5;
+}
+
+message PartitionRetentionUpsertRequest {
+  int64 partition_id = 1;
+  int64 namespace_id = 2;
+  optional int64 retention_period_ns = 3;
+  optional int64 retention_start_time_ns = 4;
+  optional int64 retention_end_time_ns = 5;
+}
+
+message PartitionRetentionUpsertResponse {
+  PartitionRetention partition_retention = 1;
+}
+
+message PartitionRetentionGetByPartitionIdRequest {
+  int64 partition_id = 1;
+}
+
+message PartitionRetentionGetByPartitionIdResponse {
+  optional PartitionRetention partition_retention = 1;
+}
+
+message PartitionRetentionListPartitionsNeedingComputationRequest {
+  int32 limit = 1;
+}
+
+message PartitionRetentionListPartitionsNeedingComputationResponse {
+  int64 partition_id = 1;
+}
+
+message PartitionRetentionReconcileMissingPartitionsRequest {
+  // Empty - no parameters needed
+}
+
+message PartitionRetentionReconcileMissingPartitionsResponse {
+  int32 reconciled_count = 1;
+}
+
+message PartitionRetentionListPartitionsForParquetRetentionRequest {
+  int64 cutoff_time_ns = 1;
+  int32 limit = 2;
+}
+
+message PartitionRetentionListPartitionsForParquetRetentionResponse {
+  int64 partition_id = 1;
+}
+
+message PartitionRetentionListPartitionsForPartitionRetentionRequest {
+  int64 cutoff_time_ns = 1;
+  int32 limit = 2;
+}
+
+message PartitionRetentionListPartitionsForPartitionRetentionResponse {
+  int64 partition_id = 1;
+}
+
+message PartitionRetentionInvalidateByNamespaceIdRequest {
+  int64 namespace_id = 1;
+}
+
+message PartitionRetentionInvalidateByNamespaceIdResponse {
+  int32 invalidated_count = 1;
 }

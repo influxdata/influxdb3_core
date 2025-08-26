@@ -257,7 +257,7 @@ static NON_NEGATIVE_DIFFERENCE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     }))
 });
 
-const INTEGRAL_UDF_NAME: &str = "integral";
+pub(crate) const INTEGRAL_UDF_NAME: &str = "integral";
 
 #[derive(Debug)]
 struct IntegralUDF {

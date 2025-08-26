@@ -1,6 +1,6 @@
 //! IOx FlightSQL Command structures
 
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashMap, fmt::Display, slice};
 
 use arrow::{
     array::RecordBatch,
@@ -143,7 +143,7 @@ impl Display for PreparedStatementHandle {
             write!(
                 f,
                 ",{}",
-                pretty_format_batches(&[batch.clone()]).map_err(|_| std::fmt::Error)?
+                pretty_format_batches(slice::from_ref(batch)).map_err(|_| std::fmt::Error)?
             )?
         };
         write!(f, ")")

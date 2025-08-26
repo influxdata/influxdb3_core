@@ -169,34 +169,32 @@ impl MetaIndexCache {
     ) -> Result<Arc<FileMetas>, DynError> {
         let cache_column_stats = self.cache_column_stats;
         let arrow_reader_options = arrow_reader_options.cloned();
-        let (res, _state) = self
-            .file_index
-            .get_or_fetch(
-                file_uuid,
-                Box::new(move || {
-                    async move {
-                        let parquet_metadata = reader
-                            .get_metadata(arrow_reader_options.as_ref())
-                            .await
-                            .map_err(|e| Arc::new(e) as DynError)?;
-                        // get statistics from metadata
-                        let col_metas = cache_column_stats
-                            .then(|| {
-                                statistics_from_parquet_meta_calc(&parquet_metadata, table_schema)
-                                    .map(ColStats::from_statistics)
-                                    .ok()
-                            })
-                            .flatten();
-                        Ok(Arc::new(FileMetas {
-                            col_metas,
-                            parquet_metadata,
-                        }))
-                    }
-                    .boxed()
-                }),
-            )
-            .await;
-        res
+        let (res, _, _state) = self.file_index.get_or_fetch(
+            file_uuid,
+            Box::new(move || {
+                async move {
+                    let parquet_metadata = reader
+                        .get_metadata(arrow_reader_options.as_ref())
+                        .await
+                        .map_err(|e| Arc::new(e) as DynError)?;
+                    // get statistics from metadata
+                    let col_metas = cache_column_stats
+                        .then(|| {
+                            statistics_from_parquet_meta_calc(&parquet_metadata, table_schema)
+                                .map(ColStats::from_statistics)
+                                .ok()
+                        })
+                        .flatten();
+                    Ok(Arc::new(FileMetas {
+                        col_metas,
+                        parquet_metadata,
+                    }))
+                }
+                .boxed()
+            }),
+            (),
+        );
+        res.await
     }
 
     /// return number of cache hits
@@ -714,22 +712,20 @@ mod tests {
         parquet_1: impl Into<Arc<ParquetMetaData>> + Send + 'static,
         file_stats_1: Statistics,
     ) -> Arc<FileMetas> {
-        let (res, _state) = meta_index
-            .file_index
-            .get_or_fetch(
-                file_uuid,
-                Box::new(|| {
-                    async move {
-                        Ok(Arc::new(FileMetas {
-                            parquet_metadata: parquet_1.into(),
-                            col_metas: Some(ColStats::from_statistics(file_stats_1)),
-                        }))
-                    }
-                    .boxed()
-                }),
-            )
-            .await;
-        res.unwrap()
+        let (res, _, _state) = meta_index.file_index.get_or_fetch(
+            file_uuid,
+            Box::new(|| {
+                async move {
+                    Ok(Arc::new(FileMetas {
+                        parquet_metadata: parquet_1.into(),
+                        col_metas: Some(ColStats::from_statistics(file_stats_1)),
+                    }))
+                }
+                .boxed()
+            }),
+            (),
+        );
+        res.await.unwrap()
     }
 
     #[tokio::test]

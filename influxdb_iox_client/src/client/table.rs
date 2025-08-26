@@ -9,6 +9,7 @@ use ::generated_types::influxdata::iox::Target;
 /// Re-export generated_types
 pub mod generated_types {
     pub use generated_types::influxdata::iox::{
+        common::v1::SoftDeleted,
         partition_template::v1::{template_part::*, *},
         table::v1::*,
     };
@@ -32,11 +33,15 @@ impl Client {
     pub async fn get_tables(
         &mut self,
         namespace: impl Into<Target> + Send,
+        filters: Option<impl IntoIterator<Item = TableStatusFilter>>,
     ) -> Result<Vec<Table>, Error> {
         Ok(self
             .inner
             .get_tables(GetTablesRequest {
                 target: Some(namespace.into().into()),
+                filters: filters.map(|filters| TableStatusFilterList {
+                    inner: filters.into_iter().map(|f| f as i32).collect(),
+                }),
             })
             .await?
             .into_inner()
@@ -81,10 +86,17 @@ impl Client {
     }
 
     /// Soft delete a table
-    pub async fn soft_delete_table(&mut self, table_id: i64) -> Result<Table, Error> {
+    pub async fn soft_delete_table(
+        &mut self,
+        table_id: i64,
+        namespace_id: i64,
+    ) -> Result<Table, Error> {
         let response = self
             .inner
-            .delete_table(DeleteTableRequest { table_id })
+            .delete_table(DeleteTableRequest {
+                table_id,
+                namespace_id,
+            })
             .await?;
 
         Ok(response.into_inner().table.unwrap_field("table")?)

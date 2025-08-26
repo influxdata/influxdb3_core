@@ -147,6 +147,17 @@ impl DurationHistogramOptions {
     pub fn new(thresholds: impl IntoIterator<Item = Duration>) -> Self {
         let mut buckets: Vec<_> = thresholds.into_iter().collect();
         buckets.sort_unstable();
+        buckets.windows(2).for_each(|window| {
+            let (lower, upper) = (window[0], window[1]);
+            assert!(lower != upper, "thresholds must be unique");
+        });
+        assert!(
+            buckets
+                .last()
+                .map(|last| last == &DURATION_MAX)
+                .unwrap_or_default(),
+            "last bucket must be DURATION_MAX (not the same as Duration::MAX!)",
+        );
         Self { buckets }
     }
 }
@@ -263,8 +274,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot fit duration into u64: TryFromIntError(())")]
+    #[should_panic(expected = "last bucket must be DURATION_MAX")]
     fn test_bucket_overflow() {
+        // Duration::MAX is larger than DURATION_MAX
         let options = DurationHistogramOptions::new([Duration::MAX]);
         DurationHistogram::create(&options);
     }
@@ -327,5 +339,44 @@ mod tests {
                 Duration::from_millis(20) - Duration::from_nanos(1)
             )
         );
+    }
+
+    #[test]
+    fn test_histogram_option_sorts_input() {
+        let options = DurationHistogramOptions::new([
+            DURATION_MAX,
+            Duration::from_nanos(1),
+            Duration::from_nanos(3),
+        ]);
+        assert_eq!(
+            options.buckets,
+            &[
+                Duration::from_nanos(1),
+                Duration::from_nanos(3),
+                DURATION_MAX,
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "thresholds must be unique")]
+    fn test_histogram_option_panic_with_duplicates() {
+        DurationHistogramOptions::new([
+            Duration::from_nanos(1),
+            DURATION_MAX,
+            Duration::from_nanos(1),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "last bucket must be DURATION_MAX")]
+    fn test_histogram_option_panic_empty() {
+        DurationHistogramOptions::new(std::iter::empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "last bucket must be DURATION_MAX")]
+    fn test_histogram_option_panic_no_duration_max() {
+        DurationHistogramOptions::new([Duration::from_nanos(1), Duration::from_nanos(3)]);
     }
 }

@@ -1,11 +1,13 @@
 //! Snapshot definition for partitions
 
-use crate::snapshot::list::MessageList;
-use crate::snapshot::mask::{BitMask, BitMaskBuilder};
 use crate::{
     ColumnId, ColumnSet, CompactionLevelProtoError, NamespaceId, ObjectStoreId, ParquetFile,
     ParquetFileId, ParquetFileSource, Partition, PartitionHashId, PartitionHashIdError,
     PartitionId, PartitionKey, SkippedCompaction, SortKeyIds, TableId, Timestamp,
+    snapshot::{
+        list::{GetId, MessageList, SortedById},
+        mask::{BitMask, BitMaskBuilder},
+    },
 };
 use bytes::Bytes;
 use generated_types::influxdata::iox::{
@@ -42,6 +44,12 @@ pub enum Error {
 
 /// Result for [`PartitionSnapshot`]
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl GetId for proto::PartitionFile {
+    fn id(&self) -> i64 {
+        self.id
+    }
+}
 
 /// A snapshot of a partition
 ///
@@ -94,7 +102,7 @@ impl PartitionSnapshot {
             acc
         });
 
-        let files = files
+        let files: SortedById<_> = files
             .into_iter()
             .map(|file| {
                 let mut mask = BitMaskBuilder::new(columns.len());
@@ -117,7 +125,7 @@ impl PartitionSnapshot {
                     use_numeric_partition_id: Some(file.partition_hash_id.is_none()),
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         Ok(Self {
             generation,
@@ -126,7 +134,7 @@ impl PartitionSnapshot {
             partition_id: partition.id,
             partition_hash_id: partition.hash_id().cloned(),
             key: partition.partition_key.as_bytes().to_vec().into(),
-            files: MessageList::encode(&files).context(FileEncodeSnafu)?,
+            files: MessageList::encode(files).context(FileEncodeSnafu)?,
             sort_key: partition.sort_key_ids().cloned().unwrap_or_default(),
             table_id: partition.table_id,
             new_file_at: partition.new_file_at,
@@ -248,6 +256,7 @@ impl PartitionSnapshot {
             self.new_file_at,
             self.cold_compact_at,
             self.created_at,
+            None, // max_time - not stored in snapshot (can be computed from partition key)
         ))
     }
 
@@ -333,6 +342,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 Default::default(),
+                None, // max_time
             );
             // Create associated Parquet files:
             let parquet_files = vec![
@@ -409,13 +419,13 @@ mod tests {
             use_numeric_partition_id: Some(true),
             ..parquet_file_missing_new_numeric_id_field_proto.clone()
         };
-
-        let files = MessageList::encode(&[
+        let parquet_files = SortedById::new(vec![
             parquet_file_missing_new_numeric_id_field_proto,
             parquet_file_new_numeric_id_field_false_proto,
             parquet_file_new_numeric_id_field_true_proto,
-        ])
-        .unwrap();
+        ]);
+
+        let files = MessageList::encode(parquet_files).unwrap();
         let files_proto: proto::MessageList = files.into();
 
         // Create cached proto for two different Partitions:

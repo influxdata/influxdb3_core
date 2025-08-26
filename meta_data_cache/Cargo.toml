@@ -22,7 +22,7 @@ futures = { version = "0.3.31" }
 [dev-dependencies]
 arrow_util = { path = "../arrow_util" }
 bytes = "1.10"
-tokio = { version = "1.47.0", default-features = false }
+tokio = { version = "1.47.1", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 
 [lints]

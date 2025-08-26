@@ -1,7 +1,7 @@
 //! Implemention of DeduplicateExec operator (resolves primary key conflicts) plumbing and tests
 mod algo;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, slice};
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use arrow::{error::ArrowError, record_batch::RecordBatch};
@@ -189,7 +189,7 @@ impl DeduplicateExec {
     ) -> PlanProperties {
         trace!("Deduplicate output ordering: {:?}", sort_keys);
         let eq_properties =
-            EquivalenceProperties::new_with_orderings(input.schema(), &[sort_keys.clone()]);
+            EquivalenceProperties::new_with_orderings(input.schema(), slice::from_ref(sort_keys));
 
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
@@ -416,7 +416,7 @@ mod test {
     use arrow::array::{DictionaryArray, Int64Array};
     use arrow_util::display::pretty_format_batches;
     use schema::TIME_DATA_TIMEZONE;
-    use std::iter::FromIterator;
+    use std::{iter::FromIterator, slice};
 
     #[tokio::test]
     async fn test_single_tag() {
@@ -921,7 +921,7 @@ mod test {
             "|    |    | 1.0 |",
             "+----+----+-----+",
         ];
-        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+        assert_batches_eq!(&expected_input_batch, slice::from_ref(&b1));
 
         // sort on t1, t2
         let sort_keys = vec![
@@ -1084,7 +1084,7 @@ mod test {
             "| b  |    | 1.0 |",
             "+----+----+-----+",
         ];
-        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+        assert_batches_eq!(&expected_input_batch, slice::from_ref(&b1));
 
         // sort on t1, t2
         let sort_keys = vec![
@@ -1251,7 +1251,7 @@ mod test {
             "| b  | a  | 1.0 |",
             "+----+----+-----+",
         ];
-        assert_batches_eq!(&expected_input_batch, &[b1.clone()]);
+        assert_batches_eq!(&expected_input_batch, slice::from_ref(&b1));
 
         // sort on t1, t2
         let sort_keys = vec![

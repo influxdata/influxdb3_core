@@ -215,6 +215,11 @@ impl PushGatewayClient {
         format!("{}/metrics/job/{}", self.address, self.job_name)
     }
 
+    /// Get the address of the PushGateway server.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
     /// Push the metrics stored in the internal [`Registry`] to the configured server.
     pub async fn push_metrics(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut buf = Vec::new();
@@ -282,7 +287,7 @@ mod tests {
 
         let histogram: Metric<U64Histogram> =
             registry.register_metric_with_options("bar", "a histogram metric", || {
-                U64HistogramOptions::new([5, 10, 50])
+                U64HistogramOptions::new([5, 10, 50, u64::MAX])
             });
 
         let histogram_r1 = histogram.recorder(&[("tag1", "value1")]);
@@ -324,13 +329,13 @@ mod tests {
 bar_bucket{tag1="value1",le="5"} 1
 bar_bucket{tag1="value1",le="10"} 2
 bar_bucket{tag1="value1",le="50"} 3
-bar_bucket{tag1="value1",le="+Inf"} 3
+bar_bucket{tag1="value1",le="inf"} 3
 bar_sum{tag1="value1"} 53
 bar_count{tag1="value1"} 3
 bar_bucket{tag1="value2",le="5"} 0
 bar_bucket{tag1="value2",le="10"} 1
 bar_bucket{tag1="value2",le="50"} 2
-bar_bucket{tag1="value2",le="+Inf"} 2
+bar_bucket{tag1="value2",le="inf"} 2
 bar_sum{tag1="value2"} 48
 bar_count{tag1="value2"} 2
 # HELP duration_counter_seconds_total a duration counter

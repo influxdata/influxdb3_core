@@ -29,7 +29,7 @@ datafusion_util = { path = "../datafusion_util" }
 executor = { path = "../executor" }
 futures = "0.3"
 hashbrown = { workspace = true }
-indexmap = { version = "2.10", features = ["std"] }
+indexmap = { version = "2.11", features = ["std"] }
 influxdb-line-protocol = { path = "../influxdb_line_protocol" }
 itertools = "0.13.0"
 iox_query_params = { path = "../iox_query_params" }

@@ -152,7 +152,6 @@ pub struct InstrumentedRawLock<R: Sized> {
 unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for InstrumentedRawLock<R> {
     // A “non-constant” const item is a legacy way to supply an initialized value to downstream
     // static items. Can hopefully be replaced with `const fn new() -> Self` at some point.
-    #[expect(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self {
         inner: R::INIT,
         metrics: None,
@@ -328,7 +327,6 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
 unsafe impl<R: lock_api::RawMutex + Sized> lock_api::RawMutex for InstrumentedRawLock<R> {
     // A “non-constant” const item is a legacy way to supply an initialized value to downstream
     // static items. Can hopefully be replaced with `const fn new() -> Self` at some point.
-    #[expect(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self {
         inner: R::INIT,
         metrics: None,

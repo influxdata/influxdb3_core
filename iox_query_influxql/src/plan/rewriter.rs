@@ -162,7 +162,6 @@ impl RewriteSelect {
         let SelectStatementInfo {
             projection_type,
             extra_intervals,
-            has_integral,
         } = select_statement_info(&fields, &group_by, stmt.fill)
             .map_err(|e| e.context("gather information about select statement"))?;
 
@@ -194,7 +193,6 @@ impl RewriteSelect {
             limit: stmt.limit,
             offset: stmt.offset,
             timezone: stmt.timezone.map(|v| *v),
-            has_integral,
         })
     }
 
@@ -279,14 +277,12 @@ impl RewriteSelect {
         let (fields, mut group_by) = if has_field_wildcard || has_group_by_wildcard {
             let (field_set, mut tag_set) = from_field_and_dimensions(s, from)?;
 
-            if !has_group_by_wildcard {
-                if let Some(group_by) = &stmt.group_by {
-                    // Remove any explicitly listed tags in the GROUP BY clause, so they are not
-                    // expanded by any wildcards specified in the SELECT projection list
-                    group_by.tag_names().for_each(|ident| {
-                        tag_set.remove(ident.as_str());
-                    });
-                }
+            if !has_group_by_wildcard && let Some(group_by) = &stmt.group_by {
+                // Remove any explicitly listed tags in the GROUP BY clause, so they are not
+                // expanded by any wildcards specified in the SELECT projection list
+                group_by.tag_names().for_each(|ident| {
+                    tag_set.remove(ident.as_str());
+                });
             }
 
             let fields = if has_field_wildcard {
@@ -987,9 +983,6 @@ struct FieldChecker {
     /// `true` when the projection contains a `DISTINCT` function or unary `DISTINCT` operator.
     has_distinct: bool,
 
-    /// `true` when the projection contains an `INTEGRAL` function.
-    has_integral: bool,
-
     /// Accumulator for the number of aggregate or window expressions for the statement.
     aggregate_count: usize,
 
@@ -1101,7 +1094,6 @@ impl FieldChecker {
         Ok(SelectStatementInfo {
             projection_type,
             extra_intervals: self.extra_intervals,
-            has_integral: self.has_integral,
         })
     }
 
@@ -1484,7 +1476,6 @@ impl FieldChecker {
 
     fn check_integral(&mut self, name: &str, args: &[Expr]) -> Result<()> {
         self.inc_aggregate_count();
-        self.has_integral = true;
         check_exp_args!(name, 1, 2, args);
 
         self.check_duration(name, args, 1)?;
@@ -1626,8 +1617,6 @@ struct SelectStatementInfo {
     ///
     /// [See also](Select::extra_intervals).
     extra_intervals: usize,
-    /// `true` when the projection contains an `INTEGRAL` function.
-    has_integral: bool,
 }
 
 /// Gather information about the semantics of a [`SelectStatement`] and verify

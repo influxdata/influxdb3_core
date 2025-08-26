@@ -367,6 +367,8 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use ::test_helpers::assert_error;
     use arrow_util::assert_batches_eq;
@@ -504,7 +506,7 @@ m f1=10i 1639612800000000000
                 "|     | 10 | 2021-12-16T00:00:00Z |",
                 "+-----+----+----------------------+",
             ],
-            &[batch.clone()]
+            slice::from_ref(&batch)
         );
 
         // Verify the nullness of the string column ("" not the same as null)
@@ -542,7 +544,7 @@ m b=t 1639612800000000000
                 "| true |   | 2021-12-16T00:00:00Z |   |",
                 "+------+---+----------------------+---+",
             ],
-            &[batch.clone()]
+            slice::from_ref(&batch)
         );
 
         // Verify the nullness of the int column

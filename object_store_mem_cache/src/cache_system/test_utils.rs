@@ -52,7 +52,7 @@ pub(crate) async fn test_happy_path(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
-    let mut fut = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut, _, state) = cache.get_or_fetch(
         &k1,
         Box::new(move || {
             async move {
@@ -60,12 +60,13 @@ pub(crate) async fn test_happy_path(setup: TestSetup) {
                 Ok(Arc::new(TestValue(test_size)))
             }
             .boxed()
-        })
-    ));
+        }),
+        (),
+    );
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let ((res, state), _) = tokio::join!(fut, barrier.wait());
+    let (res, _) = tokio::join!(fut, barrier.wait());
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
@@ -92,7 +93,7 @@ pub(crate) async fn test_panic_loader(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
-    let mut fut = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut, _, state) = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -100,12 +101,13 @@ pub(crate) async fn test_panic_loader(setup: TestSetup) {
                 panic!("foo")
             }
             .boxed()
-        })
-    ));
+        }),
+        (),
+    );
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let ((res, state), _) = tokio::join!(fut, barrier.wait());
+    let (res, _) = tokio::join!(fut, barrier.wait());
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "panic: foo");
 
@@ -128,7 +130,7 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
-    let mut fut = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut, _, state) = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -136,12 +138,13 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup) {
                 Err(str_err("my error"))
             }
             .boxed()
-        })
-    ));
+        }),
+        (),
+    );
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let ((res, state), _) = tokio::join!(fut, barrier.wait());
+    let (res, _) = tokio::join!(fut, barrier.wait());
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "my error");
 
@@ -165,14 +168,13 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
     let test_size_hook = test_size + S3_FIFO_EXTRA_SIZE;
 
     let k1 = Arc::new("k1");
-    let (res, state) = cache
-        .get_or_fetch(
-            &k1,
-            Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
-        )
-        .await;
+    let (fut, _, state) = cache.get_or_fetch(
+        &k1,
+        Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
+        (),
+    );
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
+    assert_eq!(fut.await.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
         vec![
@@ -190,14 +192,13 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
         ]
     );
 
-    let (res, state) = cache
-        .get_or_fetch(
-            &k1,
-            Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
-        )
-        .await;
+    let (fut, _, state) = cache.get_or_fetch(
+        &k1,
+        Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
+        (),
+    );
     assert_eq!(state, CacheState::WasCached);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
+    assert_eq!(fut.await.unwrap(), Arc::new(TestValue(test_size)));
 
     cache.prune();
     assert_eq!(
@@ -219,7 +220,7 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
-    let mut fut_1 = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut_1, _, state_1) = cache.get_or_fetch(
         &k1,
         Box::new(move || {
             async move {
@@ -227,23 +228,25 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
                 Ok(Arc::new(TestValue(test_size_1)))
             }
             .boxed()
-        })
-    ));
+        }),
+        (),
+    );
     fut_1.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let mut fut_2 = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut_2, _, state_2) = cache.get_or_fetch(
         &k1,
-        Box::new(move || { { async move { Ok(Arc::new(TestValue(test_size_2))) } }.boxed() })
-    ));
+        Box::new(move || { async move { Ok(Arc::new(TestValue(test_size_2))) } }.boxed()),
+        (),
+    );
     fut_2.assert_pending().await;
 
-    let (_, (fut_res, state)) = tokio::join!(barrier.wait(), fut_1);
-    assert_eq!(state, CacheState::NewEntry);
+    let (_, fut_res) = tokio::join!(barrier.wait(), fut_1);
+    assert_eq!(state_1, CacheState::NewEntry);
     assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size_1)));
 
-    let (fut_res, state) = fut_2.await;
-    assert_eq!(state, CacheState::AlreadyLoading);
+    let fut_res = fut_2.await;
+    assert_eq!(state_2, CacheState::AlreadyLoading);
     assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size_1)));
 
     assert_eq!(
@@ -262,7 +265,7 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
     {
         let barrier_captured = Arc::clone(&barrier);
         let k1 = Arc::new("k1");
-        let mut fut = std::pin::pin!(cache.get_or_fetch(
+        let (mut fut, _, _state) = cache.get_or_fetch(
             &k1,
             Box::new(move || {
                 {
@@ -273,8 +276,9 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
                     }
                 }
                 .boxed()
-            })
-        ));
+            }),
+            (),
+        );
         fut.assert_pending().await;
     }
 
@@ -292,7 +296,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
     let barriers = Arc::new((0..N_IO_STEPS).map(|_| Barrier::new(2)).collect::<Vec<_>>());
     let barriers_captured = Arc::clone(&barriers);
     let k1 = Arc::new("k1");
-    let mut fut = cache.get_or_fetch(
+    let (mut fut, _, state) = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -303,6 +307,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
             }
             .boxed()
         }),
+        (),
     );
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
@@ -319,7 +324,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
 
     // Don't use `tokio::select!` or `tokio::join!` because they poll too often. What the H?!
     // So we use this lovely crate instead: https://crates.io/crates/futures-concurrency
-    let ((res, state), ()) = fut.join(fut_io).await;
+    let (res, ()) = fut.join(fut_io).await;
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(res.unwrap(), Arc::new(TestValue(1001)),);
 
@@ -340,7 +345,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
     let barriers = Arc::new((0..N_IO_STEPS).map(|_| Barrier::new(2)).collect::<Vec<_>>());
     let barriers_captured = Arc::clone(&barriers);
     let k1 = Arc::new("k1");
-    let mut fut_1 = cache.get_or_fetch(
+    let (mut fut_1, _, state_1) = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -351,13 +356,13 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
             }
             .boxed()
         }),
+        (),
     );
     fut_1.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let mut fut_2 = cache
-        .get_or_fetch(&k1, Box::new(|| async move { unreachable!() }.boxed()))
-        .boxed();
+    let (mut fut_2, _, state_2) =
+        cache.get_or_fetch(&k1, Box::new(|| async move { unreachable!() }.boxed()), ());
     fut_2.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -375,7 +380,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
 
     // Don't use `tokio::select!` or `tokio::join!` because they poll too often. What the H?!
     // So we use this lovely crate instead: https://crates.io/crates/futures-concurrency
-    let (((res_1, state_1), (res_2, state_2)), ()) = fut_1.join(fut_2).join(fut_io).await;
+    let ((res_1, res_2), ()) = fut_1.join(fut_2).join(fut_io).await;
     assert_eq!(state_1, CacheState::NewEntry);
     assert_eq!(state_2, CacheState::AlreadyLoading);
     assert_eq!(res_1.unwrap(), Arc::new(TestValue(1001)),);
@@ -402,25 +407,20 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let cache_captured = &cache;
-    let mut fut = rt_1
-        .block_on(async move {
-            Box::new(async move {
-                let k1 = Arc::new("k1");
-                cache_captured
-                    .get_or_fetch(
-                        &k1,
-                        Box::new(|| {
-                            async move {
-                                barrier_captured.wait().await;
-                                panic!("foo")
-                            }
-                            .boxed()
-                        }),
-                    )
-                    .await
-            })
-        })
-        .boxed();
+    let (mut fut, _, _state) = rt_1.block_on(async move {
+        let k1 = Arc::new("k1");
+        cache_captured.get_or_fetch(
+            &k1,
+            Box::new(|| {
+                async move {
+                    barrier_captured.wait().await;
+                    panic!("foo")
+                }
+                .boxed()
+            }),
+            (),
+        )
+    });
     rt_1.block_on(async {
         fut.assert_pending().await;
     });
@@ -432,7 +432,7 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
         .unwrap();
     let err = rt_2
         .block_on(async move {
-            let ((res, _), _) = tokio::join!(fut, barrier.wait());
+            let (res, _) = tokio::join!(fut, barrier.wait());
             res
         })
         .unwrap_err();
@@ -455,7 +455,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
-    let mut fut = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut, _, state) = cache.get_or_fetch(
         &k1,
         Box::new(move || {
             async move {
@@ -463,8 +463,9 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
                 Ok(Arc::new(TestValue(test_size)))
             }
             .boxed()
-        })
-    ));
+        }),
+        (),
+    );
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -472,7 +473,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
     assert!(cache.get(&k1).is_none());
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let (_, (fut_res, state)) = tokio::join!(barrier.wait(), fut);
+    let (_, fut_res) = tokio::join!(barrier.wait(), fut);
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
@@ -530,7 +531,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
-    let mut fut = std::pin::pin!(cache.get_or_fetch(
+    let (mut fut, _, state) = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -538,8 +539,9 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
                 Err(str_err("err"))
             }
             .boxed()
-        })
-    ));
+        }),
+        (),
+    );
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -547,7 +549,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
     assert!(cache.get(&k1).is_none());
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let (_, (fut_res, state)) = tokio::join!(barrier.wait(), fut);
+    let (_, fut_res) = tokio::join!(barrier.wait(), fut);
     assert_eq!(state, CacheState::NewEntry);
     assert_eq!(fut_res.unwrap_err().to_string(), "err");
 
@@ -575,23 +577,21 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
     let k1 = Arc::new("k1");
     let k2 = Arc::new("k2");
 
-    let (res, state) = cache
-        .get_or_fetch(
-            &k1,
-            Box::new(move || async move { Ok(Arc::new(TestValue(test_size_1))) }.boxed()),
-        )
-        .await;
+    let (res, _, state) = cache.get_or_fetch(
+        &k1,
+        Box::new(move || async move { Ok(Arc::new(TestValue(test_size_1))) }.boxed()),
+        (),
+    );
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size_1)));
+    assert_eq!(res.await.unwrap(), Arc::new(TestValue(test_size_1)));
 
-    let (res, state) = cache
-        .get_or_fetch(
-            &k2,
-            Box::new(move || async move { Ok(Arc::new(TestValue(test_size_2))) }.boxed()),
-        )
-        .await;
+    let (res, _, state) = cache.get_or_fetch(
+        &k2,
+        Box::new(move || async move { Ok(Arc::new(TestValue(test_size_2))) }.boxed()),
+        (),
+    );
     assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.unwrap(), Arc::new(TestValue(test_size_2)));
+    assert_eq!(res.await.unwrap(), Arc::new(TestValue(test_size_2)));
 
     assert_eq!(
         observer.records(),
@@ -605,7 +605,7 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
 }
 
 pub(crate) struct TestSetup {
-    pub(crate) cache: Arc<dyn Cache<&'static str, Arc<TestValue>>>,
+    pub(crate) cache: Arc<dyn Cache<&'static str, Arc<TestValue>, ()>>,
     pub(crate) observer: Arc<TestHook<&'static str>>,
 }
 

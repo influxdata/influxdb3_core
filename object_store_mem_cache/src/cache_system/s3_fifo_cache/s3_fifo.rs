@@ -305,6 +305,11 @@ where
         self.entries.is_empty()
     }
 
+    /// Returns an iterator of all keys currently in the cache.
+    pub fn keys(&self) -> impl Iterator<Item = Arc<K>> {
+        self.entries.iter().map(|entry| Arc::clone(entry.key()))
+    }
+
     /// Create a snapshot of the locked state.
     ///
     /// This function serializes the [`S3Fifo`] inner state using bincode, allowing for

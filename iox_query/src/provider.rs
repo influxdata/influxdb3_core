@@ -310,6 +310,8 @@ impl TableProvider for ChunkTableProvider {
 
 #[cfg(test)]
 mod test {
+    use std::slice;
+
     use super::*;
     use crate::{
         exec::IOxSessionContext,
@@ -546,7 +548,7 @@ mod test {
 
         // simple plan
         let plan = provider
-            .scan(&state, None, &[pred.clone()], None)
+            .scan(&state, None, slice::from_ref(&pred), None)
             .await
             .unwrap();
         insta::assert_yaml_snapshot!(
@@ -563,7 +565,7 @@ mod test {
 
         // projection
         let plan = provider
-            .scan(&state, Some(&vec![1, 3]), &[pred.clone()], None)
+            .scan(&state, Some(&vec![1, 3]), slice::from_ref(&pred), None)
             .await
             .unwrap();
         insta::assert_yaml_snapshot!(
