@@ -229,7 +229,7 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
         }
 
         let arrowtz = Tz::from_str(tz.as_ref().unwrap().as_ref())
-            .map_err(|err| DataFusionError::ArrowError(err, None))?;
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
 
         let interval_ns = match &interval_arg {
             ColumnarValue::Scalar(scalar) => {

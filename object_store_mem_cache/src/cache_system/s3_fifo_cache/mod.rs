@@ -10,11 +10,15 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use tracing::warn;
+use tracker::{
+    AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
+};
 
 // for benchmarks
 pub use s3_fifo::{S3Config, S3Fifo};
 
-use crate::cache_system::DynError;
+use crate::cache_system::{AsyncDrop, DynError, InUse};
 
 use super::{
     Cache, CacheFn, CacheRequestResult, HasSize,
@@ -51,29 +55,38 @@ where
 pub struct S3FifoCache<K, V, D>
 where
     K: Clone + Eq + Hash + HasSize + Send + Sync + Debug + 'static,
-    V: Clone + HasSize + Send + Sync + Debug + 'static,
+    V: Clone + HasSize + InUse + AsyncDrop + Send + Sync + Debug + 'static,
     D: Clone + Send + Sync + 'static,
 {
     cache: Arc<S3Fifo<K, V>>,
     gen_counter: Arc<AtomicU64>,
     loader: Loader<K, V, D>,
     hook: Arc<dyn Hook<K>>,
+    inflight_semaphore: Arc<InstrumentedAsyncSemaphore>,
 }
 
 impl<K, V, D> S3FifoCache<K, V, D>
 where
     K: Clone + Eq + Hash + HasSize + Send + Sync + Debug + 'static,
-    V: Clone + HasSize + Send + Sync + Debug + 'static,
+    V: Clone + HasSize + InUse + AsyncDrop + Send + Sync + Debug + 'static,
     D: Clone + Send + Sync + 'static,
 {
     /// Create a new S3FifoCache from an [`S3Config`].
     pub fn new(config: S3Config<K>, metric_registry: &metric::Registry) -> Self {
         let hook = Arc::clone(&config.hook);
+
+        let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
+            metric_registry,
+            &[("semaphore", "s3_fifo_cache")],
+        ));
+        let inflight_semaphore = Arc::new(semaphore_metrics.new_semaphore(config.inflight_bytes));
+
         Self {
             cache: Arc::new(S3Fifo::new(config, metric_registry)),
             gen_counter: Default::default(),
             loader: Default::default(),
             hook,
+            inflight_semaphore,
         }
     }
 
@@ -107,6 +120,13 @@ where
         V: bincode::Encode + bincode::Decode<Q>,
     {
         let hook = Arc::clone(&config.hook);
+
+        let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
+            metric_registry,
+            &[("semaphore", "s3_fifo_cache")],
+        ));
+        let inflight_semaphore = Arc::new(semaphore_metrics.new_semaphore(config.inflight_bytes));
+
         let cache = Arc::new(S3Fifo::new_from_snapshot::<Q>(
             config,
             metric_registry,
@@ -119,6 +139,7 @@ where
             gen_counter: Default::default(),
             loader: Default::default(),
             hook,
+            inflight_semaphore,
         })
     }
 
@@ -145,7 +166,13 @@ where
     ///
     /// The value (`V`) is inserted after completion of a future. Some data (`D`) may be accessable earlier,
     /// before the future finishes, using the [`Load::data`].
-    fn get_or_fetch_impl<F, Fut>(&self, k: &K, f: F, d: D) -> S3CacheResponse<V, D>
+    fn get_or_fetch_impl<F, Fut>(
+        &self,
+        k: &K,
+        f: F,
+        d: D,
+        size_hint: Option<usize>,
+    ) -> S3CacheResponse<V, D>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = CacheRequestResult<V>> + Send + 'static,
@@ -160,7 +187,15 @@ where
         let k_captured = Arc::new(k.clone());
         let hook_captured = Arc::clone(&self.hook);
         let cache_captured = Arc::downgrade(&self.cache);
+        let semaphore_captured = Arc::clone(&self.inflight_semaphore);
         let fut = move || async move {
+            // Acquire insertion permit if size_hint is provided
+            let insertion_permit = if let Some(size) = size_hint {
+                Some(try_acquire_permit(size as u32, &semaphore_captured).await?)
+            } else {
+                None
+            };
+
             // now we inform the hook of insertion
             let generation = gen_counter_captured.fetch_add(1, Ordering::SeqCst);
             hook_captured.insert(generation, &k_captured);
@@ -168,6 +203,16 @@ where
             // get the actual value (`V`)
             let fut = f();
             let fetch_res = fut.catch_unwind_dyn_error().await;
+
+            // if we didn't have an explicit size hint before, then at least take the size now in order to get permit.
+            let insertion_permit = if insertion_permit.is_none()
+                && let Ok(fetch_res) = &fetch_res
+            {
+                let size = fetch_res.size();
+                Some(try_acquire_permit(size as u32, &semaphore_captured).await?)
+            } else {
+                insertion_permit
+            };
 
             // insert into cache
             match &fetch_res {
@@ -180,11 +225,14 @@ where
                         //   may free existing ones and the relevant allocator accounting can be rather pricey.
                         let k = Arc::clone(&k_captured);
                         let v = v.clone();
-                        tokio::task::spawn_blocking(move || {
-                            cache.get_or_put(k, v, generation);
+                        let evicted = tokio::task::spawn_blocking(move || {
+                            let (_, evicted) = cache.get_or_put(k, v, generation);
+                            evicted
                         })
                         .await
                         .expect("never fails");
+
+                        evicted.async_drop().await;
                     } else {
                         // notify "fetched" and instantly evict, because underlying cache is gone (during shutdown)
                         let size = v.size();
@@ -197,6 +245,8 @@ where
                     hook_captured.evict(generation, &k_captured, EvictResult::Failed);
                 }
             }
+
+            drop(insertion_permit);
 
             fetch_res
         };
@@ -223,7 +273,7 @@ where
 impl<K, V, D> Cache<K, V, D> for S3FifoCache<K, V, D>
 where
     K: Clone + Debug + Eq + Hash + HasSize + Send + Sync + 'static,
-    V: Clone + Debug + HasSize + Send + Sync + 'static,
+    V: Clone + Debug + HasSize + InUse + AsyncDrop + Send + Sync + 'static,
     D: Clone + Debug + Send + Sync + 'static,
 {
     /// Get an existing key or start a new fetch process.
@@ -242,12 +292,13 @@ where
         k: &K,
         f: CacheFn<V>,
         d: D,
+        size_hint: Option<usize>,
     ) -> (
         BoxFuture<'static, CacheRequestResult<V>>,
         Option<D>,
         CacheState,
     ) {
-        match self.get_or_fetch_impl(k, f, d) {
+        match self.get_or_fetch_impl(k, f, d, size_hint) {
             S3CacheResponse::NewEntry(load) => {
                 let early_access = load.data().clone();
                 let fut = load.into_future();
@@ -287,13 +338,33 @@ where
     }
 }
 
+async fn try_acquire_permit(
+    size: u32,
+    semaphore: &Arc<InstrumentedAsyncSemaphore>,
+) -> Result<InstrumentedAsyncOwnedSemaphorePermit, DynError> {
+    if let Some(delta) = semaphore.ensure_total_permits(size as usize) {
+        warn!(
+            size,
+            delta = delta.get(),
+            "encountered overlarge file that would be blocked by the semaphore, bumping total semaphore permits",
+        );
+    }
+
+    semaphore
+        .acquire_many_owned(size, None)
+        .await
+        .map_err(|e| Arc::new(e) as DynError)
+}
+
 #[cfg(test)]
 mod tests {
     use core::panic;
+    use std::sync::atomic::AtomicBool;
 
     use super::*;
 
     use crate::cache_system::{
+        AsyncDrop,
         hook::test_utils::{NoOpHook, TestHook, TestHookRecord},
         s3_fifo_cache::s3_fifo::{
             Version, VersionedSnapshot,
@@ -303,6 +374,7 @@ mod tests {
     };
 
     use futures::future::FutureExt;
+    use futures_test_utils::AssertFutureExt;
 
     #[test]
     fn test_runtime_shutdown() {
@@ -317,15 +389,19 @@ mod tests {
                 max_ghost_memory_size: 10,
                 move_to_main_threshold: 0.1,
                 hook: Arc::new(NoOpHook::default()),
+                inflight_bytes: 10,
             },
             &metric::Registry::new(),
         );
         let k1 = Arc::from("x");
+        let v1: Arc<str> = Arc::from("value");
+        let size_hint = v1.size();
 
         let (res, _, state) = cache.get_or_fetch(
             &k1,
-            Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
+            Box::new(|| futures::future::ready(Ok(v1)).boxed()),
             (),
+            Some(size_hint),
         );
         assert_eq!(state, CacheState::NewEntry);
         res.await.unwrap();
@@ -334,10 +410,13 @@ mod tests {
 
         for i in 0..100 {
             let k = Arc::from(i.to_string());
+            let v: Arc<str> = Arc::from("value");
+            let size_hint = v.size();
             let (res, _, state) = cache.get_or_fetch(
                 &k,
-                Box::new(|| futures::future::ready(Ok(Arc::from("value"))).boxed()),
+                Box::new(|| futures::future::ready(Ok(v)).boxed()),
                 (),
+                Some(size_hint),
             );
             assert_eq!(state, CacheState::NewEntry);
             res.await.unwrap();
@@ -355,11 +434,13 @@ mod tests {
                 max_ghost_memory_size: 10,
                 move_to_main_threshold: 0.5,
                 hook: Arc::clone(&hook) as _,
+                inflight_bytes: 10, // this is the same as the max_memory_size, and smaller than the entry sizes (71 & 67)
             },
             &metric::Registry::new(),
         );
 
         let k_heavy = Arc::from("heavy");
+        let size_hint = Arc::new(TestValue(5)).size();
 
         // make it heavy
         for _ in 0..2 {
@@ -367,12 +448,14 @@ mod tests {
                 &k_heavy,
                 Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
                 (),
+                Some(size_hint),
             );
             res.await.unwrap();
         }
 
         // add new keys
         let k_new = Arc::from("new");
+        let size_hint = Arc::new(TestValue(5)).size();
 
         // make them heavy enough to evict old data
         for _ in 0..2 {
@@ -380,6 +463,7 @@ mod tests {
                 &k_new,
                 Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
                 (),
+                Some(size_hint),
             );
             res.await.unwrap();
         }
@@ -410,6 +494,7 @@ mod tests {
                     max_ghost_memory_size: 10_000,
                     move_to_main_threshold: 0.25,
                     hook: Arc::clone(&observer) as _,
+                    inflight_bytes: 2_500,
                 },
                 &metric::Registry::new(),
             )),
@@ -436,6 +521,12 @@ mod tests {
         }
     }
 
+    impl InUse for SnapshotTestValue {
+        fn in_use(&self) -> bool {
+            false
+        }
+    }
+
     // bincode Decode implementation for SnapshotTestValue
     impl<Q> bincode::Decode<Q> for SnapshotTestValue {
         fn decode<D: bincode::de::Decoder<Context = Q>>(
@@ -443,6 +534,12 @@ mod tests {
         ) -> Result<Self, bincode::error::DecodeError> {
             let value: Vec<u8> = bincode::Decode::decode(decoder)?;
             Ok(Self(value))
+        }
+    }
+
+    impl AsyncDrop for SnapshotTestValue {
+        async fn async_drop(self) {
+            drop(self);
         }
     }
 
@@ -475,23 +572,27 @@ mod tests {
         // such that the OrderedSet (de)serialization is tested.
         let key_size = test_data[0].0.size();
         let value_size = Arc::new(test_data[0].1.clone()).size();
+        let max_memory_size = ((key_size + value_size) as f32 * 2.9).round() as usize;
         let cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> = S3FifoCache::new(
             S3Config {
-                max_memory_size: ((key_size + value_size) as f32 * 2.9).round() as usize,
+                max_memory_size,
                 max_ghost_memory_size: (key_size as f32 * 1.9).round() as usize,
                 move_to_main_threshold: 0.1,
                 hook: Arc::clone(&hook),
+                inflight_bytes: max_memory_size.div_ceil(4), // 25%
             },
             &metric_registry,
         );
 
         // Insert all test data
         for (key, value) in &test_data {
+            let size_hint = Some(value.size());
             let value_clone = value.clone();
             let (res, _, _state) = cache.get_or_fetch(
                 key,
                 Box::new(move || async move { Ok(value_clone) }.boxed()),
                 (),
+                size_hint,
             );
             res.await.unwrap();
         }
@@ -525,6 +626,7 @@ mod tests {
                     max_ghost_memory_size: 500,
                     move_to_main_threshold: 0.1,
                     hook: Arc::clone(&hook),
+                    inflight_bytes: 250,
                 },
                 &metric_registry,
                 &snapshot,
@@ -593,17 +695,20 @@ mod tests {
                 max_ghost_memory_size: 10_000,
                 move_to_main_threshold: 0.1,
                 hook: Arc::clone(&hook),
+                inflight_bytes: 2_500,
             },
             &metric_registry,
         );
 
         // Insert all test data
         for (key, value) in &test_data {
+            let size_hint = Some(value.size());
             let value_clone = value.clone();
             let (res, _, _state) = cache.get_or_fetch(
                 key,
                 Box::new(move || async move { Ok(value_clone) }.boxed()),
                 (),
+                size_hint,
             );
             res.await.unwrap();
         }
@@ -670,6 +775,7 @@ mod tests {
                     max_ghost_memory_size: 10_000,
                     move_to_main_threshold: 0.1,
                     hook: Arc::clone(&hook),
+                    inflight_bytes: 2_500,
                 },
                 &metric_registry,
                 v1_snapshot_data,
@@ -707,16 +813,18 @@ mod tests {
                 max_ghost_memory_size: 500,
                 move_to_main_threshold: 0.1,
                 hook: Arc::new(NoOpHook::default()),
+                inflight_bytes: 250,
             },
             &metric::Registry::new(),
         );
 
         let key = Arc::from("test_key");
         let early_access_data = Arc::from("early_data");
-        let final_value = Arc::from("final_value");
+        let final_value: Arc<str> = Arc::from("final_value");
 
         /* Test case 1: New entry - should return future and early access data */
         let final_value_clone = Arc::clone(&final_value);
+        let size_hint = final_value_clone.size();
         let (got_fut, got_early_access, got_state) = cache.get_or_fetch(
             &key,
             Box::new(move || {
@@ -729,6 +837,7 @@ mod tests {
                 .boxed()
             }),
             Arc::clone(&early_access_data),
+            Some(size_hint),
         );
 
         // Verify return signature for new entry
@@ -745,6 +854,7 @@ mod tests {
             &key,
             Box::new(|| async { panic!("should not be called") }.boxed()),
             Arc::from("unused_early_data"),
+            None,
         );
 
         // Verify return signature for cached entry
@@ -759,10 +869,11 @@ mod tests {
         /* Test case 3: Already loading - simulate concurrent access */
         let key = Arc::from("new_test_key");
         let early_access_data = Arc::from("new_early_data");
-        let final_value = Arc::from("new_final_value");
+        let final_value: Arc<str> = Arc::from("new_final_value");
 
         // Start first request (this will be loading)
         let final_value_clone = Arc::clone(&final_value);
+        let size_hint = final_value_clone.size();
         let (got_fut_1, got_early_access_1, got_state_1) = cache.get_or_fetch(
             &key,
             Box::new(move || {
@@ -775,6 +886,7 @@ mod tests {
                 .boxed()
             }),
             Arc::clone(&early_access_data),
+            Some(size_hint),
         );
 
         // Start second request while first is still loading
@@ -783,6 +895,7 @@ mod tests {
             &key,
             Box::new(|| async { panic!("should not be called") }.boxed()),
             different_early_access,
+            None,
         );
 
         // Verify return signatures
@@ -809,6 +922,7 @@ mod tests {
                 max_ghost_memory_size: 500,
                 move_to_main_threshold: 0.1,
                 hook: Arc::new(NoOpHook::default()),
+                inflight_bytes: 250,
             },
             &metric::Registry::new(),
         );
@@ -821,6 +935,7 @@ mod tests {
             &key1,
             Box::new(|| futures::future::ready(Ok(Arc::from("value1"))).boxed()),
             (),
+            Some((Arc::from("value1") as Arc<str>).size()),
         );
         res1.await.unwrap();
 
@@ -835,6 +950,7 @@ mod tests {
                 .boxed()
             }),
             (),
+            Some((Arc::from("value2") as Arc<str>).size()),
         );
 
         // List keys in the cache
@@ -854,5 +970,169 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&key1), "key1 should be in the cache");
         assert!(keys.contains(&key2), "key2 should be in the cache");
+    }
+
+    #[tokio::test]
+    async fn test_in_use_prevents_eviction() {
+        // Create cache with very limited space - only enough for 1 entry (size 10)
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
+            S3Config {
+                max_memory_size: 20, // Only enough space for 1 entry
+                max_ghost_memory_size: 100,
+                move_to_main_threshold: 0.1,
+                hook: Arc::new(NoOpHook::default()),
+                inflight_bytes: 100,
+            },
+            &metric::Registry::new(),
+        );
+
+        let key1 = Arc::from("key1");
+        let key2 = Arc::from("key2");
+
+        // Insert key1 with Arc<V>
+        let (res1, _, state1) = cache.get_or_fetch(
+            &key1,
+            Box::new(|| futures::future::ready(Ok(Arc::from("value1"))).boxed()),
+            (),
+            None,
+        );
+        assert_eq!(state1, CacheState::NewEntry);
+        let value1 = res1.await.unwrap();
+
+        // Verify key1 is in cache
+        assert!(cache.get(&key1).is_some(), "key1 should be in cache");
+
+        // Get key1 Arc<V> and hold a reference to it
+        let held_value = cache.get(&key1).unwrap().unwrap();
+
+        // Insert key2 with Arc<V> - this should try to evict key1 but fail because it's in use
+        let (mut res2, _, state2) = cache.get_or_fetch(
+            &key2,
+            Box::new(move || futures::future::ready(Ok(Arc::from("value2"))).boxed()),
+            (),
+            None,
+        );
+        assert_eq!(state2, CacheState::NewEntry);
+
+        // Give some time for the cache to try eviction
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // key1 should still be in cache because it's in use
+        assert!(
+            cache.get(&key1).is_some(),
+            "key1 should still be in cache due to InUse protection"
+        );
+
+        // res2 should still be pending because key1 couldn't be evicted to make space
+        res2.assert_pending().await;
+
+        // Drop the reference to key1's value - this should allow eviction
+        drop(held_value);
+        drop(value1);
+
+        // Small delay to allow eviction to proceed
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // res2 should now complete successfully
+        let value2 = res2.await.unwrap();
+        assert_eq!(value2, Arc::from("value2"));
+
+        // key1 should now be evicted and key2 should be in cache
+        assert!(
+            cache.get(&key1).is_none(),
+            "key1 should be evicted after reference dropped"
+        );
+        assert!(cache.get(&key2).is_some(), "key2 should be in cache");
+    }
+
+    #[tokio::test]
+    async fn test_inflight_semaphore_blocks_when_limit_exceeded() {
+        use tokio::sync::Barrier;
+
+        // Create cache with very limited inflight bytes (only 100 bytes)
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
+            S3Config {
+                max_memory_size: 10000,
+                max_ghost_memory_size: 5000,
+                move_to_main_threshold: 0.1,
+                hook: Arc::new(NoOpHook::default()),
+                inflight_bytes: 100, // 100 bytes allowed inflight
+            },
+            &metric::Registry::new(),
+        );
+
+        let key1 = Arc::from("key1");
+        let key2 = Arc::from("key2");
+
+        // Start first request with size hint of 80 bytes (within limit)
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone1 = Arc::clone(&barrier);
+        let (mut res1, _, state1) = cache.get_or_fetch(
+            &key1,
+            Box::new(move || {
+                async move {
+                    // halt download (in flight bytes) while barrier is held
+                    barrier_clone1.wait().await;
+                    Ok(Arc::from("value1"))
+                }
+                .boxed()
+            }),
+            (),
+            Some(80),
+        );
+        assert_eq!(state1, CacheState::NewEntry);
+        res1.assert_pending().await;
+
+        // Confirm first put is still loading (holding semaphore)
+        let (mut res1_again, _, state1_again) = cache.get_or_fetch(
+            &key1,
+            Box::new(move || {
+                panic!("should not be called");
+            }),
+            (),
+            Some(80),
+        );
+        assert_eq!(state1_again, CacheState::AlreadyLoading);
+        res1_again.assert_pending().await;
+
+        // Start second request with size hint of 50 bytes (would exceed limit)
+        let was_called = Arc::new(AtomicBool::new(false));
+        let was_called_captured = Arc::clone(&was_called);
+        let (mut res2, _, state2) = cache.get_or_fetch(
+            &key2,
+            Box::new(move || {
+                was_called_captured.store(true, Ordering::SeqCst);
+                futures::future::ready(Ok(Arc::from("value2"))).boxed()
+            }),
+            (),
+            Some(50),
+        );
+        assert_eq!(state2, CacheState::NewEntry);
+        res2.assert_pending().await;
+
+        // Confirm second put is seen as loading
+        let (mut res2_again, _, state2_again) = cache.get_or_fetch(
+            &key2,
+            Box::new(move || {
+                panic!("should not be called");
+            }),
+            (),
+            Some(50),
+        );
+        assert_eq!(state2_again, CacheState::AlreadyLoading);
+        res2_again.assert_pending().await;
+        // although the fetch has not begun yet
+        assert!(!was_called.load(Ordering::SeqCst));
+
+        // Release first request by unblocking its barrier
+        barrier.wait().await;
+
+        // Wait for first request to complete and release semaphore
+        let result1 = res1.await.unwrap();
+        assert_eq!(result1, Arc::from("value1"));
+
+        // Wait for second request to complete
+        let result2 = res2.await.unwrap();
+        assert_eq!(result2, Arc::from("value2"));
     }
 }

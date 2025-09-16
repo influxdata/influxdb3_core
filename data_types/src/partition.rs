@@ -268,6 +268,12 @@ impl sqlx::Type<sqlx::Postgres> for PartitionKey {
     }
 }
 
+impl sqlx::postgres::PgHasArrayType for PartitionKey {
+    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::array_of("VARCHAR")
+    }
+}
+
 impl sqlx::Encode<'_, sqlx::Postgres> for PartitionKey {
     fn encode_by_ref(
         &self,
@@ -509,7 +515,7 @@ impl PartitionHashId {
     }
 }
 
-impl<'q> sqlx::encode::Encode<'q, sqlx::Postgres> for &'q PartitionHashId {
+impl sqlx::encode::Encode<'_, sqlx::Postgres> for PartitionHashId {
     fn encode_by_ref(
         &self,
         buf: &mut sqlx::postgres::PgArgumentBuffer,
@@ -557,6 +563,12 @@ where
 {
     fn type_info() -> DB::TypeInfo {
         <&[u8] as ::sqlx::Type<DB>>::type_info()
+    }
+}
+
+impl sqlx::postgres::PgHasArrayType for PartitionHashId {
+    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
+        <&[u8] as sqlx::postgres::PgHasArrayType>::array_type_info()
     }
 }
 
@@ -614,6 +626,10 @@ pub struct Partition {
     /// The maximum time of data that can exist in this partition based on the partition template.
     /// This is calculated when the partition is created and used for efficient retention queries.
     pub max_time: Option<i64>,
+
+    /// Estimated size in bytes of all the active files in this partition, or `None`
+    /// if the partition size has not been computed yet.
+    pub estimated_size_bytes: Option<i64>,
 }
 
 impl Partition {
@@ -643,6 +659,7 @@ impl Partition {
             cold_compact_at,
             created_at,
             max_time,
+            estimated_size_bytes: None,
         }
     }
 

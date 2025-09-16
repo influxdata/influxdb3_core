@@ -1,4 +1,5 @@
 //! This module contains the schema definition for IOx
+
 //!
 //! # Series Key Format Migration (v3 feature)
 //!
@@ -26,7 +27,7 @@
 //!
 //! 1. New data writes only v2 format (no legacy format)
 //! 2. Readers check v2 format first, fall back to legacy parsing if needed
-//! 3. Legacy parsing uses a recursive algorithm to handle ambiguous cases
+//! 3. Legacy parsing uses a two-phase approach: fast path for simple cases, schema-order disambiguation for ambiguous cases
 //! 4. Over time, all data will have v2 format and legacy code can be removed
 //!
 //! ## Compatibility
@@ -245,12 +246,16 @@ const SERIES_KEY_V2_METADATA_KEY: &str = "iox::series::key::v2";
 /// Binary: [9, 0, 0, 0, r, e, g, i, o, n, /, u, s, 4, 0, 0, 0, h, o, s, t]
 /// Output: "CQAAAHJlZ2lvbi91cwQAAABob3N0"
 /// ```
-fn encode_series_key_v2(keys: &[String]) -> String {
+fn encode_series_key_v2<I, S>(keys: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     use base64::{Engine, engine::general_purpose::STANDARD};
 
     let mut buffer = Vec::new();
     for key in keys {
-        let key_bytes = key.as_bytes();
+        let key_bytes = key.as_ref().as_bytes();
         let len = key_bytes.len() as u32;
         buffer.extend_from_slice(&len.to_le_bytes());
         buffer.extend_from_slice(key_bytes);
@@ -336,8 +341,10 @@ fn decode_series_key_v2(encoded: &str) -> Result<Vec<String>> {
 ///
 /// # Algorithm
 ///
-/// 1. First tries simple split by '/' - if all parts are valid columns, returns them
-/// 2. Otherwise, uses recursive parsing to try different combinations
+/// 1. **Fast path**: Simple split by '/' - if no duplicates and all parts are valid tags,
+///    return them in series key order (doesn't depend on tags_iter() order)
+/// 2. **Slow path**: When duplicates exist or invalid parts found, fall back to schema-order
+///    parsing (only case where tags_iter() order is used for disambiguation)
 ///
 /// # Example
 ///
@@ -352,89 +359,142 @@ fn parse_legacy_series_key(series_key_str: &str, schema: &Schema) -> Vec<String>
         return vec![];
     }
 
-    // First, try the simple case - split by '/' and check if all parts are valid columns
+    // Fast path: try simple split
     let simple_parts: Vec<&str> = series_key_str
         .split(SERIES_KEY_METADATA_SEPARATOR)
         .collect();
-    let all_valid = simple_parts
-        .iter()
-        .all(|part| schema.find_index_of(part).is_some());
 
-    if all_valid {
+    // Because it is hard to pin down whether Schema insertion order is maintained always, we
+    // cannot just return `tags_iter` result directly. Using HashSet for O(1) validation instead of
+    // `find_index_of` which requires O(n) for each validation
+    let valid_tags: HashSet<&str> = schema
+        .tags_iter()
+        .map(|field| field.name().as_str())
+        .collect();
+
+    // Check for duplicates (using any() for early exit)
+    let mut seen = HashSet::with_capacity(simple_parts.len());
+    let has_duplicates = simple_parts.iter().any(|part| !seen.insert(*part));
+
+    // Fast path: If no duplicates and all parts are valid tags, return them
+    // This preserves series key order and doesn't depend on tags_iter() order
+    if !has_duplicates && simple_parts.iter().all(|part| valid_tags.contains(part)) {
         return simple_parts.into_iter().map(|s| s.to_string()).collect();
     }
 
-    // Complex case: some tag names contain '/'
-    // We need to try different combinations to find valid column names
-    parse_legacy_series_key_recursive(series_key_str, schema, 0)
+    // Slow path: Ambiguous case requires schema order for disambiguation
+    // This is the ONLY place where we depend on tags_iter() order
+    let ordered_tags: Vec<&str> = schema
+        .tags_iter()
+        .map(|field| field.name().as_str())
+        .collect();
+    parse_legacy_series_key_with_order(series_key_str, &ordered_tags)
 }
 
 #[cfg(feature = "v3")]
-/// Recursive helper for parsing legacy series keys with '/' in tag names.
+/// Tracker for which indices have been used during parsing
+struct VecTracker(Vec<bool>);
+
+#[cfg(feature = "v3")]
+impl VecTracker {
+    fn new(size: usize) -> Self {
+        Self(vec![false; size])
+    }
+
+    fn is_used(&self, idx: usize) -> bool {
+        self.0[idx]
+    }
+
+    fn mark_used(&mut self, idx: usize) {
+        self.0[idx] = true;
+    }
+}
+
+#[cfg(feature = "v3")]
+/// Helper function that parses series key and returns tags in schema order
+fn parse_series_key_with_tracker(
+    series_key_str: &str,
+    ordered_tags: &[&str],
+    tracker: &mut VecTracker,
+) -> Vec<String> {
+    let mut remaining = series_key_str;
+    let mut parsed_indices = Vec::new();
+
+    // Keep parsing while we have remaining string
+    while !remaining.is_empty() {
+        let mut found_match = false;
+
+        // Try all tags to find one that matches at current position
+        for (idx, &tag) in ordered_tags.iter().enumerate() {
+            if tracker.is_used(idx) {
+                // Skip already used tags, series_key is
+                // expected to not have duplicates
+                continue;
+            }
+
+            if remaining.starts_with(tag) {
+                let tag_len = tag.len();
+
+                // Check if this is a valid tag boundary (end of string or followed by separator)
+                let at_boundary = remaining.len() == tag_len
+                    || remaining[tag_len..].starts_with(SERIES_KEY_METADATA_SEPARATOR);
+
+                if at_boundary {
+                    // Record which tag was found
+                    parsed_indices.push(idx);
+                    tracker.mark_used(idx);
+                    remaining = &remaining[tag_len..];
+
+                    // Consume separator if present
+                    if remaining.starts_with(SERIES_KEY_METADATA_SEPARATOR) {
+                        remaining = &remaining[1..];
+                    }
+
+                    found_match = true;
+                    break;
+                }
+            }
+        }
+
+        // If we couldn't find any match, we're stuck
+        if !found_match {
+            break;
+        }
+    }
+
+    // Sort indices to maintain same order as `tags_iter` and build result
+    parsed_indices.sort_unstable();
+    parsed_indices
+        .into_iter()
+        .map(|idx| ordered_tags[idx].to_string())
+        .collect()
+}
+
+#[cfg(feature = "v3")]
+/// Schema-order parser for legacy series keys (ambiguous cases only).
 ///
-/// This function tries different ways to split the remaining string by progressively
-/// including more '/' characters into potential tag names. It validates each candidate
-/// against the actual schema columns.
+/// This function is called ONLY when the fast path fails due to:
+/// - Duplicate parts after splitting by '/' (ambiguous parsing)
+/// - Invalid parts that aren't valid tag names
+///
+/// It parses the series key string by matching tags in schema order to resolve ambiguity.
+/// This is the only place where we depend on tags_iter() maintaining a consistent order.
 ///
 /// # Parameters
 ///
-/// - `remaining`: The unparsed portion of the series key string
-/// - `schema`: The schema containing valid tag columns
-/// - `depth`: Recursion depth to prevent stack overflow
+/// - `series_key_str`: The series key string to parse (contains tag names)
+/// - `ordered_tags`: Tag names in schema order from tags_iter() (used for disambiguation)
 ///
 /// # Returns
 ///
-/// A vector of parsed tag names, or empty if parsing fails.
-fn parse_legacy_series_key_recursive(
-    remaining: &str,
-    schema: &Schema,
-    depth: usize,
-) -> Vec<String> {
-    // Prevent infinite recursion
-    if depth > 100 || remaining.is_empty() {
+/// A vector of parsed tag names in schema order
+fn parse_legacy_series_key_with_order(series_key_str: &str, ordered_tags: &[&str]) -> Vec<String> {
+    if series_key_str.is_empty() {
         return vec![];
     }
 
-    // Try to find a valid column name by progressively including more '/' characters
-    let mut accumulated = String::new();
-    let parts: Vec<&str> = remaining.split(SERIES_KEY_METADATA_SEPARATOR).collect();
-
-    // Try each possible prefix as a column name
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            accumulated.push_str(SERIES_KEY_METADATA_SEPARATOR);
-        }
-        accumulated.push_str(part);
-
-        // Check if accumulated string is a valid tag column
-        let is_valid_tag = schema
-            .field_by_name(&accumulated)
-            .map(|(t, _)| matches!(t, InfluxColumnType::Tag))
-            .unwrap_or(false);
-
-        if is_valid_tag {
-            // Found a valid tag column
-            if i + 1 == parts.len() {
-                // This was the last part
-                return vec![accumulated];
-            } else {
-                // Try to parse the rest
-                let remaining_str = parts[i + 1..].join(SERIES_KEY_METADATA_SEPARATOR);
-                let rest = parse_legacy_series_key_recursive(&remaining_str, schema, depth + 1);
-
-                if !rest.is_empty() {
-                    // Successfully parsed the rest
-                    let mut result = vec![accumulated];
-                    result.extend(rest);
-                    return result;
-                }
-                // If we couldn't parse the rest, continue trying longer prefixes
-            }
-        }
-    }
-
-    // If we couldn't parse it properly, return empty
-    vec![]
+    let mut tracker = VecTracker::new(ordered_tags.len());
+    parse_series_key_with_tracker(series_key_str, ordered_tags, &mut tracker)
 }
 
 impl Schema {
@@ -458,11 +518,25 @@ impl Schema {
 
                 // for each field, ensure any type specified by the metadata
                 // is compatible with the actual type of the field
+                #[cfg(not(feature = "v3"))]
                 let influxdb_column_type =
                     get_influx_type(field).map_err(|md| Error::InvalidInfluxColumnType {
                         column_name: column_name.to_string(),
                         md,
                     })?;
+
+                #[cfg(feature = "v3")]
+                let influxdb_column_type = match get_influx_type(field) {
+                    Ok(v) => v,
+                    Err(None) => continue, // No metadata, treat as arrow native column
+                    Err(Some(md)) => {
+                        return Err(Error::InvalidInfluxColumnType {
+                            column_name: column_name.to_string(),
+                            md: Some(md),
+                        });
+                    }
+                };
+
                 let actual_type = field.data_type();
                 if !influxdb_column_type.valid_arrow_type(actual_type) {
                     return Err(Error::IncompatibleMetadata {
@@ -510,7 +584,7 @@ impl Schema {
     /// used only by the SchemaBuilder.
     pub(crate) fn new_from_parts(
         measurement: Option<String>,
-        fields: impl Iterator<Item = (ArrowField, InfluxColumnType)>,
+        fields: impl Iterator<Item = (ArrowField, Option<InfluxColumnType>)>,
         sort_columns: bool,
         #[cfg(feature = "v3")] series_key: Option<impl IntoIterator<Item: AsRef<str>>>,
     ) -> Result<Self> {
@@ -587,17 +661,8 @@ impl Schema {
         if let Some(v2_key) = self.inner.metadata.get(SERIES_KEY_V2_METADATA_KEY) {
             match decode_series_key_v2(v2_key) {
                 Ok(keys) => {
-                    // Verify all keys exist in schema
-                    if keys.iter().all(|k| self.find_index_of(k).is_some()) {
-                        return keys;
-                    } else {
-                        warn!(
-                            "V2 series key decoded successfully but contains invalid columns: {:?}",
-                            keys.iter()
-                                .filter(|k| self.find_index_of(k).is_none())
-                                .collect::<Vec<_>>()
-                        );
-                    }
+                    // V2 format is already validated during write
+                    return keys;
                 }
                 Err(e) => {
                     warn!(
@@ -645,6 +710,14 @@ impl Schema {
     }
 
     /// Return the InfluxDB data model type, if any, and underlying arrow
+    /// schema field for the column at index `idx`. Panics if `idx` is
+    /// greater than or equal to self.len()
+    pub fn try_field(&self, idx: usize) -> (Option<InfluxColumnType>, &ArrowField) {
+        let field = self.inner.field(idx);
+        (get_influx_type(field).ok(), field)
+    }
+
+    /// Return the InfluxDB data model type, if any, and underlying arrow
     /// schema field for the column identified by `name`.
     pub fn field_by_name(&self, name: &str) -> Option<(InfluxColumnType, &ArrowField)> {
         self.find_index_of(name).map(|index| self.field(index))
@@ -680,6 +753,12 @@ impl Schema {
     /// all the columns of this schema, in order
     pub fn iter(&self) -> SchemaIter<'_> {
         SchemaIter::new(self)
+    }
+
+    /// Returns an iterator of `(Option<InfluxColumnType>, &Field)` for
+    /// all the columns of this schema, in order
+    pub fn all_iter(&self) -> v3::SchemaIter<'_> {
+        v3::SchemaIter::new(self)
     }
 
     /// Returns an iterator of `&Field` for all the tag columns of
@@ -846,7 +925,7 @@ impl Schema {
                     })
                     .collect();
 
-                // Now, sort lexographically (but put timestamp last)
+                // Now, sort lexicographically (but put timestamp last)
                 primary_keys.sort_by(|(a_column_type, a), (b_column_type, b)| {
                     match (a_column_type, b_column_type) {
                         (Tag, Tag) => a.name().cmp(b.name()),
@@ -941,11 +1020,13 @@ pub(crate) fn get_influx_type(field: &ArrowField) -> Result<InfluxColumnType, Op
 }
 
 /// Sets the metadata for a field - replacing any existing metadata
-pub(crate) fn set_field_metadata(field: &mut ArrowField, column_type: InfluxColumnType) {
-    field.set_metadata(HashMap::from([(
-        COLUMN_METADATA_KEY.to_string(),
-        column_type.to_string(),
-    )]));
+pub(crate) fn set_field_metadata(field: &mut ArrowField, column_type: Option<InfluxColumnType>) {
+    if let Some(column_type) = column_type {
+        field.set_metadata(HashMap::from([(
+            COLUMN_METADATA_KEY.to_string(),
+            column_type.to_string(),
+        )]));
+    }
 }
 
 /// Field value types for InfluxDB 2.0 data model, as defined in
@@ -1133,17 +1214,58 @@ impl<'a> Iterator for SchemaIter<'a> {
     type Item = (InfluxColumnType, &'a ArrowField);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx < self.schema.len() {
-            let ret = self.schema.field(self.idx);
+        while self.idx < self.schema.len() {
+            let ret = self.schema.try_field(self.idx);
             self.idx += 1;
-            Some(ret)
-        } else {
-            None
+            if let Some(ct) = ret.0 {
+                return Some((ct, ret.1));
+            }
         }
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, Some(self.schema.len()))
+    }
+}
+
+mod v3 {
+    use super::*;
+
+    /// Thing that implements iterator over a Schema's columns.
+    pub struct SchemaIter<'a> {
+        schema: &'a Schema,
+        idx: usize,
+    }
+
+    impl<'a> SchemaIter<'a> {
+        pub(super) fn new(schema: &'a Schema) -> Self {
+            Self { schema, idx: 0 }
+        }
+    }
+
+    impl fmt::Debug for SchemaIter<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SchemaIter<{}>", self.idx)
+        }
+    }
+
+    impl<'a> Iterator for SchemaIter<'a> {
+        type Item = (Option<InfluxColumnType>, &'a ArrowField);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.idx < self.schema.len() {
+                let ret = self.schema.try_field(self.idx);
+                self.idx += 1;
+                Some(ret)
+            } else {
+                None
+            }
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (0, Some(self.schema.len()))
+        }
     }
 }
 
@@ -1199,6 +1321,7 @@ mod test {
     use crate::test_util::make_field;
 
     use super::{builder::SchemaBuilder, *};
+    use rstest::rstest;
 
     #[test]
     fn new_from_arrow_metadata_good() {
@@ -1416,6 +1539,7 @@ mod test {
         );
     }
 
+    #[cfg(not(feature = "v3"))] // Not relevant for v3 as we allow columns without metadata for PachaTree
     #[test]
     fn new_from_arrow_no_metadata() {
         let arrow_schema = ArrowSchemaRef::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1855,118 +1979,81 @@ mod test {
     }
 
     #[cfg(feature = "v3")]
-    #[test]
-    fn test_encode_decode_series_key_v2() {
-        // Test basic encoding/decoding
-        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let encoded = encode_series_key_v2(&keys);
+    #[rstest]
+    #[case::basic(vec!["a", "b", "c"])]
+    #[case::tags_with_slash(vec!["a/b", "c", "d/e/f"])]
+    #[case::empty_tag(vec!["", "a"])]
+    #[case::unicode(vec!["测试", "a/b", "c"])]
+    #[case::duplicate_tags_scenario(vec!["region/host", "region", "host"])]
+    #[case::single_tag_with_slash(vec!["a/b/c"])]
+    #[case::nested_slashes(vec!["a/b/c/d", "e"])]
+    fn test_encode_decode_series_key_v2_roundtrip(#[case] tags: Vec<&str>) {
+        // No need to allocate Vec<String>, just use the &str slice directly
+        let encoded = encode_series_key_v2(&tags);
         let decoded = decode_series_key_v2(&encoded).unwrap();
-        assert_eq!(keys, decoded);
-
-        // Test with tags containing '/'
-        let keys = vec!["a/b".to_string(), "c".to_string(), "d/e/f".to_string()];
-        let encoded = encode_series_key_v2(&keys);
-        let decoded = decode_series_key_v2(&encoded).unwrap();
-        assert_eq!(keys, decoded);
-
-        // Test with empty tag names
-        let keys = vec!["".to_string(), "a".to_string()];
-        let encoded = encode_series_key_v2(&keys);
-        let decoded = decode_series_key_v2(&encoded).unwrap();
-        assert_eq!(keys, decoded);
-
-        // Test with Unicode characters
-        let keys = vec!["测试".to_string(), "a/b".to_string(), "c".to_string()];
-        let encoded = encode_series_key_v2(&keys);
-        let decoded = decode_series_key_v2(&encoded).unwrap();
-        assert_eq!(keys, decoded);
+        let expected: Vec<std::string::String> = tags.iter().map(|s| s.to_string()).collect();
+        assert_eq!(expected, decoded, "Failed to roundtrip: {:?}", tags);
     }
 
     #[cfg(feature = "v3")]
-    #[test]
-    fn test_series_key_with_slash_in_tag_names() {
-        // Test the example from issue #14457
-        let schema = SchemaBuilder::new()
-            .tag("a/b")
-            .tag("c")
+    #[rstest]
+    #[case::issue_14457(&["a/b", "c"])]
+    #[case::multiple_slash_tags(&["region/us", "host/server1", "path/to/resource"])]
+    #[case::single_slash_tag(&["namespace/project"])]
+    fn test_series_key_with_slash_in_tag_names(#[case] tags: &[&str]) {
+        let mut builder = SchemaBuilder::new();
+        for tag in tags {
+            builder.tag(*tag);
+        }
+        let schema = builder
             .influx_field("f1", Float)
             .timestamp()
-            .with_series_key(["a/b", "c"])
+            .with_series_key(tags.iter().copied())
             .build()
             .unwrap();
 
         let series_key = schema.series_key().unwrap();
-        assert_eq!(vec!["a/b", "c"], series_key);
+        assert_eq!(tags, series_key.as_slice());
 
-        // Primary key should work correctly
+        // Primary key should work correctly (includes time)
         let primary_key = schema.primary_key();
-        assert_eq!(vec!["a/b", "c", "time"], primary_key);
+        let mut expected_pk: Vec<&str> = tags.to_vec();
+        expected_pk.push("time");
+        assert_eq!(expected_pk, primary_key);
     }
 
     #[cfg(feature = "v3")]
-    #[test]
-    fn test_legacy_series_key_parser() {
-        // Test simple case without '/' in tag names
-        let schema = SchemaBuilder::new()
-            .tag("a")
-            .tag("b")
-            .tag("c")
-            .influx_field("f1", Float)
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let parsed = parse_legacy_series_key("a/b/c", &schema);
-        assert_eq!(vec!["a", "b", "c"], parsed);
-
-        // Test complex case with '/' in tag names
-        let schema = SchemaBuilder::new()
-            .tag("a/b")
-            .tag("c")
-            .influx_field("f1", Float)
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let parsed = parse_legacy_series_key("a/b/c", &schema);
-        assert_eq!(vec!["a/b", "c"], parsed);
-
-        // Test edge case from issue
-        let schema = SchemaBuilder::new()
-            .tag("a")
-            .tag("a/b")
-            .tag("a/b/c")
-            .influx_field("f1", Float)
-            .timestamp()
-            .build()
-            .unwrap();
-
-        // This should parse as ["a/b", "c"] not ["a", "b/c"]
-        let parsed = parse_legacy_series_key("a/b/c", &schema);
-        // The parser should find a valid combination
-        assert!(!parsed.is_empty(), "Parser returned empty result");
-        // Any of these could be valid depending on the order the parser checks
-        assert!(
-            parsed == vec!["a", "b", "c"]
-                || parsed == vec!["a/b", "c"]
-                || parsed == vec!["a/b/c"]
-                || parsed == vec!["a", "b/c"],
-            "Unexpected parse result: {parsed:?}"
-        );
-    }
-
-    #[cfg(feature = "v3")]
-    #[test]
-    fn test_backward_compatibility_reads_legacy_format() {
-        // Create schema the old way (only legacy format)
-        let arrow_fields = vec![
-            ArrowField::new("a/b", ArrowDataType::Utf8, true),
-            ArrowField::new("c", ArrowDataType::Utf8, true),
-            ArrowField::new("time", TIME_DATA_TYPE(), false),
-        ];
+    #[rstest::rstest]
+    // This test verifies that legacy series keys (using '/' separator) stored in Arrow metadata
+    // are correctly parsed. This tests the actual legacy parsing code path since we manually
+    // create schemas with SERIES_KEY_METADATA_KEY (legacy format), not SERIES_KEY_V2_METADATA_KEY.
+    #[case::simple_split("a/b/c", &["a", "b", "c"], vec!["a", "b", "c"])]
+    #[case::tags_with_slash("a/b/c", &["a/b", "c"], vec!["a/b", "c"])]
+    #[case::single_tag_with_slashes("a/b/c", &["a/b/c"], vec!["a/b/c"])]
+    #[case::slash_tag_at_beginning("region/host/region/host", &["region/host", "region", "host"], vec!["region/host", "region", "host"])]
+    #[case::slash_tag_in_middle("region/host/region/host", &["region", "region/host", "host"], vec!["region", "region/host", "host"])]
+    #[case::slash_tag_at_end("region/host/region/host", &["region", "host", "region/host"], vec!["region", "host", "region/host"])]
+    #[case::prefix_overlap("a/a/b", &["a", "a/b"], vec!["a", "a/b"])]
+    #[case::complex_nested("a/b/c/d", &["a/b/c", "d"], vec!["a/b/c", "d"])]
+    #[case::multiple_slash_tags("foo/bar/baz/qux", &["foo/bar", "baz/qux"], vec!["foo/bar", "baz/qux"])]
+    #[case::empty_series_key("", &["a", "b"], vec![])]
+    fn test_parse_legacy_series_key(
+        #[case] legacy_series_key: &str,
+        #[case] tag_names: &[&str],
+        #[case] expected: Vec<&str>,
+    ) {
+        // Create arrow fields for tags and time
+        let mut arrow_fields = Vec::new();
+        for tag in tag_names {
+            arrow_fields.push(ArrowField::new(*tag, ArrowDataType::Utf8, true));
+        }
+        arrow_fields.push(ArrowField::new("time", TIME_DATA_TYPE(), false));
 
         let mut metadata = HashMap::new();
-        metadata.insert(SERIES_KEY_METADATA_KEY.to_string(), "a/b/c".to_string());
+        metadata.insert(
+            SERIES_KEY_METADATA_KEY.to_string(),
+            legacy_series_key.to_string(),
+        );
 
         // Add column type metadata
         let arrow_schema = ArrowSchema::new_with_metadata(
@@ -1974,9 +2061,9 @@ mod test {
                 .into_iter()
                 .map(|mut f| {
                     if f.name() == "time" {
-                        set_field_metadata(&mut f, InfluxColumnType::Timestamp);
+                        set_field_metadata(&mut f, Some(InfluxColumnType::Timestamp));
                     } else {
-                        set_field_metadata(&mut f, InfluxColumnType::Tag);
+                        set_field_metadata(&mut f, Some(InfluxColumnType::Tag));
                     }
                     f
                 })
@@ -1988,7 +2075,91 @@ mod test {
 
         // Should still work with legacy parser
         let series_key = schema.series_key().unwrap();
-        assert_eq!(vec!["a/b", "c"], series_key);
+        assert_eq!(
+            expected, series_key,
+            "Failed to parse legacy key '{}' with tags {:?}",
+            legacy_series_key, tag_names
+        );
+    }
+
+    #[cfg(feature = "v3")]
+    #[rstest]
+    // This test verifies that SchemaBuilder creates v2 format series keys
+    // and that they correctly handle all the same scenarios as legacy format.
+    // Note: v2 format doesn't have parsing ambiguity issues like legacy format,
+    // but we test the same tag combinations to ensure consistent behavior.
+    #[case::simple_split(&["a", "b", "c"], vec!["a", "b", "c"])]
+    #[case::tags_with_slash(&["a/b", "c"], vec!["a/b", "c"])]
+    #[case::single_tag_with_slashes(&["a/b/c"], vec!["a/b/c"])]
+    #[case::slash_tag_at_beginning(&["region/host", "region", "host"], vec!["region/host", "region", "host"])]
+    #[case::slash_tag_in_middle(&["region", "region/host", "host"], vec!["region", "region/host", "host"])]
+    #[case::slash_tag_at_end(&["region", "host", "region/host"], vec!["region", "host", "region/host"])]
+    #[case::prefix_overlap(&["a", "a/b"], vec!["a", "a/b"])]
+    #[case::complex_nested(&["a/b/c", "d"], vec!["a/b/c", "d"])]
+    #[case::multiple_slash_tags(&["foo/bar", "baz/qux"], vec!["foo/bar", "baz/qux"])]
+    #[case::empty_no_tags(&[], vec![])]
+    fn test_series_key_v2_format(#[case] tags: &[&str], #[case] expected: Vec<&str>) {
+        // Create schema using SchemaBuilder (creates v2 format)
+        let mut builder = SchemaBuilder::new();
+        for tag in tags {
+            builder.tag(*tag);
+        }
+
+        // Only set series key if there are tags (for empty test case)
+        if !tags.is_empty() {
+            builder.with_series_key(tags.iter().copied());
+        }
+
+        let schema = builder
+            .influx_field("f1", Float)
+            .timestamp()
+            .build()
+            .unwrap();
+
+        // Verify series key returns the correct tags in schema order
+        if tags.is_empty() {
+            // Empty case: no series key should be set
+            assert_eq!(schema.series_key(), None);
+            assert!(
+                !schema
+                    .inner
+                    .metadata
+                    .contains_key(SERIES_KEY_V2_METADATA_KEY)
+            );
+            assert!(!schema.inner.metadata.contains_key(SERIES_KEY_METADATA_KEY));
+        } else {
+            let series_key = schema.series_key().unwrap();
+            assert_eq!(
+                expected,
+                series_key.as_slice(),
+                "V2 format failed for tags {:?}",
+                tags
+            );
+
+            // Verify it's using v2 format internally
+            assert!(
+                schema
+                    .inner
+                    .metadata
+                    .contains_key(SERIES_KEY_V2_METADATA_KEY)
+            );
+            assert!(!schema.inner.metadata.contains_key(SERIES_KEY_METADATA_KEY));
+
+            // Verify v2 encoding/decoding roundtrip preserves order
+            let v2_encoded = schema
+                .inner
+                .metadata
+                .get(SERIES_KEY_V2_METADATA_KEY)
+                .unwrap();
+            let decoded = decode_series_key_v2(v2_encoded).unwrap();
+            let expected_strings: Vec<std::string::String> =
+                expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                decoded, expected_strings,
+                "V2 decode failed for tags {:?}",
+                tags
+            );
+        }
     }
 
     #[cfg(feature = "v3")]
@@ -1999,9 +2170,65 @@ mod test {
         assert!(matches!(err, Error::InvalidMetadata { .. }));
 
         // Test truncated length
-        let encoded = encode_series_key_v2(&["test".to_string()]);
+        let encoded = encode_series_key_v2(["test"]);
         let truncated = &encoded[..encoded.len() - 5]; // Remove some chars
         let err = decode_series_key_v2(truncated).unwrap_err();
         assert!(matches!(err, Error::InvalidMetadata { .. }));
+    }
+
+    #[cfg(feature = "v3")]
+    #[rstest]
+    #[case::simple(&["a", "b", "c"])]
+    #[case::tags_with_slash(&["a/b", "c"])]
+    #[case::single_tag_with_slash(&["a/b/c"])]
+    #[case::duplicate_tags_scenario(&["region/host", "region", "host"])]
+    #[case::prefix_overlap(&["a", "a/b"])]
+    #[case::complex_nested(&["a/b/c", "d"])]
+    fn test_complete_series_key_flow_v2(#[case] tags: &[&str]) {
+        // Create schema with v2 format
+        let mut builder = SchemaBuilder::new();
+        for tag in tags {
+            builder.tag(*tag);
+        }
+        let schema = builder
+            .influx_field("f1", Float)
+            .timestamp()
+            .with_series_key(tags.iter().copied())
+            .build()
+            .unwrap();
+
+        // Verify series_key() returns correct result
+        let series_key = schema.series_key().unwrap();
+        assert_eq!(
+            tags,
+            series_key.as_slice(),
+            "Series key mismatch for tags: {:?}",
+            tags
+        );
+
+        // Verify primary_key() includes time
+        let primary_key = schema.primary_key();
+        let mut expected_pk: Vec<&str> = tags.to_vec();
+        expected_pk.push("time");
+        assert_eq!(
+            expected_pk, primary_key,
+            "Primary key mismatch for tags: {:?}",
+            tags
+        );
+
+        // Extract the metadata and verify v2 format exists
+        let metadata = &schema.inner.metadata();
+        assert!(
+            metadata.contains_key(SERIES_KEY_V2_METADATA_KEY),
+            "V2 metadata key missing for tags: {:?}",
+            tags
+        );
+
+        // Verify v2 encoding/decoding works
+        if let Some(v2_encoded) = metadata.get(SERIES_KEY_V2_METADATA_KEY) {
+            let decoded = decode_series_key_v2(v2_encoded).unwrap();
+            let expected: Vec<std::string::String> = tags.iter().map(|s| s.to_string()).collect();
+            assert_eq!(expected, decoded, "V2 decode mismatch for tags: {:?}", tags);
+        }
     }
 }

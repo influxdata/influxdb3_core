@@ -4,7 +4,10 @@ use std::{
 };
 
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::{
+        plan_datafusion_err,
+        tree_node::{Transformed, TreeNode},
+    },
     config::ConfigOptions,
     datasource::{
         physical_plan::{FileScanConfig, FileScanConfigBuilder},
@@ -112,6 +115,7 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
                 .collect::<Result<Vec<_>>>()?,
             None => column_indices,
         };
+
         let col_map = columns
             .iter()
             .cloned()
@@ -122,11 +126,24 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             .output_ordering
             .iter()
             .map(|output_ordering| project_output_ordering(output_ordering, &col_map))
-            .collect::<Result<_>>()?;
-        let file_scan_config = FileScanConfigBuilder::from(file_scan_config.clone())
-            .with_output_ordering(output_ordering)
-            .with_projection(Some(projection))
-            .build();
+            .collect::<Result<Vec<_>>>()?;
+        // if there's any empty output order, we need to drop everything, at least until https://github.com/apache/datafusion/issues/17354 is fixed
+        let output_ordering = output_ordering.into_iter().try_fold(
+            Vec::with_capacity(file_scan_config.output_ordering.len()),
+            |mut out, next| {
+                let next = next?;
+                out.push(next);
+                Some(out)
+            },
+        );
+
+        let mut file_scan_config_builder =
+            FileScanConfigBuilder::from(file_scan_config.clone()).with_projection(Some(projection));
+        if let Some(output_ordering) = output_ordering {
+            file_scan_config_builder =
+                file_scan_config_builder.with_output_ordering(output_ordering);
+        }
+        let file_scan_config = file_scan_config_builder.build();
         return Ok(Transformed::yes(DataSourceExec::from_data_source(
             file_scan_config,
         )));
@@ -160,7 +177,8 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             |plan, col_map| {
                 Ok(Arc::new(
                     SortExec::new(
-                        reassign_sort_exprs_columns(child_sort.expr(), col_map)?.into(),
+                        LexOrdering::new(reassign_sort_exprs_columns(child_sort.expr(), col_map)?)
+                            .ok_or_else(|| plan_datafusion_err!("empty SortExec ordering"))?,
                         plan,
                     )
                     .with_preserve_partitioning(child_sort.preserve_partitioning())
@@ -183,7 +201,10 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
             Arc::clone(child_sort.input()),
             |plan, col_map| {
                 Ok(Arc::new(SortPreservingMergeExec::new(
-                    reassign_sort_exprs_columns(child_sort.expr(), col_map)?.into(),
+                    LexOrdering::new(reassign_sort_exprs_columns(child_sort.expr(), col_map)?)
+                        .ok_or_else(|| {
+                            plan_datafusion_err!("SortPreservingMergeExec sort key empty")
+                        })?,
                     plan,
                 )))
             },
@@ -221,7 +242,8 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
                 let sort_keys = reassign_sort_exprs_columns(child_dedup.sort_keys(), col_map)?;
                 Ok(Arc::new(DeduplicateExec::new(
                     plan,
-                    sort_keys.into(),
+                    LexOrdering::new(sort_keys)
+                        .ok_or_else(|| plan_datafusion_err!("de-dup sort key empty"))?,
                     child_dedup.use_chunk_order_col(),
                 )))
             },
@@ -264,7 +286,7 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
 fn project_output_ordering(
     output_ordering: &LexOrdering,
     col_map: &HashMap<Column, usize>,
-) -> Result<LexOrdering> {
+) -> Result<Option<LexOrdering>> {
     // take longest prefix
     let sort_exprs = output_ordering
         .iter()
@@ -280,7 +302,10 @@ fn project_output_ordering(
         .cloned()
         .collect::<Vec<_>>();
 
-    Ok(reassign_sort_exprs_columns(&sort_exprs, col_map)?.into())
+    Ok(LexOrdering::new(reassign_sort_exprs_columns(
+        &sort_exprs,
+        col_map,
+    )?))
 }
 
 /// remap the column references in the expression to the new
@@ -407,9 +432,6 @@ mod tests {
         compute::SortOptions,
         datatypes::{DataType, Field, Schema, SchemaRef},
     };
-    use datafusion::datasource::physical_plan::{
-        FileScanConfig, FileScanConfigBuilder, ParquetSource,
-    };
     use datafusion::{
         common::JoinType,
         datasource::object_store::ObjectStoreUrl,
@@ -423,6 +445,10 @@ mod tests {
             joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode, utils::JoinFilter},
         },
         scalar::ScalarValue,
+    };
+    use datafusion::{
+        common::NullEquality,
+        datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource},
     };
     use datafusion_util::config::table_parquet_options;
     use serde::Serialize;
@@ -710,7 +736,7 @@ mod tests {
         )
         .with_projection(Some(projection))
         .with_output_ordering(vec![
-            vec![
+            LexOrdering::new(vec![
                 PhysicalSortExpr {
                     expr: expr_col("tag3", &schema_projected),
                     options: Default::default(),
@@ -723,8 +749,8 @@ mod tests {
                     expr: expr_col("tag2", &schema_projected),
                     options: Default::default(),
                 },
-            ]
-            .into(),
+            ])
+            .unwrap(),
         ]);
         let inner = DataSourceExec::from_data_source(file_scan_config.build());
         let plan = Arc::new(
@@ -762,6 +788,47 @@ mod tests {
             Field::new("tag3", DataType::Utf8, true),
         ]);
         assert_eq!(data_source_exec.schema().as_ref(), &expected_schema);
+    }
+
+    #[test]
+    fn test_parquet_empty_ordering_after_projection() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tag1", DataType::Utf8, true),
+            Field::new("tag2", DataType::Utf8, true),
+        ]));
+        let file_scan_config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::clone(&schema),
+            Arc::new(ParquetSource::new(table_parquet_options())),
+        )
+        .with_output_ordering(vec![
+            LexOrdering::new(vec![PhysicalSortExpr {
+                expr: expr_col("tag2", &schema),
+                options: Default::default(),
+            }])
+            .unwrap(),
+        ]);
+        let inner = DataSourceExec::from_data_source(file_scan_config.build());
+        let plan = Arc::new(
+            ProjectionExec::try_new(
+                vec![(expr_col("tag1", &inner.schema()), String::from("tag1"))],
+                inner,
+            )
+            .unwrap(),
+        );
+        let opt = ProjectionPushdown;
+        let test = OptimizationTest::new(plan, opt);
+        insta::assert_yaml_snapshot!(
+            test,
+            @r#"
+        input:
+          - " ProjectionExec: expr=[tag1@0 as tag1]"
+          - "   DataSourceExec: file_groups={0 groups: []}, projection=[tag1, tag2], output_ordering=[tag2@1 ASC], file_type=parquet"
+        output:
+          Ok:
+            - " DataSourceExec: file_groups={0 groups: []}, projection=[tag1], file_type=parquet"
+        "#
+        );
     }
 
     #[test]
@@ -941,14 +1008,14 @@ mod tests {
                 vec![(expr_col("tag1", &schema), String::from("tag1"))],
                 Arc::new(
                     SortExec::new(
-                        vec![PhysicalSortExpr {
+                        LexOrdering::new(vec![PhysicalSortExpr {
                             expr: expr_col("tag2", &schema),
                             options: SortOptions {
                                 descending: true,
                                 ..Default::default()
                             },
-                        }]
-                        .into(),
+                        }])
+                        .unwrap(),
                         Arc::new(TestExec::new(schema)),
                     )
                     .with_fetch(Some(42)),
@@ -982,14 +1049,14 @@ mod tests {
                 vec![(expr_col("tag1", &schema), String::from("tag1"))],
                 Arc::new(
                     SortExec::new(
-                        vec![PhysicalSortExpr {
+                        LexOrdering::new(vec![PhysicalSortExpr {
                             expr: expr_col("tag2", &schema),
                             options: SortOptions {
                                 descending: true,
                                 ..Default::default()
                             },
-                        }]
-                        .into(),
+                        }])
+                        .unwrap(),
                         Arc::new(TestExec::new_with_partitions(schema, 2)),
                     )
                     .with_preserve_partitioning(true)
@@ -1037,14 +1104,14 @@ mod tests {
             ProjectionExec::try_new(
                 vec![(expr_col("tag1", &schema), String::from("tag1"))],
                 Arc::new(SortPreservingMergeExec::new(
-                    vec![PhysicalSortExpr {
+                    LexOrdering::new(vec![PhysicalSortExpr {
                         expr: expr_col("tag2", &schema),
                         options: SortOptions {
                             descending: true,
                             ..Default::default()
                         },
-                    }]
-                    .into(),
+                    }])
+                    .unwrap(),
                     Arc::new(TestExec::new(schema)),
                 )),
             )
@@ -1165,14 +1232,14 @@ mod tests {
                 vec![(expr_col("tag1", &schema), String::from("tag1"))],
                 Arc::new(DeduplicateExec::new(
                     Arc::new(TestExec::new(Arc::clone(&schema))),
-                    vec![PhysicalSortExpr {
+                    LexOrdering::new(vec![PhysicalSortExpr {
                         expr: expr_col("tag2", &schema),
                         options: SortOptions {
                             descending: true,
                             ..Default::default()
                         },
-                    }]
-                    .into(),
+                    }])
+                    .unwrap(),
                     false,
                 )),
             )
@@ -1212,7 +1279,7 @@ mod tests {
                 ],
                 Arc::new(DeduplicateExec::new(
                     Arc::new(TestExec::new(Arc::clone(&schema))),
-                    vec![
+                    LexOrdering::new(vec![
                         PhysicalSortExpr {
                             expr: expr_col("tag1", &schema),
                             options: SortOptions {
@@ -1227,8 +1294,8 @@ mod tests {
                                 ..Default::default()
                             },
                         },
-                    ]
-                    .into(),
+                    ])
+                    .unwrap(),
                     false,
                 )),
             )
@@ -1311,7 +1378,7 @@ mod tests {
             &JoinType::Full,
             None,
             PartitionMode::Auto,
-            false,
+            NullEquality::NullEqualsNothing,
         )
         .unwrap();
         let plan = ProjectionExec::try_new(
@@ -1532,7 +1599,7 @@ mod tests {
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(
             plan,
-            vec![
+            LexOrdering::new(vec![
                 PhysicalSortExpr {
                     expr: expr_col("tag1", &plan_schema),
                     options: Default::default(),
@@ -1541,8 +1608,8 @@ mod tests {
                     expr: expr_col("tag2", &plan_schema),
                     options: Default::default(),
                 },
-            ]
-            .into(),
+            ])
+            .unwrap(),
             false,
         ));
         let plan =
@@ -1578,7 +1645,7 @@ mod tests {
     fn test_project_output_ordering_keep() {
         let schema = schema();
         let projection = vec!["tag1", "tag2"];
-        let output_ordering = vec![
+        let output_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: expr_col("tag1", &schema),
                 options: Default::default(),
@@ -1587,10 +1654,11 @@ mod tests {
                 expr: expr_col("tag2", &schema),
                 options: Default::default(),
             },
-        ];
+        ])
+        .unwrap();
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1609,7 +1677,7 @@ mod tests {
     fn test_project_output_ordering_project_prefix() {
         let schema = schema();
         let projection = vec!["tag1"]; // prefix of the sort key
-        let output_ordering = vec![
+        let output_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: expr_col("tag1", &schema),
                 options: Default::default(),
@@ -1618,10 +1686,11 @@ mod tests {
                 expr: expr_col("tag2", &schema),
                 options: Default::default(),
             },
-        ];
+        ])
+        .unwrap();
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1638,7 +1707,7 @@ mod tests {
     fn test_project_output_ordering_project_non_prefix() {
         let schema = schema();
         let projection = vec!["tag2"]; // in sort key, but not prefix
-        let output_ordering = vec![
+        let output_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: expr_col("tag1", &schema),
                 options: Default::default(),
@@ -1647,10 +1716,11 @@ mod tests {
                 expr: expr_col("tag2", &schema),
                 options: Default::default(),
             },
-        ];
+        ])
+        .unwrap();
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1666,7 +1736,7 @@ mod tests {
     fn test_project_output_ordering_projection_reorder() {
         let schema = schema();
         let projection = vec!["tag2", "tag1", "field"]; // in different order than sort key
-        let output_ordering = vec![
+        let output_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: expr_col("tag1", &schema),
                 options: Default::default(),
@@ -1675,10 +1745,11 @@ mod tests {
                 expr: expr_col("tag2", &schema),
                 options: Default::default(),
             },
-        ];
+        ])
+        .unwrap();
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
             @r"
         output_ordering:
           - tag1@0
@@ -1698,7 +1769,7 @@ mod tests {
     fn test_project_output_ordering_constant() {
         let schema = schema();
         let projection = vec!["tag2"];
-        let output_ordering = vec![
+        let output_ordering = LexOrdering::new(vec![
             // ordering by a constant is ignored
             PhysicalSortExpr {
                 expr: datafusion::physical_plan::expressions::lit(1),
@@ -1708,10 +1779,11 @@ mod tests {
                 expr: expr_col("tag2", &schema),
                 options: Default::default(),
             },
-        ];
+        ])
+        .unwrap();
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
             @r#"
         output_ordering:
           - "1"
@@ -1727,7 +1799,7 @@ mod tests {
     fn test_project_output_ordering_constant_second_position() {
         let schema = schema();
         let projection = vec!["tag2"];
-        let output_ordering = vec![
+        let output_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: expr_col("tag2", &schema),
                 options: Default::default(),
@@ -1737,10 +1809,11 @@ mod tests {
                 expr: datafusion::physical_plan::expressions::lit(1),
                 options: Default::default(),
             },
-        ];
+        ])
+        .unwrap();
 
         insta::assert_yaml_snapshot!(
-            ProjectOutputOrdering::new(&schema, output_ordering.into(), projection),
+            ProjectOutputOrdering::new(&schema, output_ordering, projection),
             @r#"
         output_ordering:
           - tag2@1
@@ -1783,7 +1856,10 @@ mod tests {
             let projected_ordering = project_output_ordering(&output_ordering, &col_map);
 
             let projected_ordering = match projected_ordering {
-                Ok(projected_ordering) => format_sort_exprs(&projected_ordering),
+                Ok(Some(projected_ordering)) => format_sort_exprs(&projected_ordering),
+                Ok(None) => {
+                    vec![]
+                }
                 Err(e) => vec![e.to_string()],
             };
 

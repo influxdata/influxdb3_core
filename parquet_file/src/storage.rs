@@ -70,7 +70,7 @@ impl From<UploadError> for DataFusionError {
                 Self::Context(String::from("serialize"), Box::new(e.into()))
             }
             UploadError::Metadata(e) => Self::External(Box::new(e)),
-            UploadError::Upload(e) => Self::ObjectStore(e),
+            UploadError::Upload(e) => Self::ObjectStore(Box::new(e)),
             UploadError::Config(e) => Self::External(e.into()),
         }
     }

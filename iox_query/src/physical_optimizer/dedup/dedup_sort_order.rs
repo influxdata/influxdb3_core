@@ -2,7 +2,10 @@ use std::{cmp::Reverse, sync::Arc};
 
 use arrow::compute::SortOptions;
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::{
+        plan_datafusion_err,
+        tree_node::{Transformed, TreeNode},
+    },
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
@@ -137,7 +140,8 @@ impl PhysicalOptimizerRule for DedupSortOrder {
                     config.execution.target_partitions,
                 );
 
-                let sort_exprs = arrow_sort_key_exprs(&quorum_sort_key, &schema);
+                let sort_exprs = arrow_sort_key_exprs(&quorum_sort_key, &schema)
+                    .ok_or_else(|| plan_datafusion_err!("de-dup sort key empty"))?;
                 return Ok(Transformed::yes(Arc::new(DeduplicateExec::new(
                     child,
                     sort_exprs,
@@ -633,7 +637,7 @@ mod tests {
         );
 
         let sort_key = schema::sort::SortKey::from_columns(["tag1", "tag3", "tag2", "time"]);
-        let sort_exprs = arrow_sort_key_exprs(&sort_key, &plan.schema());
+        let sort_exprs = arrow_sort_key_exprs(&sort_key, &plan.schema()).unwrap();
         let plan = Arc::new(DeduplicateExec::new(plan, sort_exprs, false));
         let opt = DedupSortOrder;
         insta::assert_yaml_snapshot!(

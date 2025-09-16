@@ -5,9 +5,8 @@
 version = 2
 yanked = "deny"
 ignore = [
-    # paste crate is no longer maintained, but it is past 1.0
-    # Keep this here until our transisent dependencies no longer
-    # need it
+    # paste is unmaintained but does not have any known issues;
+    # there is no replacement at this time
     "RUSTSEC-2024-0436",
 ]
 git-fetch-with-cli = true
@@ -20,11 +19,14 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "bzip2-1.0.6",
+    "BSL-1.0",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "NCSA",
+    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
 ]

@@ -25,7 +25,7 @@ use authz::{Authorizer, extract_token};
 use data_types::NamespaceNameError;
 use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use error_reporting::DisplaySourceChain;
-use flightsql::FlightSQLCommand;
+use flightsql::{BaseTableType, FlightSQLCommand};
 use futures::{Stream, StreamExt, TryStreamExt, ready, stream::BoxStream};
 use generated_types::{
     Code, Request, Response, Status, Streaming,
@@ -68,6 +68,9 @@ const IOX_FLIGHT_SQL_DATABASE_REQUEST_HEADERS: [&str; 4] = [
     "bucket-name",
     "iox-namespace-name", // deprecated
 ];
+
+/// Header that sets the base table type for FlightSQL requests. `BASE TABLE` or `TABLE`
+const IOX_FLIGHT_SQL_BASE_TABLE_TYPE: &str = "x-influxdata-base-table-type";
 
 /// Header that contains a query-specific partition limit.
 const IOX_FLIGHT_PARTITION_LIMIT_HEADER: &str = "x-influxdata-partition-limit";
@@ -163,6 +166,9 @@ pub enum Error {
     #[snafu(display("no 'database' header in request"))]
     NoFlightSQLDatabase,
 
+    #[snafu(display("Invalid argument: {}", source))]
+    InvalidArgument { source: flightsql::Error },
+
     #[snafu(display("Invalid 'database' header in request: {}", source))]
     InvalidDatabaseHeader {
         source: generated_types::metadata::errors::ToStrError,
@@ -240,6 +246,7 @@ impl From<Error> for Status {
             | Error::EncodeSchema { .. }
             | Error::TooManyFlightSQLDatabases { .. }
             | Error::NoFlightSQLDatabase
+            | Error::InvalidArgument { .. }
             | Error::InvalidDatabaseHeader { .. }
             | Error::Planning { .. }
             | Error::Deserialization { .. }
@@ -273,6 +280,7 @@ impl Error {
             | Self::TooManyFlightSQLDatabases { .. }
             | Self::NoFlightSQLDatabase
             | Self::NoFlightDescriptor
+            | Self::InvalidArgument { .. }
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. } => Code::InvalidArgument,
             Self::Database { source }
@@ -280,7 +288,8 @@ impl Error {
             | Self::Query { source, .. } => datafusion_error_to_tonic_code(&source),
             Self::UnsupportedMessageType { .. } => Code::Unimplemented,
             Self::FlightSQL { source } => match source {
-                flightsql::Error::InvalidHandle { .. }
+                flightsql::Error::InvalidArgument { .. }
+                | flightsql::Error::InvalidHandle { .. }
                 | flightsql::Error::InvalidTypeUrl { .. }
                 | flightsql::Error::Decode { .. }
                 | flightsql::Error::InvalidPreparedStatementParams { .. }
@@ -324,6 +333,7 @@ impl Error {
             | Self::TooManyFlightSQLDatabases { .. }
             | Self::NoFlightSQLDatabase
             | Self::NoFlightDescriptor
+            | Self::InvalidArgument { .. }
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. }
             | Self::Optimize { .. }
@@ -351,6 +361,7 @@ impl Error {
             | Self::TooManyFlightSQLDatabases { .. }
             | Self::NoFlightSQLDatabase
             | Self::NoFlightDescriptor
+            | Self::InvalidArgument { .. }
             | Self::InvalidDatabaseHeader { .. }
             | Self::InvalidDatabaseName { .. }
             | Self::Optimize { .. }
@@ -626,6 +637,7 @@ pub fn make_server(
 
 impl FlightService {
     /// Implementation of the `DoGet` method
+    #[expect(clippy::too_many_arguments)]
     async fn run_do_get(
         server: Arc<dyn QueryDatabase>,
         span_ctx: Option<SpanContext>,
@@ -634,6 +646,7 @@ impl FlightService {
         log_entry: &mut Option<Arc<QueryLogEntry>>,
         query_config: Option<&QueryConfig>,
         auth_id: Option<String>,
+        base_table_type: BaseTableType,
     ) -> Result<TonicStream<FlightData>, Status> {
         let IoxGetRequest {
             database,
@@ -687,7 +700,9 @@ impl FlightService {
             .run(async move {
                 match q.as_ref() {
                     RunQuery::FlightSQL(msg) => {
-                        planner.flight_sql_do_get(&ns, db, msg.clone()).await
+                        planner
+                            .flight_sql_do_get(&ns, db, msg.clone(), base_table_type)
+                            .await
                     }
                     RunQuery::Sql(sql_query) => planner.sql(sql_query, params).await,
                     RunQuery::InfluxQL(sql_query) => planner.influxql(sql_query, params).await,
@@ -774,6 +789,7 @@ impl Flight for FlightService {
         let authz_token = get_flight_authz(metadata);
         let debug_header = has_debug_header(metadata);
         let query_config = get_query_config(metadata);
+        let base_table_type = get_flightsql_base_table_type(metadata)?;
         let ticket = request.into_inner();
 
         // attempt to decode ticket
@@ -822,6 +838,7 @@ impl Flight for FlightService {
             &mut log_entry,
             query_config.as_ref(),
             authz.into_subject(),
+            base_table_type,
         )
         .await;
 
@@ -1200,6 +1217,20 @@ fn get_flightsql_namespace(metadata: &MetadataMap) -> Result<String> {
     Ok(database_name.context(NoFlightSQLDatabaseSnafu)?.to_string())
 }
 
+/// Retrieve the base table type for FlightSQL requests.
+/// Only `BASE TABLE` or `TABLE` are valid.
+/// If the header is not present, default to `BASE TABLE` type.
+/// If invalid, return an error.
+fn get_flightsql_base_table_type(metadata: &MetadataMap) -> Result<BaseTableType> {
+    match metadata.get(IOX_FLIGHT_SQL_BASE_TABLE_TYPE) {
+        Some(value) => {
+            let value_str = value.to_str().context(InvalidDatabaseHeaderSnafu)?;
+            value_str.parse().context(InvalidArgumentSnafu)
+        }
+        None => Ok(BaseTableType::BaseTable), // Default to `BASE TABLE` if header not present
+    }
+}
+
 /// Retrieve the authorization token associated with the request.
 fn get_flight_authz(metadata: &MetadataMap) -> Option<Vec<u8>> {
     extract_token(metadata.get("authorization"))
@@ -1301,7 +1332,7 @@ impl GetStream {
         let query_results = futures::stream::once(async move {
             let permit = server.acquire_semaphore(permit_span).await;
             let query_completed_token = query_completed_token.permit();
-            *permit_state_captured.lock().expect("not poisened") = Some(PermitAndToken {
+            *permit_state_captured.lock().expect("not poisoned") = Some(PermitAndToken {
                 permit,
                 query_completed_token,
             });
@@ -1332,7 +1363,7 @@ impl GetStream {
 
         self.permit_state
             .lock()
-            .expect("not poisened")
+            .expect("not poisoned")
             .take()
             .map(|state| state.query_completed_token)
     }

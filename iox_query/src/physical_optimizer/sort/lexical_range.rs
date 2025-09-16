@@ -331,7 +331,7 @@ impl ConvertedRows {
         let values = self
             .converter
             .convert_rows([self.min_row(index)])
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         Ok(values.iter().map(Arc::clone).collect::<Vec<_>>())
     }
 
@@ -343,7 +343,7 @@ impl ConvertedRows {
         let values = self
             .converter
             .convert_rows([self.max_row(index)])
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         Ok(values.iter().map(Arc::clone).collect::<Vec<_>>())
     }
 

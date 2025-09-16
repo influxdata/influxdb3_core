@@ -107,12 +107,14 @@ fn run_bench(
     } = params;
 
     let metrics = metric::Registry::new();
+    let max_memory_size = ((key_size * n_keys) as f64 * size_fraction).ceil() as usize;
     let store = Arc::new(S3Fifo::<Path, Arc<Bytes>>::new(
         S3Config {
-            max_memory_size: ((key_size * n_keys) as f64 * size_fraction).ceil() as usize,
+            max_memory_size,
             max_ghost_memory_size: 10_000_000,
             hook: Arc::new(NoOpHook::default()),
             move_to_main_threshold: 0.25,
+            inflight_bytes: max_memory_size.div_ceil(4), // 25%
         },
         &metrics,
     ));
@@ -149,7 +151,8 @@ fn run_bench(
                             let data = Arc::new(Bytes::from(data.as_ref().clone()));
 
                             let t_begin = Instant::now();
-                            store.get_or_put(Arc::new(path(key_idx)), data, 0);
+                            let (_, evicted) = store.get_or_put(Arc::new(path(key_idx)), data, 0);
+                            drop(evicted);
                             let t_end = Instant::now();
 
                             measurements.push(Measurement {

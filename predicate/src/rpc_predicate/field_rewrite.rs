@@ -166,7 +166,9 @@ impl FieldProjectionRewriter {
             .map(|expr| match expr.evaluate(&batch) {
                 Ok(ColumnarValue::Array(arr)) => arr,
                 Ok(ColumnarValue::Scalar(s)) => {
-                    panic!("Unexpected result evaluating {expr:?} against {batch:?}: {s:?}")
+                    s.to_array_of_size(batch.num_rows()).unwrap_or_else(|e| {
+                        panic!("Unexpected err converting scalar result from evaluating {expr:?} against {batch:?}: {e}")
+                    })
                 }
                 Err(e) => panic!("Unexpected err evaluating {expr:?} against {batch:?}: {e}"),
             })

@@ -306,6 +306,11 @@ pub struct Normalizer {
     /// If set, round floats to the specified number of decimal places
     pub rounded_floats: Option<usize>,
 
+    /// If true, merge time series data when comparing
+    // This value is not used other than to indicate the merging to
+    // the test framework generator step.
+    pub merge_time_series: bool,
+
     /// Formatter to turn [`RecordBatch`]es into text.
     pub formatter: Formatter,
 }
@@ -326,6 +331,7 @@ impl Normalizer {
             no_table_borders: _,
             ignore_time_column: _,
             rounded_floats,
+            merge_time_series: _,
             formatter,
         } = self;
 
@@ -388,6 +394,7 @@ impl Normalizer {
             no_table_borders: _,
             rounded_floats: _,
             ignore_time_column: _,
+            merge_time_series: _,
             formatter: _,
         } = self;
 
@@ -493,6 +500,7 @@ impl Normalizer {
             no_table_borders,
             rounded_floats,
             ignore_time_column,
+            merge_time_series,
             formatter: _,
         } = self;
 
@@ -516,6 +524,9 @@ impl Normalizer {
         }
         if *ignore_time_column {
             output.push("-- Results After Ignoring Time Column".into())
+        }
+        if *merge_time_series {
+            output.push("-- Results After Merging Time Series".into())
         }
         if let Some(rounded_floats) = rounded_floats {
             output.push(format!(

@@ -935,7 +935,7 @@ mod test {
         let key = Arc::new(Column::new("key", 1)) as Arc<dyn PhysicalExpr>;
         let value = Arc::new(Column::new("value", 2)) as Arc<dyn PhysicalExpr>;
 
-        vec![
+        LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: measurement,
                 options: SortOptions {
@@ -957,28 +957,28 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ]
-        .into()
+        ])
+        .unwrap()
     }
 
     fn sort_order_for_sort() -> LexOrdering {
         let value = Arc::new(Column::new("value", 2)) as Arc<dyn PhysicalExpr>;
 
-        vec![PhysicalSortExpr {
+        LexOrdering::new(vec![PhysicalSortExpr {
             expr: value,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
             },
-        }]
-        .into()
+        }])
+        .unwrap()
     }
 
     fn sort_order_two_cols() -> LexOrdering {
         let measurement = Arc::new(Column::new("iox::measurement", 0)) as Arc<dyn PhysicalExpr>;
         let key = Arc::new(Column::new("key", 1)) as Arc<dyn PhysicalExpr>;
 
-        vec![
+        LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: measurement,
                 options: SortOptions {
@@ -993,21 +993,21 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ]
-        .into()
+        ])
+        .unwrap()
     }
 
     fn sort_order_not_on_column() -> LexOrdering {
         let measurement =
             Arc::new(Literal::new(ScalarValue::from("iox::measurement"))) as Arc<dyn PhysicalExpr>;
 
-        vec![PhysicalSortExpr {
+        LexOrdering::new(vec![PhysicalSortExpr {
             expr: measurement,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
             },
-        }]
-        .into()
+        }])
+        .unwrap()
     }
 }

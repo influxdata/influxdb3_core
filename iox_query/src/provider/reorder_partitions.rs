@@ -5,7 +5,7 @@ use datafusion::{
     common::Statistics,
     error::Result,
     execution::{SendableRecordBatchStream, TaskContext},
-    physical_expr::{EquivalenceProperties, LexOrdering, LexRequirement},
+    physical_expr::{EquivalenceProperties, LexOrdering, LexRequirement, OrderingRequirements},
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
         PlanProperties,
@@ -60,15 +60,15 @@ impl ReorderPartitionsExec {
         input: Arc<dyn ExecutionPlan>,
         mapped_partition_indices: Vec<usize>,
         output_ordering: LexOrdering,
-    ) -> Self {
-        let cache = Self::compute_properties(&input, &output_ordering);
-        Self {
+    ) -> Result<Self> {
+        let cache = Self::compute_properties(&input, &output_ordering)?;
+        Ok(Self {
             input,
             mapped_partition_indices,
             output_ordering,
             cache,
             metrics: ExecutionPlanMetricsSet::new(),
-        }
+        })
     }
 
     /// Input
@@ -86,22 +86,22 @@ impl ReorderPartitionsExec {
     fn compute_properties(
         input: &Arc<dyn ExecutionPlan>,
         output_ordering: &LexOrdering,
-    ) -> PlanProperties {
+    ) -> Result<PlanProperties> {
         let input_constants = input
             .properties()
             .equivalence_properties()
             .constants()
             .to_owned();
-        let mut eq_properties =
-            EquivalenceProperties::new(input.schema()).with_constants(input_constants);
-        eq_properties.add_new_ordering(output_ordering.clone());
+        let mut eq_properties = EquivalenceProperties::new(input.schema());
+        eq_properties.add_constants(input_constants)?;
+        eq_properties.add_ordering(output_ordering.iter().cloned());
 
-        PlanProperties::new(
+        Ok(PlanProperties::new(
             eq_properties,
             input.output_partitioning().clone(),
             input.pipeline_behavior(),
             input.boundedness(),
-        )
+        ))
     }
 }
 
@@ -126,13 +126,14 @@ impl ExecutionPlan for ReorderPartitionsExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         let input_ordering = self
             .input()
             .properties()
             .output_ordering()
             .cloned()
-            .map(LexRequirement::from_lex_ordering);
+            .map(LexRequirement::from)
+            .map(OrderingRequirements::new);
 
         vec![input_ordering]
     }
@@ -149,7 +150,7 @@ impl ExecutionPlan for ReorderPartitionsExec {
             Arc::<dyn ExecutionPlan>::clone(&children[0]),
             self.mapped_partition_indices.clone(),
             self.output_ordering.clone(),
-        )))
+        )?))
     }
 
     fn execute(

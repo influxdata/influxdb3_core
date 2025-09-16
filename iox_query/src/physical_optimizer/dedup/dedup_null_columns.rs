@@ -15,7 +15,7 @@ use crate::{
     util::arrow_sort_key_exprs,
 };
 
-/// Determine sort key set of [`DeduplicateExec`] by elimating all-NULL columns.
+/// Determine sort key set of [`DeduplicateExec`] by removing all-NULL columns.
 ///
 /// This finds a good sort key for [`DeduplicateExec`] based on the [`QueryChunk`]s covered by the deduplication.
 ///
@@ -37,52 +37,53 @@ impl PhysicalOptimizerRule for DedupNullColumns {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|plan| {
             let plan_any = plan.as_any();
+            let Some(dedup_exec) = plan_any.downcast_ref::<DeduplicateExec>() else {
+                return Ok(Transformed::no(plan));
+            };
 
-            if let Some(dedup_exec) = plan_any.downcast_ref::<DeduplicateExec>() {
-                let mut children = dedup_exec.children();
-                assert_eq!(children.len(), 1);
-                let child = children.remove(0);
-                let Some((schema, chunks, _output_sort_key)) = extract_chunks(child.as_ref())
-                else {
-                    return Ok(Transformed::no(plan));
-                };
+            let mut children = dedup_exec.children();
+            assert_eq!(children.len(), 1);
+            let child = children.remove(0);
+            let Some((schema, chunks, _output_sort_key)) = extract_chunks(child.as_ref()) else {
+                return Ok(Transformed::no(plan));
+            };
 
-                let pk_cols = dedup_exec.sort_columns_ordered();
+            let pk_cols = dedup_exec.sort_columns_ordered();
 
-                let mut used_pk_cols = HashMap::new();
-                for chunk in &chunks {
-                    for (_type, field) in chunk.schema().iter() {
-                        if let Some(pos) = pk_cols.get(field.name().as_str()) {
-                            used_pk_cols.insert(field.name().as_str(), *pos);
-                        }
+            let mut used_pk_cols = HashMap::new();
+            for chunk in &chunks {
+                for (_type, field) in chunk.schema().iter() {
+                    if let Some(pos) = pk_cols.get(field.name().as_str()) {
+                        used_pk_cols.insert(field.name().as_str(), *pos);
                     }
                 }
+            }
 
-                let mut used_pk_cols = used_pk_cols.into_iter().collect::<Vec<_>>();
-                used_pk_cols.sort_by_key(|(_col, pos)| *pos);
+            let mut used_pk_cols = used_pk_cols.into_iter().collect::<Vec<_>>();
+            used_pk_cols.sort_by_key(|(_col, pos)| *pos);
 
-                let mut sort_key_builder = SortKeyBuilder::new();
-                for (col, _pos) in used_pk_cols {
-                    sort_key_builder = sort_key_builder.with_col(col);
-                }
+            let mut sort_key_builder = SortKeyBuilder::new();
+            for (col, _pos) in used_pk_cols {
+                sort_key_builder = sort_key_builder.with_col(col);
+            }
 
-                let sort_key = sort_key_builder.build();
-                let child = chunks_to_physical_nodes(
-                    &schema,
-                    (!sort_key.is_empty()).then_some(&sort_key),
-                    chunks,
-                    config.execution.target_partitions,
-                );
+            let sort_key = sort_key_builder.build();
+            let child = chunks_to_physical_nodes(
+                &schema,
+                (!sort_key.is_empty()).then_some(&sort_key),
+                chunks,
+                config.execution.target_partitions,
+            );
 
-                let sort_exprs = arrow_sort_key_exprs(&sort_key, &schema);
-                return Ok(Transformed::yes(Arc::new(DeduplicateExec::new(
+            let transformed = match arrow_sort_key_exprs(&sort_key, &schema) {
+                Some(sort_exprs) => Arc::new(DeduplicateExec::new(
                     child,
                     sort_exprs,
                     dedup_exec.use_chunk_order_col(),
-                ))));
-            }
-
-            Ok(Transformed::no(plan))
+                )),
+                None => child,
+            };
+            Ok(Transformed::yes(transformed))
         })
         .map(|t| t.data)
     }
@@ -124,8 +125,7 @@ mod tests {
           - "   EmptyExec"
         output:
           Ok:
-            - " DeduplicateExec: []"
-            - "   EmptyExec"
+            - " EmptyExec"
         "#
         );
     }

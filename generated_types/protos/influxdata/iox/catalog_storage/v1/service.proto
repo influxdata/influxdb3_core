@@ -69,6 +69,10 @@ message GetNamespacesWithStorageRequest {
     // Filter by soft-deleted status
     // If not specified, only the active namespaces are returned
     optional influxdata.iox.common.v1.SoftDeleted deleted = 5;
+
+    // Filter namespaces by name (case-insensitive partial match)
+    // If provided, only namespaces with names containing this string are returned
+    optional string name_filter = 6;
 }
 
 // Request to get a specific namespace with storage.

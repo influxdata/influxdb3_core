@@ -1,7 +1,7 @@
 //! Implemention of DeduplicateExec operator (resolves primary key conflicts) plumbing and tests
 mod algo;
 
-use std::{collections::HashMap, slice};
+use std::collections::HashMap;
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use arrow::{error::ArrowError, record_batch::RecordBatch};
@@ -12,7 +12,7 @@ use crate::CHUNK_ORDER_COLUMN_NAME;
 
 pub use self::algo::RecordBatchDeduplicator;
 use self::algo::get_col_name;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, LexRequirement};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, OrderingRequirements};
 use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
@@ -189,7 +189,7 @@ impl DeduplicateExec {
     ) -> PlanProperties {
         trace!("Deduplicate output ordering: {:?}", sort_keys);
         let eq_properties =
-            EquivalenceProperties::new_with_orderings(input.schema(), slice::from_ref(sort_keys));
+            EquivalenceProperties::new_with_orderings(input.schema(), [sort_keys.iter().cloned()]);
 
         let output_partitioning = Partitioning::UnknownPartitioning(1);
 
@@ -234,9 +234,9 @@ impl ExecutionPlan for DeduplicateExec {
         &self.cache
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
-        vec![Some(LexRequirement::from_lex_ordering(
-            self.input_order.clone(),
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![Some(OrderingRequirements::new(
+            self.input_order.clone().into(),
         ))]
     }
 
@@ -406,10 +406,9 @@ mod test {
         record_batch::RecordBatch,
     };
     use arrow_util::assert_batches_eq;
-    use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::expressions::col;
+    use datafusion::physical_plan::test::exec::MockExec;
     use datafusion_util::test_collect;
 
     use super::*;
@@ -482,7 +481,7 @@ mod test {
             },
         }];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+----+-----+-----+",
@@ -530,7 +529,7 @@ mod test {
             },
         }];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+-----+-----+--------------------------------+",
@@ -657,7 +656,7 @@ mod test {
             },
         ];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+----+----+------+------+",
@@ -713,7 +712,7 @@ mod test {
             },
         }];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+-----+---+--------------------------------+",
@@ -763,7 +762,7 @@ mod test {
             },
         }];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+-----+----+----------------------+",
@@ -844,7 +843,7 @@ mod test {
             },
         ];
 
-        let results = dedupe(vec![batch1, batch2], sort_keys.into()).await;
+        let results = dedupe(vec![batch1, batch2], sort_keys).await;
 
         let expected = vec![
             "+----+----+-----+-----+",
@@ -973,7 +972,7 @@ mod test {
             make_single_row_batch(Some("b"), Some("b"), Some(12.0)),
         ];
         // see that the dupes at the batch boundaries are de-duped
-        let results = dedupe(input_batches, sort_keys.clone().into()).await;
+        let results = dedupe(input_batches, sort_keys.clone()).await;
         assert_batches_eq!(&expected, &results.output);
 
         // TEST CASE 2. DEDUPES WITHIN BACTHES TOO
@@ -1029,7 +1028,7 @@ mod test {
             ),
         ];
         // see that the dupes within the batch are still deduped
-        let results = dedupe(input_batches, sort_keys.into()).await;
+        let results = dedupe(input_batches, sort_keys).await;
         assert_batches_eq!(&expected, &results.output);
     }
 
@@ -1144,7 +1143,7 @@ mod test {
             make_single_row_batch(None, Some("a"), Some(16.0)),
         ];
         // see that the dupes at the batch boundaries are de-duped
-        let results = dedupe(input_batches, sort_keys.clone().into()).await;
+        let results = dedupe(input_batches, sort_keys.clone()).await;
         assert_batches_eq!(&expected, &results.output);
 
         // TEST CASE 2. DEDUPES WITHIN BACTHES TOO
@@ -1202,7 +1201,7 @@ mod test {
         ];
 
         // see that the dupes within the batch are still deduped
-        let results = dedupe(input_batches, sort_keys.into()).await;
+        let results = dedupe(input_batches, sort_keys).await;
         assert_batches_eq!(&expected, &results.output);
     }
 
@@ -1333,8 +1332,11 @@ mod test {
 
         // call and return an error
         let input = Arc::new(DummyExec::new(Arc::clone(&b1.schema()), input_batches));
-        let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(DeduplicateExec::new(input, sort_keys.into(), false));
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(
+            input,
+            LexOrdering::new(sort_keys).unwrap(),
+            false,
+        ));
         test_collect(exec).await;
     }
 
@@ -1381,7 +1383,7 @@ mod test {
             },
         }];
 
-        let results = dedupe(vec![batch1, batch2], sort_keys.into()).await;
+        let results = dedupe(vec![batch1, batch2], sort_keys).await;
 
         let expected = vec![
             "+----+-----+",
@@ -1432,7 +1434,7 @@ mod test {
             },
         }];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+----+-----+-----+",
@@ -1492,7 +1494,7 @@ mod test {
             },
         ];
 
-        let results = dedupe(vec![batch], sort_keys.into()).await;
+        let results = dedupe(vec![batch], sort_keys).await;
 
         let expected = vec![
             "+-----+----+----+",
@@ -1543,8 +1545,11 @@ mod test {
             },
         }];
 
-        let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(DeduplicateExec::new(input, sort_keys.into(), false));
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(
+            input,
+            LexOrdering::new(sort_keys).unwrap(),
+            false,
+        ));
         test_collect(exec).await;
     }
 
@@ -1593,7 +1598,7 @@ mod test {
             },
         ];
 
-        let results = dedupe(vec![batch1, batch2], sort_keys.into()).await;
+        let results = dedupe(vec![batch1, batch2], sort_keys).await;
 
         let cols: Vec<_> = results
             .output
@@ -1660,7 +1665,8 @@ mod test {
     ///
     /// This function also verifies that splitting the record batches along
     /// different boundaries does not affect the output.
-    async fn dedupe(input: Vec<RecordBatch>, sort_keys: LexOrdering) -> TestResults {
+    async fn dedupe(input: Vec<RecordBatch>, sort_keys: Vec<PhysicalSortExpr>) -> TestResults {
+        let sort_keys = LexOrdering::new(sort_keys).unwrap();
         let results = dedupe_inner(input.clone(), sort_keys.clone()).await;
 
         let results_strings = pretty_format_batches(&results.output).unwrap();
@@ -1686,10 +1692,9 @@ mod test {
 
         // Setup in memory stream
         let schema = input[0].schema();
-        let projection = None;
-        let input = Arc::new(DataSourceExec::new(Arc::new(
-            MemorySourceConfig::try_new(&[input], schema, projection).unwrap(),
-        )));
+        let input = Arc::new(
+            MockExec::new(input.into_iter().map(Ok).collect(), schema).with_use_task(false),
+        );
 
         // Create and run the deduplicator
         let exec = Arc::new(DeduplicateExec::new(input, sort_keys, false));

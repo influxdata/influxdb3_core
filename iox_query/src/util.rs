@@ -63,8 +63,8 @@ pub fn logical_sort_key_exprs(sort_key: &SortKey) -> Vec<SortExpr> {
 }
 
 /// Build a datafusion [`LexOrdering`] from an iox [`SortKey`].
-pub fn arrow_sort_key_exprs(sort_key: &SortKey, input_schema: &ArrowSchema) -> LexOrdering {
-    LexOrdering::from_iter(sort_key.iter().flat_map(|(key, options)| {
+pub fn arrow_sort_key_exprs(sort_key: &SortKey, input_schema: &ArrowSchema) -> Option<LexOrdering> {
+    LexOrdering::new(sort_key.iter().flat_map(|(key, options)| {
         // Skip over missing columns
         let expr = physical_col(key, input_schema).ok()?;
         Some(PhysicalSortExpr {

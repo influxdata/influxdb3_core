@@ -30,7 +30,9 @@ pub fn iox_session_config() -> SessionConfig {
     options.execution.parquet.pushdown_filters = true;
     options.execution.parquet.reorder_filters = true;
     options.execution.parquet.schema_force_view_types = false;
-    options.execution.time_zone = TIME_DATA_TIMEZONE().map(|s| s.to_string());
+    if let Some(time_zone) = TIME_DATA_TIMEZONE() {
+        options.execution.time_zone = time_zone.to_string();
+    }
     options.optimizer.repartition_sorts = true;
     options.optimizer.prefer_existing_union = true;
     // DataSourceExec now returns estimates rather than actual
@@ -39,6 +41,14 @@ pub fn iox_session_config() -> SessionConfig {
     options
         .execution
         .use_row_number_estimates_to_optimize_partitioning = true;
+
+    // This was set to `true` by https://github.com/apache/datafusion/pull/16290 , however it is unlikely that all our
+    // clients support this yet. Some people may experience errors like this:
+    //
+    // ```
+    // flightsql: arrow/flight: could not create flight reader: arrow/ipc: unknown error while reading: arrow/ipc: type not implemented
+    // ```
+    options.sql_parser.map_string_types_to_utf8view = false;
 
     SessionConfig::from(options)
         .with_batch_size(BATCH_SIZE)

@@ -219,10 +219,6 @@ impl CatalogRequestFuture {
                         false => StatusCode::NOT_MODIFIED,
                     }
                 }
-                Method::DELETE => {
-                    self.state.cache.delete(key);
-                    StatusCode::OK
-                }
                 _ => StatusCode::METHOD_NOT_ALLOWED,
             },
             None => StatusCode::NOT_FOUND,

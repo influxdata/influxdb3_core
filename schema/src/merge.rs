@@ -35,6 +35,18 @@ pub enum Error {
         new_column_type: InfluxColumnType,
     },
 
+    #[snafu(display(
+        "Schema Merge Error: Incompatible column type for '{}'. Existing type {:?}, new type {:?}",
+        field_name,
+        existing_column_type,
+        new_column_type
+    ))]
+    TryMergeBadArrowColumnType {
+        field_name: String,
+        existing_column_type: Option<InfluxColumnType>,
+        new_column_type: Option<InfluxColumnType>,
+    },
+
     #[cfg(feature = "v3")]
     #[snafu(display(
         "Schema Merge Error: Incompatible series keys when merging schema. Existing key: [{}], new key: [{}]",
@@ -90,7 +102,7 @@ pub fn merge_record_batch_schemas(batches: &[RecordBatch]) -> Schema {
 #[derive(Debug, Default)]
 pub struct SchemaMerger<'a> {
     /// Maps column names to their definition
-    fields: HashMap<String, (Field, InfluxColumnType)>,
+    fields: HashMap<String, (Field, Option<InfluxColumnType>)>,
     /// The measurement name if any
     measurement: Option<String>,
     /// Interner, if any.
@@ -139,7 +151,7 @@ impl SchemaMerger<'_> {
         self.merge_series_key(other.series_key())?;
 
         // Merge fields
-        for (column_type, field) in other.iter() {
+        for (column_type, field) in other.all_iter() {
             self.merge_field(field, column_type)?;
         }
 
@@ -163,12 +175,17 @@ impl SchemaMerger<'_> {
             }
             (Some(_), None) => return TryMergeNonSeriesKeySnafu.fail(),
             (Some(a), Some(b)) => {
-                if a != b {
+                if a.iter().zip(&b).any(|(a, b)| a != b) {
                     return TryMergeIncompatibleSeriesKeySnafu {
                         existing_key: a.iter().map(Into::into).collect::<Vec<String>>(),
                         new_key: b.into_iter().map(Into::into).collect::<Vec<String>>(),
                     }
                     .fail();
+                }
+                // only need to update if the other schema has more tags in its key, i.e., has
+                // new values that this schema does not.
+                if b.len() > a.len() {
+                    self.series_key = Some(b.into_iter().map(|v| v.to_string()).collect());
                 }
             }
         }
@@ -179,7 +196,7 @@ impl SchemaMerger<'_> {
     pub fn merge_field(
         &mut self,
         field: &Field,
-        column_type: InfluxColumnType,
+        column_type: Option<InfluxColumnType>,
     ) -> Result<&mut Self> {
         let field_name = field.name();
         match self.fields.raw_entry_mut().from_key(field_name) {
@@ -196,12 +213,22 @@ impl SchemaMerger<'_> {
                 // for now, insist the types are exactly the same
                 // (e.g. None and Some(..) don't match). We could
                 // consider relaxing this constraint
-                if existing_column_type != &column_type {
-                    return Err(Error::TryMergeBadColumnType {
-                        field_name: field_name.to_string(),
-                        existing_column_type: *existing_column_type,
-                        new_column_type: column_type,
-                    });
+                match (existing_column_type, column_type) {
+                    (a, b) if *a == b => {}
+                    (Some(a), Some(b)) => {
+                        return Err(Error::TryMergeBadColumnType {
+                            field_name: field_name.to_string(),
+                            existing_column_type: *a,
+                            new_column_type: b,
+                        });
+                    }
+                    (_, _) => {
+                        return Err(Error::TryMergeBadArrowColumnType {
+                            field_name: field_name.to_string(),
+                            existing_column_type: *existing_column_type,
+                            new_column_type: column_type,
+                        });
+                    }
                 }
 
                 // both are valid schemas, so this should always hold
@@ -493,108 +520,93 @@ mod tests {
     #[test]
     fn test_series_key_merge_success() {
         use crate::InfluxFieldType;
-        use InfluxColumnType::*;
-        use InfluxFieldType::*;
 
-        let s1 = SchemaBuilder::new()
-            .with_series_key(["a", "b"])
-            .tag("a")
-            .tag("b")
-            .influx_field("f1", Float)
-            .timestamp()
-            .measurement("foo")
-            .build()
-            .unwrap();
-        let s2 = SchemaBuilder::new()
-            .with_series_key(["a", "b"])
-            .tag("a")
-            .tag("b")
-            .influx_field("f2", String)
-            .timestamp()
-            .measurement("foo")
-            .build()
-            .unwrap();
-        let s_merged = SchemaMerger::new()
-            .merge(&s1)
-            .unwrap()
-            .merge(&s2)
-            .unwrap()
-            .build();
-        assert_eq!(vec!["a", "b", "time"], s_merged.primary_key());
-        assert!(
-            s_merged
-                .iter()
-                .any(|(t, f)| f.name() == "a" && matches!(t, Tag))
+        let schema = |tags: &[&str]| {
+            let mut b = SchemaBuilder::new();
+            b.with_series_key(tags);
+            for tag in tags {
+                b.tag(*tag);
+            }
+            b.influx_field("f1", InfluxFieldType::String)
+                .timestamp()
+                .measurement("foo")
+                .build()
+                .unwrap()
+        };
+
+        let merge = |schema: &[Schema]| {
+            let mut m = SchemaMerger::new();
+            for s in schema {
+                m = m.merge(s).unwrap();
+            }
+            m.build()
+        };
+
+        assert_eq!(
+            vec!["a", "b"],
+            merge(&[schema(&["a", "b"]), schema(&["a", "b"])])
+                .series_key()
+                .unwrap(),
+            "same series key merges"
         );
-        assert!(
-            s_merged
-                .iter()
-                .any(|(t, f)| f.name() == "b" && matches!(t, Tag))
+        assert_eq!(
+            vec!["a", "b", "c"],
+            merge(&[schema(&["a", "b"]), schema(&["a", "b", "c"])])
+                .series_key()
+                .unwrap(),
+            "additive from the right"
         );
-        assert!(
-            s_merged
-                .iter()
-                .any(|(t, f)| f.name() == "time" && matches!(t, Timestamp))
+        assert_eq!(
+            vec!["a", "b", "c"],
+            merge(&[schema(&["a", "b", "c"]), schema(&["a", "b"])])
+                .series_key()
+                .unwrap(),
+            "additive from the left"
         );
-        assert!(
-            s_merged
-                .iter()
-                .any(|(t, f)| f.name() == "f1" && matches!(t, Field(Float)))
+        assert_eq!(
+            vec!["a"],
+            merge(&[schema(&[]), schema(&["a"])]).series_key().unwrap(),
+            "empty on the left"
         );
-        assert!(
-            s_merged
-                .iter()
-                .any(|(t, f)| f.name() == "f2" && matches!(t, Field(String)))
+        assert_eq!(
+            vec!["a"],
+            merge(&[schema(&["a"]), schema(&[])]).series_key().unwrap(),
+            "empty on the right"
         );
-        assert_eq!(5, s_merged.len());
+        assert_eq!(
+            vec![] as Vec<&str>,
+            merge(&[schema(&[]), schema(&[])]).series_key().unwrap(),
+            "both empty"
+        );
     }
 
     #[cfg(feature = "v3")]
     #[test]
     fn test_series_key_merge_failures() {
         use crate::InfluxFieldType;
-        use InfluxFieldType::*;
 
-        // base schema with two tag columns (a, b) in the series key:
-        let s1 = SchemaBuilder::new()
-            .with_series_key(["a", "b"])
-            .tag("a")
-            .tag("b")
-            .influx_field("f1", Float)
-            .timestamp()
-            .measurement("foo")
-            .build()
-            .unwrap();
-        // a similar schema with one differing tag column (c vs. b):
-        let s2 = SchemaBuilder::new()
-            .with_series_key(["a", "c"])
-            .tag("a")
-            .tag("c")
-            .influx_field("f1", Float)
-            .timestamp()
-            .measurement("foo")
-            .build()
-            .unwrap();
-        // a schema that does not have a series key:
-        let s3 = SchemaBuilder::new()
-            .tag("a")
-            .tag("b")
-            .influx_field("f1", Float)
-            .timestamp()
-            .measurement("foo")
-            .build()
-            .unwrap();
-        SchemaMerger::new()
-            .merge(&s1)
-            .unwrap()
-            .merge(&s2)
-            .expect_err("should not be able to merge schema with mismatched series keys");
-        SchemaMerger::new()
-            .merge(&s1)
-            .unwrap()
-            .merge(&s3)
-            .expect_err(
-                "should not be able to merge schema using series key with schema using tags",
-            );
+        let schema = |tags: &[&str]| {
+            let mut b = SchemaBuilder::new();
+            b.with_series_key(tags);
+            for tag in tags {
+                b.tag(*tag);
+            }
+            b.influx_field("f1", InfluxFieldType::String)
+                .timestamp()
+                .measurement("foo")
+                .build()
+                .unwrap()
+        };
+
+        let merge_fails = |a: Schema, b: Schema| {
+            SchemaMerger::new()
+                .merge(&a)
+                .unwrap()
+                .merge(&b)
+                .expect_err("merging schema should fail")
+        };
+
+        merge_fails(schema(&["a", "b"]), schema(&["b", "a"]));
+        merge_fails(schema(&["a", "b"]), schema(&["b", "c"]));
     }
 }

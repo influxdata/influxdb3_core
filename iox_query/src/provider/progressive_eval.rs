@@ -11,7 +11,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::LexRequirement;
+use datafusion::physical_expr::{LexRequirement, OrderingRequirements};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
@@ -169,13 +169,14 @@ impl ExecutionPlan for ProgressiveEvalExec {
         vec![false]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         let input_ordering = self
             .input()
             .properties()
             .output_ordering()
             .cloned()
-            .map(LexRequirement::from_lex_ordering);
+            .map(LexRequirement::from)
+            .map(OrderingRequirements::new);
 
         vec![input_ordering]
     }

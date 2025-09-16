@@ -24,7 +24,7 @@ pub struct SchemaBuilder {
     measurement: Option<String>,
 
     /// The fields, in order
-    fields: Vec<(ArrowField, InfluxColumnType)>,
+    fields: Vec<(ArrowField, Option<InfluxColumnType>)>,
 
     /// If the builder has been consumed
     finished: bool,
@@ -69,6 +69,17 @@ impl SchemaBuilder {
         self
     }
 
+    /// Add an arbitrary column with the specified Arrow datatype.
+    #[cfg(feature = "v3")]
+    pub fn arrow(
+        &mut self,
+        column_name: impl Into<String>,
+        arrow_type: ArrowDataType,
+        nullable: bool,
+    ) -> &mut Self {
+        self.add_column(column_name, nullable, None, arrow_type)
+    }
+
     /// Add a new tag column to this schema. By default tags are
     /// potentially nullable as they are not guaranteed to be present
     /// for all rows
@@ -76,7 +87,7 @@ impl SchemaBuilder {
         let influxdb_column_type = InfluxColumnType::Tag;
         let arrow_type = (&influxdb_column_type).into();
 
-        self.add_column(column_name, true, influxdb_column_type, arrow_type)
+        self.add_column(column_name, true, Some(influxdb_column_type), arrow_type)
     }
 
     /// Add a new field column with the specified InfluxDB data model type
@@ -89,7 +100,7 @@ impl SchemaBuilder {
         self.add_column(
             column_name,
             true,
-            InfluxColumnType::Field(influxdb_field_type),
+            Some(InfluxColumnType::Field(influxdb_field_type)),
             arrow_type,
         )
     }
@@ -117,14 +128,19 @@ impl SchemaBuilder {
     ) -> Result<&mut Self, &'static str> {
         let influxdb_column_type = arrow_type.clone().try_into().map(InfluxColumnType::Field)?;
 
-        Ok(self.add_column(column_name, true, influxdb_column_type, arrow_type))
+        Ok(self.add_column(column_name, true, Some(influxdb_column_type), arrow_type))
     }
 
     /// Add the InfluxDB data model timestamp column
     pub fn timestamp(&mut self) -> &mut Self {
         let influxdb_column_type = InfluxColumnType::Timestamp;
         let arrow_type = (&influxdb_column_type).into();
-        self.add_column(TIME_COLUMN_NAME, false, influxdb_column_type, arrow_type)
+        self.add_column(
+            TIME_COLUMN_NAME,
+            false,
+            Some(influxdb_column_type),
+            arrow_type,
+        )
     }
 
     /// Set optional InfluxDB data model measurement name
@@ -175,7 +191,7 @@ impl SchemaBuilder {
             if self
                 .fields
                 .iter()
-                .any(|(f, t)| matches!(t, InfluxColumnType::Tag) && !sk.contains(f.name()))
+                .any(|(f, t)| matches!(t, Some(InfluxColumnType::Tag)) && !sk.contains(f.name()))
             {
                 return TagsNotInSeriesKeySnafu
                     .fail()
@@ -198,7 +214,7 @@ impl SchemaBuilder {
         &mut self,
         column_name: impl Into<String>,
         nullable: bool,
-        column_type: InfluxColumnType,
+        column_type: Option<InfluxColumnType>,
         arrow_type: ArrowDataType,
     ) -> &mut Self {
         let field = ArrowField::new(column_name, arrow_type, nullable);

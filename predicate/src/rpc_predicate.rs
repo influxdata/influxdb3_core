@@ -520,6 +520,64 @@ mod tests {
         assert_eq!(exprs, expected_exprs);
     }
 
+    #[test]
+    fn test_inc785() {
+        // predicate that caused panic in INC-785
+        // predicate=((((TagRef:_m[0x00] == \"vaa_volume_v3\") AND (TagRef:version == \"v5\")) AND (((TagRef:app_id_1 == \"NATIVE_TOKEN_TRANSFER\") Or (TagRef:app_id_2 == \"NATIVE_TOKEN_TRANSFER\")) Or (TagRef:app_id_3 == \"NATIVE_TOKEN_TRANSFER\"))) AND (((TagRef:_f[0xff] == \"symbol\") AND (FieldRef:_value != \"\")) Or (TagRef:_f[0xff] == \"volume\")))
+        let predicate = Predicate::new().with_expr(
+            col("_measurement")
+                .eq(lit("vaa_volume_v3"))
+                .and(col("version").eq(lit("v5")))
+                .and(
+                    col("app_id_1")
+                        .eq(lit("NATIVE_TOKEN_TRANSFER"))
+                        .or(col("app_id_2").eq(lit("NATIVE_TOKEN_TRANSFER")))
+                        .or(col("app_id_3").eq(lit("NATIVE_TOKEN_TRANSFER"))),
+                )
+                .and(
+                    col("_field")
+                        .eq(lit("symbol"))
+                        .and(col("_value").not_eq(lit("")))
+                        .or(col("_field").eq(lit("volume"))),
+                ),
+        );
+
+        let schema = schema::builder::SchemaBuilder::new()
+            .tag("app_id_1")
+            .tag("app_id_2")
+            .tag("app_id_3")
+            .tag("version")
+            .field("amount", DataType::Int64)
+            .unwrap()
+            .field("from_address", DataType::Utf8)
+            .unwrap()
+            .field("notional", DataType::Boolean)
+            .unwrap()
+            .field("symbol", DataType::Utf8)
+            .unwrap()
+            .field("to_address", DataType::Utf8)
+            .unwrap()
+            .field("volume", DataType::Int64)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let exprs =
+            normalize_predicate(&SessionContext::new(), "vaa_volume_v3", &schema, &predicate)
+                .unwrap()
+                .exprs;
+
+        let expected_exprs = vec![
+            col("version").eq(lit_dict("v5")).and(
+                col("app_id_1")
+                    .eq(lit_dict("NATIVE_TOKEN_TRANSFER"))
+                    .or(col("app_id_2").eq(lit_dict("NATIVE_TOKEN_TRANSFER")))
+                    .or(col("app_id_3").eq(lit_dict("NATIVE_TOKEN_TRANSFER"))),
+            ),
+        ];
+        assert_eq!(exprs, expected_exprs);
+    }
+
     fn schema() -> Schema {
         schema::builder::SchemaBuilder::new()
             .tag("t1")

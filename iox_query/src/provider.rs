@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, plan_datafusion_err};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, provider_as_source},
@@ -231,7 +231,8 @@ impl TableProvider for ChunkTableProvider {
 
         // De-dup before doing anything else, because all logical expressions act on de-duplicated data.
         let plan = if self.deduplication {
-            let sort_exprs = arrow_sort_key_exprs(&dedup_sort_key, &plan.schema());
+            let sort_exprs = arrow_sort_key_exprs(&dedup_sort_key, &plan.schema())
+                .ok_or_else(|| plan_datafusion_err!("de-dup with empty sort key"))?;
             Arc::new(DeduplicateExec::new(plan, sort_exprs, true))
         } else {
             plan

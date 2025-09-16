@@ -411,7 +411,7 @@ mod tests {
     };
     use datafusion::{
         error::DataFusionError,
-        physical_expr::{EquivalenceProperties, PhysicalSortExpr},
+        physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr},
         physical_plan::{
             DisplayAs, ExecutionPlan, PlanProperties, RecordBatchStream,
             execution_plan::{Boundedness, EmissionType},
@@ -444,11 +444,11 @@ mod tests {
         let test_input = Arc::new(TestExec::default());
         let schema = test_input.schema();
         let plan = Arc::new(SortExec::new(
-            vec![PhysicalSortExpr {
+            LexOrdering::new(vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("c", &schema).unwrap()),
                 options: Default::default(),
-            }]
-            .into(),
+            }])
+            .unwrap(),
             Arc::clone(&test_input) as _,
         ));
         let ctx = exec.new_context();
@@ -496,11 +496,11 @@ mod tests {
         let test_input = Arc::new(TestExec::default());
         let schema = test_input.schema();
         let plan = Arc::new(SortExec::new(
-            vec![PhysicalSortExpr {
+            LexOrdering::new(vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("c", &schema).unwrap()),
                 options: Default::default(),
-            }]
-            .into(),
+            }])
+            .unwrap(),
             Arc::clone(&test_input) as _,
         ));
         let ctx = exec.new_context();

@@ -13,7 +13,8 @@ mod stream;
 
 use self::stream::GapFillStream;
 use arrow::{compute::SortOptions, datatypes::SchemaRef};
-use datafusion::physical_expr::{LexOrdering, LexRequirement};
+use datafusion::common::plan_datafusion_err;
+use datafusion::physical_expr::{LexOrdering, OrderingRequirements};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::{
     common::DFSchemaRef,
@@ -35,7 +36,7 @@ use datafusion::{
 };
 use datafusion_util::ThenWithOpt;
 pub use gap_expander::{ExpandedValue, GapExpander};
-use std::{cmp::Ordering, slice};
+use std::cmp::Ordering;
 use std::{
     convert::Infallible,
     fmt::{self, Debug},
@@ -528,7 +529,8 @@ impl GapFillExec {
                 ));
             }
 
-            sort_expr.into()
+            LexOrdering::new(sort_expr)
+                .ok_or_else(|| plan_datafusion_err!("GapFill sort key empty"))?
         };
 
         let cache = Self::compute_properties(&input);
@@ -549,9 +551,10 @@ impl GapFillExec {
         let schema = input.schema();
         let eq_properties = match input.properties().output_ordering() {
             None => EquivalenceProperties::new(schema),
-            Some(output_ordering) => {
-                EquivalenceProperties::new_with_orderings(schema, slice::from_ref(output_ordering))
-            }
+            Some(output_ordering) => EquivalenceProperties::new_with_orderings(
+                schema,
+                std::iter::once(output_ordering.iter().cloned()),
+            ),
         };
 
         let output_partitioning = Partitioning::UnknownPartitioning(1);
@@ -594,9 +597,9 @@ impl ExecutionPlan for GapFillExec {
         vec![Distribution::SinglePartition]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
-        vec![Some(LexRequirement::from_lex_ordering(
-            self.sort_expr.clone(),
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![Some(OrderingRequirements::new(
+            self.sort_expr.clone().into(),
         ))]
     }
 

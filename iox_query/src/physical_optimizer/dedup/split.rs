@@ -243,7 +243,7 @@ mod tests {
             .with_id(1);
         let schema = chunk1.schema();
         let sort_key = schema::sort::SortKey::from_columns(schema.primary_key());
-        let sort_exprs = arrow_sort_key_exprs(&sort_key, &schema.as_arrow());
+        let sort_exprs = arrow_sort_key_exprs(&sort_key, &schema.as_arrow()).unwrap();
         let plan = Arc::new(DeduplicateExec::new(
             Arc::new(
                 FilterExec::try_new(

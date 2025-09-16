@@ -14,9 +14,9 @@ chrono = { version = "0.4", default-features = false }
 data_types = { path = "../data_types" }
 hashbrown = { workspace = true }
 mutable_batch = { path = "../mutable_batch" }
-percent-encoding = "2.3.1"
+percent-encoding = "2.3.2"
 schema = { path = "../schema" }
-thiserror = "2.0.12"
+thiserror = "2.0.16"
 unicode-segmentation = "1.12.0"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

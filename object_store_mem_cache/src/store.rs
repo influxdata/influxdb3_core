@@ -13,7 +13,7 @@ use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
 use object_store_size_hinting::{extract_size_hint, hint_size};
 
 use crate::cache_system::{
-    Cache,
+    AsyncDrop, Cache, InUse,
     s3_fifo_cache::{S3Config, S3FifoCache},
 };
 use crate::{
@@ -45,13 +45,20 @@ impl CacheValue {
         };
         let res = store.get_opts(location, options).await?;
         let meta = res.meta.clone();
-        let data = res.bytes().await?;
 
         // HACK: `Bytes` is a view-based type and may reference and underlying larger buffer. Maybe that causes
         //        https://github.com/influxdata/influxdb_iox/issues/13765 (there it was a catalog issue, but we
         //        seem to have a similar issue with the disk cache interaction?) . So we "unshare" the buffer by
         //        round-tripping it through an owned type.
-        let data = Bytes::from(data.to_vec());
+        //
+        // We try to be clever by creating 1 "landing buffer" instead of using `res.bytes()` and then an
+        // additional clone. See https://github.com/influxdata/influxdb_iox/issues/15078#issuecomment-3223376485
+        let mut stream = res.into_stream();
+        let mut buffer = Vec::with_capacity(meta.size as usize);
+        while let Some(next) = stream.try_next().await? {
+            buffer.extend_from_slice(&next);
+        }
+        let data = buffer.into();
 
         Ok(Self { data, meta })
     }
@@ -72,6 +79,25 @@ impl HasSize for CacheValue {
             + location.as_ref().len()
             + e_tag.as_ref().map(|s| s.capacity()).unwrap_or_default()
             + version.as_ref().map(|s| s.capacity()).unwrap_or_default()
+    }
+}
+
+impl InUse for CacheValue {
+    fn in_use(&self) -> bool {
+        // destruct self so we don't forget new fields in the future
+        let Self {
+            data,
+            // meta is owned
+            meta: _,
+        } = self;
+
+        !data.is_unique()
+    }
+}
+
+impl AsyncDrop for CacheValue {
+    async fn async_drop(self) {
+        drop(self);
     }
 }
 
@@ -113,6 +139,9 @@ pub struct MemCacheObjectStoreParams<'a> {
 
     /// Size of S3-FIFO ghost set in bytes.
     pub s3_fifo_ghost_memory_limit: NonZeroUsize,
+
+    /// Maximum amount of in-flight data in bytes.
+    pub inflight_bytes: usize,
 }
 
 impl MemCacheObjectStoreParams<'_> {
@@ -124,6 +153,7 @@ impl MemCacheObjectStoreParams<'_> {
             metrics,
             s3fifo_main_threshold,
             s3_fifo_ghost_memory_limit,
+            inflight_bytes,
         } = self;
 
         let cache = Arc::new(S3FifoCache::<_, _, ()>::new(
@@ -136,6 +166,7 @@ impl MemCacheObjectStoreParams<'_> {
                     metrics,
                     Some(memory_limit.get() as u64),
                 )) as _])),
+                inflight_bytes,
             },
             metrics,
         ));
@@ -163,6 +194,7 @@ impl MemCacheObjectStore {
     ) -> Result<(Arc<CacheValue>, CacheState)> {
         let captured_store = Arc::clone(&self.store);
         let captured_location = Arc::new(location.clone());
+        let usize_hint = size_hint.and_then(|s| usize::try_from(s).ok());
         let (res, _, state) = self.cache.get_or_fetch(
             &Arc::clone(&captured_location),
             Box::new(move || {
@@ -175,6 +207,7 @@ impl MemCacheObjectStore {
                 .boxed()
             }),
             (),
+            usize_hint,
         );
         let res = res.await;
 
@@ -364,6 +397,7 @@ mod tests {
                         s3_fifo_ghost_memory_limit: NonZeroUsize::MAX,
                         metrics: &metric::Registry::new(),
                         s3fifo_main_threshold: 25,
+                        inflight_bytes: 1024 * 1024 * 1024, // 1GB
                     }
                     .build(),
                 );

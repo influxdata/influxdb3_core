@@ -33,7 +33,10 @@ use prost::Message;
 use snafu::OptionExt;
 use tracing::debug;
 
-use crate::{Error, error::*, sql_info::iox_sql_info_data, xdbc_type_info::xdbc_type_info_data};
+use crate::{
+    BaseTableType, Error, error::*, sql_info::iox_sql_info_data,
+    xdbc_type_info::xdbc_type_info_data,
+};
 use crate::{FlightSQLCommand, PreparedStatementHandle};
 
 /// Logic for creating plans for various Flight messages against a query database
@@ -105,6 +108,7 @@ impl FlightSQLPlanner {
         _database: Arc<dyn QueryNamespace>,
         cmd: FlightSQLCommand,
         ctx: &IOxSessionContext,
+        base_table_type: BaseTableType,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let namespace_name = namespace_name.as_ref();
         debug!(%namespace_name, %cmd, "Handling flightsql do_get");
@@ -219,12 +223,12 @@ impl FlightSQLPlanner {
                     include_schema=?cmd.include_schema,
                     "Planning GetTables query"
                 );
-                let plan = plan_get_tables(ctx, cmd).await?;
+                let plan = plan_get_tables(ctx, cmd, base_table_type).await?;
                 Ok(ctx.create_physical_plan(&plan).await?)
             }
             FlightSQLCommand::CommandGetTableTypes(CommandGetTableTypes {}) => {
                 debug!("Planning GetTableTypes query");
-                let plan = plan_get_table_types(ctx).await?;
+                let plan = plan_get_table_types(ctx, base_table_type).await?;
                 Ok(ctx.create_physical_plan(&plan).await?)
             }
             FlightSQLCommand::CommandGetXdbcTypeInfo(cmd) => {
@@ -485,7 +489,11 @@ async fn plan_get_primary_keys(
 }
 
 /// Return a list of tables from the DataFusion catalog
-async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Result<LogicalPlan> {
+async fn plan_get_tables(
+    ctx: &IOxSessionContext,
+    cmd: CommandGetTables,
+    base_table_type: BaseTableType,
+) -> Result<LogicalPlan> {
     let mut builder = cmd.into_builder();
     let catalog_list = Arc::clone(ctx.inner().state().catalog_list());
 
@@ -532,7 +540,7 @@ async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Resu
                     continue;
                 };
 
-                let table_type = table_type_name(table.table_type());
+                let table_type = table_type_name(table.table_type(), base_table_type);
 
                 builder.append(
                     &catalog_name,
@@ -550,18 +558,32 @@ async fn plan_get_tables(ctx: &IOxSessionContext, cmd: CommandGetTables) -> Resu
 }
 
 /// Return the correct FlightSQL name for the DataFusion TableType
-fn table_type_name(table_type: TableType) -> &'static str {
+fn table_type_name(table_type: TableType, base_table_type: BaseTableType) -> &'static str {
     match table_type {
         // from https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L284-L288
-        TableType::Base => "BASE TABLE",
+        TableType::Base => base_table_type.as_str(),
         TableType::View => "VIEW",
         TableType::Temporary => "LOCAL TEMPORARY",
     }
 }
 
 /// Return a `LogicalPlan` for GetTableTypes
-async fn plan_get_table_types(ctx: &IOxSessionContext) -> Result<LogicalPlan> {
-    Ok(ctx.batch_to_logical_plan(TABLE_TYPES_RECORD_BATCH.clone())?)
+async fn plan_get_table_types(
+    ctx: &IOxSessionContext,
+    base_table_type: BaseTableType,
+) -> Result<LogicalPlan> {
+    // https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L285-L287
+    // IOx doesn't support LOCAL TEMPORARY yet
+    let table_types = match base_table_type {
+        BaseTableType::BaseTable => vec!["BASE TABLE", "VIEW"],
+        BaseTableType::Table => vec!["TABLE", "VIEW"],
+    };
+
+    let table_type = Arc::new(StringArray::from_iter_values(table_types)) as ArrayRef;
+    let batch = RecordBatch::try_new(Arc::clone(&GET_TABLE_TYPE_SCHEMA), vec![table_type])
+        .map_err(|e| Error::Arrow { source: e })?;
+
+    Ok(ctx.batch_to_logical_plan(batch)?)
 }
 
 /// Return a `LogicalPlan` for GetXdbcTypeInfo
@@ -580,13 +602,6 @@ static GET_TABLE_TYPE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         DataType::Utf8,
         false,
     )]))
-});
-
-static TABLE_TYPES_RECORD_BATCH: LazyLock<RecordBatch> = LazyLock::new(|| {
-    // https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L285-L287
-    // IOx doesn't support LOCAL TEMPORARY yet
-    let table_type = Arc::new(StringArray::from_iter_values(["BASE TABLE", "VIEW"])) as ArrayRef;
-    RecordBatch::try_new(Arc::clone(&GET_TABLE_TYPE_SCHEMA), vec![table_type]).unwrap()
 });
 
 /// The returned data should be ordered by pk_catalog_name, pk_db_schema_name,
