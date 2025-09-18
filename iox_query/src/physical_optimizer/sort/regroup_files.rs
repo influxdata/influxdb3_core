@@ -35,7 +35,7 @@ pub(crate) fn split_and_regroup_parquet_files(
         && (!sort_exec
             .properties()
             .equivalence_properties()
-            .ordering_satisfy(ordering_req)
+            .ordering_satisfy(ordering_req.iter().cloned())?
             || !sort_exec.preserve_partitioning())
     {
         // halt on DAG branch
@@ -375,7 +375,8 @@ mod tests {
         let sort_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col("time", &arrow_schema).unwrap(),
             SortOptions::default(),
-        )]);
+        )])
+        .unwrap();
 
         (arrow_schema, sort_ordering, plan)
     }

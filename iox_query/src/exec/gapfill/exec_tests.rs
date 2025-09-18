@@ -13,13 +13,13 @@ use arrow::{
 };
 use arrow_util::test_util::batches_to_lines;
 use datafusion::{
-    datasource::{memory::MemorySourceConfig, source::DataSourceExec},
     error::Result,
     execution::runtime_env::RuntimeEnvBuilder,
     functions::datetime::date_bin::DateBinFunc,
     physical_plan::{
         collect,
         expressions::{col as phys_col, lit as phys_lit},
+        test::exec::MockExec,
     },
     prelude::{SessionConfig, SessionContext},
     scalar::ScalarValue,
@@ -866,103 +866,108 @@ fn test_gapfill_fill_interpolate() {
     test_helpers::maybe_start_logging();
     insta::allow_duplicates! {
         for output_batch_size in [16, 1] {
-            let input_batch_size = 8;
-            let records = TestRecords {
-                group_cols: vec![vec![
-                    Some("a"),
-                    Some("a"),
-                    Some("a"),
-                    // --- new series
-                    Some("b"),
-                    Some("b"),
-                    Some("b"),
-                    Some("b"),
-                    Some("b"),
-                    Some("b"),
-                ]],
-                time_col: vec![
-                    None,
-                    // 975
-                    Some(1000),
-                    // 1025
-                    // 1050
-                    Some(1075),
-                    // 1100
-                    // 1125
-                    // --- new series
-                    None,
+            for input_batch_size in [16, 8, 1] {
+                let description = format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}");
+                println!("-------------------------------------------------------------------------------");
+                println!("{description}");
+
+                let records = TestRecords {
+                    group_cols: vec![vec![
+                        Some("a"),
+                        Some("a"),
+                        Some("a"),
+                        // --- new series
+                        Some("b"),
+                        Some("b"),
+                        Some("b"),
+                        Some("b"),
+                        Some("b"),
+                        Some("b"),
+                    ]],
+                    time_col: vec![
+                        None,
+                        // 975
+                        Some(1000),
+                        // 1025
+                        // 1050
+                        Some(1075),
+                        // 1100
+                        // 1125
+                        // --- new series
+                        None,
+                        Some(975),
+                        Some(1000),
+                        Some(1025),
+                        // 1050
+                        Some(1075),
+                        // 1100
+                        Some(1125),
+                    ],
+                    timezone: None,
+                    agg_cols: vec![vec![
+                        Some(-1),
+                        // null,       975
+                        Some(100), // 1000
+                        // 200        1025
+                        // 300        1050
+                        Some(400), // 1075
+                        //            1100
+                        //            1125
+                        // --- new series
+                        Some(-10),
+                        Some(1100), //  975
+                        None, // 1200  1000 (this null value will be filled)
+                        Some(1300), // 1025
+                        // 1325        1050
+                        Some(1350), // 1075
+                        Some(1550), // 1100
+                        //             1125
+                    ]],
+                    struct_cols: vec![],
+                    input_batch_size,
+                };
+                let params = get_params_ms_with_fill_strategy(
+                    &records,
+                    25,
                     Some(975),
-                    Some(1000),
-                    Some(1025),
-                    // 1050
-                    Some(1075),
-                    // 1100
-                    Some(1125),
-                ],
-                timezone: None,
-                agg_cols: vec![vec![
-                    Some(-1),
-                    // null,       975
-                    Some(100), // 1000
-                    // 200        1025
-                    // 300        1050
-                    Some(400), // 1075
-                    //            1100
-                    //            1125
-                    // --- new series
-                    Some(-10),
-                    Some(1100), //  975
-                    None, // 1200  1000 (this null value will be filled)
-                    Some(1300), // 1025
-                    // 1325        1050
-                    Some(1350), // 1075
-                    Some(1550), // 1100
-                    //             1125
-                ]],
-                struct_cols: vec![],
-                input_batch_size,
-            };
-            let params = get_params_ms_with_fill_strategy(
-                &records,
-                25,
-                Some(975),
-                1_125,
-                Some(FillStrategy::LinearInterpolate)
-            );
-            let tc = TestCase {
-                test_records: records,
-                output_batch_size,
-                params,
-            };
-            let batches = tc.run().unwrap();
-            let actual = batches_to_lines(&batches);
-            insta::with_settings!({
-                description => format!("input_batch_size: {input_batch_size}, output_batch_size: {output_batch_size}"),
-            }, {
-                insta::assert_yaml_snapshot!(actual, @r#"
-                - +----+--------------------------+------+
-                - "| g0 | time                     | a0   |"
-                - +----+--------------------------+------+
-                - "| a  |                          | -1   |"
-                - "| a  | 1970-01-01T00:00:00.975Z |      |"
-                - "| a  | 1970-01-01T00:00:01Z     | 100  |"
-                - "| a  | 1970-01-01T00:00:01.025Z | 200  |"
-                - "| a  | 1970-01-01T00:00:01.050Z | 300  |"
-                - "| a  | 1970-01-01T00:00:01.075Z | 400  |"
-                - "| a  | 1970-01-01T00:00:01.100Z |      |"
-                - "| a  | 1970-01-01T00:00:01.125Z |      |"
-                - "| b  |                          | -10  |"
-                - "| b  | 1970-01-01T00:00:00.975Z | 1100 |"
-                - "| b  | 1970-01-01T00:00:01Z     | 1200 |"
-                - "| b  | 1970-01-01T00:00:01.025Z | 1300 |"
-                - "| b  | 1970-01-01T00:00:01.050Z | 1325 |"
-                - "| b  | 1970-01-01T00:00:01.075Z | 1350 |"
-                - "| b  | 1970-01-01T00:00:01.100Z | 1450 |"
-                - "| b  | 1970-01-01T00:00:01.125Z | 1550 |"
-                - +----+--------------------------+------+
-                "#)
-            });
-            assert_batch_count(&batches, output_batch_size);
+                    1_125,
+                    Some(FillStrategy::LinearInterpolate)
+                );
+                let tc = TestCase {
+                    test_records: records,
+                    output_batch_size,
+                    params,
+                };
+                let batches = tc.run().unwrap();
+                let actual = batches_to_lines(&batches);
+                insta::with_settings!({
+                    description => description,
+                }, {
+                    insta::assert_yaml_snapshot!(actual, @r#"
+                    - +----+--------------------------+------+
+                    - "| g0 | time                     | a0   |"
+                    - +----+--------------------------+------+
+                    - "| a  |                          | -1   |"
+                    - "| a  | 1970-01-01T00:00:00.975Z |      |"
+                    - "| a  | 1970-01-01T00:00:01Z     | 100  |"
+                    - "| a  | 1970-01-01T00:00:01.025Z | 200  |"
+                    - "| a  | 1970-01-01T00:00:01.050Z | 300  |"
+                    - "| a  | 1970-01-01T00:00:01.075Z | 400  |"
+                    - "| a  | 1970-01-01T00:00:01.100Z |      |"
+                    - "| a  | 1970-01-01T00:00:01.125Z |      |"
+                    - "| b  |                          | -10  |"
+                    - "| b  | 1970-01-01T00:00:00.975Z | 1100 |"
+                    - "| b  | 1970-01-01T00:00:01Z     | 1200 |"
+                    - "| b  | 1970-01-01T00:00:01.025Z | 1300 |"
+                    - "| b  | 1970-01-01T00:00:01.050Z | 1325 |"
+                    - "| b  | 1970-01-01T00:00:01.075Z | 1350 |"
+                    - "| b  | 1970-01-01T00:00:01.100Z | 1450 |"
+                    - "| b  | 1970-01-01T00:00:01.125Z | 1550 |"
+                    - +----+--------------------------+------+
+                    "#)
+                });
+                assert_batch_count(&batches, output_batch_size);
+            }
         }
     }
 }
@@ -1443,7 +1448,7 @@ impl TryFrom<TestRecords> for Vec<RecordBatch> {
         }
 
         let one_batch = RecordBatch::try_new(value.schema(), arrs)
-            .map_err(|err| DataFusionError::ArrowError(err, None))?;
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
         let mut batches = vec![];
         let mut offset = 0;
         while offset < one_batch.num_rows() {
@@ -1513,11 +1518,10 @@ impl TestCase {
             "input_batch_size is {input_batch_size}, output_batch_size is {}",
             self.output_batch_size
         );
-        let input = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-            &[batches],
-            Arc::clone(&schema),
-            None,
-        )?)));
+        let input = Arc::new(
+            MockExec::new(batches.into_iter().map(Ok).collect(), Arc::clone(&schema))
+                .with_use_task(false),
+        );
         let plan = Arc::new(GapFillExec::try_new(
             input,
             group_expr,

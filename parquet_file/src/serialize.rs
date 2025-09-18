@@ -89,7 +89,7 @@ impl From<CodecError> for DataFusionError {
             | CodecError::NoRows
             | CodecError::MetadataSerialisation(_)
             | CodecError::CloneSink(_)) => Self::External(Box::new(e)),
-            CodecError::Writer(e) => Self::ParquetError(e),
+            CodecError::Writer(e) => Self::ParquetError(Box::new(e)),
             CodecError::DataFusion(e) => *e,
         }
     }

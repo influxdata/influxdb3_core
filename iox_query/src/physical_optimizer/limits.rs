@@ -159,7 +159,7 @@ mod tests {
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
     use datafusion::execution::object_store::ObjectStoreUrl;
-    use datafusion::physical_expr::LexOrdering;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::Statistics;
     use datafusion::physical_plan::union::UnionExec;
     use datafusion_util::config::table_parquet_options;
@@ -263,7 +263,7 @@ mod tests {
                     "1/3/partition1/file02",
                     "1/4/partition1/file01",
                 ]),
-                LexOrdering::default(),
+                lex_ordering(),
                 false,
             )),
         ];
@@ -302,7 +302,7 @@ mod tests {
                     ("1/2/partition2/file2", (2, 3)),
                     ("1/2/partition2/file3", (1, 2)),
                 ]),
-                LexOrdering::default(),
+                lex_ordering(),
                 false,
             )),
             Arc::new(DeduplicateExec::new(
@@ -310,7 +310,7 @@ mod tests {
                     ("1/2/partition2/file2", (1, 2)),
                     ("1/2/partition2/file4", (1, 2)),
                 ]),
-                LexOrdering::default(),
+                lex_ordering(),
                 false,
             )),
         ];
@@ -364,5 +364,15 @@ mod tests {
         })
         .build();
         DataSourceExec::from_data_source(file_scan_config)
+    }
+
+    fn lex_ordering() -> LexOrdering {
+        use datafusion::physical_plan::expressions::Column;
+
+        LexOrdering::new([PhysicalSortExpr {
+            expr: Arc::new(Column::new("foo", 0)),
+            options: Default::default(),
+        }])
+        .unwrap()
     }
 }

@@ -32,7 +32,7 @@ arrow-flight = { workspace = true, optional = true }
 arrow_util = { path = "../arrow_util", optional = true }
 bytes = { version = "1.10", optional = true }
 client_util = { path = "../client_util" }
-comfy-table = { version = "7.1", default-features = false, optional = true }
+comfy-table = { version = "7.2", default-features = false, optional = true }
 futures = "0.3"
 futures-util = { version = "0.3" }
 influxdb-line-protocol = { path = "../influxdb_line_protocol" }
@@ -42,7 +42,7 @@ prost = { workspace = true, optional = true }
 rand = { version = "0.9.2", optional = true }
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
 schema = { path = "../schema", optional = true }
-serde_json = { version = "1.0.143", optional = true }
+serde_json = { version = "1.0.145", optional = true }
 tokio = { version = "1.47", features = [
     "macros",
     "parking_lot",

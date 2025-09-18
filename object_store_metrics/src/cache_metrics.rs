@@ -468,6 +468,7 @@ mod tests {
                 metrics,
                 s3fifo_main_threshold: usize::MAX,
                 s3_fifo_ghost_memory_limit: NonZeroUsize::MAX,
+                inflight_bytes: 1024 * 1024 * 1024, // 1GB
             }
             .build(),
         )

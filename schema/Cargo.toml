@@ -13,10 +13,13 @@ workspace = true
 arrow = { workspace = true }
 base64 = { version = "0.22", optional = true }
 hashbrown = { workspace = true }
-indexmap = { version = "2.10", features = ["std"] }
+indexmap = { version = "2.11", features = ["std"] }
 tracing = { workspace = true }
 snafu = "0.8"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+rstest = { version = "0.26.1" }
 
 [features]
 # Enable features from the newly proposed v3 data model, see:

@@ -91,7 +91,7 @@ pub fn merge_partitions_after_parallelized_sorting(
                 if !sort_exec
                     .properties()
                     .equivalence_properties()
-                    .ordering_satisfy(ordering_req)
+                    .ordering_satisfy(ordering_req.iter().cloned())?
                     || !sort_exec.preserve_partitioning()
                     || !was_repartitioned
                 {

@@ -112,10 +112,18 @@ impl BufferedInput {
                 // array so we are just looking at that value and the ones after.
                 let array = batch.column(col_offset);
                 let array = if i == last_output_batch_offset {
-                    let length = array.len() - last_output_row_offset;
-                    batch
-                        .column(col_offset)
-                        .slice(last_output_row_offset, length)
+                    // `last_output_row_offset` points at the start of the segment. To detect
+                    // the end of the segment, we need one more row though.
+                    let first_row_after = last_output_row_offset + 1;
+
+                    // Because `last_output_row_offset` was in [0..array_len) (excluding end),
+                    // `first_row_after` is <=array_len. Hence, `length` will be non-negative
+                    // but can be zero.
+                    //
+                    // Zero-sized batches do NOT resolve/remove a column because the check later
+                    // is `batch_nulls < batch_rows` (not `<=`!).
+                    let length = array.len() - first_row_after;
+                    batch.column(col_offset).slice(first_row_after, length)
                 } else {
                     Arc::clone(array)
                 };
@@ -190,7 +198,7 @@ impl BufferedInput {
                 .map(|c| SortField::new(batch.column(*c).data_type().clone()))
                 .collect();
             let row_converter = RowConverter::new(sort_fields)
-                .map_err(|err| DataFusionError::ArrowError(err, None))?;
+                .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
             self.row_converter = Some(row_converter);
         }
         Ok(self.row_converter.as_mut().expect("cannot be none"))
@@ -206,7 +214,7 @@ impl BufferedInput {
             .collect();
         self.get_row_converter()?
             .convert_columns(&columns)
-            .map_err(|err| DataFusionError::ArrowError(err, None))
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     /// Returns the row-oriented representation of the last buffered row that may appear in the next
@@ -496,5 +504,39 @@ mod tests {
         // 9 rows (series changes here)
         buffered_input.push(batches.pop_front().unwrap());
         assert!(!buffered_input.need_more(batch_size - 1).unwrap());
+    }
+
+    #[test]
+    fn need_more_at_end_of_batch() {
+        let params = GapFillParams {
+            gap_expander: Arc::new(DateBinGapExpander::new(50_000_000)),
+            first_ts: Some(1_000_000_000),
+            last_ts: 1_055_000_000,
+            fill_strategy: [(2, FillStrategy::LinearInterpolate)].into(),
+        };
+        let group_cols = vec![0];
+
+        let last_output_row_offset = 1;
+        let records = TestRecords {
+            group_cols: vec![std::iter::repeat_n(Some("a"), 3).collect()],
+            time_col: (0..3).map(|i| Some(1000 + i * 5)).collect(),
+            timezone: None,
+            agg_cols: vec![vec![
+                // batch 1
+                Some(1),
+                Some(2), // <-- point `last_output_row_offset` to this
+                // batch 2
+                None,
+            ]],
+            struct_cols: vec![],
+            input_batch_size: 2,
+        };
+        let batches: Vec<RecordBatch> = records.try_into().unwrap();
+
+        let mut buffered_input = BufferedInput::new(&params, group_cols);
+        for batch in batches {
+            buffered_input.push(batch);
+        }
+        assert!(buffered_input.need_more(last_output_row_offset).unwrap());
     }
 }

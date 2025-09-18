@@ -2,6 +2,7 @@
 use std::{
     future::Future,
     marker::PhantomData,
+    num::NonZeroUsize,
     ops::Deref,
     sync::Arc,
     task::Poll,
@@ -10,6 +11,7 @@ use std::{
 
 use futures::{FutureExt, future::BoxFuture};
 use metric::{Attributes, DurationHistogram, MakeMetricObserver, U64Counter, U64Gauge};
+use parking_lot::RwLock;
 use pin_project::{pin_project, pinned_drop};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -31,6 +33,7 @@ pub struct AsyncSemaphoreMetrics {
     holders_pending: U64Gauge,
     holders_cancelled_while_pending: U64Counter,
     acquire_duration: DurationHistogram,
+    first_poll_wait_duration: DurationHistogram,
 }
 
 impl AsyncSemaphoreMetrics {
@@ -80,6 +83,10 @@ impl AsyncSemaphoreMetrics {
                 "Number of pending semaphore holders that were cancelled while they were waiting for the semaphore. Each holder might have multiple permits",
             )
             .recorder(attributes.clone());
+        let first_poll_wait_duration = registry.register_metric::<DurationHistogram>(
+            "iox_async_semaphore_first_poll_wait_duration",
+            "Duration between the time the acquire future is created and until it is polled for the first time"
+        ).recorder(attributes.clone());
         let acquire_duration = registry
             .register_metric::<DurationHistogram>(
                 "iox_async_semaphore_acquire_duration",
@@ -95,6 +102,7 @@ impl AsyncSemaphoreMetrics {
             holders_acquired,
             holders_pending,
             holders_cancelled_while_pending,
+            first_poll_wait_duration,
             acquire_duration,
         }
     }
@@ -109,6 +117,7 @@ impl AsyncSemaphoreMetrics {
             holders_acquired: Default::default(),
             holders_pending: Default::default(),
             holders_cancelled_while_pending: Default::default(),
+            first_poll_wait_duration: DurationHistogram::create(&Default::default()),
             acquire_duration: DurationHistogram::create(&Default::default()),
         }
     }
@@ -119,7 +128,7 @@ impl AsyncSemaphoreMetrics {
 
         InstrumentedAsyncSemaphore {
             inner: Arc::new(Semaphore::new(permits)),
-            permits,
+            permits: RwLock::new(permits),
             metrics: Arc::clone(self),
         }
     }
@@ -141,13 +150,33 @@ pub struct InstrumentedAsyncSemaphore {
     inner: Arc<Semaphore>,
 
     /// Number of total permits (acquired and available).
-    permits: usize,
+    permits: RwLock<usize>,
 
     /// Metrics.
     metrics: Arc<AsyncSemaphoreMetrics>,
 }
 
 impl InstrumentedAsyncSemaphore {
+    /// Ensure that this semaphore has at least this amount of permits in total.
+    ///
+    /// If the semaphore size was changed the delta will be returned.
+    pub fn ensure_total_permits(&self, permits: usize) -> Option<NonZeroUsize> {
+        // fast-path
+        {
+            let guard = self.permits.read();
+            if permits <= *guard {
+                return None;
+            }
+        }
+
+        let mut guard = self.permits.write();
+        let delta = NonZeroUsize::new(permits.saturating_sub(*guard))?;
+        self.inner.add_permits(delta.get());
+        self.metrics.permits_total.inc(delta.get() as u64);
+        *guard = permits;
+        Some(delta)
+    }
+
     /// Acquire a single permit.
     ///
     /// See [`tokio::sync::Semaphore::acquire`] for details.
@@ -207,7 +236,7 @@ impl InstrumentedAsyncSemaphore {
             inner: Arc::clone(&self.inner).acquire_many_owned(n).boxed(),
             metrics: Arc::clone(&self.metrics),
             n,
-            reported_pending: false,
+            time_until_first_poll: None,
             t_start: Instant::now(),
             span_recorder_acquire: Some(span_recorder_acquire),
             span_recorder_all: Some(span_recorder_all),
@@ -215,34 +244,35 @@ impl InstrumentedAsyncSemaphore {
     }
 
     /// return the total number of permits (available + already acquired).
-    pub fn total_permits(self: &Arc<Self>) -> usize {
-        self.permits
+    pub fn total_permits(&self) -> usize {
+        *self.permits.read()
     }
 
     /// return the number of pending permits
-    pub fn permits_pending(self: &Arc<Self>) -> u64 {
+    pub fn permits_pending(&self) -> u64 {
         self.metrics.permits_pending.fetch()
     }
 
     /// return the number of acquired permits
-    pub fn permits_acquired(self: &Arc<Self>) -> u64 {
+    pub fn permits_acquired(&self) -> u64 {
         self.metrics.permits_acquired.fetch()
     }
 
     /// return the number of pending holders
-    pub fn holders_pending(self: &Arc<Self>) -> u64 {
+    pub fn holders_pending(&self) -> u64 {
         self.metrics.holders_pending.fetch()
     }
 
     /// return the number of acquired holders
-    pub fn holders_acquired(self: &Arc<Self>) -> u64 {
+    pub fn holders_acquired(&self) -> u64 {
         self.metrics.holders_acquired.fetch()
     }
 }
 
 impl Drop for InstrumentedAsyncSemaphore {
     fn drop(&mut self) {
-        self.metrics.permits_total.dec(self.permits as u64);
+        let permits = self.permits.read();
+        self.metrics.permits_total.dec(*permits as u64);
     }
 }
 
@@ -263,10 +293,12 @@ struct InstrumentedAsyncSemaphoreAcquire<'a> {
     /// This was already passed to the `acquire_many` future but we need to store it separately for our metrics.
     n: u32,
 
-    /// Flags if we already reported a "pending" state for this future.
+    /// The amount of time that passed between `t_start` and the first time that this future is
+    /// polled at all.
     ///
-    /// This is toggled back from `true` to `false` when we clear the "pending" metrics, e.g. when the future completes.
-    reported_pending: bool,
+    /// This is set back to `None` after the future returns `Poll::Ready(Ok(_))` so that we don't
+    /// falsely record this future as cancelled-while-pending in the `Drop` impl
+    time_until_first_poll: Option<Duration>,
 
     /// Start time of the "acquire" action.
     t_start: Instant,
@@ -291,7 +323,7 @@ impl std::fmt::Debug for InstrumentedAsyncSemaphoreAcquire<'_> {
         f.debug_struct("InstrumentedAsyncSemaphoreAcquire")
             .field("metrics", &self.metrics)
             .field("n", &self.n)
-            .field("reported_pending", &self.reported_pending)
+            .field("time_until_first_poll", &self.time_until_first_poll)
             .field("t_start", &self.t_start)
             .finish_non_exhaustive()
     }
@@ -302,8 +334,13 @@ impl Future for InstrumentedAsyncSemaphoreAcquire<'_> {
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        let is_first_poll = this.time_until_first_poll.is_none();
+        let time_until_first_poll = this
+            .time_until_first_poll
+            .take()
+            .unwrap_or_else(|| this.t_start.elapsed());
 
-        match this.inner.poll(cx) {
+        let ret = match this.inner.poll(cx) {
             Poll::Ready(res) => match res {
                 Ok(permit) => {
                     this.metrics.permits_acquired.inc(*this.n as u64);
@@ -311,16 +348,14 @@ impl Future for InstrumentedAsyncSemaphoreAcquire<'_> {
 
                     let acquire_duration = this.t_start.elapsed();
                     this.metrics.acquire_duration.record(acquire_duration);
+                    this.metrics
+                        .first_poll_wait_duration
+                        .record(time_until_first_poll);
 
                     // reset "pending" metrics if we've reported any
-                    if *this.reported_pending {
+                    if !is_first_poll {
                         this.metrics.permits_pending.dec(*this.n as u64);
                         this.metrics.holders_pending.dec(1);
-
-                        // Ensure that `Drop` doesn't decrease these metrics a 2nd time. Don't solely rely on `Drop`
-                        // however since this future might be referenced somewhere in the stack even when the result was
-                        // already produced.
-                        *this.reported_pending = false;
                     }
 
                     let mut span_recorder_acquire = this
@@ -338,14 +373,17 @@ impl Future for InstrumentedAsyncSemaphoreAcquire<'_> {
                     let span_recorder_permit =
                         SpanRecorder::new(span_recorder_all.child_span(SPAN_NAME_PERMIT));
 
-                    Poll::Ready(Ok(InstrumentedAsyncOwnedSemaphorePermit {
+                    // we return this early specifically so that we don't re-insert
+                    // `time_until_first_poll` since we need it to be `None` if we reach this path
+                    // so that we don't double-record the pending metrics in the `Drop` impl.
+                    return Poll::Ready(Ok(InstrumentedAsyncOwnedSemaphorePermit {
                         inner: permit,
                         n: *this.n,
                         metrics: Arc::clone(this.metrics),
                         acquire_duration,
                         span_recorder_permit,
                         span_recorder_all,
-                    }))
+                    }));
                 }
                 Err(e) => {
                     this.span_recorder_all
@@ -358,16 +396,17 @@ impl Future for InstrumentedAsyncSemaphoreAcquire<'_> {
             },
             Poll::Pending => {
                 // report "pending" metrics once
-                if !*this.reported_pending {
+                if is_first_poll {
                     this.metrics.permits_pending.inc(*this.n as u64);
                     this.metrics.holders_pending.inc(1);
-
-                    *this.reported_pending = true;
                 }
 
                 Poll::Pending
             }
-        }
+        };
+
+        *this.time_until_first_poll = Some(time_until_first_poll);
+        ret
     }
 }
 
@@ -377,7 +416,7 @@ impl<'a> PinnedDrop for InstrumentedAsyncSemaphoreAcquire<'a> {
         let this = self.project();
 
         // reset "pending" metrics if we've reported any
-        if *this.reported_pending {
+        if this.time_until_first_poll.is_some() {
             this.metrics.permits_pending.dec(*this.n as u64);
             this.metrics.holders_pending.dec(1);
 
@@ -471,6 +510,7 @@ impl Deref for InstrumentedAsyncSemaphorePermit<'_> {
 mod tests {
     use std::time::Duration;
 
+    use test_helpers::timeout::FutureTimeout;
     use tokio::{pin, sync::Barrier};
     use trace::{RingBufferTraceCollector, ctx::SpanContext, span::SpanStatus};
 
@@ -776,6 +816,53 @@ mod tests {
                 .into_iter()
                 .any(|s| s.name == SPAN_NAME_PERMIT)
         );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_total_permits() {
+        let metrics = Arc::new(AsyncSemaphoreMetrics::new_unregistered());
+
+        let semaphore = metrics.new_semaphore(10);
+        assert_eq!(semaphore.total_permits(), 10);
+        assert_eq!(metrics.permits_total.fetch(), 10);
+        semaphore
+            .acquire_many(10, None)
+            .with_timeout_panic(Duration::from_secs(1))
+            .await
+            .unwrap();
+        semaphore
+            .acquire_many(12, None)
+            .with_timeout(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(semaphore.ensure_total_permits(10), None);
+        assert_eq!(semaphore.total_permits(), 10);
+        assert_eq!(metrics.permits_total.fetch(), 10);
+
+        assert_eq!(
+            semaphore.ensure_total_permits(12),
+            Some(NonZeroUsize::new(2).unwrap())
+        );
+        assert_eq!(semaphore.total_permits(), 12);
+        assert_eq!(metrics.permits_total.fetch(), 12);
+        semaphore
+            .acquire_many(12, None)
+            .with_timeout_panic(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(semaphore.ensure_total_permits(10), None);
+        assert_eq!(semaphore.total_permits(), 12);
+        assert_eq!(metrics.permits_total.fetch(), 12);
+        semaphore
+            .acquire_many(12, None)
+            .with_timeout_panic(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        drop(semaphore);
+        assert_eq!(metrics.permits_total.fetch(), 0);
     }
 
     /// Check that a given object implements [`Send`].

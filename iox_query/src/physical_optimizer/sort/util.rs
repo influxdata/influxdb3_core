@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use datafusion::{
+    common::plan_datafusion_err,
     error::Result,
-    physical_expr::PhysicalSortExpr,
+    physical_expr::{LexOrdering, PhysicalSortExpr},
     physical_plan::{ExecutionPlan, sorts::sort_preserving_merge::SortPreservingMergeExec},
 };
 
@@ -14,10 +15,10 @@ pub(crate) fn add_sort_preserving_merge(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if input.properties().output_partitioning().partition_count() > 1 {
         // Add SortPreservingMergeExec on top of this input
-        let sort_preserving_merge_exec = Arc::new(
-            SortPreservingMergeExec::new(sort_exprs.to_vec().into(), input)
-                .with_fetch(fetch_number),
-        );
+        let expr = LexOrdering::new(sort_exprs.iter().cloned())
+            .ok_or_else(|| plan_datafusion_err!("sort key empoty"))?;
+        let sort_preserving_merge_exec =
+            Arc::new(SortPreservingMergeExec::new(expr, input).with_fetch(fetch_number));
         Ok(sort_preserving_merge_exec as _)
     } else {
         Ok(input)

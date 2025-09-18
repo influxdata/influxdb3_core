@@ -34,7 +34,13 @@ impl Client {
         let response = self
             .inner
             .get_namespaces(GetNamespacesRequest {
-                deleted: Some(SoftDeleted::OnlyActive.into()),
+                // we need to specify the field to fully initialize the struct, but it is
+                // deprecated.
+                #[expect(deprecated)]
+                deleted: None,
+                filters: Some(NamespaceStatusFilterList {
+                    inner: vec![i32::from(NamespaceStatusFilter::Active)],
+                }),
             })
             .await?;
 

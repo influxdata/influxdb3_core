@@ -31,7 +31,9 @@
 //! [shared futures]: futures::future::Shared
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use object_store_metrics::cache_state::CacheState;
 use std::{fmt::Debug, hash::Hash};
 
@@ -93,6 +95,47 @@ impl HasSize for DynError {
     }
 }
 
+/// Trait for checking if a value is currently in use.
+///
+/// This is useful for determining if a cache entry can be
+/// safely evicted, or if it is still needed.
+#[async_trait]
+pub trait InUse {
+    /// Check if a value is currently in use.
+    fn in_use(&self) -> bool;
+}
+
+#[async_trait]
+impl<T> InUse for Arc<T>
+where
+    T: InUse + ?Sized,
+{
+    /// For arc'ed references (e.g. `Arc<V>` or nested arc'ed values within V),
+    /// check the strong count and the inner usage,
+    /// since an inner Arc may still be held.
+    fn in_use(&self) -> bool {
+        Self::strong_count(self) > 1 || (**self).in_use()
+    }
+}
+
+impl InUse for str {
+    fn in_use(&self) -> bool {
+        false
+    }
+}
+
+impl InUse for &str {
+    fn in_use(&self) -> bool {
+        false
+    }
+}
+
+impl InUse for Bytes {
+    fn in_use(&self) -> bool {
+        false
+    }
+}
+
 /// Result type for cache requests.
 ///
 /// The value (`V`) must be cloneable, so that they can be shared between multiple consumers of the cache.
@@ -113,11 +156,70 @@ where
 /// Type of the function that is used to fetch a value for a key.
 type CacheFn<V> = Box<dyn FnOnce() -> BoxFuture<'static, CacheRequestResult<V>> + Send>;
 
+/// Trait for asynchronously dropping a value.
+pub trait AsyncDrop: Send + Sync {
+    /// Return a future which drops a value.
+    fn async_drop(self) -> impl Future<Output = ()> + Send;
+}
+
+impl<T> AsyncDrop for Arc<T>
+where
+    T: AsyncDrop,
+{
+    /// Drop an `Arc<T>`.
+    ///
+    /// Note that if this reference is still used elsewhere,
+    /// it will not drop the inner value. This is expected behavior
+    /// and can be compensated by checking the [`InUse`] status
+    /// of items prior to calling async drop.
+    async fn async_drop(self) {
+        // Try to extract the inner value if we're the only owner,
+        // otherwise we can't drop the inner value asynchronously
+        if let Ok(inner) = Self::try_unwrap(self) {
+            inner.async_drop().await
+        } else {
+            unreachable!("InUse check should have already been performed");
+        }
+    }
+}
+
+impl<T> AsyncDrop for Vec<T>
+where
+    T: AsyncDrop,
+{
+    /// Drop all values in the vector.
+    async fn async_drop(self)
+    where
+        Self: Sized,
+    {
+        let mut unordered = self
+            .into_iter()
+            .map(|v| T::async_drop(v))
+            .collect::<FuturesUnordered<_>>();
+
+        while unordered.next().await.is_some() {}
+    }
+}
+
+impl AsyncDrop for Arc<str> {
+    async fn async_drop(self) {}
+}
+
+impl AsyncDrop for &str {
+    async fn async_drop(self) {}
+}
+
+impl AsyncDrop for Bytes {
+    async fn async_drop(self) {
+        drop(self);
+    }
+}
+
 #[async_trait]
 pub trait Cache<K, V, D>: Send + Sync + Debug
 where
     K: Clone + Eq + Hash + Send + Sync + 'static,
-    V: Clone + HasSize + Send + Sync + 'static,
+    V: Clone + HasSize + AsyncDrop + Send + Sync + 'static,
     D: Clone + Send + Sync + 'static,
 {
     /// Get an existing key or start a new fetch process.
@@ -134,6 +236,7 @@ where
         k: &K,
         f: CacheFn<V>,
         d: D,
+        size_hint: Option<usize>,
     ) -> (
         BoxFuture<'static, CacheRequestResult<V>>,
         Option<D>,

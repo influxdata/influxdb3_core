@@ -73,38 +73,40 @@ arrow-ipc = { version = "55" }
 arrow-schema = { version = "55" }
 bincode = { version = "2", default-features = false, features = ["alloc", "derive"] }
 # Use DataFusion fork
-# See https://github.com/influxdata/arrow-datafusion/pull/53 for contents
-# plus additional patches from https://github.com/influxdata/arrow-datafusion/pull/58
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "de1eb41e301a53e4916a5f1792e403fb68dd6106" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "de1eb41e301a53e4916a5f1792e403fb68dd6106" }
-hashbrown = {version = "0.14.5"}
-http = {version = "1"}
-http-body = {version = "1"}
-http-body-util = {version = "0.1"}
-hyper = {version = "1"}
-hyper-util = {version = "0.1"}
+# See https://github.com/influxdata/arrow-datafusion/pull/73 for contents
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "a9cf9aca9ebf0d6c04e0861d2baebffa0ba77dbc" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "a9cf9aca9ebf0d6c04e0861d2baebffa0ba77dbc" }
+hashbrown = { version = "0.14.5" }
+http = { version = "1" }
+http-body = { version = "1" }
+http-body-util = { version = "0.1" }
+hyper = { version = "1" }
+hyper-util = { version = "0.1" }
 object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
 parquet = { version = "55", features = ["object_store"] }
-pbjson = {version = "0.7"}
-pbjson-build = {version = "0.7"}
-pbjson-types = {version = "0.7"}
-proptest = {version = "1", default-features = false, features = ["std"] }
-prost = {version = "0.13"}
-prost-build = {version = "0.13"}
-prost-types = {version = "0.13"}
-reqwest = {version = "0.12", default-features = false }
-smallvec = {version = "1.15.1", features = ["union"] }
-sqlx = { version = "0.8.2", features = ["sqlite"]}
+pbjson = { version = "0.7" }
+pbjson-build = { version = "0.7" }
+pbjson-types = { version = "0.7" }
+proptest = { version = "1", default-features = false, features = ["std"] }
+prost = { version = "0.13" }
+prost-build = { version = "0.13" }
+prost-types = { version = "0.13" }
+reqwest = { version = "0.12", default-features = false }
+rstest = { version = "0.21" }
+sqlx = { version = "0.8.6", features = ["sqlite"] }
 tower = { version = "0.5" }
 tracing = { version = "0.1", features = ["log", "max_level_trace"] }
 tracing-log = { version = "0.2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
 
+# unify features between workspace-hack members and packages that are excluded from this hack
+smallvec = { version = "1.15.1", features = ["union"] }
+
 [workspace.lints.rust]
 missing_copy_implementations = "deny"
 missing_debug_implementations = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(tokio_unstable)'] }
 unreachable_pub = "deny"
 unused_crate_dependencies = "deny"
 

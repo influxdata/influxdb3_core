@@ -242,20 +242,23 @@ pub fn chunks_to_physical_nodes(
         let statistics = build_statistics_for_chunks(&query_chunks, Arc::clone(schema));
 
         // Tell datafusion about the sort key, if any
-        let output_ordering = sort_key.map(|sort_key| arrow_sort_key_exprs(&sort_key, schema));
+        let output_ordering = sort_key.and_then(|sort_key| arrow_sort_key_exprs(&sort_key, schema));
         let output_ordering = if has_chunk_order_col {
-            Some(LexOrdering::from_iter(
-                output_ordering
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(std::iter::once(PhysicalSortExpr {
-                        expr: Arc::new(
-                            Column::new_with_schema(CHUNK_ORDER_COLUMN_NAME, schema)
-                                .expect("just added col"),
-                        ),
-                        options: Default::default(),
-                    })),
-            ))
+            let suffix = std::iter::once(PhysicalSortExpr {
+                expr: Arc::new(
+                    Column::new_with_schema(CHUNK_ORDER_COLUMN_NAME, schema)
+                        .expect("just added col"),
+                ),
+                options: Default::default(),
+            });
+            let output_ordering = match output_ordering {
+                Some(output_ordering) => {
+                    LexOrdering::new(output_ordering.into_iter().chain(suffix))
+                        .expect("added suffix")
+                }
+                None => LexOrdering::new(suffix).expect("suffix is not empty"),
+            };
+            Some(output_ordering)
         } else {
             output_ordering
         };

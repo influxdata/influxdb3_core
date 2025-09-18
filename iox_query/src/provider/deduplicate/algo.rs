@@ -466,13 +466,14 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = LexOrdering::from(vec![PhysicalSortExpr {
+        let sort_keys = LexOrdering::new(vec![PhysicalSortExpr {
             expr: col("t1", &current_batch.schema()).unwrap(),
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
             },
-        }]);
+        }])
+        .unwrap();
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -541,7 +542,7 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = LexOrdering::from(vec![
+        let sort_keys = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: col("t1", &current_batch.schema()).unwrap(),
                 options: SortOptions {
@@ -556,7 +557,8 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ]);
+        ])
+        .unwrap();
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -620,13 +622,14 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = LexOrdering::from(vec![PhysicalSortExpr {
+        let sort_keys = LexOrdering::new(vec![PhysicalSortExpr {
             expr: col("t1", &current_batch.schema()).unwrap(),
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
             },
-        }]);
+        }])
+        .unwrap();
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -681,7 +684,7 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = LexOrdering::from(vec![
+        let sort_keys = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: col("t1", &current_batch.schema()).unwrap(),
                 options: SortOptions {
@@ -696,7 +699,8 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ]);
+        ])
+        .unwrap();
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), Some(last_batch));
 
@@ -729,7 +733,7 @@ mod test {
         ])
         .unwrap();
 
-        let sort_keys = LexOrdering::from(vec![
+        let sort_keys = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: col("t1", &current_batch.schema()).unwrap(),
                 options: SortOptions {
@@ -744,7 +748,8 @@ mod test {
                     nulls_first: false,
                 },
             },
-        ]);
+        ])
+        .unwrap();
 
         let mut dedupe = RecordBatchDeduplicator::new(sort_keys, make_counter(), None);
 
@@ -832,7 +837,11 @@ mod test {
             },
         ];
 
-        let dedupe = RecordBatchDeduplicator::new(sort_keys.into(), make_counter(), None);
+        let dedupe = RecordBatchDeduplicator::new(
+            LexOrdering::new(sort_keys).unwrap(),
+            make_counter(),
+            None,
+        );
         let key_ranges = dedupe.compute_ranges(&batch).unwrap().ranges;
 
         let expected_key_range = vec![

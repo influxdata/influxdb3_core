@@ -2550,7 +2550,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr],
                         distinct,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2578,7 +2578,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2606,7 +2606,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2634,7 +2634,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2662,7 +2662,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2689,7 +2689,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr, "time".as_expr()],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2717,7 +2717,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr, nexpr],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -2744,7 +2744,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         args: vec![expr],
                         distinct: false,
                         filter: None,
-                        order_by: None,
+                        order_by: vec![],
                         null_treatment: None,
                     },
                 }))
@@ -4295,26 +4295,26 @@ fn remove_aggr_count_from_error(error: DataFusionError) -> DataFusionError {
     // Strip "__aggr_count" from the SchemaError
     // since it is just an internal field
     match error {
-        DataFusionError::SchemaError(
+        DataFusionError::SchemaError(schema_error, e) => match *schema_error {
             SchemaError::FieldNotFound {
                 field,
                 valid_fields,
-            },
-            e,
-        ) => {
-            let new_fields = valid_fields
-                .into_iter()
-                .filter(|x| x.name != "__aggr_count")
-                .collect();
+            } => {
+                let new_fields = valid_fields
+                    .into_iter()
+                    .filter(|x| x.name != "__aggr_count")
+                    .collect();
 
-            DataFusionError::SchemaError(
-                SchemaError::FieldNotFound {
-                    field,
-                    valid_fields: new_fields,
-                },
-                e,
-            )
-        }
+                DataFusionError::SchemaError(
+                    Box::new(SchemaError::FieldNotFound {
+                        field,
+                        valid_fields: new_fields,
+                    }),
+                    e,
+                )
+            }
+            schema_error => DataFusionError::SchemaError(Box::new(schema_error), e),
+        },
         _ => error,
     }
 }

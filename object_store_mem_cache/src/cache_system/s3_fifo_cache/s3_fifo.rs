@@ -11,7 +11,7 @@ use std::{
 use tracker::{LockMetrics, Mutex};
 
 use crate::cache_system::{
-    DynError, HasSize,
+    AsyncDrop, DynError, HasSize, InUse,
     hook::{EvictResult, Hook},
 };
 
@@ -51,6 +51,24 @@ where
             freq: _,
         } = self;
         key.size() + value.size()
+    }
+}
+
+/// The arc'ed version of [`S3FifoEntry`].
+///
+/// This arc is shared between the `S3Fifo.entries` and the locked state.
+/// Therefore we want to not consider the arc's ref count
+/// in determining in-use status.
+impl<K, V> InUse for Arc<S3FifoEntry<K, V>>
+where
+    K: Send + Sync + ?Sized,
+    V: InUse,
+{
+    fn in_use(&self) -> bool
+    where
+        Self: Sized,
+    {
+        self.value.in_use()
     }
 }
 
@@ -94,8 +112,20 @@ where
     }
 }
 
+impl<K, V> AsyncDrop for S3FifoEntry<K, V>
+where
+    K: Send + Sync + ?Sized,
+    V: AsyncDrop,
+{
+    fn async_drop(self) -> impl Future<Output = ()> + Send {
+        // perform the async drop on the value
+        self.value.async_drop()
+    }
+}
+
 pub(crate) type CacheEntry<K, V> = Arc<S3FifoEntry<K, V>>;
 type Entries<K, V> = DashMap<Arc<K>, CacheEntry<K, V>>;
+pub(crate) type Evicted<K, V> = Vec<Arc<S3FifoEntry<K, V>>>;
 
 /// Implementation of the [S3-FIFO] cache algorithm.
 ///
@@ -108,7 +138,7 @@ type Entries<K, V> = DashMap<Arc<K>, CacheEntry<K, V>>;
 pub struct S3Fifo<K, V>
 where
     K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
-    V: HasSize + Send + Sync + 'static,
+    V: HasSize + InUse + Send + Sync + 'static,
 {
     locked_state: Mutex<LockedState<K, V>>,
     entries: Entries<K, V>,
@@ -118,7 +148,7 @@ where
 impl<K, V> Debug for S3Fifo<K, V>
 where
     K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
-    V: HasSize + Send + Sync + 'static,
+    V: HasSize + InUse + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Fifo")
@@ -131,7 +161,7 @@ where
 impl<K, V> S3Fifo<K, V>
 where
     K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
-    V: HasSize + Send + Sync + 'static,
+    V: HasSize + InUse + Send + Sync + 'static,
 {
     /// Create new, empty set.
     pub fn new(config: S3Config<K>, metric_registry: &metric::Registry) -> Self {
@@ -201,6 +231,7 @@ where
     }
 
     /// Gets entry from the set, or inserts it if it does not exist yet.
+    /// Returns the entry and any evicted entries.
     ///
     /// # Hook Interaction
     /// If the key already exists, this calls [`Hook::evict`] w/ [`EvictResult::Unfetched`] on the provided new data
@@ -216,7 +247,12 @@ where
     ///
     /// Does NOT block read methods like [`get`](Self::get), [`len`](Self::len), and [`is_empty`](Self::is_empty),
     /// except for short-lived internal locks within [`DashMap`].
-    pub fn get_or_put(&self, key: Arc<K>, value: V, generation: u64) -> CacheEntry<K, V> {
+    pub fn get_or_put(
+        &self,
+        key: Arc<K>,
+        value: V,
+        generation: u64,
+    ) -> (CacheEntry<K, V>, Evicted<K, V>) {
         // Lock the state BEFORE checking `self.entries`. We won't prevent concurrent reads with it but we prevent that
         // concurrent writes could check `entries`, find the key absent and then double-insert the data into the locked state.
         let mut guard = self.locked_state.lock();
@@ -236,9 +272,19 @@ where
             // deallocate the key/value is not done while holding the lock
             // and preventing other operations from proceeding
             drop(guard);
-            drop_it(key);
-            drop_it(value);
-            return entry;
+
+            return (
+                entry,
+                vec![
+                    S3FifoEntry {
+                        key,
+                        value,
+                        generation: Default::default(),
+                        freq: Default::default(),
+                    }
+                    .into(),
+                ],
+            );
         }
 
         let entry = Arc::new(S3FifoEntry {
@@ -253,7 +299,7 @@ where
             .fetched(generation, &entry.key, Ok(entry.size()));
         self.entries
             .insert(Arc::clone(&entry.key), Arc::clone(&entry));
-        let evicted = if guard.ghost.remove(&entry.key) {
+        let (evicted_entries, evicted_keys) = if guard.ghost.remove(&entry.key) {
             let evicted = guard.evict(&self.entries, &self.config);
             guard.main.push_back(Arc::clone(&entry));
             evicted
@@ -264,9 +310,9 @@ where
         };
 
         drop(guard);
-        drop_it(evicted);
+        drop_it(evicted_keys);
 
-        entry
+        (entry, evicted_entries)
     }
 
     /// Gets entry from the set, returns `None` if the key is NOT stored.
@@ -381,7 +427,7 @@ where
 
 /// Calls [`drop`] but isn't inlined, so it is easier to see on profiles.
 #[inline(never)]
-fn drop_it<T>(t: T) {
+pub(crate) fn drop_it<T>(t: T) {
     drop(t);
 }
 
@@ -397,6 +443,9 @@ where
 
     /// Controls when we start evicting from S in an attempt to move more items to M.
     pub move_to_main_threshold: f64,
+
+    /// Maximum amount of in-flight data in bytes.
+    pub inflight_bytes: usize,
 }
 
 impl<K> std::fmt::Debug for S3Config<K>
@@ -409,6 +458,7 @@ where
             .field("max_ghost_memory_size", &self.max_ghost_memory_size)
             .field("hook", &self.hook)
             .field("move_to_main_threshold", &self.move_to_main_threshold)
+            .field("inflight_bytes", &self.inflight_bytes)
             .finish()
     }
 }
@@ -554,7 +604,7 @@ where
 impl<K, V> LockedState<K, V>
 where
     K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
-    V: HasSize + Send + Sync + 'static,
+    V: HasSize + InUse + Send + Sync + 'static,
 {
     fn insert_ghost(&mut self, key: Arc<K>, config: &S3Config<K>, evicted_keys: &mut Vec<Arc<K>>) {
         while self.ghost.memory_size() >= config.max_ghost_memory_size {
@@ -612,11 +662,20 @@ where
         evicted_keys: &mut Vec<Arc<K>>,
     ) {
         while let Some(tail) = self.small.pop_front() {
-            if tail.freq.load(Ordering::SeqCst) > 0 {
+            if tail.freq.load(Ordering::SeqCst) > 0 || tail.in_use() {
                 self.main.push_back(tail);
             } else {
                 let size = tail.size();
+
+                // cache GETs are still served by the S3Fifo::entries, which is not behind the lock
+                // therefore, need to check again
                 entries.remove(&tail.key);
+                if tail.in_use() {
+                    self.main.push_back(Arc::clone(&tail));
+                    entries.insert(Arc::clone(&tail.key), tail);
+                    continue;
+                }
+
                 self.insert_ghost(Arc::clone(&tail.key), config, evicted_keys);
                 config
                     .hook
@@ -653,11 +712,20 @@ where
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| f.checked_sub(1))
                 .is_ok();
 
-            if was_not_zero {
+            if was_not_zero || tail.in_use() {
                 self.main.push_back(tail);
             } else {
                 let size = tail.size();
+
+                // cache GETs are still served by the S3Fifo::entries, which is not behind the lock
+                // therefore, need to check again
                 entries.remove(&tail.key);
+                if tail.in_use() {
+                    self.main.push_back(Arc::clone(&tail));
+                    entries.insert(Arc::clone(&tail.key), tail);
+                    continue;
+                }
+
                 config
                     .hook
                     .evict(tail.generation, &tail.key, EvictResult::Fetched { size });
@@ -684,7 +752,8 @@ mod tests {
 
             // prime S3-FIFO with an entry
             let barrier_a = Arc::new(Barrier::new(2));
-            s3.get_or_put(DropBarrier::new("k", &barrier_a), Arc::new("v"), 0);
+            let (_, evicted) = s3.get_or_put(DropBarrier::new("k", &barrier_a), Arc::new("v"), 0);
+            drop_it(evicted);
 
             let barrier_b = Arc::new(Barrier::new(3));
             let handle_1 =
@@ -708,7 +777,8 @@ mod tests {
 
             // prime S3-FIFO with an entry
             let barrier_a = Arc::new(Barrier::new(2));
-            s3.get_or_put(Arc::new("k"), DropBarrier::new("v", &barrier_a), 0);
+            let (_, evicted) = s3.get_or_put(Arc::new("k"), DropBarrier::new("v", &barrier_a), 0);
+            drop_it(evicted);
 
             let barrier_b = Arc::new(Barrier::new(3));
             let handle_1 =
@@ -769,16 +839,31 @@ mod tests {
         }
     }
 
+    impl<T> InUse for DropBarrier<T> {
+        fn in_use(&self) -> bool {
+            false
+        }
+    }
+
     impl<T> Drop for DropBarrier<T> {
         fn drop(&mut self) {
             self.barrier.wait();
         }
     }
 
+    impl<T> AsyncDrop for DropBarrier<T>
+    where
+        T: AsyncDrop,
+    {
+        async fn async_drop(self) {
+            drop(self);
+        }
+    }
+
     fn s3_fifo<K, V>() -> Arc<S3Fifo<K, V>>
     where
         K: std::fmt::Debug + Eq + Hash + HasSize + Send + Sync + 'static,
-        V: HasSize + Send + Sync + 'static,
+        V: HasSize + InUse + Send + Sync + 'static,
     {
         Arc::new(S3Fifo::new(
             S3Config {
@@ -786,6 +871,7 @@ mod tests {
                 max_ghost_memory_size: 10_000,
                 hook: Arc::new(NoOpHook::default()),
                 move_to_main_threshold: 0.5,
+                inflight_bytes: 10,
             },
             &metric::Registry::new(),
         ))
@@ -799,7 +885,7 @@ mod tests {
         fn get_or_put_handle<K, V>(&self, s3: &Arc<S3Fifo<K, V>>, k: Arc<K>, v: V) -> Self::Handle
         where
             K: Eq + Hash + HasSize + Send + Sync + 'static,
-            V: Clone + HasSize + Send + Sync + 'static;
+            V: Clone + HasSize + InUse + AsyncDrop + Send + Sync + 'static;
     }
 
     impl<'scope> ScopeExt for &'scope std::thread::Scope<'scope, '_> {
@@ -814,11 +900,12 @@ mod tests {
         fn get_or_put_handle<K, V>(&self, s3: &Arc<S3Fifo<K, V>>, k: Arc<K>, v: V) -> Self::Handle
         where
             K: Eq + Hash + HasSize + Send + Sync + 'static,
-            V: Clone + HasSize + Send + Sync + 'static,
+            V: Clone + HasSize + InUse + AsyncDrop + Send + Sync + 'static,
         {
             let s3_captured = Arc::clone(s3);
             self.spawn(move || {
-                s3_captured.get_or_put(k, v, 0);
+                let (_, evicted) = s3_captured.get_or_put(k, v, 0);
+                drop_it(evicted);
             })
         }
     }

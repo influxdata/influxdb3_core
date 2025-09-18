@@ -7,7 +7,7 @@ pub(crate) use datafusion::error::{DataFusionError as Error, Result};
 use datafusion::{
     arrow::datatypes::SchemaRef, error::DataFusionError, physical_plan::ExecutionPlan,
 };
-use flightsql::{FlightSQLCommand, FlightSQLPlanner};
+use flightsql::{BaseTableType, FlightSQLCommand, FlightSQLPlanner};
 use futures::stream::Peekable;
 use generated_types::Streaming;
 use iox_query::{
@@ -73,11 +73,12 @@ impl Planner {
         namespace_name: impl AsRef<str> + Send,
         namespace: Arc<dyn QueryNamespace>,
         cmd: FlightSQLCommand,
+        base_table_type: BaseTableType,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let namespace_name = namespace_name.as_ref();
         let ctx = self.ctx.child_ctx("planner_flight_sql_do_get");
 
-        FlightSQLPlanner::do_get(namespace_name, namespace, cmd, &ctx)
+        FlightSQLPlanner::do_get(namespace_name, namespace, cmd, &ctx, base_table_type)
             .await
             .map_err(DataFusionError::from)
     }

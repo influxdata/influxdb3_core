@@ -6,12 +6,12 @@ use influxdb_influxql_parser::show_measurements::ShowMeasurementsStatement;
 use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
 use influxdb_influxql_parser::show_tag_values::ShowTagValuesStatement;
 use iox_query_params::StatementParams;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::{any::Any, slice};
 
 use crate::plan::{InfluxQLToLogicalPlan, SchemaProvider, parse_regex};
 use datafusion::datasource::provider_as_source;
@@ -97,9 +97,10 @@ impl SchemaExec {
     fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
         let eq_properties = match input.properties().output_ordering() {
             None => EquivalenceProperties::new(schema),
-            Some(output_ordering) => {
-                EquivalenceProperties::new_with_orderings(schema, slice::from_ref(output_ordering))
-            }
+            Some(output_ordering) => EquivalenceProperties::new_with_orderings(
+                schema,
+                std::iter::once(output_ordering.iter().cloned()),
+            ),
         };
 
         let output_partitioning = input.output_partitioning().clone();

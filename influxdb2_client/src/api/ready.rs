@@ -19,6 +19,7 @@ impl Client {
 
         match response.status() {
             StatusCode::OK => Ok(true),
+            StatusCode::SERVICE_UNAVAILABLE => Ok(false),
             _ => {
                 let status = response.status();
                 let text = response.text().await.context(ReqwestProcessingSnafu)?;

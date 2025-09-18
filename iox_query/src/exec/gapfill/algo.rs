@@ -277,7 +277,7 @@ impl GapFiller {
         output_arrays.sort_by(|(a, _), (b, _)| a.cmp(b));
         let output_arrays: Vec<_> = output_arrays.into_iter().map(|(_, arr)| arr).collect();
         let batch = RecordBatch::try_new(Arc::clone(&schema), output_arrays)
-            .map_err(|err| DataFusionError::ArrowError(err, None))?;
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
 
         self.cursor = final_cursor;
         Ok(batch)
@@ -601,7 +601,7 @@ impl Cursor {
         self.build_vec(params, input_time_array, series_ends, &mut aggr_builder)?;
 
         interleave::interleave(&[input_aggr_array, &other_arr], &aggr_builder.idxes)
-            .map_err(|err| DataFusionError::ArrowError(err, None))
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     /// Builds an array using the [`take`](take::take) kernel
@@ -674,7 +674,7 @@ impl Cursor {
 
         let take_arr = UInt64Array::from(take_idxs);
         take::take(input_aggr_array, &take_arr, None)
-            .map_err(|err| DataFusionError::ArrowError(err, None))
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     /// Builds an array using the [`interleave`](arrow::compute::interleave) kernel
@@ -964,14 +964,14 @@ impl StashedAggrBuilder<'_> {
     fn create_stash(input_aggr_array: &ArrayRef, offset: u64) -> Result<ArrayRef> {
         let take_arr: UInt64Array = vec![None, Some(offset)].into();
         let stash = take::take(input_aggr_array, &take_arr, None)
-            .map_err(|err| DataFusionError::ArrowError(err, None))?;
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
         Ok(stash)
     }
 
     /// Build the output column.
     fn build(&self) -> Result<ArrayRef> {
         arrow::compute::interleave(&[&self.stash, self.input_aggr_array], &self.interleave_idxs)
-            .map_err(|err| DataFusionError::ArrowError(err, None))
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     fn buffered_input(offset: usize) -> (usize, usize) {

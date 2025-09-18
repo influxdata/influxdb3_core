@@ -9,9 +9,8 @@ use crate::{CHUNK_ORDER_COLUMN_NAME, QueryChunk};
 
 use super::adapter::SchemaAdapterStream;
 use arrow::datatypes::SchemaRef;
-use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::display::ProjectSchemaDisplay;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::{
     error::DataFusionError,
     execution::context::TaskContext,
@@ -70,7 +69,7 @@ impl RecordBatchesExec {
 
         let chunk_order_field = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).ok();
         let eq_properties = if chunk_order_field.is_some() {
-            let output_ordering: LexOrdering = vec![
+            let output_ordering = [
                 // every chunk gets its own partition, so we can claim that the output is ordered
                 PhysicalSortExpr {
                     expr: Arc::new(
@@ -79,9 +78,8 @@ impl RecordBatchesExec {
                     ),
                     options: Default::default(),
                 },
-            ]
-            .into();
-            EquivalenceProperties::new_with_orderings(Arc::clone(&schema), &[output_ordering])
+            ];
+            EquivalenceProperties::new_with_orderings(Arc::clone(&schema), [output_ordering])
         } else {
             EquivalenceProperties::new(Arc::clone(&schema))
         };
@@ -126,6 +124,7 @@ impl RecordBatchesExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
+        .with_scheduling_type(SchedulingType::Cooperative)
     }
 }
 

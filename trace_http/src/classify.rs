@@ -53,10 +53,16 @@ pub(crate) fn classify_response<B>(
             ),
         }
     } else if status.is_server_error() {
-        (
-            format!("unexpected 5XX status code: {status}").into(),
-            Classification::ServerErr,
-        )
+        match status {
+            // While Not Implemented is technically a server error, it generally indicates that the
+            // client is trying to use an unsupported feature, and we do not want these errors to
+            // contribute to server error alerting.
+            StatusCode::NOT_IMPLEMENTED => ("unimplemented".into(), Classification::ClientErr),
+            _ => (
+                format!("unexpected 5XX status code: {status}").into(),
+                Classification::ServerErr,
+            ),
+        }
     } else {
         (
             format!("unexpected non-error status code: {status}").into(),
@@ -97,7 +103,7 @@ pub(crate) fn classify_headers(
                 9 => ("failed precondition".into(), Classification::ClientErr),
                 10 => ("aborted".into(), Classification::ClientErr),
                 11 => ("out of range".into(), Classification::ClientErr),
-                12 => ("unimplemented".into(), Classification::ServerErr),
+                12 => ("unimplemented".into(), Classification::ClientErr),
                 13 => ("internal".into(), Classification::ServerErr),
                 14 => ("unavailable".into(), Classification::ServerErr),
                 15 => ("data loss".into(), Classification::ServerErr),

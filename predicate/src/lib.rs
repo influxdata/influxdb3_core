@@ -77,11 +77,6 @@ impl Predicate {
         Default::default()
     }
 
-    /// Return true if this predicate has any general purpose predicates
-    pub fn has_exprs(&self) -> bool {
-        !self.exprs.is_empty()
-    }
-
     /// Return a DataFusion [`Expr`] predicate representing the
     /// combination of AND'ing all (`exprs`) and timestamp restriction
     /// in this Predicate.
@@ -269,18 +264,6 @@ impl Predicate {
         self
     }
 
-    /// sets the optional timestamp range, if any
-    pub fn with_maybe_timestamp_range(mut self, range: Option<TimestampRange>) -> Self {
-        // Without more thought, redefining the timestamp range would
-        // lose the old range. Asser that that cannot happen.
-        assert!(
-            range.is_none() || self.range.is_none(),
-            "Unexpected re-definition of timestamp range"
-        );
-        self.range = range;
-        self
-    }
-
     /// Add an  exprestion "time > retention_time"
     pub fn with_retention(mut self, retention_time: i64) -> Self {
         let expr = col(TIME_COLUMN_NAME).gt(lit_timestamptz_nano(retention_time));
@@ -297,20 +280,6 @@ impl Predicate {
     pub fn with_value_expr(mut self, value_expr: ValueExpr) -> Self {
         self.value_expr.push(value_expr);
         self
-    }
-
-    /// Builds a regex matching expression from the provided column name and
-    /// pattern. Values not matching the regex will be filtered out.
-    pub fn with_regex_match_expr(self, column: &str, pattern: impl Into<String>) -> Self {
-        let expr = query_functions::regex_match_expr(col(column), pattern.into());
-        self.with_expr(expr)
-    }
-
-    /// Builds a regex "not matching" expression from the provided column name
-    /// and pattern. Values *matching* the regex will be filtered out.
-    pub fn with_regex_not_match_expr(self, column: &str, pattern: impl Into<String>) -> Self {
-        let expr = query_functions::regex_not_match_expr(col(column), pattern.into());
-        self.with_expr(expr)
     }
 
     /// Sets field_column restriction

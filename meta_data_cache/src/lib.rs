@@ -30,7 +30,7 @@ use datafusion_util::create_physical_expr_from_schema;
 use futures::FutureExt;
 use metric::U64Counter;
 use object_store_mem_cache::cache_system::{
-    Cache, DynError, HasSize,
+    AsyncDrop, Cache, DynError, HasSize, InUse,
     hook::observer::ObserverHook,
     s3_fifo_cache::{S3Config, S3FifoCache},
 };
@@ -77,6 +77,7 @@ impl MetaIndexCacheParams<'_> {
                     metrics,
                     Some(memory_limit.get() as u64),
                 )) as _,
+                inflight_bytes: 1024 * 1024 * 1024, // 1GB
             },
             metrics,
         ));
@@ -193,6 +194,7 @@ impl MetaIndexCache {
                 .boxed()
             }),
             (),
+            None,
         );
         res.await
     }
@@ -424,6 +426,20 @@ impl HasSize for FileMetas {
                 .sum::<usize>();
         }
         size
+    }
+}
+
+impl InUse for FileMetas {
+    fn in_use(&self) -> bool {
+        // although there is an inner Arc, we are ok
+        // with not blocking the eviction
+        false
+    }
+}
+
+impl AsyncDrop for FileMetas {
+    async fn async_drop(self) {
+        drop(self);
     }
 }
 
@@ -724,6 +740,7 @@ mod tests {
                 .boxed()
             }),
             (),
+            None,
         );
         res.await.unwrap()
     }

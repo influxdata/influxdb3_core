@@ -9,6 +9,7 @@ use datafusion::{
         aggregates::AggregateExec,
         coalesce_batches::CoalesceBatchesExec,
         coalesce_partitions::CoalescePartitionsExec,
+        coop::CooperativeExec,
         empty::EmptyExec,
         filter::FilterExec,
         limit::{GlobalLimitExec, LocalLimitExec},
@@ -297,6 +298,12 @@ impl PartitionStatistics for AggregateExec {
     }
 }
 
+impl PartitionStatistics for CooperativeExec {
+    fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
+        statistics_by_partition(self.input().as_ref())
+    }
+}
+
 /// Handle downcasting of the `dyn ExecutionPlan` to the specific execution nodes which
 /// have implemented [`PartitionStatistics`].
 pub fn statistics_by_partition(plan: &dyn ExecutionPlan) -> Result<PartitionedStatistics> {
@@ -333,6 +340,8 @@ pub fn statistics_by_partition(plan: &dyn ExecutionPlan) -> Result<PartitionedSt
     } else if let Some(exec) = plan.as_any().downcast_ref::<RepartitionExec>() {
         exec.statistics_by_partition()
     } else if let Some(exec) = plan.as_any().downcast_ref::<AggregateExec>() {
+        exec.statistics_by_partition()
+    } else if let Some(exec) = plan.as_any().downcast_ref::<CooperativeExec>() {
         exec.statistics_by_partition()
     } else {
         /* These include, but not limited to, the following operators used in iox:
@@ -684,7 +693,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -829,7 +839,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -1068,7 +1079,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -1141,7 +1153,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -1230,7 +1243,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -1342,7 +1356,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema()).unwrap(),
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -1383,7 +1398,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let ranges_per_partition = &[
             &SortKeyRange {
                 min: Some(1000),
@@ -1511,7 +1527,8 @@ mod test {
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
             Default::default(),
-        )]);
+        )])
+        .unwrap();
 
         /* Test Case: the SPM+Deduped `DataSourceExec` are overlapping each other, but are disjoint from the 3rd partion exec */
         let ranges_per_partition_for_data_source_exec_1 = &[
@@ -1645,7 +1662,8 @@ mod test {
         let lex_ordering_on_c = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &file_schema)?, // file_schema
             Default::default(),
-        )]);
+        )])
+        .unwrap();
         let multiple_column_key_ranges_per_file = PartitionedFilesAndRanges {
             per_file: vec![ranges_for_file_0.clone(), ranges_for_file_1.clone()],
         };
@@ -1778,7 +1796,8 @@ mod test {
         let lex_ordering_on_c = LexOrdering::new(vec![
             PhysicalSortExpr::new(col("c", &file_schema)?, Default::default()),
             PhysicalSortExpr::new(col("b", &file_schema)?, Default::default()),
-        ]);
+        ])
+        .unwrap();
         let multiple_column_key_ranges_per_file = PartitionedFilesAndRanges {
             per_file: vec![ranges_for_file_0.clone(), ranges_for_file_1.clone()],
         };

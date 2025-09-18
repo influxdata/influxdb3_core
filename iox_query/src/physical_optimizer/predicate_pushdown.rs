@@ -479,7 +479,7 @@ mod tests {
             .with_col("tag1")
             .with_col("tag2")
             .build();
-        arrow_sort_key_exprs(&sort_key, schema)
+        arrow_sort_key_exprs(&sort_key, schema).unwrap()
     }
 
     fn predicate_tag(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {

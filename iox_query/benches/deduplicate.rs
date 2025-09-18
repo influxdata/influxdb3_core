@@ -10,8 +10,8 @@ use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::sort_batch;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::SessionContext;
@@ -231,7 +231,8 @@ impl TestScenario {
         let num_rows = input.num_rows();
         // First sort the input data by tags
         let fetch = None;
-        let mut batch = sort_batch(&input, &sort_keys.clone().into(), fetch).unwrap();
+        let mut batch =
+            sort_batch(&input, &LexOrdering::new(sort_keys.clone()).unwrap(), fetch).unwrap();
 
         // Divide into batches of 4k rows
         const BATCH_SIZE: usize = 4000;
@@ -282,7 +283,7 @@ impl TestScenario {
         let use_chunk_order_col = false;
         let exec = Arc::new(DeduplicateExec::new(
             Arc::clone(&self.input),
-            self.sort_keys.clone().into(),
+            LexOrdering::new(self.sort_keys.clone()).unwrap(),
             use_chunk_order_col,
         )) as _;
         self.runtime.block_on(async move {

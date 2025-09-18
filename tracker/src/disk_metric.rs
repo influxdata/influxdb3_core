@@ -46,6 +46,65 @@ impl DiskSpaceSnapshot {
     }
 }
 
+/// A disk space reader that handles the low-level disk space reading logic.
+#[derive(Debug)]
+pub struct DiskSpaceReader {
+    /// The [`Disks`] containing the disk list at construction time.
+    disks: Disks,
+
+    /// The index into [`Disks::list()`] for the disk containing the observed
+    /// directory.
+    disk_idx: usize,
+}
+
+impl DiskSpaceReader {
+    /// Create a new [`DiskSpaceReader`], returning [`None`] if no disk can be
+    /// found for the specified `directory`.
+    pub fn new(directory: PathBuf) -> Option<Self> {
+        let mut directory = directory.canonicalize().ok()?;
+
+        // Load the disk stats once, and refresh them later.
+        let mut disks = Disks::new();
+        disks.refresh(true);
+
+        // Resolve the mount point once.
+        // The directory path may be `/path/to/dir` and the mount point is `/`.
+        let disk_idx = loop {
+            if let Some((idx, _disk)) = disks
+                .list()
+                .iter()
+                .enumerate()
+                .find(|(_idx, disk)| disk.mount_point() == directory)
+            {
+                break idx;
+            }
+            // The mount point for this directory could not be found.
+            if !directory.pop() {
+                return None;
+            }
+        };
+
+        Some(Self { disks, disk_idx })
+    }
+
+    /// Read the current disk space statistics.
+    pub fn read(&mut self) -> DiskSpaceSnapshot {
+        let disk = self
+            .disks
+            .list_mut()
+            .get_mut(self.disk_idx)
+            .expect("disk list never refreshed so should not change");
+
+        // Refresh the stats for this disk only.
+        disk.refresh();
+
+        DiskSpaceSnapshot {
+            available_disk_space: disk.available_space(),
+            total_disk_space: disk.total_space(),
+        }
+    }
+}
+
 /// A periodic reporter of disk capacity / free statistics for a given
 /// directory.
 #[derive(Debug)]
@@ -53,12 +112,8 @@ pub struct DiskSpaceMetrics {
     available_disk_space: U64Gauge,
     total_disk_space: U64Gauge,
 
-    /// The [`Disks`] containing the disk list at construction time.
-    disks: Disks,
-
-    /// The index into [`Disks::list()`] for the disk containing the observed
-    /// directory.
-    disk_idx: usize,
+    /// The disk space reader for getting current statistics.
+    reader: DiskSpaceReader,
 
     /// A stream of [`DiskSpaceSnapshot`] produced by the metric reporter for
     /// consumption by any listeners.
@@ -73,8 +128,6 @@ impl DiskSpaceMetrics {
         registry: &metric::Registry,
     ) -> Option<(Self, watch::Receiver<DiskSpaceSnapshot>)> {
         let path: Cow<'static, str> = Cow::from(directory.display().to_string());
-        let mut directory = directory.canonicalize().ok()?;
-
         let attributes = Attributes::from([("path", path)]);
 
         let available_disk_space = registry
@@ -91,38 +144,16 @@ impl DiskSpaceMetrics {
             )
             .recorder(attributes);
 
-        // Load the disk stats once, and refresh them later.
-        let mut disks = Disks::new();
-        disks.refresh(true);
+        let mut reader = DiskSpaceReader::new(directory)?;
+        let initial_snapshot = reader.read();
 
-        // Resolve the mount point once.
-        // The directory path may be `/path/to/dir` and the mount point is `/`.
-        let (disk_idx, initial_disk) = loop {
-            if let Some((idx, disk)) = disks
-                .list()
-                .iter()
-                .enumerate()
-                .find(|(_idx, disk)| disk.mount_point() == directory)
-            {
-                break (idx, disk);
-            }
-            // The mount point for this directory could not be found.
-            if !directory.pop() {
-                return None;
-            }
-        };
-
-        let (snapshot_tx, snapshot_rx) = watch::channel(DiskSpaceSnapshot {
-            available_disk_space: initial_disk.available_space(),
-            total_disk_space: initial_disk.total_space(),
-        });
+        let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
 
         Some((
             Self {
                 available_disk_space,
                 total_disk_space,
-                disks,
-                disk_idx,
+                reader,
                 snapshot_tx,
             },
             snapshot_rx,
@@ -135,24 +166,14 @@ impl DiskSpaceMetrics {
         loop {
             interval.tick().await;
 
-            let disk = self
-                .disks
-                .list_mut()
-                .get_mut(self.disk_idx)
-                .expect("disk list never refreshed so should not change");
+            let snapshot = self.reader.read();
 
-            // Refresh the stats for this disk only.
-            disk.refresh();
-
-            self.available_disk_space.set(disk.available_space());
-            self.total_disk_space.set(disk.total_space());
+            self.available_disk_space.set(snapshot.available_disk_space);
+            self.total_disk_space.set(snapshot.total_disk_space);
 
             // Produce and send a [`DiskSpaceSnapshot`] for any listeners
             // that might exist.
-            _ = self.snapshot_tx.send(DiskSpaceSnapshot {
-                available_disk_space: disk.available_space(),
-                total_disk_space: disk.total_space(),
-            });
+            _ = self.snapshot_tx.send(snapshot);
         }
     }
 }

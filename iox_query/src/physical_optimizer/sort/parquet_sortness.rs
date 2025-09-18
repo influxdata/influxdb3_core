@@ -98,7 +98,7 @@ fn detect_children_with_desired_ordering(
                 required_input_ordering
                     .into_iter()
                     .map(|requirement| requirement.expect("just checked"))
-                    .map(LexOrdering::from_lex_requirement),
+                    .map(|requirement| requirement.into_single().into()),
             )
             .map(|(arc, sort_exprs)| (Arc::clone(arc), sort_exprs))
             .collect(),
@@ -666,9 +666,10 @@ mod tests {
     }
 
     fn ordering<const N: usize>(cols: [&str; N], schema: &SchemaRef) -> LexOrdering {
-        LexOrdering::from_iter(cols.into_iter().map(|col| PhysicalSortExpr {
+        LexOrdering::new(cols.into_iter().map(|col| PhysicalSortExpr {
             expr: Arc::new(Column::new_with_schema(col, schema.as_ref()).unwrap()),
             options: Default::default(),
         }))
+        .unwrap()
     }
 }

@@ -47,7 +47,7 @@ fn dedup_plan_impl(
     let plan = chunks_to_physical_nodes(&arrow_schema, None, chunks, 2);
 
     let sort_key = schema::sort::SortKey::from_columns(schema.primary_key());
-    let sort_exprs = arrow_sort_key_exprs(&sort_key, &plan.schema());
+    let sort_exprs = arrow_sort_key_exprs(&sort_key, &plan.schema()).unwrap();
     Arc::new(DeduplicateExec::new(plan, sort_exprs, use_chunk_order_col))
 }
 

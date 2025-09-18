@@ -45,6 +45,7 @@ service CatalogService {
   rpc TableSoftDelete(TableSoftDeleteRequest) returns (TableSoftDeleteResponse);
   rpc TableRename(TableRenameRequest) returns (TableRenameResponse);
   rpc TableUndelete(TableUndeleteRequest) returns (TableUndeleteResponse);
+  rpc TableDeleteOld(TableDeleteOldRequest) returns (TableDeleteOldResponse);
 
   rpc ColumnCreateOrGet(ColumnCreateOrGetRequest) returns (ColumnCreateOrGetResponse);
   rpc ColumnCreateOrGetManyUnchecked(ColumnCreateOrGetManyUncheckedRequest) returns (stream ColumnCreateOrGetManyUncheckedResponse);
@@ -69,16 +70,21 @@ service CatalogService {
   rpc PartitionUpdateColdCompact(PartitionUpdateColdCompactRequest) returns (PartitionUpdateColdCompactResponse);
   rpc PartitionListOldStyle(PartitionListOldStyleRequest) returns (stream PartitionListOldStyleResponse);
   rpc PartitionDeleteByRetention(PartitionDeleteByRetentionRequest) returns (stream PartitionDeleteByRetentionResponse);
+  rpc PartitionDeleteBatch(PartitionDeleteBatchRequest) returns (stream PartitionDeleteBatchResponse);
   rpc PartitionSnapshot(PartitionSnapshotRequest) returns (PartitionSnapshotResponse);
   rpc PartitionMigrate(PartitionMigrateRequest) returns (PartitionMigrateResponse);
+  rpc PartitionGetNamespaceIdsInRange(PartitionGetNamespaceIdsInRangeRequest) returns (stream PartitionGetNamespaceIdsInRangeResponse);
+  rpc PartitionGetMaxId(PartitionGetMaxIdRequest) returns (PartitionGetMaxIdResponse);
 
   // Partition retention methods
   rpc PartitionRetentionUpsert(PartitionRetentionUpsertRequest) returns (PartitionRetentionUpsertResponse);
+  rpc PartitionRetentionBulkInsert(PartitionRetentionBulkInsertRequest) returns (PartitionRetentionBulkInsertResponse);
   rpc PartitionRetentionGetByPartitionId(PartitionRetentionGetByPartitionIdRequest) returns (PartitionRetentionGetByPartitionIdResponse);
+  rpc PartitionRetentionGetMaxId(PartitionRetentionGetMaxIdRequest) returns (PartitionRetentionGetMaxIdResponse);
   rpc PartitionRetentionListPartitionsNeedingComputation(PartitionRetentionListPartitionsNeedingComputationRequest) returns (stream PartitionRetentionListPartitionsNeedingComputationResponse);
-  rpc PartitionRetentionReconcileMissingPartitions(PartitionRetentionReconcileMissingPartitionsRequest) returns (PartitionRetentionReconcileMissingPartitionsResponse);
   rpc PartitionRetentionListPartitionsForParquetRetention(PartitionRetentionListPartitionsForParquetRetentionRequest) returns (stream PartitionRetentionListPartitionsForParquetRetentionResponse);
   rpc PartitionRetentionListPartitionsForPartitionRetention(PartitionRetentionListPartitionsForPartitionRetentionRequest) returns (stream PartitionRetentionListPartitionsForPartitionRetentionResponse);
+  rpc PartitionRetentionGetPartitionComputeData(PartitionRetentionGetPartitionComputeDataRequest) returns (PartitionRetentionGetPartitionComputeDataResponse);
   rpc PartitionRetentionInvalidateByNamespaceId(PartitionRetentionInvalidateByNamespaceIdRequest) returns (PartitionRetentionInvalidateByNamespaceIdResponse);
 
   rpc ParquetFileFlagForDeleteByRetention(ParquetFileFlagForDeleteByRetentionRequest) returns (stream ParquetFileFlagForDeleteByRetentionResponse);
@@ -382,6 +388,20 @@ message TableUndeleteResponse {
   int64 router_version = 2;
 }
 
+message TableDeleteOldRequest {
+  int64 older_than = 1;
+  uint32 limit = 2;
+}
+
+message TableDeleteOldResponse {
+  repeated DeletedTable deleted_ids = 1;
+}
+
+message DeletedTable {
+  int64 id = 1;
+  int64 namespace_id = 2;
+}
+
 message ColumnCreateOrGetRequest {
   string name = 1;
   int64 table_id = 2;
@@ -576,6 +596,15 @@ message PartitionDeleteByRetentionResponse {
   int64 partition_id = 2;
 }
 
+message PartitionDeleteBatchRequest {
+  repeated int64 partition_ids = 1;
+}
+
+message PartitionDeleteBatchResponse {
+  int64 table_id = 1;
+  int64 partition_id = 2;
+}
+
 message PartitionSnapshotRequest {
   int64 partition_id = 1;
 }
@@ -591,6 +620,17 @@ message PartitionMigrateRequest {
 
 message PartitionMigrateResponse {
   bytes partition_hash_id = 1;
+}
+
+message PartitionGetNamespaceIdsInRangeRequest {
+  int64 min_partition_id = 1;
+  int64 max_partition_id = 2;
+}
+
+message PartitionGetNamespaceIdsInRangeResponse {
+  int64 partition_id = 1;
+  int64 namespace_id = 2;
+  optional int64 retention_period_ns = 3;
 }
 
 message ParquetFileFlagForDeleteByRetentionRequest {}
@@ -782,6 +822,7 @@ message Partition {
   optional int64 cold_compact_at = 7;
   optional int64 created_at = 8;
   optional int64 max_time = 9;
+  optional int64 estimated_size_bytes = 10;
 }
 
 message SkippedCompaction {
@@ -879,6 +920,14 @@ message PartitionRetentionUpsertResponse {
   PartitionRetention partition_retention = 1;
 }
 
+message PartitionRetentionBulkInsertRequest {
+  repeated PartitionRetention entries = 1;
+}
+
+message PartitionRetentionBulkInsertResponse {
+  int64 inserted_count = 1;
+}
+
 message PartitionRetentionGetByPartitionIdRequest {
   int64 partition_id = 1;
 }
@@ -893,14 +942,6 @@ message PartitionRetentionListPartitionsNeedingComputationRequest {
 
 message PartitionRetentionListPartitionsNeedingComputationResponse {
   int64 partition_id = 1;
-}
-
-message PartitionRetentionReconcileMissingPartitionsRequest {
-  // Empty - no parameters needed
-}
-
-message PartitionRetentionReconcileMissingPartitionsResponse {
-  int32 reconciled_count = 1;
 }
 
 message PartitionRetentionListPartitionsForParquetRetentionRequest {
@@ -927,4 +968,38 @@ message PartitionRetentionInvalidateByNamespaceIdRequest {
 
 message PartitionRetentionInvalidateByNamespaceIdResponse {
   int32 invalidated_count = 1;
+}
+
+message PartitionRetentionGetPartitionComputeDataRequest {
+  repeated int64 partition_ids = 1;
+}
+
+message PartitionRetentionGetPartitionComputeDataResponse {
+  repeated PartitionComputeData compute_data = 1;
+}
+
+message PartitionComputeData {
+  int64 partition_id = 1;
+  string partition_key = 2;
+  int64 namespace_id = 3;
+  optional int64 retention_period_ns = 4;
+  optional influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 5;
+}
+
+message PartitionGetMaxIdRequest {
+  // Empty request
+}
+
+message PartitionGetMaxIdResponse {
+  // The maximum partition ID, if any partitions exist
+  optional int64 max_partition_id = 1;
+}
+
+message PartitionRetentionGetMaxIdRequest {
+  // Empty request
+}
+
+message PartitionRetentionGetMaxIdResponse {
+  // The maximum partition ID in partition_retention table, if any entries exist
+  optional int64 max_partition_id = 1;
 }

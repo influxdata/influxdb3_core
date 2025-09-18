@@ -92,7 +92,7 @@ pub(crate) fn extract_ranges_from_plan(
     if !input_plan
         .properties()
         .equivalence_properties()
-        .ordering_satisfy(exprs)
+        .ordering_satisfy(exprs.iter().cloned())?
     {
         return Ok(None);
     }
@@ -659,7 +659,7 @@ mod tests {
                 sort_exprs,
                 schema,
             } = self;
-            let lex_ordering = LexOrdering::new(sort_exprs);
+            let lex_ordering = LexOrdering::new(sort_exprs).unwrap();
 
             assert_eq!(input_ranges.len(), 3);
             let range_a = &input_ranges[0];
@@ -714,7 +714,7 @@ mod tests {
                 schema,
             } = self;
 
-            let lex_ordering = LexOrdering::new(sort_exprs);
+            let lex_ordering = LexOrdering::new(sort_exprs).unwrap();
 
             assert_eq!(input_ranges.len(), 3);
             let range_a = &input_ranges[0];

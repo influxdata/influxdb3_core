@@ -19,7 +19,7 @@ repository = "https://github.com/influxdata/influxdb_iox/tree/main/influxdb_line
 
 [dependencies] # In alphabetical order
 bytes = "1.10"
-log = "0.4.27"
+log = "0.4.28"
 nom = { version = "8", default-features = false, features = ["std"] }
 smallvec = { workspace = true }
 snafu = "0.8"

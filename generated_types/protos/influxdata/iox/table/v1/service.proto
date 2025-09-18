@@ -39,6 +39,9 @@ service TableService {
 
   // Rename a table
   rpc RenameTable(RenameTableRequest) returns (RenameTableResponse);
+
+  // Undelete a table
+  rpc UndeleteTable(UndeleteTableRequest) returns (UndeleteTableResponse);
 }
 
 message CreateTableRequest {
@@ -240,5 +243,14 @@ message RenameTableRequest {
 }
 
 message RenameTableResponse {
+  Table table = 1;
+}
+
+message UndeleteTableRequest {
+  int64 table_id = 1;
+  int64 namespace_id = 2;
+}
+
+message UndeleteTableResponse {
   Table table = 1;
 }

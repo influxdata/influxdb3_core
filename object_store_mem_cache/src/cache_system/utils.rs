@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::FutureExt;
+use futures::{FutureExt, Stream, StreamExt};
 use tokio::task::JoinHandle;
 
 use super::DynError;
@@ -99,20 +99,30 @@ where
     async fn catch_unwind_dyn_error(self) -> Result<Self::Output, DynError> {
         match AssertUnwindSafe(self).catch_unwind().await {
             Ok(res) => res,
-            Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    (*s).to_owned()
-                } else {
-                    "<unknown>".to_owned()
-                };
-
-                Err(Arc::new(PanicError {
-                    message: StringError(msg),
-                }))
-            }
+            Err(e) => Err(PanicError::dyn_error_from_panic(e)),
         }
+    }
+}
+
+/// Same as [`CatchUnwindDynErrorExt`] but for streams.
+pub trait CatchUnwindDynErrorStreamExt {
+    type Output;
+
+    /// Catch unwind and convert panic message into a [`DynError`].
+    fn catch_unwind_dyn_error(self) -> impl Stream<Item = Result<Self::Output, DynError>> + Send;
+}
+
+impl<S, T> CatchUnwindDynErrorStreamExt for S
+where
+    S: Stream<Item = Result<T, DynError>> + Send,
+{
+    type Output = T;
+
+    fn catch_unwind_dyn_error(self) -> impl Stream<Item = Result<Self::Output, DynError>> + Send {
+        AssertUnwindSafe(self).catch_unwind().map(|res| match res {
+            Ok(res) => res,
+            Err(e) => Err(PanicError::dyn_error_from_panic(e)),
+        })
     }
 }
 
@@ -126,6 +136,20 @@ impl PanicError {
     /// Panic message.
     pub fn message(&self) -> &str {
         self.message.inner()
+    }
+
+    fn dyn_error_from_panic(e: Box<dyn std::any::Any + Send>) -> DynError {
+        let msg = if let Some(s) = e.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = e.downcast_ref::<&str>() {
+            (*s).to_owned()
+        } else {
+            "<unknown>".to_owned()
+        };
+
+        Arc::new(Self {
+            message: StringError(msg),
+        })
     }
 }
 

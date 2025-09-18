@@ -168,7 +168,7 @@ fn swap_spm_for_progeval(
             input,
             lexical_ranges.indices().to_owned(),
             ordering_req.clone(),
-        )) as Arc<dyn ExecutionPlan>
+        )?) as Arc<dyn ExecutionPlan>
     };
 
     // Step 5: Replace SortPreservingMergeExec with ProgressiveEvalExec
@@ -1744,11 +1744,10 @@ mod test {
             @r#"
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(90)->(100), (65)->(69), (60)->(64), (55)->(58), (50)->(54), (45)->(49)]"
         - "   ReorderPartitionsExec: mapped_partition_indices=[5, 0, 1, 2, 3, 4]"
-        - "     UnionExec"
-        - "       SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
+        - "     SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
+        - "       UnionExec"
         - "         DataSourceExec: file_groups={5 groups: [[4.parquet:0..100000000], [5.parquet:0..100000000], [6.parquet:0..100000000], [7.parquet:0..100000000], [8.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet, predicate=time@1 > 0, pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         - " "
-        - "       SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[false]"
         - "         ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
         - "           DeduplicateExec: [tag@0 ASC,time@1 ASC]"
         - "             SortPreservingMergeExec: [tag@0 ASC, time@1 ASC, __chunk_order@2 ASC]"
@@ -1786,11 +1785,10 @@ mod test {
             format_execution_plan(&plan),
             @r#"
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(45)->(49), (50)->(54), (55)->(58), (60)->(64), (65)->(69), (90)->(100)]"
-        - "   UnionExec"
-        - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
+        - "   SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
+        - "     UnionExec"
         - "       DataSourceExec: file_groups={5 groups: [[8.parquet:0..100000000], [7.parquet:0..100000000], [6.parquet:0..100000000], [5.parquet:0..100000000], [4.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet, predicate=time@1 > 0, pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         - " "
-        - "     SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[false]"
         - "       ProjectionExec: expr=[tag@0 as tag, time@1 as time]"
         - "         DeduplicateExec: [tag@0 ASC,time@1 ASC]"
         - "           SortPreservingMergeExec: [tag@0 ASC, time@1 ASC, __chunk_order@2 ASC]"
@@ -1892,7 +1890,7 @@ mod test {
             @r#"
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(65)->(69), (60)->(64), (55)->(58), (50)->(54), (45)->(49)]"
         - "   SortExec: TopK(fetch=1), expr=[time@1 DESC], preserve_partitioning=[true]"
-        - "     DataSourceExec: file_groups={5 groups: [[1.parquet:0..100000000], [2.parquet:0..100000000], [3.parquet:0..100000000], [4.parquet:0..100000000], [5.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet, predicate=time@1 > 0, pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - "     DataSourceExec: file_groups={5 groups: [[1.parquet:0..100000000], [2.parquet:0..100000000], [3.parquet:0..100000000], [4.parquet:0..100000000], [5.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet, predicate=time@1 > 0 AND DynamicFilterPhysicalExpr [ true ], pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         "#
         );
 
@@ -1922,7 +1920,7 @@ mod test {
             @r#"
         - " ProgressiveEvalExec: fetch=1, input_ranges=[(45)->(49), (50)->(54), (55)->(58), (60)->(64), (65)->(69)]"
         - "   SortExec: TopK(fetch=1), expr=[time@1 ASC], preserve_partitioning=[true]"
-        - "     DataSourceExec: file_groups={5 groups: [[5.parquet:0..100000000], [4.parquet:0..100000000], [3.parquet:0..100000000], [2.parquet:0..100000000], [1.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet, predicate=time@1 > 0, pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0, required_guarantees=[]"
+        - "     DataSourceExec: file_groups={5 groups: [[5.parquet:0..100000000], [4.parquet:0..100000000], [3.parquet:0..100000000], [2.parquet:0..100000000], [1.parquet:0..100000000]]}, projection=[tag, time], output_ordering=[tag@0 ASC, time@1 ASC], file_type=parquet, predicate=time@1 > 0 AND DynamicFilterPhysicalExpr [ true ], pruning_predicate=time_null_count@1 != row_count@2 AND time_max@0 > 0, required_guarantees=[]"
         "#
         );
     }
@@ -2139,13 +2137,14 @@ mod test {
         fn sort_exprs<'a>(&self, cols: impl IntoIterator<Item = (&'a str, SortOp)>) -> LexOrdering {
             // sort expressions are based on the schema of the input
             let schema = self.inner.schema();
-            LexOrdering::from_iter(cols.into_iter().map(|col| PhysicalSortExpr {
+            LexOrdering::new(cols.into_iter().map(|col| PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema(col.0, schema.as_ref()).unwrap()),
                 options: SortOptions {
                     descending: col.1 == SortOp::Desc,
                     nulls_first: false,
                 },
             }))
+            .unwrap()
         }
 
         fn limit(self, skip: usize, fetch: Option<usize>) -> Self {

@@ -42,12 +42,74 @@ service NamespaceService {
   rpc GetNamespaceWithStorage(GetNamespaceWithStorageRequest) returns (GetNamespaceWithStorageResponse);
 }
 
+// How to filter deleted namespaces in the response of requests this is in.
+//
+// This should generally only be used inside the `NamespaceStatusFilterList` type,
+// so that it can be effecitvely an `optional repeated` field. This is important so that
+// we can determine if someone actually wanted the filters they specified - if we make
+// it just a `repeated` field, they could send nothing for the filters, and thus get some
+// implicit behavior that they may start relying on without realizing it. But if we make
+// it optional, we can fallback to old behavior (since they're probably relying on that right now)
+//
+// Unfortunately, we do have to have the `unspecified` variant because we, once again,
+// need to be able to distinguish between intentionally sending something and relying on
+// implicit behavior.
+//
+// Within `NamespaceStatusFilterList`, we treat a lack of filters as a request to include
+// nothing. Since they opted into having a filter, but then specified that the filter should
+// let nothing be returned, we treat that as a nonsensical operation and reject it, returning
+// an error.
+//
+// We could just make this a repeated list (instead of repeated optional) and treat `None` as
+// a request to return everything, regardless of filters, but we don't do that to keep
+// consistent with the behavior of `TableStatusFilter` in the `TableService` specification
+// (read that spec for its rationale).
+//
+// So if someone specified [Active, Deleted] in this field, that would return all
+// namespaces which are either active or deleted. At time of writing, that includes all
+// namespaces that can exist. However, at some point in the future, we may want to extend
+// the granularity of this endpoint and allow customers to see all namespaces that are in
+// the process of being deleted, or maybe all namespaces that are in the process of being
+// created, or maybe we'll need to add some other status like 'hidden'. Who knows.
+//
+// With the `SoftDeleted` method of filtering, adding more statuses would cause
+// exponential blowup with the number of variants that could occur, since we'd want to
+// support any combination of statuses. With this, however, that extension becomes way
+// easier and more backwards-compatible.
+//
+// Currently, the endpoints that use this filter status also have a deprecated `SoftDeleted`
+// field. This deprecated field will eventually be completely removed, once we are certain
+// granite (which, as far as I know, is the only consumer of this API) is not using this
+// deprecated method of filtering anymore.
+//
+// While we have both of these fields, though, we need to make them both work. To do that,
+// we set two rules:
+// 1. If a request leaves the optional `filters` value unspecified, we just fallback to the
+//   old behavior, from before this field existed. This means parsing the `SoftDeleted` field
+//   and following its behavior (or only returning active tables if the `SoftDeleted` field
+//   was left unspecified)
+// 2. If a request specifies the `filters` field, use it as the only filter, and completely
+//   discard whatever was sent for the `SoftDeleted` field.
+enum NamespaceStatusFilter {
+  NAMESPACE_STATUS_FILTER_UNSPECIFIED = 0;
+  NAMESPACE_STATUS_FILTER_ACTIVE = 1;
+  NAMESPACE_STATUS_FILTER_DELETED = 2;
+}
+
+// See [`NamespaceStatusFilter`] for details
+message NamespaceStatusFilterList {
+  repeated NamespaceStatusFilter inner = 1;
+}
+
 message GetNamespacesRequest {
   // An optional filter against the soft deletion status of returned namespaces.
   //
   // If not specified, only the active namespaces are returned. This is to
   // support legacy clients using the prior behaviour.
-  optional influxdata.iox.common.v1.SoftDeleted deleted = 1;
+  optional influxdata.iox.common.v1.SoftDeleted deleted = 1 [deprecated = true];
+
+  // See type-level comment for details.
+  optional NamespaceStatusFilterList filters = 2;
 }
 
 message GetNamespacesResponse { repeated Namespace namespaces = 1; }
@@ -206,7 +268,14 @@ message GetNamespacesWithStorageRequest {
 
   // Filter by soft-deleted status
   // If not specified, only the active namespaces are returned
-  optional influxdata.iox.common.v1.SoftDeleted deleted = 5;
+  optional influxdata.iox.common.v1.SoftDeleted deleted = 5 [deprecated = true];
+
+  // See type-level comment for details.
+  optional NamespaceStatusFilterList filters = 6;
+
+  // Filter namespaces by name (case-insensitive partial match)
+  // If provided, only namespaces with names containing this string are returned
+  optional string name_filter = 7;
 }
 
 // Request to get a specific namespace with storage.
@@ -216,7 +285,10 @@ message GetNamespaceWithStorageRequest {
 
   // Filter by soft-deleted status
   // If not specified, only the active namespaces are returned
-  optional influxdata.iox.common.v1.SoftDeleted deleted = 2;
+  optional influxdata.iox.common.v1.SoftDeleted deleted = 2 [deprecated = true];
+
+  // See type-level comment for details.
+  optional NamespaceStatusFilterList filters = 3;
 }
 
 // Response containing a list of namespaces with storage.

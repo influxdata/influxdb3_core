@@ -1018,6 +1018,23 @@ impl TryFrom<catalog_v2_proto::PartitionRetention> for PartitionRetention {
     }
 }
 
+/// Data needed for bulk partition retention computation.
+/// This struct contains all the information needed to compute retention boundaries
+/// for a partition without requiring additional database queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionComputeData {
+    /// The partition ID
+    pub partition_id: PartitionId,
+    /// The partition key for template boundary extraction
+    pub partition_key: PartitionKey,
+    /// The namespace this partition belongs to
+    pub namespace_id: NamespaceId,
+    /// The namespace retention period in nanoseconds (None = infinite retention)
+    pub retention_period_ns: Option<i64>,
+    /// The table's partition template for time boundary extraction
+    pub partition_template: partition_template::TablePartitionTemplateOverride,
+}
+
 /// Whether the file was created via bulk ingest or not (For now. This may be expanded to
 /// distinguish between ingester and compactor in the future).
 ///

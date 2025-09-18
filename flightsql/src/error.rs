@@ -15,6 +15,9 @@ pub enum Error {
     #[snafu(context(false))]
     Decode { source: DecodeError },
 
+    #[snafu(display("Invalid argument: {}", description))]
+    InvalidArgument { description: String },
+
     #[snafu(display(
         "Invalid PreparedStatement handle. Expected protobuf Any or UTF-8 query string\nnot protobuf Any: {}\nand not UTF-8: {}",
         proto_source,
@@ -73,7 +76,7 @@ impl From<Error> for DataFusionError {
     fn from(value: Error) -> Self {
         match value {
             Error::DataFusion { source } => *source,
-            Error::Arrow { source } => Self::ArrowError(source, None),
+            Error::Arrow { source } => Self::ArrowError(Box::new(source), None),
             value => Self::External(Box::new(value)),
         }
     }

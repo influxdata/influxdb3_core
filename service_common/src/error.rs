@@ -202,7 +202,10 @@ mod test {
         );
 
         let e = ParserError::ParserError(s.clone());
-        do_transl_test(DataFusionError::SQL(e, None), tonic::Code::InvalidArgument);
+        do_transl_test(
+            DataFusionError::SQL(Box::new(e), None),
+            tonic::Code::InvalidArgument,
+        );
 
         do_transl_test(
             DataFusionError::NotImplemented(s.clone()),
@@ -226,7 +229,10 @@ mod test {
 
         // arrow errors
         do_transl_test(
-            DataFusionError::ArrowError(ArrowError::NotYetImplemented("foo".to_string()), None),
+            DataFusionError::ArrowError(
+                Box::new(ArrowError::NotYetImplemented("foo".to_string())),
+                None,
+            ),
             tonic::Code::Unimplemented,
         );
 
@@ -250,12 +256,12 @@ mod test {
             tonic::Code::ResourceExhausted,
         );
         do_transl_test(
-            FlightError::ExternalError(Box::new(DataFusionError::ObjectStore(
+            FlightError::ExternalError(Box::new(DataFusionError::ObjectStore(Box::new(
                 object_store::Error::Generic {
                     store: "foo",
                     source: Box::new(DataFusionError::Plan(s.clone())),
                 },
-            ))),
+            )))),
             tonic::Code::InvalidArgument,
         );
 
@@ -284,11 +290,11 @@ mod test {
         do_transl_test(
             FlightError::Arrow(ArrowError::ExternalError(Box::new(
                 DataFusionError::ArrowError(
-                    ArrowError::ExternalError(Box::new(ParquetError::External(Box::new(
+                    Box::new(ArrowError::ExternalError(Box::new(ParquetError::External(Box::new(
                         ArrowError::ComputeError(
                             "Error evaluating filter predicate: ArrowError(CastError(\"Cannot cast string 'val1' to value of Int64 type\"), None)".to_string(),
                         ),
-                    )))),
+                    ))))),
                     None,
                 ),
             ))),
@@ -297,10 +303,10 @@ mod test {
 
         // object store errors
         do_transl_test(
-            DataFusionError::ObjectStore(object_store::Error::Generic {
+            DataFusionError::ObjectStore(Box::new(object_store::Error::Generic {
                 store: "foo",
                 source: Box::new(DataFusionError::Plan(s.clone())),
-            }),
+            })),
             tonic::Code::InvalidArgument,
         );
         do_transl_test(
