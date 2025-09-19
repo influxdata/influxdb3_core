@@ -15,8 +15,19 @@ impl<T> Fifo<T>
 where
     T: HasSize,
 {
+    /// Create a new Fifo from a VecDeque.
+    pub(crate) fn new(queue: VecDeque<T>) -> Self {
+        let memory_size = queue.iter().map(|o| o.size()).sum();
+        Self { queue, memory_size }
+    }
+
     pub(crate) fn memory_size(&self) -> usize {
         self.memory_size
+    }
+
+    /// Return a count of items in the queue.
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
     }
 
     pub(crate) fn iter(&self) -> vec_deque::Iter<'_, T> {
@@ -36,6 +47,15 @@ where
             }
             None => None,
         }
+    }
+
+    /// Drain all elements from the queue, consuming the underlying VecDeque
+    /// and returning a iterator over the items.
+    ///
+    /// This preserves the ordering of elements and avoids re-allocation.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> {
+        self.memory_size = 0;
+        std::mem::take(&mut self.queue).into_iter()
     }
 }
 
