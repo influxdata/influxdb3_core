@@ -26,8 +26,9 @@ use super::{FillStrategy, params::GapFillParams};
 /// [`FillStrategy::LinearInterpolate`]: super::FillStrategy::LinearInterpolate
 /// [`GapFillStream`]: super::stream::GapFillStream
 pub(super) struct BufferedInput {
-    /// Indexes of group columns in the schema (not including time).
-    group_cols: Vec<usize>,
+    /// Indexes of series columns in the schema. These are the columns
+    /// that will have consistent values for all rows in a time series.
+    series_cols: Vec<usize>,
     /// Indexes of aggregate columns filled via interpolation.
     interpolate_cols: Vec<usize>,
     /// Buffered records from the input stream.
@@ -42,7 +43,7 @@ pub(super) struct BufferedInput {
 }
 
 impl BufferedInput {
-    pub(super) fn new(params: &GapFillParams, group_cols: Vec<usize>) -> Self {
+    pub(super) fn new(params: &GapFillParams, series_cols: Vec<usize>) -> Self {
         let interpolate_cols = params
             .fill_strategy
             .iter()
@@ -51,7 +52,7 @@ impl BufferedInput {
             })
             .collect::<Vec<usize>>();
         Self {
-            group_cols,
+            series_cols,
             interpolate_cols,
             batches: vec![],
             row_converter: None,
@@ -170,7 +171,7 @@ impl BufferedInput {
     ///
     /// [`arrow::row`]: https://docs.rs/arrow-row/36.0.0/arrow_row/index.html
     fn group_columns_changed(&mut self, last_output_row_idx: (usize, usize)) -> Result<bool> {
-        if self.group_cols.is_empty() {
+        if self.series_cols.is_empty() {
             return Ok(false);
         }
 
@@ -193,7 +194,7 @@ impl BufferedInput {
         if self.row_converter.is_none() {
             let batch = self.batches.first().expect("at least one batch");
             let sort_fields = self
-                .group_cols
+                .series_cols
                 .iter()
                 .map(|c| SortField::new(batch.column(*c).data_type().clone()))
                 .collect();
@@ -208,7 +209,7 @@ impl BufferedInput {
     fn convert_row(&mut self, row_idxs: (usize, usize)) -> Result<Rows> {
         let batch = &self.batches[row_idxs.0];
         let columns: Vec<ArrayRef> = self
-            .group_cols
+            .series_cols
             .iter()
             .map(|col_idx| batch.column(*col_idx).slice(row_idxs.1, 1))
             .collect();

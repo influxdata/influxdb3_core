@@ -730,18 +730,16 @@ fn fields_expand_wildcards(
             }
 
             Expr::Call(Call { name, args }) => {
-                let mut name = name;
-                let mut args = args;
+                let mut stack = vec![(name, args)];
 
                 // Search for the call with a wildcard by continuously descending until
                 // we no longer have a call.
                 while let Some(Expr::Call(Call {
                     name: inner_name,
                     args: inner_args,
-                })) = args.first()
+                })) = stack.last().unwrap().1.first()
                 {
-                    name = inner_name;
-                    args = inner_args;
+                    stack.push((inner_name, inner_args));
                 }
 
                 // a list of supported types that may be selected from the var_refs
@@ -753,7 +751,7 @@ fn fields_expand_wildcards(
                 ]);
 
                 // Modify the supported types for certain functions.
-                match name.as_str() {
+                match stack.last().unwrap().0.as_str() {
                     "count" | "first" | "last" | "distinct" | "elapsed" | "mode" | "sample" => {
                         supported_types
                             .extend([Some(VarRefDataType::String), Some(VarRefDataType::Boolean)]);
@@ -767,21 +765,38 @@ fn fields_expand_wildcards(
                     _ => {}
                 }
 
+                // Reverse the stack so that new fields can be added by
+                // applying the required function calls starting with
+                // the inner-most.
+                stack.reverse();
                 let add_field = |v: &VarRef| {
-                    let mut args = args.clone();
-                    args[0] = Expr::VarRef(v.clone());
+                    let var_ref_name = v.name.clone();
+                    let mut e = Expr::VarRef(v.clone());
+                    for (name, args) in &stack {
+                        e = Expr::Call(Call {
+                            name: (*name).clone(),
+                            // The first argument is always e as it is
+                            // either the new field reference or the
+                            // next inner function call. Any remaining
+                            // arguments are appended.
+                            args: vec![e]
+                                .into_iter()
+                                .chain(args.iter().skip(1).cloned())
+                                .collect(),
+                        })
+                    }
                     new_fields.push(influxdb_influxql_parser::select::Field {
-                        expr: Expr::Call(Call {
-                            name: name.clone(),
-                            args,
-                        }),
-                        alias: Some(format!("{}_{}", field_name(&f), v.name).into()),
+                        expr: e,
+                        alias: Some(format!("{}_{}", field_name(&f), var_ref_name).into()),
                     })
                 };
 
-                match args.first() {
+                match stack.first().unwrap().1.first() {
                     Some(Expr::Wildcard(Some(WildcardType::Tag))) => {
-                        return error::query(format!("unable to use tag as wildcard in {name}()"));
+                        return error::query(format!(
+                            "unable to use tag as wildcard in {}()",
+                            stack.first().unwrap().0
+                        ));
                     }
                     Some(Expr::Wildcard(_)) => {
                         var_refs
@@ -1670,16 +1685,19 @@ fn select_statement_info(
 
 #[cfg(test)]
 mod test {
-    use super::Result;
+    use super::{Result, VarRef};
     use crate::plan::ir::{Field, Select};
     use crate::plan::rewriter::{
-        ProjectionType, SelectStatementInfo, find_table_names, has_wildcards, rewrite_select,
-        rewrite_statement,
+        ProjectionType, SelectStatementInfo, fields_expand_wildcards, find_table_names,
+        has_wildcards, rewrite_select, rewrite_statement,
     };
     use crate::plan::test_utils::{MockSchemaProvider, parse_select};
     use assert_matches::assert_matches;
     use datafusion::error::DataFusionError;
+    use influxdb_influxql_parser::expression::VarRefDataType;
+    use influxdb_influxql_parser::identifier::Identifier;
     use influxdb_influxql_parser::select::SelectStatement;
+    use influxdb_influxql_parser::string::Regex;
     use test_helpers::{assert_contains, assert_error};
 
     #[test]
@@ -2811,5 +2829,233 @@ mod test {
         let res = has_wildcards(&sel);
         assert!(!res.0);
         assert!(!res.1);
+    }
+
+    #[test]
+    fn test_nested_function_wildcard_expansion() {
+        // Test that wildcards in nested functions are properly expanded
+        // This tests the fix for expanding regular expressions in nested functions
+
+        let _namespace = MockSchemaProvider::default();
+
+        // Create var_refs for cpu table (based on database::schemas())
+        // Tags: host, region, cpu
+        // Fields: usage_user, usage_system, usage_idle (all Float)
+        let var_refs = vec![
+            VarRef {
+                name: Identifier::new("host".to_string()),
+                data_type: Some(VarRefDataType::Tag),
+            },
+            VarRef {
+                name: Identifier::new("region".to_string()),
+                data_type: Some(VarRefDataType::Tag),
+            },
+            VarRef {
+                name: Identifier::new("cpu".to_string()),
+                data_type: Some(VarRefDataType::Tag),
+            },
+            VarRef {
+                name: Identifier::new("usage_user".to_string()),
+                data_type: Some(VarRefDataType::Float),
+            },
+            VarRef {
+                name: Identifier::new("usage_system".to_string()),
+                data_type: Some(VarRefDataType::Float),
+            },
+            VarRef {
+                name: Identifier::new("usage_idle".to_string()),
+                data_type: Some(VarRefDataType::Float),
+            },
+        ];
+
+        // Test difference(sum(*)) - a nested function combination with wildcard
+        let fields = vec![influxdb_influxql_parser::select::Field {
+            expr: influxdb_influxql_parser::expression::Expr::Call(
+                influxdb_influxql_parser::expression::Call {
+                    name: "difference".to_string(),
+                    args: vec![influxdb_influxql_parser::expression::Expr::Call(
+                        influxdb_influxql_parser::expression::Call {
+                            name: "sum".to_string(),
+                            args: vec![influxdb_influxql_parser::expression::Expr::Wildcard(None)],
+                        },
+                    )],
+                },
+            ),
+            alias: None,
+        }];
+
+        // Expand wildcards
+        let expanded_fields = fields_expand_wildcards(fields, var_refs.clone()).unwrap();
+
+        // Check that wildcards were expanded to actual fields (only numeric fields)
+        assert!(
+            expanded_fields.len() == 3,
+            "Expected 3 numeric fields after expansion"
+        );
+
+        // Verify each field has proper nested structure difference(sum(field))
+        for field in &expanded_fields {
+            // Should have an alias like difference_<fieldname> (outermost function name + field)
+            assert!(field.alias.is_some(), "Field should have an alias");
+            let alias = field.alias.as_ref().unwrap();
+            assert!(
+                alias.starts_with("difference_"),
+                "Alias should start with difference_"
+            );
+
+            // Verify it's a difference(sum(field)) structure
+            match &field.expr {
+                influxdb_influxql_parser::expression::Expr::Call(outer_call) => {
+                    assert_eq!(outer_call.name, "difference");
+                    assert_eq!(outer_call.args.len(), 1);
+
+                    match &outer_call.args[0] {
+                        influxdb_influxql_parser::expression::Expr::Call(inner_call) => {
+                            assert_eq!(inner_call.name, "sum");
+                            assert_eq!(inner_call.args.len(), 1);
+
+                            // Should be a VarRef to an actual field
+                            assert_matches!(
+                                &inner_call.args[0],
+                                influxdb_influxql_parser::expression::Expr::VarRef(_)
+                            );
+                        }
+                        _ => panic!("Expected inner call to be sum()"),
+                    }
+                }
+                _ => panic!("Expected outer call to be difference()"),
+            }
+        }
+
+        // Test with regex pattern in nested function - difference(sum(/usage.*/))
+        let fields_regex = vec![influxdb_influxql_parser::select::Field {
+            expr: influxdb_influxql_parser::expression::Expr::Call(
+                influxdb_influxql_parser::expression::Call {
+                    name: "difference".to_string(),
+                    args: vec![influxdb_influxql_parser::expression::Expr::Call(
+                        influxdb_influxql_parser::expression::Call {
+                            name: "sum".to_string(),
+                            args: vec![influxdb_influxql_parser::expression::Expr::Literal(
+                                influxdb_influxql_parser::literal::Literal::Regex(Regex::new(
+                                    "usage.*".to_string(),
+                                )),
+                            )],
+                        },
+                    )],
+                },
+            ),
+            alias: None,
+        }];
+
+        // Expand regex pattern
+        let expanded_regex = fields_expand_wildcards(fields_regex, var_refs.clone()).unwrap();
+
+        // Should expand to fields matching the pattern
+        assert_eq!(
+            expanded_regex.len(),
+            3,
+            "Expected exactly 3 fields matching 'usage.*'"
+        );
+
+        for field in &expanded_regex {
+            assert!(field.alias.is_some());
+            let alias = field.alias.as_ref().unwrap();
+            assert!(
+                alias.starts_with("difference_usage"),
+                "Expanded field should start with 'difference_usage'"
+            );
+
+            // Verify it's a difference(sum(field)) structure
+            match &field.expr {
+                influxdb_influxql_parser::expression::Expr::Call(outer_call) => {
+                    assert_eq!(outer_call.name, "difference");
+                    match &outer_call.args[0] {
+                        influxdb_influxql_parser::expression::Expr::Call(inner_call) => {
+                            assert_eq!(inner_call.name, "sum");
+                        }
+                        _ => panic!("Expected inner call to be sum()"),
+                    }
+                }
+                _ => panic!("Expected outer call to be difference()"),
+            }
+        }
+
+        // Test that the stack-based traversal correctly handles deeply nested functions
+        // This is the core of the fix - ensuring we properly rebuild the nested structure
+        let deep_nested = vec![influxdb_influxql_parser::select::Field {
+            expr: influxdb_influxql_parser::expression::Expr::Call(
+                influxdb_influxql_parser::expression::Call {
+                    name: "non_negative_difference".to_string(),
+                    args: vec![influxdb_influxql_parser::expression::Expr::Call(
+                        influxdb_influxql_parser::expression::Call {
+                            name: "mean".to_string(),
+                            args: vec![influxdb_influxql_parser::expression::Expr::Call(
+                                influxdb_influxql_parser::expression::Call {
+                                    name: "sum".to_string(),
+                                    args: vec![
+                                        influxdb_influxql_parser::expression::Expr::Wildcard(None),
+                                    ],
+                                },
+                            )],
+                        },
+                    )],
+                },
+            ),
+            alias: None,
+        }];
+
+        // This should expand the wildcard while preserving the full nested structure
+        let expanded_deep = fields_expand_wildcards(deep_nested, var_refs).unwrap();
+        assert_eq!(
+            expanded_deep.len(),
+            3,
+            "Deep nested functions should expand to 3 numeric fields"
+        );
+
+        // Verify the structure is preserved: non_negative_difference(mean(sum(field)))
+        for field in &expanded_deep {
+            assert!(field.alias.is_some());
+            let alias = field.alias.as_ref().unwrap();
+            assert!(
+                alias.starts_with("non_negative_difference_usage"),
+                "Deep nested alias should start with non_negative_difference_usage"
+            );
+
+            match &field.expr {
+                influxdb_influxql_parser::expression::Expr::Call(outer) => {
+                    assert_eq!(outer.name, "non_negative_difference");
+                    assert_eq!(
+                        outer.args.len(),
+                        1,
+                        "non_negative_difference should have 1 arg"
+                    );
+
+                    // First arg should be mean(sum(field))
+                    match &outer.args[0] {
+                        influxdb_influxql_parser::expression::Expr::Call(middle) => {
+                            assert_eq!(middle.name, "mean");
+                            assert_eq!(middle.args.len(), 1);
+
+                            // Inner should be sum(field)
+                            match &middle.args[0] {
+                                influxdb_influxql_parser::expression::Expr::Call(inner) => {
+                                    assert_eq!(inner.name, "sum");
+                                    assert_eq!(inner.args.len(), 1);
+
+                                    // Should be a VarRef
+                                    assert_matches!(
+                                        &inner.args[0],
+                                        influxdb_influxql_parser::expression::Expr::VarRef(_)
+                                    );
+                                }
+                                _ => panic!("Expected innermost call to be sum()"),
+                            }
+                        }
+                        _ => panic!("Expected middle call to be mean()"),
+                    }
+                }
+                _ => panic!("Expected outer call to be non_negative_difference()"),
+            }
+        }
     }
 }

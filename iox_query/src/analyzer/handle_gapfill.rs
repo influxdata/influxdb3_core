@@ -4,7 +4,7 @@
 pub mod range_predicate;
 mod virtual_function;
 
-use crate::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
+use crate::exec::gapfill::{FillExpr, FillStrategy, GapFill};
 use datafusion::common::{
     DFSchema, ExprSchema, internal_datafusion_err, plan_datafusion_err, plan_err,
 };
@@ -150,7 +150,7 @@ fn build_gapfill_node(
     new_aggr_plan: LogicalPlan,
     date_bin_gapfill_index: usize,
     date_bin_gapfill_args: Vec<Expr>,
-    date_bin_udf: Arc<str>,
+    date_bin_udf: Arc<ScalarUDF>,
 ) -> Result<LogicalPlan> {
     match date_bin_gapfill_args.len() {
         2 | 3 => (),
@@ -159,7 +159,7 @@ fn build_gapfill_node(
                 "DATE_BIN_GAPFILL expects 2 or 3 arguments, got {nargs}",
             )));
         }
-    }
+    };
 
     let mut args_iter = date_bin_gapfill_args.into_iter();
 
@@ -206,6 +206,15 @@ fn build_gapfill_node(
             .schema()
             .qualified_field(date_bin_gapfill_index),
     ));
+    let time_column_alias = time_column.name_for_alias()?;
+
+    let time_expr = date_bin_udf
+        .call(if let Some(origin) = origin {
+            vec![stride, time_column, origin]
+        } else {
+            vec![stride, time_column]
+        })
+        .alias(time_column_alias);
 
     let LogicalPlan::Aggregate(aggr) = &new_aggr_plan else {
         return Err(DataFusionError::Internal(format!(
@@ -213,26 +222,19 @@ fn build_gapfill_node(
             new_aggr_plan.display()
         )));
     };
-    let mut new_group_expr: Vec<_> = aggr
-        .schema
-        .iter()
-        .map(|(qualifier, field)| {
+
+    let mut col_it = aggr.schema.iter();
+    let series_expr = (&mut col_it)
+        .take(aggr.group_expr.len())
+        .enumerate()
+        .filter(|(idx, _)| *idx != date_bin_gapfill_index)
+        .map(|(_, (qualifier, field))| {
             Expr::Column(datafusion::common::Column::from((
                 qualifier,
                 field.as_ref(),
             )))
         })
         .collect();
-    let aggr_expr = new_group_expr.split_off(aggr.group_expr.len());
-
-    match (aggr_expr.len(), aggr.aggr_expr.len()) {
-        (f, e) if f != e => {
-            return Err(internal_datafusion_err!(
-                "The number of aggregate expressions has gotten lost; expected {e}, found {f}. This is a bug, please report it."
-            ));
-        }
-        _ => (),
-    }
 
     // this schema is used for the `FillStrategy::Default` checks below. It also represents the
     // schema of the projection of `aggr`, meaning that it shows the columns/fields as they exist
@@ -241,9 +243,13 @@ fn build_gapfill_node(
     // value of those types according to the AggregateFunction below, it all works out.
     let schema = &aggr.schema;
 
-    let fill_behavior = aggr_expr
-        .iter()
-        .cloned()
+    let fill_expr = col_it
+        .map(|(qualifier, field)| {
+            Expr::Column(datafusion::common::Column::from((
+                qualifier,
+                field.as_ref(),
+            )))
+        })
         // `aggr_expr` and `aggr.aggr_expr` should line up in the sense that `aggr.aggr_expr[n]`
         // represents a transformation that was done to produce `aggr_expr[n]`, so we can zip them
         // together like this to determine the correct fill type for the produced expression
@@ -257,25 +263,32 @@ fn build_gapfill_node(
             // `col_expr` should be the 'computed'/'transformed' representation of `aggr_expr`, we
             // `aggr_expr`, we need to make sure that it's a column or else this doesn't really
             // matter to calculate.
-            default_return_value_for_aggr_fn(aggr_expr, schema, col_expr.try_as_col())
-                .map(|rt| (col_expr, FillStrategy::Default(rt)))
+            default_return_value_for_aggr_fn(aggr_expr, schema, col_expr.try_as_col()).map(|rt| {
+                FillExpr {
+                    expr: col_expr,
+                    strategy: FillStrategy::Default(rt),
+                }
+            })
         })
-        .collect::<Result<_>>()?;
+        .collect::<Result<Vec<_>>>()?;
+
+    match (fill_expr.len(), aggr.aggr_expr.len()) {
+        (f, e) if f != e => {
+            return Err(internal_datafusion_err!(
+                "The number of aggregate expressions has gotten lost; expected {e}, found {f}. This is a bug, please report it."
+            ));
+        }
+        _ => (),
+    }
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(
             GapFill::try_new(
                 Arc::new(new_aggr_plan),
-                new_group_expr,
-                aggr_expr,
-                GapFillParams {
-                    date_bin_udf,
-                    stride,
-                    time_column,
-                    origin,
-                    time_range,
-                    fill_strategy: fill_behavior,
-                },
+                series_expr,
+                time_expr,
+                fill_expr,
+                time_range,
             )
             .map_err(|e| e.context("GapFill::try_new"))?,
         ),
@@ -329,7 +342,7 @@ enum RewriteInfo {
         // The arguments to the call to DATE_BIN_GAPFILL.
         date_bin_gapfill_args: Vec<Expr>,
         // The name of the UDF that provides the DATE_BIN like functionality.
-        date_bin_udf: Arc<str>,
+        date_bin_udf: Arc<ScalarUDF>,
     },
 }
 
@@ -375,7 +388,7 @@ fn replace_date_bin_gapfill(aggr: Aggregate) -> Result<RewriteInfo> {
         }
     };
 
-    let date_bin_udf = Arc::from(date_bin.name());
+    let date_bin_udf = Arc::clone(&date_bin);
     let mut rewriter = DateBinGapfillRewriter {
         args: None,
         date_bin,
@@ -985,7 +998,7 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
             @r#"
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[avg(temps.temp)], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp)]]"
         - "    Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "      TableScan: temps"
@@ -1014,7 +1027,7 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
             @r#"
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None))], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None)), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None)), TimestampNanosecond(7, None)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None)), fill=[avg(temps.temp)], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time, TimestampNanosecond(7, None)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time,TimestampNanosecond(7, None))]], aggr=[[avg(temps.temp)]]"
         - "    Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "      TableScan: temps"
@@ -1043,7 +1056,7 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan)?,
             @r#"
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), temps.loc], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "GapFill: series=[temps.loc], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[avg(temps.temp)], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), temps.loc]], aggr=[[avg(temps.temp)]]"
         - "    Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "      TableScan: temps"
@@ -1094,7 +1107,7 @@ mod test {
             format_analyzed_plan(plan)?,
             @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), avg(temps.temp)"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp)]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "  GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[avg(temps.temp)], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp)]]"
         - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
@@ -1128,7 +1141,7 @@ mod test {
             format_analyzed_plan(plan)?,
             @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), avg(temps.temp) AS locf(avg(temps.temp)), min(temps.temp) AS locf(min(temps.temp))"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[LOCF(avg(temps.temp)), LOCF(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "  GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[LOCF(avg(temps.temp)), LOCF(min(temps.temp))], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp), min(temps.temp)]]"
         - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
@@ -1161,7 +1174,7 @@ mod test {
             format_analyzed_plan(plan)?,
             @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), min(temps.temp) AS locf(min(temps.temp)) AS locf_min_temp"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[avg(temps.temp), LOCF(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "  GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[avg(temps.temp), LOCF(min(temps.temp))], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp), min(temps.temp)]]"
         - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
@@ -1195,7 +1208,7 @@ mod test {
             format_analyzed_plan(plan)?,
             @r#"
         - "Projection: date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), avg(temps.temp) AS interpolate(avg(temps.temp)), min(temps.temp) AS interpolate(min(temps.temp))"
-        - "  GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[INTERPOLATE(avg(temps.temp)), INTERPOLATE(min(temps.temp))]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "  GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[INTERPOLATE(avg(temps.temp)), INTERPOLATE(min(temps.temp))], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "    Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[avg(temps.temp), min(temps.temp)]]"
         - "      Filter: temps.time >= TimestampNanosecond(1000, None) AND temps.time < TimestampNanosecond(2000, None)"
         - "        TableScan: temps"
@@ -1231,7 +1244,7 @@ mod test {
         insta::assert_yaml_snapshot!(
             format_analyzed_plan(plan).unwrap(),
             @r#"
-        - "GapFill: groupBy=[date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)], aggr=[[]], time_column=date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), stride=IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
+        - "GapFill: series=[], time=date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time), fill=[], range=Included(Literal(TimestampNanosecond(1000, None), None))..Excluded(Literal(TimestampNanosecond(2000, None), None))"
         - "  Aggregate: groupBy=[[date_bin(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"), temps.time) AS date_bin_gapfill(IntervalDayTime(\"IntervalDayTime { days: 0, milliseconds: 60000 }\"),temps.time)]], aggr=[[]]"
         - "    TableScan: temps projection=[time], full_filters=[temps.time >= TimestampNanosecond(1000, None), temps.time < TimestampNanosecond(2000, None), temps.loc = Utf8(\"foo\")]"
         "#);

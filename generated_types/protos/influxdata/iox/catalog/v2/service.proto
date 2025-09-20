@@ -68,7 +68,10 @@ service CatalogService {
   rpc PartitionNewFileBetween(PartitionNewFileBetweenRequest) returns (stream PartitionNewFileBetweenResponse);
   rpc PartitionNeedingColdCompact(PartitionNeedingColdCompactRequest) returns (stream PartitionNeedingColdCompactResponse);
   rpc PartitionUpdateColdCompact(PartitionUpdateColdCompactRequest) returns (PartitionUpdateColdCompactResponse);
-  rpc PartitionListOldStyle(PartitionListOldStyleRequest) returns (stream PartitionListOldStyleResponse);
+  rpc PartitionUpdateStorageSize(PartitionUpdateStorageSizeRequest) returns (PartitionUpdateStorageSizeResponse);
+  rpc PartitionListOldStyle(PartitionListOldStyleRequest) returns (stream PartitionListOldStyleResponse) {
+    option deprecated = true;
+  };
   rpc PartitionDeleteByRetention(PartitionDeleteByRetentionRequest) returns (stream PartitionDeleteByRetentionResponse);
   rpc PartitionDeleteBatch(PartitionDeleteBatchRequest) returns (stream PartitionDeleteBatchResponse);
   rpc PartitionSnapshot(PartitionSnapshotRequest) returns (PartitionSnapshotResponse);
@@ -352,13 +355,19 @@ message TableEnableIcebergRequest {
   int64 table_id = 1;
 }
 
-message TableEnableIcebergResponse {}
+message TableEnableIcebergResponse {
+  Table table = 1;
+  int64 router_version = 2;
+}
 
 message TableDisableIcebergRequest {
   int64 table_id = 1;
 }
 
-message TableDisableIcebergResponse {}
+message TableDisableIcebergResponse {
+  Table table = 1;
+  int64 router_version = 2;
+}
 
 message TableSoftDeleteRequest {
   int64 table_id = 1;
@@ -568,6 +577,7 @@ message PartitionNewFileBetweenResponse {
 message PartitionNeedingColdCompactRequest {
   int64 maximum_time = 1;
   uint64 n = 2;
+  optional int64 redo_before_nanos = 3;
 }
 
 message PartitionNeedingColdCompactResponse {
@@ -580,6 +590,13 @@ message PartitionUpdateColdCompactRequest {
 }
 
 message PartitionUpdateColdCompactResponse {}
+
+message PartitionUpdateStorageSizeRequest {
+  int64 partition_id = 1;
+  int64 estimated_size_bytes = 2;
+}
+
+message PartitionUpdateStorageSizeResponse {}
 
 message PartitionListOldStyleRequest {}
 

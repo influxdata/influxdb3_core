@@ -327,6 +327,52 @@ mod test {
         );
     }
 
+    // Under sort preserving merge is not UnionExec,
+    // although the new optimizer can handle it.
+    #[test]
+    fn test_replace_spm_with_no_union_under_spm() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+        let sort_order = sort_order_for_sort();
+
+        // First sort on parquet file
+        let plan_parquet = data_source_exec_parquet_with_value_range(&schema, 1000, 2000);
+        let plan_projection_1 = Arc::new(
+            ProjectionExec::try_new(
+                projection_expr_with_2_constants("m1", "tag0", &schema),
+                plan_parquet,
+            )
+            .unwrap(),
+        );
+        let plan_sort1 = Arc::new(SortExec::new(sort_order.clone(), plan_projection_1));
+
+        // add sort preserving merge on top
+        let plan_spm = Arc::new(SortPreservingMergeExec::new(
+            sort_order_for_sort_preserving_merge(),
+            plan_sort1,
+        ));
+
+        // input and output are the same
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_spm, opt),
+            @r#"
+        input:
+          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
+          - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
+          - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC], file_type=parquet"
+        output:
+          Ok:
+            - " ProgressiveEvalExec: input_ranges=[(m1,tag0)->(m1,tag0)]"
+            - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
+            - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC], file_type=parquet"
+        "#
+        );
+    }
+
     // ------------------------------------------------------------------
     // Negative tests: wrong structure -> not optimized
     // ------------------------------------------------------------------
@@ -391,52 +437,6 @@ mod test {
             - "     SortExec: expr=[iox::measurement ASC NULLS LAST], preserve_partitioning=[false]"
             - "       ProjectionExec: expr=[m0 as iox::measurement, tag0 as key, tag0@1 as value]"
             - "         RecordBatchesExec: chunks=1, projection=[tag2, tag0, tag1, field1, time, __chunk_order]"
-        "#
-        );
-    }
-
-    // Under sort preserving merge is not UnionExec,
-    // altho the new optimizer can handle it.
-    #[test]
-    fn test_replace_spm_with_no_union_under_spm() {
-        test_helpers::maybe_start_logging();
-
-        let schema = schema();
-        let sort_order = sort_order_for_sort();
-
-        // First sort on parquet file
-        let plan_parquet = data_source_exec_parquet_with_value_range(&schema, 1000, 2000);
-        let plan_projection_1 = Arc::new(
-            ProjectionExec::try_new(
-                projection_expr_with_2_constants("m1", "tag0", &schema),
-                plan_parquet,
-            )
-            .unwrap(),
-        );
-        let plan_sort1 = Arc::new(SortExec::new(sort_order.clone(), plan_projection_1));
-
-        // add sort preserving merge on top
-        let plan_spm = Arc::new(SortPreservingMergeExec::new(
-            sort_order_for_sort_preserving_merge(),
-            plan_sort1,
-        ));
-
-        // input and output are the same
-        let opt = OrderUnionSortedInputs;
-        insta::assert_yaml_snapshot!(
-            OptimizationTest::new(plan_spm, opt),
-            @r#"
-        input:
-          - " SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST, key@1 ASC NULLS LAST, value@2 ASC NULLS LAST]"
-          - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
-          - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC], file_type=parquet"
-        output:
-          Ok:
-            - " ProgressiveEvalExec: input_ranges=[(m1,tag0)->(m1,tag0)]"
-            - "   SortExec: expr=[value@2 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "     ProjectionExec: expr=[m1 as iox::measurement, tag0 as key, tag0@1 as value]"
-            - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[tag2, tag0, tag1, field1, time, __chunk_order], output_ordering=[__chunk_order@5 ASC], file_type=parquet"
         "#
         );
     }

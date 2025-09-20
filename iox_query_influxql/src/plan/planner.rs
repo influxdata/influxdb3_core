@@ -100,7 +100,7 @@ use iox_query::analyzer::default_return_value_for_aggr_fn;
 use iox_query::analyzer::range_predicate::find_time_range;
 use iox_query::config::{IoxConfigExt, MetadataCutoff};
 use iox_query::exec::IOxSessionContext;
-use iox_query::exec::gapfill::{FillStrategy, GapFill, GapFillParams};
+use iox_query::exec::gapfill::{FillExpr, FillStrategy, GapFill};
 use iox_query_params::StatementParams;
 use itertools::Itertools;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
@@ -1580,7 +1580,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             ctx.group_by.and_then(|gb| gb.time_dimension()),
             fill_strategy,
         ) {
-            build_gap_fill_node(plan, time_column, fill_strategy, &ctx.projection_type)?
+            build_gap_fill_node(plan, fill_strategy, &ctx.projection_type)?
         } else {
             plan
         };
@@ -2291,106 +2291,10 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         iql: &IQLExpr,
         schema: &IQLSchema<'_>,
     ) -> Result<Expr> {
-        let df_schema = &schema.df_schema;
         match iql {
             // rewriter is expected to expand wildcard expressions
             IQLExpr::Wildcard(_) => error::internal("unexpected wildcard in projection"),
-            IQLExpr::VarRef(VarRef {
-                name,
-                data_type: opt_dst_type,
-            }) => {
-                Ok(match (scope, name.as_str()) {
-                    // Per the Go implementation, the time column is case-insensitive in the
-                    // `WHERE` clause and disregards any postfix type cast operator.
-                    //
-                    // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5751-L5753
-                    (ExprScope::Where, name) if name.eq_ignore_ascii_case("time") => {
-                        "time".as_expr()
-                    }
-                    (ExprScope::Projection, "time") => "time".as_expr(),
-                    (_, name) => match df_schema
-                        .fields_with_unqualified_name(name)
-                        .first()
-                        .map(|f| f.data_type().clone())
-                    {
-                        Some(src_type) => {
-                            let column = name.as_expr();
-
-                            match opt_dst_type.and_then(var_ref_data_type_to_data_type) {
-                                Some(dst_type) => {
-                                    fn is_numeric(dt: &DataType) -> bool {
-                                        matches!(
-                                            dt,
-                                            DataType::Int64 | DataType::Float64 | DataType::UInt64
-                                        )
-                                    }
-
-                                    if src_type == dst_type {
-                                        column
-                                    } else if is_numeric(&src_type) && is_numeric(&dst_type) {
-                                        // InfluxQL only allows casting between numeric types,
-                                        // and it is safe to unconditionally unwrap, as the
-                                        // `is_numeric_type` call guarantees it can be mapped to
-                                        // an Arrow DataType
-                                        column.cast_to(&dst_type, &schema.df_schema)?
-                                    } else {
-                                        // If the cast is incompatible, evaluates to NULL
-                                        Expr::Literal(ScalarValue::Null, None)
-                                    }
-                                }
-                                None => column,
-                            }
-                        }
-                        _ => {
-                            // For non-existent columns, we need to check if the user specified a gap-filling value.
-                            // See [`VirtualColumnFillConfig`] for more details.
-                            match fill_config {
-                                Some(VirtualColumnFillConfig {
-                                    fill_clause: Some(FillClause::Value(n)),
-                                    data_type,
-                                }) => {
-                                    // The user specified a gap-filling value
-                                    match data_type {
-                                        Some(InfluxColumnType::Field(InfluxFieldType::Integer)) => {
-                                            Expr::Literal(
-                                                number_to_scalar(n, &DataType::Int64)?,
-                                                None,
-                                            )
-                                        }
-                                        Some(InfluxColumnType::Field(InfluxFieldType::Float)) => {
-                                            Expr::Literal(
-                                                number_to_scalar(n, &DataType::Float64)?,
-                                                None,
-                                            )
-                                        }
-                                        Some(InfluxColumnType::Tag) => {
-                                            // Do not gap-fill tags
-                                            Expr::Literal(ScalarValue::Null, None)
-                                        }
-                                        _ => {
-                                            match n {
-                                                // Default to the data type of the gap-filling value
-                                                Number::Integer(_) => Expr::Literal(
-                                                    number_to_scalar(n, &DataType::Int64)?,
-                                                    None,
-                                                ),
-                                                Number::Float(_) => Expr::Literal(
-                                                    number_to_scalar(n, &DataType::Float64)?,
-                                                    None,
-                                                ),
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    // No gap-filling config or value, return NULL
-                                    Expr::Literal(ScalarValue::Null, None)
-                                }
-                            }
-                        }
-                    },
-                })
-            }
+            IQLExpr::VarRef(varref) => self.varref_to_df_expr(fill_config, scope, varref, schema),
             IQLExpr::BindParameter(id) => {
                 let err = BindParameterError::NotDefined(id.to_string());
                 error::params(err.to_string())
@@ -2423,6 +2327,101 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
             IQLExpr::Nested(e) => self.expr_to_df_expr(tz, fill_config, scope, e, schema),
         }
+    }
+
+    /// Map an InfluxQL variable reference to a DataFusion expression.
+    fn varref_to_df_expr(
+        &self,
+        fill_config: &Option<VirtualColumnFillConfig>,
+        scope: ExprScope,
+        varref: &VarRef,
+        schema: &IQLSchema<'_>,
+    ) -> Result<Expr> {
+        let df_schema = &schema.df_schema;
+        let VarRef {
+            name,
+            data_type: opt_dst_type,
+        } = varref;
+        Ok(match (scope, name.as_str()) {
+            // Per the Go implementation, the time column is case-insensitive in the
+            // `WHERE` clause and disregards any postfix type cast operator.
+            //
+            // See: https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5751-L5753
+            (ExprScope::Where, name) if name.eq_ignore_ascii_case("time") => "time".as_expr(),
+            (ExprScope::Projection, "time") => "time".as_expr(),
+            (_, name) => match df_schema
+                .fields_with_unqualified_name(name)
+                .first()
+                .map(|f| f.data_type().clone())
+            {
+                Some(src_type) => {
+                    let column = name.as_expr();
+
+                    match opt_dst_type.and_then(var_ref_data_type_to_data_type) {
+                        Some(dst_type) => {
+                            fn is_numeric(dt: &DataType) -> bool {
+                                matches!(dt, DataType::Int64 | DataType::Float64 | DataType::UInt64)
+                            }
+
+                            if src_type == dst_type {
+                                column
+                            } else if is_numeric(&src_type) && is_numeric(&dst_type) {
+                                // InfluxQL only allows casting between numeric types,
+                                // and it is safe to unconditionally unwrap, as the
+                                // `is_numeric_type` call guarantees it can be mapped to
+                                // an Arrow DataType
+                                column.cast_to(&dst_type, &schema.df_schema)?
+                            } else {
+                                // If the cast is incompatible, evaluates to NULL
+                                Expr::Literal(ScalarValue::Null, None)
+                            }
+                        }
+                        None => column,
+                    }
+                }
+                _ => {
+                    // For non-existent columns, we need to check if the user specified a gap-filling value.
+                    // See [`VirtualColumnFillConfig`] for more details.
+                    match fill_config {
+                        Some(VirtualColumnFillConfig {
+                            fill_clause: Some(FillClause::Value(n)),
+                            data_type,
+                        }) => {
+                            // The user specified a gap-filling value
+                            match data_type {
+                                Some(InfluxColumnType::Field(InfluxFieldType::Integer)) => {
+                                    Expr::Literal(number_to_scalar(n, &DataType::Int64)?, None)
+                                }
+                                Some(InfluxColumnType::Field(InfluxFieldType::Float)) => {
+                                    Expr::Literal(number_to_scalar(n, &DataType::Float64)?, None)
+                                }
+                                Some(InfluxColumnType::Tag) => {
+                                    // Do not gap-fill tags
+                                    Expr::Literal(ScalarValue::Null, None)
+                                }
+                                _ => {
+                                    match n {
+                                        // Default to the data type of the gap-filling value
+                                        Number::Integer(_) => Expr::Literal(
+                                            number_to_scalar(n, &DataType::Int64)?,
+                                            None,
+                                        ),
+                                        Number::Float(_) => Expr::Literal(
+                                            number_to_scalar(n, &DataType::Float64)?,
+                                            None,
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // No gap-filling config or value, return NULL
+                            Expr::Literal(ScalarValue::Null, None)
+                        }
+                    }
+                }
+            },
+        })
     }
 
     /// Map an InfluxQL function call to a DataFusion expression.
@@ -3891,37 +3890,64 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 ///
 /// # Arguments
 ///
-/// * `input` - An aggregate plan which requires gap-filling.
-/// * `time_column` - The `date_bin` expression.
-/// * `fill_strategy` - The strategy used to fill gaps in the data. Should be equal in length to
-///   `input.aggr_exprs`, where fill_strategy\[n\] is the strategy for aggr_exprs\[n\]
+/// * `input` - A plan which requires gap-filling, it is required that
+///   the input plan includes an Aggregate node.
+/// * `fill_strategy` - The strategy used to fill gaps in the data.
+///   Should be equal in length to `input.aggr_exprs`, where
+///   fill_strategy\[n\] is the strategy for aggr_exprs\[n\].
+/// * `projection_type` - The type of projection being performed.
 fn build_gap_fill_node(
     input: LogicalPlan,
-    time_column: &Expr,
     fill_strategy: Vec<FillStrategy>,
     projection_type: &ProjectionType,
 ) -> Result<LogicalPlan> {
-    let (expr, alias) = match time_column {
-        Expr::Alias(Alias {
-            expr,
-            relation: None,
-            name: alias,
-            metadata: _,
-        }) => (expr.as_ref(), alias),
-        _ => return error::internal("expected time column to have an alias function"),
+    let mut aggr = None;
+    input.apply(|expr| {
+        if let LogicalPlan::Aggregate(a) = expr {
+            aggr = Some(a.clone());
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })?;
+    let Some(aggr) = aggr else {
+        return error::internal("GapFill requires an Aggregate ancestor");
     };
 
-    let (date_bin_udf, date_bin_args) = match expr {
-        Expr::ScalarFunction(ScalarFunction { func: udf, args })
-            if udf.inner().as_any().is::<DateBinFunc>()
-                || udf.inner().as_any().is::<DateBinWallclockUDF>() =>
-        {
-            (Arc::<str>::from(udf.name()), args)
-        }
+    let group_expr = aggr.group_expr;
+
+    // Extract the DATE_BIN expression from the aggregate's group
+    // expressions.
+    let (time_column_idx, time_column_alias, date_bin_udf, date_bin_args) = match group_expr
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, expr)| match expr {
+            Expr::Alias(alias) => {
+                if let Expr::ScalarFunction(fun) = alias.expr.as_ref() {
+                    if fun.func.inner().as_any().is::<DateBinFunc>()
+                        || fun.func.inner().as_any().is::<DateBinWallclockUDF>()
+                    {
+                        Some((
+                            idx,
+                            alias.name.clone(),
+                            Arc::clone(&fun.func),
+                            fun.args.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [(idx, alias, udf, args)] => (*idx, alias.to_owned(), Arc::clone(udf), args.to_owned()),
         _ => {
-            // The InfluxQL planner adds the `date_bin` function,
-            // so this condition represents an internal failure.
-            return error::internal("expected DATE_BIN function");
+            return error::internal("expected exactly one DATE_BIN in Aggregate group expressions");
         }
     };
 
@@ -3995,26 +4021,43 @@ fn build_gap_fill_node(
     let aggr_expr = new_group_expr.split_off(aggr.group_expr.len());
 
     // The fill strategy for InfluxQL is specified at the query level
-    let fill_strategy = aggr_expr.iter().cloned().zip(fill_strategy).collect();
+    let fill_expr = aggr_expr
+        .iter()
+        .cloned()
+        .zip(fill_strategy)
+        .map(|(e, s)| FillExpr {
+            expr: e,
+            strategy: s,
+        })
+        .collect();
 
-    let time_column = col(input
-        .schema()
-        .qualified_field_with_unqualified_name(alias)
-        .map(Column::from)?);
+    let series_expr = group_expr
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            if i != time_column_idx {
+                Some(e.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let time_expr = Expr::ScalarFunction(ScalarFunction {
+        func: date_bin_udf,
+        args: vec![stride.clone(), col(time_column_alias)]
+            .into_iter()
+            .chain(origin.clone())
+            .collect(),
+    });
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(GapFill::try_new(
             Arc::new(input),
-            new_group_expr,
-            aggr_expr,
-            GapFillParams {
-                date_bin_udf,
-                stride: stride.clone(),
-                time_column,
-                origin,
-                time_range,
-                fill_strategy,
-            },
+            series_expr,
+            time_expr,
+            fill_expr,
+            time_range,
         )?),
     }))
 }
@@ -5296,7 +5339,7 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, difference(avg(cpu.usage_idle)) AS difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, difference:Float64;N]
                     Filter: difference(avg(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, difference(avg(cpu.usage_idle)):Float64;N]
                       WindowAggr: windowExpr=[[difference(avg(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS difference(avg(cpu.usage_idle))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, difference(avg(cpu.usage_idle)):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5322,10 +5365,23 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_difference(avg(cpu.usage_idle)) AS non_negative_difference [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, non_negative_difference:Float64;N]
                     Filter: non_negative_difference(avg(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, non_negative_difference(avg(cpu.usage_idle)):Float64;N]
                       WindowAggr: windowExpr=[[non_negative_difference(avg(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(avg(cpu.usage_idle))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, non_negative_difference(avg(cpu.usage_idle)):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                                TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                "#);
+
+                // aggregate SUM regex
+                assert_snapshot!(plan("SELECT NON_NEGATIVE_DIFFERENCE(SUM(/usage_.*/)) FROM cpu GROUP BY time(10s)"), @r#"
+                Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, non_negative_difference_usage_idle:Float64;N, non_negative_difference_usage_system:Float64;N, non_negative_difference_usage_user:Float64;N]
+                  Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_difference(sum(cpu.usage_idle)) AS non_negative_difference_usage_idle, non_negative_difference(sum(cpu.usage_system)) AS non_negative_difference_usage_system, non_negative_difference(sum(cpu.usage_user)) AS non_negative_difference_usage_user [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, non_negative_difference_usage_idle:Float64;N, non_negative_difference_usage_system:Float64;N, non_negative_difference_usage_user:Float64;N]
+                    Filter: non_negative_difference(sum(cpu.usage_idle)) IS NOT NULL OR non_negative_difference(sum(cpu.usage_system)) IS NOT NULL OR non_negative_difference(sum(cpu.usage_user)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, sum(cpu.usage_idle):Float64;N, sum(cpu.usage_system):Float64;N, sum(cpu.usage_user):Float64;N, non_negative_difference(sum(cpu.usage_idle)):Float64;N, non_negative_difference(sum(cpu.usage_system)):Float64;N, non_negative_difference(sum(cpu.usage_user)):Float64;N]
+                      WindowAggr: windowExpr=[[non_negative_difference(sum(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(sum(cpu.usage_idle)), non_negative_difference(sum(cpu.usage_system)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(sum(cpu.usage_system)), non_negative_difference(sum(cpu.usage_user)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_difference(sum(cpu.usage_user))]] [time:Timestamp(Nanosecond, None);N, sum(cpu.usage_idle):Float64;N, sum(cpu.usage_system):Float64;N, sum(cpu.usage_user):Float64;N, non_negative_difference(sum(cpu.usage_idle)):Float64;N, non_negative_difference(sum(cpu.usage_system)):Float64;N, non_negative_difference(sum(cpu.usage_user)):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[sum(cpu.usage_idle), sum(cpu.usage_system), sum(cpu.usage_user)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, sum(cpu.usage_idle):Float64;N, sum(cpu.usage_system):Float64;N, sum(cpu.usage_user):Float64;N]
+                          Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[sum(cpu.usage_idle), sum(cpu.usage_system), sum(cpu.usage_user)]] [time:Timestamp(Nanosecond, None);N, sum(cpu.usage_idle):Float64;N, sum(cpu.usage_system):Float64;N, sum(cpu.usage_user):Float64;N]
+                            Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
+                              Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL OR cpu.usage_user IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "#);
             }
@@ -5348,7 +5404,7 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, moving_average(avg(cpu.usage_idle),Int64(3)) AS moving_average [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, moving_average:Float64;N]
                     Filter: moving_average(avg(cpu.usage_idle),Int64(3)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, moving_average(avg(cpu.usage_idle),Int64(3)):Float64;N]
                       WindowAggr: windowExpr=[[moving_average(avg(cpu.usage_idle), Int64(3)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS moving_average(avg(cpu.usage_idle),Int64(3))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, moving_average(avg(cpu.usage_idle),Int64(3)):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5383,7 +5439,7 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, derivative(avg(cpu.usage_idle)) AS derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, derivative:Float64;N]
                     Filter: derivative(avg(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, derivative(avg(cpu.usage_idle)):Float64;N]
                       WindowAggr: windowExpr=[[derivative(avg(cpu.usage_idle), IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS derivative(avg(cpu.usage_idle))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, derivative(avg(cpu.usage_idle)):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5409,7 +5465,7 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative(avg(cpu.usage_idle)) AS non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, non_negative_derivative:Float64;N]
                     Filter: non_negative_derivative(avg(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, non_negative_derivative(avg(cpu.usage_idle)):Float64;N]
                       WindowAggr: windowExpr=[[non_negative_derivative(avg(cpu.usage_idle), IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(avg(cpu.usage_idle))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, non_negative_derivative(avg(cpu.usage_idle)):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5422,7 +5478,7 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]) AS non_negative_derivative [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, non_negative_derivative:Float64;N]
                     Filter: non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]) IS NOT NULL [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]):Float64;N]
                       WindowAggr: windowExpr=[[non_negative_derivative(get_field(selector_last(cpu.usage_idle,cpu.time), Utf8("value")), IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value])]] [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N, non_negative_derivative(selector_last(cpu.usage_idle,cpu.time)[value]):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[selector_last(cpu.usage_idle,cpu.time)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5448,7 +5504,7 @@ mod tests {
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cumulative_sum(avg(cpu.usage_idle)) AS cumulative_sum [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, cumulative_sum:Float64;N]
                     Filter: cumulative_sum(avg(cpu.usage_idle)) IS NOT NULL [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, cumulative_sum(avg(cpu.usage_idle)):Float64;N]
                       WindowAggr: windowExpr=[[cumumlative_sum(avg(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS cumulative_sum(avg(cpu.usage_idle))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, cumulative_sum(avg(cpu.usage_idle)):Float64;N]
-                        GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                        GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                             Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5462,7 +5518,7 @@ mod tests {
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, difference:Float64;N, mean:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, difference(avg(cpu.usage_idle)) AS difference, avg(cpu.usage_idle) AS mean [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, difference:Float64;N, mean:Float64;N]
                     WindowAggr: windowExpr=[[difference(avg(cpu.usage_idle)) ORDER BY [time ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS difference(avg(cpu.usage_idle))]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N, difference(avg(cpu.usage_idle)):Float64;N]
-                      GapFill: groupBy=[time], aggr=[[avg(cpu.usage_idle)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
+                      GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[avg(cpu.usage_idle)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                         Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[avg(cpu.usage_idle)]] [time:Timestamp(Nanosecond, None);N, avg(cpu.usage_idle):Float64;N]
                           Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                             Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5598,7 +5654,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT LAST(usage_idle) FROM cpu GROUP BY TIME(5s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, last:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, get_field(selector_last(cpu.usage_idle,cpu.time), Utf8("value")) AS last [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, last:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), time, TimestampNanosecond(0, None)), fill=[selector_last(cpu.usage_idle,cpu.time)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5611,7 +5667,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT FIRST(usage_idle) FROM cpu GROUP BY TIME(5s) FILL(0)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, get_field(coalesce_struct(selector_first(cpu.usage_idle,cpu.time), Struct({value:0.0,time:1970-01-01T00:00:00})), Utf8("value")) AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[COALESCE({value:0.0,time:1970-01-01T00:00:00}, selector_first(cpu.usage_idle,cpu.time))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(selector_first(cpu.usage_idle,cpu.time), {value:0.0,time:1970-01-01T00:00:00})], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_first(cpu.usage_idle, cpu.time)]] [time:Timestamp(Nanosecond, None);N, selector_first(cpu.usage_idle,cpu.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5658,7 +5714,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT LAST(usage_idle), usage_system FROM cpu GROUP BY TIME(5s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, last:Float64;N, usage_system:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, get_field(selector_last(cpu.usage_idle,cpu.time,cpu.usage_system), Utf8("value")) AS last, get_field(selector_last(cpu.usage_idle,cpu.time,cpu.usage_system), Utf8("other_1")) AS usage_system [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, last:Float64;N, usage_system:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[selector_last(cpu.usage_idle,cpu.time,cpu.usage_system)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), time, TimestampNanosecond(0, None)), fill=[selector_last(cpu.usage_idle,cpu.time,cpu.usage_system)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time, cpu.usage_system)]] [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5670,7 +5726,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT LAST(usage_idle), usage_system FROM cpu GROUP BY TIME(5s) FILL(0)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, last:Float64;N, usage_system:Float64;N]
                   Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, get_field(coalesce_struct(selector_last(cpu.usage_idle,cpu.time,cpu.usage_system), Struct({value:0.0,time:1970-01-01T00:00:00,other_1:0.0})), Utf8("value")) AS last, get_field(coalesce_struct(selector_last(cpu.usage_idle,cpu.time,cpu.usage_system), Struct({value:0.0,time:1970-01-01T00:00:00,other_1:0.0})), Utf8("other_1")) AS usage_system [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, last:Float64;N, usage_system:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[COALESCE({value:0.0,time:1970-01-01T00:00:00,other_1:0.0}, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(selector_last(cpu.usage_idle,cpu.time,cpu.usage_system), {value:0.0,time:1970-01-01T00:00:00,other_1:0.0})], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 5000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_last(cpu.usage_idle, cpu.time, cpu.usage_system)]] [time:Timestamp(Nanosecond, None);N, selector_last(cpu.usage_idle,cpu.time,cpu.usage_system):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "other_1", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: cpu.time <= TimestampNanosecond(1672531200000000000, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                           Filter: cpu.usage_idle IS NOT NULL OR cpu.usage_system IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -5787,7 +5843,7 @@ mod tests {
             assert_snapshot!(plan("SELECT percentile(usage_idle,50), percentile(usage_idle,90) FROM cpu WHERE time >= 0 AND time < 60000000000 GROUP BY time(10s), cpu"), @r#"
             Sort: cpu ASC NULLS LAST, time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, cpu:Dictionary(Int32, Utf8);N, percentile:Float64;N, percentile_1:Float64;N]
               Projection: Dictionary(Int32, Utf8("cpu")) AS iox::measurement, time, cpu.cpu AS cpu, percentile(cpu.usage_idle,Int64(50)) AS percentile, percentile(cpu.usage_idle,Int64(90)) AS percentile_1 [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, cpu:Dictionary(Int32, Utf8);N, percentile:Float64;N, percentile_1:Float64;N]
-                GapFill: groupBy=[time, cpu.cpu], aggr=[[percentile(cpu.usage_idle,Int64(50)), percentile(cpu.usage_idle,Int64(90))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Included(Literal(TimestampNanosecond(0, None), None))..Included(Literal(TimestampNanosecond(59999999999, None), None)) [time:Timestamp(Nanosecond, None);N, cpu:Dictionary(Int32, Utf8);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
+                GapFill: series=[cpu.cpu], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[percentile(cpu.usage_idle,Int64(50)), percentile(cpu.usage_idle,Int64(90))], range=Included(Literal(TimestampNanosecond(0, None), None))..Included(Literal(TimestampNanosecond(59999999999, None), None)) [cpu:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
                   Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), cpu.time, TimestampNanosecond(0, None)) AS time, cpu.cpu]], aggr=[[percentile(cpu.usage_idle, Int64(50)), percentile(cpu.usage_idle, Int64(90))]] [time:Timestamp(Nanosecond, None);N, cpu:Dictionary(Int32, Utf8);N, percentile(cpu.usage_idle,Int64(50)):Float64;N, percentile(cpu.usage_idle,Int64(90)):Float64;N]
                     Filter: cpu.time >= TimestampNanosecond(0, None) AND cpu.time <= TimestampNanosecond(59999999999, None) [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                       Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
@@ -6681,7 +6737,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6695,7 +6751,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data WHERE time < '2022-10-31T02:02:00Z' GROUP BY TIME(10s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1667181719999999999, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Unbounded..Included(Literal(TimestampNanosecond(1667181719999999999, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1667181719999999999, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6709,7 +6765,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data WHERE time >= '2022-10-31T02:00:00Z' GROUP BY TIME(10s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Included(Literal(TimestampNanosecond(1667181600000000000, None), None))..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Included(Literal(TimestampNanosecond(1667181600000000000, None), None))..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time >= TimestampNanosecond(1667181600000000000, None) AND data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6723,7 +6779,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(10s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Included(Literal(TimestampNanosecond(1667181600000000000, None), None))..Included(Literal(TimestampNanosecond(1667181719999999999, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Included(Literal(TimestampNanosecond(1667181600000000000, None), None))..Included(Literal(TimestampNanosecond(1667181719999999999, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time >= TimestampNanosecond(1667181600000000000, None) AND data.time <= TimestampNanosecond(1667181719999999999, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6736,7 +6792,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6749,7 +6805,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s) FILL(null)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6762,7 +6818,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s) FILL(previous)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[LOCF(count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[LOCF(count(data.f64_field))], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6775,7 +6831,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s) FILL(0)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, coalesce_struct(count(data.f64_field), Int64(0)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64;N]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(0, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 0)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6788,7 +6844,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s) FILL(linear)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, count(data.f64_field) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64]
-                    GapFill: groupBy=[time], aggr=[[INTERPOLATE(count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[INTERPOLATE(count(data.f64_field))], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6804,7 +6860,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT first(f64_field) FROM data GROUP BY TIME(10s) FILL(null)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, get_field(selector_first(data.f64_field,data.time), Utf8("value")) AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[selector_first(data.f64_field,data.time)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[selector_first(data.f64_field,data.time)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_first(data.f64_field, data.time)]] [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6814,7 +6870,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT first(f64_field) * 1 FROM data GROUP BY TIME(10s) FILL(null)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, get_field(selector_first(data.f64_field,data.time), Utf8("value")) * Int64(1) AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[selector_first(data.f64_field,data.time)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[selector_first(data.f64_field,data.time)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_first(data.f64_field, data.time)]] [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6824,7 +6880,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT first(f64_field) / 1 FROM data GROUP BY TIME(10s) FILL(null)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, CASE WHEN Int64(1) = Float64(0) AND get_field(selector_first(data.f64_field,data.time), Utf8("value")) IS NOT NULL THEN Float64(0) ELSE get_field(selector_first(data.f64_field,data.time), Utf8("value")) / Int64(1) END AS first [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, first:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[selector_first(data.f64_field,data.time)]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[selector_first(data.f64_field,data.time)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[selector_first(data.f64_field, data.time)]] [time:Timestamp(Nanosecond, None);N, selector_first(data.f64_field,data.time):Struct([Field { name: "value", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "time", data_type: Timestamp(Nanosecond, None), nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]);N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6838,7 +6894,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) FROM data GROUP BY TIME(10s) FILL(3.2)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, coalesce_struct(count(data.f64_field), Int64(3)) AS count [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count:Int64;N]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(3, count(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 3)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
@@ -6852,7 +6908,7 @@ mod tests {
                 assert_snapshot!(plan("SELECT count(f64_field) + MEAN(f64_field) FROM data GROUP BY TIME(10s) FILL(3.2)"), @r#"
                 Sort: time ASC NULLS LAST [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count_mean:Float64;N]
                   Projection: Dictionary(Int32, Utf8("data")) AS iox::measurement, time, coalesce_struct(count(data.f64_field), Int64(3)) + coalesce_struct(avg(data.f64_field), Float64(3.2)) AS count_mean [iox::measurement:Dictionary(Int32, Utf8), time:Timestamp(Nanosecond, None);N, count_mean:Float64;N]
-                    GapFill: groupBy=[time], aggr=[[COALESCE(3, count(data.f64_field)), COALESCE(3.2, avg(data.f64_field))]], time_column=time, stride=IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64, avg(data.f64_field):Float64;N]
+                    GapFill: series=[], time=date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), time, TimestampNanosecond(0, None)), fill=[COALESCE(count(data.f64_field), 3), COALESCE(avg(data.f64_field), 3.2)], range=Unbounded..Included(Literal(TimestampNanosecond(1672531200000000000, None), None)) [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64, avg(data.f64_field):Float64;N]
                       Aggregate: groupBy=[[date_bin_wallclock(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 10000000000 }"), data.time, TimestampNanosecond(0, None)) AS time]], aggr=[[count(data.f64_field), avg(data.f64_field)]] [time:Timestamp(Nanosecond, None);N, count(data.f64_field):Int64, avg(data.f64_field):Float64;N]
                         Filter: data.time <= TimestampNanosecond(1672531200000000000, None) [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]
                           Filter: data.f64_field IS NOT NULL [TIME:Boolean;N, bar:Dictionary(Int32, Utf8);N, bool_field:Boolean;N, f64_field:Float64;N, foo:Dictionary(Int32, Utf8);N, i64_field:Int64;N, mixedCase:Float64;N, str_field:Utf8;N, time:Timestamp(Nanosecond, None), with space:Float64;N]

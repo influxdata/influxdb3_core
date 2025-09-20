@@ -42,7 +42,7 @@ use crate::{
 pub const ROW_GROUP_WRITE_SIZE: usize = 1024 * 1024;
 
 /// ensure read and write work well together
-const _: () = assert!(ROW_GROUP_WRITE_SIZE % BATCH_SIZE == 0);
+const _: () = assert!(ROW_GROUP_WRITE_SIZE.is_multiple_of(BATCH_SIZE));
 
 /// [`RecordBatch`] to Parquet serialisation errors.
 ///

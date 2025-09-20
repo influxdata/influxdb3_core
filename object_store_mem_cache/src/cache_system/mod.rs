@@ -86,6 +86,12 @@ where
     }
 }
 
+impl HasSize for () {
+    fn size(&self) -> usize {
+        0
+    }
+}
+
 /// Dynamic error type.
 pub type DynError = Arc<dyn std::error::Error + Send + Sync>;
 

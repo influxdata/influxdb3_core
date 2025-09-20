@@ -4,6 +4,7 @@
 use super::{
     cross_rt_stream::CrossRtStream,
     gapfill::{GapFill, plan_gap_fill},
+    series_limit::{SeriesLimit, plan_series_limit},
     sleep::SleepNode,
     split::StreamSplitNode,
 };
@@ -131,6 +132,10 @@ impl ExtensionPlanner for IOxExtensionPlanner {
             let gap_fill_exec =
                 plan_gap_fill(session_state, gap_fill, logical_inputs, physical_inputs)?;
             Some(Arc::new(gap_fill_exec))
+        } else if let Some(series_limit) = any.downcast_ref::<SeriesLimit>() {
+            let series_limit_exec =
+                plan_series_limit(session_state, series_limit, logical_inputs, physical_inputs)?;
+            Some(Arc::new(series_limit_exec))
         } else if let Some(sleep) = any.downcast_ref::<SleepNode>() {
             let sleep = sleep.plan(planner, logical_inputs, physical_inputs, session_state)?;
             Some(Arc::new(sleep))

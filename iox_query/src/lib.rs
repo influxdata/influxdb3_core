@@ -6,8 +6,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use data_types::{ChunkId, ChunkOrder, TransitionPartitionId};
+use data_types::{ChunkId, ChunkOrder, Namespace, TransitionPartitionId};
 use datafusion::{
+    common::not_impl_err,
     error::DataFusionError,
     physical_plan::{SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
@@ -166,6 +167,14 @@ pub trait QueryDatabase: Debug + Send + Sync + 'static {
         span: Option<Span>,
         include_debug_info_tables: bool,
     ) -> Result<Option<Arc<dyn QueryNamespace>>, DataFusionError>;
+
+    /// List all namespaces
+    async fn list_namespaces(
+        &self,
+        _span: Option<Span>,
+    ) -> Result<Vec<Namespace>, DataFusionError> {
+        not_impl_err!("QueryDatabase::list_namespaces is only used in InfluxDB 3 Core/Enterprise")
+    }
 
     /// Acquire concurrency-limiting semapahore
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit;

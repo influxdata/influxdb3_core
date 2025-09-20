@@ -82,6 +82,10 @@ message Partition {
   // The time this partition was created, or `None` if this partition was
   // created before this field existed
   optional int64 created_at = 13;
+
+  /// Estimated size in bytes of all the active files in this partition, or `None`
+  /// if the partition size has not been computed yet.
+  optional int64 estimated_size_bytes = 14;
 }
 
 enum ParquetFileSource {
@@ -123,16 +127,8 @@ message PartitionFile {
   // Which component created this parquet file
   ParquetFileSource source = 11;
 
-  // Present and true if this parquet file's object store path uses the partition's numeric ID
-  // (as opposed to the partition's hash ID, which is what most files use).
-  // Exists to enable file-by-file transition to always using the partition's hash ID.
-  //
-  // The current code always sets this value when encoding. This value's absence indicates the
-  // protobuf was cached before the code adding this field was deployed. In that case, the code
-  // will fall back to the behavior the catalog cache exhibited previously, which was looking at
-  // the partition to know which ID to use and assuming all Parquet files in a partition were
-  // addressed with the same ID.
-  optional bool use_numeric_partition_id = 12;
+  // No longer needed because all partitions and Parquet files should have partition hash IDs.
+  optional bool use_numeric_partition_id = 12 [deprecated = true];
 }
 
 message Table {

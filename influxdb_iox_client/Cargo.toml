@@ -43,14 +43,15 @@ rand = { version = "0.9.2", optional = true }
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
 schema = { path = "../schema", optional = true }
 serde_json = { version = "1.0.145", optional = true }
-tokio = { version = "1.47", features = [
+tokio = { version = "1.48", features = [
     "macros",
     "parking_lot",
     "rt-multi-thread",
 ] }
 tokio-stream = "0.1.17"
-thiserror = "2.0.16"
+thiserror = "2.0.17"
 tonic-reflection = { version = "0.12" }
+tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1" }

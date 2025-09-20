@@ -212,7 +212,6 @@ mod tests {
         test::TestChunk,
         util::arrow_sort_key_exprs,
     };
-    use data_types::{PartitionHashId, PartitionId, TransitionPartitionId};
     use datafusion::{
         physical_plan::{expressions::Literal, filter::FilterExec},
         scalar::ScalarValue,
@@ -308,59 +307,6 @@ mod tests {
             let chunk4 = chunk(4).with_dummy_parquet_file().with_partition(2);
             let chunk5 = chunk(5).with_dummy_parquet_file().with_partition(1);
             let chunk6 = chunk(6).with_dummy_parquet_file().with_partition(1);
-            let schema = chunk1.schema().clone();
-            let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3, chunk4, chunk5, chunk6]);
-            let mut config = ConfigOptions::default();
-            config.execution.target_partitions = 2;
-            insta::assert_yaml_snapshot!(
-                OptimizationTest::new_with_config(plan, SplitDedup, &config),
-                @r#"
-            input:
-              - " DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-              - "   UnionExec"
-              - "     RecordBatchesExec: chunks=2, projection=[field, tag1, tag2, time]"
-              - "     DataSourceExec: file_groups={2 groups: [[3.parquet, 5.parquet], [4.parquet, 6.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
-            output:
-              Ok:
-                - " UnionExec"
-                - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "     UnionExec"
-                - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       DataSourceExec: file_groups={2 groups: [[3.parquet, 6.parquet], [5.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
-                - "   DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
-                - "     UnionExec"
-                - "       RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time]"
-                - "       DataSourceExec: file_groups={1 group: [[4.parquet]]}, projection=[field, tag1, tag2, time], file_type=parquet"
-            "#
-            );
-        }
-
-        #[test]
-        fn test_different_partitions_with_and_without_hash_ids() {
-            // Partition without hash ID in the catalog
-            let legacy_partition_id = 1;
-            let legacy_transition_partition_id =
-                TransitionPartitionId::Catalog(PartitionId::new(legacy_partition_id));
-
-            // Partition with hash ID in the catalog
-            let transition_partition_id =
-                TransitionPartitionId::Hash(PartitionHashId::arbitrary_for_testing());
-
-            let chunk1 = chunk(1).with_partition_id(legacy_transition_partition_id.clone());
-            let chunk2 = chunk(2).with_partition_id(transition_partition_id.clone());
-
-            let chunk3 = chunk(3)
-                .with_dummy_parquet_file()
-                .with_partition_id(legacy_transition_partition_id.clone());
-            let chunk4 = chunk(4)
-                .with_dummy_parquet_file()
-                .with_partition_id(transition_partition_id.clone());
-            let chunk5 = chunk(5)
-                .with_dummy_parquet_file()
-                .with_partition_id(legacy_transition_partition_id.clone());
-            let chunk6 = chunk(6)
-                .with_dummy_parquet_file()
-                .with_partition_id(legacy_transition_partition_id.clone());
             let schema = chunk1.schema().clone();
             let plan = dedup_plan(schema, vec![chunk1, chunk2, chunk3, chunk4, chunk5, chunk6]);
             let mut config = ConfigOptions::default();

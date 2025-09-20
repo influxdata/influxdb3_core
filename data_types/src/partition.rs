@@ -578,9 +578,8 @@ impl sqlx::postgres::PgHasArrayType for PartitionHashId {
 pub struct Partition {
     /// the id of the partition
     pub id: PartitionId,
-    /// The unique hash derived from the table ID and partition key, if available. This will become
-    /// required when partitions without the value have aged out.
-    hash_id: Option<PartitionHashId>,
+    /// The unique hash derived from the table ID and partition key.
+    hash_id: PartitionHashId,
     /// the table the partition is under
     pub table_id: TableId,
     /// the string key of the partition
@@ -640,7 +639,6 @@ impl Partition {
     #[expect(clippy::too_many_arguments)]
     pub fn new_catalog_only(
         id: PartitionId,
-        hash_id: Option<PartitionHashId>,
         table_id: TableId,
         partition_key: PartitionKey,
         sort_key_ids: SortKeyIds,
@@ -648,10 +646,11 @@ impl Partition {
         cold_compact_at: Option<Timestamp>,
         created_at: Option<Timestamp>,
         max_time: Option<i64>,
+        estimated_size_bytes: Option<i64>,
     ) -> Self {
         Self {
             id,
-            hash_id,
+            hash_id: PartitionHashId::new(table_id, &partition_key),
             table_id,
             partition_key,
             sort_key_ids,
@@ -659,19 +658,19 @@ impl Partition {
             cold_compact_at,
             created_at,
             max_time,
-            estimated_size_bytes: None,
+            estimated_size_bytes,
         }
     }
 
     /// If this partition has a `PartitionHashId` stored in the catalog, use that. Otherwise, use
     /// the database-assigned `PartitionId`.
     pub fn transition_partition_id(&self) -> TransitionPartitionId {
-        TransitionPartitionId::from((self.id, self.hash_id.as_ref()))
+        TransitionPartitionId::from((self.id, Some(&self.hash_id)))
     }
 
-    /// The unique hash derived from the table ID and partition key, if it exists in the catalog.
-    pub fn hash_id(&self) -> Option<&PartitionHashId> {
-        self.hash_id.as_ref()
+    /// The unique hash derived from the table ID and partition key
+    pub fn hash_id(&self) -> &PartitionHashId {
+        &self.hash_id
     }
 
     /// The sort key IDs, if the sort key has been set

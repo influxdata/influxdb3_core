@@ -103,12 +103,25 @@ fn encode_partition_snapshot(i: usize) -> Bytes {
     let partition_key = PartitionKey::from(format!("arbitrary_{i}"));
     let expected_partition_hash_id = PartitionHashId::new(table_id, &partition_key);
     let generation = 6;
-    let parquet_file_defaults = ParquetFile {
+
+    let partition = Partition::new_catalog_only(
+        partition_id,
+        table_id,
+        partition_key.clone(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        None, // max_time
+        Default::default(),
+    );
+    // Create associated Parquet file
+    let parquet_files = vec![ParquetFile {
         id: ParquetFileId::new(7 + i as i64),
         namespace_id,
         table_id,
         partition_id,
-        partition_hash_id: Some(expected_partition_hash_id.clone()),
+        partition_hash_id: expected_partition_hash_id.clone(),
         object_store_id: ObjectStoreId::from_str("00000000-0000-0001-0000-000000000000").unwrap(),
         min_time: Timestamp::new(2),
         max_time: Timestamp::new(3),
@@ -120,31 +133,9 @@ fn encode_partition_snapshot(i: usize) -> Bytes {
         column_set: ColumnSet::empty(),
         max_l0_created_at: Timestamp::new(6),
         source: None,
-    };
+    }];
 
-    let partition = Partition::new_catalog_only(
-        partition_id,
-        Some(expected_partition_hash_id.clone()),
-        table_id,
-        partition_key.clone(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        None, // max_time
-    );
-    // Create associated Parquet files:
-    let parquet_files = vec![
-        // one addressed by numeric ID,
-        ParquetFile {
-            partition_hash_id: None,
-            ..parquet_file_defaults.clone()
-        },
-        // one addressed by hash ID.
-        parquet_file_defaults.clone(),
-    ];
-
-    // Encode the partition and its Parquet files,
+    // Encode the partition and its Parquet file
     let snapshot = PartitionSnapshot::encode(
         namespace_id,
         partition,

@@ -13,7 +13,7 @@ use reqwest::{Body, Method};
 pub const DEFAULT_MAX_REQUEST_PAYLOAD_SIZE_BYTES: Option<usize> = Some(1024 * 1024);
 
 /// Name of a database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DatabaseName {
     /// The database name.
     database: String,
@@ -53,7 +53,7 @@ impl DatabaseName {
 
     /// Internally, we speak the v2 protocol which has an "org" parameter. Single tenant instances of InfluxDB
     /// will tolerate the presence of an "org" parameter provided it's an empty string.
-    fn get_org_bucket(&self) -> (String, String) {
+    pub fn get_org_bucket(&self) -> (String, String) {
         let name = self.clone();
         (name.org.unwrap_or_default(), name.database)
     }
@@ -123,7 +123,7 @@ impl Client {
     }
 
     /// Creates a new client with the provided request maker
-    fn new_with_maker(inner: Arc<dyn RequestMaker>) -> Self {
+    pub fn new_with_maker(inner: Arc<dyn RequestMaker>) -> Self {
         Self {
             inner,
             max_request_payload_size_bytes: DEFAULT_MAX_REQUEST_PAYLOAD_SIZE_BYTES,
@@ -225,7 +225,7 @@ impl Client {
 
 /// Something that knows how to send http data. Exists so it can be
 /// mocked out for testing
-trait RequestMaker: Debug + Send + Sync {
+pub trait RequestMaker: Debug + Send + Sync {
     /// Write the body data to the specified org, bucket, and
     /// returning the number of bytes written
     ///

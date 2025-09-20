@@ -5,6 +5,7 @@ pub(crate) mod context;
 pub mod gapfill;
 mod metrics;
 pub mod query_tracing;
+pub mod series_limit;
 pub mod sleep;
 pub(crate) mod split;
 use datafusion_util::config::register_iox_object_store;

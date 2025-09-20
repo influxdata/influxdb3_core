@@ -15,9 +15,11 @@ members = [
     "influxdb2_client",
     "iox_http",
     "iox_query_influxql",
+    "iox_query_influxql_rewrite",
     "iox_query",
     "iox_system_tables",
     "iox_time",
+    "iox_v1_query_api",
     "logfmt",
     "meta_data_cache",
     "metric_exporters",
@@ -74,26 +76,26 @@ arrow-schema = { version = "55" }
 bincode = { version = "2", default-features = false, features = ["alloc", "derive"] }
 # Use DataFusion fork
 # See https://github.com/influxdata/arrow-datafusion/pull/73 for contents
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "a9cf9aca9ebf0d6c04e0861d2baebffa0ba77dbc" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "a9cf9aca9ebf0d6c04e0861d2baebffa0ba77dbc" }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
 hashbrown = { version = "0.14.5" }
 http = { version = "1" }
 http-body = { version = "1" }
 http-body-util = { version = "0.1" }
 hyper = { version = "1" }
 hyper-util = { version = "0.1" }
-object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
+object_store = { version = "0.12.4", features = ["aws", "azure", "gcp"] }
 parquet = { version = "55", features = ["object_store"] }
-pbjson = { version = "0.7" }
-pbjson-build = { version = "0.7" }
+pbjson = { version = "0.8" }
+pbjson-build = { version = "0.8" }
 pbjson-types = { version = "0.7" }
 proptest = { version = "1", default-features = false, features = ["std"] }
 prost = { version = "0.13" }
 prost-build = { version = "0.13" }
 prost-types = { version = "0.13" }
 reqwest = { version = "0.12", default-features = false }
-rstest = { version = "0.21" }
-sqlx = { version = "0.8.6", features = ["sqlite"] }
+rstest = { version = "0.26" }
+sqlx = { version = "0.8.6" }
 tower = { version = "0.5" }
 tracing = { version = "0.1", features = ["log", "max_level_trace"] }
 tracing-log = { version = "0.2" }

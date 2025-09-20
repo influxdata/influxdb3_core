@@ -1,6 +1,7 @@
 use bincode::{Decode, Encode};
 use dashmap::DashMap;
 use std::{
+    collections::{HashSet, VecDeque},
     fmt::{Debug, Formatter},
     hash::Hash,
     sync::{
@@ -121,6 +122,23 @@ where
         // perform the async drop on the value
         self.value.async_drop()
     }
+}
+
+/// Returns the overhead size of the [`S3FifoEntry`]
+/// placed into the S3 Fifo cache manager.
+///
+/// This is useful for testing, since it's the size used
+/// for eviction decisions.
+pub fn s3_fifo_entry_overhead_size() -> usize {
+    // The overhead size is the size of the S3FifoEntry<V> struct,
+    // which is used to store the cache entry in the S3 FIFO cache manager.
+    Arc::new(S3FifoEntry {
+        key: Arc::new(()),
+        value: Arc::new(()),
+        generation: 0,
+        freq: AtomicU8::new(0),
+    })
+    .size()
 }
 
 pub(crate) type CacheEntry<K, V> = Arc<S3FifoEntry<K, V>>;
@@ -356,6 +374,33 @@ where
         self.entries.iter().map(|entry| Arc::clone(entry.key()))
     }
 
+    /// Remove multiple keys from the cache, in a blocking manner.
+    ///
+    /// This method directly removes entries from the cache without going through
+    /// the normal eviction process. This is useful for cache management operations
+    /// like repair/validation.
+    ///
+    /// Returns the number of keys that were successfully removed. If a key does not
+    /// exist in the cache and cannot be removed, it will be ignored (and the returned count
+    /// of removed items will be lower).
+    pub fn remove_keys(&self, keys: impl Iterator<Item = K>) -> usize
+    where
+        K: Sized + Clone + Debug,
+    {
+        let mut guard = self.locked_state.lock();
+
+        // Remove keys from the entries map
+        let to_remove_from_state: HashSet<K> = keys
+            .filter_map(|k| self.entries.remove(&k).map(|_| k))
+            .collect();
+
+        // Remove from locked state.
+        let count_removed = guard.remove_keys(&to_remove_from_state);
+        drop(guard);
+
+        count_removed
+    }
+
     /// Create a snapshot of the locked state.
     ///
     /// This function serializes the [`S3Fifo`] inner state using bincode, allowing for
@@ -422,6 +467,38 @@ where
     pub(crate) fn ghost_len(&self) -> usize {
         let guard = self.locked_state.lock();
         guard.ghost.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn small_queue_keys(&self) -> Vec<Arc<K>> {
+        let guard = self.locked_state.lock();
+        guard
+            .small
+            .iter()
+            .map(|entry| Arc::clone(&entry.key))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn main_queue_keys(&self) -> Vec<Arc<K>> {
+        let guard = self.locked_state.lock();
+        guard
+            .main
+            .iter()
+            .map(|entry| Arc::clone(&entry.key))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key_in_entries(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key_in_ghost(&self, key: &Arc<K>) -> bool {
+        let guard = self.locked_state.lock();
+        // The ghost stores Arc<K>, so we need to check by content
+        guard.ghost.contains(key)
     }
 }
 
@@ -733,6 +810,41 @@ where
                 break;
             }
         }
+    }
+
+    /// Remove multiple keys from the small and main queues.
+    ///
+    /// This method efficiently removes multiple keys by iterating through each queue once.
+    /// It first checks the small queue for all keys, then checks the main queue for any
+    /// remaining keys that weren't found in the small queue.
+    ///
+    /// Returns the number of keys that were successfully removed. If a key does not
+    /// exist in the cache and cannot be removed, it will be ignored (and the returned count
+    /// of removed items will be lower).
+    fn remove_keys(&mut self, keys_to_remove: &HashSet<K>) -> usize
+    where
+        K: Sized + Clone + Debug,
+    {
+        let initial_count = self.small.len() + self.main.len();
+
+        // Remove from small queue
+        let filtered_small: VecDeque<_> = self
+            .small
+            .drain()
+            .filter(|entry| !keys_to_remove.contains(entry.key.as_ref()))
+            .collect();
+        self.small = Fifo::new(filtered_small);
+
+        // Remove from main queue
+        let filtered_main: VecDeque<_> = self
+            .main
+            .drain()
+            .filter(|entry| !keys_to_remove.contains(entry.key.as_ref()))
+            .collect();
+        self.main = Fifo::new(filtered_main);
+
+        // Return the number of keys that were actually removed
+        initial_count - (self.small.len() + self.main.len())
     }
 }
 

@@ -11,6 +11,8 @@ mod aggregate;
 mod error;
 pub mod frontend;
 pub mod plan;
+pub mod show_databases;
+pub mod show_retention_policies;
 mod window;
 
 /// A list of the numeric types supported by InfluxQL that can be be used

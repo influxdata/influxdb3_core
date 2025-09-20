@@ -441,7 +441,7 @@ async fn test_derive_parquet_file_params() {
     let partition_id = PartitionId::new(1);
     let catalog_data = meta.to_parquet_file(
         partition_id,
-        Some(partition_hash_id),
+        partition_hash_id,
         file_size,
         &iox_parquet_meta,
         |name| *column_id_map.get(name).unwrap(),

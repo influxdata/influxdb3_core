@@ -19,7 +19,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use data_types::{ChunkId, ChunkOrder, NamespaceId, PartitionKey, TableId, TransitionPartitionId};
+use data_types::{
+    ChunkId, ChunkOrder, Namespace, NamespaceId, PartitionKey, TableId, TransitionPartitionId,
+};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
@@ -112,6 +114,28 @@ impl QueryDatabase for TestDatabaseStore {
         let databases = self.databases.lock();
 
         Ok(databases.get(name).cloned().map(|ns| ns as _))
+    }
+
+    async fn list_namespaces(
+        &self,
+        _span: Option<Span>,
+    ) -> Result<Vec<Namespace>, DataFusionError> {
+        Ok(self
+            .databases
+            .lock()
+            .iter()
+            .enumerate()
+            .map(|(i, (name, db))| Namespace {
+                id: NamespaceId::new(i as i64),
+                name: name.to_owned(),
+                retention_period_ns: db.retention_time_ns,
+                max_tables: Default::default(),
+                max_columns_per_table: Default::default(),
+                deleted_at: Default::default(),
+                partition_template: Default::default(),
+                router_version: Default::default(),
+            })
+            .collect())
     }
 
     async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit {

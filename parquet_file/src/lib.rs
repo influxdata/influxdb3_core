@@ -163,7 +163,7 @@ impl From<&ParquetFile> for ParquetFilePath {
             table_id: f.table_id,
             partition_id: TransitionPartitionId::from_parts(
                 f.partition_id,
-                f.partition_hash_id.clone(),
+                Some(f.partition_hash_id.clone()),
             ),
             object_store_id: f.object_store_id,
         }
@@ -173,7 +173,7 @@ impl From<&ParquetFile> for ParquetFilePath {
 impl From<&ParquetFileParams> for ParquetFilePath {
     fn from(f: &ParquetFileParams) -> Self {
         let partition_id =
-            TransitionPartitionId::from_parts(f.partition_id, f.partition_hash_id.clone());
+            TransitionPartitionId::from_parts(f.partition_id, Some(f.partition_hash_id.clone()));
 
         Self {
             partition_id,
