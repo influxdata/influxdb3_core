@@ -82,6 +82,10 @@ message Partition {
   // The time this partition was created, or `None` if this partition was
   // created before this field existed
   optional int64 created_at = 13;
+
+  /// Estimated size in bytes of all the active files in this partition, or `None`
+  /// if the partition size has not been computed yet.
+  optional int64 estimated_size_bytes = 14;
 }
 
 enum ParquetFileSource {

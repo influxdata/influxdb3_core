@@ -124,6 +124,23 @@ where
     }
 }
 
+/// Returns the overhead size of the [`S3FifoEntry`]
+/// placed into the S3 Fifo cache manager.
+///
+/// This is useful for testing, since it's the size used
+/// for eviction decisions.
+pub fn s3_fifo_entry_overhead_size() -> usize {
+    // The overhead size is the size of the S3FifoEntry<V> struct,
+    // which is used to store the cache entry in the S3 FIFO cache manager.
+    Arc::new(S3FifoEntry {
+        key: Arc::new(()),
+        value: Arc::new(()),
+        generation: 0,
+        freq: AtomicU8::new(0),
+    })
+    .size()
+}
+
 pub(crate) type CacheEntry<K, V> = Arc<S3FifoEntry<K, V>>;
 type Entries<K, V> = DashMap<Arc<K>, CacheEntry<K, V>>;
 pub(crate) type Evicted<K, V> = Vec<Arc<S3FifoEntry<K, V>>>;

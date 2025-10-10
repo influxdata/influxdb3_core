@@ -648,6 +648,7 @@ impl Partition {
         cold_compact_at: Option<Timestamp>,
         created_at: Option<Timestamp>,
         max_time: Option<i64>,
+        estimated_size_bytes: Option<i64>,
     ) -> Self {
         Self {
             id,
@@ -659,7 +660,7 @@ impl Partition {
             cold_compact_at,
             created_at,
             max_time,
-            estimated_size_bytes: None,
+            estimated_size_bytes,
         }
     }
 

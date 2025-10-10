@@ -232,14 +232,26 @@ pub(super) fn proj_exec_stats<'a>(
     mut stats: Statistics,
     exprs: impl Iterator<Item = &'a (Arc<dyn PhysicalExpr>, String)>,
     projexec_schema: &SchemaRef,
-) -> Arc<Statistics> {
+) -> Result<Arc<Statistics>> {
     let mut primitive_row_size = 0;
     let mut primitive_row_size_possible = true;
     let mut column_statistics = vec![];
     for (expr, _) in exprs {
         let col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>() {
             // handle columns in schema
-            stats.column_statistics[col.index()].clone()
+            let col_index = col.index();
+            if col_index >= stats.column_statistics.len() {
+                return Err(internal_datafusion_err!(
+                    "Column index {} out of bounds in partition statistics projection \
+                     (available columns: {}, column name: '{}'). \
+                     This indicates a schema mismatch between projection expressions and input statistics.",
+                    col_index,
+                    stats.column_statistics.len(),
+                    col.name()
+                ));
+            } else {
+                stats.column_statistics[col_index].clone()
+            }
         } else if let Some(lit_expr) = expr.as_any().downcast_ref::<Literal>() {
             // handle constants
             match lit_expr.value() {
@@ -277,7 +289,7 @@ pub(super) fn proj_exec_stats<'a>(
         stats.total_byte_size = Precision::Exact(primitive_row_size).multiply(&stats.num_rows);
     }
     stats.column_statistics = column_statistics;
-    Arc::new(stats)
+    Ok(Arc::new(stats))
 }
 
 #[cfg(test)]
@@ -387,7 +399,8 @@ mod tests {
             Arc::unwrap_or_clone(src_stats),
             exprs.iter(),
             &project_schema,
-        );
+        )
+        .unwrap();
         assert_eq!(
             actual, expected_stats,
             "should be able to project all columns"
@@ -457,7 +470,8 @@ mod tests {
             Arc::unwrap_or_clone(src_stats),
             exprs.iter(),
             &project_schema,
-        );
+        )
+        .unwrap();
         assert_eq!(
             actual, expected_stats,
             "should be able to remove and re-order columns"
@@ -549,7 +563,8 @@ mod tests {
             Arc::unwrap_or_clone(src_stats),
             exprs.iter(),
             &project_schema,
-        );
+        )
+        .unwrap();
         assert_eq!(
             actual, expected_stats,
             "should be able to handle schema with aliases"
@@ -717,7 +732,8 @@ mod tests {
             Arc::unwrap_or_clone(src_stats),
             exprs.iter(),
             &project_schema,
-        );
+        )
+        .unwrap();
         assert_eq!(
             actual, expected_stats,
             "should be able to handle schema with same-named fields"
@@ -789,7 +805,8 @@ mod tests {
             Arc::unwrap_or_clone(src_stats),
             exprs.iter(),
             &project_schema,
-        );
+        )
+        .unwrap();
         assert_eq!(
             actual, expected_stats,
             "should be able to handle schema with same-named fields, reversed ordering"
@@ -816,7 +833,8 @@ mod tests {
             Arc::unwrap_or_clone(Arc::clone(&src_stats)),
             exprs.iter(),
             &src_schema,
-        );
+        )
+        .unwrap();
         assert_eq!(
             actual, src_stats,
             "proj_exec_stats should extract the proper columns from the physical exprs"
@@ -831,7 +849,8 @@ mod tests {
             Arc::unwrap_or_clone(Arc::clone(&src_stats)),
             exprs.iter(),
             &src_schema,
-        );
+        )
+        .unwrap();
         // min/max are the constants
         assert_eq!(
             actual.column_statistics[0].min_value.get_value(),
@@ -881,7 +900,8 @@ mod tests {
             (lit(ScalarValue::Null), "col_a".to_string()),
             (lit(ScalarValue::Null), "col_b".to_string()),
         ];
-        let actual = proj_exec_stats(Arc::unwrap_or_clone(src_stats), exprs.iter(), &src_schema);
+        let actual =
+            proj_exec_stats(Arc::unwrap_or_clone(src_stats), exprs.iter(), &src_schema).unwrap();
         // min/max are the constants
         assert_eq!(
             actual.column_statistics[0].min_value.get_value(),

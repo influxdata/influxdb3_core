@@ -7,6 +7,7 @@ use clap as _;
 use rand as _;
 use workspace_hack as _;
 
+pub mod buffer_channel;
 pub mod cache_system;
 pub mod object_store_cache_tests;
 pub mod object_store_helpers;

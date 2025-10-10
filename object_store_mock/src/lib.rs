@@ -1,6 +1,6 @@
 use std::{
     fmt::Display,
-    ops::Range,
+    ops::{Deref, Range},
     sync::{Arc, Mutex},
 };
 
@@ -13,7 +13,10 @@ use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
-use tokio::sync::Barrier;
+use tokio::sync::{
+    Barrier,
+    mpsc::{UnboundedReceiver, UnboundedSender},
+};
 
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
@@ -63,6 +66,12 @@ impl From<GetOptions> for WrappedGetOptions {
     }
 }
 
+impl From<WrappedGetOptions> for GetOptions {
+    fn from(options: WrappedGetOptions) -> Self {
+        options.0
+    }
+}
+
 impl Clone for WrappedGetOptions {
     fn clone(&self) -> Self {
         Self(GetOptions {
@@ -75,6 +84,14 @@ impl Clone for WrappedGetOptions {
             head: self.0.head,
             extensions: self.0.extensions.clone(),
         })
+    }
+}
+
+impl Deref for WrappedGetOptions {
+    type Target = GetOptions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -171,6 +188,17 @@ macro_rules! calls {
                     )*
                 }
             }
+        }
+
+        #[derive(Debug)]
+        #[expect(
+            unused_parens,
+            reason = "a single param will expand to ($param)"
+        )]
+        pub enum MockParam {
+            $(
+                $name (($($param),*),),
+            )*
         }
     };
 }
@@ -279,9 +307,46 @@ struct MockStoreState {
     index_counter: usize,
 }
 
-#[derive(Debug, Default)]
 pub struct MockStore {
     state: Mutex<MockStoreState>,
+    tx: UnboundedSender<MockParam>,
+    rx: Mutex<Option<UnboundedReceiver<MockParam>>>,
+}
+
+impl Default for MockStore {
+    fn default() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        Self {
+            state: Default::default(),
+            tx,
+            rx: Mutex::new(Some(rx)),
+        }
+    }
+}
+
+impl std::fmt::Debug for MockStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            state,
+            tx: _,
+            rx: _,
+        } = self;
+
+        match state.try_lock() {
+            Ok(state) => {
+                let MockStoreState {
+                    calls,
+                    index_counter,
+                } = state.deref();
+                f.debug_struct("MockStore")
+                    .field("calls", calls)
+                    .field("index_counter", index_counter)
+                    .finish_non_exhaustive()
+            }
+            Err(_) => f.debug_struct("MockStore").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Drop for MockStore {
@@ -326,6 +391,18 @@ impl MockStore {
 
     pub fn as_store(self: Arc<Self>) -> Arc<dyn ObjectStore> {
         self as Arc<dyn ObjectStore>
+    }
+
+    /// Get receiver for mocked operations.
+    ///
+    /// The data will be sent BEFORE barriers are passed and contains the original instance of the parameters, not the
+    /// one passed to [`mock_next`](Self::mock_next)/[`mock_next_multi`](Self::mock_next_multi).
+    ///
+    /// # Panic
+    /// Since the parameters are not [`Clone`]able, you can only extract the receiver once.
+    pub fn observed_params(&self) -> UnboundedReceiver<MockParam> {
+        let maybe_rx = { self.rx.lock().unwrap().take() };
+        maybe_rx.expect("cannot take receiver twice")
     }
 }
 
@@ -382,6 +459,8 @@ macro_rules! mock {
                 actual,
                 params,
             );
+
+            $self.tx.send(MockParam::$variant(actual)).ok();
 
             let res = res.into();
 
@@ -635,7 +714,7 @@ mod tests {
     fn test_debug() {
         assert_eq!(
             format!("{:?}", MockStore::new()),
-            "MockStore { state: Mutex { data: MockStoreState { calls: [], index_counter: 0 }, poisoned: false, .. } }",
+            "MockStore { calls: [], index_counter: 0, .. }",
         );
     }
 
@@ -812,6 +891,72 @@ mod tests {
         },);
         res.unwrap().unwrap();
         assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot take receiver twice")]
+    fn test_take_param_reciever_twice() {
+        let store = MockStore::new();
+        store.observed_params();
+        store.observed_params();
+    }
+
+    /// There are two parameters created:
+    ///
+    /// 1. the one for the [`MockCall`] that is tested for "equality"
+    /// 2. the one that the API user of [`ObjectStore`] passes into the respective trait method.
+    ///
+    /// The [`MockStore::observed_params`] should return (2), so a test can use it for various things. Returning (1)
+    /// would be redundant because the mock/test setup actually had that parameter at hand already.
+    #[tokio::test]
+    async fn test_param_receiver_has_original_instance() {
+        let payload_1 = PutPayload::from_bytes(Bytes::from(b"foo".to_vec()));
+        let payload_1_ptr = payload_1.as_ref().as_ptr().expose_provenance();
+        let store = MockStore::new().mock_next(MockCall::Put {
+            params: (path(), payload_1.clone().into()),
+            barriers: vec![],
+            res: Ok(PutResult {
+                e_tag: None,
+                version: None,
+            }),
+        });
+
+        let payload_2 = PutPayload::from_bytes(Bytes::from(b"foo".to_vec()));
+        let payload_2_ptr = payload_2.as_ref().as_ptr().expose_provenance();
+        assert_ne!(payload_1_ptr, payload_2_ptr);
+        store.put(&path(), payload_2.clone()).await.unwrap();
+
+        let MockParam::Put((_path, payload_3)) = store.observed_params().recv().await.unwrap()
+        else {
+            unreachable!()
+        };
+        let payload_3_ptr = payload_3.0.as_ref().as_ptr().expose_provenance();
+        assert_eq!(payload_2_ptr, payload_3_ptr);
+    }
+
+    #[tokio::test]
+    async fn test_param_receiver_gets_data_before_barrier() {
+        let barrier = Arc::new(Barrier::new(2));
+        let store = MockStore::new().mock_next(MockCall::Copy {
+            params: (path(), path()),
+            barriers: vec![Arc::clone(&barrier)],
+            res: Ok(()),
+        });
+
+        let mut recv = store.observed_params();
+
+        let path = path();
+        let mut fut = store.copy(&path, &path);
+        fut.assert_pending().await;
+
+        // the barrier is still blocked, but we can already retrieve the parameters
+        assert!(matches!(recv.recv().await.unwrap(), MockParam::Copy(_)));
+
+        // now unblock the barrier
+        let (res, _) = tokio::join!(fut, async move {
+            barrier.wait().await;
+        },);
+        res.unwrap();
     }
 
     #[test]

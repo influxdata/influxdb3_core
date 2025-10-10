@@ -276,6 +276,10 @@ message GetNamespacesWithStorageRequest {
   // Filter namespaces by name (case-insensitive partial match)
   // If provided, only namespaces with names containing this string are returned
   optional string name_filter = 7;
+
+  // Filter namespaces by ID (partial match)
+  // If provided, only namespaces with IDs containing this string are returned
+  optional string id_filter = 8;
 }
 
 // Request to get a specific namespace with storage.

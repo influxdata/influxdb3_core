@@ -359,7 +359,9 @@ fn statements_to_response(
     format: QueryFormat,
 ) -> BoxStream<'static, Bytes> {
     match format {
-        QueryFormat::Csv => CsvStream::new(executing_statements).boxed(),
+        QueryFormat::Csv => CsvStream::new(executing_statements)
+            .with_epoch(epoch)
+            .boxed(),
         QueryFormat::Json => match chunk_size {
             Some(chunk_size) => {
                 let response_stream = ChunkedResponseStream::new(executing_statements, chunk_size);

@@ -1,5 +1,5 @@
 //! Evaluate the parameters to be used for gap filling.
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::sync::Arc;
 
 use arrow::{
@@ -7,20 +7,23 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::Duration;
+use datafusion::physical_plan::expressions::Column;
 use datafusion::{
     common::exec_err,
     error::{DataFusionError, Result},
     functions::datetime::date_bin::DateBinFunc,
     logical_expr::ScalarFunctionArgs,
-    physical_expr::PhysicalExpr,
-    physical_plan::{ColumnarValue, expressions::Column},
+    physical_expr::{PhysicalExpr, ScalarFunctionExpr},
+    physical_plan::ColumnarValue,
     scalar::ScalarValue,
 };
 use hashbrown::HashMap;
 use query_functions::date_bin_wallclock::DateBinWallclockUDF;
 
+use crate::exec::gapfill::PhysicalFillExpr;
+
 use super::{
-    FillStrategy, GapExpander, GapFillExecParams, date_bin_gap_expander::DateBinGapExpander,
+    FillStrategy, GapExpander, date_bin_gap_expander::DateBinGapExpander,
     date_bin_wallclock_gap_expander::DateBinWallclockGapExpander, try_map_bound, try_map_range,
 };
 
@@ -47,22 +50,40 @@ pub(crate) struct GapFillParams {
 impl GapFillParams {
     /// Create a new [GapFillParams] by figuring out the actual values (as native i64) for the stride,
     /// first and last timestamp for gap filling.
-    pub(super) fn try_new(schema: SchemaRef, params: &GapFillExecParams) -> Result<Self> {
-        let time_data_type = params.time_column.data_type(schema.as_ref())?;
+    pub(super) fn try_new(
+        schema: SchemaRef,
+        time_expr: &Arc<dyn PhysicalExpr>,
+        fill_expr: &[PhysicalFillExpr],
+        time_range: &Range<Bound<Arc<dyn PhysicalExpr>>>,
+    ) -> Result<Self> {
+        let Some(time_func) = time_expr.as_any().downcast_ref::<ScalarFunctionExpr>() else {
+            return Err(DataFusionError::Internal(format!(
+                "time_expr was not a function call: {time_expr}"
+            )));
+        };
+
+        let time_data_type = time_func.data_type(schema.as_ref())?;
         let DataType::Timestamp(_, tz) = time_data_type else {
             return exec_err!("invalid data type for time column: {time_data_type}");
         };
 
         let batch = RecordBatch::new_empty(schema);
-        let stride = params.stride.evaluate(&batch)?;
-        let origin = params
-            .origin
-            .as_ref()
-            .map(|e| e.evaluate(&batch))
-            .transpose()?;
+        let (stride, origin) = match time_func.args() {
+            [stride, _] => (Arc::clone(stride), None),
+            [stride, _, origin] => (Arc::clone(stride), Some(Arc::clone(origin))),
+            _ => {
+                return Err(DataFusionError::Internal(format!(
+                    "unexpected arguments to time_expr: {:?}",
+                    time_func.args()
+                )));
+            }
+        };
+
+        let stride = stride.evaluate(&batch)?;
+        let origin = origin.as_ref().map(|e| e.evaluate(&batch)).transpose()?;
 
         // Evaluate the upper and lower bounds of the time range
-        let range = try_map_range(&params.time_range, |b| {
+        let range = try_map_range(time_range, |b| {
             try_map_bound(b.as_ref(), |pe| {
                 extract_timestamp_nanos(&pe.evaluate(&batch)?)
             })
@@ -103,55 +124,48 @@ impl GapFillParams {
         ));
         let first_ts = first_ts
             .map(|_| {
-                extract_timestamp_nanos(&params.date_bin_udf.invoke_with_args(
-                    ScalarFunctionArgs {
-                        args: args.clone(),
-                        arg_fields: arg_fields(&args),
-                        number_rows: 1,
-                        return_field: Arc::clone(&return_field),
-                    },
-                )?)
+                extract_timestamp_nanos(&time_func.fun().invoke_with_args(ScalarFunctionArgs {
+                    args: args.clone(),
+                    arg_fields: arg_fields(&args),
+                    number_rows: 1,
+                    return_field: Arc::clone(&return_field),
+                })?)
             })
             .transpose()?;
         args[1] = i64_to_columnar_ts(Some(last_ts), &tz);
-        let last_ts = extract_timestamp_nanos(&params.date_bin_udf.invoke_with_args(
-            ScalarFunctionArgs {
+        let last_ts =
+            extract_timestamp_nanos(&time_func.fun().invoke_with_args(ScalarFunctionArgs {
                 args: args.clone(),
                 arg_fields: arg_fields(&args),
                 number_rows: 1,
                 return_field: Arc::clone(&return_field),
-            },
-        )?)?;
+            })?)?;
 
         let gap_expander: Arc<dyn GapExpander + Send + Sync> =
-            if params.date_bin_udf.inner().as_any().is::<DateBinFunc>() {
+            if time_func.fun().inner().as_any().is::<DateBinFunc>() {
                 Arc::new(DateBinGapExpander::new(stride_nanos))
-            } else if params
-                .date_bin_udf
-                .inner()
-                .as_any()
-                .is::<DateBinWallclockUDF>()
-            {
+            } else if time_func.fun().inner().as_any().is::<DateBinWallclockUDF>() {
                 Arc::new(DateBinWallclockGapExpander::try_from_df_args(&args)?)
             } else {
                 return Err(DataFusionError::Execution(format!(
                     "gap filling not supported for {}",
-                    params.date_bin_udf.name()
+                    time_func.fun().name()
                 )));
             };
 
-        let fill_strategy = params
-            .fill_strategy
+        let fill_strategy = fill_expr
             .iter()
-            .map(|(e, fs)| {
-                let idx = e
+            .map(|pfe| {
+                let idx = pfe
+                    .expr
                     .as_any()
                     .downcast_ref::<Column>()
                     .ok_or(DataFusionError::Internal(format!(
-                        "fill strategy aggr expr was not a column: {e:?}",
+                        "fill strategy aggr expr was not a column: {:?}",
+                        pfe.expr
                     )))?
                     .index();
-                Ok((idx, fs.clone()))
+                Ok((idx, pfe.strategy.clone()))
             })
             .collect::<Result<HashMap<usize, FillStrategy>>>()?;
 
@@ -237,7 +251,7 @@ mod tests {
 
     use crate::exec::{
         Executor,
-        gapfill::{FillStrategy, GapFillExec, GapFillExecParams},
+        gapfill::{FillStrategy, GapFillExec},
     };
 
     #[tokio::test]
@@ -367,23 +381,29 @@ mod tests {
 
     #[test]
     fn test_params_no_start() {
-        let exec_params = GapFillExecParams {
-            date_bin_udf: Arc::new(ScalarUDF::new_from_impl(DateBinFunc::new())),
-            stride: interval(1_000_000_000),
-            time_column: Column::new("time", 0),
-            origin: None,
-            time_range: Range {
-                start: Bound::Unbounded,
-                end: Bound::Excluded(timestamp(20_000_000_000)),
-            },
-            fill_strategy: std::iter::once((
-                Arc::new(Column::new("a0", 1)) as Arc<dyn PhysicalExpr>,
-                FillStrategy::Default(ScalarValue::Null),
-            ))
-            .collect(),
+        let time_range = Range {
+            start: Bound::Unbounded,
+            end: Bound::Excluded(timestamp(20_000_000_000)),
         };
 
-        let params = GapFillParams::try_new(schema().into(), &exec_params).unwrap();
+        let time_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "time",
+            Arc::new(ScalarUDF::new_from_impl(DateBinFunc::new())),
+            vec![interval(1_000_000_000), Arc::new(Column::new("time", 0))],
+            Arc::new(Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )),
+        ));
+
+        let fill_expr = vec![PhysicalFillExpr {
+            expr: Arc::new(Column::new("a0", 1)),
+            strategy: FillStrategy::Default(ScalarValue::Null),
+        }];
+
+        let params =
+            GapFillParams::try_new(schema().into(), &time_expr, &fill_expr, &time_range).unwrap();
         assert_eq!(
             params.gap_expander.to_string(),
             "DateBinGapExpander [stride=PT1S]"
@@ -419,9 +439,11 @@ mod tests {
         let physical_plan = context.sql_to_physical_plan(sql).await?;
         let gapfill_node = &physical_plan.children()[0];
         let gapfill_node = gapfill_node.as_any().downcast_ref::<GapFillExec>().unwrap();
-        let exec_params = &gapfill_node.params;
+        let time_expr = &gapfill_node.time_expr;
+        let fill_expr = &gapfill_node.fill_expr;
+        let time_range = &gapfill_node.time_range;
         let schema = schema();
-        GapFillParams::try_new(schema.into(), exec_params)
+        GapFillParams::try_new(schema.into(), time_expr, fill_expr, time_range)
     }
 
     fn simple_fill_strategy() -> HashMap<usize, FillStrategy> {

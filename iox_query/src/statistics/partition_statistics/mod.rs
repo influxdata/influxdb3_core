@@ -11,6 +11,7 @@ use datafusion::{
         coalesce_partitions::CoalescePartitionsExec,
         coop::CooperativeExec,
         empty::EmptyExec,
+        expressions::Column,
         filter::FilterExec,
         limit::{GlobalLimitExec, LocalLimitExec},
         placeholder_row::PlaceholderRowExec,
@@ -157,16 +158,19 @@ impl PartitionStatistics for ProjectionExec {
             |mut acc, child| {
                 let child_stats = statistics_by_partition(child.as_ref())?;
 
-                let child_stats_with_project_exec_projected =
-                    child_stats.into_iter().map(|stats| {
-                        proj_exec_stats(
-                            Arc::unwrap_or_clone(stats),
-                            self.expr().iter(),
-                            &self.schema(),
-                        )
-                    });
+                let child_stats_with_project_exec_projected: Result<Vec<_>, DataFusionError> =
+                    child_stats
+                        .into_iter()
+                        .map(|stats| {
+                            proj_exec_stats(
+                                Arc::unwrap_or_clone(stats),
+                                self.expr().iter(),
+                                &self.schema(),
+                            )
+                        })
+                        .collect();
 
-                acc.extend(child_stats_with_project_exec_projected);
+                acc.extend(child_stats_with_project_exec_projected?);
                 Ok::<PartitionedStatistics, DataFusionError>(acc)
             },
         )?;
@@ -270,27 +274,52 @@ impl PartitionStatistics for AggregateExec {
     fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
         if self.aggr_expr().is_empty() {
             let inner_stats_per_partition = statistics_by_partition(self.input.as_ref())?;
+            let input_schema = self.input.schema();
 
-            Ok(inner_stats_per_partition
+            inner_stats_per_partition
                 .iter()
                 .map(|stats| {
-                    // only retain the min/max per column
-                    // whereas the remaining stats can be changed by the grouping
-                    Arc::new(Statistics {
+                    // Create column statistics for each output GROUP BY expression
+                    let column_statistics: Result<Vec<ColumnStatistics>, DataFusionError> = self
+                        .output_group_expr()
+                        .iter()
+                        .map(|group_expr| {
+                            // Check if this group expression corresponds to an input column
+                            if let Some(input_col_idx) = group_expr
+                                .as_any()
+                                .downcast_ref::<Column>()
+                                .and_then(|col| input_schema.index_of(col.name()).ok())
+                            {
+                                // This is a direct column reference, use existing statistics
+                                if input_col_idx < stats.column_statistics.len() {
+                                    let col_stats = &stats.column_statistics[input_col_idx];
+                                    Ok(ColumnStatistics {
+                                        min_value: col_stats.min_value.clone(),
+                                        max_value: col_stats.max_value.clone(),
+                                        ..Default::default()
+                                    })
+                                } else {
+                                    // Input column index out of bounds - this should not happen
+                                    Err(internal_datafusion_err!(
+                                        "Column index {input_col_idx} out of bounds in partition statistics (available columns: {}, column found in schema)",
+                                        stats.column_statistics.len()
+                                    ))
+                                }
+                            } else {
+                                // This is a computed expression (like date_part), return unknown stats
+                                Ok(ColumnStatistics::default())
+                            }
+                        })
+                        .collect();
+
+                    let column_statistics = column_statistics?;
+                    Ok(Arc::new(Statistics {
                         num_rows: Precision::Absent,
                         total_byte_size: Precision::Absent,
-                        column_statistics: stats
-                            .column_statistics
-                            .iter()
-                            .map(|col_stats| ColumnStatistics {
-                                min_value: col_stats.min_value.clone(),
-                                max_value: col_stats.max_value.clone(),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    })
+                        column_statistics,
+                    }))
                 })
-                .collect())
+                .collect()
         } else {
             // if aggr expr is not empty, then the projected values (per column) could be different
             Ok(unknown_statistics_by_partition(self))

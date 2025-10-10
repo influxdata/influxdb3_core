@@ -15,8 +15,8 @@ use tracker::{
     AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
 };
 
-// for benchmarks
-pub use s3_fifo::{S3Config, S3Fifo};
+// for benchmarks and tests
+pub use s3_fifo::{S3Config, S3Fifo, s3_fifo_entry_overhead_size};
 
 use crate::cache_system::{AsyncDrop, DynError, InUse};
 

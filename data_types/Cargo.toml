@@ -14,7 +14,7 @@ arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 bytes = "1.10"
 chrono = { version = "0.4", default-features = false }
-croaring = "2.4.0"
+croaring = "2.5.1"
 influxdb-line-protocol = { path = "../influxdb_line_protocol" }
 iox_time = { path = "../iox_time" }
 generated_types = { path = "../generated_types" }
@@ -33,7 +33,7 @@ sqlx = { workspace = true, features = [
     "postgres",
     "uuid",
 ] }
-thiserror = "2.0.16"
+thiserror = "2.0.17"
 uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
