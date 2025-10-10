@@ -3,6 +3,7 @@ use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream::BoxStream};
+use linear_buffer::Slice;
 use metric::U64Counter;
 use object_store::{
     AttributeValue, Attributes, DynObjectStore, Error, GetOptions, GetResult, GetResultPayload,
@@ -28,8 +29,37 @@ const CACHE_NAME: &str = "object_store";
 const STORE_NAME: &str = "mem_cache";
 
 #[derive(Debug)]
+enum CacheValueData {
+    Owned(Bytes),
+    Shared(Slice),
+}
+
+impl CacheValueData {
+    fn size(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.len(),
+            Self::Shared(slice) => slice.allocation_size(),
+        }
+    }
+
+    fn as_bytes(&self) -> Bytes {
+        match self {
+            Self::Owned(bytes) => bytes.clone(),
+            Self::Shared(slice) => Bytes::from_owner(slice.clone()),
+        }
+    }
+
+    fn is_unique(&self) -> bool {
+        match self {
+            Self::Owned(bytes) => bytes.is_unique(),
+            Self::Shared(slice) => slice.strong_count() == 1,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct CacheValue {
-    data: Bytes,
+    data: CacheValueData,
     meta: ObjectMeta,
 }
 
@@ -39,28 +69,47 @@ impl CacheValue {
         location: &Path,
         size_hint: Option<u64>,
     ) -> Result<Self> {
-        let options = match size_hint {
+        let mut options = match size_hint {
             Some(size) => hint_size(size),
             None => GetOptions::default(),
         };
+
+        let (buffer_tx, buffer_rx) = crate::buffer_channel::channel();
+        options.extensions.insert(buffer_tx);
+
         let res = store.get_opts(location, options).await?;
         let meta = res.meta.clone();
 
-        // HACK: `Bytes` is a view-based type and may reference and underlying larger buffer. Maybe that causes
-        //        https://github.com/influxdata/influxdb_iox/issues/13765 (there it was a catalog issue, but we
-        //        seem to have a similar issue with the disk cache interaction?) . So we "unshare" the buffer by
-        //        round-tripping it through an owned type.
-        //
-        // We try to be clever by creating 1 "landing buffer" instead of using `res.bytes()` and then an
-        // additional clone. See https://github.com/influxdata/influxdb_iox/issues/15078#issuecomment-3223376485
-        let mut stream = res.into_stream();
-        let mut buffer = Vec::with_capacity(meta.size as usize);
-        while let Some(next) = stream.try_next().await? {
-            buffer.extend_from_slice(&next);
-        }
-        let data = buffer.into();
+        let data = if let Some(buffer_rx) = buffer_rx.accepted() {
+            // drain stream because metric wrappers might depend on it
+            let mut stream = res.into_stream();
+            while stream.try_next().await?.is_some() {}
+
+            CacheValueData::Shared(buffer_rx.await.map_err(|e| Error::Generic {
+                store: STORE_NAME,
+                source: Box::new(e),
+            })?)
+        } else {
+            // HACK: `Bytes` is a view-based type and may reference and underlying larger buffer. Maybe that causes
+            //        https://github.com/influxdata/influxdb_iox/issues/13765 (there it was a catalog issue, but we
+            //        seem to have a similar issue with the disk cache interaction?) . So we "unshare" the buffer by
+            //        round-tripping it through an owned type.
+            //
+            // We try to be clever by creating 1 "landing buffer" instead of using `res.bytes()` and then an
+            // additional clone. See https://github.com/influxdata/influxdb_iox/issues/15078#issuecomment-3223376485
+            let mut stream = res.into_stream();
+            let mut buffer = Vec::with_capacity(meta.size as usize);
+            while let Some(next) = stream.try_next().await? {
+                buffer.extend_from_slice(&next);
+            }
+            CacheValueData::Owned(buffer.into())
+        };
 
         Ok(Self { data, meta })
+    }
+
+    fn data(&self) -> Bytes {
+        self.data.as_bytes()
     }
 }
 
@@ -75,7 +124,7 @@ impl HasSize for CacheValue {
             version,
         } = meta;
 
-        data.len()
+        data.size()
             + location.as_ref().len()
             + e_tag.as_ref().map(|s| s.capacity()).unwrap_or_default()
             + version.as_ref().map(|s| s.capacity()).unwrap_or_default()
@@ -269,11 +318,13 @@ impl ObjectStore for MemCacheObjectStore {
         }
 
         let (v, state) = self.get_or_fetch(location, size_hint).await?;
+        let data = v.data();
+        let data_len = data.len();
 
         Ok(GetResult {
-            payload: GetResultPayload::Stream(futures::stream::iter([Ok(v.data.clone())]).boxed()),
+            payload: GetResultPayload::Stream(futures::stream::iter([Ok(data)]).boxed()),
             meta: v.meta.clone(),
-            range: 0..(v.data.len() as u64),
+            range: 0..(data_len as u64),
             attributes: Attributes::from_iter([(ATTR_CACHE_STATE, AttributeValue::from(state))]),
         })
     }
@@ -289,17 +340,18 @@ impl ObjectStore for MemCacheObjectStore {
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         let (v, _state) = self.get_or_fetch(location, None).await?;
+        let data = v.data();
 
         ranges
             .iter()
             .map(|range| {
-                if range.end > (v.data.len() as u64) {
+                if range.end > (data.len() as u64) {
                     return Err(Error::Generic {
                         store: STORE_NAME,
                         source: format!(
                             "Range end ({}) out of bounds, object size is {}",
                             range.end,
-                            v.data.len()
+                            data.len(),
                         )
                         .into(),
                     });
@@ -314,7 +366,7 @@ impl ObjectStore for MemCacheObjectStore {
                         .into(),
                     });
                 }
-                Ok(v.data.slice((range.start as usize)..(range.end as usize)))
+                Ok(data.slice((range.start as usize)..(range.end as usize)))
             })
             .collect()
     }
@@ -374,9 +426,12 @@ impl ObjectStore for MemCacheObjectStore {
 #[cfg(test)]
 mod tests {
     use futures::FutureExt;
-    use object_store_mock::MockStore;
+    use http::Extensions;
+    use linear_buffer::{LinearBuffer, LinearBufferExtend};
+    use object_store_mock::{MockCall, MockParam, MockStore, path};
+    use tokio::sync::Barrier;
 
-    use crate::{gen_store_tests, object_store_cache_tests::Setup};
+    use crate::{buffer_channel::BufferSender, gen_store_tests, object_store_cache_tests::Setup};
 
     use super::*;
 
@@ -414,7 +469,129 @@ mod tests {
         fn outer(&self) -> &Arc<DynObjectStore> {
             &self.store
         }
+
+        fn extensions(&self) -> Extensions {
+            let mut ext = Extensions::default();
+            let (tx, _rx) = crate::buffer_channel::channel();
+            ext.insert(tx);
+            ext
+        }
     }
 
     gen_store_tests!(TestSetup);
+
+    #[tokio::test]
+    async fn test_cache_value_buffer_copy() {
+        let location = path();
+        let data = Bytes::from(b"foobar".to_vec());
+
+        let (tx, _rx) = crate::buffer_channel::channel();
+        let mut get_ops = GetOptions::default();
+        get_ops.extensions.insert(tx);
+
+        let store = MockStore::new()
+            .mock_next(MockCall::GetOpts {
+                params: (location.clone(), get_ops.clone().into()),
+                barriers: vec![],
+                res: Ok(GetResult {
+                    payload: GetResultPayload::Stream(
+                        futures::stream::iter([Ok(data.clone())]).boxed(),
+                    ),
+                    meta: meta(&location, &data),
+                    range: 0..(data.len() as u64),
+                    attributes: Default::default(),
+                }),
+            })
+            .as_store();
+
+        let value = CacheValue::fetch(&store, &location, None).await.unwrap();
+        assert!(!value.in_use());
+
+        let slice = value.data();
+        assert_eq!(slice, data);
+        assert_ne!(
+            slice.as_ptr().expose_provenance(),
+            data.as_ptr().expose_provenance(),
+            "data was copied",
+        );
+        assert!(value.in_use());
+
+        drop(slice);
+        assert!(!value.in_use());
+    }
+
+    #[tokio::test]
+    async fn test_cache_value_buffer_nocopy() {
+        let location = path();
+        let data = Bytes::from(b"foobar".to_vec());
+
+        const OVERALLOCATE: usize = 10;
+        let mut buffer = LinearBuffer::new(data.len() + OVERALLOCATE);
+        buffer.append(&data);
+
+        let (tx, _rx) = crate::buffer_channel::channel();
+        let mut get_ops = GetOptions::default();
+        get_ops.extensions.insert(tx);
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let store = MockStore::new().mock_next(MockCall::GetOpts {
+            params: (location.clone(), get_ops.clone().into()),
+            barriers: vec![Arc::clone(&barrier)],
+            res: Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    futures::stream::iter([Ok(data.clone())]).boxed(),
+                ),
+                meta: meta(&location, &data),
+                range: 0..(data.len() as u64),
+                attributes: Default::default(),
+            }),
+        });
+        let mut store_params = store.observed_params();
+        let store = store.as_store();
+
+        let fut_value = async { CacheValue::fetch(&store, &location, None).await.unwrap() };
+        let fut_buffer = async {
+            let param = store_params.recv().await.unwrap();
+            let MockParam::GetOpts((_path, get_options)) = param else {
+                unreachable!()
+            };
+            let tx = get_options.extensions.get::<BufferSender>().unwrap();
+            let tx = tx.clone().accept();
+            tx.send(buffer.slice_initialized_part(0..data.len()));
+            barrier.wait().await;
+        };
+
+        let (value, ()) = tokio::join!(fut_value, fut_buffer);
+        assert!(value.in_use());
+
+        let buffer_ptr = buffer
+            .slice_initialized_part(0..0)
+            .as_ptr()
+            .expose_provenance();
+        drop(buffer);
+        assert!(!value.in_use());
+
+        let slice = value.data();
+        assert_eq!(slice, data);
+        assert_eq!(
+            slice.as_ptr().expose_provenance(),
+            buffer_ptr,
+            "data was NOT copied",
+        );
+        assert!(value.in_use());
+
+        drop(slice);
+        assert!(!value.in_use());
+    }
+
+    fn meta(location: &Path, data: &[u8]) -> ObjectMeta {
+        ObjectMeta {
+            location: location.clone(),
+            last_modified: Default::default(),
+            size: data.len() as u64,
+            e_tag: None,
+            version: None,
+        }
+    }
 }

@@ -15,8 +15,8 @@ use tracker::{
     AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
 };
 
-// for benchmarks
-pub use s3_fifo::{S3Config, S3Fifo};
+// for benchmarks and tests
+pub use s3_fifo::{S3Config, S3Fifo, s3_fifo_entry_overhead_size};
 
 use crate::cache_system::{AsyncDrop, DynError, InUse};
 
@@ -264,8 +264,26 @@ where
     ///
     /// Note that the keys listed in the cache are those which have returned from the
     /// [`CacheFn`] function, i.e. they are the keys that have been successfully fetched.
+    ///
+    /// These keys do not have any guaranteed ordering.
     pub fn list(&self) -> impl Iterator<Item = Arc<K>> {
         self.cache.keys()
+    }
+
+    /// Evict multiple keys from the S3FifoCache, in a blocking manner.
+    ///
+    /// This method directly removes entries from the cache without going through
+    /// the normal eviction process, where the S3-Fifo algorthim decides what to evict.
+    /// This is useful for cache management operations like repair/validation.
+    ///
+    /// This method is blocking, and holds a mutex in order to replace the [`S3Fifo`] cache
+    /// at once.
+    ///
+    /// Returns the number of keys that were successfully evicted. If a key does not
+    /// exist in the cache and cannot be evicted, it will be ignored (and the
+    /// returned count of evicted items will be lower).
+    pub fn evict_keys(&self, keys: impl Iterator<Item = K>) -> usize {
+        self.cache.remove_keys(keys)
     }
 }
 
@@ -1134,5 +1152,257 @@ mod tests {
         // Wait for second request to complete
         let result2 = res2.await.unwrap();
         assert_eq!(result2, Arc::from("value2"));
+    }
+
+    #[tokio::test]
+    async fn test_evict_keys_small_queue() {
+        let hook = Arc::new(TestHook::default());
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
+            S3Config {
+                max_memory_size: 1000,
+                max_ghost_memory_size: 500,
+                move_to_main_threshold: 0.1,
+                hook: Arc::clone(&hook) as _,
+                inflight_bytes: 250,
+            },
+            &metric::Registry::new(),
+        );
+
+        // Insert 5 keys in order: key1, key2, key3, key4, key5
+        let keys = vec!["key1", "key2", "key3", "key4", "key5"];
+        let mut inserted_keys = Vec::new();
+
+        for key_str in &keys {
+            let key = Arc::from(*key_str);
+            let value = Arc::from(format!("value_{}", key_str));
+            inserted_keys.push(Arc::clone(&key));
+
+            let (res, _, state) = cache.get_or_fetch(
+                &key,
+                Box::new({
+                    let value = Arc::clone(&value);
+                    move || futures::future::ready(Ok(value)).boxed()
+                }),
+                (),
+                Some(value.size()),
+            );
+            assert_eq!(state, CacheState::NewEntry);
+            res.await.unwrap();
+        }
+
+        // Verify all keys are in the cache
+        assert_eq!(cache.len(), 5);
+        for key in &inserted_keys {
+            assert!(cache.get(key).is_some(), "Key {key:?} should be in cache");
+        }
+
+        // Get list of keys before eviction to verify ordering preservation
+        let keys_before: Vec<Arc<str>> = cache
+            .cache
+            .small_queue_keys()
+            .into_iter()
+            .map(Arc::unwrap_or_clone)
+            .collect();
+        assert_eq!(keys_before.len(), 5, "Should have 5 keys before eviction");
+
+        // Confirm have empty ghost queue
+        assert_eq!(cache.cache.ghost_len(), 0, "Ghost queue should be empty");
+
+        // Evict only key2 and key4 (selective eviction)
+        let keys_to_evict = vec![
+            Arc::clone(&inserted_keys[1]), // key2
+            Arc::clone(&inserted_keys[3]), // key4
+        ];
+        let evicted_count = cache.evict_keys(keys_to_evict.clone().into_iter());
+        assert_eq!(evicted_count, 2, "Should have evicted exactly 2 keys");
+
+        // Verify cache size is reduced
+        assert_eq!(
+            cache.len(),
+            3,
+            "Cache should contain 3 entries after eviction"
+        );
+
+        // Get list of keys after eviction
+        let keys_after: Vec<Arc<str>> = cache
+            .cache
+            .small_queue_keys()
+            .into_iter()
+            .map(Arc::unwrap_or_clone)
+            .collect();
+        let expected_remaining_keys: Vec<Arc<str>> = keys_before
+            .into_iter()
+            .filter(|key| !keys_to_evict.contains(key))
+            .collect();
+        assert_eq!(
+            keys_after, expected_remaining_keys,
+            "Remaining keys should match expected keys, and retain the same ordering"
+        );
+
+        // Check that evicted keys are removed from S3Fifo::entries
+        for evicted_key in &keys_to_evict {
+            assert!(
+                !cache.cache.contains_key_in_entries(evicted_key),
+                "Evicted key {evicted_key:?} should be removed from entries"
+            );
+        }
+
+        // Check that remaining keys are still in S3Fifo::entries
+        for remaining_key in &expected_remaining_keys {
+            assert!(
+                cache.cache.contains_key_in_entries(remaining_key),
+                "Remaining key {remaining_key:?} should still be in entries"
+            );
+        }
+
+        // Check ghost queue is still empty
+        assert_eq!(
+            cache.cache.ghost_len(),
+            0,
+            "Ghost queue should remain empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_keys_main_queue_and_ghost() {
+        let hook = Arc::new(TestHook::default());
+        let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
+            S3Config {
+                max_memory_size: 150 + 100,
+                max_ghost_memory_size: 150,
+                move_to_main_threshold: 0.3,
+                hook: Arc::clone(&hook) as _,
+                inflight_bytes: 50,
+            },
+            &metric::Registry::new(),
+        );
+
+        // Insert 6 keys in order: key1, key2, key3, key4, key5, key6
+        let keys = vec!["key1", "key2", "key3", "key4", "key5", "key6"];
+        let mut inserted_keys = Vec::new();
+
+        for key_str in &keys {
+            let key = Arc::from(*key_str);
+            let value = Arc::from(format!("value_{}", key_str));
+            inserted_keys.push(Arc::clone(&key));
+
+            let (res, _, state) = cache.get_or_fetch(
+                &key,
+                Box::new({
+                    let value = Arc::clone(&value);
+                    move || futures::future::ready(Ok(value)).boxed()
+                }),
+                (),
+                Some(value.size()),
+            );
+            assert_eq!(state, CacheState::NewEntry);
+            res.await.unwrap();
+        }
+
+        // Verify cache only has the last 3 keys (key4, key5, key6) due to eviction
+        assert_eq!(cache.len(), 3, "Cache should contain exactly 3 entries");
+
+        // The first 3 keys should have been evicted and logged in the ghost
+        assert_eq!(cache.cache.ghost_len(), 3, "Ghost should have 3 entries");
+
+        // Re-insert the first 3 keys (key1, key2, key3)
+        for i in 0..3 {
+            let key = Arc::clone(&inserted_keys[i]);
+            let value = Arc::from(format!("value_{}", keys[i]));
+
+            let (res, _, state) = cache.get_or_fetch(
+                &key,
+                Box::new({
+                    let value = Arc::clone(&value);
+                    move || futures::future::ready(Ok(value)).boxed()
+                }),
+                (),
+                Some(value.size()),
+            );
+            assert_eq!(state, CacheState::NewEntry);
+            res.await.unwrap();
+        }
+
+        // Verify the first 3 keys are now in the main queue (since they were in ghost)
+        let main_queue_keys = cache.cache.main_queue_keys();
+        assert_eq!(
+            main_queue_keys,
+            vec![
+                Arc::new(Arc::clone(&inserted_keys[0])),
+                Arc::new(Arc::clone(&inserted_keys[1])),
+                Arc::new(Arc::clone(&inserted_keys[2])),
+            ]
+        );
+
+        // Verify they are no longer in the ghost
+        assert!(
+            !cache
+                .cache
+                .contains_key_in_ghost(&Arc::new(Arc::clone(&inserted_keys[0]))),
+            "key1 should no longer be in ghost"
+        );
+        assert!(
+            !cache
+                .cache
+                .contains_key_in_ghost(&Arc::new(Arc::clone(&inserted_keys[1]))),
+            "key2 should no longer be in ghost"
+        );
+        assert!(
+            !cache
+                .cache
+                .contains_key_in_ghost(&Arc::new(Arc::clone(&inserted_keys[2]))),
+            "key3 should no longer be in ghost"
+        );
+        // Instead, we have key4 & key5 & key6 in the ghost
+        assert_eq!(
+            cache.cache.ghost_len(),
+            3,
+            "Ghost should have 3 NEW entries"
+        );
+        assert!(
+            cache
+                .cache
+                .contains_key_in_ghost(&Arc::new(Arc::clone(&inserted_keys[3]))),
+            "key4 should be in ghost"
+        );
+
+        // Evict key1 (main queue) and key4 (ghost) from the cache
+        let keys_to_evict = vec![Arc::clone(&inserted_keys[0]), Arc::clone(&inserted_keys[3])]; // key1, key4
+        let evicted_count = cache.evict_keys(keys_to_evict.clone().into_iter());
+        assert_eq!(
+            evicted_count, 1,
+            "Should have evicted exactly 1 key -- since only 1 is currently in the queue"
+        );
+
+        // Verify key1 is removed from main queue
+        let main_queue_keys_after = cache.cache.main_queue_keys();
+        assert!(
+            !main_queue_keys_after.contains(&Arc::new(Arc::clone(&inserted_keys[0]))),
+            "key1 should be removed from main queue"
+        );
+
+        // Verify key1 is removed from entries (should not be in cache anymore)
+        assert!(
+            !cache.cache.contains_key_in_entries(&inserted_keys[0]),
+            "key1 should be removed from entries"
+        );
+
+        // Verify key2 & key 3 are still in main queue, as well as the ordering is retained.
+        assert_eq!(
+            main_queue_keys_after,
+            vec![
+                Arc::new(Arc::clone(&inserted_keys[1])),
+                Arc::new(Arc::clone(&inserted_keys[2])),
+            ],
+            "key2 & key3 should still be in main queue"
+        );
+
+        // Verify key4 is still in ghost queue (should remain there)
+        assert!(
+            cache
+                .cache
+                .contains_key_in_ghost(&Arc::new(Arc::clone(&inserted_keys[3]))),
+            "key4 should still be in ghost after eviction"
+        );
     }
 }

@@ -1061,10 +1061,15 @@ mod tests {
         let capture = capture();
 
         let location = path();
+
+        let mut get_opts = GetOptions::default();
+        let (tx, _rx) = object_store_mem_cache::buffer_channel::channel();
+        get_opts.extensions.insert(tx);
+
         let barrier = Arc::new(Barrier::new(2));
         let inner: Arc<dyn ObjectStore> = MockStore::new()
             .mock_next(GetOpts {
-                params: (location.clone(), Default::default()),
+                params: (location.clone(), get_opts.into()),
                 barriers: vec![Arc::clone(&barrier)],
                 res: Ok(get_result_stream()),
             })

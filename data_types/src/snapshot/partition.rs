@@ -84,6 +84,9 @@ pub struct PartitionSnapshot {
     /// The time this Partition was created at, or `None` if this partition was created before this
     /// field existed. Not the time the snapshot was created.
     created_at: Option<Timestamp>,
+    /// Estimated size in bytes of all the active files in this partition, or `None`
+    /// if the partition size has not been computed yet.
+    estimated_size_bytes: Option<i64>,
 }
 
 impl PartitionSnapshot {
@@ -141,6 +144,7 @@ impl PartitionSnapshot {
             skipped_compaction: skipped_compaction.map(|sc| sc.into()),
             cold_compact_at: partition.cold_compact_at,
             created_at: partition.created_at(),
+            estimated_size_bytes: partition.estimated_size_bytes,
         })
     }
 
@@ -165,6 +169,7 @@ impl PartitionSnapshot {
             skipped_compaction: proto.skipped_compaction,
             cold_compact_at: proto.cold_compact_at.map(Timestamp::new),
             created_at: proto.created_at.map(Timestamp::new),
+            estimated_size_bytes: proto.estimated_size_bytes,
         }
     }
 
@@ -257,6 +262,7 @@ impl PartitionSnapshot {
             self.cold_compact_at,
             self.created_at,
             None, // max_time - not stored in snapshot (can be computed from partition key)
+            self.estimated_size_bytes,
         ))
     }
 
@@ -271,6 +277,13 @@ impl PartitionSnapshot {
             .as_ref()
             .cloned()
             .map(|sc| sc.into())
+    }
+
+    /// Returns the estimated size of the partition in bytes.
+    pub fn estimated_size_bytes(&self) -> i64 {
+        // Treat None as 0. Since this is an estimated size,
+        // it is acceptable to treat partitions with None as having size 0.
+        self.estimated_size_bytes.unwrap_or(0)
     }
 }
 
@@ -289,6 +302,7 @@ impl From<PartitionSnapshot> for proto::Partition {
             skipped_compaction: value.skipped_compaction,
             cold_compact_at: value.cold_compact_at.map(|x| x.get()),
             created_at: value.created_at.map(|x| x.get()),
+            estimated_size_bytes: value.estimated_size_bytes,
         }
     }
 }
@@ -343,6 +357,7 @@ mod tests {
                 Default::default(),
                 Default::default(),
                 None, // max_time
+                Default::default(),
             );
             // Create associated Parquet files:
             let parquet_files = vec![
@@ -448,6 +463,7 @@ mod tests {
             new_file_at: Default::default(),
             skipped_compaction: Default::default(),
             sort_key_ids: Default::default(),
+            estimated_size_bytes: Default::default(),
         };
         let numeric_id_partition_proto = proto::Partition {
             partition_hash_id: false,

@@ -139,6 +139,11 @@ where
     pub(crate) fn len(&self) -> usize {
         self.set.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, o: &T) -> bool {
+        self.set.contains(&Entry::Data(o))
+    }
 }
 
 /// Encode implementation, with trait bounds for `T`.

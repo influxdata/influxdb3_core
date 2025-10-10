@@ -15,10 +15,9 @@ use arrow_util::test_util::batches_to_lines;
 use datafusion::{
     error::Result,
     execution::runtime_env::RuntimeEnvBuilder,
-    functions::datetime::date_bin::DateBinFunc,
     physical_plan::{
         collect,
-        expressions::{col as phys_col, lit as phys_lit},
+        expressions::{Column, col as phys_col, lit as phys_lit},
         test::exec::MockExec,
     },
     prelude::{SessionConfig, SessionContext},
@@ -42,11 +41,13 @@ fn test_gapfill_simple() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&batch, 25, Some(975), 1_125);
+            let time_expr = get_date_bin_expr(&batch, 25, None);
             let tc = TestCase {
                 test_records: batch,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             // For this simple test case, also test that
             // memory is tracked correctly, which is done by
@@ -84,11 +85,13 @@ fn test_gapfill_simple_tz() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&batch, 25, Some(975), 1_125);
+            let time_expr = get_date_bin_expr(&batch, 25, None);
             let tc = TestCase {
                 test_records: batch,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             // For this simple test case, also test that
             // memory is tracked correctly, which is done by
@@ -129,11 +132,13 @@ fn test_gapfill_simple_no_group_no_aggr() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&batch, 25, Some(975), 1_125);
+            let time_expr= get_date_bin_expr(&batch, 25, None);
             let tc = TestCase {
                 test_records: batch,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -169,11 +174,13 @@ fn test_gapfill_multi_group_simple() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&records, 25, Some(975), 1_125);
+            let time_expr  = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -215,11 +222,13 @@ fn test_gapfill_multi_group_simple_origin() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_origin_fill_strategy(&records, 25, Some(975), 1_125, Some(3), None);
+            let time_expr  = get_date_bin_expr(&records, 25, Some(3));
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -286,11 +295,13 @@ fn test_gapfill_multi_group_with_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&records, 25, Some(975), 1_125);
+            let time_expr = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -370,11 +381,13 @@ fn test_gapfill_multi_group_cols_with_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&records, 25, Some(975), 1_125);
+            let time_expr = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -431,11 +444,13 @@ fn test_gapfill_multi_group_cols_with_more_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&records, 25, Some(975), 1_025);
+            let time_expr  = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_025),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -519,11 +534,13 @@ fn test_gapfill_multi_aggr_cols_with_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&records, 25, Some(975), 1_125);
+            let time_expr = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -568,11 +585,13 @@ fn test_gapfill_simple_no_lower_bound() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&batch, 25, None, 1_125);
+            let time_expr = get_date_bin_expr(&batch, 25, None);
             let tc = TestCase {
                 test_records: batch,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(None, 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -637,11 +656,13 @@ fn test_gapfill_fill_prev() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, Some(FillStrategy::PrevNullAsIntentional));
+            let time_expr = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: Some(FillStrategy::PrevNullAsIntentional),
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -716,11 +737,13 @@ fn test_gapfill_fill_prev_null_as_missing() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, Some(FillStrategy::PrevNullAsMissing));
+            let time_expr  = get_date_bin_expr(&records, 25, None );
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: Some(FillStrategy::PrevNullAsMissing),
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -816,11 +839,13 @@ fn test_gapfill_fill_prev_null_as_missing_many_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(&records, 25, Some(975), 1_125, Some(FillStrategy::PrevNullAsMissing));
+            let time_expr = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: Some(FillStrategy::PrevNullAsMissing),
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -926,17 +951,13 @@ fn test_gapfill_fill_interpolate() {
                     struct_cols: vec![],
                     input_batch_size,
                 };
-                let params = get_params_ms_with_fill_strategy(
-                    &records,
-                    25,
-                    Some(975),
-                    1_125,
-                    Some(FillStrategy::LinearInterpolate)
-                );
+                let time_expr = get_date_bin_expr(&records,25,None);
                 let tc = TestCase {
                     test_records: records,
                     output_batch_size,
-                    params,
+                    time_expr,
+                    time_range: get_time_range(Some(975), 1_125),
+                    fill_strategy:  Some(FillStrategy::LinearInterpolate),
                 };
                 let batches = tc.run().unwrap();
                 let actual = batches_to_lines(&batches);
@@ -1024,11 +1045,13 @@ fn test_gapfill_simple_no_lower_bound_with_nulls() {
                 struct_cols: vec![],
                 input_batch_size,
             };
-            let params = get_params_ms(&batch, 25, None, 1_125);
+            let time_expr = get_date_bin_expr(&batch, 25, None);
             let tc = TestCase {
                 test_records: batch,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(None, 1_125),
+                fill_strategy: None,
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -1074,11 +1097,13 @@ fn test_gapfill_oom() {
         struct_cols: vec![],
         input_batch_size,
     };
-    let params = get_params_ms(&batch, 25, Some(975), 1_125);
+    let time_expr = get_date_bin_expr(&batch, 25, None);
     let tc = TestCase {
         test_records: batch,
         output_batch_size,
-        params,
+        time_expr,
+        time_range: get_time_range(Some(975), 1_125),
+        fill_strategy: None,
     };
     let result = tc.run_with_memory_limit(1);
     assert_error!(result, DataFusionError::ResourcesExhausted(_));
@@ -1145,17 +1170,13 @@ fn test_gapfill_interpolate_struct() {
                 ]],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(
-                &records,
-                25,
-                Some(975),
-                1_125,
-                Some(FillStrategy::LinearInterpolate)
-            );
+            let time_expr= get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: Some(FillStrategy::LinearInterpolate),
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -1251,17 +1272,13 @@ fn test_gapfill_interpolate_struct_additional_data() {
                 ]],
                 input_batch_size,
             };
-            let params = get_params_ms_with_fill_strategy(
-                &records,
-                25,
-                Some(975),
-                1_125,
-                Some(FillStrategy::LinearInterpolate)
-            );
+            let time_expr = get_date_bin_expr(&records, 25, None);
             let tc = TestCase {
                 test_records: records,
                 output_batch_size,
-                params,
+                time_expr,
+                time_range: get_time_range(Some(975), 1_125),
+                fill_strategy: Some(FillStrategy::LinearInterpolate),
             };
             let batches = tc.run().unwrap();
             let actual = batches_to_lines(&batches);
@@ -1391,7 +1408,7 @@ impl TestRecords {
         for i in 0..self.schema().fields().len() {
             match i.cmp(&ngroup_cols) {
                 Ordering::Less => group_expr.push(Arc::new(Column::new(&format!("g{i}"), i))),
-                Ordering::Equal => group_expr.push(Arc::new(Column::new("t", i))),
+                Ordering::Equal => continue,
                 Ordering::Greater => {
                     let idx = i - ngroup_cols + 1;
                     aggr_expr.push(Arc::new(Column::new(&format!("a{idx}"), i)));
@@ -1464,7 +1481,9 @@ impl TryFrom<TestRecords> for Vec<RecordBatch> {
 struct TestCase {
     test_records: TestRecords,
     output_batch_size: usize,
-    params: GapFillExecParams,
+    time_expr: Arc<dyn PhysicalExpr>,
+    time_range: Range<Bound<Arc<dyn PhysicalExpr>>>,
+    fill_strategy: Option<FillStrategy>,
 }
 
 impl TestCase {
@@ -1502,8 +1521,8 @@ impl TestCase {
 
     fn plan(self) -> Result<Arc<GapFillExec>> {
         let schema = self.test_records.schema();
-        let (group_expr, aggr_expr) = self.test_records.exprs()?;
-
+        let (series_expr, _) = self.test_records.exprs()?;
+        let fill_expr = phys_fill_expr(&self.test_records, self.fill_strategy)?;
         let input_batch_size = self.test_records.input_batch_size;
 
         let num_records = self.test_records.len();
@@ -1522,11 +1541,13 @@ impl TestCase {
             MockExec::new(batches.into_iter().map(Ok).collect(), Arc::clone(&schema))
                 .with_use_task(false),
         );
+
         let plan = Arc::new(GapFillExec::try_new(
             input,
-            group_expr,
-            aggr_expr,
-            self.params.clone(),
+            series_expr,
+            Arc::clone(&self.time_expr),
+            fill_expr,
+            self.time_range.clone(),
         )?);
         Ok(plan)
     }
@@ -1548,75 +1569,62 @@ fn bound_included_from_option<T>(o: Option<T>) -> Bound<T> {
     }
 }
 
-fn phys_fill_strategies(
+fn phys_fill_expr(
     records: &TestRecords,
     fill_strategy: Option<FillStrategy>,
-) -> Result<Vec<(Arc<dyn PhysicalExpr>, FillStrategy)>> {
+) -> Result<Vec<PhysicalFillExpr>> {
     let start = records.group_cols.len() + 1; // 1 is for time col
     let end = start + records.agg_cols.len() + records.struct_cols.len();
     let mut v = Vec::with_capacity(records.agg_cols.len());
     for f in &records.schema().fields()[start..end] {
-        v.push((
-            phys_col(f.name(), &records.schema())?,
-            match fill_strategy {
+        v.push(PhysicalFillExpr {
+            expr: phys_col(f.name(), &records.schema())?,
+            strategy: match fill_strategy {
                 Some(ref fs) => fs.clone(),
                 None => FillStrategy::Default(f.data_type().try_into()?),
             },
-        ));
+        });
     }
     Ok(v)
 }
 
-fn get_params_ms_with_fill_strategy(
+fn get_date_bin_expr(
     batch: &TestRecords,
     stride_ms: i64,
-    start: Option<i64>,
-    end: i64,
-    fill_strategy: Option<FillStrategy>,
-) -> GapFillExecParams {
-    get_params_ms_with_origin_fill_strategy(batch, stride_ms, start, end, None, fill_strategy)
-}
-
-fn get_params_ms_with_origin_fill_strategy(
-    batch: &TestRecords,
-    stride_ms: i64,
-    start: Option<i64>,
-    end: i64,
     origin_ms: Option<i64>,
-    fill_strategy: Option<FillStrategy>,
-) -> GapFillExecParams {
-    // stride is in ms
-    let stride = ScalarValue::new_interval_mdn(0, 0, stride_ms * 1_000_000);
-    let origin =
-        origin_ms.map(|o| phys_lit(ScalarValue::TimestampNanosecond(Some(o * 1_000_000), None)));
-
-    GapFillExecParams {
-        date_bin_udf: Arc::new(ScalarUDF::new_from_impl(DateBinFunc::new())),
-        stride: phys_lit(stride),
-        time_column: Column::new("t", batch.group_cols.len()),
-        origin,
-        // timestamps are nanos, so scale them accordingly
-        time_range: Range {
-            start: bound_included_from_option(start.map(|start| {
-                phys_lit(ScalarValue::TimestampNanosecond(
-                    Some(start * 1_000_000),
-                    None,
-                ))
-            })),
-            end: Bound::Included(phys_lit(ScalarValue::TimestampNanosecond(
-                Some(end * 1_000_000),
-                None,
-            ))),
-        },
-        fill_strategy: phys_fill_strategies(batch, fill_strategy).unwrap(),
-    }
+) -> Arc<dyn PhysicalExpr> {
+    let mut args = vec![
+        phys_lit(ScalarValue::new_interval_mdn(0, 0, stride_ms * 1_000_000)),
+        Arc::new(Column::new("t", batch.group_cols.len())),
+    ];
+    args.extend(
+        origin_ms
+            .iter()
+            .map(|ms| phys_lit(ScalarValue::TimestampNanosecond(Some(ms * 1_000_000), None))),
+    );
+    Arc::new(ScalarFunctionExpr::new(
+        "time",
+        datafusion::functions::datetime::date_bin(),
+        args,
+        Arc::new(Field::new(
+            "time",
+            DataType::Timestamp(TimeUnit::Nanosecond, batch.timezone.clone()),
+            true,
+        )),
+    ))
 }
 
-fn get_params_ms(
-    batch: &TestRecords,
-    stride: i64,
-    start: Option<i64>,
-    end: i64,
-) -> GapFillExecParams {
-    get_params_ms_with_fill_strategy(batch, stride, start, end, None)
+fn get_time_range(start: Option<i64>, end: i64) -> Range<Bound<Arc<dyn PhysicalExpr>>> {
+    Range {
+        start: bound_included_from_option(start.map(|start| {
+            phys_lit(ScalarValue::TimestampNanosecond(
+                Some(start * 1_000_000),
+                None,
+            ))
+        })),
+        end: Bound::Included(phys_lit(ScalarValue::TimestampNanosecond(
+            Some(end * 1_000_000),
+            None,
+        ))),
+    }
 }

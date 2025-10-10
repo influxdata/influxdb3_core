@@ -810,15 +810,31 @@ pub struct TableSchema {
 
     /// the table's columns by their name
     pub columns: ColumnsByName,
+
+    /// Whether or not iceberg is enabled for this table
+    pub iceberg_enabled: bool,
 }
 
 impl TableSchema {
-    /// Initialize new `TableSchema` from the information in the given `Table`.
+    /// Initialize new [`TableSchema`] from the information in the given [`Table`].
     pub fn new_empty_from(table: &Table) -> Self {
         Self {
             id: table.id,
             partition_template: table.partition_template.clone(),
             columns: ColumnsByName::default(),
+            // TODO(june): make this table.iceberg_enabled instead
+            iceberg_enabled: false,
+        }
+    }
+
+    /// Initialize a new [`TableSchema`] with the given id, no columns, default partition, and
+    /// iceberg disabled.
+    pub fn new_with(id: TableId) -> Self {
+        Self {
+            id,
+            partition_template: TablePartitionTemplateOverride::default(),
+            columns: ColumnsByName::default(),
+            iceberg_enabled: false,
         }
     }
 
@@ -3329,6 +3345,7 @@ mod tests {
             id: TableId::new(1),
             partition_template: Default::default(),
             columns: ColumnsByName::default(),
+            iceberg_enabled: false,
         };
         let schema2 = TableSchema {
             id: TableId::new(2),
@@ -3339,6 +3356,7 @@ mod tests {
                 name: String::from("foo"),
                 column_type: ColumnType::Bool,
             }]),
+            iceberg_enabled: false,
         };
         assert!(schema1.size() < schema2.size());
     }
@@ -3361,11 +3379,7 @@ mod tests {
             id: NamespaceId::new(1),
             active_tables: BTreeMap::from([(
                 String::from("foo"),
-                TableSchema {
-                    id: TableId::new(1),
-                    columns: ColumnsByName::default(),
-                    partition_template: Default::default(),
-                },
+                TableSchema::new_with(TableId::new(1)),
             )]),
             deleted_tables: BTreeSet::new(),
             partition_template: Default::default(),

@@ -14,6 +14,7 @@ use arrow_util::optimize::optimize_dictionaries;
 use datafusion::{
     error::{DataFusionError, Result},
     execution::memory_pool::MemoryReservation,
+    physical_expr::ScalarFunctionExpr,
     physical_plan::{
         ExecutionPlan, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
         expressions::Column,
@@ -35,15 +36,14 @@ use super::{GapFillExec, algo::GapFiller, buffered_input::BufferedInput, params:
 pub(super) struct GapFillStream {
     /// The schema of the input and output.
     schema: SchemaRef,
+    /// The columns that define the time series that a value belongs to.
+    series_expr: Vec<Arc<dyn PhysicalExpr>>,
     /// The column from the input that contains the timestamps for each row.
     /// This column has already had `date_bin` applied to it by a previous `Aggregate`
     /// operator.
     time_expr: Arc<dyn PhysicalExpr>,
-    /// The other columns from the input that appeared in the GROUP BY clause of the
-    /// original query.
-    group_expr: Vec<Arc<dyn PhysicalExpr>>,
     /// The aggregate columns from the select list of the original query.
-    aggr_expr: Vec<Arc<dyn PhysicalExpr>>,
+    fill_expr: Vec<Arc<dyn PhysicalExpr>>,
     /// The producer of the input record batches.
     input: SendableRecordBatchStream,
     /// Input that has been read from the input stream.
@@ -69,35 +69,40 @@ impl GapFillStream {
     ) -> Result<Self> {
         let schema = exec.schema();
         let GapFillExec {
-            sort_expr,
-            aggr_expr,
-            params,
+            series_expr,
+            time_expr,
+            fill_expr,
+            time_range,
             ..
         } = exec;
 
-        if sort_expr.is_empty() {
-            return Err(DataFusionError::Internal(
-                "empty sort_expr vector for gap filling; should have at least a time expression"
-                    .to_string(),
-            ));
-        }
-        let mut group_expr = sort_expr
-            .iter()
-            .map(|se| Arc::clone(&se.expr))
-            .collect::<Vec<_>>();
-        let aggr_expr = aggr_expr.to_owned();
-        let time_expr = group_expr.split_off(group_expr.len() - 1).pop().unwrap();
+        let series_cols = series_expr.iter().map(expr_to_index).collect::<Vec<_>>();
+        let params = GapFillParams::try_new(Arc::clone(&schema), time_expr, fill_expr, time_range)?;
+        let buffered_input = BufferedInput::new(&params, series_cols);
 
-        let group_cols = group_expr.iter().map(expr_to_index).collect::<Vec<_>>();
-        let params = GapFillParams::try_new(Arc::clone(&schema), params)?;
-        let buffered_input = BufferedInput::new(&params, group_cols);
+        let time_expr = if let Some(func) = time_expr.as_any().downcast_ref::<ScalarFunctionExpr>()
+        {
+            // The time_expr has already been determined to be a
+            // date_bin call. Thie input time column is the second
+            // argument.
+            Arc::clone(&func.args()[1])
+        } else {
+            return Err(DataFusionError::Internal(
+                "time_expr must be a ScalarFunctionExpr".to_string(),
+            ));
+        };
+
+        let fill_expr = fill_expr
+            .iter()
+            .map(|pfe| Arc::clone(&pfe.expr))
+            .collect::<Vec<_>>();
 
         let gap_filler = GapFiller::new(params, batch_size);
         Ok(Self {
             schema,
+            series_expr: series_expr.clone(),
             time_expr,
-            group_expr,
-            aggr_expr,
+            fill_expr,
             input,
             buffered_input,
             gap_filler,
@@ -180,7 +185,7 @@ impl GapFillStream {
 
         let old_size = batches.iter().map(|rb| rb.get_array_memory_size()).sum();
 
-        let mut batch = arrow::compute::concat_batches(&self.schema, &batches)
+        let mut batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
             .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
         self.reservation.try_grow(batch.get_array_memory_size())?;
 
@@ -212,10 +217,9 @@ impl GapFillStream {
             .ok_or(DataFusionError::Internal(
                 "time array must be a TimestampNanosecondArray".to_string(),
             ))?;
-        let input_time_array = (expr_to_index(&self.time_expr), input_time_array);
 
-        let group_arrays = self.group_arrays(&input_batch)?;
-        let aggr_arrays = self.aggr_arrays(&input_batch)?;
+        let series_arrays = self.series_arrays(&input_batch)?;
+        let fill_arrays = self.fill_arrays(&input_batch)?;
 
         let timer = elapsed_compute.timer();
         let output_batch = self
@@ -223,8 +227,8 @@ impl GapFillStream {
             .build_gapfilled_output(
                 Arc::clone(&self.schema),
                 input_time_array,
-                &group_arrays,
-                &aggr_arrays,
+                &series_arrays,
+                &fill_arrays,
             )
             .record_output(&self.baseline_metrics)?;
         timer.done();
@@ -241,23 +245,17 @@ impl GapFillStream {
 
     /// Produces the arrays for the group columns in the input.
     /// The first item in the 2-tuple is the arrays offset in the schema.
-    fn group_arrays(&self, input_batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
-        self.group_expr
+    fn series_arrays(&self, input_batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
+        self.series_expr
             .iter()
-            .map(|e| {
-                Ok((
-                    expr_to_index(e),
-                    e.evaluate(input_batch)?
-                        .into_array(input_batch.num_rows())?,
-                ))
-            })
+            .map(|e| e.evaluate(input_batch)?.into_array(input_batch.num_rows()))
             .collect::<Result<Vec<_>>>()
     }
 
     /// Produces the arrays for the aggregate columns in the input.
     /// The first item in the 2-tuple is the arrays offset in the schema.
-    fn aggr_arrays(&self, input_batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
-        self.aggr_expr
+    fn fill_arrays(&self, input_batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.fill_expr
             .iter()
             .map(|e| {
                 Ok((

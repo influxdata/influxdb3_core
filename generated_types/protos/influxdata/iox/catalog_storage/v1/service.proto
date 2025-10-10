@@ -73,6 +73,10 @@ message GetNamespacesWithStorageRequest {
     // Filter namespaces by name (case-insensitive partial match)
     // If provided, only namespaces with names containing this string are returned
     optional string name_filter = 6;
+
+    // Filter namespaces by ID (partial match)
+    // If provided, only namespaces with IDs containing this string are returned
+    optional string id_filter = 7;
 }
 
 // Request to get a specific namespace with storage.
@@ -170,6 +174,14 @@ message GetTablesWithStorageRequest {
     // Filter by soft-deleted status
     // If not specified, only the active tables are returned
     optional influxdata.iox.common.v1.SoftDeleted deleted = 6;
+
+    // Filter tables by name (case-insensitive partial match)
+    // If provided, only tables with names containing this string are returned
+    optional string name_filter = 7;
+
+    // Filter tables by ID (partial match)
+    // If provided, only tables with IDs containing this string are returned
+    optional string id_filter = 8;
 }
 
 // Request to get a specific table with storage.
