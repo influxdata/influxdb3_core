@@ -4,7 +4,7 @@
 //! described in detail in the [`data_types::partition_template`] module.
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 mod filter;
 pub mod template;

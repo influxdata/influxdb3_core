@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies] # In alphabetical order
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 [dev-dependencies]
 datafusion = { workspace = true }

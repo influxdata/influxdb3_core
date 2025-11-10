@@ -1,7 +1,7 @@
 #![no_main]
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 use hashbrown::HashMap;
 use libfuzzer_sys::fuzz_target;

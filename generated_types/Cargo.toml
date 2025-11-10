@@ -17,7 +17,7 @@ serde = { version = "1.0", features = ["derive"] }
 tonic = { version = "0.12", features = ["gzip", "tls", "tls-roots", "zstd"] }
 tracing = { workspace = true }
 uuid = { version = "1" }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 [dev-dependencies]
 bytes = "1.10"

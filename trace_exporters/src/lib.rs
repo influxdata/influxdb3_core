@@ -1,7 +1,7 @@
 #![expect(unreachable_pub)]
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 use crate::export::AsyncExporter;
 use crate::jaeger::JaegerAgentExporter;

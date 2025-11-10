@@ -10,7 +10,7 @@
 //! `iox_http` is meant for services providing HTTP APIs.
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 use futures::{Stream, StreamExt, TryStreamExt};
 use http_body::Frame;

@@ -16,7 +16,6 @@ iox_time = { version = "0.1.0", path = "../iox_time" }
 generated_types = { path = "../generated_types" }
 metric = { version = "0.1.0", path = "../metric" }
 tracing = { workspace = true }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # crates.io dependencies in alphabetical order.
 async-trait = "0.1"

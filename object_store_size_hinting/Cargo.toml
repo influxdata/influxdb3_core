@@ -10,7 +10,7 @@ license.workspace = true
 [dependencies]
 http = { workspace = true }
 object_store.workspace = true
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 [lints]
 workspace = true

@@ -18,7 +18,7 @@ use clap as _;
 use futures_concurrency as _;
 #[cfg(test)]
 use rand as _;
-use workspace_hack as _;
+
 
 /// Helper trait for asserting state of a future
 pub trait AssertFutureExt {

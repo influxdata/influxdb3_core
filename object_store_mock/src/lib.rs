@@ -16,7 +16,7 @@ use object_store::{
 use tokio::sync::Barrier;
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 /// [`GetOptions`] doesn't impl PartialEq or Clone.
 #[derive(Debug, Default)]

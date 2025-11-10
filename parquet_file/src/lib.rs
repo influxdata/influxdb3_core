@@ -7,7 +7,7 @@ use std::{num::ParseIntError, str::FromStr};
 use hex::FromHexError;
 use snafu::{OptionExt, ResultExt, Snafu};
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 pub mod chunk;
 pub mod metadata;

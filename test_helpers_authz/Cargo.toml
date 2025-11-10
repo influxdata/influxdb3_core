@@ -9,7 +9,7 @@ license.workspace = true
 # Workspace dependencies, in alphabetical order
 generated_types = { path = "../generated_types" }
 tracing = { workspace = true }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 # Crates.io dependencies, in alphabetical order
 futures = "0.3"

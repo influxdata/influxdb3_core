@@ -16,7 +16,7 @@ hashbrown = { workspace = true }
 indexmap = { version = "2.11", features = ["std"] }
 tracing = { workspace = true }
 snafu = "0.8"
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 [dev-dependencies]
 rstest = { version = "0.26.1" }

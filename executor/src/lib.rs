@@ -13,7 +13,7 @@ use tokio_watchdog::WatchdogConfig;
 // Workaround for "unused crate" lint false positives.
 #[cfg(not(tokio_unstable))]
 use tokio_metrics_bridge as _;
-use workspace_hack as _;
+
 
 use parking_lot::RwLock;
 use std::{

@@ -15,5 +15,5 @@ datafusion = { workspace = true }
 executor = { path = "../executor" }
 object_store.workspace = true
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 

@@ -37,7 +37,7 @@
 //! - New writers: Write only v2 format
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 use std::{
     cmp::Ordering,

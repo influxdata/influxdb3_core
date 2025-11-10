@@ -9,7 +9,7 @@ license.workspace = true
 snafu = "0.8"
 tikv-jemalloc-ctl = { version = "0.5.4", features = ["use_std"] }
 tokio = { version = "1.47.1", features = ["rt", "sync", "time"] }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 [lints]
 workspace = true

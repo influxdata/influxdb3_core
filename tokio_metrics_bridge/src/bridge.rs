@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use tokio::runtime::RuntimeMetrics;
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 /// Register metric instrumentation for given tokio runtime.
 ///

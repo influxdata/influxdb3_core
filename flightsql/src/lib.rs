@@ -1,7 +1,7 @@
 //! InfluxDB IOx implementation of FlightSQL
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 mod cmd;
 mod error;

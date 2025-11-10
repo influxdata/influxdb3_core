@@ -5,7 +5,7 @@ use datafusion::{common::Result, scalar::ScalarValue};
 
 use tracing::warn;
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 mod aggregate;
 mod error;

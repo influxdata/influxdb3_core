@@ -22,7 +22,7 @@ object_store_size_hinting = { path = "../object_store_size_hinting" }
 tracing = { workspace = true }
 tokio = { version = "1.47.1", default-features = false }
 tracker = { path = "../tracker" }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

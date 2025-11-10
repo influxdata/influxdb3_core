@@ -42,7 +42,6 @@ members = [
     "trace",
     "tracker",
     "trogging",
-    "workspace-hack",
 ]
 
 resolver = "2"

@@ -3,7 +3,7 @@
 #![warn(missing_docs)]
 
 // Workaround for "unused crate" lint false positives.
-use workspace_hack as _;
+
 
 /// Builder for constructing connections for use with the various gRPC clients
 pub mod connection;

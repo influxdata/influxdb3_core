@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 # technically not required but prevents us from rebuilding smallvec w/ a different feature set
 smallvec = { workspace = true }
 
+
 [dev-dependencies] # In alphabetical order
 mockito = { version ="1.7", default-features = false }
 parking_lot = "0.12"
