@@ -6,7 +6,7 @@ use std::{
 };
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use data_types::{ChunkId, ChunkOrder, TransitionPartitionId};
+use data_types::{ChunkId, ChunkOrder, PartitionHashId};
 use datafusion::{
     common::Statistics,
     error::DataFusionError,
@@ -191,7 +191,7 @@ pub struct IngesterChunk {
     pub chunk_id: ChunkId,
 
     /// Partition ID.
-    pub partition_id: TransitionPartitionId,
+    pub partition_id: PartitionHashId,
 
     /// Chunk schema.
     ///
@@ -224,7 +224,7 @@ impl QueryChunk for IngesterChunk {
         &self.schema
     }
 
-    fn partition_id(&self) -> &TransitionPartitionId {
+    fn partition_id(&self) -> &PartitionHashId {
         &self.partition_id
     }
 

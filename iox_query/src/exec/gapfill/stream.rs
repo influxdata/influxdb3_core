@@ -32,7 +32,7 @@ use super::{GapFillExec, algo::GapFiller, buffered_input::BufferedInput, params:
 /// - Accounting for memory
 /// - Extracting arrays for processing by [`GapFiller`]
 /// - Recording metrics
-/// - Sending record batches to next operator (by implementing [`Self::poll_next'])
+/// - Sending record batches to next operator (by implementing [`Self::poll_next`])
 pub(super) struct GapFillStream {
     /// The schema of the input and output.
     schema: SchemaRef,

@@ -205,16 +205,16 @@ where
     });
     let res_1 = setup.outer().get(&location).await.unwrap();
     assert_eq!(
-        CacheState::try_from(res_1.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
-        CacheState::NewEntry,
+        CacheStateKind::try_from(res_1.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
+        CacheStateKind::NewEntry,
     );
     let data_1 = res_1.bytes().await.unwrap();
     assert_eq!(data_1.as_ref(), b"foo");
 
     let res_2 = setup.outer().get(&location).await.unwrap();
     assert_ne!(
-        CacheState::try_from(res_2.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
-        CacheState::NewEntry, // should be loading, or in cache
+        CacheStateKind::try_from(res_2.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
+        CacheStateKind::NewEntry, // should be loading, or in cache
     );
     let data_2 = res_2.bytes().await.unwrap();
     assert_eq!(data_1, data_2);
@@ -334,6 +334,6 @@ macro_rules! gen_store_tests {
 
 pub use gen_store_tests;
 
-use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheStateKind};
 use object_store_mock::MockStore;
 use object_store_size_hinting::hint_size;

@@ -896,7 +896,7 @@ message ParquetFileParams {
 }
 
 message ParquetFile {
-  reserved 4; // TransitionPartitionId
+  reserved 4;
 
   int64 id = 1;
   int64 namespace_id = 2;

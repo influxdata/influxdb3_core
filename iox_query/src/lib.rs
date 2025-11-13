@@ -6,7 +6,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use data_types::{ChunkId, ChunkOrder, Namespace, TransitionPartitionId};
+use data_types::{ChunkId, ChunkOrder, Namespace, PartitionHashId};
 use datafusion::{
     common::not_impl_err,
     error::DataFusionError,
@@ -40,6 +40,7 @@ pub mod frontend;
 pub mod ingester;
 pub mod logical_optimizer;
 pub mod physical_optimizer;
+mod plan;
 pub mod provider;
 pub mod pruning;
 pub mod pruning_oracle;
@@ -50,6 +51,7 @@ pub mod util;
 use crate::exec::QueryConfig;
 use crate::query_log::QueryLogEntries;
 pub use extension::Extension;
+pub use plan::{LogicalPlanBuilderExt, transform_plan_schema};
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 // Avoid unused dependency clippy warning for dependencies used in benchmarks
@@ -78,7 +80,7 @@ pub trait QueryChunk: Debug + Send + Sync + 'static {
     fn schema(&self) -> &Schema;
 
     /// Return partition identifier for this chunk
-    fn partition_id(&self) -> &TransitionPartitionId;
+    fn partition_id(&self) -> &PartitionHashId;
 
     /// return a reference to the sort key if any
     fn sort_key(&self) -> Option<&SortKey>;

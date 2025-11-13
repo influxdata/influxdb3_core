@@ -372,7 +372,7 @@ impl Executor {
 ///  c | 2000
 /// ```
 ///
-/// A StreamSplit with split_exprs = [`time <= 1000`, `1000 < time <=2000`] will produce the
+/// A StreamSplit with split_exprs = \[`time <= 1000`, `1000 < time <=2000`\] will produce the
 /// following three output streams (output DataFusion Partitions):
 ///
 ///

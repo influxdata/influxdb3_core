@@ -6,5 +6,8 @@ import "influxdata/iox/catalog/v1/partition_identifier.proto";
 
 // Notification of a partition queried.
 message QueryExecMetadataEvent {
-  repeated influxdata.iox.catalog.v1.PartitionIdentifier identifiers = 1;
+  reserved 1;
+  reserved "identifiers";
+
+  repeated influxdata.iox.catalog.v1.PartitionHashIdentifier hash_identifiers = 2;
 }

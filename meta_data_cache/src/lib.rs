@@ -170,7 +170,7 @@ impl MetaIndexCache {
     ) -> Result<Arc<FileMetas>, DynError> {
         let cache_column_stats = self.cache_column_stats;
         let arrow_reader_options = arrow_reader_options.cloned();
-        let (res, _, _state) = self.file_index.get_or_fetch(
+        let cache_state = self.file_index.get_or_fetch(
             file_uuid,
             Box::new(move || {
                 async move {
@@ -196,7 +196,8 @@ impl MetaIndexCache {
             (),
             None,
         );
-        res.await
+
+        cache_state.await_inner().await
     }
 
     /// return number of cache hits
@@ -430,7 +431,7 @@ impl HasSize for FileMetas {
 }
 
 impl InUse for FileMetas {
-    fn in_use(&self) -> bool {
+    fn in_use(&mut self) -> bool {
         // although there is an inner Arc, we are ok
         // with not blocking the eviction
         false
@@ -728,7 +729,7 @@ mod tests {
         parquet_1: impl Into<Arc<ParquetMetaData>> + Send + 'static,
         file_stats_1: Statistics,
     ) -> Arc<FileMetas> {
-        let (res, _, _state) = meta_index.file_index.get_or_fetch(
+        let cache_state = meta_index.file_index.get_or_fetch(
             file_uuid,
             Box::new(|| {
                 async move {
@@ -742,7 +743,7 @@ mod tests {
             (),
             None,
         );
-        res.await.unwrap()
+        cache_state.await_inner().await.unwrap()
     }
 
     #[tokio::test]

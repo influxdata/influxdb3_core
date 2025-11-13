@@ -226,7 +226,7 @@ impl V1HttpHandler {
                             .map(|n| {
                                 Permission::ResourceAction(
                                     authz::Resource::Database(authz::Target::ResourceName(n.name)),
-                                    authz::Action::Read,
+                                    authz::Action::Describe,
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -269,7 +269,7 @@ impl V1HttpHandler {
                                     authz::Resource::Database(authz::Target::ResourceName(
                                         database.clone(),
                                     )),
-                                    authz::Action::Read,
+                                    authz::Action::Describe,
                                 )],
                             )
                             .await

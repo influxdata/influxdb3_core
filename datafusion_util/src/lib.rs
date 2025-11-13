@@ -7,7 +7,10 @@
 //! [datafusion_optimizer::utils](https://docs.rs/datafusion-optimizer/13.0.0/datafusion_optimizer/utils/index.html)
 //! for expression manipulation functions.
 
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::{DFSchemaRef, Result};
 use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use datafusion::logical_expr::{Distinct, Extension, LogicalPlan, UserDefinedLogicalNode};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 // Workaround for "unused crate" lint false positives.
@@ -485,9 +488,197 @@ pub fn timestamptz_nano(ns: i64) -> ScalarValue {
     ScalarValue::TimestampNanosecond(Some(ns), TIME_DATA_TIMEZONE())
 }
 
+/// Transform the schema of a single [`LogicalPlan`] node by applying a function to its schema.
+///
+/// This function applies the transformation function `f` to the schema field of the given
+/// plan node, without recursing into child nodes. It returns a [`Transformed`] result
+/// indicating whether the plan was modified and how tree traversal should proceed when
+/// used with DataFusion's tree traversal APIs.
+///
+/// # Parameters
+///
+/// * `plan` - The logical plan node to transform
+/// * `e` - A mutable closure that handles extension nodes, receiving the
+///   user-defined logical node and a mutable reference to the schema transformation
+///   function `f`. It should return a [`Transformed`] result with the potentially modified
+///   [`UserDefinedLogicalNode`].
+/// * `f` - A mutable closure that transforms a [`DFSchemaRef`] and returns a [`Transformed`]
+///   result indicating whether the schema was modified
+///
+/// # Returns
+///
+/// Returns a [`Transformed<LogicalPlan>`] that contains:
+/// - The plan node with its schema potentially modified
+/// - A boolean indicating whether any transformation occurred
+/// - A [`TreeNodeRecursion`](datafusion::common::tree_node::TreeNodeRecursion)
+///   value controlling tree traversal (typically `Continue`, or `Jump`
+///   for extension nodes to avoid recursing into their internals)
+///
+/// # Supported Plan Nodes
+///
+/// This function handles schema transformation for the following plan node types:
+/// - `Projection`, `Window`, `Aggregate`, `Join`, `Union` - Core query operators
+/// - `TableScan`, `EmptyRelation`, `SubqueryAlias`, `Values` - Data sources
+/// - `Explain`, `Analyze` - Query analysis nodes
+/// - `Dml`, `Copy`, `DescribeTable` - Data manipulation and metadata nodes
+/// - `Unnest` - Array expansion operator
+/// - `Distinct::On` - Distinct operator with ON clause
+///
+/// Extension plan nodes are handled via the provided closure `e`.
+///
+/// Plan nodes without schemas (`Filter`, `Sort`, `Limit`, etc.) return unchanged with
+/// `Transformed::no(plan)`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The transformation function `f` returns an error
+/// - The extension handler `e` returns an error
+///
+/// # Example
+///
+/// ```ignore
+/// use datafusion::common::tree_node::Transformed;
+///
+/// // Transform the schema of the first node with an attached schema
+/// let plan = ...; // some LogicalPlan
+/// let plan = plan.transform_down(|plan| {
+///     transform_plan_schema(
+///         plan,
+///         |node, _| Ok(Transformed::no(node)),
+///         |schema| {
+///             let qualified_fields = schema.iter().map(|(q, f)| (q.cloned(), Arc::clone(f))).collect();
+///             let mut md = schema.metadata().clone();
+///             md.insert("key".to_string(), "value".to_string());
+///             let new_schema = DFSchema::new_with_metadata(qualified_fields, md)?;
+///             Ok(Transformed::new(Arc::new(new_schema), true, TreeNodeRecursion::Jump))
+///         },
+///     )
+/// })?;
+/// ```
+///
+/// N.B. This function makes no attempt to validate the correctness of
+/// the modified schema. The intended use-case is for modifying schema
+/// metadata. Changes to the schema information used by DataFusion may
+/// result in incorrect query plans or runtime errors.
+pub fn transform_plan_schema<E, F>(
+    plan: LogicalPlan,
+    mut e: E,
+    mut f: F,
+) -> Result<Transformed<LogicalPlan>>
+where
+    E: FnMut(
+        Arc<dyn UserDefinedLogicalNode>,
+        &mut dyn FnMut(DFSchemaRef) -> Result<Transformed<DFSchemaRef>>,
+    ) -> Result<Transformed<Arc<dyn UserDefinedLogicalNode>>>,
+    F: FnMut(DFSchemaRef) -> Result<Transformed<DFSchemaRef>>,
+{
+    match plan {
+        LogicalPlan::Projection(mut projection) => {
+            f(Arc::clone(&projection.schema))?.map_data(|data| {
+                projection.schema = data;
+                Ok(LogicalPlan::Projection(projection))
+            })
+        }
+        LogicalPlan::Window(mut window) => f(Arc::clone(&window.schema))?.map_data(|data| {
+            window.schema = data;
+            Ok(LogicalPlan::Window(window))
+        }),
+        LogicalPlan::Aggregate(mut aggregate) => {
+            f(Arc::clone(&aggregate.schema))?.map_data(|data| {
+                aggregate.schema = data;
+                Ok(LogicalPlan::Aggregate(aggregate))
+            })
+        }
+        LogicalPlan::Join(mut join) => f(Arc::clone(&join.schema))?.map_data(|data| {
+            join.schema = data;
+            Ok(LogicalPlan::Join(join))
+        }),
+        LogicalPlan::Union(mut union) => f(Arc::clone(&union.schema))?.map_data(|data| {
+            union.schema = data;
+            Ok(LogicalPlan::Union(union))
+        }),
+        LogicalPlan::TableScan(mut table_scan) => f(Arc::clone(&table_scan.projected_schema))?
+            .map_data(|data| {
+                table_scan.projected_schema = data;
+                Ok(LogicalPlan::TableScan(table_scan))
+            }),
+        LogicalPlan::EmptyRelation(mut empty_relation) => f(Arc::clone(&empty_relation.schema))?
+            .map_data(|data| {
+                empty_relation.schema = data;
+                Ok(LogicalPlan::EmptyRelation(empty_relation))
+            }),
+        LogicalPlan::SubqueryAlias(mut subquery_alias) => f(Arc::clone(&subquery_alias.schema))?
+            .map_data(|data| {
+                subquery_alias.schema = data;
+                Ok(LogicalPlan::SubqueryAlias(subquery_alias))
+            }),
+        LogicalPlan::Values(mut values) => f(Arc::clone(&values.schema))?.map_data(|data| {
+            values.schema = data;
+            Ok(LogicalPlan::Values(values))
+        }),
+        LogicalPlan::Explain(mut explain) => f(Arc::clone(&explain.schema))?.map_data(|data| {
+            explain.schema = data;
+            Ok(LogicalPlan::Explain(explain))
+        }),
+        LogicalPlan::Analyze(mut analyze) => f(Arc::clone(&analyze.schema))?.map_data(|data| {
+            analyze.schema = data;
+            Ok(LogicalPlan::Analyze(analyze))
+        }),
+        LogicalPlan::Extension(Extension { node }) => {
+            e(node, &mut f)?.map_data(|node| Ok(LogicalPlan::Extension(Extension { node })))
+        }
+        LogicalPlan::Distinct(Distinct::On(mut distinct_on)) => f(Arc::clone(&distinct_on.schema))?
+            .map_data(|data| {
+                distinct_on.schema = data;
+                Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
+            }),
+        LogicalPlan::Dml(mut dml_statement) => f(Arc::clone(&dml_statement.output_schema))?
+            .map_data(|data| {
+                dml_statement.output_schema = data;
+                Ok(LogicalPlan::Dml(dml_statement))
+            }),
+        LogicalPlan::Copy(mut copy_to) => f(Arc::clone(&copy_to.output_schema))?.map_data(|data| {
+            copy_to.output_schema = data;
+            Ok(LogicalPlan::Copy(copy_to))
+        }),
+        LogicalPlan::DescribeTable(mut describe_table) => {
+            f(Arc::clone(&describe_table.output_schema))?.map_data(|data| {
+                describe_table.output_schema = data;
+                Ok(LogicalPlan::DescribeTable(describe_table))
+            })
+        }
+        LogicalPlan::Unnest(mut unnest) => f(Arc::clone(&unnest.schema))?.map_data(|data| {
+            unnest.schema = data;
+            Ok(LogicalPlan::Unnest(unnest))
+        }),
+
+        // Plans that do not contain a schema are unchanged.
+        plan @ (LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Repartition(_)
+        | LogicalPlan::Subquery(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Statement(_)
+        | LogicalPlan::Distinct(Distinct::All(_))
+        | LogicalPlan::Ddl(_)
+        | LogicalPlan::RecursiveQuery(_)) => Ok(Transformed::no(plan)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::DFSchema;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::functions_window::row_number::row_number_udwf;
+    use datafusion::logical_expr::expr::WindowFunction;
+    use datafusion::logical_expr::test::function_stub::count;
+    use datafusion::logical_expr::{
+        Expr, LogicalPlanBuilder, LogicalTableSource, Projection, WindowFunctionDefinition, col,
+        lit,
+    };
     use schema::builder::SchemaBuilder;
 
     use super::*;
@@ -554,5 +745,497 @@ mod tests {
         datafusion::physical_plan::common::collect(stream)
             .await
             .unwrap_err();
+    }
+
+    /// Helper function to create a simple test input.
+    fn create_test_source() -> LogicalPlan {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        LogicalPlanBuilder::scan("test", Arc::new(LogicalTableSource::new(schema)), None)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Helper function to create a modified schema with different metadata
+    fn add_metadata_to_schema(schema: DFSchemaRef, key: &str, value: &str) -> Result<DFSchemaRef> {
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(key.to_string(), value.to_string());
+        Ok(Arc::new(DFSchema::new_with_metadata(
+            schema
+                .iter()
+                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
+                .collect(),
+            metadata,
+        )?))
+    }
+
+    /// Helper function to apply schema transformation to a plan and return the transformed plan
+    fn do_transform_plan_schema(plan: LogicalPlan) -> LogicalPlan {
+        let Transformed {
+            data, transformed, ..
+        } = plan
+            .transform_down(|plan| {
+                transform_plan_schema(
+                    plan,
+                    |n, _| Ok(Transformed::no(n)),
+                    |s| {
+                        let new_schema = add_metadata_to_schema(s, "transformed", "true")?;
+                        Ok(Transformed::new(new_schema, true, TreeNodeRecursion::Stop))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            data.schema().as_arrow().metadata().get("transformed"),
+            Some(&"true".to_string())
+        );
+        assert!(transformed);
+        data
+    }
+
+    #[test]
+    fn test_transform_projection() {
+        let input = create_test_source();
+        let schema = Arc::clone(input.schema());
+        // Create expressions that match the schema fields
+        let exprs = vec![
+            datafusion::logical_expr::col("id"),
+            datafusion::logical_expr::col("name"),
+        ];
+        let projection = LogicalPlan::Projection(
+            Projection::try_new_with_schema(exprs, Arc::new(input), schema).unwrap(),
+        );
+        assert_matches!(
+            do_transform_plan_schema(projection),
+            LogicalPlan::Projection(_)
+        );
+    }
+
+    #[test]
+    fn test_transform_empty_relation() {
+        assert_matches!(
+            do_transform_plan_schema(LogicalPlanBuilder::empty(false).build().unwrap()),
+            LogicalPlan::EmptyRelation(_)
+        );
+    }
+
+    #[test]
+    fn test_transform_filter() {
+        // Create a simple plan with a filter node (which has no schema)
+        let input = create_test_source();
+        let filter = LogicalPlanBuilder::from(input)
+            .filter(lit(true))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(do_transform_plan_schema(filter), LogicalPlan::Filter(_));
+    }
+
+    #[test]
+    fn test_transform_sort() {
+        let input = create_test_source();
+        let sort = LogicalPlanBuilder::from(input)
+            .sort([col("id").sort(true, false)])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(do_transform_plan_schema(sort), LogicalPlan::Sort(_));
+    }
+
+    #[test]
+    fn test_transform_limit() {
+        let input = create_test_source();
+        let limit = LogicalPlanBuilder::from(input)
+            .limit(0, Some(10))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(do_transform_plan_schema(limit), LogicalPlan::Limit(_));
+    }
+
+    #[test]
+    fn test_transform_aggregate() {
+        let input = create_test_source();
+
+        // Create a simple aggregate plan
+        let aggregate = LogicalPlanBuilder::from(input)
+            .aggregate(vec![col("id")], vec![count(col("name"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(
+            do_transform_plan_schema(aggregate),
+            LogicalPlan::Aggregate(_)
+        );
+    }
+
+    #[test]
+    fn test_transform_union() {
+        let input1 = create_test_source();
+        let input2 = LogicalPlanBuilder::scan(
+            "test2",
+            Arc::new(LogicalTableSource::new(Arc::new(
+                input1.schema().as_arrow().clone(),
+            ))),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        // Create a union plan
+        let union = datafusion::logical_expr::union(input1, input2).unwrap();
+        assert_matches!(do_transform_plan_schema(union), LogicalPlan::Union(_));
+    }
+
+    #[test]
+    fn test_transform_window() {
+        let input = create_test_source();
+
+        // Create a window plan
+        let window_expr = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+            vec![],
+        )));
+
+        let window = LogicalPlanBuilder::from(input)
+            .window(vec![window_expr])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(do_transform_plan_schema(window), LogicalPlan::Window(_));
+    }
+
+    #[test]
+    fn test_transform_join() {
+        let left = create_test_source();
+        let right = LogicalPlanBuilder::scan(
+            "test2",
+            Arc::new(LogicalTableSource::new(Arc::new(
+                left.schema().as_arrow().clone(),
+            ))),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        // Create a cross join (no join keys needed)
+        let join = LogicalPlanBuilder::from(left)
+            .cross_join(right)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(do_transform_plan_schema(join), LogicalPlan::Join(_));
+    }
+
+    #[test]
+    fn test_transform_subquery_alias() {
+        let input = create_test_source();
+        // Create a subquery alias
+        let subquery = LogicalPlanBuilder::from(input)
+            .alias("subquery")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(
+            do_transform_plan_schema(subquery),
+            LogicalPlan::SubqueryAlias(_)
+        );
+    }
+
+    #[test]
+    fn test_transform_values() {
+        // Create a values plan
+        let values = LogicalPlanBuilder::values(vec![vec![lit(1), lit("test")]])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(do_transform_plan_schema(values), LogicalPlan::Values(_));
+    }
+
+    #[test]
+    fn test_transform_distinct_on() {
+        let input = create_test_source();
+
+        // Create a distinct on plan
+        let distinct = LogicalPlanBuilder::from(input)
+            .distinct_on(vec![col("id")], vec![], None)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(do_transform_plan_schema(distinct), LogicalPlan::Distinct(_));
+    }
+
+    #[test]
+    fn test_transform_repartition() {
+        use datafusion::logical_expr::Partitioning;
+
+        let input = create_test_source();
+
+        // Create a repartition plan
+        let repartition = LogicalPlanBuilder::from(input)
+            .repartition(Partitioning::RoundRobinBatch(4))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_matches!(
+            do_transform_plan_schema(repartition),
+            LogicalPlan::Repartition(_)
+        );
+    }
+
+    #[test]
+    fn test_transform_distinct_all() {
+        let input = create_test_source();
+
+        // Create a distinct all plan
+        let distinct = LogicalPlanBuilder::from(input)
+            .distinct()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(
+            do_transform_plan_schema(distinct),
+            LogicalPlan::Distinct(Distinct::All(_))
+        );
+    }
+
+    #[test]
+    fn test_transform_unnest() {
+        // Create a schema with an array column
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let input =
+            LogicalPlanBuilder::scan("test", Arc::new(LogicalTableSource::new(schema)), None)
+                .unwrap()
+                .build()
+                .unwrap();
+
+        // Create an unnest plan on the array column
+        let unnest = LogicalPlanBuilder::from(input)
+            .unnest_column("tags")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(do_transform_plan_schema(unnest), LogicalPlan::Unnest(_));
+    }
+
+    #[test]
+    fn test_transform_table_scan() {
+        let input = create_test_source();
+        assert_matches!(do_transform_plan_schema(input), LogicalPlan::TableScan(_));
+    }
+
+    #[test]
+    fn test_transform_explain() {
+        let input = create_test_source();
+
+        // Create an explain plan
+        let explain = LogicalPlanBuilder::from(input)
+            .explain(false, false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(do_transform_plan_schema(explain), LogicalPlan::Explain(_));
+    }
+
+    #[test]
+    fn test_transform_analyze() {
+        let input = create_test_source();
+
+        // Create an analyze plan
+        let analyze = LogicalPlanBuilder::from(input)
+            .explain(false, true)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_matches!(do_transform_plan_schema(analyze), LogicalPlan::Analyze(_));
+    }
+
+    #[test]
+    fn test_transform_subquery() {
+        use datafusion::common::Spans;
+        use datafusion::logical_expr::{Subquery, expr::InSubquery};
+
+        let input = create_test_source();
+
+        // Create a filter with a subquery (Subquery node has no schema, so transform_down recurses to child)
+        let subquery = Subquery {
+            subquery: Arc::new(input),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        };
+
+        let filter_plan = LogicalPlanBuilder::from(create_test_source())
+            .filter(Expr::InSubquery(InSubquery::new(
+                Box::new(col("id")),
+                subquery,
+                false,
+            )))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // The transformation should recurse through Subquery and transform the child TableScan
+        let transformed = do_transform_plan_schema(filter_plan);
+        assert_matches!(transformed, LogicalPlan::Filter(_));
+    }
+
+    #[test]
+    fn test_transform_dml() {
+        use datafusion::logical_expr::dml::{DmlStatement, InsertOp, WriteOp};
+
+        let input = create_test_source();
+
+        // Create a DML statement
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            "test".into(),
+            Arc::new(LogicalTableSource::new(Arc::new(
+                input.schema().as_arrow().clone(),
+            ))),
+            WriteOp::Insert(InsertOp::Append),
+            Arc::new(input),
+        ));
+
+        assert_matches!(do_transform_plan_schema(dml), LogicalPlan::Dml(_));
+    }
+
+    #[test]
+    fn test_transform_copy() {
+        use datafusion::datasource::file_format::format_as_file_type;
+        use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
+        use datafusion::logical_expr::dml::CopyTo;
+        use std::collections::HashMap;
+
+        let input = create_test_source();
+
+        // Create a Copy plan
+        let copy = LogicalPlan::Copy(CopyTo::new(
+            Arc::new(input),
+            "file:///tmp/output.parquet".to_string(),
+            vec![],
+            format_as_file_type(Arc::new(ParquetFormatFactory::new())),
+            HashMap::new(),
+        ));
+
+        assert_matches!(do_transform_plan_schema(copy), LogicalPlan::Copy(_));
+    }
+
+    #[test]
+    fn test_transform_describe_table() {
+        use datafusion::logical_expr::DescribeTable;
+
+        let input = create_test_source();
+        let arrow_schema = Arc::new(input.schema().as_arrow().clone());
+
+        // Create a DescribeTable plan with a simple output schema
+        let output_fields = vec![
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+        ];
+        let output_schema = Arc::new(Schema::new(output_fields));
+        let output_df_schema =
+            DFSchema::try_from_qualified_schema("describe", &output_schema).unwrap();
+
+        let describe = LogicalPlan::DescribeTable(DescribeTable {
+            schema: arrow_schema,
+            output_schema: Arc::new(output_df_schema),
+        });
+
+        assert_matches!(
+            do_transform_plan_schema(describe),
+            LogicalPlan::DescribeTable(_)
+        );
+    }
+
+    #[test]
+    fn test_transform_statement() {
+        // Create a Statement plan (no schema, so transform_down recurses to child)
+        // Use SetVariable as a simple Statement variant
+        let statement = LogicalPlan::Statement(datafusion::logical_expr::Statement::SetVariable(
+            datafusion::logical_expr::SetVariable {
+                variable: "test_var".to_string(),
+                value: "test_value".to_string(),
+            },
+        ));
+
+        // Statement nodes don't have schemas, so the transformation returns them unchanged
+        let Transformed {
+            data, transformed, ..
+        } = statement
+            .transform_down(|plan| {
+                transform_plan_schema(
+                    plan,
+                    |e, _| Ok(Transformed::no(e)),
+                    |s| {
+                        let new_schema = add_metadata_to_schema(s, "transformed", "true")?;
+                        Ok(Transformed::new(new_schema, true, TreeNodeRecursion::Stop))
+                    },
+                )
+            })
+            .unwrap();
+
+        // Statement itself has no schema to transform, so transformed should be false
+        assert!(!transformed);
+        assert_matches!(data, LogicalPlan::Statement(_));
+    }
+
+    #[test]
+    fn test_transform_ddl() {
+        use datafusion::common::Constraints;
+        use datafusion::logical_expr::{CreateMemoryTable, DdlStatement};
+
+        let input = create_test_source();
+
+        // Create a DDL plan (no schema, so transform_down recurses to child)
+        let ddl = LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
+            name: "test_table".into(),
+            constraints: Constraints::new_unverified(vec![]),
+            input: Arc::new(input),
+            if_not_exists: false,
+            or_replace: false,
+            column_defaults: vec![],
+            temporary: false,
+        }));
+
+        // The transformation should recurse through DDL and transform the child TableScan
+        let transformed = do_transform_plan_schema(ddl);
+        assert_matches!(transformed, LogicalPlan::Ddl(_));
+    }
+
+    #[test]
+    fn test_transform_recursive_query() {
+        use datafusion::logical_expr::RecursiveQuery;
+
+        let input = create_test_source();
+
+        // Create a RecursiveQuery plan (no schema field in transform, so transform_down recurses to children)
+        let recursive = LogicalPlan::RecursiveQuery(RecursiveQuery {
+            name: "recursive_table".to_string(),
+            static_term: Arc::new(input.clone()),
+            recursive_term: Arc::new(input),
+            is_distinct: false,
+        });
+
+        // The transformation should recurse through RecursiveQuery and transform the child TableScans
+        let transformed = do_transform_plan_schema(recursive);
+        assert_matches!(transformed, LogicalPlan::RecursiveQuery(_));
     }
 }

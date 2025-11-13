@@ -10,7 +10,7 @@ use object_store::{
     ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
     PutPayload, PutResult, Result, path::Path,
 };
-use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheStateKind};
 use object_store_size_hinting::{extract_size_hint, hint_size};
 
 use crate::cache_system::{
@@ -49,10 +49,10 @@ impl CacheValueData {
         }
     }
 
-    fn is_unique(&self) -> bool {
+    fn is_unique(&mut self) -> bool {
         match self {
             Self::Owned(bytes) => bytes.is_unique(),
-            Self::Shared(slice) => slice.strong_count() == 1,
+            Self::Shared(slice) => slice.is_unique(),
         }
     }
 }
@@ -132,7 +132,7 @@ impl HasSize for CacheValue {
 }
 
 impl InUse for CacheValue {
-    fn in_use(&self) -> bool {
+    fn in_use(&mut self) -> bool {
         // destruct self so we don't forget new fields in the future
         let Self {
             data,
@@ -240,11 +240,11 @@ impl MemCacheObjectStore {
         &self,
         location: &Path,
         size_hint: Option<u64>,
-    ) -> Result<(Arc<CacheValue>, CacheState)> {
+    ) -> Result<(Arc<CacheValue>, CacheStateKind)> {
         let captured_store = Arc::clone(&self.store);
         let captured_location = Arc::new(location.clone());
         let usize_hint = size_hint.and_then(|s| usize::try_from(s).ok());
-        let (res, _, state) = self.cache.get_or_fetch(
+        let cache_state = self.cache.get_or_fetch(
             &Arc::clone(&captured_location),
             Box::new(move || {
                 async move {
@@ -258,16 +258,18 @@ impl MemCacheObjectStore {
             (),
             usize_hint,
         );
-        let res = res.await;
 
-        match state {
-            CacheState::WasCached => &self.hit_metrics.cached,
-            CacheState::NewEntry => &self.hit_metrics.miss,
-            CacheState::AlreadyLoading => &self.hit_metrics.miss_already_loading,
+        let state_kind = cache_state.kind();
+        let res = cache_state.await_inner().await;
+
+        match state_kind {
+            CacheStateKind::WasCached => &self.hit_metrics.cached,
+            CacheStateKind::NewEntry => &self.hit_metrics.miss,
+            CacheStateKind::AlreadyLoading => &self.hit_metrics.miss_already_loading,
         }
         .inc(1);
 
-        res.map(|val| (val, state))
+        res.map(|val| (val, state_kind))
             .map_err(|e| dyn_error_to_object_store_error(e, STORE_NAME))
     }
 }
@@ -504,7 +506,7 @@ mod tests {
             })
             .as_store();
 
-        let value = CacheValue::fetch(&store, &location, None).await.unwrap();
+        let mut value = CacheValue::fetch(&store, &location, None).await.unwrap();
         assert!(!value.in_use());
 
         let slice = value.data();
@@ -562,7 +564,7 @@ mod tests {
             barrier.wait().await;
         };
 
-        let (value, ()) = tokio::join!(fut_value, fut_buffer);
+        let (mut value, ()) = tokio::join!(fut_value, fut_buffer);
         assert!(value.in_use());
 
         let buffer_ptr = buffer

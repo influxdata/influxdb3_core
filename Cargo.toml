@@ -74,10 +74,8 @@ arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
 arrow-ipc = { version = "55" }
 arrow-schema = { version = "55" }
 bincode = { version = "2", default-features = false, features = ["alloc", "derive"] }
-# Use DataFusion fork
-# See https://github.com/influxdata/arrow-datafusion/pull/73 for contents
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+# Use DataFusion fork (see below)
+datafusion = { version = "49" }
 hashbrown = { version = "0.14.5" }
 http = { version = "1" }
 http-body = { version = "1" }
@@ -155,6 +153,16 @@ opt-level = 3
 
 [profile.dev.package.similar]
 opt-level = 3
+
+# Patching Datafusion
+[patch.crates-io]
+# Use DataFusion fork
+# See https://github.com/influxdata/arrow-datafusion/pull/78 for contents
+#
+# NOTE: This is an incomplete list of datafusion dependencies, but enough to get all dependencies to use our forked
+#       version. Should you ever encounter a `datafusion-*` crate that is duplicated (i.e. `Cargo.lock` lists both the
+#       crates.io release and our fork), just add it to this list here.
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
 
 # Patching Arrow
 #

@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    ops::Range,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -12,7 +13,7 @@ use arrow::{
         Array, ArrayRef, BooleanArray, Datum, PrimitiveArray, RecordBatch, Scalar, UInt64Builder,
         new_null_array,
     },
-    compute::{Partitions, partition},
+    compute::partition,
     datatypes::{SchemaRef, UInt64Type},
     error::ArrowError,
 };
@@ -545,7 +546,7 @@ impl ExecutionPlan for SeriesLimitExec {
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![if self.series_expr.is_empty() {
-            Distribution::UnspecifiedDistribution
+            Distribution::SinglePartition
         } else {
             Distribution::HashPartitioned(self.series_expr.iter().map(Arc::clone).collect())
         }]
@@ -792,7 +793,12 @@ impl SeriesLimitStream {
         }
 
         // Partition the series.
-        let partitions = partition(&series_arrs)?;
+        let ranges = if series_arrs.is_empty() {
+            #[expect(clippy::single_range_in_vec_init)]
+            Vec::from([(0..num_rows)])
+        } else {
+            partition(&series_arrs)?.ranges()
+        };
 
         // All columns that have ignore_nulls as false will produce the
         // same filter, remember it to avoid recomputing.
@@ -810,7 +816,7 @@ impl SeriesLimitStream {
 
             let (filter, count) = match (*ignore_nulls, &respect_nulls_cache) {
                 (true, _) => {
-                    let (arr, count) = row_number(&arr, self.counts[idx], true, &partitions);
+                    let (arr, count) = row_number(&arr, self.counts[idx], true, &ranges);
                     let filter = arrow::compute::and(
                         &arrow::compute::kernels::cmp::gt(&arr, &self.lower)?,
                         &arrow::compute::kernels::cmp::lt_eq(&arr, &self.upper)?,
@@ -819,7 +825,7 @@ impl SeriesLimitStream {
                 }
                 (false, Some((filter, count))) => (Arc::clone(filter), *count),
                 (false, None) => {
-                    let (arr, count) = row_number(&arr, self.counts[idx], false, &partitions);
+                    let (arr, count) = row_number(&arr, self.counts[idx], false, &ranges);
                     let filter = Arc::new(arrow::compute::and(
                         &arrow::compute::kernels::cmp::gt(&arr, &self.lower)?,
                         &arrow::compute::kernels::cmp::lt_eq(&arr, &self.upper)?,
@@ -986,7 +992,7 @@ impl TryFrom<&PhysicalLimitExpr> for LimitParams {
 /// * `ignore_nulls` - Controls null handling behavior:
 ///   - `false` (RESPECT NULLS): Null values receive row numbers like any other value
 ///   - `true` (IGNORE NULLS): Null values are skipped and assigned null row numbers
-/// * `partitions` - Defines the partition boundaries within the array. Each partition
+/// * `ranges` - Defines the partition boundaries within the array. Each range
 ///   represents a distinct group (e.g., time series) where row numbering should restart.
 ///
 /// # Returns
@@ -1037,12 +1043,12 @@ fn row_number(
     arr: &ArrayRef,
     start: u64,
     ignore_nulls: bool,
-    partitions: &Partitions,
+    ranges: &[Range<usize>],
 ) -> (PrimitiveArray<UInt64Type>, u64) {
     let mut builder = UInt64Builder::with_capacity(arr.len());
     let mut row_number = start;
 
-    for (idx, range) in partitions.ranges().iter().enumerate() {
+    for (idx, range) in ranges.iter().enumerate() {
         if idx > 0 {
             row_number = 0;
         }
@@ -2491,9 +2497,9 @@ mod tests {
             // Single partition - all rows in same group
             let group_arr = Arc::new(StringArray::from(vec!["a", "a", "a"])) as ArrayRef;
             let value_arr = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 0, false, &partitions);
+            let (result, final_count) = row_number(&value_arr, 0, false, &ranges);
 
             assert_eq!(result, PrimitiveArray::from_iter_values([1_u64, 2, 3]));
             assert_eq!(final_count, 3);
@@ -2503,9 +2509,9 @@ mod tests {
         fn test_row_number_with_start() {
             let group_arr = Arc::new(StringArray::from(vec!["a", "a", "a"])) as ArrayRef;
             let value_arr = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 10, false, &partitions);
+            let (result, final_count) = row_number(&value_arr, 10, false, &ranges);
 
             assert_eq!(result, PrimitiveArray::from_iter_values([11_u64, 12, 13]));
             assert_eq!(final_count, 13);
@@ -2515,9 +2521,9 @@ mod tests {
         fn test_row_number_with_nulls_respect() {
             let group_arr = Arc::new(StringArray::from(vec!["a", "a", "a"])) as ArrayRef;
             let value_arr = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 0, false, &partitions);
+            let (result, final_count) = row_number(&value_arr, 0, false, &ranges);
 
             // Respect nulls means nulls still get row numbers
             assert_eq!(result, PrimitiveArray::from_iter_values([1_u64, 2, 3]));
@@ -2528,9 +2534,9 @@ mod tests {
         fn test_row_number_with_nulls_ignore() {
             let group_arr = Arc::new(StringArray::from(vec!["a", "a", "a"])) as ArrayRef;
             let value_arr = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 0, true, &partitions);
+            let (result, final_count) = row_number(&value_arr, 0, true, &ranges);
 
             // Ignore nulls means nulls are skipped in numbering
             assert_eq!(
@@ -2546,9 +2552,9 @@ mod tests {
             let group_arr =
                 Arc::new(StringArray::from(vec!["a", "a", "a", "b", "b", "b"])) as ArrayRef;
             let value_arr = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 0, false, &partitions);
+            let (result, final_count) = row_number(&value_arr, 0, false, &ranges);
 
             // Numbers start at one for each partition
             assert_eq!(
@@ -2562,9 +2568,9 @@ mod tests {
         fn test_row_number_empty() {
             let group_arr = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
             let value_arr = Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 0, false, &partitions);
+            let (result, final_count) = row_number(&value_arr, 0, false, &ranges);
 
             assert_eq!(result, PrimitiveArray::<UInt64Type>::from_iter_values([]));
             assert_eq!(final_count, 0);
@@ -2580,9 +2586,9 @@ mod tests {
                 None,
                 Some(5),
             ])) as ArrayRef;
-            let partitions = partition(&[group_arr]).unwrap();
+            let ranges = partition(&[group_arr]).unwrap().ranges();
 
-            let (result, final_count) = row_number(&value_arr, 5, true, &partitions);
+            let (result, final_count) = row_number(&value_arr, 5, true, &ranges);
 
             assert_eq!(
                 result,

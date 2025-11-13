@@ -115,9 +115,11 @@ impl LinearBuffer {
         self.first_uninit_element
     }
 
-    /// Number of references that point to the allocation.
-    pub fn strong_count(&self) -> usize {
-        self.data.strong_count()
+    /// Checks if this is the only slice pointing to the underlying allocation.
+    ///
+    /// This requires a mutable reference so because only mutable references are unique.
+    pub fn is_unique(&mut self) -> bool {
+        self.data.is_unique()
     }
 
     /// The uninitialized part of the buffer.
@@ -238,9 +240,12 @@ impl SharedAllocation {
         allocation.len()
     }
 
-    /// Number of references that point to the allocation.
-    fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.0)
+    /// Checks if this is the only slice pointing to the underlying allocation.
+    ///
+    /// This requires a mutable reference so because only mutable references are unique.
+    fn is_unique(&mut self) -> bool {
+        // do NOT use `Arc::strong_count` here because it is racy/relaxed, see https://github.com/rust-lang/rust/issues/117485
+        Arc::get_mut(&mut self.0).is_some()
     }
 }
 
@@ -257,9 +262,11 @@ impl Slice {
         self.data.total_size()
     }
 
-    /// Number of references that point to the allocation.
-    pub fn strong_count(&self) -> usize {
-        self.data.strong_count()
+    /// Checks if this is the only slice pointing to the underlying allocation.
+    ///
+    /// This requires a mutable reference so because only mutable references are unique.
+    pub fn is_unique(&mut self) -> bool {
+        self.data.is_unique()
     }
 }
 
@@ -405,17 +412,17 @@ mod test {
         let mut buffer = LinearBuffer::new(3);
         buffer.append(b"foo");
 
-        let bytes = buffer.slice_initialized_part(..);
+        let mut bytes = buffer.slice_initialized_part(..);
         assert_eq!(bytes.as_ref(), b"foo".as_slice());
-        assert_eq!(bytes.strong_count(), 2);
+        assert!(!bytes.is_unique());
 
         drop(buffer);
-        assert_eq!(bytes.strong_count(), 1);
+        assert!(bytes.is_unique());
 
-        let bytes2 = bytes.clone();
+        let mut bytes2 = bytes.clone();
         assert_eq!(bytes2.as_ref(), b"foo".as_slice());
-        assert_eq!(bytes.strong_count(), 2);
-        assert_eq!(bytes2.strong_count(), 2);
+        assert!(!bytes.is_unique());
+        assert!(!bytes2.is_unique());
         assert_eq!(
             bytes.as_ptr().expose_provenance(),
             bytes2.as_ptr().expose_provenance(),
@@ -423,7 +430,7 @@ mod test {
         );
 
         drop(bytes);
-        assert_eq!(bytes2.strong_count(), 1);
+        assert!(bytes2.is_unique());
         assert_eq!(bytes2.as_ref(), b"foo".as_slice());
     }
 
@@ -484,25 +491,25 @@ mod test {
     }
 
     #[test]
-    fn strong_count() {
-        let buffer = LinearBuffer::new(3);
-        assert_eq!(buffer.strong_count(), 1);
+    fn is_unique() {
+        let mut buffer = LinearBuffer::new(3);
+        assert!(buffer.is_unique());
 
-        let slice_1 = buffer.slice_initialized_part(..0);
-        assert_eq!(buffer.strong_count(), 2);
-        assert_eq!(slice_1.strong_count(), 2);
+        let mut slice_1 = buffer.slice_initialized_part(..0);
+        assert!(!buffer.is_unique());
+        assert!(!slice_1.is_unique());
 
-        let slice_2 = buffer.slice_initialized_part(..0);
-        assert_eq!(buffer.strong_count(), 3);
-        assert_eq!(slice_1.strong_count(), 3);
-        assert_eq!(slice_2.strong_count(), 3);
+        let mut slice_2 = buffer.slice_initialized_part(..0);
+        assert!(!buffer.is_unique());
+        assert!(!slice_1.is_unique());
+        assert!(!slice_2.is_unique());
 
         drop(slice_1);
-        assert_eq!(buffer.strong_count(), 2);
-        assert_eq!(slice_2.strong_count(), 2);
+        assert!(!buffer.is_unique());
+        assert!(!slice_2.is_unique());
 
         drop(buffer);
-        assert_eq!(slice_2.strong_count(), 1);
+        assert!(slice_2.is_unique());
     }
 
     #[test]

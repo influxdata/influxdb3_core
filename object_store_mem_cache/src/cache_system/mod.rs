@@ -34,7 +34,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use object_store_metrics::cache_state::CacheState;
 use std::{fmt::Debug, hash::Hash};
 
 use std::sync::Arc;
@@ -108,7 +107,10 @@ impl HasSize for DynError {
 #[async_trait]
 pub trait InUse {
     /// Check if a value is currently in use.
-    fn in_use(&self) -> bool;
+    ///
+    /// This accepts a mutable reference so one can use [`Arc::get_mut`] which is thread synchronized (in constrast to
+    /// [`Arc::strong_count`], see <https://github.com/rust-lang/rust/issues/117485>).
+    fn in_use(&mut self) -> bool;
 }
 
 #[async_trait]
@@ -119,26 +121,30 @@ where
     /// For arc'ed references (e.g. `Arc<V>` or nested arc'ed values within V),
     /// check the strong count and the inner usage,
     /// since an inner Arc may still be held.
-    fn in_use(&self) -> bool {
-        Self::strong_count(self) > 1 || (**self).in_use()
+    fn in_use(&mut self) -> bool {
+        // do NOT use `strong_count` as it's ordering is implemented as "relaxed", see
+        // https://github.com/rust-lang/rust/issues/117485
+        Self::get_mut(self)
+            .map(|inner| inner.in_use())
+            .unwrap_or(true)
     }
 }
 
 impl InUse for str {
-    fn in_use(&self) -> bool {
+    fn in_use(&mut self) -> bool {
         false
     }
 }
 
 impl InUse for &str {
-    fn in_use(&self) -> bool {
+    fn in_use(&mut self) -> bool {
         false
     }
 }
 
 impl InUse for Bytes {
-    fn in_use(&self) -> bool {
-        false
+    fn in_use(&mut self) -> bool {
+        !self.is_unique()
     }
 }
 
@@ -184,7 +190,10 @@ where
         if let Ok(inner) = Self::try_unwrap(self) {
             inner.async_drop().await
         } else {
-            unreachable!("InUse check should have already been performed");
+            unreachable!(
+                "InUse check should have already been performed for {}",
+                std::any::type_name::<T>(),
+            );
         }
     }
 }
@@ -221,6 +230,9 @@ impl AsyncDrop for Bytes {
     }
 }
 
+/// Re-export for callers of [`Cache::get_or_fetch`].
+pub use object_store_metrics::cache_state::{CacheState, CacheStateKind};
+
 #[async_trait]
 pub trait Cache<K, V, D>: Send + Sync + Debug
 where
@@ -233,8 +245,8 @@ where
     /// Fetching is driven by a background tokio task and will make progress even when you do not poll the resulting
     /// future.
     ///
-    /// Returns a future that resolves to the value [`CacheRequestResult<V>`].
-    /// If data is loading, provides early access data (`D`).
+    /// Returns a [`CacheState`] that contains either the cached value or a future that resolves to the value.
+    /// If data is loading, the early access data (`D`) is included in the [`CacheState`].
     ///
     /// The early access data (`D`) may be used by metrics, logging, or other purposes.
     fn get_or_fetch(
@@ -243,11 +255,7 @@ where
         f: CacheFn<V>,
         d: D,
         size_hint: Option<usize>,
-    ) -> (
-        BoxFuture<'static, CacheRequestResult<V>>,
-        Option<D>,
-        CacheState,
-    );
+    ) -> CacheState<V, D>;
 
     /// Get the cached value and return `None` if was not cached.
     ///

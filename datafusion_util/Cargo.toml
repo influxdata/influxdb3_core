@@ -21,3 +21,6 @@ tokio-stream = "0.1"
 tracing = { workspace = true }
 url = "2.5"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+assert_matches = "1"

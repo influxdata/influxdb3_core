@@ -1219,11 +1219,6 @@ impl ParquetFile {
         }
         false
     }
-
-    /// Temporary to aid incremental migration
-    pub fn transition_partition_id(&self) -> TransitionPartitionId {
-        TransitionPartitionId::from_parts(self.partition_id, Some(self.partition_hash_id.clone()))
-    }
 }
 
 impl From<ParquetFile> for catalog_proto::ParquetFile {
@@ -1299,10 +1294,6 @@ pub enum ParquetFileProtoError {
     /// The proto type does not contain a partition ID.
     #[error("no partition id specified for parquet file")]
     NoPartitionId,
-
-    /// The specified partition ID is invalid.
-    #[error(transparent)]
-    InvalidPartitionId(#[from] PartitionIdProtoError),
 
     /// The specified object store UUID is invalid.
     #[error("invalid object store ID: {0}")]

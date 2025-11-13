@@ -11,7 +11,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use data_types::TransitionPartitionId;
+use data_types::PartitionHashId;
 use datafusion::{
     catalog::memory::DataSourceExec,
     datasource::{
@@ -165,7 +165,7 @@ pub struct ParquetUploadInput {
 
 impl ParquetUploadInput {
     fn try_new(
-        partition_id: &TransitionPartitionId,
+        partition_id: &PartitionHashId,
         meta: &IoxMetadata,
         id: &StorageId,
         object_store: Arc<DynObjectStore>,
@@ -285,7 +285,7 @@ impl ParquetStorage {
     pub async fn upload(
         &self,
         batches: SendableRecordBatchStream,
-        partition_id: &TransitionPartitionId,
+        partition_id: &PartitionHashId,
         meta: &IoxMetadata,
         runtime: Arc<RuntimeEnv>,
     ) -> Result<(IoxParquetMetaData, u64), UploadError> {
@@ -364,7 +364,7 @@ impl ParquetStorage {
     pub async fn parallel_upload(
         &self,
         batches: SendableRecordBatchStream,
-        partition_id: &TransitionPartitionId,
+        partition_id: &PartitionHashId,
         meta: &IoxMetadata,
         runtime: Arc<RuntimeEnv>,
     ) -> Result<(IoxParquetMetaData, u64), UploadError> {
@@ -466,7 +466,7 @@ mod tests {
         record_batch::RecordBatch,
     };
     use data_types::{
-        CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, PartitionId, TableId,
+        CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, PartitionHashId, TableId,
         Timestamp,
     };
     use datafusion::common::{DataFusionError, ScalarValue};
@@ -1061,17 +1061,19 @@ mod tests {
         Arc::new(array)
     }
 
-    fn meta() -> (TransitionPartitionId, IoxMetadata) {
+    fn meta() -> (PartitionHashId, IoxMetadata) {
+        let table_id = TableId::new(3);
+        let partition_key = "potato".into();
         (
-            TransitionPartitionId::Catalog(PartitionId::new(4)),
+            PartitionHashId::new(table_id, &partition_key),
             IoxMetadata {
                 object_store_id: ObjectStoreId::new(),
                 creation_timestamp: Time::from_timestamp_nanos(42),
                 namespace_id: NamespaceId::new(1),
                 namespace_name: "bananas".into(),
-                table_id: TableId::new(3),
+                table_id,
                 table_name: "platanos".into(),
-                partition_key: "potato".into(),
+                partition_key,
                 compaction_level: CompactionLevel::FileNonOverlapped,
                 sort_key: None,
                 max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
@@ -1087,7 +1089,7 @@ mod tests {
     /// Perform (not assert): upload based upon [`UploadType`]
     async fn upload(
         store: &ParquetStorage,
-        partition_id: &TransitionPartitionId,
+        partition_id: &PartitionHashId,
         meta: &IoxMetadata,
         batch: RecordBatch,
         upload_type: UploadType,
@@ -1118,7 +1120,7 @@ mod tests {
     /// Perform (not assert): download
     async fn download(
         store: &ParquetStorage,
-        partition_id: &TransitionPartitionId,
+        partition_id: &PartitionHashId,
         meta: &IoxMetadata,
         selection: Projection<'_>,
         expected_schema: SchemaRef,

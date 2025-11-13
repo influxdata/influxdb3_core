@@ -111,7 +111,7 @@ impl GapFiller {
     /// the first row in the next output batch, return the offset
     /// of last input row that could possibly be in the output.
     ///
-    /// This offset is used by ['BufferedInput`] to determine how many
+    /// This offset is used by [`BufferedInput`] to determine how many
     /// rows need to be buffered.
     ///
     /// [`BufferedInput`]: super::buffered_input::BufferedInput

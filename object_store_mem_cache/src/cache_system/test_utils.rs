@@ -10,7 +10,7 @@ use futures_test_utils::{AssertFutureExt, FutureObserver};
 use tokio::sync::Barrier;
 
 use crate::cache_system::{
-    AsyncDrop, Cache, CacheState, HasSize, InUse,
+    AsyncDrop, Cache, CacheRequestResult, CacheState, CacheStateKind, HasSize, InUse,
     hook::{
         EvictResult,
         test_utils::{TestHook, TestHookRecord},
@@ -18,10 +18,44 @@ use crate::cache_system::{
     utils::str_err,
 };
 
+/// Type alias for cache result futures
+type CacheResultFuture<V> = futures::future::BoxFuture<'static, CacheRequestResult<V>>;
+
+/// Helper function to extract future and state from CacheState for tests
+pub(crate) fn extract_future_and_state<V, D>(
+    cache_state: CacheState<V, D>,
+) -> (CacheResultFuture<V>, CacheStateKind)
+where
+    V: Clone + Send + Sync + 'static,
+    D: Clone + Send + Sync + 'static,
+{
+    let state = cache_state.kind();
+    let fut = cache_state
+        .inner_fut()
+        .expect("extract_future_and_state should only be used with loading states");
+    (fut, state)
+}
+
+/// Helper function to extract all components from CacheState for tests with early access data
+pub(crate) fn extract_full_state<V, D>(
+    cache_state: CacheState<V, D>,
+) -> (CacheResultFuture<V>, Option<D>, CacheStateKind)
+where
+    V: Clone + Send + Sync + 'static,
+    D: Clone + Send + Sync + 'static,
+{
+    let state = cache_state.kind();
+    let early_data = cache_state.early_access_data().cloned();
+    let fut = cache_state
+        .inner_fut()
+        .expect("extract_full_state should only be used with loading states");
+    (fut, early_data, state)
+}
+
 /// The extra size of entries when the S3-FIFO is used.
 ///
 /// This is because the internal bookkeeping of the S3-FIFO implementation is more precise.
-const S3_FIFO_EXTRA_SIZE: usize = 56;
+const S3_FIFO_EXTRA_SIZE: usize = 72;
 
 /// Assert that the result of `f` converges against the given value;
 pub(crate) async fn assert_converge_eq<F, T>(f: F, expected: T)
@@ -53,7 +87,7 @@ pub(crate) async fn test_happy_path(setup: TestSetup) {
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
     let size_hint = Arc::new(TestValue(test_size)).size();
-    let (mut fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(move || {
             async move {
@@ -65,11 +99,12 @@ pub(crate) async fn test_happy_path(setup: TestSetup) {
         (),
         Some(size_hint),
     );
+    let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (res, _) = tokio::join!(fut, barrier.wait());
-    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
@@ -95,7 +130,7 @@ pub(crate) async fn test_panic_loader(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
-    let (mut fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -107,11 +142,12 @@ pub(crate) async fn test_panic_loader(setup: TestSetup) {
         (),
         None,
     );
+    let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (res, _) = tokio::join!(fut, barrier.wait());
-    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "panic: foo");
 
     assert_eq!(
@@ -133,7 +169,7 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
-    let (mut fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -145,11 +181,12 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup) {
         (),
         None,
     );
+    let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (res, _) = tokio::join!(fut, barrier.wait());
-    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(res.unwrap_err().to_string(), "my error");
 
     assert_eq!(
@@ -173,13 +210,15 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
 
     let k1 = Arc::new("k1");
     let size_hint = Arc::new(TestValue(test_size)).size();
-    let (fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
         (),
         Some(size_hint),
     );
-    assert_eq!(state, CacheState::NewEntry);
+    let state = cache_state.kind();
+    let fut = cache_state.await_inner();
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(fut.await.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
@@ -199,14 +238,17 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
     );
 
     let size_hint = Arc::new(TestValue(test_size)).size();
-    let (fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
         (),
         Some(size_hint),
     );
-    assert_eq!(state, CacheState::WasCached);
-    assert_eq!(fut.await.unwrap(), Arc::new(TestValue(test_size)));
+    assert_eq!(cache_state.kind(), CacheStateKind::WasCached);
+    assert_eq!(
+        cache_state.await_inner().await.unwrap(),
+        Arc::new(TestValue(test_size))
+    );
 
     cache.prune();
     assert_eq!(
@@ -229,7 +271,7 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
     let barrier_captured = Arc::clone(&barrier);
     let k1 = Arc::new("k1");
     let size_hint = Arc::new(TestValue(test_size_1)).size();
-    let (mut fut_1, _, state_1) = cache.get_or_fetch(
+    let cache_state_1 = cache.get_or_fetch(
         &k1,
         Box::new(move || {
             async move {
@@ -241,24 +283,26 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
         (),
         Some(size_hint),
     );
+    let (mut fut_1, state_1) = extract_future_and_state(cache_state_1);
     fut_1.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let size_hint = Arc::new(TestValue(test_size_2)).size();
-    let (mut fut_2, _, state_2) = cache.get_or_fetch(
+    let cache_state_2 = cache.get_or_fetch(
         &k1,
         Box::new(move || { async move { Ok(Arc::new(TestValue(test_size_2))) } }.boxed()),
         (),
         Some(size_hint),
     );
+    let (mut fut_2, state_2) = extract_future_and_state(cache_state_2);
     fut_2.assert_pending().await;
 
     let (_, fut_res) = tokio::join!(barrier.wait(), fut_1);
-    assert_eq!(state_1, CacheState::NewEntry);
+    assert_eq!(state_1, CacheStateKind::NewEntry);
     assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size_1)));
 
     let fut_res = fut_2.await;
-    assert_eq!(state_2, CacheState::AlreadyLoading);
+    assert_eq!(state_2, CacheStateKind::AlreadyLoading);
     assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size_1)));
 
     assert_eq!(
@@ -278,7 +322,7 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
         let barrier_captured = Arc::clone(&barrier);
         let k1 = Arc::new("k1");
         let size_hint = Arc::new(TestValue(1001)).size();
-        let (mut fut, _, _state) = cache.get_or_fetch(
+        let cache_state = cache.get_or_fetch(
             &k1,
             Box::new(move || {
                 {
@@ -293,6 +337,7 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
             (),
             Some(size_hint),
         );
+        let (mut fut, _state) = extract_future_and_state(cache_state);
         fut.assert_pending().await;
     }
 
@@ -311,7 +356,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
     let barriers_captured = Arc::clone(&barriers);
     let k1 = Arc::new("k1");
     let size_hint = Arc::new(TestValue(1001)).size();
-    let (mut fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -325,6 +370,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
         (),
         Some(size_hint),
     );
+    let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -341,7 +387,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
     // Don't use `tokio::select!` or `tokio::join!` because they poll too often. What the H?!
     // So we use this lovely crate instead: https://crates.io/crates/futures-concurrency
     let (res, ()) = fut.join(fut_io).await;
-    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(res.unwrap(), Arc::new(TestValue(1001)),);
 
     // polled once for to determine that all of them are pending, and then once when we finally got
@@ -362,7 +408,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
     let barriers_captured = Arc::clone(&barriers);
     let k1 = Arc::new("k1");
     let size_hint = Arc::new(TestValue(1001)).size();
-    let (mut fut_1, _, state_1) = cache.get_or_fetch(
+    let cache_state_1 = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -376,15 +422,17 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
         (),
         Some(size_hint),
     );
+    let (mut fut_1, state_1) = extract_future_and_state(cache_state_1);
     fut_1.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
-    let (mut fut_2, _, state_2) = cache.get_or_fetch(
+    let cache_state_2 = cache.get_or_fetch(
         &k1,
         Box::new(|| async move { unreachable!() }.boxed()),
         (),
         None,
     );
+    let (mut fut_2, state_2) = extract_future_and_state(cache_state_2);
     fut_2.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -403,8 +451,8 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
     // Don't use `tokio::select!` or `tokio::join!` because they poll too often. What the H?!
     // So we use this lovely crate instead: https://crates.io/crates/futures-concurrency
     let ((res_1, res_2), ()) = fut_1.join(fut_2).join(fut_io).await;
-    assert_eq!(state_1, CacheState::NewEntry);
-    assert_eq!(state_2, CacheState::AlreadyLoading);
+    assert_eq!(state_1, CacheStateKind::NewEntry);
+    assert_eq!(state_2, CacheStateKind::AlreadyLoading);
     assert_eq!(res_1.unwrap(), Arc::new(TestValue(1001)),);
     assert_eq!(res_2.unwrap(), Arc::new(TestValue(1001)),);
 
@@ -429,7 +477,7 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let cache_captured = &cache;
-    let (mut fut, _, _state) = rt_1.block_on(async move {
+    let cache_state = rt_1.block_on(async move {
         let k1 = Arc::new("k1");
         cache_captured.get_or_fetch(
             &k1,
@@ -444,6 +492,7 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
             None,
         )
     });
+    let (mut fut, _state) = extract_future_and_state(cache_state);
     rt_1.block_on(async {
         fut.assert_pending().await;
     });
@@ -479,7 +528,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
     let size_hint = Arc::new(TestValue(test_size)).size();
-    let (mut fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(move || {
             async move {
@@ -491,6 +540,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
         (),
         Some(size_hint),
     );
+    let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -499,7 +549,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (_, fut_res) = tokio::join!(barrier.wait(), fut);
-    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(fut_res.unwrap(), Arc::new(TestValue(test_size)));
     assert_eq!(
         observer.records(),
@@ -556,7 +606,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_captured = Arc::clone(&barrier);
-    let (mut fut, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(|| {
             async move {
@@ -568,6 +618,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
         (),
         None,
     );
+    let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
@@ -576,7 +627,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
     assert_eq!(observer.records(), vec![TestHookRecord::Insert(0, "k1")],);
 
     let (_, fut_res) = tokio::join!(barrier.wait(), fut);
-    assert_eq!(state, CacheState::NewEntry);
+    assert_eq!(state, CacheStateKind::NewEntry);
     assert_eq!(fut_res.unwrap_err().to_string(), "err");
 
     assert_eq!(
@@ -604,24 +655,30 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
     let k2 = Arc::new("k2");
 
     let size_hint = Arc::new(TestValue(test_size_1)).size();
-    let (res, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k1,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size_1))) }.boxed()),
         (),
         Some(size_hint),
     );
-    assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.await.unwrap(), Arc::new(TestValue(test_size_1)));
+    assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
+    assert_eq!(
+        cache_state.await_inner().await.unwrap(),
+        Arc::new(TestValue(test_size_1))
+    );
 
     let size_hint = Arc::new(TestValue(test_size_2)).size();
-    let (res, _, state) = cache.get_or_fetch(
+    let cache_state = cache.get_or_fetch(
         &k2,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size_2))) }.boxed()),
         (),
         Some(size_hint),
     );
-    assert_eq!(state, CacheState::NewEntry);
-    assert_eq!(res.await.unwrap(), Arc::new(TestValue(test_size_2)));
+    assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
+    assert_eq!(
+        cache_state.await_inner().await.unwrap(),
+        Arc::new(TestValue(test_size_2))
+    );
 
     assert_eq!(
         observer.records(),
@@ -649,7 +706,7 @@ impl HasSize for TestValue {
 }
 
 impl InUse for TestValue {
-    fn in_use(&self) -> bool {
+    fn in_use(&mut self) -> bool {
         false
     }
 }
