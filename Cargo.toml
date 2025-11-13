@@ -93,7 +93,8 @@ prost-build = { version = "0.13" }
 prost-types = { version = "0.13" }
 reqwest = { version = "0.12", default-features = false }
 rstest = { version = "0.26" }
-sqlx = { version = "0.8.6" }
+# NOTE(tjh): explicitly add sqlite feature as the `data_types` crate relies on it
+sqlx = { version = "0.8.6", features = ["sqlite"] }
 tower = { version = "0.5" }
 tracing = { version = "0.1", features = ["log", "max_level_trace"] }
 tracing-log = { version = "0.2" }
