@@ -40,25 +40,29 @@ message GetParquetFilesByPartitionIdResponse {
 }
 
 message Partition {
-    reserved 5;
-    reserved "sort_key";
-    reserved 2;
-    reserved "sequencer_id";
-    reserved 7;
-    reserved "shard_id";
     reserved 1;
     reserved "id";
+    reserved 2;
+    reserved "sequencer_id";
+    reserved 5;
+    reserved "sort_key";
     reserved 6;
     reserved "array_sort_key";
+    reserved 7;
+    reserved "shard_id";
+    reserved 8;
+    reserved "identifier";
     reserved 10;
     reserved "optional_sort_key";
 
     // the table id the partition is in
     int64 table_id = 3;
+
     // the partition key
     string key = 4;
 
-    PartitionIdentifier identifier = 8;
+    // the partition hash id
+    PartitionHashIdentifier hash_identifier = 11;
 
     // the sort key ids sort_key_ids for data in parquet files of this partition which
     // is an array of column ids of the sort keys

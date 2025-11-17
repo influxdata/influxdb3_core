@@ -63,8 +63,8 @@ message IngesterQueryResponseMetadata {
   reserved "tombstone_max_sequence_number";
   reserved 4;
 
-  // Fields from a time when this metadata was sent once at the beginning of the response stream instead of once per
-  // partition.
+  // Fields from a time when this metadata was sent once at the beginning of the response stream
+  // instead of once per partition.
   reserved "unpersisted_partitions";
   reserved 5;
   reserved "batch_partition_ids";
@@ -80,28 +80,17 @@ message IngesterQueryResponseMetadata {
   // Number of Parquet files that have been persisted to object storage for this partition.
   uint64 completed_persistence_count = 10;
 
-  // Either the catalog-assigned partition ID or the hash identifier
+  // Was either the catalog-assigned partition ID or the hash identifier
   // created from the table ID and partition key.
   //
-  // For "old-style" partitions that were created before the switch to
-  // hash partition IDs, a `catalog_id` is returned, and this is used
-  // to address the partition by row ID.
-  //
-  // For "new-style" partitions, a hash-based ID is used to
-  // address a partition.
-  //
-  // Invariant: a partition is EITHER an "old-style", row addressed partition,
-  // OR a "new-style" hash ID addressed partition for the lifetime of the
-  // partition.
-  //
-  // See <https://github.com/influxdata/idpe/issues/17476>.
-  oneof partition_identifier {
-    // An "old-style" partition addressed by catalog row ID.
-    int64 catalog_id = 7;
+  // Replaced by `partition_hash_identifier`.
+  reserved "catalog_id";
+  reserved 7;
+  reserved "hash_id";
+  reserved 11;
 
-    // A "new-style" partition addressed by a hash ID.
-    bytes hash_id = 11;
-  }
+  // Hash-based identifier created from the table ID and partition key used to address a partition.
+  bytes partition_hash_identifier = 12;
 }
 
 // Serialization of `predicate::predicate::Predicate` that contains DataFusion `Expr`s

@@ -9,7 +9,7 @@ use arrow::{
 };
 use data_types::{
     ColumnId, CompactionLevel, MaxL0CreatedAt, NamespaceId, ObjectStoreId, PartitionHashId,
-    PartitionId, PartitionKey, TableId, Timestamp, TransitionPartitionId,
+    PartitionId, PartitionKey, TableId, Timestamp,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_util::{MemoryStream, unbounded_memory_pool};
@@ -52,7 +52,9 @@ async fn test_decoded_iox_metadata() {
         ),
     ];
 
-    let partition_id = TransitionPartitionId::Catalog(PartitionId::new(4));
+    let table_id = TableId::new(3);
+    let partition_key = "potato".into();
+    let partition_hash_id = PartitionHashId::new(table_id, &partition_key);
 
     // And the metadata the batch would be encoded with if it came through the
     // IOx write path.
@@ -61,9 +63,9 @@ async fn test_decoded_iox_metadata() {
         creation_timestamp: Time::from_timestamp_nanos(42),
         namespace_id: NamespaceId::new(1),
         namespace_name: "bananas".into(),
-        table_id: TableId::new(3),
+        table_id,
         table_name: "platanos".into(),
-        partition_key: "potato".into(),
+        partition_key,
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: None,
         max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
@@ -93,7 +95,7 @@ async fn test_decoded_iox_metadata() {
     });
 
     let (iox_parquet_meta, file_size) = storage
-        .upload(stream, &partition_id, &meta, runtime)
+        .upload(stream, &partition_hash_id, &meta, runtime)
         .await
         .expect("failed to serialize & persist record batch");
 
@@ -198,7 +200,9 @@ async fn test_empty_parquet_file_panic() {
         ("some_field", to_string_array(&[])),
     ];
 
-    let partition_id = TransitionPartitionId::Catalog(PartitionId::new(4));
+    let table_id = TableId::new(3);
+    let partition_key = "potato".into();
+    let partition_hash_id = PartitionHashId::new(table_id, &partition_key);
 
     // And the metadata the batch would be encoded with if it came through the
     // IOx write path.
@@ -207,9 +211,9 @@ async fn test_empty_parquet_file_panic() {
         creation_timestamp: Time::from_timestamp_nanos(42),
         namespace_id: NamespaceId::new(1),
         namespace_name: "bananas".into(),
-        table_id: TableId::new(3),
+        table_id,
         table_name: "platanos".into(),
-        partition_key: "potato".into(),
+        partition_key,
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: None,
         max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
@@ -228,7 +232,7 @@ async fn test_empty_parquet_file_panic() {
 
     // Serialising empty data should cause a panic for human investigation.
     let err = storage
-        .upload(stream, &partition_id, &meta, runtime)
+        .upload(stream, &partition_hash_id, &meta, runtime)
         .await
         .expect_err("empty file should raise an error");
 
@@ -298,15 +302,17 @@ async fn test_decoded_many_columns_with_null_cols_iox_metadata() {
     }
     sort_key_data.push(TIME_COLUMN_NAME.to_string());
     let sort_key = SortKey::from_columns(sort_key_data);
-    let partition_id = TransitionPartitionId::Catalog(PartitionId::new(4));
+    let table_id = TableId::new(3);
+    let partition_key = "potato".into();
+    let partition_hash_id = PartitionHashId::new(table_id, &partition_key);
     let meta = IoxMetadata {
         object_store_id: ObjectStoreId::new(),
         creation_timestamp: Time::from_timestamp_nanos(42),
         namespace_id: NamespaceId::new(1),
         namespace_name: "bananas".into(),
-        table_id: TableId::new(3),
+        table_id,
         table_name: "platanos".into(),
-        partition_key: "potato".into(),
+        partition_key,
         compaction_level: CompactionLevel::FileNonOverlapped,
         sort_key: Some(sort_key),
         max_l0_created_at: MaxL0CreatedAt::Computed(Timestamp::new(42)),
@@ -336,7 +342,7 @@ async fn test_decoded_many_columns_with_null_cols_iox_metadata() {
     });
 
     let (iox_parquet_meta, file_size) = storage
-        .upload(stream, &partition_id, &meta, runtime)
+        .upload(stream, &partition_hash_id, &meta, runtime)
         .await
         .expect("failed to serialize & persist record batch");
 
@@ -392,7 +398,6 @@ async fn test_derive_parquet_file_params() {
     let table_id = TableId::new(3);
     let partition_key = PartitionKey::from("potato");
     let partition_hash_id = PartitionHashId::new(table_id, &partition_key);
-    let partition_id = TransitionPartitionId::Hash(partition_hash_id.clone());
 
     let meta = IoxMetadata {
         object_store_id: ObjectStoreId::new(),
@@ -428,7 +433,7 @@ async fn test_derive_parquet_file_params() {
     });
 
     let (iox_parquet_meta, file_size) = storage
-        .upload(stream, &partition_id, &meta, runtime)
+        .upload(stream, &partition_hash_id, &meta, runtime)
         .await
         .expect("failed to serialize & persist record batch");
 
@@ -441,7 +446,7 @@ async fn test_derive_parquet_file_params() {
     let partition_id = PartitionId::new(1);
     let catalog_data = meta.to_parquet_file(
         partition_id,
-        Some(partition_hash_id),
+        partition_hash_id,
         file_size,
         &iox_parquet_meta,
         |name| *column_id_map.get(name).unwrap(),

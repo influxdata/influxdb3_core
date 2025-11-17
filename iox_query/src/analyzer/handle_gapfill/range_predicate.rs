@@ -72,7 +72,7 @@ impl TreeNodeVisitor<'_> for TimeRangeVisitor {
                     None,
                     t.filters.clone(),
                 )
-                .map_err(|e| e.context("reconstruct unprojected scheam"))?;
+                .map_err(|e| e.context("reconstruct unprojected schema"))?;
                 let unprojected_schema = unprojected_scan.schema();
                 let range = t
                     .filters

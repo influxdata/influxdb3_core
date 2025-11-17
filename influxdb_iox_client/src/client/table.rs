@@ -103,19 +103,25 @@ impl Client {
     }
 
     /// Enable iceberg exports for a table
-    pub async fn enable_iceberg(&mut self, table_id: i64) -> Result<(), Error> {
+    pub async fn enable_iceberg(&mut self, table_id: i64, namespace_id: i64) -> Result<(), Error> {
         let _ = self
             .inner
-            .enable_iceberg(EnableIcebergRequest { table_id })
+            .enable_iceberg(EnableIcebergRequest {
+                table_id,
+                namespace_id,
+            })
             .await?;
         Ok(())
     }
 
     /// Disable iceberg exports for a table
-    pub async fn disable_iceberg(&mut self, table_id: i64) -> Result<(), Error> {
+    pub async fn disable_iceberg(&mut self, table_id: i64, namespace_id: i64) -> Result<(), Error> {
         let _ = self
             .inner
-            .disable_iceberg(DisableIcebergRequest { table_id })
+            .disable_iceberg(DisableIcebergRequest {
+                table_id,
+                namespace_id,
+            })
             .await?;
         Ok(())
     }

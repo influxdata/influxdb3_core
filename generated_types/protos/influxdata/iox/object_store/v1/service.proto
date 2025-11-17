@@ -38,6 +38,12 @@ message GetParquetFileByObjectStorePathResponse {
 
 // filter parquet files based upon path
 message ParquetFilePathFilter {
+    reserved 3;
+    reserved "partition_id";
+
+    reserved 4;
+    reserved "partition_key";
+
     // namespace is always required
     int64 namespace_id = 1;
 
@@ -45,12 +51,7 @@ message ParquetFilePathFilter {
     optional int64 table_id = 2;
 
     // partition is optional
-    //
-    // when a partition is provided, the partition_hash_id will be created by either:
-    // (a) PartitionIdentifier(hash_id)
-    // (b) PartitionIdentifier(catalog_id) + partition_key (if exists)
-    optional influxdata.iox.catalog.v1.PartitionIdentifier partition_id = 3;
-    optional string partition_key = 4;
+    optional influxdata.iox.catalog.v1.PartitionHashIdentifier partition_hash_id = 5;
 }
 
 message ListParquetFilesByPathFilterRequest {

@@ -9,188 +9,14 @@ use sha2::Digest;
 use std::{fmt::Display, sync::Arc};
 use thiserror::Error;
 
-/// For issue idpe#17476 we introduced a hash-based partition identifier.  We never stopped
-/// allocating the identifiers in the catalog, and have no plans to stop doing so.  Components that
-/// need to support both can use this type.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TransitionPartitionId {
-    /// The classic, catalog-assigned sequential `PartitionId`.
-    Catalog(PartitionId),
-    /// The hash-based `PartitionHashId`.
-    Hash(PartitionHashId),
-}
-
-impl TransitionPartitionId {
-    /// Create a [`TransitionPartitionId`] from a [`PartitionId`] and optional [`PartitionHashId`]
-    pub fn from_parts(id: PartitionId, hash_id: Option<PartitionHashId>) -> Self {
-        match hash_id {
-            Some(x) => Self::Hash(x),
-            None => Self::Catalog(id),
-        }
-    }
-
-    /// Size in bytes including `self`.
-    pub fn size(&self) -> usize {
-        match self {
-            Self::Catalog(_) => std::mem::size_of::<Self>(),
-            Self::Hash(id) => std::mem::size_of::<Self>() + id.size() - std::mem::size_of_val(id),
-        }
-    }
-}
-
-impl<'a, R> sqlx::FromRow<'a, R> for TransitionPartitionId
-where
-    R: sqlx::Row,
-    &'static str: sqlx::ColumnIndex<R>,
-    PartitionId: sqlx::decode::Decode<'a, R::Database>,
-    PartitionId: sqlx::types::Type<R::Database>,
-    Option<PartitionHashId>: sqlx::decode::Decode<'a, R::Database>,
-    Option<PartitionHashId>: sqlx::types::Type<R::Database>,
+/// Serialise a [`PartitionHashId`] to the `PartitionHashIdentifier` protobuf representation.
+impl From<&PartitionHashId>
+    for generated_types::influxdata::iox::catalog::v1::PartitionHashIdentifier
 {
-    fn from_row(row: &'a R) -> sqlx::Result<Self> {
-        let partition_id: Option<PartitionId> = row.try_get("partition_id")?;
-        let partition_hash_id: Option<PartitionHashId> = row.try_get("partition_hash_id")?;
-
-        let transition_partition_id = match (partition_id, partition_hash_id) {
-            (_, Some(hash_id)) => Self::Hash(hash_id),
-            (Some(id), _) => Self::Catalog(id),
-            (None, None) => {
-                return Err(sqlx::Error::ColumnDecode {
-                    index: "partition_id".into(),
-                    source: "Both partition_id and partition_hash_id were NULL".into(),
-                });
-            }
-        };
-
-        Ok(transition_partition_id)
-    }
-}
-
-impl From<(PartitionId, Option<&PartitionHashId>)> for TransitionPartitionId {
-    fn from((partition_id, partition_hash_id): (PartitionId, Option<&PartitionHashId>)) -> Self {
-        Self::from_parts(partition_id, partition_hash_id.cloned())
-    }
-}
-
-impl std::fmt::Display for TransitionPartitionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Catalog(old_partition_id) => write!(f, "{}", old_partition_id.0),
-            Self::Hash(partition_hash_id) => write!(f, "{partition_hash_id}"),
+    fn from(value: &PartitionHashId) -> Self {
+        Self {
+            hash_id: value.as_bytes().to_owned(),
         }
-    }
-}
-
-impl TransitionPartitionId {
-    /// Create a new `TransitionPartitionId::Hash` with the given table
-    /// ID and partition key. Provided to reduce typing and duplication a bit,
-    /// and because this variant should be most common now.
-    ///
-    /// This MUST NOT be used for partitions that are addressed using
-    /// classical catalog row IDs, which should use
-    /// [`TransitionPartitionId::Catalog`] instead.
-    pub fn hash(table_id: TableId, partition_key: &PartitionKey) -> Self {
-        Self::Hash(PartitionHashId::new(table_id, partition_key))
-    }
-
-    /// Create a new `TransitionPartitionId` for cases in tests where you need some value but the
-    /// value doesn't matter. Public and not test-only so that other crates' tests can use this.
-    pub fn arbitrary_for_testing() -> Self {
-        Self::hash(TableId::new(0), &PartitionKey::from("arbitrary"))
-    }
-}
-
-/// Errors deserialising protobuf representations of [`TransitionPartitionId`].
-#[derive(Debug, Error)]
-pub enum PartitionIdProtoError {
-    /// The proto type does not contain an ID.
-    #[error("no id specified for partition id")]
-    NoId,
-
-    /// The specified hash ID is invalid.
-    #[error(transparent)]
-    InvalidHashId(#[from] PartitionHashIdError),
-}
-
-/// Serialise a [`TransitionPartitionId`] to a protobuf representation.
-impl From<TransitionPartitionId>
-    for generated_types::influxdata::iox::catalog::v1::PartitionIdentifier
-{
-    fn from(value: TransitionPartitionId) -> Self {
-        use generated_types::influxdata::iox::catalog::v1 as proto;
-        match value {
-            TransitionPartitionId::Catalog(id) => Self {
-                id: Some(proto::partition_identifier::Id::CatalogId(id.get())),
-            },
-            TransitionPartitionId::Hash(hash) => Self {
-                id: Some(proto::partition_identifier::Id::HashId(
-                    hash.as_bytes().to_owned(),
-                )),
-            },
-        }
-    }
-}
-
-/// Deserialise a [`TransitionPartitionId`] from a protobuf representation.
-impl TryFrom<generated_types::influxdata::iox::catalog::v1::PartitionIdentifier>
-    for TransitionPartitionId
-{
-    type Error = PartitionIdProtoError;
-
-    fn try_from(
-        value: generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
-    ) -> Result<Self, Self::Error> {
-        use generated_types::influxdata::iox::catalog::v1 as proto;
-
-        let id = value.id.ok_or(PartitionIdProtoError::NoId)?;
-
-        Ok(match id {
-            proto::partition_identifier::Id::CatalogId(v) => Self::Catalog(PartitionId::new(v)),
-            proto::partition_identifier::Id::HashId(hash) => {
-                Self::Hash(PartitionHashId::try_from(hash.as_slice())?)
-            }
-        })
-    }
-}
-
-/// Deserialize a [`TransitionPartitionId`] from a protobuf representation,
-/// with an optional partition_key to enable hash ids.
-impl
-    TryFrom<(
-        generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
-        TableId,
-        Option<PartitionKey>,
-    )> for TransitionPartitionId
-{
-    type Error = PartitionIdProtoError;
-
-    fn try_from(
-        value: (
-            generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
-            TableId,
-            Option<PartitionKey>,
-        ),
-    ) -> Result<Self, Self::Error> {
-        use generated_types::influxdata::iox::catalog::v1 as proto;
-
-        let id = value.0.id.ok_or(PartitionIdProtoError::NoId)?;
-        let table_id = value.1;
-        let partition_key = value.2;
-
-        Ok(match (id, partition_key) {
-            (proto::partition_identifier::Id::CatalogId(v), None) => {
-                Self::Catalog(PartitionId::new(v))
-            }
-            (proto::partition_identifier::Id::CatalogId(v), Some(partition_key)) => {
-                Self::from_parts(
-                    PartitionId::new(v),
-                    Some(PartitionHashId::new(table_id, &partition_key)),
-                )
-            }
-            (proto::partition_identifier::Id::HashId(hash), _) => {
-                Self::Hash(PartitionHashId::try_from(hash.as_slice())?)
-            }
-        })
     }
 }
 
@@ -578,9 +404,8 @@ impl sqlx::postgres::PgHasArrayType for PartitionHashId {
 pub struct Partition {
     /// the id of the partition
     pub id: PartitionId,
-    /// The unique hash derived from the table ID and partition key, if available. This will become
-    /// required when partitions without the value have aged out.
-    hash_id: Option<PartitionHashId>,
+    /// The unique hash derived from the table ID and partition key.
+    hash_id: PartitionHashId,
     /// the table the partition is under
     pub table_id: TableId,
     /// the string key of the partition
@@ -640,7 +465,6 @@ impl Partition {
     #[expect(clippy::too_many_arguments)]
     pub fn new_catalog_only(
         id: PartitionId,
-        hash_id: Option<PartitionHashId>,
         table_id: TableId,
         partition_key: PartitionKey,
         sort_key_ids: SortKeyIds,
@@ -648,10 +472,11 @@ impl Partition {
         cold_compact_at: Option<Timestamp>,
         created_at: Option<Timestamp>,
         max_time: Option<i64>,
+        estimated_size_bytes: Option<i64>,
     ) -> Self {
         Self {
             id,
-            hash_id,
+            hash_id: PartitionHashId::new(table_id, &partition_key),
             table_id,
             partition_key,
             sort_key_ids,
@@ -659,19 +484,13 @@ impl Partition {
             cold_compact_at,
             created_at,
             max_time,
-            estimated_size_bytes: None,
+            estimated_size_bytes,
         }
     }
 
-    /// If this partition has a `PartitionHashId` stored in the catalog, use that. Otherwise, use
-    /// the database-assigned `PartitionId`.
-    pub fn transition_partition_id(&self) -> TransitionPartitionId {
-        TransitionPartitionId::from((self.id, self.hash_id.as_ref()))
-    }
-
-    /// The unique hash derived from the table ID and partition key, if it exists in the catalog.
-    pub fn hash_id(&self) -> Option<&PartitionHashId> {
-        self.hash_id.as_ref()
+    /// The unique hash derived from the table ID and partition key
+    pub fn hash_id(&self) -> &PartitionHashId {
+        &self.hash_id
     }
 
     /// The sort key IDs, if the sort key has been set
@@ -712,8 +531,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    use assert_matches::assert_matches;
-    use proptest::{prelude::*, proptest};
+    use proptest::proptest;
 
     /// A fixture test asserting the partition hash generation
     /// algorithm outputs a fixed value, preventing accidental changes to the
@@ -730,21 +548,6 @@ pub(crate) mod tests {
             "ebd1041daa7c644c99967b817ae607bdcb754c663f2c415f270d6df720280f7a",
             partition_hash_id.to_string()
         );
-    }
-
-    prop_compose! {
-        /// Return an arbitrary [`TransitionPartitionId`] with a randomised ID
-        /// value.
-        pub fn arbitrary_partition_id()(
-            use_hash in any::<bool>(),
-            row_id in any::<i64>(),
-            hash_id in any::<[u8; PARTITION_HASH_ID_SIZE_BYTES]>()
-        ) -> TransitionPartitionId {
-            match use_hash {
-                true => TransitionPartitionId::Hash(PartitionHashId(hash_id.into())),
-                false => TransitionPartitionId::Catalog(PartitionId::new(row_id)),
-            }
-        }
     }
 
     proptest! {
@@ -785,48 +588,6 @@ pub(crate) mod tests {
             let from_string = PartitionHashId::try_from(&bytes_from_string[..]).unwrap();
             assert_eq!(from_string, partition_hash_id);
         }
-
-        /// Assert a [`TransitionPartitionId`] is round-trippable through proto
-        /// serialisation.
-        #[test]
-        fn prop_partition_id_proto_round_trip(id in arbitrary_partition_id()) {
-            use generated_types::influxdata::iox::catalog::v1 as proto;
-
-            // Encoding is infallible
-            let encoded = proto::PartitionIdentifier::from(id.clone());
-
-            // Decoding a valid ID is infallible.
-            let decoded = TransitionPartitionId::try_from(encoded).unwrap();
-
-            // The deserialised value must match the input (round trippable)
-            assert_eq!(decoded, id);
-        }
-    }
-
-    #[test]
-    fn test_proto_no_id() {
-        use generated_types::influxdata::iox::catalog::v1 as proto;
-
-        let msg = proto::PartitionIdentifier { id: None };
-
-        assert_matches!(
-            TransitionPartitionId::try_from(msg),
-            Err(PartitionIdProtoError::NoId)
-        );
-    }
-
-    #[test]
-    fn test_proto_bad_hash() {
-        use generated_types::influxdata::iox::catalog::v1 as proto;
-
-        let msg = proto::PartitionIdentifier {
-            id: Some(proto::partition_identifier::Id::HashId(vec![42])),
-        };
-
-        assert_matches!(
-            TransitionPartitionId::try_from(msg),
-            Err(PartitionIdProtoError::InvalidHashId(_))
-        );
     }
 
     #[test]

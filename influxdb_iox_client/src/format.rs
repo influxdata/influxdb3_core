@@ -40,10 +40,11 @@ pub enum Error {
 }
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 /// Requested output format for the query endpoint
 pub enum QueryOutputFormat {
     /// Arrow pretty printer format (default)
+    #[default]
     Pretty,
     /// Comma separated values
     Csv,
@@ -58,12 +59,6 @@ impl Display for QueryOutputFormat {
             Self::Csv => write!(f, "csv"),
             Self::Json => write!(f, "json"),
         }
-    }
-}
-
-impl Default for QueryOutputFormat {
-    fn default() -> Self {
-        Self::Pretty
     }
 }
 

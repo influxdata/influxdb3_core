@@ -1,6 +1,6 @@
 #![expect(missing_copy_implementations)]
 
-use std::{sync::LazyLock, time::Duration};
+use std::{sync::OnceLock, time::Duration};
 
 use tikv_jemalloc_ctl::{epoch as epoch_ctl, stats};
 use tokio::{sync::watch, task::JoinHandle};
@@ -17,8 +17,9 @@ pub use monitor::{AllocationMonitor, AllocationMonitorError};
 /// [`Refresher::handle()`] to obtain periodic updates.
 ///
 /// The first reference to [`STATS`] MUST be made from within an async tokio
-/// runtime.
-pub static STATS: LazyLock<Refresher> = LazyLock::new(Refresher::new);
+/// runtime because a background tokio task is spawned by the initialised
+/// [`Refresher`].
+pub static STATS: OnceLock<Refresher> = OnceLock::new();
 
 /// Defines the frequency at which updated [`Stats`] are obtained and published.
 ///
@@ -58,7 +59,7 @@ impl Refresher {
     /// Construct a new [`Stats`].
     ///
     /// Intentionally non-pub to enforce a singleton exposed via [`STATS`].
-    fn new() -> Self {
+    pub fn new(tick_duration: Duration) -> Self {
         let (tx, rx) = watch::channel(Stats::default());
 
         Self {
@@ -66,7 +67,7 @@ impl Refresher {
 
             // Spawn a background task to ask jemalloc to refresh the statistics
             // periodically, and publish the result.
-            refresh_task: tokio::task::spawn(refresh(tx)),
+            refresh_task: tokio::task::spawn(refresh(tx, tick_duration)),
         }
     }
 
@@ -82,8 +83,8 @@ impl Refresher {
     /// ```rust
     /// # fn do_slow_thing() {}
     /// # let _guard = tokio::runtime::Runtime::new().unwrap().enter();
-    /// #
-    /// let handle = jemalloc_stats::STATS.handle();
+    /// # let REFRESH_INTERVAL = std::time::Duration::from_millis(9100);
+    /// let handle = jemalloc_stats::STATS.get_or_init(|| jemalloc_stats::Refresher::new(REFRESH_INTERVAL)).handle();
     ///
     /// // Good:
     /// let stats = handle.borrow().clone();
@@ -104,7 +105,7 @@ impl Drop for Refresher {
     }
 }
 
-async fn refresh(tx: watch::Sender<Stats>) {
+async fn refresh(tx: watch::Sender<Stats>, tick_duration: Duration) {
     let epoch = epoch_ctl::mib().unwrap();
     let active = stats::active::mib().unwrap();
     let allocated = stats::allocated::mib().unwrap();
@@ -135,7 +136,7 @@ async fn refresh(tx: watch::Sender<Stats>) {
             return;
         }
 
-        tokio::time::sleep(REFRESH_INTERVAL).await;
+        tokio::time::sleep(tick_duration).await;
     }
 }
 
@@ -147,7 +148,8 @@ mod tests {
     /// reported.
     #[tokio::test]
     async fn test_stats() {
-        let handle = STATS.handle();
+        let stats = STATS.get_or_init(|| Refresher::new(REFRESH_INTERVAL));
+        let handle = stats.handle();
 
         tokio::time::timeout(Duration::from_secs(10), async move {
             loop {

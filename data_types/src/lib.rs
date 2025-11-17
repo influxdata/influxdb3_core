@@ -810,15 +810,30 @@ pub struct TableSchema {
 
     /// the table's columns by their name
     pub columns: ColumnsByName,
+
+    /// Whether or not iceberg is enabled for this table
+    pub iceberg_enabled: bool,
 }
 
 impl TableSchema {
-    /// Initialize new `TableSchema` from the information in the given `Table`.
+    /// Initialize new [`TableSchema`] from the information in the given [`Table`].
     pub fn new_empty_from(table: &Table) -> Self {
         Self {
             id: table.id,
             partition_template: table.partition_template.clone(),
             columns: ColumnsByName::default(),
+            iceberg_enabled: table.iceberg_enabled,
+        }
+    }
+
+    /// Initialize a new [`TableSchema`] with the given id, no columns, default partition, and
+    /// iceberg disabled.
+    pub fn new_with(id: TableId) -> Self {
+        Self {
+            id,
+            partition_template: TablePartitionTemplateOverride::default(),
+            columns: ColumnsByName::default(),
+            iceberg_enabled: false,
         }
     }
 
@@ -1077,8 +1092,8 @@ pub struct ParquetFile {
     pub table_id: TableId,
     /// the partition identifier
     pub partition_id: PartitionId,
-    /// the optional partition hash id
-    pub partition_hash_id: Option<PartitionHashId>,
+    /// the partition hash id
+    pub partition_hash_id: PartitionHashId,
     /// the uuid used in the object store path for this file
     pub object_store_id: ObjectStoreId,
     /// the min timestamp of data in this file
@@ -1178,11 +1193,7 @@ impl ParquetFile {
 
     /// Estimate the memory consumption of this object and its contents
     pub fn size(&self) -> usize {
-        let hash_id = self
-            .partition_hash_id
-            .as_ref()
-            .map(|x| x.size())
-            .unwrap_or_default();
+        let hash_id = self.partition_hash_id.size();
 
         size_of_val(self) + hash_id + self.column_set.size() - size_of_val(&self.column_set)
     }
@@ -1208,11 +1219,6 @@ impl ParquetFile {
         }
         false
     }
-
-    /// Temporary to aid incremental migration
-    pub fn transition_partition_id(&self) -> TransitionPartitionId {
-        TransitionPartitionId::from_parts(self.partition_id, self.partition_hash_id.clone())
-    }
 }
 
 impl From<ParquetFile> for catalog_proto::ParquetFile {
@@ -1222,10 +1228,7 @@ impl From<ParquetFile> for catalog_proto::ParquetFile {
             namespace_id: v.namespace_id.get(),
             table_id: v.table_id.get(),
             partition_id: v.partition_id.get(),
-            partition_hash_id: v
-                .partition_hash_id
-                .map(|x| x.as_bytes().to_vec())
-                .unwrap_or_default(),
+            partition_hash_id: v.partition_hash_id.as_bytes().to_vec(),
             object_store_id: v.object_store_id.to_string(),
             min_time: v.min_time.get(),
             max_time: v.max_time.get(),
@@ -1266,11 +1269,7 @@ impl TryFrom<catalog_proto::ParquetFile> for ParquetFile {
             namespace_id: NamespaceId::new(v.namespace_id),
             table_id: TableId::new(v.table_id),
             partition_id: PartitionId::new(v.partition_id),
-            partition_hash_id: if v.partition_hash_id.is_empty() {
-                None
-            } else {
-                Some(v.partition_hash_id[..].try_into()?)
-            },
+            partition_hash_id: v.partition_hash_id[..].try_into()?,
             object_store_id: ObjectStoreId::from_str(&v.object_store_id)?,
             min_time: Timestamp::new(v.min_time),
             max_time: Timestamp::new(v.max_time),
@@ -1295,10 +1294,6 @@ pub enum ParquetFileProtoError {
     /// The proto type does not contain a partition ID.
     #[error("no partition id specified for parquet file")]
     NoPartitionId,
-
-    /// The specified partition ID is invalid.
-    #[error(transparent)]
-    InvalidPartitionId(#[from] PartitionIdProtoError),
 
     /// The specified object store UUID is invalid.
     #[error("invalid object store ID: {0}")]
@@ -1346,7 +1341,7 @@ pub struct ParquetFileParams {
     /// the partition identifier
     pub partition_id: PartitionId,
     /// the partition hash ID
-    pub partition_hash_id: Option<PartitionHashId>,
+    pub partition_hash_id: PartitionHashId,
     /// the uuid used in the object store path for this file
     pub object_store_id: ObjectStoreId,
     /// the min timestamp of data in this file
@@ -3329,6 +3324,7 @@ mod tests {
             id: TableId::new(1),
             partition_template: Default::default(),
             columns: ColumnsByName::default(),
+            iceberg_enabled: false,
         };
         let schema2 = TableSchema {
             id: TableId::new(2),
@@ -3339,6 +3335,7 @@ mod tests {
                 name: String::from("foo"),
                 column_type: ColumnType::Bool,
             }]),
+            iceberg_enabled: false,
         };
         assert!(schema1.size() < schema2.size());
     }
@@ -3361,11 +3358,7 @@ mod tests {
             id: NamespaceId::new(1),
             active_tables: BTreeMap::from([(
                 String::from("foo"),
-                TableSchema {
-                    id: TableId::new(1),
-                    columns: ColumnsByName::default(),
-                    partition_template: Default::default(),
-                },
+                TableSchema::new_with(TableId::new(1)),
             )]),
             deleted_tables: BTreeSet::new(),
             partition_template: Default::default(),
@@ -3412,41 +3405,13 @@ mod tests {
 
     #[test]
     fn catalog_service_parquet_file_serde_roundtrip() {
-        // This part of the test can be removed when all partitions have hash IDs.
-        let old_style_parquet_file = ParquetFile {
-            id: ParquetFileId::new(3),
-            namespace_id: NamespaceId::new(4),
-            table_id: TableId::new(5),
-            partition_id: PartitionId::new(6),
-            partition_hash_id: None, // this is the important part for this test
-            object_store_id: ObjectStoreId::new(),
-            min_time: Timestamp::new(30),
-            max_time: Timestamp::new(50),
-            to_delete: None,
-            file_size_bytes: 1024,
-            row_count: 42,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(70),
-            column_set: ColumnSet::empty(),
-            max_l0_created_at: Timestamp::new(70),
-            source: None,
-        };
-        let catalog_proto_old_style_parquet_file =
-            catalog_proto::ParquetFile::from(old_style_parquet_file.clone());
-        let round_trip_old_style_parquet_file =
-            ParquetFile::try_from(catalog_proto_old_style_parquet_file).unwrap();
-        assert_eq!(old_style_parquet_file, round_trip_old_style_parquet_file);
-
         let table_id = TableId::new(5);
         let parquet_file = ParquetFile {
             id: ParquetFileId::new(3),
             namespace_id: NamespaceId::new(4),
             table_id,
             partition_id: PartitionId::new(6),
-            partition_hash_id: Some(PartitionHashId::new(
-                table_id,
-                &PartitionKey::from("arbitrary"),
-            )),
+            partition_hash_id: PartitionHashId::new(table_id, &PartitionKey::from("arbitrary")),
             object_store_id: ObjectStoreId::new(),
             min_time: Timestamp::new(30),
             max_time: Timestamp::new(50),

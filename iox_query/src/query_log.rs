@@ -8,7 +8,7 @@ use datafusion::physical_plan::{
     ExecutionPlan,
     metrics::{MetricValue, MetricsSet},
 };
-use influxdb_iox_client::write::Client as WriteClient;
+use influxdb_iox_client::batched_write::MaybeBatchedWriteClient as WriteClient;
 use influxdb_line_protocol::LineProtocolBuilder;
 use iox_query_params::StatementParams;
 use iox_time::{Time, TimeProvider};
@@ -230,6 +230,7 @@ impl QueryLogEntryState {
 
         let mut lp = builder
             .measurement(measurement_name)
+            .tag("id", &self.id.to_string())
             .tag("namespace_id", &self.namespace_id.get().to_string())
             .tag("namespace_name", &self.namespace_name)
             .tag("query_type", self.query_type)
@@ -1477,7 +1478,7 @@ mod test_super {
 
         insta::assert_snapshot!(
             format_line_protocol(&lp),
-            @r#"query_log_test,namespace_id=1,namespace_name=ns,query_type=sql,phase=cancel running="false",success="false",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i,end_to_end_duration_ns=0u 1000000000000000000"#
+            @r#"query_log_test,id=00000000-0000-0000-0000-000000000001,namespace_id=1,namespace_name=ns,query_type=sql,phase=cancel running="false",success="false",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i,end_to_end_duration_ns=0u 1000000000000000000"#
         );
     }
 
@@ -1510,7 +1511,7 @@ mod test_super {
         let lp = lp_builder.build();
         insta::assert_snapshot!(
             format_line_protocol(&lp),
-            @r#"query_log_test,namespace_id=1,namespace_name=ns,query_type=sql,phase=success running="false",success="true",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i,partition_count=0u,parquet_file_count=0u,permit_duration_ns=2000000u,plan_duration_ns=1000000u,execute_duration_ns=5000000u,end_to_end_duration_ns=8000000u,compute_duration_ns=1337000000u,max_memory_bytes=0i,ingester_latency_to_plan_ns=0u,ingester_latency_to_full_data_ns=0u,ingester_response_row_count=0u,ingester_response_size_bytes=0u,ingester_partition_count=0u 1000000000000000000"#);
+            @r#"query_log_test,id=00000000-0000-0000-0000-000000000001,namespace_id=1,namespace_name=ns,query_type=sql,phase=success running="false",success="true",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i,partition_count=0u,parquet_file_count=0u,permit_duration_ns=2000000u,plan_duration_ns=1000000u,execute_duration_ns=5000000u,end_to_end_duration_ns=8000000u,compute_duration_ns=1337000000u,max_memory_bytes=0i,ingester_latency_to_plan_ns=0u,ingester_latency_to_full_data_ns=0u,ingester_response_row_count=0u,ingester_response_size_bytes=0u,ingester_partition_count=0u 1000000000000000000"#);
     }
 
     #[test]
@@ -1550,7 +1551,7 @@ mod test_super {
 
         insta::assert_snapshot!(
             format_line_protocol(&lp),
-            @r#"query_log_test,namespace_id=1,namespace_name=ns,query_type=sql,phase=received,auth_id=user123,trace_id=42 running="true",success="false",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i 1000000000000000000"#
+            @r#"query_log_test,id=00000000-0000-0000-0000-000000000001,namespace_id=1,namespace_name=ns,query_type=sql,phase=received,auth_id=user123,trace_id=42 running="true",success="false",query_text="SELECT 1",query_params="Params { }",query_issue_time_ns=100000000i 1000000000000000000"#
         );
     }
 

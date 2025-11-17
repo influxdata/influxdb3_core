@@ -270,7 +270,12 @@ impl Error {
         // walk cause chain to display full details
         // see https://github.com/influxdata/influxdb_iox/issues/12373
         let err = DisplaySourceChain::new(self);
-        let msg = err.to_string();
+
+        // limit msg length
+        let mut msg = err.to_string();
+        if msg.len() > 2_000 {
+            msg = format!("{}...", &msg[..2_000]);
+        }
 
         let code = match err.into_inner() {
             Self::DatabaseNotFound { .. } => Code::NotFound,

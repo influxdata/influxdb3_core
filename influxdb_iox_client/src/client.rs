@@ -47,3 +47,6 @@ pub mod test;
 
 /// Client for write API
 pub mod write;
+
+/// Batched write client for efficient bulk writes
+pub mod batched_write;

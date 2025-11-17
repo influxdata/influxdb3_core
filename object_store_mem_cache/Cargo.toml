@@ -12,15 +12,17 @@ bytes = { version = "1.10.1", default-features = false }
 dashmap = "6.1.0"
 data_types = { path = "../data_types" }
 futures = { version = "0.3.31" }
-indexmap = { version = "2.11", features = ["std"] }
+http = { workspace = true }
+indexmap = { version = "2.12", features = ["std"] }
 iox_time = { path = "../iox_time" }
+linear_buffer = { path = "../linear_buffer" }
 metric = { path = "../metric" }
 object_store.workspace = true
 object_store_metrics = { path = "../object_store_metrics" }
 object_store_mock = { path = "../object_store_mock" }
 object_store_size_hinting = { path = "../object_store_size_hinting" }
 tracing = { workspace = true }
-tokio = { version = "1.47.1", default-features = false }
+tokio = { version = "1.48.0", default-features = false }
 tracker = { path = "../tracker" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

@@ -5,6 +5,7 @@ pub(crate) mod context;
 pub mod gapfill;
 mod metrics;
 pub mod query_tracing;
+pub mod series_limit;
 pub mod sleep;
 pub(crate) mod split;
 use datafusion_util::config::register_iox_object_store;
@@ -371,7 +372,7 @@ impl Executor {
 ///  c | 2000
 /// ```
 ///
-/// A StreamSplit with split_exprs = [`time <= 1000`, `1000 < time <=2000`] will produce the
+/// A StreamSplit with split_exprs = \[`time <= 1000`, `1000 < time <=2000`\] will produce the
 /// following three output streams (output DataFusion Partitions):
 ///
 ///

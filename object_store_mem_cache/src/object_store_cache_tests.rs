@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use http::Extensions;
 use object_store::{
-    DynObjectStore, Error, GetResult, GetResultPayload, ObjectMeta, PutPayload, path::Path,
+    DynObjectStore, Error, GetOptions, GetResult, GetResultPayload, ObjectMeta, PutPayload,
+    path::Path,
 };
 
 /// Abstract test setup.
@@ -25,6 +27,11 @@ pub trait Setup: Send {
     ///
     /// This store MUST reject writes.
     fn outer(&self) -> &Arc<DynObjectStore>;
+
+    /// Extensions used by the store.
+    fn extensions(&self) -> Extensions {
+        Default::default()
+    }
 }
 
 fn get_result(data: &'static [u8], path: &Path) -> GetResult {
@@ -53,14 +60,19 @@ where
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
 
+    let get_ops = GetOptions {
+        extensions: setup.extensions(),
+        ..Default::default()
+    };
+
     Arc::clone(setup.inner())
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_a.clone(), Default::default()),
+            params: (location_a.clone(), get_ops.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"foo", &location_a)),
         })
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_b.clone(), Default::default()),
+            params: (location_b.clone(), get_ops.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"bar", &location_b)),
         });
@@ -107,14 +119,19 @@ where
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
 
+    let get_ops = GetOptions {
+        extensions: setup.extensions(),
+        ..Default::default()
+    };
+
     Arc::clone(setup.inner())
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_a.clone(), Default::default()),
+            params: (location_a.clone(), get_ops.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"foo", &location_a)),
         })
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_b.clone(), Default::default()),
+            params: (location_b.clone(), get_ops.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"bar", &location_b)),
         });
@@ -147,8 +164,13 @@ where
 
     let location = Path::parse("x").unwrap();
 
+    let get_ops = GetOptions {
+        extensions: setup.extensions(),
+        ..Default::default()
+    };
+
     Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
-        params: (location.clone(), Default::default()),
+        params: (location.clone(), get_ops.clone().into()),
         barriers: vec![],
         res: Err(Error::NotFound {
             path: location.to_string(),
@@ -171,23 +193,28 @@ where
 
     let location = Path::parse("x").unwrap();
 
+    let get_ops = GetOptions {
+        extensions: setup.extensions(),
+        ..Default::default()
+    };
+
     Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
-        params: (location.clone(), Default::default()),
+        params: (location.clone(), get_ops.clone().into()),
         barriers: vec![],
         res: Ok(get_result(b"foo", &location)),
     });
     let res_1 = setup.outer().get(&location).await.unwrap();
     assert_eq!(
-        CacheState::try_from(res_1.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
-        CacheState::NewEntry,
+        CacheStateKind::try_from(res_1.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
+        CacheStateKind::NewEntry,
     );
     let data_1 = res_1.bytes().await.unwrap();
     assert_eq!(data_1.as_ref(), b"foo");
 
     let res_2 = setup.outer().get(&location).await.unwrap();
-    assert_eq!(
-        CacheState::try_from(res_2.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
-        CacheState::WasCached,
+    assert_ne!(
+        CacheStateKind::try_from(res_2.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
+        CacheStateKind::NewEntry, // should be loading, or in cache
     );
     let data_2 = res_2.bytes().await.unwrap();
     assert_eq!(data_1, data_2);
@@ -221,8 +248,11 @@ where
     let location = Path::parse("x").unwrap();
     let data = b"foo";
 
+    let mut get_ops = hint_size(data.len() as u64);
+    get_ops.extensions.extend(setup.extensions());
+
     Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
-        params: (location.clone(), hint_size(data.len() as u64).into()),
+        params: (location.clone(), get_ops.clone().into()),
         barriers: vec![],
         res: Ok(get_result(data, &location)),
     });
@@ -304,6 +334,6 @@ macro_rules! gen_store_tests {
 
 pub use gen_store_tests;
 
-use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheState};
+use object_store_metrics::cache_state::{ATTR_CACHE_STATE, CacheStateKind};
 use object_store_mock::MockStore;
 use object_store_size_hinting::hint_size;

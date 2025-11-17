@@ -17,6 +17,8 @@ pub enum Action {
     ReadSchema,
     /// The write action is used when data is being written to the resource.
     Write,
+    /// The describe action is used when non-schema resource metadata is being read.
+    Describe,
 }
 
 impl TryFrom<proto::resource_action_permission::Action> for Action {
@@ -34,14 +36,17 @@ impl TryFrom<proto::resource_action_permission::Action> for Action {
     }
 }
 
-impl From<Action> for proto::resource_action_permission::Action {
-    fn from(value: Action) -> Self {
+impl TryFrom<Action> for proto::resource_action_permission::Action {
+    type Error = IncompatiblePermissionError;
+
+    fn try_from(value: Action) -> Result<Self, Self::Error> {
         match value {
-            Action::Create => Self::Create,
-            Action::Delete => Self::Delete,
-            Action::Read => Self::Read,
-            Action::ReadSchema => Self::ReadSchema,
-            Action::Write => Self::Write,
+            Action::Create => Ok(Self::Create),
+            Action::Delete => Ok(Self::Delete),
+            Action::Read => Ok(Self::Read),
+            Action::ReadSchema => Ok(Self::ReadSchema),
+            Action::Write => Ok(Self::Write),
+            _ => Err(IncompatiblePermissionError {}),
         }
     }
 }
@@ -97,7 +102,7 @@ impl TryFrom<Permission> for proto::Permission {
         match value {
             Permission::ResourceAction(r, a) => {
                 let (resource_type, target) = r.try_into_proto()?;
-                let a: proto::resource_action_permission::Action = a.into();
+                let a: proto::resource_action_permission::Action = a.try_into()?;
                 Ok(Self {
                     permission_one_of: Some(proto::permission::PermissionOneOf::ResourceAction(
                         proto::ResourceActionPermission {
@@ -221,23 +226,23 @@ mod tests {
     fn action_into_proto() {
         assert_eq!(
             proto::resource_action_permission::Action::Create,
-            proto::resource_action_permission::Action::from(Action::Create)
+            proto::resource_action_permission::Action::try_from(Action::Create).unwrap()
         );
         assert_eq!(
             proto::resource_action_permission::Action::Delete,
-            proto::resource_action_permission::Action::from(Action::Delete)
+            proto::resource_action_permission::Action::try_from(Action::Delete).unwrap()
         );
         assert_eq!(
             proto::resource_action_permission::Action::Read,
-            proto::resource_action_permission::Action::from(Action::Read)
+            proto::resource_action_permission::Action::try_from(Action::Read).unwrap()
         );
         assert_eq!(
             proto::resource_action_permission::Action::ReadSchema,
-            proto::resource_action_permission::Action::from(Action::ReadSchema)
+            proto::resource_action_permission::Action::try_from(Action::ReadSchema).unwrap()
         );
         assert_eq!(
             proto::resource_action_permission::Action::Write,
-            proto::resource_action_permission::Action::from(Action::Write)
+            proto::resource_action_permission::Action::try_from(Action::Write).unwrap()
         );
     }
 

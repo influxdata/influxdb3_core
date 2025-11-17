@@ -181,6 +181,14 @@ message GetTablesWithStorageRequest {
   // Filter by soft-deleted status
   // If not specified, only the active tables are returned
   optional influxdata.iox.common.v1.SoftDeleted deleted = 6;
+
+  // Filter tables by name (case-insensitive partial match)
+  // If provided, only tables with names containing this string are returned
+  optional string name_filter = 7;
+
+  // Filter tables by ID (partial match)
+  // If provided, only tables with IDs containing this string are returned
+  optional string id_filter = 8;
 }
 
 // Request to get a specific table with storage.
@@ -212,6 +220,7 @@ message GetTableWithStorageResponse {
 // Request to enable iceberg exports for the given table.
 message EnableIcebergRequest {
   int64 table_id = 1;
+  int64 namespace_id = 2;
 }
 
 message EnableIcebergResponse {}
@@ -219,6 +228,7 @@ message EnableIcebergResponse {}
 // Request to disable iceberg exports for the given table.
 message DisableIcebergRequest {
   int64 table_id = 1;
+  int64 namespace_id = 2;
 }
 
 message DisableIcebergResponse {}

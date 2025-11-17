@@ -14,7 +14,7 @@ use tracker::{LockMetrics, Mutex};
 
 use crate::{
     StoreType,
-    cache_state::{ATTR_CACHE_STATE, CacheState},
+    cache_state::{ATTR_CACHE_STATE, CacheStateKind},
 };
 
 pub(crate) const CACHE_METRIC_BYTES: &str = "parquet_cache_bytes";
@@ -206,18 +206,18 @@ impl ObjectStoreCacheMetrics {
     fn register_get(&self, location: &Path, size: u64, result_attributes: &Attributes) {
         if let Some(state) = result_attributes
             .get(&ATTR_CACHE_STATE)
-            .and_then(|val| CacheState::try_from(val).ok())
+            .and_then(|val| CacheStateKind::try_from(val).ok())
         {
             match state {
-                CacheState::NewEntry => {
+                CacheStateKind::NewEntry => {
                     self.has_filter
                         .register_miss(&self.store_type, location, size);
                 }
-                CacheState::AlreadyLoading => {
+                CacheStateKind::AlreadyLoading => {
                     self.bytes_cache_miss_already_loading.record(size);
                     debug!(state="MISS_ALREADY_LOADING", store_type=self.store_type.0.as_ref(), %location, "object store cache");
                 }
-                CacheState::WasCached => {
+                CacheStateKind::WasCached => {
                     self.bytes_cache_hit.record(size);
                     debug!(state="HIT", store_type=self.store_type.0.as_ref(), %location, "object store cache");
                 }
@@ -1061,10 +1061,15 @@ mod tests {
         let capture = capture();
 
         let location = path();
+
+        let mut get_opts = GetOptions::default();
+        let (tx, _rx) = object_store_mem_cache::buffer_channel::channel();
+        get_opts.extensions.insert(tx);
+
         let barrier = Arc::new(Barrier::new(2));
         let inner: Arc<dyn ObjectStore> = MockStore::new()
             .mock_next(GetOpts {
-                params: (location.clone(), Default::default()),
+                params: (location.clone(), get_opts.into()),
                 barriers: vec![Arc::clone(&barrier)],
                 res: Ok(get_result_stream()),
             })

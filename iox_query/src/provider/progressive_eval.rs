@@ -24,7 +24,7 @@ use futures::{Stream, StreamExt, ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::config::IoxConfigExt;
 use crate::physical_optimizer::sort::lexical_range::LexicalRange;
@@ -312,12 +312,9 @@ impl InputStreams {
         let current_stream_idx = 0;
         let mut current_input_stream = None;
         let mut capacity = 0;
+        // Can be one if there is a single input stream
         if num_input_streams_to_prefetch > 1 {
             capacity = num_input_streams_to_prefetch - 1;
-        } else {
-            warn!(
-                "num_input_streams_to_prefetch is {num_input_streams_to_prefetch} and not greater than 1"
-            );
         }
         let mut prefetched_input_streams = Vec::with_capacity(capacity);
 

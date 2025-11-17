@@ -97,18 +97,22 @@ impl CatalogCacheClientBuilder {
             },
         );
 
-        // Note: do NOT set `.timeout` here because we set the timeout per request type.
-        let client = Client::builder()
-            .connect_timeout(connect_timeout)
-            .dns_resolver(Arc::new(Resolver::new(&registry)))
-            .http2_prior_knowledge()
-            .http2_adaptive_window(true)
-            .build()
-            .context(ClientSnafu)?;
+        let dns_resolver = Arc::new(Resolver::new(&registry));
+        let client_builder = Box::new(move || {
+            // Note: do NOT set `.timeout` here because we set the timeout per request type.
+            Client::builder()
+                .connect_timeout(connect_timeout)
+                .dns_resolver(Arc::clone(&dns_resolver))
+                .http2_prior_knowledge()
+                .http2_adaptive_window(true)
+                .build()
+        });
+        let client = client_builder().context(ClientSnafu)?;
 
         Ok(CatalogCacheClient {
             endpoint,
             client,
+            client_builder,
             get_request_timeout,
             put_request_timeout,
             list_request_timeout,
@@ -161,9 +165,9 @@ impl CatalogCacheClientBuilder {
 }
 
 /// A client for accessing a remote catalog cache
-#[derive(Debug)]
 pub struct CatalogCacheClient {
     client: Client,
+    client_builder: Box<dyn Fn() -> Result<Client, reqwest::Error> + Send + Sync>,
     endpoint: Url,
     get_request_timeout: Duration,
     put_request_timeout: Duration,
@@ -296,8 +300,17 @@ impl CatalogCacheClient {
         let size = max_value_size.unwrap_or(MAX_VALUE_SIZE);
         url.set_query(Some(&format!("size={size}")));
 
-        let fut = self
-            .client
+        // use dedicated client connection for LIST to bypass potential rate limits
+        let client = match (self.client_builder)() {
+            Ok(c) => c,
+            Err(e) => {
+                return futures::stream::once(async move {
+                    Err(crate::api::list::Error::Reqwest { source: e })
+                })
+                .boxed();
+            }
+        };
+        let fut = client
             .get(url)
             .header(ACCEPT, &LIST_PROTOCOL_V2)
             .timeout(self.list_request_timeout)
@@ -315,6 +328,28 @@ impl CatalogCacheClient {
             })
             .try_flatten()
             .boxed()
+    }
+}
+
+impl std::fmt::Debug for CatalogCacheClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client,
+            client_builder: _,
+            endpoint,
+            get_request_timeout,
+            put_request_timeout,
+            list_request_timeout,
+        } = self;
+
+        f.debug_struct("CatalogCacheClient")
+            .field("client", client)
+            .field("client_builder", &"<CLIENT_BUILDER>")
+            .field("endpoint", endpoint)
+            .field("get_request_timeout", get_request_timeout)
+            .field("put_request_timeout", put_request_timeout)
+            .field("list_request_timeout", list_request_timeout)
+            .finish()
     }
 }
 

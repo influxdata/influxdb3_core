@@ -1,10 +1,11 @@
 use bincode::{Decode, Encode};
 use dashmap::DashMap;
 use std::{
+    collections::{HashSet, VecDeque},
     fmt::{Debug, Formatter},
     hash::Hash,
     sync::{
-        Arc,
+        Arc, RwLock, RwLockReadGuard,
         atomic::{AtomicU8, Ordering},
     },
 };
@@ -24,7 +25,7 @@ where
     K: ?Sized,
 {
     key: Arc<K>,
-    value: V,
+    value: RwLock<V>,
     generation: u64,
     freq: AtomicU8,
 }
@@ -33,8 +34,8 @@ impl<K, V> S3FifoEntry<K, V>
 where
     K: ?Sized,
 {
-    pub(crate) fn value(&self) -> &V {
-        &self.value
+    pub(crate) fn value(&self) -> RwLockReadGuard<'_, V> {
+        self.value.read().expect("not poisoned")
     }
 }
 
@@ -50,26 +51,33 @@ where
             generation: _,
             freq: _,
         } = self;
-        key.size() + value.size()
+        key.size() + value.read().expect("not poisoned").size()
     }
 }
 
-/// The arc'ed version of [`S3FifoEntry`].
-///
-/// This arc is shared between the `S3Fifo.entries` and the locked state.
-/// Therefore we want to not consider the arc's ref count
-/// in determining in-use status.
-impl<K, V> InUse for Arc<S3FifoEntry<K, V>>
+impl<K, V> InUse for S3FifoEntry<K, V>
 where
     K: Send + Sync + ?Sized,
     V: InUse,
 {
-    fn in_use(&self) -> bool
+    fn in_use(&mut self) -> bool
     where
         Self: Sized,
     {
-        self.value.in_use()
+        self.value.write().expect("not poisoned").in_use()
     }
+}
+
+/// This arc is shared between the `S3Fifo.entries` and the locked state.
+/// Therefore, we want to not consider the arc's ref count
+/// in determining in-use status.
+fn entry_likely_in_use<K, V>(entry: &Arc<S3FifoEntry<K, V>>) -> bool
+where
+    K: Send + Sync + ?Sized,
+    V: InUse,
+{
+    // NOTE: try the exclusive lock AFTER performing the cheap `Arc` check
+    Arc::strong_count(entry) > 2 || entry.value.write().expect("not poisoned").in_use()
 }
 
 impl<K, V> Encode for S3FifoEntry<K, V>
@@ -81,10 +89,18 @@ where
         &self,
         encoder: &mut E,
     ) -> Result<(), bincode::error::EncodeError> {
-        self.key.encode(encoder)?;
-        self.value.encode(encoder)?;
-        self.generation.encode(encoder)?;
-        self.freq.load(Ordering::SeqCst).encode(encoder)?;
+        let Self {
+            key,
+            value,
+            generation,
+            freq,
+        } = self;
+
+        key.encode(encoder)?;
+        value.read().expect("not poisoned").encode(encoder)?;
+        generation.encode(encoder)?;
+        freq.load(Ordering::SeqCst).encode(encoder)?;
+
         Ok(())
     }
 }
@@ -105,7 +121,7 @@ where
 
         Ok(Self {
             key,
-            value,
+            value: RwLock::new(value),
             generation,
             freq: AtomicU8::new(freq_val),
         })
@@ -118,9 +134,33 @@ where
     V: AsyncDrop,
 {
     fn async_drop(self) -> impl Future<Output = ()> + Send {
+        let Self {
+            key: _,
+            value,
+            generation: _,
+            freq: _,
+        } = self;
+
         // perform the async drop on the value
-        self.value.async_drop()
+        value.into_inner().expect("not poisoned").async_drop()
     }
+}
+
+/// Returns the overhead size of the [`S3FifoEntry`]
+/// placed into the S3 Fifo cache manager.
+///
+/// This is useful for testing, since it's the size used
+/// for eviction decisions.
+pub fn s3_fifo_entry_overhead_size() -> usize {
+    // The overhead size is the size of the S3FifoEntry<V> struct,
+    // which is used to store the cache entry in the S3 FIFO cache manager.
+    Arc::new(S3FifoEntry {
+        key: Arc::new(()),
+        value: RwLock::new(Arc::new(())),
+        generation: 0,
+        freq: AtomicU8::new(0),
+    })
+    .size()
 }
 
 pub(crate) type CacheEntry<K, V> = Arc<S3FifoEntry<K, V>>;
@@ -137,7 +177,7 @@ pub(crate) type Evicted<K, V> = Vec<Arc<S3FifoEntry<K, V>>>;
 /// [S3-FIFO]: https://s3fifo.com/
 pub struct S3Fifo<K, V>
 where
-    K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
+    K: Debug + Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
     V: HasSize + InUse + Send + Sync + 'static,
 {
     locked_state: Mutex<LockedState<K, V>>,
@@ -147,7 +187,7 @@ where
 
 impl<K, V> Debug for S3Fifo<K, V>
 where
-    K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
+    K: Debug + Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
     V: HasSize + InUse + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -160,7 +200,7 @@ where
 
 impl<K, V> S3Fifo<K, V>
 where
-    K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
+    K: Debug + Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
     V: HasSize + InUse + Send + Sync + 'static,
 {
     /// Create new, empty set.
@@ -278,7 +318,7 @@ where
                 vec![
                     S3FifoEntry {
                         key,
-                        value,
+                        value: RwLock::new(value),
                         generation: Default::default(),
                         freq: Default::default(),
                     }
@@ -289,7 +329,7 @@ where
 
         let entry = Arc::new(S3FifoEntry {
             key,
-            value,
+            value: RwLock::new(value),
             generation,
             freq: 0.into(),
         });
@@ -354,6 +394,33 @@ where
     /// Returns an iterator of all keys currently in the cache.
     pub fn keys(&self) -> impl Iterator<Item = Arc<K>> {
         self.entries.iter().map(|entry| Arc::clone(entry.key()))
+    }
+
+    /// Remove multiple keys from the cache, in a blocking manner.
+    ///
+    /// This method directly removes entries from the cache without going through
+    /// the normal eviction process. This is useful for cache management operations
+    /// like repair/validation.
+    ///
+    /// Returns the number of keys that were successfully removed. If a key does not
+    /// exist in the cache and cannot be removed, it will be ignored (and the returned count
+    /// of removed items will be lower).
+    pub fn remove_keys(&self, keys: impl Iterator<Item = K>) -> usize
+    where
+        K: Sized + Clone + Debug,
+    {
+        let mut guard = self.locked_state.lock();
+
+        // Remove keys from the entries map
+        let to_remove_from_state: HashSet<K> = keys
+            .filter_map(|k| self.entries.remove(&k).map(|_| k))
+            .collect();
+
+        // Remove from locked state.
+        let count_removed = guard.remove_keys(&to_remove_from_state);
+        drop(guard);
+
+        count_removed
     }
 
     /// Create a snapshot of the locked state.
@@ -422,6 +489,38 @@ where
     pub(crate) fn ghost_len(&self) -> usize {
         let guard = self.locked_state.lock();
         guard.ghost.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn small_queue_keys(&self) -> Vec<Arc<K>> {
+        let guard = self.locked_state.lock();
+        guard
+            .small
+            .iter()
+            .map(|entry| Arc::clone(&entry.key))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn main_queue_keys(&self) -> Vec<Arc<K>> {
+        let guard = self.locked_state.lock();
+        guard
+            .main
+            .iter()
+            .map(|entry| Arc::clone(&entry.key))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key_in_entries(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key_in_ghost(&self, key: &Arc<K>) -> bool {
+        let guard = self.locked_state.lock();
+        // The ghost stores Arc<K>, so we need to check by content
+        guard.ghost.contains(key)
     }
 }
 
@@ -603,7 +702,7 @@ where
 
 impl<K, V> LockedState<K, V>
 where
-    K: Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
+    K: Debug + Eq + Hash + HasSize + Send + Sync + 'static + ?Sized,
     V: HasSize + InUse + Send + Sync + 'static,
 {
     fn insert_ghost(&mut self, key: Arc<K>, config: &S3Config<K>, evicted_keys: &mut Vec<Arc<K>>) {
@@ -661,8 +760,8 @@ where
         evicted_entries: &mut Vec<CacheEntry<K, V>>,
         evicted_keys: &mut Vec<Arc<K>>,
     ) {
-        while let Some(tail) = self.small.pop_front() {
-            if tail.freq.load(Ordering::SeqCst) > 0 || tail.in_use() {
+        while let Some(mut tail) = self.small.pop_front() {
+            if tail.freq.load(Ordering::SeqCst) > 0 || entry_likely_in_use(&tail) {
                 self.main.push_back(tail);
             } else {
                 let size = tail.size();
@@ -706,13 +805,13 @@ where
         config: &S3Config<K>,
         evicted_entries: &mut Vec<CacheEntry<K, V>>,
     ) {
-        while let Some(tail) = self.main.pop_front() {
+        while let Some(mut tail) = self.main.pop_front() {
             let was_not_zero = tail
                 .freq
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| f.checked_sub(1))
                 .is_ok();
 
-            if was_not_zero || tail.in_use() {
+            if was_not_zero || entry_likely_in_use(&tail) {
                 self.main.push_back(tail);
             } else {
                 let size = tail.size();
@@ -733,6 +832,41 @@ where
                 break;
             }
         }
+    }
+
+    /// Remove multiple keys from the small and main queues.
+    ///
+    /// This method efficiently removes multiple keys by iterating through each queue once.
+    /// It first checks the small queue for all keys, then checks the main queue for any
+    /// remaining keys that weren't found in the small queue.
+    ///
+    /// Returns the number of keys that were successfully removed. If a key does not
+    /// exist in the cache and cannot be removed, it will be ignored (and the returned count
+    /// of removed items will be lower).
+    fn remove_keys(&mut self, keys_to_remove: &HashSet<K>) -> usize
+    where
+        K: Sized + Clone + Debug,
+    {
+        let initial_count = self.small.len() + self.main.len();
+
+        // Remove from small queue
+        let filtered_small: VecDeque<_> = self
+            .small
+            .drain()
+            .filter(|entry| !keys_to_remove.contains(entry.key.as_ref()))
+            .collect();
+        self.small = Fifo::new(filtered_small);
+
+        // Remove from main queue
+        let filtered_main: VecDeque<_> = self
+            .main
+            .drain()
+            .filter(|entry| !keys_to_remove.contains(entry.key.as_ref()))
+            .collect();
+        self.main = Fifo::new(filtered_main);
+
+        // Return the number of keys that were actually removed
+        initial_count - (self.small.len() + self.main.len())
     }
 }
 
@@ -840,7 +974,7 @@ mod tests {
     }
 
     impl<T> InUse for DropBarrier<T> {
-        fn in_use(&self) -> bool {
+        fn in_use(&mut self) -> bool {
             false
         }
     }
@@ -884,7 +1018,7 @@ mod tests {
 
         fn get_or_put_handle<K, V>(&self, s3: &Arc<S3Fifo<K, V>>, k: Arc<K>, v: V) -> Self::Handle
         where
-            K: Eq + Hash + HasSize + Send + Sync + 'static,
+            K: Debug + Eq + Hash + HasSize + Send + Sync + 'static,
             V: Clone + HasSize + InUse + AsyncDrop + Send + Sync + 'static;
     }
 
@@ -899,7 +1033,7 @@ mod tests {
 
         fn get_or_put_handle<K, V>(&self, s3: &Arc<S3Fifo<K, V>>, k: Arc<K>, v: V) -> Self::Handle
         where
-            K: Eq + Hash + HasSize + Send + Sync + 'static,
+            K: Debug + Eq + Hash + HasSize + Send + Sync + 'static,
             V: Clone + HasSize + InUse + AsyncDrop + Send + Sync + 'static,
         {
             let s3_captured = Arc::clone(s3);
@@ -933,7 +1067,7 @@ pub(crate) mod test_migration {
                 .chain(locked_state.small.iter())
                 .map(|entry| {
                     let key = Arc::unwrap_or_clone(Arc::clone(&entry.key));
-                    let value = entry.value.clone();
+                    let value = entry.value.read().unwrap().clone();
                     (key, value)
                 })
                 .collect::<Vec<_>>();

@@ -56,6 +56,7 @@ use hashbrown::HashSet;
 
 use crate::sort::SortKey;
 use snafu::{OptionExt, Snafu};
+
 #[cfg(feature = "v3")]
 use tracing::warn;
 
@@ -1321,6 +1322,10 @@ mod test {
     use crate::test_util::make_field;
 
     use super::{builder::SchemaBuilder, *};
+
+    use rstest as _; // workaround for "unused crate" false positive
+
+    #[cfg(feature = "v3")]
     use rstest::rstest;
 
     #[test]

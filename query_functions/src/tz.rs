@@ -79,13 +79,16 @@ impl ScalarUDFImpl for TzUDF {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
-        match args.arg_fields.len() {
-            1 => Ok(Arc::new(Field::new(
-                self.name(),
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-                false,
-            ))),
-            2 => {
+        match args.arg_fields {
+            [time] => Ok(Arc::new(
+                Field::new(
+                    self.name(),
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                    false,
+                )
+                .with_metadata(time.metadata().clone()),
+            )),
+            [time, _tz] => {
                 let Some(ScalarValue::Utf8(Some(tz))) = &args.scalar_arguments[1] else {
                     return plan_err!(
                         "tz requires its second argument to be a timezone string, got {:?}",
@@ -94,11 +97,14 @@ impl ScalarUDFImpl for TzUDF {
                 };
                 Self::is_valid_timezone(tz)?;
 
-                Ok(Arc::new(Field::new(
-                    self.name(),
-                    DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from(tz.as_str()))),
-                    false,
-                )))
+                Ok(Arc::new(
+                    Field::new(
+                        self.name(),
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from(tz.as_str()))),
+                        false,
+                    )
+                    .with_metadata(time.metadata().clone()),
+                ))
             }
             _ => {
                 plan_err!(

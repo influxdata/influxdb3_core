@@ -20,13 +20,13 @@ parking_lot = "0.12"
 pin-project = "1.1"
 # Delaying upgrade until <https://github.com/GuillaumeGomez/sysinfo/issues/1496> is fixed
 sysinfo = "<0.38"
-tokio = { version = "1.47", features = ["macros", "parking_lot", "sync", "time"] }
-tokio-util = { version = "0.7.16" }
+tokio = { version = "1.48", features = ["macros", "parking_lot", "sync", "time"] }
+tokio-util = { version = "0.7.17" }
 trace = { path = "../trace"}
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-tempfile = "3.22.0"
+tempfile = "3.23.0"
 # Need the multi-threaded executor for testing
-tokio = { version = "1.47", features = ["macros", "parking_lot", "rt-multi-thread", "time"] }
+tokio = { version = "1.48", features = ["macros", "parking_lot", "rt-multi-thread", "time"] }
 test_helpers = { path = "../test_helpers" }

@@ -588,7 +588,7 @@ mod test {
             ScalarValue::TimestampNanosecond(Some(65), None),
         );
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3]).unwrap();
         assert!(!overlap);
     }
 
@@ -607,7 +607,7 @@ mod test {
             ScalarValue::TimestampNanosecond(Some(10), None),
         );
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3]).unwrap();
         assert!(overlap);
     }
 
@@ -619,7 +619,7 @@ mod test {
         let pair_3 = (ScalarValue::Int16(Some(1)), ScalarValue::Int16(Some(1)));
         let pair_4 = (ScalarValue::Int16(Some(6)), ScalarValue::Int16(Some(8)));
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3, pair_4]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3, pair_4]).unwrap();
         assert!(!overlap);
     }
 
@@ -631,7 +631,7 @@ mod test {
         let pair_3 = (ScalarValue::Int16(Some(1)), ScalarValue::Int16(Some(1)));
         let pair_4 = (ScalarValue::Int16(Some(4)), ScalarValue::Int16(Some(6)));
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3, pair_4]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3, pair_4]).unwrap();
         assert!(overlap);
     }
 
@@ -643,7 +643,7 @@ mod test {
         let pair_3 = (ScalarValue::Int16(Some(1)), ScalarValue::Int16(Some(2)));
         let pair_4 = (ScalarValue::Int16(Some(6)), ScalarValue::Int16(Some(8)));
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3, pair_4]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3, pair_4]).unwrap();
         assert!(!overlap);
     }
 
@@ -655,7 +655,7 @@ mod test {
         let pair_3 = (ScalarValue::Int16(Some(1)), ScalarValue::Int16(Some(2)));
         let pair_4 = (ScalarValue::Int16(Some(4)), ScalarValue::Int16(Some(6)));
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3, pair_4]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3, pair_4]).unwrap();
         assert!(overlap);
     }
 
@@ -672,7 +672,7 @@ mod test {
             ScalarValue::Utf8(Some('a'.to_string())),
         );
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3]).unwrap();
         assert!(!overlap);
     }
 
@@ -689,7 +689,7 @@ mod test {
             ScalarValue::Utf8(Some('f'.to_string())),
         );
 
-        let overlap = overlap_all(&vec![pair_1, pair_2, pair_3]).unwrap();
+        let overlap = overlap_all(&[pair_1, pair_2, pair_3]).unwrap();
         assert!(overlap);
     }
 

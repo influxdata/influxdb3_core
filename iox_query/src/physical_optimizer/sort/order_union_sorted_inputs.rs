@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{ExecutionPlan, sorts::sort_preserving_merge::SortPreservingMergeExec},
+    physical_plan::{
+        ExecutionPlan, Partitioning, repartition::RepartitionExec,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
+    },
 };
 use itertools::Itertools;
 
@@ -146,21 +149,26 @@ fn swap_spm_for_progeval(
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     let ordering_req = original_spm.expr();
 
-    // Step 1: Split and regroup partitioned file scans. Also re-orders the scan partitions.
-    // This step maximizes our chances of getting a disjoint, nonoverlapping lexical ranges.
+    // Step 1: Remove any RoundRobin repartition nodes that may interfere with optimization
     let input = Arc::clone(original_spm.input())
+        .transform_down(remove_rr_repartition_if_exists)
+        .map(|t| t.data)?;
+
+    // Step 2: Split and regroup partitioned file scans. Also re-orders the scan partitions.
+    // This step maximizes our chances of getting a disjoint, nonoverlapping lexical ranges.
+    let input = input
         .transform_down(|plan| split_and_regroup_parquet_files(plan, ordering_req))
         .map(|t| t.data)?;
 
-    // Step 2: compensate for previous redistribution (for parallelized sorting) passes.
+    // Step 3: compensate for previous redistribution (for parallelized sorting) passes.
     let input = merge_partitions_after_parallelized_sorting(input, ordering_req)?;
 
-    // Step 3: try to extract the lexical ranges for the input partitions
+    // Step 4: try to extract the lexical ranges for the input partitions
     let Some(lexical_ranges) = extract_disjoint_ranges_from_plan(ordering_req, &input)? else {
         return Ok(Transformed::no(return_unaltered_plan));
     };
 
-    // Step 4: if needed, re-order the partitions
+    // Step 5: if needed, re-order the partitions
     let ordered_input = if lexical_ranges.indices().is_sorted() {
         input
     } else {
@@ -171,7 +179,7 @@ fn swap_spm_for_progeval(
         )?) as Arc<dyn ExecutionPlan>
     };
 
-    // Step 5: Replace SortPreservingMergeExec with ProgressiveEvalExec
+    // Step 6: Replace SortPreservingMergeExec with ProgressiveEvalExec
     let progresive_eval_exec = Arc::new(ProgressiveEvalExec::new(
         ordered_input,
         Some(lexical_ranges.ordered_ranges().cloned().collect_vec()),
@@ -179,6 +187,34 @@ fn swap_spm_for_progeval(
     ));
 
     Ok(Transformed::yes(progresive_eval_exec))
+}
+
+/// Remove any RoundRobin repartition nodes that may interfere with optimization.
+///
+/// If the current node is a RepartitionExec with Partitioning::RoundRobinBatch,
+/// then remove that node and return its child.
+fn remove_rr_repartition_if_exists(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    if let Some(repartition_exec) = plan.as_any().downcast_ref::<RepartitionExec>()
+        && matches!(
+            repartition_exec.partitioning(),
+            Partitioning::RoundRobinBatch(_)
+        )
+    {
+        // Remove the RoundRobin repartition node and return its child
+        Ok(Transformed::new(
+            Arc::clone(repartition_exec.input()),
+            true,
+            TreeNodeRecursion::Continue,
+        ))
+    } else if plan.as_any().is::<SortPreservingMergeExec>() {
+        // halt at the next SPM.
+        // that will be considered separately at the root PhysicalOptimizer::optimize(), as it checks per SPM found
+        Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
+    } else {
+        Ok(Transformed::no(plan))
+    }
 }
 
 #[cfg(test)]
@@ -424,7 +460,7 @@ mod test {
         );
     }
 
-    // No limit & but the input is in the right sort preserving merge struct --> optimize
+    // No limit & the input is in the right sort preserving merge struct --> optimize
     #[test]
     fn test_spm_time_desc() {
         test_helpers::maybe_start_logging();
@@ -470,6 +506,74 @@ mod test {
           - "             SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
           - "               RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
           - "             DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+        output:
+          Ok:
+            - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
+            - "   ReorderPartitionsExec: mapped_partition_indices=[1, 0]"
+            - "     UnionExec"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+            - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+            - "             UnionExec"
+            - "               SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "               DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+        "#
+        );
+    }
+
+    // No limit & the input is in the right sort preserving merge struct
+    // has a rr repartitoning --> should remove
+    // then --> optimize
+    #[test]
+    fn test_spm_time_desc_rr_repartition() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+
+        let plan_parquet = PlanBuilder::data_source_exec_parquet(&schema, 1000, 2000);
+        let plan_parquet2 = PlanBuilder::data_source_exec_parquet(&schema, 2001, 3000);
+        let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
+
+        let plan_sort1 = plan_batches.sort(sort_exprs);
+        let plan_union_1 = plan_sort1.union(plan_parquet2);
+        let plan_spm_for_dedupe = plan_union_1.sort_preserving_merge(sort_exprs);
+        let plan_dedupe = plan_spm_for_dedupe.deduplicate(sort_exprs, false);
+
+        let sort_exprs = [("time", SortOp::Desc)];
+        let plan_sort1 = plan_parquet.sort(sort_exprs);
+        let plan_sort2 = plan_dedupe.sort(sort_exprs);
+
+        let plan_union_2 = plan_sort1.union(plan_sort2);
+        let repartioned = plan_union_2.round_robin_repartition(4);
+
+        let plan_spm = repartioned.sort_preserving_merge(sort_exprs);
+
+        // Output plan: rr Repartition will be removed
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_spm.build(), opt),
+            @r#"
+        input:
+          - " SortPreservingMergeExec: [time@3 DESC NULLS LAST]"
+          - "   RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=2"
+          - "     UnionExec"
+          - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "         DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+          - "       SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "         DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "           SortPreservingMergeExec: [col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST]"
+          - "             UnionExec"
+          - "               SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "                 RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "               DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         output:
           Ok:
             - " ProgressiveEvalExec: input_ranges=[(2001)->(3500), (1000)->(2000)]"
@@ -1206,13 +1310,9 @@ mod test {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Negative tests: the right structure not found -> nothing optimized
-    // ------------------------------------------------------------------
-
-    // Right stucture but sort on 2 columns --> plan stays the same
+    // Right stucture and sort on 2 columns --> optimize
     #[test]
-    fn test_negative_spm_2_column_sort_desc() {
+    fn test_spm_2_column_sort_desc() {
         test_helpers::maybe_start_logging();
 
         // plan:
@@ -1272,104 +1372,10 @@ mod test {
         );
     }
 
-    // No limit  & random plan --> plan stay the same
+    // right structure and same sort order
+    // inputs of union touch, but do not overlap --> optimize
     #[test]
-    fn test_negative_no_limit() {
-        test_helpers::maybe_start_logging();
-
-        let schema = schema();
-        let sort_exprs = [
-            ("col2", SortOp::Asc),
-            ("col1", SortOp::Asc),
-            ("time", SortOp::Asc),
-        ];
-
-        let plan_parquet = PlanBuilder::data_source_exec_parquet(&schema, 1000, 2000);
-        let plan_batches = PlanBuilder::record_batches_exec(2, 1500, 2500);
-
-        let plan = plan_batches
-            .union(plan_parquet)
-            .round_robin_repartition(8)
-            .hash_repartition(vec!["col2", "col1", "time"], 8)
-            .sort(sort_exprs)
-            .deduplicate(sort_exprs, true);
-
-        // input and output are the same
-        let opt = OrderUnionSortedInputs;
-        insta::assert_yaml_snapshot!(
-            OptimizationTest::new(plan.build(), opt),
-            @r#"
-        input:
-          - " DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-          - "   SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-          - "     RepartitionExec: partitioning=Hash([col2@1, col1@0, time@3], 8), input_partitions=8"
-          - "       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=3"
-          - "         UnionExec"
-          - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "           DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
-        output:
-          Ok:
-            - " DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
-            - "   SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
-            - "     RepartitionExec: partitioning=Hash([col2@1, col1@0, time@3], 8), input_partitions=8"
-            - "       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=3"
-            - "         UnionExec"
-            - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "           DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
-        "#
-        );
-    }
-
-    // has limit but no sort preserving merge --> plan stay the same
-    #[test]
-    fn test_negative_limit_no_preserving_merge() {
-        test_helpers::maybe_start_logging();
-
-        let plan_batches1 = PlanBuilder::record_batches_exec(1, 1000, 2000);
-        let plan_batches2 = PlanBuilder::record_batches_exec(3, 2001, 3000);
-        let plan_batches3 = PlanBuilder::record_batches_exec(2, 2500, 3500);
-
-        let plan_union_1 = plan_batches2.union(plan_batches3);
-
-        let sort_exprs = [("time", SortOp::Desc)];
-        let plan_sort1 = plan_batches1.sort(sort_exprs);
-        let plan_sort2 = plan_union_1.sort(sort_exprs);
-
-        let plan_union_2 = plan_sort1.union(plan_sort2);
-
-        let plan_limit = plan_union_2.limit(0, Some(1));
-
-        // input and output are the same
-        let opt = OrderUnionSortedInputs;
-        insta::assert_yaml_snapshot!(
-            OptimizationTest::new(plan_limit.build(), opt),
-            @r#"
-        input:
-          - " GlobalLimitExec: skip=0, fetch=1"
-          - "   UnionExec"
-          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "       RecordBatchesExec: chunks=1, projection=[col1, col2, field1, time, __chunk_order]"
-          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "       UnionExec"
-          - "         RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
-          - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-        output:
-          Ok:
-            - " GlobalLimitExec: skip=0, fetch=1"
-            - "   UnionExec"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       RecordBatchesExec: chunks=1, projection=[col1, col2, field1, time, __chunk_order]"
-            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "       UnionExec"
-            - "         RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
-            - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-        "#
-        );
-    }
-
-    // right structure and same sort order but inputs of uion overlap --> plan stay the same
-    #[test]
-    fn test_negative_overlap() {
+    fn test_touching_ranges() {
         test_helpers::maybe_start_logging();
 
         // Input plan:
@@ -1442,64 +1448,10 @@ mod test {
         );
     }
 
-    // No limit & but the input is in the right union struct --> plan stay the same
+    // Projection expression (field + field)
+    // but the sort order is not on field, only time ==> optimize
     #[test]
-    fn test_negative_no_sortpreservingmerge_input_union() {
-        test_helpers::maybe_start_logging();
-
-        // plan:
-        //    UnionExec
-        //      SortExec: expr=[time@2 DESC]
-        //        DataSourceExec
-        //      SortExec: expr=[time@2 DESC]
-        //        UnionExec
-        //          RecordBatchesExec
-        //          DataSourceExec
-
-        let schema = schema();
-
-        let plan_parquet = PlanBuilder::data_source_exec_parquet(&schema, 1000, 2000);
-        let plan_parquet2 = PlanBuilder::data_source_exec_parquet(&schema, 2001, 3000);
-        let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
-
-        let plan_union_1 = plan_batches.union(plan_parquet2);
-
-        let sort_exprs = [("time", SortOp::Desc)];
-
-        let plan_sort1 = plan_parquet.sort(sort_exprs);
-        let plan_sort2 = plan_union_1.sort(sort_exprs);
-
-        let plan_union_2 = plan_sort1.union(plan_sort2);
-
-        // input and output are the same
-        let opt = OrderUnionSortedInputs;
-        insta::assert_yaml_snapshot!(
-            OptimizationTest::new(plan_union_2.build(), opt),
-            @r#"
-        input:
-          - " UnionExec"
-          - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "     DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
-          - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-          - "     UnionExec"
-          - "       RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-          - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
-        output:
-          Ok:
-            - " UnionExec"
-            - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "     DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
-            - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
-            - "     UnionExec"
-            - "       RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
-            - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
-        "#
-        );
-    }
-
-    // Projection expression (field + field) ==> not optimze. Plan stays the same
-    #[test]
-    fn test_negative_spm_time_desc_with_dedupe_and_proj_on_expr() {
+    fn test_spm_time_desc_with_dedupe_and_proj_on_expr() {
         test_helpers::maybe_start_logging();
 
         // plan:
@@ -1628,6 +1580,164 @@ mod test {
         "#
         );
     }
+
+    // ------------------------------------------------------------------
+    // Negative tests: the right structure not found -> nothing optimized
+    // ------------------------------------------------------------------
+
+    // No limit  & random plan --> plan stay the same
+    #[test]
+    fn test_negative_no_limit() {
+        test_helpers::maybe_start_logging();
+
+        let schema = schema();
+        let sort_exprs = [
+            ("col2", SortOp::Asc),
+            ("col1", SortOp::Asc),
+            ("time", SortOp::Asc),
+        ];
+
+        let plan_parquet = PlanBuilder::data_source_exec_parquet(&schema, 1000, 2000);
+        let plan_batches = PlanBuilder::record_batches_exec(2, 1500, 2500);
+
+        let plan = plan_batches
+            .union(plan_parquet)
+            .round_robin_repartition(8)
+            .hash_repartition(vec!["col2", "col1", "time"], 8)
+            .sort(sort_exprs)
+            .deduplicate(sort_exprs, true);
+
+        // input and output are the same
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan.build(), opt),
+            @r#"
+        input:
+          - " DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+          - "   SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+          - "     RepartitionExec: partitioning=Hash([col2@1, col1@0, time@3], 8), input_partitions=8"
+          - "       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=3"
+          - "         UnionExec"
+          - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "           DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+        output:
+          Ok:
+            - " DeduplicateExec: [col2@1 ASC NULLS LAST,col1@0 ASC NULLS LAST,time@3 ASC NULLS LAST]"
+            - "   SortExec: expr=[col2@1 ASC NULLS LAST, col1@0 ASC NULLS LAST, time@3 ASC NULLS LAST], preserve_partitioning=[false]"
+            - "     RepartitionExec: partitioning=Hash([col2@1, col1@0, time@3], 8), input_partitions=8"
+            - "       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=3"
+            - "         UnionExec"
+            - "           RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "           DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+        "#
+        );
+    }
+
+    // has limit but no sort preserving merge --> plan stay the same
+    #[test]
+    fn test_negative_limit_no_preserving_merge() {
+        test_helpers::maybe_start_logging();
+
+        let plan_batches1 = PlanBuilder::record_batches_exec(1, 1000, 2000);
+        let plan_batches2 = PlanBuilder::record_batches_exec(3, 2001, 3000);
+        let plan_batches3 = PlanBuilder::record_batches_exec(2, 2500, 3500);
+
+        let plan_union_1 = plan_batches2.union(plan_batches3);
+
+        let sort_exprs = [("time", SortOp::Desc)];
+        let plan_sort1 = plan_batches1.sort(sort_exprs);
+        let plan_sort2 = plan_union_1.sort(sort_exprs);
+
+        let plan_union_2 = plan_sort1.union(plan_sort2);
+
+        let plan_limit = plan_union_2.limit(0, Some(1));
+
+        // input and output are the same
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_limit.build(), opt),
+            @r#"
+        input:
+          - " GlobalLimitExec: skip=0, fetch=1"
+          - "   UnionExec"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       RecordBatchesExec: chunks=1, projection=[col1, col2, field1, time, __chunk_order]"
+          - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "       UnionExec"
+          - "         RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
+          - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+        output:
+          Ok:
+            - " GlobalLimitExec: skip=0, fetch=1"
+            - "   UnionExec"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "       RecordBatchesExec: chunks=1, projection=[col1, col2, field1, time, __chunk_order]"
+            - "     SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "       UnionExec"
+            - "         RecordBatchesExec: chunks=3, projection=[col1, col2, field1, time, __chunk_order]"
+            - "         RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+        "#
+        );
+    }
+
+    // No limit & but the input is in the right union struct --> plan stay the same
+    #[test]
+    fn test_negative_no_sortpreservingmerge_input_union() {
+        test_helpers::maybe_start_logging();
+
+        // plan:
+        //    UnionExec
+        //      SortExec: expr=[time@2 DESC]
+        //        DataSourceExec
+        //      SortExec: expr=[time@2 DESC]
+        //        UnionExec
+        //          RecordBatchesExec
+        //          DataSourceExec
+
+        let schema = schema();
+
+        let plan_parquet = PlanBuilder::data_source_exec_parquet(&schema, 1000, 2000);
+        let plan_parquet2 = PlanBuilder::data_source_exec_parquet(&schema, 2001, 3000);
+        let plan_batches = PlanBuilder::record_batches_exec(2, 2500, 3500);
+
+        let plan_union_1 = plan_batches.union(plan_parquet2);
+
+        let sort_exprs = [("time", SortOp::Desc)];
+
+        let plan_sort1 = plan_parquet.sort(sort_exprs);
+        let plan_sort2 = plan_union_1.sort(sort_exprs);
+
+        let plan_union_2 = plan_sort1.union(plan_sort2);
+
+        // input and output are the same
+        let opt = OrderUnionSortedInputs;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan_union_2.build(), opt),
+            @r#"
+        input:
+          - " UnionExec"
+          - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "     DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+          - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+          - "     UnionExec"
+          - "       RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+          - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+        output:
+          Ok:
+            - " UnionExec"
+            - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "     DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+            - "   SortExec: expr=[time@3 DESC NULLS LAST], preserve_partitioning=[false]"
+            - "     UnionExec"
+            - "       RecordBatchesExec: chunks=2, projection=[col1, col2, field1, time, __chunk_order]"
+            - "       DataSourceExec: file_groups={1 group: [[0.parquet]]}, projection=[col1, col2, field1, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
+        "#
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Many partitioned files tests
+    // ------------------------------------------------------------------
 
     // Reproduce of https://github.com/influxdata/influxdb_iox/issues/12461#issuecomment-2430196754
     // The reproducer needs big non-overlapped files so its first physical plan will have DataSourceExec with multiple

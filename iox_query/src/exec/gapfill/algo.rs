@@ -111,7 +111,7 @@ impl GapFiller {
     /// the first row in the next output batch, return the offset
     /// of last input row that could possibly be in the output.
     ///
-    /// This offset is used by ['BufferedInput`] to determine how many
+    /// This offset is used by [`BufferedInput`] to determine how many
     /// rows need to be buffered.
     ///
     /// [`BufferedInput`]: super::buffered_input::BufferedInput
@@ -132,17 +132,17 @@ impl GapFiller {
     pub fn build_gapfilled_output(
         &mut self,
         schema: SchemaRef,
-        input_time_array: (usize, &TimestampNanosecondArray),
-        group_arrays: &[(usize, ArrayRef)],
-        aggr_arrays: &[(usize, ArrayRef)],
+        input_time_array: &TimestampNanosecondArray,
+        series_arrays: &[ArrayRef],
+        fill_arrays: &[(usize, ArrayRef)],
     ) -> Result<RecordBatch> {
-        let series_ends = self.plan_output_batch(input_time_array.1, group_arrays)?;
+        let series_ends = self.plan_output_batch(input_time_array, series_arrays)?;
         self.cursor.remaining_output_batch_size = self.batch_size;
         self.build_output(
             schema,
             input_time_array,
-            group_arrays,
-            aggr_arrays,
+            series_arrays,
+            fill_arrays,
             &series_ends,
         )
     }
@@ -167,18 +167,15 @@ impl GapFiller {
     fn plan_output_batch(
         &mut self,
         input_time_array: &TimestampNanosecondArray,
-        group_arr: &[(usize, ArrayRef)],
+        series_arr: &[ArrayRef],
     ) -> Result<Vec<usize>> {
-        if group_arr.is_empty() {
+        if series_arr.is_empty() {
             // there are no group columns, so the output
             // will be just one big series.
             return Ok(vec![input_time_array.len()]);
         }
 
-        let sort_columns = group_arr
-            .iter()
-            .map(|(_, arr)| Arc::clone(arr))
-            .collect::<Vec<_>>();
+        let sort_columns = series_arr.to_vec();
 
         let mut ranges = partition(&sort_columns)?.ranges().into_iter();
 
@@ -218,32 +215,27 @@ impl GapFiller {
     fn build_output(
         &mut self,
         schema: SchemaRef,
-        input_time_array: (usize, &TimestampNanosecondArray),
-        group_arr: &[(usize, ArrayRef)],
-        aggr_arr: &[(usize, ArrayRef)],
+        input_time_array: &TimestampNanosecondArray,
+        series_arr: &[ArrayRef],
+        fill_arr: &[(usize, ArrayRef)],
         series_ends: &[usize],
     ) -> Result<RecordBatch> {
-        let mut output_arrays: Vec<(usize, ArrayRef)> =
-            Vec::with_capacity(group_arr.len() + aggr_arr.len() + 1); // plus one for time column
+        let mut output_arrays: Vec<ArrayRef> =
+            Vec::with_capacity(series_arr.len() + fill_arr.len() + 1); // plus one for time column
 
         // build the time column
         let mut cursor = self.cursor.clone_for_aggr_col(None)?;
-        let (time_idx, input_time_array) = input_time_array;
         let time_vec = cursor.build_time_vec(&self.params, series_ends, input_time_array)?;
         let output_time_len = time_vec.len();
-        output_arrays.push((
-            time_idx,
-            Arc::new(
-                TimestampNanosecondArray::from(time_vec)
-                    .with_timezone_opt(input_time_array.timezone()),
-            ),
-        ));
+        let time_arr = Arc::new(
+            TimestampNanosecondArray::from(time_vec).with_timezone_opt(input_time_array.timezone()),
+        );
         // There may not be any aggregate or group columns, so use this cursor state as the new
         // GapFiller cursor once this output batch is complete.
         let mut final_cursor = cursor;
 
         // build the other group columns
-        for (idx, ga) in group_arr {
+        for ga in series_arr {
             let mut cursor = self.cursor.clone_for_aggr_col(None)?;
             let take_vec =
                 cursor.build_group_take_vec(&self.params, series_ends, input_time_array)?;
@@ -255,11 +247,12 @@ impl GapFiller {
                 )));
             }
             let take_arr = UInt64Array::from(take_vec);
-            output_arrays.push((*idx, take::take(ga, &take_arr, None)?));
+            output_arrays.push(take::take(ga, &take_arr, None)?);
         }
+        output_arrays.push(time_arr);
 
         // Build the aggregate columns
-        for (idx, aa) in aggr_arr {
+        for (idx, aa) in fill_arr {
             let mut cursor = self.cursor.clone_for_aggr_col(Some(*idx))?;
             let output_array =
                 cursor.build_aggr_col(&self.params, series_ends, input_time_array, aa)?;
@@ -270,14 +263,13 @@ impl GapFiller {
                     output_time_len
                 )));
             }
-            output_arrays.push((*idx, output_array));
+            output_arrays.push(output_array);
             final_cursor.merge_aggr_col_cursor(cursor);
         }
 
-        output_arrays.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let output_arrays: Vec<_> = output_arrays.into_iter().map(|(_, arr)| arr).collect();
-        let batch = RecordBatch::try_new(Arc::clone(&schema), output_arrays)
-            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), output_arrays).map_err(|err| {
+            DataFusionError::ArrowError(Box::new(err), None).context("build_output")
+        })?;
 
         self.cursor = final_cursor;
         Ok(batch)

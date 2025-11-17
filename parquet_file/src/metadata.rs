@@ -465,7 +465,7 @@ impl IoxMetadata {
     pub fn to_parquet_file<F>(
         &self,
         partition_id: PartitionId,
-        partition_hash_id: Option<PartitionHashId>,
+        partition_hash_id: PartitionHashId,
         file_size_bytes: u64,
         metadata: &IoxParquetMetaData,
         column_id_map: F,
