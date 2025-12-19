@@ -8,6 +8,10 @@ ignore = [
     # paste is unmaintained but does not have any known issues;
     # there is no replacement at this time
     "RUSTSEC-2024-0436",
+    # rustls-pemfile is unmaintained but is a thin wrapper around rustls-pki-types;
+    # fixed in object_store main: https://github.com/apache/arrow-rs-object-store/pull/565
+    # TODO: remove once object_store > 0.12.4 is released
+    "RUSTSEC-2025-0134",
 ]
 git-fetch-with-cli = true
 

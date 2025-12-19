@@ -135,7 +135,7 @@ pub enum Expr {
     Binary(Binary),
 
     /// Nested expression, such as (foo = 'bar') or (1)
-    Nested(Box<Expr>),
+    Nested(Box<Self>),
 }
 
 impl From<Literal> for Expr {

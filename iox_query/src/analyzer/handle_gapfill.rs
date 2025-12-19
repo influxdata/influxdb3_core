@@ -657,10 +657,10 @@ pub fn default_return_value_for_aggr_fn(
                 .params
                 .args
                 .iter()
-                .map(|arg| arg.get_type(schema))
+                .map(|arg| arg.to_field(schema).map(|f| f.1))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            fun.func.return_type(&args)
+            fun.func.return_field(&args).map(|f| f.data_type().clone())
         })
         // and then get the default value for that return type.
         .and_then(|return_type| fun.func.default_value(&return_type))

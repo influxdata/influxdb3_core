@@ -9,7 +9,7 @@ license.workspace = true
 
 [dependencies]
 async-trait = { version = "0.1.89", default-features = false }
-bytes = { version = "1.10.1", default-features = false }
+bytes = { version = "1.11.0", default-features = false }
 futures = { version = "0.3.31" }
 object_store.workspace = true
 tokio = { version = "1.48.0", default-features = false, features = [
@@ -23,3 +23,5 @@ workspace = true
 
 [dev-dependencies]
 futures_test_utils = { path = "../futures_test_utils" }
+http-body-util = { workspace = true }
+http.workspace = true

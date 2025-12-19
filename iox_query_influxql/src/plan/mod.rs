@@ -13,4 +13,5 @@ mod var_ref;
 
 pub use planner::InfluxQLToLogicalPlan;
 pub use planner::SchemaProvider;
+pub(crate) use planner::metadata::strip_influxql_metadata_from_plan;
 pub(crate) use util::parse_regex;

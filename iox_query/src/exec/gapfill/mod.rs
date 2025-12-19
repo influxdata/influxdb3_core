@@ -30,6 +30,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
         PhysicalExpr, PlanProperties, SendableRecordBatchStream, Statistics,
+        coop::cooperative,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
     },
     prelude::Expr,
@@ -614,13 +615,14 @@ impl ExecutionPlan for GapFillExec {
         let reservation = MemoryConsumer::new(format!("GapFillExec[{partition}]"))
             .register(context.memory_pool());
         let input_stream = self.input.execute(partition, context)?;
-        Ok(Box::pin(GapFillStream::try_new(
+        let stream = GapFillStream::try_new(
             self,
             output_batch_size,
             input_stream,
             reservation,
             baseline_metrics,
-        )?))
+        )?;
+        Ok(Box::pin(cooperative(stream)))
     }
 
     fn statistics(&self) -> Result<Statistics> {

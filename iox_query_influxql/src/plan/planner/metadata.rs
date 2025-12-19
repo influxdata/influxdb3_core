@@ -2,14 +2,21 @@ use std::sync::Arc;
 
 use arrow::datatypes::Field;
 use datafusion::{
-    common::{DFSchema, DFSchemaRef, ExprSchema, Result},
+    common::{DFSchema, DFSchemaRef, ExprSchema, Result, tree_node::Transformed},
     logical_expr::{
-        BinaryExpr, Case, Cast, Expr, TryCast,
+        BinaryExpr, Case, Cast, Expr, LogicalPlan, TryCast,
         expr::{AggregateFunction, Alias, ScalarFunction},
     },
 };
+use iox_query::transform_plan_schema;
 
 const INFLUXQL_FILLED_KEY: &str = "influxql::filled";
+
+/// Check if a field has any InfluxQL-specific metadata that should be stripped
+/// before physical planning.
+fn field_has_influxql_metadata(field: &Field) -> bool {
+    field.metadata().contains_key(INFLUXQL_FILLED_KEY)
+}
 
 /// Extension trait for `Field` to manage InfluxQL-specific metadata.
 pub(super) trait FieldExt {
@@ -107,6 +114,79 @@ pub(super) fn schema_with_influxql_filled(
         })
         .collect::<Vec<_>>();
     DFSchema::new_with_metadata(qualified_fields, md).map(Arc::new)
+}
+
+/// Strip `influxql::filled` metadata from all fields in a schema.
+///
+/// This is used before physical planning to remove InfluxQL-specific metadata that was used during
+/// logical planning but would cause schema mismatch errors if present
+///
+/// Returns `Transformed::yes` with the new schema if any fields had the metadata
+/// removed, or `Transformed::no` with the original schema if no changes were made.
+pub(super) fn strip_influxql_metadata_from_schema(
+    schema: &DFSchemaRef,
+) -> Result<Transformed<DFSchemaRef>> {
+    // Check if any field has metadata we need to strip
+    let has_metadata = schema
+        .fields()
+        .iter()
+        .any(|f| field_has_influxql_metadata(f));
+
+    if !has_metadata {
+        return Ok(Transformed::no(Arc::clone(schema)));
+    }
+
+    let md = schema.as_arrow().metadata().clone();
+    let qualified_fields = schema
+        .iter()
+        .map(|(qualifier, field)| {
+            let mut metadata = field.metadata().clone();
+            metadata.remove(INFLUXQL_FILLED_KEY);
+            (
+                qualifier.cloned(),
+                Arc::new(field.as_ref().clone().with_metadata(metadata)),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(Transformed::yes(Arc::new(DFSchema::new_with_metadata(
+        qualified_fields,
+        md,
+    )?)))
+}
+
+/// Check if any schema in the plan tree has InfluxQL-specific metadata.
+fn plan_has_influxql_metadata(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+
+    plan.exists(|node| {
+        Ok(node
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| field_has_influxql_metadata(f)))
+    })
+    .expect("infallible closure") // exists is infallible when closure is infallible
+}
+
+/// Strip `influxql::filled` metadata from all schemas in the logical plan tree.
+///
+/// This is used before physical planning to remove InfluxQL-specific metadata that was used during
+/// logical planning but would cause schema mismatch errors if present
+pub(crate) fn strip_influxql_metadata_from_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
+    use datafusion::common::tree_node::TreeNode;
+
+    // if no schema in the plan tree has the metadata, avoid
+    // calling transform_down which would trigger a DataFusion bug where
+    // Extension node schemas are rebuilt and lose their metadata.
+    if !plan_has_influxql_metadata(&plan) {
+        return Ok(plan);
+    }
+
+    // At least one schema has the metadata, so we need to strip it
+    plan.transform_down(|plan| {
+        transform_plan_schema(plan, |schema| strip_influxql_metadata_from_schema(&schema))
+    })
+    .map(|transformed| transformed.data)
 }
 
 #[cfg(test)]

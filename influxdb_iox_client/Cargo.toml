@@ -30,7 +30,7 @@ format = [
 arrow = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true }
 arrow_util = { path = "../arrow_util", optional = true }
-bytes = { version = "1.10", optional = true }
+bytes = { version = "1.11", optional = true }
 client_util = { path = "../client_util" }
 comfy-table = { version = "7.2", default-features = false, optional = true }
 futures = "0.3"
@@ -55,3 +55,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1" }
+tempfile = "3"

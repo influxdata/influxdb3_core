@@ -11,7 +11,7 @@ workspace = true
 [dependencies] # In alphabetical order
 async-trait = "0.1.89"
 bloom2 = "0.5.1"
-bytes = "1.10"
+bytes = "1.11"
 futures = "0.3"
 iox_time = { version = "0.1.0", path = "../iox_time" }
 metric = { version = "0.1.0", path = "../metric" }

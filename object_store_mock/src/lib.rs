@@ -21,6 +21,8 @@ use tokio::sync::{
 // Workaround for "unused crate" lint false positives.
 use workspace_hack as _;
 
+pub mod interceptor;
+
 /// [`GetOptions`] doesn't impl PartialEq or Clone.
 #[derive(Debug, Default)]
 pub struct WrappedGetOptions(pub(crate) GetOptions);

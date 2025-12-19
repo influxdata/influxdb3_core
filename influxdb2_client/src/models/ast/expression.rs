@@ -22,46 +22,46 @@ pub struct Expression {
     pub operator: Option<String>,
     /// Left leaf
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub left: Option<Box<crate::models::ast::Expression>>,
+    pub left: Option<Box<Self>>,
     /// Right leaf
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub right: Option<Box<crate::models::ast::Expression>>,
+    pub right: Option<Box<Self>>,
     /// Parent Expression
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub callee: Option<Box<crate::models::ast::Expression>>,
+    pub callee: Option<Box<Self>>,
     /// Function arguments
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub arguments: Vec<crate::models::ast::Expression>,
+    pub arguments: Vec<Self>,
     /// Test Expr
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub test: Option<Box<crate::models::ast::Expression>>,
+    pub test: Option<Box<Self>>,
     /// Alternate Expr
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub alternate: Option<Box<crate::models::ast::Expression>>,
+    pub alternate: Option<Box<Self>>,
     /// Consequent Expr
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub consequent: Option<Box<crate::models::ast::Expression>>,
+    pub consequent: Option<Box<Self>>,
     /// Object Expr
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub object: Option<Box<crate::models::ast::Expression>>,
+    pub object: Option<Box<Self>>,
     /// PropertyKey Expr
     #[serde(skip_serializing_if = "Option::is_none")]
     pub property: Option<Box<crate::models::ast::PropertyKey>>,
     /// Array Expr
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub array: Option<Box<crate::models::ast::Expression>>,
+    pub array: Option<Box<Self>>,
     /// Index Expr
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<Box<crate::models::ast::Expression>>,
+    pub index: Option<Box<Self>>,
     /// Properties
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<crate::models::ast::Property>,
     /// Expression
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<Box<crate::models::ast::Expression>>,
+    pub expression: Option<Box<Self>>,
     /// Argument
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub argument: Option<Box<crate::models::ast::Expression>>,
+    pub argument: Option<Box<Self>>,
     /// Call Expr
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<crate::models::ast::CallExpression>,

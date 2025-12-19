@@ -53,7 +53,7 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, as_boolean_array},
+    array::{Array, ArrayRef, BooleanArray},
     compute::{self, filter_record_batch},
     datatypes::SchemaRef,
     record_batch::RecordBatch,
@@ -524,35 +524,55 @@ fn negate(v: &ColumnarValue) -> Result<ColumnarValue> {
     }
 }
 
+/// Extract `Option<bool>` from `ScalarValue::Boolean` with a descriptive error on type mismatch.
+fn try_as_boolean_scalar(scalar: &ScalarValue) -> Result<Option<bool>> {
+    match scalar {
+        ScalarValue::Boolean(v) => Ok(*v),
+        other => Err(DataFusionError::Internal(format!(
+            "Expected boolean scalar, but got type {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+/// Downcast an ArrayRef to BooleanArray, returning an error if it's not a boolean array.
+fn try_as_boolean_array(arr: &ArrayRef) -> Result<&BooleanArray> {
+    arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "Expected boolean array, but got type {:?}",
+            arr.data_type()
+        ))
+    })
+}
+
+/// Boolean AND on ColumnarValues. Handles all combinations of Array/Scalar ColumnarValue.
 fn and(left: &ColumnarValue, right: &ColumnarValue) -> Result<ColumnarValue> {
     match (left, right) {
-        (ColumnarValue::Array(arr_left), ColumnarValue::Array(arr_right)) => {
-            let arr_left = as_boolean_array(arr_left);
-            let arr_right = as_boolean_array(arr_right);
-            let and_array = Arc::new(compute::and(arr_left, arr_right)?) as ArrayRef;
-            Ok(ColumnarValue::Array(and_array))
+        // Array/Array: use Arrow kernel
+        (ColumnarValue::Array(l), ColumnarValue::Array(r)) => {
+            let result = compute::and(try_as_boolean_array(l)?, try_as_boolean_array(r)?)?;
+            Ok(ColumnarValue::Array(Arc::new(result)))
         }
-        (ColumnarValue::Scalar(val_left), ColumnarValue::Scalar(val_right)) => {
-            if let (ScalarValue::Boolean(Some(v_left)), ScalarValue::Boolean(Some(v_right))) =
-                (val_left, val_right)
-            {
-                let and_val = v_left & v_right;
-                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(and_val))))
-            } else {
-                let msg = format!(
-                    "Expected two boolean literals, but got type {:?} and type {:?}",
-                    val_left.data_type(),
-                    val_right.data_type()
-                );
-                Err(DataFusionError::Internal(msg))
+        // Scalar/Scalar: boolean logic with null handling
+        (ColumnarValue::Scalar(l), ColumnarValue::Scalar(r)) => {
+            let result = match (try_as_boolean_scalar(l)?, try_as_boolean_scalar(r)?) {
+                (Some(l), Some(r)) => Some(l & r),
+                // Arrow AND semantics: null propagates
+                _ => None,
+            };
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(result)))
+        }
+        // Mixed Array/Scalar: short-circuit based on scalar value
+        (ColumnarValue::Scalar(scalar), ColumnarValue::Array(arr))
+        | (ColumnarValue::Array(arr), ColumnarValue::Scalar(scalar)) => {
+            match try_as_boolean_scalar(scalar)? {
+                // scalar true: return the array unchanged
+                Some(true) => Ok(ColumnarValue::Array(Arc::clone(arr))),
+                // scalar false: return scalar false
+                Some(false) => Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false)))),
+                // Arrow AND semantics: null propagates
+                None => Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None))),
             }
-        }
-        _ => {
-            panic!(
-                "Expected either two boolean arrays or two boolean scalars, but had type {:?} and type {:?}",
-                left.data_type(),
-                right.data_type()
-            );
         }
     }
 }
@@ -969,5 +989,447 @@ mod tests {
         let df_schema = DFSchema::try_from(input.schema()).unwrap();
         ctx.create_physical_expr(expr, &df_schema)
             .expect("Created PhysicalExpr")
+    }
+
+    /// Test that mixed Scalar/Array ColumnarValue combinations work correctly. This is a
+    /// regression test for the DataFusion 50.3 upgrade where `PhysicalExpr::evaluate` sometimes
+    /// returns Scalar values.
+    /// Related Issues:
+    /// - https://github.com/influxdata/influxdb_iox/issues/15755
+    /// - https://github.com/apache/datafusion/pull/16930
+    #[tokio::test]
+    async fn test_mixed_scalar_array_values() {
+        test_helpers::maybe_start_logging();
+
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])) as ArrayRef,
+        )])
+        .unwrap();
+
+        let input = make_input(vec![vec![batch]]);
+
+        // Split expr 1: value < 3
+        // Returns Array with mixed true/false results
+        let split_expr1 = df_physical_expr(&input, col("value").lt(lit(3)));
+
+        // Split expr 2: value == 10 AND value > 100
+        // This expression is an AND expression that triggers pre-selection.
+        // - LHS: `value == 10` has only 10% true -> triggers pre-selection (threshold is <20%)
+        // - RHS input filtered to just [10], RHS `value > 100` evaluated
+        // - After DF 50.3 upgrade: RHS returns Scalar(false) instead of Array([false])
+        let split_expr2 = df_physical_expr(
+            &input,
+            col("value").eq(lit(10)).and(col("value").gt(lit(100))),
+        );
+
+        let split_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamSplitExec::new(input, vec![split_expr1, split_expr2]));
+
+        // Partition 0: value < 3
+        let output0 = test_collect_partition(Arc::clone(&split_exec), 0).await;
+        let expected = vec![
+            "+-------+",
+            "| value |",
+            "+-------+",
+            "| 1     |",
+            "| 2     |",
+            "+-------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &output0);
+
+        // Partition 1: value == 10 AND value > 100 (empty)
+        let output1 = test_collect_partition(Arc::clone(&split_exec), 1).await;
+        let expected = vec!["+-------+", "| value |", "+-------+", "+-------+"];
+        assert_batches_sorted_eq!(&expected, &output1);
+
+        // Partition 2 (remainder): values 3-10
+        let output2 = test_collect_partition(split_exec, 2).await;
+        let expected = vec![
+            "+-------+",
+            "| value |",
+            "+-------+",
+            "| 10    |",
+            "| 3     |",
+            "| 4     |",
+            "| 5     |",
+            "| 6     |",
+            "| 7     |",
+            "| 8     |",
+            "| 9     |",
+            "+-------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &output2);
+    }
+
+    /// Unit tests for the [`super::and`] function
+    mod and {
+        use super::*;
+
+        /// Construct a boolean ColumnarValue::Array
+        fn arr(values: &[Option<bool>]) -> ColumnarValue {
+            ColumnarValue::from(Arc::new(BooleanArray::from(values.to_vec())) as ArrayRef)
+        }
+
+        /// Construct a boolean ColumnarValue::Scalar
+        fn scalar(value: Option<bool>) -> ColumnarValue {
+            ColumnarValue::from(ScalarValue::from(value))
+        }
+
+        /// ColumnarValue doesn't have a PartialEq impl, so we need a custom assertion
+        fn assert_columnar_eq(result: &ColumnarValue, expected: &ColumnarValue) {
+            match (result, expected) {
+                (ColumnarValue::Array(r), ColumnarValue::Array(e)) => {
+                    assert_eq!(r.as_ref(), e.as_ref());
+                }
+                (ColumnarValue::Scalar(r), ColumnarValue::Scalar(e)) => {
+                    assert_eq!(r, e);
+                }
+                _ => panic!("result type mismatch: {result} vs {expected}"),
+            }
+        }
+
+        #[test]
+        /// Valid combinations for AND
+        fn truth_table() {
+            struct Case {
+                left: ColumnarValue,
+                right: ColumnarValue,
+                expected: ColumnarValue,
+            }
+
+            let cases = vec![
+                // Array & Array: covers all 9 element-wise combinations
+                Case {
+                    left: arr(&[
+                        Some(true),
+                        Some(true),
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                    ]),
+                    right: arr(&[
+                        Some(true),
+                        Some(false),
+                        None,
+                        Some(true),
+                        Some(false),
+                        None,
+                        Some(true),
+                        Some(false),
+                        None,
+                    ]),
+                    expected: arr(&[
+                        Some(true),
+                        Some(false),
+                        None,
+                        Some(false),
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ]),
+                },
+                // Scalar & Scalar: Covers all left/right combinations
+                Case {
+                    left: scalar(Some(true)),
+                    right: scalar(Some(true)),
+                    expected: scalar(Some(true)),
+                },
+                Case {
+                    left: scalar(Some(true)),
+                    right: scalar(Some(false)),
+                    expected: scalar(Some(false)),
+                },
+                Case {
+                    left: scalar(Some(false)),
+                    right: scalar(Some(true)),
+                    expected: scalar(Some(false)),
+                },
+                Case {
+                    left: scalar(Some(false)),
+                    right: scalar(Some(false)),
+                    expected: scalar(Some(false)),
+                },
+                Case {
+                    left: scalar(None),
+                    right: scalar(Some(true)),
+                    expected: scalar(None),
+                },
+                Case {
+                    left: scalar(Some(true)),
+                    right: scalar(None),
+                    expected: scalar(None),
+                },
+                Case {
+                    left: scalar(Some(false)),
+                    right: scalar(None),
+                    expected: scalar(None),
+                },
+                Case {
+                    left: scalar(None),
+                    right: scalar(Some(false)),
+                    expected: scalar(None),
+                },
+                Case {
+                    left: scalar(None),
+                    right: scalar(None),
+                    expected: scalar(None),
+                },
+                // Mixed: scalar(true) & array -> returns array unchanged
+                Case {
+                    left: scalar(Some(true)),
+                    right: arr(&[Some(true), Some(false), None]),
+                    expected: arr(&[Some(true), Some(false), None]),
+                },
+                Case {
+                    left: arr(&[Some(true), Some(false), None]),
+                    right: scalar(Some(true)),
+                    expected: arr(&[Some(true), Some(false), None]),
+                },
+                // Mixed: scalar(false) & array -> short-circuits to scalar(false)
+                Case {
+                    left: scalar(Some(false)),
+                    right: arr(&[Some(true), Some(false), None]),
+                    expected: scalar(Some(false)),
+                },
+                Case {
+                    left: arr(&[Some(true), Some(false), None]),
+                    right: scalar(Some(false)),
+                    expected: scalar(Some(false)),
+                },
+                // Mixed: scalar(null) & array -> returns scalar null
+                Case {
+                    left: scalar(None),
+                    right: arr(&[Some(true), Some(false), None]),
+                    expected: scalar(None),
+                },
+                Case {
+                    left: arr(&[Some(true), Some(false), None]),
+                    right: scalar(None),
+                    expected: scalar(None),
+                },
+                // Empty arrays
+                Case {
+                    left: arr(&[]),
+                    right: arr(&[]),
+                    expected: arr(&[]),
+                },
+                Case {
+                    left: arr(&[]),
+                    right: scalar(Some(true)),
+                    expected: arr(&[]),
+                },
+                Case {
+                    left: scalar(Some(true)),
+                    right: arr(&[]),
+                    expected: arr(&[]),
+                },
+                Case {
+                    left: arr(&[]),
+                    right: scalar(Some(false)),
+                    expected: scalar(Some(false)),
+                },
+                Case {
+                    left: scalar(Some(false)),
+                    right: arr(&[]),
+                    expected: scalar(Some(false)),
+                },
+                Case {
+                    left: arr(&[]),
+                    right: scalar(None),
+                    expected: scalar(None),
+                },
+                Case {
+                    left: scalar(None),
+                    right: arr(&[]),
+                    expected: scalar(None),
+                },
+            ];
+
+            for Case {
+                left,
+                right,
+                expected,
+            } in cases
+            {
+                let result = and(&left, &right).expect("and() should succeed");
+                assert_columnar_eq(&result, &expected);
+            }
+        }
+
+        #[test]
+        fn type_errors() {
+            struct Case {
+                left: ColumnarValue,
+                right: ColumnarValue,
+                expected: &'static str,
+            }
+
+            let int_arr = ColumnarValue::from(Arc::new(Int64Array::from(vec![1])) as ArrayRef);
+            let int_scalar = ColumnarValue::from(ScalarValue::Int64(Some(42)));
+            let bool_arr = arr(&[Some(true)]);
+            let bool_scalar = scalar(Some(true));
+
+            let cases = vec![
+                Case {
+                    left: int_scalar.clone(),
+                    right: bool_scalar.clone(),
+                    expected: "Expected boolean scalar",
+                },
+                Case {
+                    left: bool_scalar.clone(),
+                    right: int_scalar.clone(),
+                    expected: "Expected boolean scalar",
+                },
+                Case {
+                    left: int_arr.clone(),
+                    right: bool_arr.clone(),
+                    expected: "Expected boolean array",
+                },
+                Case {
+                    left: bool_arr.clone(),
+                    right: int_arr.clone(),
+                    expected: "Expected boolean array",
+                },
+            ];
+
+            for Case {
+                left,
+                right,
+                expected,
+            } in cases
+            {
+                let result = and(&left, &right);
+                assert!(result.is_err(), "{left} & {right}");
+                assert!(
+                    result.unwrap_err().to_string().contains(expected),
+                    "{left} & {right}"
+                );
+            }
+        }
+
+        #[test]
+        fn length_mismatch() {
+            let short = arr(&[Some(true)]);
+            let long = arr(&[Some(true), Some(false)]);
+            let result = and(&short, &long);
+            assert!(result.is_err(), "mismatched lengths should error");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Cannot perform bitwise operation on arrays of different length"),
+            );
+        }
+
+        /// Property-based tests for AND
+        mod proptests {
+            use super::*;
+            use proptest::prelude::*;
+
+            /// Strategy for generating arbitrary Option<bool> values
+            fn arb_opt_bool() -> impl Strategy<Value = Option<bool>> {
+                prop_oneof![Just(None), Just(Some(true)), Just(Some(false)),]
+            }
+
+            /// Strategy for generating ColumnarValue::Scalar with boolean values
+            fn arb_scalar() -> impl Strategy<Value = ColumnarValue> {
+                arb_opt_bool().prop_map(scalar)
+            }
+
+            /// Strategy for generating ColumnarValue::Array with boolean values of given length
+            fn arb_array(len: usize) -> impl Strategy<Value = ColumnarValue> {
+                prop::collection::vec(arb_opt_bool(), len).prop_map(|v| arr(&v))
+            }
+
+            /// Strategy for generating any ColumnarValue (scalar or array of given length)
+            fn arb_columnar_value_with_len(len: usize) -> impl Strategy<Value = ColumnarValue> {
+                prop_oneof![arb_scalar(), arb_array(len),]
+            }
+
+            /// Strategy for generating any ColumnarValue with default array length of 8
+            fn arb_columnar_value() -> impl Strategy<Value = ColumnarValue> {
+                arb_columnar_value_with_len(8)
+            }
+
+            /// Returns true if the value is a scalar null
+            fn is_scalar_null(cv: &ColumnarValue) -> bool {
+                matches!(cv, ColumnarValue::Scalar(ScalarValue::Boolean(None)))
+            }
+
+            // Commutativity: a & b == b & a
+            proptest! {
+                #[test]
+                fn commutativity(a in arb_columnar_value(), b in arb_columnar_value()) {
+                    let ab = and(&a, &b).unwrap();
+                    let ba = and(&b, &a).unwrap();
+                    assert_columnar_eq(&ab, &ba);
+                }
+            }
+
+            // Identity: a & true == a
+            proptest! {
+                #[test]
+                fn identity(a in arb_columnar_value()) {
+                    let result = and(&a, &scalar(Some(true))).unwrap();
+                    assert_columnar_eq(&result, &a);
+
+                    let result = and(&scalar(Some(true)), &a).unwrap();
+                    assert_columnar_eq(&result, &a);
+                }
+            }
+
+            // Annihilator: a & false == scalar(false) (except for scalar null where null propagation wins)
+            proptest! {
+                #[test]
+                fn annihilator_false(a in arb_columnar_value().prop_filter("except scalar null", |v| !is_scalar_null(v))) {
+                    let result = and(&a, &scalar(Some(false))).unwrap();
+                    assert_columnar_eq(&result, &scalar(Some(false)));
+
+                    let result = and(&scalar(Some(false)), &a).unwrap();
+                    assert_columnar_eq(&result, &scalar(Some(false)));
+                }
+            }
+
+            // Null propagation: a & null == null
+            proptest! {
+                #[test]
+                fn null_propagation(a in arb_columnar_value()) {
+                    let result = and(&a, &scalar(None)).unwrap();
+                    assert_columnar_eq(&result, &scalar(None));
+
+                    let result = and(&scalar(None), &a).unwrap();
+                    assert_columnar_eq(&result, &scalar(None));
+                }
+            }
+
+            // Idempotence: a & a == a
+            proptest! {
+                #[test]
+                fn idempotence(a in arb_columnar_value()) {
+                    let result = and(&a, &a).unwrap();
+                    assert_columnar_eq(&result, &a);
+                }
+            }
+
+            // Associativity: (a & b) & c == a & (b & c)
+            // Note: while intermediate types may differ (scalar vs array), the final values are equal
+            proptest! {
+                #[test]
+                fn associativity(a in arb_columnar_value(), b in arb_columnar_value(), c in arb_columnar_value()) {
+                    let ab = and(&a, &b).unwrap();
+                    let ab_c = and(&ab, &c).unwrap();
+
+                    let bc = and(&b, &c).unwrap();
+                    let a_bc = and(&a, &bc).unwrap();
+
+                    assert_columnar_eq(&ab_c, &a_bc);
+                }
+            }
+        }
     }
 }

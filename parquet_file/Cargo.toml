@@ -12,7 +12,7 @@ workspace = true
 arrow = { workspace = true }
 arrow_util = { path = "../arrow_util" }
 base64 = "0.22"
-bytes = "1.10"
+bytes = "1.11"
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
 datafusion_util = { path = "../datafusion_util" }

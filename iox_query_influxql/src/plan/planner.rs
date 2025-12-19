@@ -1,4 +1,4 @@
-mod metadata;
+pub(crate) mod metadata;
 mod select;
 mod source_field_names;
 mod union;
@@ -51,7 +51,7 @@ use datafusion::functions_aggregate::{
 use datafusion::functions_array::expr_fn::make_array;
 use datafusion::functions_window::row_number::row_number_udwf;
 use datafusion::logical_expr::expr::{
-    AggregateFunctionParams, Alias, ScalarFunction, WindowFunctionParams,
+    AggregateFunctionParams, Alias, FieldMetadata, ScalarFunction, WindowFunctionParams,
 };
 use datafusion::logical_expr::expr_rewriter::normalize_col;
 use datafusion::logical_expr::logical_plan::Analyze;
@@ -60,9 +60,9 @@ use datafusion::logical_expr::{
     AggregateUDF, EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan,
     LogicalPlanBuilder, Operator, PlanType, Projection, ScalarUDF, TableSource, ToStringifiedPlan,
     Union, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition, binary_expr,
-    col, expr, expr::WindowFunction, lit,
+    col, expr, expr::WindowFunction, lit, lit_with_metadata,
 };
-use datafusion::logical_expr::{ExplainFormat, SortExpr};
+use datafusion::logical_expr::{ExplainFormat, Filter, SortExpr};
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::prelude::{Column, ExprFunctionExt, cast, lit_timestamp_nano, when};
 use datafusion::sql::TableReference;
@@ -181,6 +181,9 @@ enum ExprScope {
 /// root `SELECT` and subqueries.
 #[derive(Debug, Default, Clone)]
 struct Context<'a> {
+    /// The parent context, if this is a subquery.
+    parent: Option<&'a Self>,
+
     /// The name of the table used as the data source for the current query.
     table_name: &'a str,
     projection_type: ProjectionType,
@@ -225,6 +228,7 @@ impl<'a> Context<'a> {
         root_group_by_tags: &'a [&'a str],
     ) -> Self {
         Self {
+            parent: None,
             table_name,
             projection_type: select.projection_type,
             tz: select.timezone.map(|tz| Arc::from(tz.name())),
@@ -242,8 +246,9 @@ impl<'a> Context<'a> {
 
     /// Create a new context for the select statement that is
     /// a subquery of the current context.
-    fn subquery(&self, select: &'a Select) -> Self {
+    fn subquery(&'a self, select: &'a Select) -> Self {
         Self {
+            parent: Some(self),
             table_name: self.table_name,
             projection_type: select.projection_type,
             tz: select.timezone.map(|tz| Arc::from(tz.name())),
@@ -274,6 +279,62 @@ impl<'a> Context<'a> {
         )
     }
 
+    /// Calculate the time range that would have been stored in the
+    /// shard group created when the query was prepared in InfluxQL OG
+    /// ([source][1]).
+    ///
+    /// ```go
+    /// // Modify the time range if there are extra intervals and an interval.
+    /// if !c.Interval.IsZero() && c.ExtraIntervals > 0 {
+    ///     if c.Ascending {
+    ///         newTime := timeRange.Min.Add(time.Duration(-c.ExtraIntervals) * c.Interval.Duration)
+    ///         if !newTime.Before(time.Unix(0, influxql.MinTime).UTC()) {
+    ///             timeRange.Min = newTime
+    /// ```
+    ///
+    /// This time range is stored in the shard group and any iterators
+    /// that are created from the group will have the time bound by this
+    /// range ([source][2]).
+    ///
+    /// ```go
+    /// // Override the time constraints if they don't match each other.
+    /// if !a.MinTime.IsZero() && opt.StartTime < a.MinTime.UnixNano() {
+    ///     opt.StartTime = a.MinTime.UnixNano()
+    /// }
+    /// if !a.MaxTime.IsZero() && opt.EndTime > a.MaxTime.UnixNano() {
+    ///     opt.EndTime = a.MaxTime.UnixNano()
+    /// }
+    /// ```
+    /// [1]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L1153-L1158
+    /// [2]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/coordinator/shard_mapper.go#L177-L183
+    fn shard_group_time_range(&self) -> TimeRange {
+        if let Some(parent) = &self.parent {
+            return parent.shard_group_time_range();
+        }
+        match (self.extra_intervals, self.interval) {
+            (count @ 1.., Some(interval)) => {
+                if self.order_by.is_ascending() {
+                    TimeRange {
+                        lower: self
+                            .time_range
+                            .lower
+                            .map(|v| v - (count as i64 * interval.duration)),
+                        upper: self.time_range.upper,
+                    }
+                } else {
+                    TimeRange {
+                        lower: self.time_range.lower,
+                        upper: self
+                            .time_range
+                            .upper
+                            .map(|v| v + (count as i64 * interval.duration)),
+                    }
+                }
+            }
+            _ => self.time_range,
+        }
+    }
+
     /// Return the time range of the context, including any
     /// additional intervals required for window functions like
     /// `difference` or `moving_average`, when the query contains a
@@ -285,7 +346,7 @@ impl<'a> Context<'a> {
     /// a single interval, rather than the number required based on the
     /// window function.
     ///
-    /// # EXPECTED
+    /// ## EXPECTED
     ///
     /// For InfluxQL OG, the likely intended behaviour of the extra intervals
     /// was to ensure a minimum number of windows were calculated to ensure
@@ -319,7 +380,7 @@ impl<'a> Context<'a> {
     /// ```
     /// however, the actual output starts at `2020-06-11T16:53:10Z`.
     ///
-    /// # BUG
+    /// ## BUG
     ///
     /// During compilation of the query, InfluxQL OG determines the `ExtraIntervals`
     /// required for the `moving_average` function, which in the example is `3` ([source][1]):
@@ -394,6 +455,47 @@ impl<'a> Context<'a> {
     /// ```go
     /// return newMovingAverageIterator(input, int(n.Val), opt)
     /// ```
+    ///
+    /// # Note
+    ///
+    /// This function also ensures that the time range cannot extend
+    /// outside of the time range that InfluxQL OG would have passed to
+    /// the shard mapper when preparing the query, as calculated by
+    /// [`Self::shard_group_time_range`] ([source][2]).
+    ///
+    /// ```go
+    /// // Modify the time range if there are extra intervals and an interval.
+    /// if !c.Interval.IsZero() && c.ExtraIntervals > 0 {
+    ///     if c.Ascending {
+    ///         newTime := timeRange.Min.Add(time.Duration(-c.ExtraIntervals) * c.Interval.Duration)
+    ///         if !newTime.Before(time.Unix(0, influxql.MinTime).UTC()) {
+    ///             timeRange.Min = newTime
+    /// ```
+    ///
+    /// This time range is stored in the shard group and all iterators
+    /// created from the shard group will be restricted to this time
+    /// range ([source][9]).
+    ///
+    /// ```go
+    /// // Override the time constraints if they don't match each other.
+    /// if !a.MinTime.IsZero() && opt.StartTime < a.MinTime.UnixNano() {
+    ///     opt.StartTime = a.MinTime.UnixNano()
+    /// }
+    /// if !a.MaxTime.IsZero() && opt.EndTime > a.MaxTime.UnixNano() {
+    ///     opt.EndTime = a.MaxTime.UnixNano()
+    /// }
+    /// ```
+    ///
+    /// For top-level queries this will have no effect as the shard
+    /// group time range will always be the same, or wider than this
+    /// extended time range.
+    ///
+    /// For subqueries this might narrow the time range that would have
+    /// been used to read extra intervals, if the top-level query had
+    /// no need for those extra intervals. This should not further
+    /// restrict the requested time range, as that is restricted to
+    /// requested time range of the parent query in [`Self::subquery`].
+    ///
     /// [1]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L592-L594
     /// [2]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L1153-L1158
     /// [3]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L1172-L1173
@@ -402,6 +504,7 @@ impl<'a> Context<'a> {
     /// [6]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/select.go#L268-L267
     /// [7]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/select.go#L286-L290
     /// [8]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/select.go#L295
+    /// [9]: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/coordinator/shard_mapper.go#L177-L183
     fn extended_time_range(&self) -> TimeRange {
         // As described in the function docs, extra_intervals is either
         // 1 or 0 to match InfluxQL OG behaviour.
@@ -427,6 +530,9 @@ impl<'a> Context<'a> {
             }
             _ => self.time_range,
         }
+        // The time range cannot be any wider than the shard group time
+        // range.
+        .intersected(self.shard_group_time_range())
     }
 
     /// Calculate the time range of the expected result set. This is the
@@ -905,13 +1011,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             };
 
             let schema = IQLSchema::new_from_ds_schema(plan.schema(), ds.schema(self.s)?)?;
-            let plan = self.plan_condition_time_range(
-                &ctx.tz,
-                ctx.condition,
-                ctx.extended_time_range(),
-                plan,
-                &schema,
-            )?;
+            let plan = self.plan_condition(&ctx.tz, ctx.condition, plan, &schema)?;
             plans.push((plan, schema));
         }
 
@@ -920,6 +1020,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             2.. => {
                 // find all the columns referenced in the `SELECT`
                 let var_refs = find_var_refs(select);
+
+                // Collect metadata from all source plans for all var refs
+                // We need metadata to be consistent across all branches for DataFusion's aggregate
+                // physical schema check
+                let mut column_metadata: HashMap<String, HashMap<String, String>> = HashMap::new();
+                for (plan, _) in &plans {
+                    let schema = plan.schema();
+                    for vr in &var_refs {
+                        let name = vr.name.as_str();
+                        if let Ok(field) = schema.field_with_unqualified_name(name)
+                            && !field.metadata().is_empty()
+                            && !column_metadata.contains_key(name)
+                        {
+                            column_metadata.insert(name.to_string(), field.metadata().clone());
+                        }
+                    }
+                }
 
                 let mut tags = HashMap::new();
                 let plans = plans
@@ -941,9 +1058,19 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             }?;
 
                             if schema.has_column_with_unqualified_name(name) {
+                                // Column exists - keep it as is
                                 Ok(name.as_expr().alias(name))
                             } else {
-                                Ok(lit(ScalarValue::Null).alias(name))
+                                // Column doesn't exist - create NULL literal with collected metadata
+                                // This ensures consistent metadata across union branches
+                                if let Some(metadata) = column_metadata.get(name) {
+                                    Ok(lit_with_metadata(
+                                        ScalarValue::Null,
+                                        Some(FieldMetadata::from(metadata.clone()))
+                                    ).alias(name))
+                                } else {
+                                    Ok(lit(ScalarValue::Null).alias(name))
+                                }
                             }
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -3125,11 +3252,10 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         ))
     }
 
-    fn plan_condition_time_range(
+    fn plan_condition(
         &self,
         tz: &Option<Arc<str>>,
         condition: Option<&ConditionalExpression>,
-        time_range: TimeRange,
         plan: LogicalPlan,
         schema: &IQLSchema<'a>,
     ) -> Result<LogicalPlan> {
@@ -3144,15 +3270,34 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             })
             .transpose()?;
 
-        let time_expr = time_range_to_df_expr("time", tz, time_range);
-
-        let pb = LogicalPlanBuilder::from(plan);
-        match (time_expr, filter_expr) {
-            (Some(lhs), Some(rhs)) => pb.filter(lhs.and(rhs))?,
-            (Some(expr), None) | (None, Some(expr)) => pb.filter(expr)?,
-            (None, None) => pb,
+        match (filter_expr, plan) {
+            // Add to an existing filter, if possible.
+            (Some(expr), LogicalPlan::Filter(filter)) => {
+                let Filter {
+                    predicate, input, ..
+                } = filter;
+                Ok(LogicalPlan::Filter(Filter::try_new(
+                    predicate.and(expr),
+                    input,
+                )?))
+            }
+            (Some(expr), plan) => LogicalPlanBuilder::from(plan).filter(expr)?.build(),
+            (None, plan) => Ok(plan),
         }
-        .build()
+    }
+
+    fn plan_time_range(
+        &self,
+        tz: &Option<Arc<str>>,
+        time_range: TimeRange,
+        plan: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        let time_expr = time_range_to_df_expr("time", tz, time_range);
+        if let Some(expr) = time_expr {
+            LogicalPlanBuilder::from(plan).filter(expr)?.build()
+        } else {
+            Ok(plan)
+        }
     }
 
     /// Generate a logical plan that filters the existing plan based on the
@@ -3199,7 +3344,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             time_range
         };
 
-        self.plan_condition_time_range(&None, cond.as_ref(), time_range, plan, schema)
+        let plan = self.plan_time_range(&None, time_range, plan)?;
+        self.plan_condition(&None, cond.as_ref(), plan, schema)
     }
 
     /// Generate a logical plan for the specified `DataSource`. If the data source is a table then
@@ -3232,7 +3378,9 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     builder = builder.filter(expr)?;
                 }
                 builder = ctx.project_timezone(builder)?;
-                Ok(Some(builder.build()?))
+                let plan =
+                    self.plan_time_range(&ctx.tz, ctx.extended_time_range(), builder.build()?)?;
+                Ok(Some(plan))
             }
             DataSource::Table(_) => Ok(None),
             DataSource::Subquery(select) => self

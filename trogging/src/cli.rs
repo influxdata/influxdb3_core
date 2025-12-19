@@ -2,6 +2,42 @@
 use crate::{Builder, config::*};
 use tracing_subscriber::fmt::{MakeWriter, writer::BoxMakeWriter};
 
+/// CLI config for tokio console.
+#[derive(Debug, Clone, clap::Parser)]
+#[expect(missing_copy_implementations, reason = "easier to extend type")]
+pub struct TokioConsoleConfig {
+    /// Sets the maximum capacity for the channel of events sent from subscriber layers to the aggregator task.
+    ///
+    /// When this channel is at capacity, additional events will be dropped.
+    #[clap(
+        long = "tokio-console-event-buffer-capacity",
+        env = "TOKIO_CONSOLE_EVENT_BUFFER_CAPACITY",
+        action
+    )]
+    pub event_buffer_capacity: Option<usize>,
+
+    /// Sets the maximum capacity of updates to buffer for each subscribed client, if that client is not reading from the RPC stream.
+    ///
+    /// When this channel is at capacity, the client may be disconnected.
+    #[clap(
+        long = "tokio-console-client-buffer-capacity",
+        env = "TOKIO_CONSOLE_CLIENT_BUFFER_CAPACITY",
+        action
+    )]
+    pub client_buffer_capacity: Option<usize>,
+
+    /// Enable tokio console.
+    ///
+    /// This comes with a certain runtime overhead.
+    #[clap(
+        long = "tokio-console-enabled",
+        env = "TOKIO_CONSOLE_ENABLED",
+        default_value = "false",
+        action
+    )]
+    pub enabled: bool,
+}
+
 /// CLI config for the logging related subset of options.
 #[derive(Debug, Clone, clap::Parser)]
 pub struct LoggingConfig {
@@ -100,6 +136,10 @@ pub struct LoggingConfig {
         action,
     )]
     pub log_format: LogFormat,
+
+    /// Tokio console config.
+    #[clap(flatten)]
+    pub tokio_console: TokioConsoleConfig,
 }
 
 impl LoggingConfig {

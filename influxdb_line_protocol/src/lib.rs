@@ -82,7 +82,8 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
     character::complete::digit1,
-    combinator::{map, opt, recognize},
+    combinator::{cut, map, opt, recognize},
+    error::context,
     multi::many0,
     sequence::{preceded, separated_pair, terminated},
 };
@@ -100,11 +101,28 @@ use std::{
 /// <https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/#string>
 const STRING_LENGTH_LIMIT_IN_BYTES: usize = 65536;
 
+/// Maximum number of chars of context shown in error messages
+const MAX_ERROR_CONTEXT_CHARS: usize = 10;
+
+fn maybe_truncate_context(message: &str) -> String {
+    if message.len() > MAX_ERROR_CONTEXT_CHARS {
+        format!(
+            "{}...",
+            message
+                .chars()
+                .take(MAX_ERROR_CONTEXT_CHARS)
+                .collect::<String>()
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 /// Parsing errors that describe how a particular line is invalid line protocol.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum Error {
-    #[snafu(display(r#"Must not contain duplicate tags, but "{}" was repeated"#, tag_key))]
+    #[snafu(display(r#"Must not contain duplicate tags, but `{}` was repeated"#, tag_key))]
     DuplicateTag { tag_key: String },
 
     #[snafu(display(r#"Invalid measurement was provided"#))]
@@ -113,25 +131,25 @@ pub enum Error {
     #[snafu(display(r#"No fields were provided"#))]
     FieldSetMissing,
 
-    #[snafu(display(r#"Unable to parse integer value '{}'"#, value))]
+    #[snafu(display(r#"Unable to parse integer value `{}`"#, value))]
     IntegerValueInvalid {
         source: std::num::ParseIntError,
         value: String,
     },
 
-    #[snafu(display(r#"Unable to parse unsigned integer value '{}'"#, value))]
+    #[snafu(display(r#"Unable to parse unsigned integer value `{}`"#, value))]
     UIntegerValueInvalid {
         source: std::num::ParseIntError,
         value: String,
     },
 
-    #[snafu(display(r#"Unable to parse floating-point value '{}'"#, value))]
+    #[snafu(display(r#"Unable to parse floating-point value `{}`"#, value))]
     FloatValueInvalid {
         source: std::num::ParseFloatError,
         value: String,
     },
 
-    #[snafu(display(r#"Unable to parse timestamp value '{}'"#, value))]
+    #[snafu(display(r#"Unable to parse timestamp value `{}`"#, value))]
     TimestampValueInvalid {
         source: std::num::ParseIntError,
         value: String,
@@ -144,13 +162,22 @@ pub enum Error {
     EndsWithBackslash,
 
     #[snafu(display(
-        "Could not parse entire line. Found trailing content: '{}'",
-        trailing_content
+        "Could not parse entire line. Found trailing content: `{}`",
+        maybe_truncate_context(trailing_content)
     ))]
     CannotParseEntireLine { trailing_content: String },
 
-    #[snafu(display(r#"Tag Set Malformed"#))]
+    #[snafu(display(r#"Tag set malformed"#))]
     TagSetMalformed,
+
+    #[snafu(display(
+        r#"Tag set malformed: could not find {context} in `{}`"#,
+        maybe_truncate_context(input)
+    ))]
+    TagSetMalformedWithContext {
+        context: &'static str,
+        input: String,
+    },
 
     // TODO: Replace this with specific failures.
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]
@@ -158,6 +185,36 @@ pub enum Error {
         kind: nom::error::ErrorKind,
         trace: Vec<Error>,
     },
+
+    #[snafu(display("Expected {context}: {inner}"))]
+    Context {
+        context: &'static str,
+        inner: Box<Error>,
+    },
+
+    #[snafu(display("Expected at least one space character, got {}", if input.is_empty() {
+            "end of input".into()
+        } else {
+            format!("`{input}`")
+        }
+    ))]
+    ExpectedSpace { input: String },
+
+    #[snafu(display("Expected tag key, got {}", if input.is_empty() {
+            "end of input".into()
+        } else {
+            format!("`{}`", maybe_truncate_context(input))
+        }
+    ))]
+    ExpectedTagKey { input: String },
+
+    #[snafu(display("Expected tag value, got {}", if input.is_empty() {
+            "end of input".into()
+        } else {
+            format!("`{}`", maybe_truncate_context(input))
+        }
+    ))]
+    ExpectedTagValue { input: String },
 
     #[snafu(display(r#"String is greater than 64KB"#))]
     FieldStringValueTooLarge,
@@ -182,6 +239,16 @@ impl nom::error::ParseError<&str> for Error {
         GenericParsingSnafu {
             kind,
             trace: vec![other],
+        }
+        .build()
+    }
+}
+
+impl nom::error::ContextError<&str> for Error {
+    fn add_context(_input: &str, context: &'static str, inner: Self) -> Self {
+        ContextSnafu {
+            context,
+            inner: Box::new(inner),
         }
         .build()
     }
@@ -543,6 +610,7 @@ pub fn split_lines(input: &str) -> impl Iterator<Item = &str> {
                 commas += 1;
                 return false;
             } else if c == '"' && equals > commas {
+                // " this closing quote fixes editor highlighting that's confused by the prev line
                 quoted = !quoted;
                 return false;
             }
@@ -606,7 +674,15 @@ fn maybe_tagset(i: &str) -> IResult<&str, Option<TagSet<'_>>, Error> {
                     }
                     Ok((i, Some(ts)))
                 }
-                Err(nom::Err::Error(_)) => TagSetMalformedSnafu.fail().map_err(nom::Err::Error),
+                Err(nom::Err::Error(_)) => TagSetMalformedSnafu.fail().map_err(nom::Err::Failure),
+                Err(nom::Err::Failure(Error::Context { context, .. })) => {
+                    TagSetMalformedWithContextSnafu {
+                        input: remainder,
+                        context,
+                    }
+                    .fail()
+                    .map_err(nom::Err::Failure)
+                }
                 Err(e) => Err(e),
             }
         }
@@ -632,21 +708,38 @@ fn measurement(i: &str) -> IResult<&str, Measurement<'_>, Error> {
 }
 
 fn tag_set(i: &str) -> IResult<&str, TagSet<'_>> {
-    let one_tag = separated_pair(tag_key, tag("="), tag_value);
+    let one_tag = separated_pair(
+        cut(tag_key),
+        context("equals sign", cut(tag("="))),
+        cut(tag_value),
+    );
     parameterized_separated_list(tag(","), one_tag, SmallVec::new, |v, i| v.push(i))(i)
 }
 
-fn tag_key(i: &str) -> IResult<&str, EscapedStr<'_>> {
+fn tag_key(input: &str) -> IResult<&str, EscapedStr<'_>> {
     let normal_char =
         take_while1::<_, _, Error>(|c| !is_whitespace_boundary_char(c) && c != '=' && c != '\\');
 
-    escaped_value(normal_char)(i)
+    escaped_value(normal_char)(input).map_err(|e: nom::Err<Error>| match e {
+        nom::Err::Error(Error::GenericParsingError {
+            kind: nom::error::ErrorKind::TakeWhile1,
+            ..
+        }) => nom::Err::Error(ExpectedTagKeySnafu { input }.build()),
+        other => other,
+    })
 }
 
-fn tag_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
+fn tag_value(input: &str) -> IResult<&str, EscapedStr<'_>> {
     let normal_char =
         take_while1::<_, _, Error>(|c| !is_whitespace_boundary_char(c) && c != ',' && c != '\\');
-    escaped_value(normal_char)(i)
+
+    escaped_value(normal_char)(input).map_err(|e: nom::Err<Error>| match e {
+        nom::Err::Error(Error::GenericParsingError {
+            kind: nom::error::ErrorKind::TakeWhile1,
+            ..
+        }) => nom::Err::Error(ExpectedTagValueSnafu { input }.build()),
+        other => other,
+    })
 }
 
 fn field_set(i: &str) -> IResult<&str, FieldSet<'_>> {
@@ -808,8 +901,9 @@ fn trim_leading(mut i: &str) -> &str {
     }
 }
 
-fn whitespace(i: &str) -> IResult<&str, &str> {
-    take_while1(|c| c == ' ')(i)
+fn whitespace(input: &str) -> IResult<&str, &str> {
+    take_while1(|c| c == ' ')(input)
+        .map_err(|_e: nom::Err<Error>| nom::Err::Error(ExpectedSpaceSnafu { input }.build()))
 }
 
 fn is_whitespace_boundary_char(c: char) -> bool {
@@ -879,7 +973,7 @@ where
                     result.push(parsed);
                     head = remaining;
                 }
-                Err(nom::Err::Error(_)) => {
+                Err(nom::Err::Error(e)) => {
                     // FUTURE: https://doc.rust-lang.org/std/primitive.str.html#method.strip_prefix
                     if head.starts_with(escape_char) {
                         let after = &head[escape_char.len()..];
@@ -909,10 +1003,7 @@ where
                     } else {
                         // have we parsed *anything*?
                         if head == i {
-                            return Err(nom::Err::Error(Error::from_error_kind(
-                                head,
-                                nom::error::ErrorKind::EscapedTransform,
-                            )));
+                            return Err(nom::Err::Error(e));
                         } else {
                             return Ok((head, EscapedStr::from_slices(&result)));
                         }
@@ -935,7 +1026,7 @@ fn parameterized_separated_list<I, O, O2, E, F, G, Ret>(
 where
     I: Clone + PartialEq,
     F: Parser<I, Output = O, Error = E>,
-    G: FnMut(I) -> IResult<I, O2, E>,
+    G: Parser<I, Output = O2, Error = E>,
     E: nom::error::ParseError<I>,
 {
     move |mut i: I| {
@@ -958,7 +1049,7 @@ where
         }
 
         loop {
-            match sep(i.clone()) {
+            match sep.parse(i.clone()) {
                 Err(nom::Err::Error(_)) => return Ok((i, res)),
                 Err(e) => return Err(e),
                 Ok((i1, _)) => {
@@ -999,8 +1090,8 @@ fn parameterized_separated_list1<I, O, O2, E, F, G, Ret>(
 where
     I: Clone + PartialEq,
     F: Parser<I, Output = O, Error = E>,
-    G: FnMut(I) -> IResult<I, O2, E>,
-    E: nom::error::ParseError<I>,
+    G: Parser<I, Output = O2, Error = E>,
+    E: nom::error::ParseError<I> + std::fmt::Debug,
 {
     move |i| {
         let (rem, first) = f.parse(i)?;
@@ -1008,7 +1099,7 @@ where
         let mut res = cre();
         add(&mut res, first);
 
-        match sep(rem.clone()) {
+        match sep.parse(rem.clone()) {
             Ok((rem, _)) => parameterized_separated_list(sep, f, move || res, add)(rem),
             Err(nom::Err::Error(_)) => Ok((rem, res)),
             Err(e) => Err(e),
@@ -1093,7 +1184,147 @@ fn escape_and_write_value(
 mod test {
     use super::*;
     use smallvec::smallvec;
-    use test_helpers::approximately_equal;
+    use test_helpers::{approximately_equal, assert_error};
+
+    #[test]
+    fn better_error_messages() {
+        let lp = "measurement";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Expected at least one space character, got end of input",
+            result.to_string()
+        );
+
+        let lp = ",";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Invalid measurement was provided", result.to_string());
+
+        let lp = "J,#";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Tag set malformed: could not find equals sign in `#`",
+            result.to_string()
+        );
+
+        let lp = format!("J,{}", "a".repeat(200));
+        let result = parse_lines(&lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Tag set malformed: could not find equals sign in `aaaaaaaaaa...`",
+            result.to_string()
+        );
+
+        let lp = "J,";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag key, got end of input", result.to_string());
+
+        let lp = "testmeasure, bar=1i";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag key, got ` bar=1i`", result.to_string());
+
+        let lp = format!("testmeasure, {}=1i", "b".repeat(200));
+        let result = parse_lines(&lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag key, got ` bbbbbbbbb...`", result.to_string());
+
+        let lp = "0,,=";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag value, got end of input", result.to_string());
+
+        let lp = "testmeasure,foo\\=\\,baz= bar=1i";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag value, got ` bar=1i`", result.to_string());
+
+        let lp = format!("testmeasure,foo\\=\\,baz= bar={}i", "1".repeat(100));
+        let result = parse_lines(&lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Expected tag value, got ` bar=11111...`",
+            result.to_string()
+        );
+
+        let lp = "testmeasure,foo=,baz= bar=1i";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Expected tag value, got `,baz= bar=...`",
+            result.to_string()
+        );
+
+        let lp = "metrics,bananas=,platanos=great value=1.000000 1725629157696678000";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Expected tag value, got `,platanos=...`",
+            result.to_string()
+        );
+
+        let lp = "metrics,\
+            metrics_name=kube_node_spec_taint,node=10.0.213.170,itsEmpty=,effect=NoSchedule \
+            value=1.000000 \
+            1725628131752524000";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Expected tag value, got `,effect=No...`",
+            result.to_string()
+        );
+
+        let lp = "testmeasure,foo= sed=1i";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag value, got ` sed=1i`", result.to_string());
+
+        let lp = "testmeasure,foo=f bar=1i,baz=";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Could not parse entire line. Found trailing content: `baz=`",
+            result.to_string()
+        );
+
+        let lp = format!("testmeasure,foo=f bar=1i,ba{}=", "z".repeat(100));
+        let result = parse_lines(&lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Could not parse entire line. Found trailing content: `bazzzzzzzz...`",
+            result.to_string()
+        );
+
+        let lp = "testmeasure,foo\\=\\,baz= bar=1i";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("Expected tag value, got ` bar=1i`", result.to_string());
+
+        let lp = "\u{1b}# /";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!("No fields were provided", result.to_string());
+
+        let lp = ":\u{14}\\";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Measurements, tag keys and values, and field keys may not end with a backslash",
+            result.to_string()
+        );
+
+        let lp = "testmeasure field=3.0 \
+        188888888888888888888888888888888888888888888888888888888888888888888888";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Unable to parse timestamp value \
+            `188888888888888888888888888888888888888888888888888888888888888888888888`",
+            result.to_string()
+        );
+
+        let lp = "testmeasure field=66666666666666666666666666666666666666666666668i";
+        let result = parse_lines(lp).next().unwrap().unwrap_err();
+        assert_eq!(
+            "Unable to parse integer value \
+            `66666666666666666666666666666666666666666666668`",
+            result.to_string()
+        );
+
+        let lp = "goodline,tag1=one,tag2=2 value=1 123
+        badline,
+        anothergoodline,tag3=3,tag4=4 value=67 1234";
+        let result: Vec<_> = parse_lines(lp)
+            .filter_map(|r| r.err().map(|e| e.to_string()))
+            .collect();
+        assert_eq!(
+            &[String::from("Expected tag key, got end of input")],
+            &result.as_slice(),
+        );
+    }
 
     impl FieldValue<'_> {
         pub(crate) fn unwrap_i64(&self) -> i64 {
@@ -1274,28 +1505,24 @@ mod test {
     #[test]
     fn parse_tag_no_value() {
         let input = "testmeasure,foo= bar=1i";
-        let vals = parse(input);
-        assert!(matches!(vals, Err(Error::TagSetMalformed)));
+        assert_error!(parse(input), Error::ExpectedTagValue { ref input } if input == " bar=1i");
     }
 
     // tests that just a comma after the measurement is an error
     #[test]
     fn parse_no_tagset() {
         let input = "testmeasure, bar=1i";
-        let vals = parse(input);
-        assert!(matches!(vals, Err(Error::TagSetMalformed)));
+        assert_error!(parse(input), Error::ExpectedTagKey { ref input } if input == " bar=1i");
     }
 
     #[test]
     fn parse_no_measurement() {
         let input = ",tag1=1,tag2=2 value=1 123";
-        let vals = parse(input);
-        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+        assert_error!(parse(input), Error::MeasurementValueInvalid);
 
         // accepts `field=1` as measurement, and errors on missing field
         let input = "field=1 1234";
-        let vals = parse(input);
-        assert!(matches!(vals, Err(Error::FieldSetMissing)));
+        assert_error!(parse(input), Error::FieldSetMissing);
     }
 
     // matches behavior in influxdb golang parser
@@ -1313,12 +1540,10 @@ mod test {
     #[test]
     fn parse_null_measurement() {
         let input = "\0 field=1 1234";
-        let vals = parse(input);
-        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+        assert_error!(parse(input), Error::MeasurementValueInvalid);
 
         let input = "\0,tag1=1,tag2=2 value=1 123";
-        let vals = parse(input);
-        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+        assert_error!(parse(input), Error::MeasurementValueInvalid);
     }
 
     #[test]
@@ -1336,16 +1561,14 @@ mod test {
     #[test]
     fn parse_no_fields() {
         let input = "foo 1234";
-        let vals = parse(input);
 
-        assert!(matches!(vals, Err(super::Error::FieldSetMissing)));
+        assert_error!(parse(input), Error::FieldSetMissing);
     }
 
     #[test]
     fn parse_null_in_field_value() {
         let input = "m,tag1=one,tag2=2 value=\0 123";
-        let vals = parse(input);
-        assert!(vals.is_err());
+        assert_error!(parse(input), Error::FieldSetMissing);
     }
 
     #[test]
@@ -1570,12 +1793,8 @@ mod test {
     #[test]
     fn parse_negative_uinteger() {
         let input = "m0 field=-1u 99";
-        let parsed = parse(input);
 
-        assert!(
-            matches!(parsed, Err(super::Error::CannotParseEntireLine { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::CannotParseEntireLine { .. });
     }
 
     #[test]
@@ -1645,39 +1864,19 @@ mod test {
 
         // No digits after e
         let input = "m0 field=-1.234456e 1615869152385000000";
-        let parsed = parse(input);
-        assert!(
-            matches!(parsed, Err(super::Error::CannotParseEntireLine { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::CannotParseEntireLine { .. });
 
         let input = "m0 field=-1.234456e+ 1615869152385000000";
-        let parsed = parse(input);
-        assert!(
-            matches!(parsed, Err(super::Error::CannotParseEntireLine { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::CannotParseEntireLine { .. });
 
         let input = "m0 field=-1.234456E 1615869152385000000";
-        let parsed = parse(input);
-        assert!(
-            matches!(parsed, Err(super::Error::CannotParseEntireLine { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::CannotParseEntireLine { .. });
 
         let input = "m0 field=-1.234456E+ 1615869152385000000";
-        let parsed = parse(input);
-        assert!(
-            matches!(parsed, Err(super::Error::CannotParseEntireLine { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::CannotParseEntireLine { .. });
 
         let input = "m0 field=-1.234456E-";
-        let parsed = parse(input);
-        assert!(
-            matches!(parsed, Err(super::Error::CannotParseEntireLine { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::CannotParseEntireLine { .. });
     }
 
     #[test]
@@ -1695,23 +1894,15 @@ mod test {
     #[test]
     fn parse_out_of_range_integer() {
         let input = "m0 field=99999999999999999999999999999999i 99";
-        let parsed = parse(input);
 
-        assert!(
-            matches!(parsed, Err(super::Error::IntegerValueInvalid { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::IntegerValueInvalid { .. });
     }
 
     #[test]
     fn parse_out_of_range_uinteger() {
         let input = "m0 field=99999999999999999999999999999999u 99";
-        let parsed = parse(input);
 
-        assert!(
-            matches!(parsed, Err(super::Error::UIntegerValueInvalid { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::UIntegerValueInvalid { .. });
     }
 
     #[test]
@@ -1812,12 +2003,8 @@ bar value2=2i 123"#;
     #[test]
     fn parse_out_of_range_timestamp() {
         let input = "m0 field=1i 99999999999999999999999999999999";
-        let parsed = parse(input);
 
-        assert!(
-            matches!(parsed, Err(super::Error::TimestampValueInvalid { .. })),
-            "Wrong error: {parsed:?}",
-        );
+        assert_error!(parse(input), Error::TimestampValueInvalid { .. });
     }
 
     #[test]
@@ -1904,11 +2091,10 @@ her"#,
 
     #[test]
     fn measurement_disallows_ending_in_backslash() {
-        let parsed = measurement(r"weather\");
-        assert!(matches!(
-            parsed,
-            Err(nom::Err::Failure(super::Error::EndsWithBackslash))
-        ));
+        assert_error!(
+            measurement(r"weather\"),
+            nom::Err::Failure(Error::EndsWithBackslash)
+        );
     }
 
     #[test]
@@ -1960,11 +2146,10 @@ her"#,
 
     #[test]
     fn tag_key_disallows_ending_in_backslash() {
-        let parsed = tag_key(r"weather\");
-        assert!(matches!(
-            parsed,
-            Err(nom::Err::Failure(super::Error::EndsWithBackslash))
-        ));
+        assert_error!(
+            tag_key(r"weather\"),
+            nom::Err::Failure(Error::EndsWithBackslash)
+        );
     }
 
     #[test]
@@ -2016,11 +2201,10 @@ her"#,
 
     #[test]
     fn tag_value_disallows_ending_in_backslash() {
-        let parsed = tag_value(r"weather\");
-        assert!(matches!(
-            parsed,
-            Err(nom::Err::Failure(super::Error::EndsWithBackslash))
-        ));
+        assert_error!(
+            tag_value(r"weather\"),
+            nom::Err::Failure(Error::EndsWithBackslash)
+        );
     }
 
     #[test]
@@ -2072,11 +2256,10 @@ her"#,
 
     #[test]
     fn field_key_disallows_ending_in_backslash() {
-        let parsed = field_key(r"weather\");
-        assert!(matches!(
-            parsed,
-            Err(nom::Err::Failure(super::Error::EndsWithBackslash))
-        ));
+        assert_error!(
+            field_key(r"weather\"),
+            nom::Err::Failure(Error::EndsWithBackslash)
+        );
     }
 
     #[test]
@@ -2357,9 +2540,7 @@ her"#,
             r#"foo,tag1=normal,tag={} value=1i 123"#,
             "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1)
         );
-        let parsed = parse(&input);
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]
@@ -2403,10 +2584,7 @@ her"#,
             "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 2)
         );
 
-        let parsed = parse(&input);
-
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]
@@ -2416,10 +2594,7 @@ her"#,
             "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1)
         );
 
-        let parsed = parse(&input);
-
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]
@@ -2447,10 +2622,7 @@ her"#,
             "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1)
         );
 
-        let parsed = parse(&input);
-
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]
@@ -2458,10 +2630,7 @@ her"#,
         let measurement = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1);
         let input = format!("{measurement},tag1=bar value=1i 123");
 
-        let parsed = parse(&input);
-
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]
@@ -2481,10 +2650,7 @@ her"#,
         let tag_name = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1);
         let input = format!("foo,{tag_name}=bar value=1i 123");
 
-        let parsed = parse(&input);
-
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]
@@ -2505,10 +2671,7 @@ her"#,
         let value_name = "a".repeat(STRING_LENGTH_LIMIT_IN_BYTES + 1);
         let input = format!("foo,tag1=bar {value_name}=1i 123");
 
-        let parsed = parse(&input);
-
-        assert!(parsed.is_err());
-        assert!(matches!(parsed, Err(Error::FieldStringValueTooLarge)));
+        assert_error!(parse(&input), Error::FieldStringValueTooLarge);
     }
 
     #[test]

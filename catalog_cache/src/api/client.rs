@@ -188,6 +188,11 @@ impl CatalogCacheClient {
         }
     }
 
+    /// Get endpoint.
+    pub fn endpoint(&self) -> &Url {
+        &self.endpoint
+    }
+
     /// URL to given key.
     fn url(&self, path: RequestPath) -> Url {
         // try to construct URL rather cheaply, a true builder doesn't really exists yet, see https://github.com/servo/rust-url/issues/835
