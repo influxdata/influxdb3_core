@@ -2,46 +2,62 @@
 # In alphabetical order
 members = [
     "arrow_util",
+    "authz",
     "backoff",
+    "catalog_cache",
     "client_util",
     "data_types",
     "datafusion_util",
+    "error_reporting",
     "executor",
     "flightsql",
+    "futures_test_utils",
     "generated_types",
     "influxdb_influxql_parser",
     "influxdb_iox_client",
     "influxdb_line_protocol",
     "influxdb2_client",
+    "ingester_query_grpc",
     "iox_http",
+    "iox_http_util",
+    "iox_query",
     "iox_query_influxql",
     "iox_query_influxql_rewrite",
-    "iox_query",
+    "iox_query_params",
     "iox_system_tables",
     "iox_time",
     "iox_v1_query_api",
+    "jemalloc_stats",
+    "linear_buffer",
     "logfmt",
     "meta_data_cache",
-    "metric_exporters",
     "metric",
+    "metric_exporters",
+    "mutable_batch",
     "mutable_batch_lp",
     "mutable_batch_lp/fuzz",
-    "mutable_batch",
     "object_store_mem_cache",
     "object_store_metrics",
+    "object_store_mock",
+    "object_store_size_hinting",
+    "observability_deps",
     "panic_logging",
     "parquet_file",
+    "partition",
     "predicate",
     "query_functions",
     "schema",
     "service_common",
     "service_grpc_flight",
     "sharder",
-    "tokio_metrics_bridge",
+    "test_helpers",
     "test_helpers_authz",
+    "tokio_metrics_bridge",
+    "tokio_watchdog",
+    "tower_trailer",
+    "trace",
     "trace_exporters",
     "trace_http",
-    "trace",
     "tracker",
     "trogging",
     "workspace-hack",
@@ -76,6 +92,7 @@ arrow-schema = { version = "55" }
 bincode = { version = "2", default-features = false, features = ["alloc", "derive"] }
 # Use DataFusion fork (see below)
 datafusion = { version = "49" }
+datafusion-proto = { version = "49" }
 hashbrown = { version = "0.14.5" }
 http = { version = "1" }
 http-body = { version = "1" }
@@ -164,6 +181,10 @@ opt-level = 3
 #       version. Should you ever encounter a `datafusion-*` crate that is duplicated (i.e. `Cargo.lock` lists both the
 #       crates.io release and our fork), just add it to this list here.
 datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+datafusion-common = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+datafusion-expr = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+datafusion-sql = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
 
 # Patching Arrow
 #
