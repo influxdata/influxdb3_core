@@ -13,7 +13,7 @@ pub struct HealthCheck {
     pub message: Option<String>,
     /// Checks
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<crate::models::HealthCheck>,
+    pub checks: Vec<Self>,
     /// Status
     pub status: Status,
     /// Version

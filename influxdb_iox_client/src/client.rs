@@ -50,3 +50,6 @@ pub mod write;
 
 /// Batched write client for efficient bulk writes
 pub mod batched_write;
+
+/// Reloadable token provider for write client authentication
+pub mod reloadable_token;

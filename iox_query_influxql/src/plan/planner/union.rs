@@ -1,5 +1,3 @@
-use std::{collections::HashMap, sync::Arc};
-
 use arrow::datatypes::Field;
 use datafusion::{
     common::DFSchema,
@@ -45,39 +43,54 @@ fn coerce_union_schema(inputs: Vec<&LogicalPlan>) -> DFSchema {
         .iter()
         .map(|f| f.is_nullable())
         .collect::<Vec<_>>();
+    let mut union_field_meta = base_schema
+        .fields()
+        .iter()
+        .map(|f| f.metadata().clone())
+        .collect::<Vec<_>>();
+
+    let mut metadata = base_schema.metadata().clone();
 
     for plan in inputs.iter().skip(1) {
         let plan_schema = plan.schema();
+        metadata.extend(plan_schema.metadata().clone());
+
         if plan_schema.fields().len() != base_schema.fields().len() {
             return (**base_schema).clone();
         }
+
         // coerce data type and nullablity for each field
-        for (union_datatype, union_nullable, plan_field) in izip!(
+        for (union_datatype, union_nullable, union_field_map, plan_field) in izip!(
             union_datatypes.iter_mut(),
             union_nullabilities.iter_mut(),
-            plan_schema.fields()
+            union_field_meta.iter_mut(),
+            plan_schema.fields().iter()
         ) {
             let Some(coerced_type) = comparison_coercion(union_datatype, plan_field.data_type())
             else {
                 return (**base_schema).clone();
             };
+
             *union_datatype = coerced_type;
             *union_nullable = *union_nullable || plan_field.is_nullable();
+            union_field_map.extend(plan_field.metadata().clone());
         }
     }
     let union_qualified_fields = izip!(
         base_schema.iter(),
         union_datatypes.into_iter(),
-        union_nullabilities
+        union_nullabilities,
+        union_field_meta.into_iter()
     )
-    .map(|((qualifier, field), datatype, nullable)| {
-        let field = Arc::new(Field::new(field.name().clone(), datatype, nullable));
-        (qualifier.cloned(), field)
+    .map(|((qualifier, field), datatype, nullable, metadata)| {
+        let mut field = Field::new(field.name().clone(), datatype, nullable);
+        field.set_metadata(metadata);
+        (qualifier.cloned(), field.into())
     })
     .collect::<Vec<_>>();
-    let Ok(new_schema) = DFSchema::new_with_metadata(union_qualified_fields, HashMap::new()) else {
+
+    let Ok(new_schema) = DFSchema::new_with_metadata(union_qualified_fields, metadata) else {
         return (**base_schema).clone();
     };
-
     new_schema
 }

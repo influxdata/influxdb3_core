@@ -8,10 +8,47 @@ use futures::future::{Either, select};
 use futures::{StreamExt, pin_mut};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use url::Url;
+
+fn display_remote_generations(g: &[RemoteGeneration; 2]) -> impl std::fmt::Display {
+    let mut out = String::new();
+
+    out.push('[');
+
+    for (idx, (url, res)) in g.iter().enumerate() {
+        if idx > 0 {
+            write!(&mut out, ", ").unwrap();
+        }
+
+        write!(&mut out, "'{url}'=>").unwrap();
+
+        match res.as_ref() {
+            Ok(Some(generation)) => {
+                write!(&mut out, "Ok({generation})").unwrap();
+            }
+            Ok(None) => {
+                write!(&mut out, "Ok(MISSING)").unwrap();
+            }
+            Err(e) => {
+                write!(&mut out, "Err({e})").unwrap();
+            }
+        }
+    }
+
+    out.push(']');
+
+    out
+}
+
+/// Generation that we got from a remote endpoint.
+///
+/// Used for [error reporting](Error).
+pub type RemoteGeneration = (Url, Result<Option<u64>, ClientError>);
 
 /// Error for [`QuorumCatalogCache`]
 #[expect(missing_docs)]
@@ -26,9 +63,14 @@ pub enum Error {
     #[snafu(display("Join Error: {source}"))]
     Join { source: JoinError },
 
-    #[snafu(display("Failed to establish a read quorum: {generations:?}"))]
+    #[snafu(display(
+        "Failed to establish a read quorum: local={}, remote={}",
+        local_generation.map(|g| g.to_string()).unwrap_or_else(|| "MISSING".to_owned()),
+        display_remote_generations(remote_generations),
+    ))]
     Quorum {
-        generations: [Result<Option<u64>, ClientError>; 3],
+        local_generation: Option<u64>,
+        remote_generations: Box<[RemoteGeneration; 2]>,
     },
 
     #[snafu(display("Failed to list replica: {source}"))]
@@ -110,11 +152,17 @@ impl QuorumCatalogCache {
                             Ok(Some(l))
                         }
                         (l, r1, r2) => Err(Error::Quorum {
-                            generations: [
-                                Ok(l.map(|x| x.generation)),
-                                r1.map(|x| x.map(|x| x.generation)),
-                                r2.map(|x| x.map(|x| x.generation)),
-                            ],
+                            local_generation: l.map(|x| x.generation()),
+                            remote_generations: Box::new([
+                                (
+                                    self.replicas[0].endpoint().clone(),
+                                    r1.map(|x| x.map(|x| x.generation)),
+                                ),
+                                (
+                                    self.replicas[1].endpoint().clone(),
+                                    r2.map(|x| x.map(|x| x.generation)),
+                                ),
+                            ]),
                         }),
                     }
                 }
@@ -694,6 +742,35 @@ mod tests {
         assert!(
             matches!(err, Error::Quorum { .. }),
             "Expected Quorum error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quorum_err_display() {
+        assert_eq!(
+            Error::Quorum {
+                local_generation: None,
+                remote_generations: Box::new([
+                    ("http://foo".parse().unwrap(), Ok(None)),
+                    ("http://bar".parse().unwrap(), Ok(None)),
+                ]),
+            }
+            .to_string(),
+            "Failed to establish a read quorum: local=MISSING, remote=['http://foo/'=>Ok(MISSING), 'http://bar/'=>Ok(MISSING)]",
+        );
+        assert_eq!(
+            Error::Quorum {
+                local_generation: Some(1),
+                remote_generations: Box::new([
+                    ("http://foo".parse().unwrap(), Ok(Some(1))),
+                    (
+                        "http://bar".parse().unwrap(),
+                        Err(ClientError::MissingGeneration)
+                    ),
+                ]),
+            }
+            .to_string(),
+            "Failed to establish a read quorum: local=1, remote=['http://foo/'=>Ok(1), 'http://bar/'=>Err(Missing generation header)]",
         );
     }
 }

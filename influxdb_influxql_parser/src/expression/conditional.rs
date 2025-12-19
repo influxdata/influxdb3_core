@@ -93,7 +93,7 @@ pub enum ConditionalExpression {
     Binary(ConditionalBinary),
 
     /// Represents a conditional expression enclosed in parenthesis.
-    Grouped(Box<ConditionalExpression>),
+    Grouped(Box<Self>),
 }
 
 impl ConditionalExpression {

@@ -75,7 +75,7 @@ impl ScalarUDFImpl for TzUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        internal_err!("tz should call return_type_from_args")
+        internal_err!("tz should call return_field_from_args")
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {

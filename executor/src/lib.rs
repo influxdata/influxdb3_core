@@ -33,7 +33,7 @@ use futures::{
 
 use tracing::warn;
 
-pub use io::{register_current_runtime_for_io, register_io_runtime, spawn_io};
+pub use io::{get_io_runtime, register_current_runtime_for_io, register_io_runtime, spawn_io};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 

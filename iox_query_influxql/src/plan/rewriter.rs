@@ -1006,6 +1006,12 @@ struct FieldChecker {
 
     /// Accumulator for the number of selector expressions for the statement.
     selector_count: usize,
+
+    /// Number of fields that have a top-level window function (not nested inside another window).
+    fields_with_top_level_window: usize,
+
+    /// Number of fields that have either an aggregate or selector function, or both.
+    fields_with_aggregate_or_selector: usize,
     // Set to `true` if any window or aggregate functions are expected to
     // only produce non-null results.
     //
@@ -1019,7 +1025,20 @@ impl FieldChecker {
         fields: &[Field],
         fill: Option<FillClause>,
     ) -> Result<SelectStatementInfo> {
-        fields.iter().try_for_each(|f| self.check_expr(&f.expr))?;
+        // Check each field and track whether it has a top-level window function
+        for f in fields {
+            let starting_aggregate_selector_count = self.aggregate_count + self.selector_count;
+            let starting_window_count = self.window_count;
+
+            self.check_expr(&f.expr)?;
+
+            if self.aggregate_count + self.selector_count > starting_aggregate_selector_count {
+                self.fields_with_aggregate_or_selector += 1;
+            }
+            if self.window_count > starting_window_count {
+                self.fields_with_top_level_window += 1;
+            }
+        }
 
         match self.function_count() {
             0 => {
@@ -1082,7 +1101,9 @@ impl FieldChecker {
             ProjectionType::TopBottomSelector
         } else if self.has_group_by_time {
             if self.window_count > 0 {
-                if self.window_count >= self.aggregate_count + self.selector_count {
+                // WindowAggregate: all fields with aggregates/selectors also have window functions
+                // WindowAggregateMixed: some fields have aggregates/selectors without window functions
+                if self.fields_with_top_level_window >= self.fields_with_aggregate_or_selector {
                     ProjectionType::WindowAggregate
                 } else {
                     ProjectionType::WindowAggregateMixed
@@ -1801,6 +1822,29 @@ mod test {
         ))
         .unwrap();
         assert_matches!(info.projection_type, ProjectionType::WindowAggregateMixed);
+
+        // Test multiple nested window functions (issue #12700)
+        // cumulative_sum(difference(mean(foo))) has 2 window functions wrapping 1 aggregate
+        let info = select_statement_info(&parse_select(
+            "SELECT cumulative_sum(difference(mean(foo))) FROM cpu GROUP BY TIME(10s)",
+        ))
+        .unwrap();
+        assert_matches!(info.projection_type, ProjectionType::WindowAggregate);
+
+        // cumulative_sum(difference(mean(foo))) with an additional unwrapped aggregate
+        // should be WindowAggregateMixed because mean(bar) is not wrapped by a window function
+        let info = select_statement_info(&parse_select(
+            "SELECT cumulative_sum(difference(mean(foo))), mean(bar) FROM cpu GROUP BY TIME(10s)",
+        ))
+        .unwrap();
+        assert_matches!(info.projection_type, ProjectionType::WindowAggregateMixed);
+
+        // Multiple fields with nested windows should still be WindowAggregate
+        let info = select_statement_info(&parse_select(
+            "SELECT cumulative_sum(difference(mean(foo))), derivative(sum(bar)) FROM cpu GROUP BY TIME(10s)",
+        ))
+        .unwrap();
+        assert_matches!(info.projection_type, ProjectionType::WindowAggregate);
 
         let info = select_statement_info(&parse_select("SELECT top(foo, 3) FROM cpu")).unwrap();
         assert_matches!(info.projection_type, ProjectionType::TopBottomSelector);

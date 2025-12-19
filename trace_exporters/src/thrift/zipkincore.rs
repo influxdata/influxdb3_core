@@ -76,7 +76,7 @@ impl TryFrom<i32> for AnnotationType {
 
 /// Indicates the network context of a service recording an annotation with two
 /// exceptions.
-/// 
+///
 /// When a BinaryAnnotation, and key is CLIENT_ADDR or SERVER_ADDR,
 /// the endpoint indicates the source or destination of an RPC. This exception
 /// allows zipkin to display network context of uninstrumented services, or
@@ -84,17 +84,17 @@ impl TryFrom<i32> for AnnotationType {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Endpoint {
   /// IPv4 host address packed into 4 bytes.
-  /// 
+  ///
   /// Ex for the ip 1.2.3.4, it would be (1 << 24) | (2 << 16) | (3 << 8) | 4
   pub ipv4: Option<i32>,
   /// IPv4 port
-  /// 
+  ///
   /// Note: this is to be treated as an unsigned integer, so watch for negatives.
-  /// 
+  ///
   /// Conventionally, when the port isn't known, port = 0.
   pub port: Option<i16>,
   /// Service name in lowercase, such as "memcache" or "zipkin-web"
-  /// 
+  ///
   /// Conventionally, when the service name isn't known, service_name = "unknown".
   pub service_name: Option<String>,
   /// IPv6 host address packed into 16 bytes. Ex Inet6Address.getBytes()
@@ -214,7 +214,7 @@ impl Default for Endpoint {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Annotation {
   /// Microseconds from epoch.
-  /// 
+  ///
   /// This value should use the most precise value possible. For example,
   /// gettimeofday or syncing nanoTime against a tick of currentTimeMillis.
   pub timestamp: Option<i64>,
@@ -319,10 +319,10 @@ impl Default for Annotation {
 /// Binary annotations are tags applied to a Span to give it context. For
 /// example, a binary annotation of "http.uri" could the path to a resource in a
 /// RPC call.
-/// 
+///
 /// Binary annotations of type STRING are always queryable, though more a
 /// historical implementation detail than a structural concern.
-/// 
+///
 /// Binary annotations can repeat, and vary on the host. Similar to Annotation,
 /// the host indicates who logged the event. This allows you to tell the
 /// difference between the client and server side of the same key. For example,
@@ -336,7 +336,7 @@ pub struct BinaryAnnotation {
   pub annotation_type: Option<AnnotationType>,
   /// The host that recorded tag, which allows you to differentiate between
   /// multiple tags with the same key. There are two exceptions to this.
-  /// 
+  ///
   /// When the key is CLIENT_ADDR or SERVER_ADDR, host indicates the source or
   /// destination of an RPC. This exception allows zipkin to display network
   /// context of uninstrumented services, or clients such as web browsers.
@@ -452,7 +452,7 @@ impl Default for BinaryAnnotation {
 //
 
 /// A trace is a series of spans (often RPC calls) which form a latency tree.
-/// 
+///
 /// The root span is where trace_id = id and parent_id = Nil. The root span is
 /// usually the longest interval in the trace, starting with a SERVER_RECV
 /// annotation and ending with a SERVER_SEND.
@@ -460,7 +460,7 @@ impl Default for BinaryAnnotation {
 pub struct Span {
   pub trace_id: Option<i64>,
   /// Span name in lowercase, rpc method for example
-  /// 
+  ///
   /// Conventionally, when the span name isn't known, name = "unknown".
   pub name: Option<String>,
   pub id: Option<i64>,
@@ -469,32 +469,32 @@ pub struct Span {
   pub binary_annotations: Option<Vec<BinaryAnnotation>>,
   pub debug: Option<bool>,
   /// Microseconds from epoch of the creation of this span.
-  /// 
+  ///
   /// This value should be set directly by instrumentation, using the most
   /// precise value possible. For example, gettimeofday or syncing nanoTime
   /// against a tick of currentTimeMillis.
-  /// 
+  ///
   /// For compatibility with instrumentation that precede this field, collectors
   /// or span stores can derive this via Annotation.timestamp.
   /// For example, SERVER_RECV.timestamp or CLIENT_SEND.timestamp.
-  /// 
+  ///
   /// This field is optional for compatibility with old data: first-party span
   /// stores are expected to support this at time of introduction.
   pub timestamp: Option<i64>,
   /// Measurement of duration in microseconds, used to support queries.
-  /// 
+  ///
   /// This value should be set directly, where possible. Doing so encourages
   /// precise measurement decoupled from problems of clocks, such as skew or NTP
   /// updates causing time to move backwards.
-  /// 
+  ///
   /// For compatibility with instrumentation that precede this field, collectors
   /// or span stores can derive this by subtracting Annotation.timestamp.
   /// For example, SERVER_SEND.timestamp - SERVER_RECV.timestamp.
-  /// 
+  ///
   /// If this field is persisted as unset, zipkin will continue to work, except
   /// duration query support will be implementation-specific. Similarly, setting
   /// this field non-atomically is implementation-specific.
-  /// 
+  ///
   /// This field is i64 vs i32 to support spans longer than 35 minutes.
   pub duration: Option<i64>,
   /// Optional unique 8-byte additional identifier for a trace. If non zero, this
@@ -1074,8 +1074,8 @@ impl ZipkinCollectorSubmitZipkinBatchResult {
     o_prot.write_struct_end()
   }
   fn ok_or(self) -> thrift::Result<Vec<Response>> {
-    if self.result_value.is_some() {
-      Ok(self.result_value.unwrap())
+    if let Some(value) = self.result_value {
+      Ok(value)
     } else {
       Err(
         thrift::Error::Application(
@@ -1088,4 +1088,3 @@ impl ZipkinCollectorSubmitZipkinBatchResult {
     }
   }
 }
-

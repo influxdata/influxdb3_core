@@ -39,6 +39,9 @@ pub enum Error {
 
     #[error("Cannot set global log subscriber")]
     SetLoggerError(#[from] tracing_log::log_tracer::SetLoggerError),
+
+    #[error("`tokio_console` feature not enabled")]
+    TokioConsoleMissing,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -199,33 +202,32 @@ where
 
         let res: Box<dyn Layer<S> + Send + Sync> = match log_format {
             LogFormat::Full => Box::new(
-                log_filter.and_then(
-                    fmt::layer()
-                        .with_writer(log_writer)
-                        .with_target(with_target)
-                        .with_ansi(with_ansi),
-                ),
+                fmt::layer()
+                    .with_writer(log_writer)
+                    .with_target(with_target)
+                    .with_ansi(with_ansi)
+                    .with_filter(log_filter),
             ),
             LogFormat::Pretty => Box::new(
-                log_filter.and_then(
-                    fmt::layer()
-                        .pretty()
-                        .with_writer(log_writer)
-                        .with_target(with_target)
-                        .with_ansi(with_ansi),
-                ),
+                fmt::layer()
+                    .pretty()
+                    .with_writer(log_writer)
+                    .with_target(with_target)
+                    .with_ansi(with_ansi)
+                    .with_filter(log_filter),
             ),
             LogFormat::Json => Box::new(
-                log_filter.and_then(
-                    fmt::layer()
-                        .json()
-                        .with_writer(log_writer)
-                        .with_target(with_target)
-                        .with_ansi(with_ansi),
-                ),
+                fmt::layer()
+                    .json()
+                    .with_writer(log_writer)
+                    .with_target(with_target)
+                    .with_ansi(with_ansi)
+                    .with_filter(log_filter),
             ),
             LogFormat::Logfmt => Box::new(
-                log_filter.and_then(logfmt::LogFmtLayer::new(log_writer).with_target(with_target)),
+                logfmt::LogFmtLayer::new(log_writer)
+                    .with_target(with_target)
+                    .with_filter(log_filter),
             ),
         };
 

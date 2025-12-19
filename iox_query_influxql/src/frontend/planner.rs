@@ -13,7 +13,9 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::plan::{InfluxQLToLogicalPlan, SchemaProvider, parse_regex};
+use crate::plan::{
+    InfluxQLToLogicalPlan, SchemaProvider, parse_regex, strip_influxql_metadata_from_plan,
+};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};
@@ -192,7 +194,11 @@ impl InfluxQLQueryPlanner {
 
         let statement = Self::query_to_statement(query)?;
         let logical_plan = Self::statement_to_plan(statement, params, &ctx).await?;
-        // add params to plan only when they're non-empty
+
+        // Strip "influxql::filled" metadata before physical planning. Removing
+        // it avoids schema mismatch errors since parquet files won't have it.
+        let logical_plan = strip_influxql_metadata_from_plan(logical_plan)?;
+
         let input = ctx.create_physical_plan(&logical_plan).await?;
 
         // Merge schema-level metadata from the logical plan with the

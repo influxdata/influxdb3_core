@@ -25,6 +25,19 @@ pub fn register_current_runtime_for_io() {
     register_io_runtime(Some(Handle::current()));
 }
 
+/// Get handle to IO runtime.
+///
+/// # Panic
+/// Needs a IO runtime [registered](register_io_runtime).
+pub fn get_io_runtime() -> Handle {
+    IO_RUNTIME.with_borrow(|h| h.clone()).expect(
+        "No IO runtime registered. If you hit this panic, it likely \
+            means a DataFusion plan or other CPU bound work is running on the \
+            a tokio threadpool used for IO. Try spawning the work using \
+            `DedicatedExcutor::spawn` or for tests `register_current_runtime_for_io`",
+    )
+}
+
 /// Runs `fut` on the runtime registered by [`register_io_runtime`] if any,
 /// otherwise awaits on the current thread
 ///
@@ -35,13 +48,7 @@ where
     Fut: Future + Send + 'static,
     Fut::Output: Send,
 {
-    let h = IO_RUNTIME.with_borrow(|h| h.clone()).expect(
-        "No IO runtime registered. If you hit this panic, it likely \
-            means a DataFusion plan or other CPU bound work is running on the \
-            a tokio threadpool used for IO. Try spawning the work using \
-            `DedicatedExcutor::spawn` or for tests `register_current_runtime_for_io`",
-    );
-    DropGuard(h.spawn(fut)).await
+    DropGuard(get_io_runtime().spawn(fut)).await
 }
 
 struct DropGuard<T>(JoinHandle<T>);

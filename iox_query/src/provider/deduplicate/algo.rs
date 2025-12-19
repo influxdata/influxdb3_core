@@ -360,8 +360,7 @@ impl RecordBatchDeduplicator {
             .map(|r| {
                 let value_index = r
                     .clone()
-                    .filter(|&i| input_array.is_valid(i))
-                    .next_back()
+                    .rfind(|&i| input_array.is_valid(i))
                     .map(|i| i as u64)
                     // if all field values are none, pick one arbitrarily
                     .unwrap_or(r.start as u64);
