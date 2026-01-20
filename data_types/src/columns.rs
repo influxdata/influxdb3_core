@@ -775,7 +775,14 @@ impl SortKeyIds {
     ///
     /// # Panics
     ///
-    /// Will panic if an ID isn't found in the column map.
+    /// Will panic if an ID isn't found in the column map. This should not happen in normal
+    /// operation as the column map should contain all columns referenced in the sort key.
+    ///
+    /// If this panic occurs, it indicates the column map is incomplete/stale relative to the
+    /// sort key. Callers should either:
+    /// - Pre-filter the sort key IDs to only those present in the map (querier does this), or
+    /// - Validate and retry with fresh catalog data (ingester persist does this via
+    ///   `PersistError::IncompleteColumnMap`)
     pub fn to_sort_key_using_map(&self, column_id_map: &HashMap<ColumnId, Arc<str>>) -> SortKey {
         SortKey::from_columns(self.0.iter().map(|id| {
             Arc::clone(

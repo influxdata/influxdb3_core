@@ -246,11 +246,11 @@ where
         if load.already_loading() {
             let early_access = load.data().clone();
             let fut = load.into_future();
-            CacheState::AlreadyLoading(Box::pin(fut), Some(early_access))
+            CacheState::AlreadyLoading(Box::pin(fut), early_access)
         } else {
             let early_access = load.data().clone();
             let fut = load.into_future();
-            CacheState::NewEntry(Box::pin(fut), Some(early_access))
+            CacheState::NewEntry(Box::pin(fut), early_access)
         }
     }
 

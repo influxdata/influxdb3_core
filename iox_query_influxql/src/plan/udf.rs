@@ -59,7 +59,7 @@ pub(super) fn find_window_udfs(exprs: &[Expr]) -> Vec<Expr> {
 
 const MOVING_AVERAGE_UDF_NAME: &str = "moving_average";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct MovingAverageUDF {
     signature: Signature,
 }
@@ -108,7 +108,7 @@ static MOVING_AVERAGE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 const DIFFERENCE_UDF_NAME: &str = "difference";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DifferenceUDF {
     signature: Signature,
 }
@@ -162,7 +162,7 @@ static DIFFERENCE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 const ELAPSED_UDF_NAME: &str = "elapsed";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ElapsedUDF {
     signature: Signature,
 }
@@ -205,7 +205,7 @@ static ELAPSED: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 const NON_NEGATIVE_DIFFERENCE_UDF_NAME: &str = "non_negative_difference";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct NonNegativeDifferenceUDF {
     signature: Signature,
 }
@@ -259,7 +259,7 @@ static NON_NEGATIVE_DIFFERENCE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 pub(crate) const INTEGRAL_UDF_NAME: &str = "integral";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct IntegralUDF {
     signature: Signature,
 }
@@ -333,7 +333,7 @@ static INTEGRAL: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 const DERIVATIVE_UDF_NAME: &str = "derivative";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DerivativeUDF {
     signature: Signature,
 }
@@ -394,7 +394,7 @@ static DERIVATIVE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 const NON_NEGATIVE_DERIVATIVE_UDF_NAME: &str = "non_negative_derivative";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct NonNegativeDerivativeUDF {
     signature: Signature,
 }
@@ -454,7 +454,7 @@ static NON_NEGATIVE_DERIVATIVE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
 
 const CUMULATIVE_SUM_UDF_NAME: &str = "cumulative_sum";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct CumulativeSumUDF {
     signature: Signature,
 }

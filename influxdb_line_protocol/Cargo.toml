@@ -23,7 +23,12 @@ log = "0.4.29"
 nom = { version = "8", default-features = false, features = ["std"] }
 smallvec = { workspace = true }
 snafu = "0.8"
+proptest = { version = "1", optional = true }
+schema = { path = "../schema", optional = true }
 
 # `path` `[dev-dependencies]` are fine
 [dev-dependencies] # In alphabetical order
 test_helpers = { path = "../test_helpers" }
+
+[features]
+test_helpers = [ "dep:proptest", "dep:schema" ]

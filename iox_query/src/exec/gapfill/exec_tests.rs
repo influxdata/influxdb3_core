@@ -7,11 +7,15 @@ use std::{
 
 use super::*;
 use arrow::{
-    array::{ArrayRef, DictionaryArray, Int64Array, StructArray, TimestampNanosecondArray},
+    array::{
+        ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray, StructArray,
+        TimestampNanosecondArray,
+    },
     datatypes::{DataType, Field, Fields, Int32Type, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use arrow_util::test_util::batches_to_lines;
+use datafusion::config::ConfigOptions;
 use datafusion::{
     error::Result,
     execution::runtime_env::RuntimeEnvBuilder,
@@ -1611,6 +1615,7 @@ fn get_date_bin_expr(
             DataType::Timestamp(TimeUnit::Nanosecond, batch.timezone.clone()),
             true,
         )),
+        Arc::new(ConfigOptions::new()),
     ))
 }
 
@@ -1627,4 +1632,117 @@ fn get_time_range(start: Option<i64>, end: i64) -> Range<Bound<Arc<dyn PhysicalE
             None,
         ))),
     }
+}
+
+/// Regression test for memory accounting drift after `optimize_dictionaries()`.
+///
+/// When multiple batches with inefficient dictionaries are concatenated and
+/// optimized, the batch size changes significantly. Without proper accounting,
+/// this caused a panic in `MemoryReservation::shrink()`.
+///
+/// See <https://github.com/influxdata/EAR/issues/6588>
+#[test]
+fn test_gapfill_memory_accounting_with_dictionary_optimization() {
+    test_helpers::maybe_start_logging();
+
+    const TAG_KEY: &str = "a";
+    const NUM_UNUSED_DICT_ENTRIES: usize = 1000;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("tag", (&InfluxColumnType::Tag).into(), true),
+        Field::new(
+            "value",
+            (&InfluxColumnType::Field(InfluxFieldType::Integer)).into(),
+            true,
+        ),
+        Field::new("time", (&InfluxColumnType::Timestamp).into(), true),
+    ]));
+
+    // Create a batch with a bloated dictionary (many unused entries).
+    let create_batch_with_inefficient_dictionary = |time_ms: i64, value: i64| {
+        let dict_keys = Int32Array::from(vec![0]);
+        let mut dict_values: Vec<String> = vec![TAG_KEY.to_string()];
+        for i in 0..NUM_UNUSED_DICT_ENTRIES {
+            dict_values.push(format!("unused_{:05}", i));
+        }
+        let dict_values_array = StringArray::from(dict_values);
+        let tag_column: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(dict_keys, Arc::new(dict_values_array)).unwrap(),
+        );
+
+        let time_column: ArrayRef =
+            Arc::new(TimestampNanosecondArray::from(vec![time_ms * 1_000_000]));
+        let value_column: ArrayRef = Arc::new(Int64Array::from(vec![value]));
+
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![tag_column, value_column, time_column],
+        )
+        .unwrap()
+    };
+
+    // Multiple batches triggers concatenation and dictionary optimization.
+    let batches: Vec<RecordBatch> = vec![(1000, 10), (1100, 11), (1200, 12), (1300, 13)]
+        .into_iter()
+        .map(|(time_ms, value)| create_batch_with_inefficient_dictionary(time_ms, value))
+        .collect();
+
+    let input = Arc::new(
+        MockExec::new(batches.into_iter().map(Ok).collect(), Arc::clone(&schema))
+            .with_use_task(false),
+    );
+
+    let series_expr: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("tag", 0))];
+    let config_options = Arc::new(ConfigOptions::new());
+    let time_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "time",
+        datafusion::functions::datetime::date_bin(),
+        vec![
+            phys_lit(ScalarValue::new_interval_mdn(0, 0, 50 * 1_000_000)), // 50ms stride
+            Arc::new(Column::new("time", 2)),
+        ],
+        Arc::new(Field::new(
+            "time",
+            (&InfluxColumnType::Timestamp).into(),
+            true,
+        )),
+        config_options,
+    ));
+    let fill_expr = vec![PhysicalFillExpr {
+        expr: Arc::new(Column::new("value", 1)),
+        strategy: FillStrategy::Default(ScalarValue::Int64(None)),
+    }];
+    let time_range = Range {
+        start: Bound::Included(phys_lit(ScalarValue::TimestampNanosecond(
+            Some(950 * 1_000_000),
+            None,
+        ))),
+        end: Bound::Included(phys_lit(ScalarValue::TimestampNanosecond(
+            Some(1350 * 1_000_000),
+            None,
+        ))),
+    };
+
+    let gapfill_exec = Arc::new(
+        GapFillExec::try_new(input, series_expr, time_expr, fill_expr, time_range).unwrap(),
+    );
+
+    // Dictionary optimization reduces batch size below the original reservation,
+    // causing an underflow panic in shrink() if not accounted for.
+    block_on(async {
+        let session_ctx: Arc<SessionContext> = SessionContext::new_with_config_rt(
+            SessionConfig::default().with_batch_size(4),
+            RuntimeEnvBuilder::new()
+                .with_memory_limit(1024 * 1024, 1.0)
+                .build_arc()
+                .unwrap(),
+        )
+        .into();
+        let task_ctx = Arc::new(TaskContext::from(session_ctx.as_ref()));
+        let _ = collect(gapfill_exec, task_ctx).await;
+
+        // Verify memory is fully released.
+        let pool = &session_ctx.runtime_env().memory_pool;
+        assert_eq!(0, pool.reserved());
+    });
 }

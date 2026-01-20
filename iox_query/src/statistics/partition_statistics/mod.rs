@@ -108,7 +108,7 @@ impl PartitionStatistics for PlaceholderRowExec {
     fn statistics_by_partition(&self) -> Result<PartitionedStatistics> {
         // all partitions have the same single row, and same stats.
         // refer to `PlaceholderRowExec::execute`.
-        let data = self.partition_statistics(None)?.into();
+        let data = self.partition_statistics(Some(0))?.into();
         Ok(vec![data; partition_count(self)])
     }
 }
@@ -717,7 +717,7 @@ mod test {
 
     /// Plan nodes which generate the original statistics (a.k.a. the data sources).
     #[test]
-    fn test_handles_datasources() -> Result<(), DataFusionError> {
+    fn test_handles_datasources_parquet() -> Result<(), DataFusionError> {
         let col_name = "a";
         let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
             col(col_name, &single_column_schema())?,
@@ -763,7 +763,12 @@ mod test {
             partition 1:  (Int32(2001))->(Int32(3000))
             partition 2:  (Int32(3001))->(Int32(3500))
         ");
+        Ok(())
+    }
 
+    #[test]
+    fn test_handles_datasources_empty() -> Result<(), DataFusionError> {
+        let col_name = "a";
         /* Test Case: empty exec */
         // note: empty exec always has only 1 partition, and has absent stats (except for 0 num_rows)
         let plan = Arc::new(EmptyExec::new(single_column_schema())) as _;
@@ -785,6 +790,12 @@ mod test {
             Some(&0),
             "empty exec should have zero rows"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_handles_datasources_memory() -> Result<(), DataFusionError> {
+        let col_name = "a";
 
         /* Test Case: memory exec */
         // note: memory exec is a collection of record batches, and has absent stats (because batches are not read at planning time)
@@ -809,6 +820,12 @@ mod test {
             partition 0:  None
             partition 1:  None
         ");
+        Ok(())
+    }
+
+    #[test]
+    fn test_handles_datasources_placeholder() -> Result<(), DataFusionError> {
+        let col_name = "a";
 
         /* Test Case: placeholder row */
         // note: placeholder row is 1 row with null values for all columns

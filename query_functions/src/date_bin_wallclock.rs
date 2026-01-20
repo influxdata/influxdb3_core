@@ -87,7 +87,7 @@ pub fn date_bin_wallclock() -> Arc<ScalarUDF> {
 /// '1970-01-01T00:30:00') AT TIME ZONE 'UTC';` is `2020-10-25T01:30:00Z`. I.e.
 /// timestamps that are one minute apart are put into bins 2 hours apart, despite
 /// expected interval being 1 hour. Care should be taken to avoid such cases.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DateBinWallclockUDF {
     signature: Signature,
     date_bin: Arc<ScalarUDF>,
@@ -153,6 +153,7 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
             arg_fields,
             number_rows,
             return_field,
+            config_options,
         } = args;
 
         if args.len() != arg_fields.len() {
@@ -217,6 +218,7 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
                         ],
                         number_rows,
                         return_field,
+                        config_options,
                     })
                 }
                 None => self.date_bin.invoke_with_args(ScalarFunctionArgs {
@@ -224,6 +226,7 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
                     arg_fields: vec![Arc::clone(internal_field), Arc::clone(source_field)],
                     number_rows,
                     return_field,
+                    config_options,
                 }),
             };
         }
@@ -306,12 +309,14 @@ impl ScalarUDFImpl for DateBinWallclockUDF {
                 ],
                 number_rows,
                 return_field,
+                config_options,
             })?,
             None => self.date_bin.invoke_with_args(ScalarFunctionArgs {
                 args: vec![interval_arg.clone(), wallclocks],
                 arg_fields: vec![Arc::clone(internal_field), wallclocks_field],
                 number_rows,
                 return_field,
+                config_options,
             })?,
         };
 
@@ -469,12 +474,12 @@ pub mod expr_fn {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::test::default_config_options;
     use arrow::{
         array::{IntervalMonthDayNanoArray, TimestampNanosecondArray},
         datatypes::{FieldRef, IntervalMonthDayNano},
     };
-
-    use super::*;
 
     const MAYDAY: i64 = 1619827200000000000; // 2021-05-01T00:00:00Z
 
@@ -497,6 +502,7 @@ mod tests {
                 arg_fields,
                 number_rows: 13,
                 return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -529,6 +535,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::clone(&tz)),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -567,6 +574,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::clone(&tz)),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -609,6 +617,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::clone(&tz)),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -651,6 +660,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::clone(&tz)),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -693,6 +703,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("Europe/Paris")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -743,6 +754,7 @@ mod tests {
                 TimeUnit::Nanosecond,
                 Some(Arc::clone(&tz)),
             )),
+            config_options: default_config_options(),
         });
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -778,6 +790,7 @@ mod tests {
                 TimeUnit::Nanosecond,
                 Some(Arc::clone(&tz)),
             )),
+            config_options: default_config_options(),
         });
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -812,6 +825,7 @@ mod tests {
                 TimeUnit::Nanosecond,
                 Some(Arc::from("Etc/Universal")),
             )),
+            config_options: default_config_options(),
         })
         .unwrap();
     }
@@ -819,7 +833,7 @@ mod tests {
     /// A UDF that is a stub `date_bin` which checks that the `source`
     /// and `origin` arguments have the same data type, expecially that
     /// they have identical timezones.
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     struct TimeZoneCheckingUDF {
         signature: Signature,
     }

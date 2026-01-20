@@ -75,6 +75,9 @@ pub mod builder;
 pub use builder::LineProtocolBuilder;
 pub mod v3;
 
+#[cfg(feature = "test_helpers")]
+pub mod test_helpers;
+
 use fmt::Display;
 use log::debug;
 use nom::{
@@ -183,12 +186,14 @@ pub enum Error {
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]
     GenericParsingError {
         kind: nom::error::ErrorKind,
+        #[expect(clippy::use_self, reason = "SNAFU derive generates intermediate types")]
         trace: Vec<Error>,
     },
 
     #[snafu(display("Expected {context}: {inner}"))]
     Context {
         context: &'static str,
+        #[expect(clippy::use_self, reason = "SNAFU derive generates intermediate types")]
         inner: Box<Error>,
     },
 
@@ -261,6 +266,16 @@ pub struct ParsedLine<'a> {
     pub series: Series<'a>,
     pub field_set: FieldSet<'a>,
     pub timestamp: Option<i64>,
+}
+
+impl Clone for ParsedLine<'static> {
+    fn clone(&self) -> Self {
+        Self {
+            series: self.series.clone(),
+            field_set: self.field_set.clone(),
+            timestamp: self.timestamp,
+        }
+    }
 }
 
 impl<'a> ParsedLine<'a> {
@@ -345,18 +360,23 @@ pub struct Series<'a> {
     pub tag_set: Option<TagSet<'a>>,
 }
 
+impl Clone for Series<'static> {
+    fn clone(&self) -> Self {
+        Self {
+            raw_input: self.raw_input,
+            measurement: self.measurement.clone(),
+            tag_set: self.tag_set.clone(),
+        }
+    }
+}
+
 /// Converts `Series` back to line protocol
 impl Display for Series<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         escape_and_write_value(f, self.measurement.as_str(), MEASUREMENT_DELIMITERS)?;
         if let Some(tag_set) = &self.tag_set {
-            write!(f, ",")?;
-            let mut first = true;
             for (tag_name, tag_value) in tag_set {
-                if !first {
-                    write!(f, ",")?;
-                }
-                first = false;
+                write!(f, ",")?;
                 escape_and_write_value(f, tag_name.as_str(), TAG_KEY_DELIMITERS)?;
                 write!(f, "=")?;
                 escape_and_write_value(f, tag_value.as_str(), TAG_VALUE_DELIMITERS)?;
@@ -368,15 +388,19 @@ impl Display for Series<'_> {
 
 pub type Measurement<'a> = EscapedStr<'a>;
 
+pub const OPTIMISTIC_MAX_NUM_FIELDS: usize = 4;
+
 /// The [field] keys and values that appear in the line of line protocol.
 ///
 /// [field]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#field-set
-pub type FieldSet<'a> = SmallVec<[(EscapedStr<'a>, FieldValue<'a>); 4]>;
+pub type FieldSet<'a> = SmallVec<[(EscapedStr<'a>, FieldValue<'a>); OPTIMISTIC_MAX_NUM_FIELDS]>;
+
+pub const OPTIMISTIC_MAX_NUM_TAGS: usize = 8;
 
 /// The [tag] keys and values that appear in the line of line protocol.
 ///
 /// [tag]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#tag-set
-pub type TagSet<'a> = SmallVec<[(EscapedStr<'a>, EscapedStr<'a>); 8]>;
+pub type TagSet<'a> = SmallVec<[(EscapedStr<'a>, EscapedStr<'a>); OPTIMISTIC_MAX_NUM_TAGS]>;
 
 /// Allowed types of fields in a `ParsedLine`. One of the types described in [the line protocol
 /// reference].
@@ -1183,8 +1207,8 @@ fn escape_and_write_value(
 #[cfg(test)]
 mod test {
     use super::*;
+    use ::test_helpers::{approximately_equal, assert_error};
     use smallvec::smallvec;
-    use test_helpers::{approximately_equal, assert_error};
 
     #[test]
     fn better_error_messages() {

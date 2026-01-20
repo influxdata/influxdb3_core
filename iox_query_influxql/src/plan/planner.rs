@@ -19,7 +19,9 @@ use crate::plan::udf::{
     find_window_udfs, integral, is_integral_udf, moving_average, non_negative_derivative,
     non_negative_difference,
 };
-use crate::plan::util::{IQLSchema, binary_operator_to_df_operator, rebase_expr};
+use crate::plan::util::{
+    IQLSchema, binary_operator_to_df_operator, find_aggregate_exprs, rebase_expr,
+};
 use crate::plan::var_ref::var_ref_data_type_to_data_type;
 use crate::plan::{planner_rewrite_expression, udf};
 use crate::window::{
@@ -48,14 +50,13 @@ use datafusion::functions_aggregate::expr_fn::sum;
 use datafusion::functions_aggregate::{
     average::avg_udaf, count::count_udaf, median::median_udaf, stddev::stddev_udaf, sum::sum_udaf,
 };
-use datafusion::functions_array::expr_fn::make_array;
 use datafusion::functions_window::row_number::row_number_udwf;
 use datafusion::logical_expr::expr::{
     AggregateFunctionParams, Alias, FieldMetadata, ScalarFunction, WindowFunctionParams,
 };
 use datafusion::logical_expr::expr_rewriter::normalize_col;
 use datafusion::logical_expr::logical_plan::Analyze;
-use datafusion::logical_expr::utils::{disjunction, expr_as_column_expr, find_aggregate_exprs};
+use datafusion::logical_expr::utils::{disjunction, expr_as_column_expr};
 use datafusion::logical_expr::{
     AggregateUDF, EmptyRelation, Explain, Expr, ExprSchemable, Extension, LogicalPlan,
     LogicalPlanBuilder, Operator, PlanType, Projection, ScalarUDF, TableSource, ToStringifiedPlan,
@@ -64,7 +65,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::logical_expr::{ExplainFormat, Filter, SortExpr};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::prelude::{Column, ExprFunctionExt, cast, lit_timestamp_nano, when};
+use datafusion::prelude::{Column, ExprFunctionExt, cast, lit_timestamp_nano, make_array, when};
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::NullTreatment;
 use datafusion_util::{AsExpr, lit_dict};
@@ -101,7 +102,6 @@ use influxdb_influxql_parser::{
     statement::Statement,
 };
 use iox_query::analyzer::default_return_value_for_aggr_fn;
-use iox_query::analyzer::range_predicate::find_time_range;
 use iox_query::config::{IoxConfigExt, MetadataCutoff};
 use iox_query::exec::IOxSessionContext;
 use iox_query::exec::gapfill::{FillExpr, FillStrategy, GapFill};
@@ -1486,7 +1486,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         // It is possible this vector is empty, when all the fields in the
         // projection refer to columns that do not exist in the current
         // table.
-        let mut aggr_exprs = find_aggregate_exprs(&select_exprs);
+        let (mut aggr_exprs, aggr_count) = find_aggregate_exprs(&select_exprs);
 
         // gather some time-related metadata
         let Some(time_column_index) = find_time_column_index(fields) else {
@@ -1501,6 +1501,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 
             if let Expr::AggregateFunction(mut agg) = selector.clone()
                 && agg.func.name().starts_with("selector_")
+                && aggr_count == 1
             {
                 let selector_index = select_exprs
                     .iter()
@@ -1733,7 +1734,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             ctx.group_by.and_then(|gb| gb.time_dimension()),
             fill_strategy,
         ) {
-            build_gap_fill_node(plan, fill_strategy)?
+            build_gap_fill_node(plan, fill_strategy, ctx.extended_time_range(), &ctx.tz)?
         } else {
             plan
         };
@@ -2043,6 +2044,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2061,6 +2063,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2079,6 +2082,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2097,6 +2101,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2119,6 +2124,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2141,6 +2147,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2159,6 +2166,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             WindowFrameBound::Preceding(ScalarValue::Null),
                             WindowFrameBound::Following(ScalarValue::Null),
                         ),
+                        filter: None,
                         null_treatment: None,
                         distinct: false,
                     },
@@ -2241,6 +2249,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                                 WindowFrameBound::Preceding(ScalarValue::Null),
                                 WindowFrameBound::Following(ScalarValue::Null),
                             ),
+                            filter: None,
                             null_treatment: None,
                             distinct: false,
                         },
@@ -4120,10 +4129,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
 /// * `fill_strategy` - The strategy used to fill gaps in the data.
 ///   Should be equal in length to `input.aggr_exprs`, where
 ///   fill_strategy\[n\] is the strategy for aggr_exprs\[n\].
-/// * `projection_type` - The type of projection being performed.
+/// * `time_range` - The range to fill gaps between.
+/// * `tz` - The optional time zone for the query.
 fn build_gap_fill_node(
     input: LogicalPlan,
     fill_strategy: Vec<FillStrategy>,
+    time_range: TimeRange,
+    tz: &Option<Arc<str>>,
 ) -> Result<LogicalPlan> {
     let mut aggr = None;
     input.apply(|expr| {
@@ -4175,7 +4187,7 @@ fn build_gap_fill_node(
         }
     };
 
-    let ([stride, time_arg] | [stride, time_arg, _]) = date_bin_args.as_slice() else {
+    let ([stride, _] | [stride, _, _]) = date_bin_args.as_slice() else {
         // This is an internal error as the date_bin function is added by the planner and should
         // always contain the correct number of arguments.
         return error::internal(format!(
@@ -4183,43 +4195,34 @@ fn build_gap_fill_node(
             date_bin_args.len()
         ));
     };
-
-    let Some(time_col) = time_arg.try_as_col() else {
-        return error::internal("DATE_BIN requires a column as the source argument");
-    };
-
     let origin = date_bin_args.get(2).cloned();
 
     // Ensure that a time range was specified and is valid for gap filling
     let time_range = {
-        // TODO(sgc): Fix via https://github.com/influxdata/influxdb_iox/issues/7829
-
-        // This is a stop gap, until #7929 is fixed, as `find_time_range` does not look
-        // beyond Union operators. We are working around the limitation by traversing the
-        // tree until we find the first operator which specifies a filter predicate.
-        let mut time_range: Option<Range<Bound<Expr>>> = None;
-        _ = input.apply(|n| match n {
-            plan @ (LogicalPlan::Filter(_) | LogicalPlan::TableScan(_)) => {
-                time_range = Some(match find_time_range(plan, time_col)? {
-                    // Follow the InfluxQL behaviour to use an upper bound of `now` when
-                    // not found:
-                    //
-                    // See: https://github.com/influxdata/influxdb/blob/98361e207349a3643bcc332d54b009818fe7585f/query/compile.go#L172-L176
-                    Range {
-                        start,
-                        end: Bound::Unbounded,
-                    } => Range {
-                        start,
-                        end: Bound::Excluded(now()),
-                    },
-                    time_range => time_range,
-                });
-                Ok(TreeNodeRecursion::Stop)
-            }
-            _ => Ok(TreeNodeRecursion::Continue),
-        });
-        time_range.ok_or_else(|| error::map::internal("expected to find a Filter or TableScan"))
-    }?;
+        let TimeRange { lower, upper } = time_range;
+        Range {
+            start: lower
+                .map(|n| {
+                    Bound::Included(Expr::Literal(
+                        ScalarValue::TimestampNanosecond(Some(n), tz.clone()),
+                        None,
+                    ))
+                })
+                .unwrap_or(Bound::Unbounded),
+            end: upper
+                .map(|n| {
+                    Bound::Included(Expr::Literal(
+                        ScalarValue::TimestampNanosecond(Some(n), tz.clone()),
+                        None,
+                    ))
+                })
+                // Follow the InfluxQL behaviour to use an upper bound of `now` when
+                // not found:
+                //
+                // See: https://github.com/influxdata/influxdb/blob/98361e207349a3643bcc332d54b009818fe7585f/query/compile.go#L172-L176
+                .unwrap_or(Bound::Excluded(now())),
+        }
+    };
 
     let LogicalPlan::Aggregate(aggr) = &input else {
         return Err(DataFusionError::Internal(format!(
@@ -4846,6 +4849,24 @@ mod tests {
                     "SELECT value FROM (SELECT usage_idle AS value FROM cpu) ORDER BY TIME DESC"
                 ));
             }
+
+            #[test]
+            fn aggregate_around_window_aggregate() {
+                assert_snapshot!(plan(
+                    r#"
+                        SELECT sum(*)
+                        FROM (
+                            SELECT non_negative_difference(sum(/usage_.*/))
+                            FROM cpu
+                            WHERE time >= 0s AND time < 10m
+                            GROUP BY time(1m), cpu
+                            OFFSET 1
+                        )
+                        WHERE time >= 0s AND time < 10m
+                        GROUP BY time(1m), cpu
+                    "#
+                ));
+            }
         }
 
         /// Validate plans for multiple data sources in the `FROM` clause, including subqueries
@@ -5082,6 +5103,13 @@ mod tests {
             fn test_selectors_invalid_arguments_3() {
                 // Invalid number of arguments
                 assert_snapshot!(plan("SELECT MIN(usage_idle, usage_idle) FROM cpu"));
+            }
+
+            #[test]
+            fn issue_15698() {
+                assert_snapshot!(plan(
+                    "SELECT time, LAST(usage_idle) AS last_idle, DIFFERENCE(LAST(usage_idle)) AS delta FROM cpu GROUP BY cpu, time(20s) FILL(none)"
+                ))
             }
         }
 

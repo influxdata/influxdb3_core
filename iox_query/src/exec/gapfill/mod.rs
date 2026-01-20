@@ -612,6 +612,7 @@ impl ExecutionPlan for GapFillExec {
 
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let output_batch_size = context.session_config().batch_size();
+        let config_options = Arc::clone(context.session_config().options());
         let reservation = MemoryConsumer::new(format!("GapFillExec[{partition}]"))
             .register(context.memory_pool());
         let input_stream = self.input.execute(partition, context)?;
@@ -621,7 +622,9 @@ impl ExecutionPlan for GapFillExec {
             input_stream,
             reservation,
             baseline_metrics,
+            config_options,
         )?;
+
         Ok(Box::pin(cooperative(stream)))
     }
 

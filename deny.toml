@@ -8,10 +8,16 @@ ignore = [
     # paste is unmaintained but does not have any known issues;
     # there is no replacement at this time
     "RUSTSEC-2024-0436",
-    # rustls-pemfile is unmaintained but is a thin wrapper around rustls-pki-types;
-    # fixed in object_store main: https://github.com/apache/arrow-rs-object-store/pull/565
-    # TODO: remove once object_store > 0.12.4 is released
+    # rustls-pemfile is unmaintained, but is a deeply nested dependency.
+    # Upstream dependencies need to stop depending on it before we can
+    # remove it.
     "RUSTSEC-2025-0134",
+    # bincode is unmaintained but does not have any known issues;
+    # there are multiple replacements at this time but there isn't
+    # yet a clear choice
+    "RUSTSEC-2025-0141",
+    # lru is a dependency of aws-sdk-s3 and there is no update available yet
+    "RUSTSEC-2026-0002",
 ]
 git-fetch-with-cli = true
 
@@ -50,7 +56,7 @@ license-files = [
 ]
 
 [sources.allow-org]
-github = ["influxdata"]
+github = ["influxdata", "apache"]
 
 [bans]
 multiple-versions = "allow"
@@ -61,6 +67,7 @@ deny = [
     # If you're hitting this, you might want to take a look at what new
     # dependencies you have introduced and check if there's a way to depend on
     # rustls instead of OpenSSL (tip: check the crate's feature flags).
+    # (see exception above for aws sdk's rustls-native-certs using openssl-probe)
     { name = "openssl-sys" },
     # We've decided to use the `humantime` crate to parse and generate friendly time formats; use
     # that rather than chrono-english.

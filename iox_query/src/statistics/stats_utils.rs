@@ -48,8 +48,11 @@ pub fn overlap(value_ranges: &[(ScalarValue, ScalarValue)]) -> Result<bool, Data
 }
 
 pub(crate) fn projection_includes_pure_columns(projection: &ProjectionExec) -> bool {
-    projection
-        .expr()
-        .iter()
-        .all(|(expr, _col_name)| expr.as_any().downcast_ref::<Column>().is_some())
+    projection.expr().iter().all(|projection_expr| {
+        projection_expr
+            .expr
+            .as_any()
+            .downcast_ref::<Column>()
+            .is_some()
+    })
 }

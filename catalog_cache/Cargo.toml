@@ -19,7 +19,7 @@ iox_http_util = { path = "../iox_http_util" }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 snafu = "0.8"
-tokio = { version = "1.48", default-features = false, features = [
+tokio = { version = "1.49", default-features = false, features = [
     "macros",
     "rt",
 ] }

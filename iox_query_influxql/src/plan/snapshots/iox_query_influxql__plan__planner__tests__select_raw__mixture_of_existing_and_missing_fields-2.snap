@@ -1,5 +1,6 @@
 ---
 source: iox_query_influxql/src/plan/planner.rs
 expression: "plan(\"SELECT foo, missing FROM data\")"
+snapshot_kind: text
 ---
-EmptyRelation [iox::measurement:Dictionary(Int32, Utf8)]
+EmptyRelation: rows=0 [iox::measurement:Dictionary(Int32, Utf8)]

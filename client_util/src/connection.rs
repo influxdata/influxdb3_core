@@ -157,9 +157,6 @@ impl Builder {
     }
 
     fn create_endpoint(&self, uri: Uri) -> Result<Endpoint> {
-        // This call can probably be removed when tonic is upgraded to 0.13+.
-        // See <https://github.com/influxdata/influxdb_iox/issues/14683> for more details.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let endpoint = Endpoint::from(uri)
             .tls_config(ClientTlsConfig::new().with_native_roots())?
             .user_agent(&self.user_agent)?

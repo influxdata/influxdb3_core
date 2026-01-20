@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { version = "1.48", features = ["macros", "time"] }
+tokio = { version = "1.49", features = ["macros", "time"] }
 tracing = { workspace = true }
 rand = "0.9"
 snafu = "0.8"
