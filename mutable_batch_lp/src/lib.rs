@@ -144,7 +144,7 @@ impl LinesConverter {
         &mut self,
         line: ParsedLine<'_>,
         line_idx: usize,
-    ) -> Result<(), LineError> {
+    ) -> Result<Option<Warning>, LineError> {
         let measurement = line.series.measurement.as_str();
 
         let (_, batch) = self
@@ -155,17 +155,14 @@ impl LinesConverter {
 
         // TODO: Reuse writer
         let mut writer = Writer::new(batch, 1);
-        match write_line(&mut writer, &line, self.default_time)
-            .context(WriteSnafu { line: line_idx + 1 })
-        {
-            Ok(_) => {
-                writer.commit();
-                self.stats.num_lines += 1;
-                self.stats.num_fields += line.field_set.len();
-            }
-            Err(e) => return Err(e),
-        };
-        Ok(())
+        let warning = write_line(&mut writer, &line, self.default_time)
+            .context(WriteSnafu { line: line_idx + 1 })?;
+
+        writer.commit();
+        self.stats.num_lines += 1;
+        self.stats.num_fields += line.field_set.len();
+
+        Ok(warning)
     }
 
     /// Consume this [`LinesConverter`] returning the [`MutableBatch`]
@@ -187,6 +184,21 @@ impl LinesConverter {
             true => Err(Error::EmptyPayload),
         }
     }
+}
+
+/// A warning can be produced by the [`write_line`] function. Such a warning indicates that writing
+/// the individual line didn't completely fail, but did something that the user should be warned
+/// about.
+#[derive(Debug, Clone)]
+#[must_use = "Warnings should be bubbled up to the user"]
+pub enum Warning {
+    /// If the user passes in a field named `time`, the `time field must be simply stripped out,
+    /// while the rest of the batch moves on as expected. See
+    /// <https://github.com/influxdata/influxdb_iox/issues/15710#issuecomment-3633907650>
+    BogusTimeStrippedOut {
+        /// The measurement from which the field was stripped out
+        measurement: String,
+    },
 }
 
 /// Converts the provided lines of line protocol to a set of [`MutableBatch`]
@@ -229,6 +241,32 @@ pub enum LineWriteError {
         /// The duplicated field name.
         name: String,
     },
+
+    /// Using `time` as a tag is not allowed. See
+    /// <https://github.com/influxdata/influxdb_iox/issues/15710#issuecomment-3633907650>
+    /// As stated in <https://github.com/influxdata/influxdb_iox/issues/15710#issuecomment-3607311952>,
+    /// since this is a v1 compatibility thing, we want to match the v1 error string as closely as
+    /// we can, so this error string should stay exactly the same unless we explicitly decide
+    /// otherwise.
+    #[snafu(display("input tag \"time\" on measurement \"{measurement}\" is invalid"))]
+    TimeTagNotAllowed {
+        /// The measurement the tag was trying to be written for
+        measurement: String,
+    },
+
+    /// This can occur when someone submits a write that only has `time` as a field, which is then
+    /// stripped out due to <https://github.com/influxdata/influxdb_iox/issues/15710>, and leaves
+    /// the line with no fields. In this case, we don't write the line and instead return an error
+    /// that displays to the user the same as [`Warning::BogusTimeStrippedOut`] does. We want to
+    /// keep this exact string for the error so that it matches with v1, just like we're doing with
+    /// [`Self::TimeTagNotAllowed`].
+    #[snafu(display(
+        "invalid field name: input field \"time\" on measurement \"{measurement}\" is invalid"
+    ))]
+    TimeWasOnlyField {
+        /// The measurement that they were trying to write for
+        measurement: String,
+    },
 }
 
 /// Writes the [`ParsedLine`] to the [`MutableBatch`], respecting the edge case
@@ -237,10 +275,26 @@ pub fn write_line<T>(
     writer: &mut Writer<'_, T>,
     line: &ParsedLine<'_>,
     default_time: i64,
-) -> Result<(), LineWriteError>
+) -> Result<Option<Warning>, LineWriteError>
 where
     T: ColumnInsertValidator,
 {
+    if line.tag_value("time").is_some() {
+        return Err(LineWriteError::TimeTagNotAllowed {
+            measurement: line.series.measurement.to_string(),
+        });
+    }
+
+    if let [(field_name, _)] = &*line.field_set
+        && *field_name == "time"
+    {
+        return Err(LineWriteError::TimeWasOnlyField {
+            measurement: line.series.measurement.to_string(),
+        });
+    }
+
+    let mut warning = None;
+
     // Only allocate the seen tags hashset if there are tags.
     if let Some(tags) = &line.series.tag_set {
         let mut seen = HashSet::with_capacity(tags.len());
@@ -303,6 +357,13 @@ where
 
     let mut seen = HashMap::<_, &FieldValue<'_>>::with_capacity(line.field_set.len());
     for (field_key, field_value) in line.field_set.iter().rev() {
+        if *field_key == "time" {
+            warning = Some(Warning::BogusTimeStrippedOut {
+                measurement: line.series.measurement.to_string(),
+            });
+            continue;
+        }
+
         // Check if a field with this name has been observed previously.
         match seen.entry(field_key) {
             Entry::Occupied(e) if e.get().is_same_type(field_value) => {
@@ -349,7 +410,7 @@ where
         .write_time("time", std::iter::once(time))
         .context(MutableBatchSnafu)?;
 
-    Ok(())
+    Ok(warning)
 }
 
 /// Test helper utilities

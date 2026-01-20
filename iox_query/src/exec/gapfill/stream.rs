@@ -11,6 +11,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_util::optimize::optimize_dictionaries;
+use datafusion::config::ConfigOptions;
 use datafusion::{
     error::{DataFusionError, Result},
     execution::memory_pool::MemoryReservation,
@@ -52,8 +53,6 @@ pub(super) struct GapFillStream {
     gap_filler: GapFiller,
     /// This is true as long as there are more input record batches to read from `input`.
     more_input: bool,
-    /// For tracking memory.
-    reservation: MemoryReservation,
     /// Baseline metrics.
     baseline_metrics: BaselineMetrics,
 }
@@ -66,6 +65,7 @@ impl GapFillStream {
         input: SendableRecordBatchStream,
         reservation: MemoryReservation,
         metrics: BaselineMetrics,
+        config_options: Arc<ConfigOptions>,
     ) -> Result<Self> {
         let schema = exec.schema();
         let GapFillExec {
@@ -77,8 +77,14 @@ impl GapFillStream {
         } = exec;
 
         let series_cols = series_expr.iter().map(expr_to_index).collect::<Vec<_>>();
-        let params = GapFillParams::try_new(Arc::clone(&schema), time_expr, fill_expr, time_range)?;
-        let buffered_input = BufferedInput::new(&params, series_cols);
+        let params = GapFillParams::try_new(
+            Arc::clone(&schema),
+            time_expr,
+            fill_expr,
+            time_range,
+            config_options,
+        )?;
+        let buffered_input = BufferedInput::new(&params, series_cols, reservation);
 
         let time_expr = if let Some(func) = time_expr.as_any().downcast_ref::<ScalarFunctionExpr>()
         {
@@ -107,7 +113,6 @@ impl GapFillStream {
             buffered_input,
             gap_filler,
             more_input: true,
-            reservation,
             baseline_metrics: metrics,
         })
     }
@@ -133,8 +138,7 @@ impl Stream for GapFillStream {
         while self.more_input && self.buffered_input.need_more(last_output_row_offset)? {
             match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
-                    self.reservation.try_grow(batch.get_array_memory_size())?;
-                    self.buffered_input.push(batch);
+                    self.buffered_input.try_push(batch)?;
                 }
                 Some(Err(e)) => {
                     return Poll::Ready(Some(Err(e)));
@@ -148,14 +152,10 @@ impl Stream for GapFillStream {
         let input_batch = match self.take_buffered_input() {
             Ok(None) => return Poll::Ready(None),
             Ok(Some(input_batch)) => {
-                // If we have consumed all of our input, and there is no more work
+                // If there are no more output rows to produce for the current buffered input
                 if self.gap_filler.done(input_batch.num_rows()) {
-                    // leave the input batch taken so that its reference
-                    // count goes to zero.
-                    self.reservation.shrink(input_batch.get_array_memory_size());
                     return Poll::Ready(None);
                 }
-
                 input_batch
             }
             Err(e) => return Poll::Ready(Some(Err(e))),
@@ -163,10 +163,7 @@ impl Stream for GapFillStream {
 
         match self.process(input_batch) {
             Ok((output_batch, remaining_input_batch)) => {
-                self.buffered_input.push(remaining_input_batch);
-
-                self.reservation
-                    .shrink(output_batch.get_array_memory_size());
+                self.buffered_input.try_push(remaining_input_batch)?;
                 Poll::Ready(Some(Ok(output_batch)))
             }
             Err(e) => Poll::Ready(Some(Err(e))),
@@ -183,11 +180,8 @@ impl GapFillStream {
             return Ok(None);
         }
 
-        let old_size = batches.iter().map(|rb| rb.get_array_memory_size()).sum();
-
         let mut batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
             .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
-        self.reservation.try_grow(batch.get_array_memory_size())?;
 
         if batches.len() > 1 {
             // Optimize the dictionaries. The output of this operator uses the take kernel to produce
@@ -197,7 +191,6 @@ impl GapFillStream {
                 .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
         }
 
-        self.reservation.shrink(old_size);
         Ok(Some(batch))
     }
 
@@ -232,9 +225,6 @@ impl GapFillStream {
             )
             .record_output(&self.baseline_metrics)?;
         timer.done();
-
-        self.reservation
-            .try_grow(output_batch.get_array_memory_size())?;
 
         // Slice the input to just what is needed moving forward, with one context
         // row before the next input offset.

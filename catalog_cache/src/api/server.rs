@@ -1,10 +1,8 @@
 //! Server for the cache HTTP API
 
 use crate::CacheValue;
-use crate::api::list::{ListEntry, v1, v2};
-use crate::api::{
-    GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V1, LIST_PROTOCOL_V2, NO_VALUE, RequestPath,
-};
+use crate::api::list::{ListEntry, v2};
+use crate::api::{GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE, RequestPath};
 use crate::local::CatalogCache;
 use bytes::{Bytes, BytesMut};
 use futures::stream::FusedStream;
@@ -53,6 +51,9 @@ enum Error {
 
     #[snafu(display("List query invalid size: {source}"))]
     InvalidSize { source: std::num::ParseIntError },
+
+    #[snafu(display("Client indicates unsupported LIST protocol version: {version}"))]
+    UnsupportedListProtocol { version: String },
 }
 
 impl Error {
@@ -69,6 +70,7 @@ impl Error {
             | Self::InvalidEtag { .. }
             | Self::MissingSize
             | Self::BadHeader { .. } => StatusCode::BAD_REQUEST,
+            Self::UnsupportedListProtocol { .. } => StatusCode::NOT_IMPLEMENTED,
         };
         response
     }
@@ -151,24 +153,24 @@ impl CatalogRequestFuture {
                     let iter = self.state.cache.list();
                     let entries = iter.map(|(k, v)| ListEntry::new(k, v)).collect();
 
-                    let response = match self.parts.headers.get(ACCEPT) {
+                    match self.parts.headers.get(ACCEPT) {
                         Some(x) if x == LIST_PROTOCOL_V2 => {
                             let encoder = v2::ListEncoder::new(entries).with_max_value_size(size);
                             let stream = futures::stream::iter(encoder);
                             let stream = BatchedBytesStream::new(stream, size);
-                            ResponseBuilder::new()
+                            let response = ResponseBuilder::new()
                                 .header(CONTENT_TYPE, &LIST_PROTOCOL_V2)
-                                .body(stream_bytes_to_response_body(stream))?
+                                .body(stream_bytes_to_response_body(stream))?;
+                            return Ok(response);
                         }
-                        _ => {
-                            let encoder = v1::ListEncoder::new(entries).with_max_value_size(size);
-                            let stream = futures::stream::iter(encoder);
-                            ResponseBuilder::new()
-                                .header(CONTENT_TYPE, &LIST_PROTOCOL_V1)
-                                .body(stream_bytes_to_response_body(stream))?
+                        other => {
+                            return Err(Error::UnsupportedListProtocol {
+                                version: other
+                                    .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned())
+                                    .unwrap_or_else(|| "<none>".to_owned()),
+                            });
                         }
-                    };
-                    return Ok(response);
+                    }
                 }
                 _ => StatusCode::METHOD_NOT_ALLOWED,
             },

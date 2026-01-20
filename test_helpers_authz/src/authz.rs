@@ -43,7 +43,7 @@ impl Authorizer {
         info!(local_addr = %addr, "Authorizer started");
         info!("****************");
 
-        let incoming = TcpIncoming::from_listener(listener, false, None).unwrap();
+        let incoming = TcpIncoming::from(listener).with_nodelay(Some(false));
         let (stop, stop_rx) = oneshot::channel();
         let tokens = Arc::new(Mutex::new(HashMap::new()));
         let router = Server::builder().add_service(IoxAuthorizerServiceServer::new(

@@ -161,7 +161,7 @@ fn conjunction(
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::{
-        datasource::{object_store::ObjectStoreUrl, physical_plan::FileScanConfig},
+        datasource::object_store::ObjectStoreUrl,
         logical_expr::Operator,
         physical_expr::LexOrdering,
         physical_plan::{
@@ -185,11 +185,12 @@ mod tests {
         let schema = schema();
         let mut table_opts = table_parquet_options();
         table_opts.global.pushdown_filters = false;
-        let file_scan_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
             Arc::new(ParquetSource::new(table_opts).with_predicate(predicate_tag(&schema))),
-        );
+        )
+        .build();
         let plan = Arc::new(
             FilterExec::try_new(
                 predicate_mixed(&schema),
@@ -336,13 +337,14 @@ mod tests {
     #[test]
     fn test_parquet() {
         let schema = schema();
-        let file_scan_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
             Arc::new(
                 ParquetSource::new(table_parquet_options()).with_predicate(predicate_tag(&schema)),
             ),
-        );
+        )
+        .build();
         let plan = Arc::new(
             FilterExec::try_new(
                 predicate_mixed(&schema),

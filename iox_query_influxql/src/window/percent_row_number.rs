@@ -8,7 +8,7 @@ use datafusion::logical_expr::{
 };
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct PercentRowNumberUDWF {
     signature: Signature,
 }

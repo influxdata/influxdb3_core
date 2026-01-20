@@ -63,9 +63,9 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
 
     let mut columns = Vec::with_capacity(projection_exec.expr().len());
     let mut column_indices = Vec::with_capacity(projection_exec.expr().len());
-    for (expr, output_name) in projection_exec.expr() {
-        if let Some(column) = expr.as_any().downcast_ref::<Column>()
-            && column.name() == output_name
+    for projection_expr in projection_exec.expr() {
+        if let Some(column) = projection_expr.expr.as_any().downcast_ref::<Column>()
+            && column.name() == projection_expr.alias
         {
             columns.push(column.clone());
             column_indices.push(column.index());
@@ -215,7 +215,7 @@ fn optimize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Exe
         let expr = column_indices
             .iter()
             .map(|idx| child_proj.expr()[*idx].clone())
-            .collect();
+            .collect::<Vec<_>>();
         let plan = Arc::new(ProjectionExec::try_new(
             expr,
             Arc::clone(child_proj.input()),
@@ -432,6 +432,7 @@ mod tests {
         compute::SortOptions,
         datatypes::{DataType, Field, Schema, SchemaRef},
     };
+    use datafusion::physical_plan::projection::ProjectionExpr;
     use datafusion::{
         common::JoinType,
         datasource::object_store::ObjectStoreUrl,
@@ -448,7 +449,7 @@ mod tests {
     };
     use datafusion::{
         common::NullEquality,
-        datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource},
+        datasource::physical_plan::{FileScanConfigBuilder, ParquetSource},
     };
     use datafusion_util::config::table_parquet_options;
     use serde::Serialize;
@@ -594,7 +595,7 @@ mod tests {
         let schema = schema();
         let plan = Arc::new(
             ProjectionExec::try_new(
-                vec![(
+                vec![ProjectionExpr::new(
                     Arc::new(Literal::new(ScalarValue::from("foo"))),
                     String::from("tag1"),
                 )],
@@ -1142,11 +1143,11 @@ mod tests {
         let plan = Arc::new(
             ProjectionExec::try_new(
                 vec![
-                    (
+                    ProjectionExpr::new(
                         Arc::new(Literal::new(ScalarValue::from("foo"))),
                         String::from("tag1"),
                     ),
-                    (
+                    ProjectionExpr::new(
                         Arc::new(Literal::new(ScalarValue::from("bar"))),
                         String::from("tag2"),
                     ),
@@ -1362,6 +1363,8 @@ mod tests {
 
     #[test]
     fn test_preserve_schema_with_duplicate_column_names() {
+        let config_options = Arc::new(ConfigOptions::new());
+
         let table_schema = Arc::new(Schema::new([Arc::new(Field::new(
             "col1",
             DataType::Utf8,
@@ -1382,8 +1385,8 @@ mod tests {
         )
         .unwrap();
         let plan = ProjectionExec::try_new(
-            vec![
-                (
+            [
+                ProjectionExpr::new(
                     Arc::new(ScalarFunctionExpr::new(
                         "COALESCE",
                         coalesce(),
@@ -1392,11 +1395,12 @@ mod tests {
                             Arc::new(Column::new("col1", 1)),
                         ],
                         Arc::new(Field::new("r", DataType::Utf8, false)),
+                        Arc::clone(&config_options),
                     )),
                     "__common_expr".to_string(),
                 ),
-                (Arc::new(Column::new("col1", 0)), "col1".to_string()),
-                (Arc::new(Column::new("col1", 1)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 0)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 1)), "col1".to_string()),
             ],
             Arc::new(plan),
         )
@@ -1412,14 +1416,14 @@ mod tests {
         .unwrap();
         let plan = ProjectionExec::try_new(
             vec![
-                (Arc::new(Column::new("col1", 1)), "col1".to_string()),
-                (Arc::new(Column::new("col1", 2)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 1)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 2)), "col1".to_string()),
             ],
             Arc::new(plan),
         )
         .unwrap();
         let plan = ProjectionExec::try_new(
-            vec![(
+            vec![ProjectionExpr::new(
                 Arc::new(ScalarFunctionExpr::new(
                     "COALESCE",
                     coalesce(),
@@ -1428,6 +1432,7 @@ mod tests {
                         Arc::new(Column::new("col1", 1)),
                     ],
                     Arc::new(Field::new("r", DataType::Utf8, false)),
+                    config_options,
                 )),
                 "value".to_string(),
             )],
@@ -1498,8 +1503,8 @@ mod tests {
         .unwrap();
         let plan = ProjectionExec::try_new(
             vec![
-                (Arc::new(Column::new("col1", 0)), "col1".to_string()),
-                (Arc::new(Column::new("col1", 2)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 0)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 2)), "col1".to_string()),
             ],
             Arc::new(plan),
         )
@@ -1536,8 +1541,8 @@ mod tests {
         .unwrap();
         let plan = ProjectionExec::try_new(
             vec![
-                (Arc::new(Column::new("col1", 0)), "col1".to_string()),
-                (Arc::new(Column::new("col1", 2)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 0)), "col1".to_string()),
+                ProjectionExpr::new(Arc::new(Column::new("col1", 2)), "col1".to_string()),
             ],
             Arc::new(plan),
         )
@@ -1548,7 +1553,10 @@ mod tests {
         )
         .unwrap();
         let plan = ProjectionExec::try_new(
-            vec![(Arc::new(Column::new("col1", 0)), "col1".to_string())],
+            vec![ProjectionExpr::new(
+                Arc::new(Column::new("col1", 0)),
+                "col1".to_string(),
+            )],
             Arc::new(plan),
         )
         .unwrap();
@@ -1590,11 +1598,12 @@ mod tests {
             Field::new("field1", DataType::UInt64, true),
             Field::new("field2", DataType::UInt64, true),
         ]));
-        let file_scan_config = FileScanConfig::new(
+        let file_scan_config = FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("test://").unwrap(),
             Arc::clone(&schema),
             Arc::new(ParquetSource::new(table_parquet_options())),
-        );
+        )
+        .build();
         let plan = DataSourceExec::from_data_source(file_scan_config);
         let plan_schema = plan.schema();
         let plan = Arc::new(DeduplicateExec::new(

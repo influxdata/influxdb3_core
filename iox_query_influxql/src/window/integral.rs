@@ -34,7 +34,7 @@ macro_rules! format_column_types {
 
 const INTEGRAL_WINDOW_NAME: &str = "integral_window";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct IntegralUDWF {
     signature: Signature,
 }

@@ -16,7 +16,7 @@ pub const TO_TIMESTAMP_FUNCTION_NAME: &str = "to_timestamp";
 /// upstream: <https://github.com/apache/arrow-datafusion/pull/7844>
 ///
 /// See <https://github.com/influxdata/influxdb_iox/issues/9164> for more details
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 struct ToTimestampUDF {
     signature: Signature,
     /// Fall back to DataFusion's built in to_timestamp implementation

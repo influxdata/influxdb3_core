@@ -118,15 +118,15 @@ pub fn register_iox_scalar_functions(ctx: &SessionContext) {
 
 #[cfg(test)]
 mod test {
+    use super::*;
     use arrow::{
         array::{ArrayRef, StringArray, TimestampNanosecondArray},
         record_batch::RecordBatch,
     };
+    use datafusion::config::ConfigOptions;
     use datafusion::{assert_batches_eq, prelude::col};
     use schema::TIME_DATA_TIMEZONE;
-    use std::sync::Arc;
-
-    use super::*;
+    use std::sync::{Arc, LazyLock};
 
     /// plumbing test to validate registry is connected. functions are
     /// tested more thoroughly in their own modules
@@ -230,5 +230,11 @@ mod test {
         ];
 
         assert_batches_eq!(&expected, &result);
+    }
+
+    pub(crate) fn default_config_options() -> Arc<ConfigOptions> {
+        static CONFIG_OPTIONS: LazyLock<Arc<ConfigOptions>> =
+            LazyLock::new(|| Arc::new(ConfigOptions::default()));
+        Arc::clone(&CONFIG_OPTIONS)
     }
 }

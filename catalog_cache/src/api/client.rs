@@ -1,6 +1,6 @@
 //! Client for the cache HTTP API
 
-use crate::api::list::{ListEntry, MAX_VALUE_SIZE, v1, v2};
+use crate::api::list::{ListEntry, MAX_VALUE_SIZE, v2};
 use crate::api::{GENERATION, GENERATION_NOT_MATCH, LIST_PROTOCOL_V2, NO_VALUE, RequestPath};
 use crate::{CacheKey, CacheValue};
 use futures::prelude::*;
@@ -327,7 +327,11 @@ impl CatalogCacheClient {
                     Some(x) if x == LIST_PROTOCOL_V2 => {
                         v2::decode_response(response).map(|x| x.boxed())
                     }
-                    _ => v1::decode_response(response, size).map(|x| x.boxed()),
+                    other => Err(crate::api::list::Error::UnsupportedProtocol {
+                        version: other
+                            .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned())
+                            .unwrap_or_else(|| "<none>".to_owned()),
+                    }),
                 };
                 futures::future::ready(stream)
             })

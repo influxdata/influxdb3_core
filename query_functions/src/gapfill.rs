@@ -59,7 +59,7 @@ pub(crate) static DATE_BIN_WALLCLOCK_GAPFILL: LazyLock<Arc<ScalarUDF>> = LazyLoc
 /// Wrapper around date_bin style functions to enable gap filling
 /// functionality. Although presented as a scalar function the planner
 /// will rewrite queries including this wrapper to use a GapFill node.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct GapFillWrapper {
     udf: Arc<ScalarUDF>,
     name: String,
@@ -124,7 +124,7 @@ pub const LOCF_UDF_NAME: &str = "locf";
 /// The virtual function definition for the `locf` gap-filling
 /// function. This function is never actually invoked, but is used to
 /// provider parameters for the GapFill node that is added to the plan.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LocfUDF {
     signature: Signature,
 }
@@ -177,7 +177,7 @@ pub const INTERPOLATE_UDF_NAME: &str = "interpolate";
 /// The virtual function definition for the `interpolate` gap-filling
 /// function. This function is never actually invoked, but is used to
 /// provider parameters for the GapFill node that is added to the plan.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct InterpolateUDF {
     signature: Signature,
 }

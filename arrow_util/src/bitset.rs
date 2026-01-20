@@ -5,7 +5,7 @@ use std::ops::Range;
 ///
 /// Note: This currently operates on individual bytes at a time
 /// it could be optimised to instead operate on usize blocks
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct BitSet {
     /// The underlying data
     ///
@@ -80,18 +80,6 @@ impl BitSet {
             *self.buffer.last_mut().unwrap() &= (1 << overrun) - 1;
         }
         self.len = len;
-    }
-
-    /// Split this bitmap at the specified bit boundary, such that after this
-    /// call, `self` contains the range `[0, n)` and the returned value contains
-    /// `[n, len)`.
-    pub fn split_off(&mut self, n: usize) -> Self {
-        let mut right = Self::with_capacity(self.len - n);
-        right.extend_from_range(self, n..self.len);
-
-        self.truncate(n);
-
-        right
     }
 
     /// Extends this [`BitSet`] by the context of `other`
@@ -177,7 +165,7 @@ impl BitSet {
 
     /// Sets a given bit
     pub fn set(&mut self, idx: usize) {
-        assert!(idx <= self.len);
+        assert!(idx < self.len);
 
         let byte_idx = idx / 8;
         let bit_idx = idx % 8;
@@ -186,10 +174,11 @@ impl BitSet {
 
     /// Returns if the given index is set
     pub fn get(&self, idx: usize) -> bool {
-        assert!(idx <= self.len);
+        assert!(idx < self.len);
 
         let byte_idx = idx / 8;
         let bit_idx = idx % 8;
+
         (self.buffer[byte_idx] >> bit_idx) & 1 != 0
     }
 
@@ -229,7 +218,7 @@ impl BitSet {
 
         // Check all the bytes in the bitmap that have all their bits considered
         // part of the bit set.
-        let full_blocks = (self.len / 8).saturating_sub(1);
+        let full_blocks = self.len / 8;
         if !self.buffer.iter().take(full_blocks).all(|&v| v == u8::MAX) {
             return false;
         }
@@ -237,12 +226,15 @@ impl BitSet {
         // Check the last byte of the bitmap that may only be partially part of
         // the bit set, and therefore need masking to check only the relevant
         // bits.
-        let mask = match self.len % 8 {
-            1..=8 => !(0xFF << (self.len % 8)), // LSB mask
-            0 => 0xFF,
-            _ => unreachable!(),
-        };
-        *self.buffer.last().unwrap() == mask
+        let offset = self.len % 8;
+
+        if offset != 0
+            && let Some(last) = self.buffer.last()
+        {
+            *last == !(0xFF << offset) // LSB mask
+        } else {
+            true
+        }
     }
 
     /// Return `true` if all bits in the [`BitSet`] are currently unset.
@@ -270,25 +262,6 @@ impl BitSet {
     /// bitmap.
     pub fn iter(&self) -> Iter<'_> {
         Iter::new(self)
-    }
-
-    /// Returns the bitwise AND between the two [`BitSet`] instances.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the two sets have differing lengths.
-    pub fn and(&self, other: &Self) -> Self {
-        assert_eq!(self.len, other.len);
-
-        Self {
-            buffer: self
-                .buffer
-                .iter()
-                .zip(other.buffer.iter())
-                .map(|(a, b)| a & b)
-                .collect(),
-            len: self.len,
-        }
     }
 }
 
@@ -355,15 +328,26 @@ pub fn iter_set_positions_with_offset(
     let mut in_progress = bytes.get(byte_idx).cloned().unwrap_or(0);
 
     let skew = offset % 8;
+    // `in_progress` is the byte that we're currently looking at, but modified so that the
+    // right-most set bit is the next bit we need to inspect. Each time we inspect a bit and return
+    // its index, we clear that bit so that we can then move into the next one.
     in_progress &= 0xFF << skew;
 
     std::iter::from_fn(move || {
         loop {
+            // If the current byte that we're looking at has any amount of bits that are still
+            // set...
             if in_progress != 0 {
+                // We find the first (right-most, least-significant) bit that is set...
                 let bit_pos = in_progress.trailing_zeros();
+                // ... clear it so that we don't find it next time around...
                 in_progress ^= 1 << bit_pos;
+                // ... and then return it, since we know it is a valid index.
                 return Some((byte_idx * 8) + (bit_pos as usize));
             }
+
+            // If we get here, we've exhausted every bit on `in_progress`, so we need to move to the
+            // next one.
             byte_idx += 1;
             in_progress = *bytes.get(byte_idx)?;
         }
@@ -373,6 +357,7 @@ pub fn iter_set_positions_with_offset(
 #[cfg(test)]
 mod tests {
     use arrow::array::BooleanBufferBuilder;
+    use pretty_assertions::assert_eq;
     use proptest::prelude::*;
     use rand::prelude::*;
     use rand::rngs::OsRng;
@@ -623,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "idx <= self.len"]
+    #[should_panic = "idx < self.len"]
     fn test_bitset_set_get_out_of_bounds() {
         let mut v = BitSet::with_size(4);
 
@@ -632,8 +617,8 @@ mod tests {
         //
         // Accessing bits past the 4 the bitset "contains" should not succeed.
 
-        v.get(5);
-        v.set(5);
+        v.get(4);
+        v.set(4);
     }
 
     #[test]
@@ -717,106 +702,6 @@ mod tests {
         assert!(v.is_all_unset());
     }
 
-    #[test]
-    fn test_split_byte_boundary() {
-        let mut a = BitSet::new();
-
-        a.append_set(16);
-        a.append_unset(8);
-        a.append_set(8);
-
-        let b = a.split_off(16);
-
-        assert_eq!(a.len(), 16);
-        assert_eq!(b.len(), 16);
-
-        // All the bits in A are set.
-        assert!(a.is_all_set());
-        for i in 0..16 {
-            assert!(a.get(i));
-        }
-
-        // The first 8 bits in b are unset, and the next 8 bits are set.
-        for i in 0..8 {
-            assert!(!b.get(i));
-        }
-        for i in 8..16 {
-            assert!(b.get(i));
-        }
-    }
-
-    #[test]
-    fn test_split_sub_byte_boundary() {
-        let mut a = BitSet::new();
-
-        a.append_set(3);
-        a.append_unset(3);
-        a.append_set(1);
-
-        assert_eq!(a.bytes(), &[0b01000111]);
-
-        let b = a.split_off(5);
-
-        assert_eq!(a.len(), 5);
-        assert_eq!(b.len(), 2);
-
-        // A contains 3 set bits & 2 unset bits, with the rest masked out.
-        assert_eq!(a.bytes(), &[0b00000111]);
-
-        // B contains 1 unset bit, and then 1 set bit
-        assert_eq!(b.bytes(), &[0b0000010]);
-    }
-
-    #[test]
-    fn test_split_multi_byte_unclean_boundary() {
-        let mut a = BitSet::new();
-
-        a.append_set(8);
-        a.append_unset(1);
-        a.append_set(1);
-        a.append_unset(1);
-        a.append_set(1);
-
-        assert_eq!(a.bytes(), &[0b11111111, 0b00001010]);
-
-        let b = a.split_off(10);
-
-        assert_eq!(a.len(), 10);
-        assert_eq!(b.len(), 2);
-
-        assert_eq!(a.bytes(), &[0b11111111, 0b00000010]);
-        assert_eq!(b.bytes(), &[0b0000010]);
-    }
-
-    #[test]
-    fn test_count_ones_with_truncate() {
-        // For varying sizes of bitmaps.
-        for i in 1..150 {
-            let mut b = BitSet::new();
-
-            // Set "i" number of bits in 2*i values.
-            for _ in 0..i {
-                b.append_unset(1);
-                b.append_set(1);
-            }
-
-            assert_eq!(b.len(), 2 * i);
-            assert_eq!(b.count_ones(), i);
-            assert_eq!(b.count_zeros(), i);
-
-            // Split it such that the last bit is removed.
-            let other = b.split_off((2 * i) - 1);
-            assert_eq!(other.len(), 1);
-            assert_eq!(other.count_ones(), 1);
-            assert_eq!(other.count_zeros(), 0);
-
-            // Which means the original bitmap must now have 1 less 1 bit.
-            assert_eq!(b.len(), (2 * i) - 1);
-            assert_eq!(b.count_ones(), i - 1);
-            assert_eq!(b.count_zeros(), i);
-        }
-    }
-
     prop_compose! {
         /// Returns a [`BitSet`] of random length and content.
         fn arbitrary_bitset()(
@@ -832,52 +717,6 @@ mod tests {
             }
 
             b
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn prop_iter(
-            values in prop::collection::vec(any::<bool>(), 0..20),
-        ) {
-            let mut b = BitSet::new();
-
-            for v in &values {
-                match v {
-                    true => b.append_set(1),
-                    false => b.append_unset(1),
-                }
-            }
-
-            assert_eq!(values.len(), b.len());
-
-            let got = b.iter().collect::<Vec<_>>();
-            assert_eq!(values, got);
-
-            // Exact size iter
-            assert_eq!(b.iter().len(), values.len());
-        }
-
-        #[test]
-        fn prop_and(
-            mut a in arbitrary_bitset(),
-            mut b in arbitrary_bitset(),
-        ) {
-            let min_len = a.len().min(b.len());
-            // Truncate a and b to the same length.
-            a.truncate(min_len);
-            b.truncate(min_len);
-
-            let want = a
-                .iter()
-                .zip(b.iter())
-                .map(|(a, b)| a & b)
-                .collect::<Vec<_>>();
-
-            let c = a.and(&b);
-            let got = c.iter().collect::<Vec<_>>();
-
-            assert_eq!(got, want);
         }
     }
 }

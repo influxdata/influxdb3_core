@@ -104,6 +104,7 @@ fn arrow_error_to_tonic_code(e: &ArrowError) -> tonic::Code {
         | ArrowError::ComputeError(_)
         | ArrowError::DivideByZero
         | ArrowError::ArithmeticOverflow(_)
+        | ArrowError::OffsetOverflowError(_)
         | ArrowError::CsvError(_)
         | ArrowError::JsonError(_)
         | ArrowError::IoError(_, _)

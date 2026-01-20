@@ -23,9 +23,6 @@ static GENERATION_NOT_MATCH: HeaderName =
 /// on read.
 static NO_VALUE: HeaderName = HeaderName::from_static("x-influx-no-value");
 
-/// Value of Accept header for v1 list protocol
-static LIST_PROTOCOL_V1: HeaderValue = HeaderValue::from_static("application/x-list-v1");
-
 /// Value of Accept header for v2 list protocol
 static LIST_PROTOCOL_V2: HeaderValue = HeaderValue::from_static("application/x-list-v2");
 

@@ -13,9 +13,9 @@ use arrow::{
     error::ArrowError,
 };
 use data_types::ObjectStoreId;
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::{
     common::{Column, Statistics},
-    datasource::file_format::parquet::statistics_from_parquet_meta_calc,
     error::DataFusionError,
     execution::context::ExecutionProps,
     logical_expr::{Expr, utils::conjunction},
@@ -181,9 +181,12 @@ impl MetaIndexCache {
                     // get statistics from metadata
                     let col_metas = cache_column_stats
                         .then(|| {
-                            statistics_from_parquet_meta_calc(&parquet_metadata, table_schema)
-                                .map(ColStats::from_statistics)
-                                .ok()
+                            DFParquetMetadata::statistics_from_parquet_metadata(
+                                &parquet_metadata,
+                                &table_schema,
+                            )
+                            .map(ColStats::from_statistics)
+                            .ok()
                         })
                         .flatten();
                     Ok(Arc::new(FileMetas {

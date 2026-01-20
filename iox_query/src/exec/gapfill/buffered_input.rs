@@ -8,7 +8,10 @@ use arrow::{
     record_batch::RecordBatch,
     row::{RowConverter, Rows, SortField},
 };
-use datafusion::error::{DataFusionError, Result};
+use datafusion::{
+    error::{DataFusionError, Result},
+    execution::memory_pool::MemoryReservation,
+};
 use hashbrown::HashSet;
 
 use super::{FillStrategy, params::GapFillParams};
@@ -40,10 +43,16 @@ pub(super) struct BufferedInput {
     /// representation of the last row that may appear in the output so
     /// it doesn't need to be computed more than once.
     last_output_row: Option<Rows>,
+    /// Tracks memory reservation for buffered batches.
+    reservation: MemoryReservation,
 }
 
 impl BufferedInput {
-    pub(super) fn new(params: &GapFillParams, series_cols: Vec<usize>) -> Self {
+    pub(super) fn new(
+        params: &GapFillParams,
+        series_cols: Vec<usize>,
+        reservation: MemoryReservation,
+    ) -> Self {
         let interpolate_cols = params
             .fill_strategy
             .iter()
@@ -57,18 +66,33 @@ impl BufferedInput {
             batches: vec![],
             row_converter: None,
             last_output_row: None,
+            reservation,
         }
     }
+
     /// Add a new batch of buffered records from the input stream.
-    pub(super) fn push(&mut self, batch: RecordBatch) {
+    ///
+    /// Returns an error if the memory reservation cannot be grown to
+    /// accommodate the batch.
+    pub(super) fn try_push(&mut self, batch: RecordBatch) -> Result<()> {
+        self.reservation.try_grow(batch.get_array_memory_size())?;
         self.batches.push(batch);
+        Ok(())
     }
 
     /// Transfer ownership of the buffered record batches to the caller for
-    /// processing.
+    /// processing. Resets the memory reservation since we no longer hold
+    /// these batches.
     pub(super) fn take(&mut self) -> Vec<RecordBatch> {
         self.last_output_row = None;
+        self.reservation.resize(0);
         std::mem::take(&mut self.batches)
+    }
+
+    /// Returns a reference to the memory reservation.
+    #[cfg(test)]
+    pub(super) fn reservation(&self) -> &MemoryReservation {
+        &self.reservation
     }
 
     /// Determine if we need more input before we start processing.
@@ -253,12 +277,19 @@ impl BufferedInput {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Arc;
 
     use arrow_util::test_util::batches_to_lines;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
 
     use super::*;
     use crate::exec::gapfill::date_bin_gap_expander::DateBinGapExpander;
     use crate::exec::gapfill::exec_tests::TestRecords;
+
+    fn test_reservation() -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new("test").register(&pool)
+    }
 
     fn test_records(batch_size: usize) -> VecDeque<RecordBatch> {
         let records = TestRecords {
@@ -405,8 +436,11 @@ mod tests {
         let mut params = test_params();
         params.fill_strategy = [].into();
 
-        let mut buffered_input = BufferedInput::new(&params, vec![]);
+        let mut buffered_input = BufferedInput::new(&params, vec![], test_reservation());
         let mut batches = test_records(batch_size);
+
+        // Verify memory reservation starts at 0
+        assert_eq!(buffered_input.reservation().size(), 0);
 
         // There are no rows, so that is less than the batch size,
         // it needs more.
@@ -414,19 +448,33 @@ mod tests {
 
         // There are now 3 rows, still less than batch_size + 1,
         // so it needs more.
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        let batch_size_bytes = batch.get_array_memory_size();
+        buffered_input.try_push(batch).unwrap();
+        // Verify memory reservation grows by batch size
+        assert_eq!(buffered_input.reservation().size(), batch_size_bytes);
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // We now have batch_size * 2, records, which is enough.
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        let total_size_bytes = batch_size_bytes + batch.get_array_memory_size();
+        buffered_input.try_push(batch).unwrap();
+        // Verify memory reservation is cumulative
+        assert_eq!(buffered_input.reservation().size(), total_size_bytes);
         assert!(!buffered_input.need_more(batch_size - 1).unwrap());
+
+        // After take(), reservation resets to 0
+        let taken = buffered_input.take();
+        assert_eq!(taken.len(), 2);
+        // Verify memory reservation resets to 0 after take()
+        assert_eq!(buffered_input.reservation().size(), 0);
     }
 
     #[test]
     fn no_group() {
         let batch_size = 3;
         let params = test_params();
-        let mut buffered_input = BufferedInput::new(&params, vec![]);
+        let mut buffered_input = BufferedInput::new(&params, vec![], test_reservation());
         let mut batches = test_records(batch_size);
 
         // There are no rows, so that is less than the batch size,
@@ -435,25 +483,29 @@ mod tests {
 
         // There are now 3 rows, still less than batch_size + 1,
         // so it needs more.
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // There are now 6 rows, if we were not interpolating,
         // this would be enough.
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
 
         // If we are interpolating, there are no non null values
         // at offset 5.
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // Push more rows, now totaling 9.
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
         // Column `a1` has a non-null value at offset 8.
         // If that were the only column being interpolated, we would have enough.
 
         // 12 rows, with non-null values in both columns being interpolated.
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
         assert!(!buffered_input.need_more(batch_size - 1).unwrap());
     }
 
@@ -461,32 +513,50 @@ mod tests {
     fn with_group() {
         let params = test_params();
         let group_cols = vec![0, 1];
-        let mut buffered_input = BufferedInput::new(&params, group_cols);
+        let mut buffered_input = BufferedInput::new(&params, group_cols, test_reservation());
 
         let batch_size = 3;
         let mut batches = test_records(batch_size);
+        let mut expected_size = 0;
 
         // no rows
+        // Verify memory reservation starts at 0
+        assert_eq!(buffered_input.reservation().size(), 0);
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // 3 rows
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        expected_size += batch.get_array_memory_size();
+        buffered_input.try_push(batch).unwrap();
+        // Verify memory reservation tracks cumulative batch sizes
+        assert_eq!(buffered_input.reservation().size(), expected_size);
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // 6 rows
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        expected_size += batch.get_array_memory_size();
+        buffered_input.try_push(batch).unwrap();
+        assert_eq!(buffered_input.reservation().size(), expected_size);
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // 9 rows (series changes here)
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        expected_size += batch.get_array_memory_size();
+        buffered_input.try_push(batch).unwrap();
+        assert_eq!(buffered_input.reservation().size(), expected_size);
         assert!(!buffered_input.need_more(batch_size - 1).unwrap());
+
+        // Verify memory reservation resets to 0 after take()
+        let taken = buffered_input.take();
+        assert_eq!(taken.len(), 3);
+        assert_eq!(buffered_input.reservation().size(), 0);
     }
 
     #[test]
     fn struct_with_group() {
         let params = test_params();
         let group_cols = vec![0, 1];
-        let mut buffered_input = BufferedInput::new(&params, group_cols);
+        let mut buffered_input = BufferedInput::new(&params, group_cols, test_reservation());
 
         let batch_size = 3;
         let mut batches = test_struct_records(batch_size);
@@ -495,15 +565,18 @@ mod tests {
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // 3 rows
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // 6 rows
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
         assert!(buffered_input.need_more(batch_size - 1).unwrap());
 
         // 9 rows (series changes here)
-        buffered_input.push(batches.pop_front().unwrap());
+        let batch = batches.pop_front().unwrap();
+        buffered_input.try_push(batch).unwrap();
         assert!(!buffered_input.need_more(batch_size - 1).unwrap());
     }
 
@@ -534,9 +607,9 @@ mod tests {
         };
         let batches: Vec<RecordBatch> = records.try_into().unwrap();
 
-        let mut buffered_input = BufferedInput::new(&params, group_cols);
+        let mut buffered_input = BufferedInput::new(&params, group_cols, test_reservation());
         for batch in batches {
-            buffered_input.push(batch);
+            buffered_input.try_push(batch).unwrap();
         }
         assert!(buffered_input.need_more(last_output_row_offset).unwrap());
     }

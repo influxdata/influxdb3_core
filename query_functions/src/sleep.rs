@@ -13,7 +13,7 @@ use datafusion::{
 /// The name of the "sleep" UDF given to DataFusion.
 pub const SLEEP_UDF_NAME: &str = "sleep";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct SleepUDF {
     signature: Signature,
 }

@@ -38,10 +38,12 @@ use datafusion::{
     prelude::*,
 };
 use datafusion::{catalog::Session, config::TableOptions};
+use datafusion_udf_wasm_host::{AllowCertainHttpRequests, WasmPermissions};
+use datafusion_udf_wasm_query::ParsedQuery;
 use datafusion_util::config::{
     DEFAULT_CATALOG, iox_file_formats, iox_session_config, table_parquet_options,
 };
-use executor::DedicatedExecutor;
+use executor::{DedicatedExecutor, get_io_runtime};
 use futures::TryStreamExt;
 use query_functions::{register_iox_scalar_functions, selectors::register_selector_aggregates};
 use std::{fmt, num::NonZeroUsize, str::FromStr, sync::Arc};
@@ -484,7 +486,40 @@ impl IOxSessionContext {
     pub async fn sql_to_logical_plan(&self, sql: &str) -> Result<LogicalPlan> {
         let ctx = self.child_ctx("sql_to_logical_plan");
         debug!(text=%sql, "planning SQL query");
-        let plan = ctx.inner.state().create_logical_plan(sql).await?;
+        let task_ctx = ctx.inner().task_ctx();
+        let config_ext = task_ctx
+            .session_config()
+            .options()
+            .extensions
+            .get::<IoxConfigExt>()
+            .cloned()
+            .unwrap_or_default();
+
+        let sql = if config_ext.udfs_enabled {
+            let mut http_permissions = AllowCertainHttpRequests::new();
+            config_ext
+                .udfs_http_allow_list
+                .0
+                .into_iter()
+                .for_each(|matcher| http_permissions.allow(matcher));
+            let permissions = WasmPermissions::new().with_http(http_permissions);
+
+            let rt_io = get_io_runtime();
+
+            let ParsedQuery { udfs, sql } = iox_query_udf::udf_parser()
+                .parse(sql, &permissions, rt_io, task_ctx.as_ref())
+                .await?;
+
+            for udf in udfs {
+                ctx.inner().register_udf(udf.as_async_udf().into());
+            }
+
+            sql
+        } else {
+            sql.to_owned()
+        };
+
+        let plan = ctx.inner.state().create_logical_plan(&sql).await?;
         // ensure the plan does not contain unwanted statements
         let verifier = SQLOptions::new()
             .with_allow_ddl(false) // no CREATE ...

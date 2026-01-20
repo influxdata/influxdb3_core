@@ -10,7 +10,7 @@ use datafusion::{
     physical_plan::{Accumulator, expressions::format_state_name},
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct SpreadUDF {
     signature: Signature,
 }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 /// Wrap a WindowUDF so that all values are non-negative.
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct NonNegativeUDWF<U: WindowUDFImpl> {
     name: String,
     inner: U,
@@ -30,7 +30,7 @@ impl<U: WindowUDFImpl> NonNegativeUDWF<U> {
     }
 }
 
-impl<U: WindowUDFImpl + 'static> WindowUDFImpl for NonNegativeUDWF<U> {
+impl<U: WindowUDFImpl + std::hash::Hash + Eq + 'static> WindowUDFImpl for NonNegativeUDWF<U> {
     fn as_any(&self) -> &dyn Any {
         self
     }

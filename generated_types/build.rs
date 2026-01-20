@@ -114,7 +114,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         println!("cargo:rerun-if-changed={}", proto_file.display());
     }
 
-    let mut config = prost_build::Config::new();
+    let mut config = tonic_build::Config::new();
 
     config
         .compile_well_known_types()

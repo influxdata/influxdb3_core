@@ -9,7 +9,7 @@ use datafusion::logical_expr::{
 use std::any::Any;
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct CumulativeSumUDWF {
     signature: Signature,
 }

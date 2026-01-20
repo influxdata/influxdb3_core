@@ -10,7 +10,6 @@
 /// large cache values
 pub const MAX_VALUE_SIZE: usize = 1024 * 10;
 
-pub mod v1;
 pub mod v2;
 
 use bytes::Bytes;
@@ -35,6 +34,9 @@ pub enum Error {
 
     #[snafu(display("List request error: {source}"), context(false))]
     Reqwest { source: reqwest::Error },
+
+    #[snafu(display("Server indicates unsupported LIST protocol version: {version}"))]
+    UnsupportedProtocol { version: String },
 }
 
 /// Result type for list streams

@@ -613,6 +613,8 @@ impl TryFrom<ArrayRef> for StatementParam {
             DataType::Struct(_) => unsupported_type("Struct"),
             DataType::Union(_, _) => unsupported_type("Union"),
             DataType::Dictionary(_, _) => unsupported_type("Dictionary"),
+            DataType::Decimal32(_, _) => unsupported_type("Decimal32"),
+            DataType::Decimal64(_, _) => unsupported_type("Decimal64"),
             DataType::Decimal128(_, _) => unsupported_type("Decimal128"),
             DataType::Decimal256(_, _) => unsupported_type("Decimal256"),
             DataType::Map(_, _) => unsupported_type("Map"),

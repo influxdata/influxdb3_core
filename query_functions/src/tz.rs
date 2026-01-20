@@ -22,7 +22,7 @@ pub static TZ_UDF: LazyLock<Arc<ScalarUDF>> =
 /// A scalar UDF that converts a timestamp to a different timezone.
 /// This function understands that input timestamps are in UTC despite
 /// the lack of time zone information.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct TzUDF {
     signature: Signature,
 }
@@ -166,9 +166,9 @@ impl ScalarUDFImpl for TzUDF {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int64Array, TimestampNanosecondArray, TimestampNanosecondBuilder};
-
     use super::*;
+    use crate::test::default_config_options;
+    use arrow::array::{Int64Array, TimestampNanosecondArray, TimestampNanosecondBuilder};
 
     const TODAY: i64 = 1728668794000000000;
 
@@ -189,6 +189,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("UTC")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -218,6 +219,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("UTC")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -243,6 +245,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("UTC")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -272,6 +275,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("America/New_York")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -300,6 +304,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("America/New_York")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -326,6 +331,7 @@ mod tests {
                 arg_fields,
                 number_rows: 13,
                 return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -354,6 +360,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("+05:00")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -387,6 +394,7 @@ mod tests {
                     TimeUnit::Nanosecond,
                     Some(Arc::from("Europe/Brussels")),
                 )),
+                config_options: default_config_options(),
             })
             .unwrap()
         {
@@ -418,6 +426,7 @@ mod tests {
                 TimeUnit::Nanosecond,
                 Some(Arc::from("NewYork")),
             )),
+            config_options: default_config_options(),
         });
         assert!(result.is_err());
         assert!(
@@ -441,6 +450,7 @@ mod tests {
             arg_fields,
             number_rows: 13,
             return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            config_options: default_config_options(),
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains(
@@ -458,6 +468,7 @@ mod tests {
             arg_fields,
             number_rows: 13,
             return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            config_options: default_config_options(),
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains(
@@ -477,6 +488,7 @@ mod tests {
             arg_fields,
             number_rows: 13,
             return_field: return_field(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            config_options: default_config_options(),
         });
         assert!(result.is_err());
         assert!(
