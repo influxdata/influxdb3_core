@@ -125,8 +125,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parki
 # unify features between workspace-hack members and packages that are excluded from this hack
 smallvec = { version = "1.15.1", features = ["union"] }
 
-datafusion-udf-wasm-host = { git = "https://github.com/influxdata/datafusion-udf-wasm.git", rev = "e7a60e3abcf10c8a97ed2b55162a1d6b9aa238ba", default-features = false }
-datafusion-udf-wasm-query = { git = "https://github.com/influxdata/datafusion-udf-wasm.git", rev = "e7a60e3abcf10c8a97ed2b55162a1d6b9aa238ba" }
+datafusion-udf-wasm-host = { git = "https://github.com/influxdata/datafusion-udf-wasm.git", rev = "9b2243ad3305ca3e29af38e8cc9097cb853f1fce", default-features = false }
+datafusion-udf-wasm-query = { git = "https://github.com/influxdata/datafusion-udf-wasm.git", rev = "9b2243ad3305ca3e29af38e8cc9097cb853f1fce" }
 
 [workspace.lints.rust]
 missing_copy_implementations = "deny"
