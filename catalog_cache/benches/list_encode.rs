@@ -6,7 +6,7 @@ use std::str::FromStr;
 use bytes::Bytes;
 use catalog_cache::{
     CacheKey, CacheValue,
-    api::list::{ListEntry, v1, v2},
+    api::list::{ListEntry, v2},
 };
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
@@ -31,31 +31,11 @@ fn bench_encode_list(c: &mut Criterion) {
 fn run(group: &mut BenchmarkGroup<'_, WallTime>, size: usize) {
     group.throughput(Throughput::Elements(size as u64));
 
-    group.bench_with_input(BenchmarkId::new("v1/real", size), &size, |b, i| {
-        b.iter_batched(
-            || get_list_entries_real(*i),
-            |entries: Vec<ListEntry>| {
-                let _encoded: Vec<_> = v1::ListEncoder::new(entries).collect();
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
     group.bench_with_input(BenchmarkId::new("v2/real", size), &size, |b, i| {
         b.iter_batched(
             || get_list_entries_real(*i),
             |entries: Vec<ListEntry>| {
                 let _encoded: Vec<_> = v2::ListEncoder::new(entries).collect();
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.bench_with_input(BenchmarkId::new("v1/short", size), &size, |b, i| {
-        b.iter_batched(
-            || get_list_entries_short(*i),
-            |entries: Vec<ListEntry>| {
-                let _encoded: Vec<_> = v1::ListEncoder::new(entries).collect();
             },
             BatchSize::SmallInput,
         );

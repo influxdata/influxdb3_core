@@ -1,12 +1,10 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
+use datafusion::physical_plan::projection::ProjectionExpr;
 use datafusion::{
     common::{ColumnStatistics, Result, Statistics, internal_datafusion_err, stats::Precision},
-    physical_plan::{
-        PhysicalExpr,
-        expressions::{Column, Literal},
-    },
+    physical_plan::expressions::{Column, Literal},
     scalar::ScalarValue,
 };
 use itertools::Itertools;
@@ -230,13 +228,14 @@ pub(super) fn project_select_subset_of_column_statistics<
 /// <https://github.com/influxdata/arrow-datafusion/blob/b754eb4b9ccadc03d13838ac6e416c407975b405/datafusion/physical-plan/src/projection.rs#L294-L326>
 pub(super) fn proj_exec_stats<'a>(
     mut stats: Statistics,
-    exprs: impl Iterator<Item = &'a (Arc<dyn PhysicalExpr>, String)>,
+    exprs: impl Iterator<Item = &'a ProjectionExpr>,
     projexec_schema: &SchemaRef,
 ) -> Result<Arc<Statistics>> {
     let mut primitive_row_size = 0;
     let mut primitive_row_size_possible = true;
     let mut column_statistics = vec![];
-    for (expr, _) in exprs {
+    for projection_expr in exprs {
+        let expr = &projection_expr.expr;
         let col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>() {
             // handle columns in schema
             let col_index = col.index();
@@ -391,9 +390,9 @@ mod tests {
 
         /* Test: works for projection_exec */
         let exprs = [
-            (col("col_a", &src_schema).unwrap(), "col_a".into()),
-            (col("col_b", &src_schema).unwrap(), "col_b".into()),
-            (col("col_c", &src_schema).unwrap(), "col_c".into()),
+            ProjectionExpr::new(col("col_a", &src_schema).unwrap(), "col_a".into()),
+            ProjectionExpr::new(col("col_b", &src_schema).unwrap(), "col_b".into()),
+            ProjectionExpr::new(col("col_c", &src_schema).unwrap(), "col_c".into()),
         ];
         let actual = proj_exec_stats(
             Arc::unwrap_or_clone(src_stats),
@@ -463,8 +462,8 @@ mod tests {
 
         /* Test: works for projection_exec */
         let exprs = [
-            (col("col_c", &src_schema).unwrap(), "col_c".into()),
-            (col("col_a", &src_schema).unwrap(), "col_a".into()),
+            ProjectionExpr::new(col("col_c", &src_schema).unwrap(), "col_c".into()),
+            ProjectionExpr::new(col("col_a", &src_schema).unwrap(), "col_a".into()),
         ];
         let actual = proj_exec_stats(
             Arc::unwrap_or_clone(src_stats),
@@ -552,9 +551,9 @@ mod tests {
 
         /* Test: works for projection_exec */
         let exprs = [
-            (col("col_a", &src_schema).unwrap(), "col_a".into()),
-            (Arc::new(NoOp::new()), "I am an alias".into()),
-            (
+            ProjectionExpr::new(col("col_a", &src_schema).unwrap(), "col_a".into()),
+            ProjectionExpr::new(Arc::new(NoOp::new()), "I am an alias".into()),
+            ProjectionExpr::new(
                 Arc::new(NoOp::new()),
                 "I am an alias for possible idx bounds-failure".into(),
             ),
@@ -725,8 +724,8 @@ mod tests {
 
         /* Test: works for projection_exec */
         let exprs = [
-            (Arc::new(Column::new("col_a", 0)) as _, "col_a_idx0".into()),
-            (Arc::new(Column::new("col_a", 1)) as _, "col_a_idx1".into()),
+            ProjectionExpr::new(Arc::new(Column::new("col_a", 0)) as _, "col_a_idx0".into()),
+            ProjectionExpr::new(Arc::new(Column::new("col_a", 1)) as _, "col_a_idx1".into()),
         ];
         let actual = proj_exec_stats(
             Arc::unwrap_or_clone(src_stats),
@@ -798,8 +797,8 @@ mod tests {
 
         /* Test: works for projection_exec */
         let exprs = [
-            (Arc::new(Column::new("col_a", 1)) as _, "col_a_idx1".into()),
-            (Arc::new(Column::new("col_a", 0)) as _, "col_a_idx0".into()),
+            ProjectionExpr::new(Arc::new(Column::new("col_a", 1)) as _, "col_a_idx1".into()),
+            ProjectionExpr::new(Arc::new(Column::new("col_a", 0)) as _, "col_a_idx0".into()),
         ];
         let actual = proj_exec_stats(
             Arc::unwrap_or_clone(src_stats),
@@ -826,8 +825,8 @@ mod tests {
 
         /* Test: if use columns col_a and col_b, you should get back their stats: */
         let exprs = [
-            (col("col_a", &src_schema).unwrap(), "col_a".to_string()),
-            (col("col_b", &src_schema).unwrap(), "col_b".to_string()),
+            ProjectionExpr::new(col("col_a", &src_schema).unwrap(), "col_a".to_string()),
+            ProjectionExpr::new(col("col_b", &src_schema).unwrap(), "col_b".to_string()),
         ];
         let actual = proj_exec_stats(
             Arc::unwrap_or_clone(Arc::clone(&src_stats)),
@@ -842,8 +841,8 @@ mod tests {
 
         /* Test: if use constants, then should get back constant stats: */
         let exprs = [
-            (lit(10_000), "col_a".to_string()),
-            (lit(1_000_000), "col_b".to_string()),
+            ProjectionExpr::new(lit(10_000), "col_a".to_string()),
+            ProjectionExpr::new(lit(1_000_000), "col_b".to_string()),
         ];
         let actual = proj_exec_stats(
             Arc::unwrap_or_clone(Arc::clone(&src_stats)),
@@ -897,8 +896,8 @@ mod tests {
 
         /* Test: if use NULL as a constant, then should get back constant stats: */
         let exprs = [
-            (lit(ScalarValue::Null), "col_a".to_string()),
-            (lit(ScalarValue::Null), "col_b".to_string()),
+            ProjectionExpr::new(lit(ScalarValue::Null), "col_a".to_string()),
+            ProjectionExpr::new(lit(ScalarValue::Null), "col_b".to_string()),
         ];
         let actual =
             proj_exec_stats(Arc::unwrap_or_clone(src_stats), exprs.iter(), &src_schema).unwrap();

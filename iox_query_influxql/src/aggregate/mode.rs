@@ -23,7 +23,7 @@ use datafusion::{
 };
 use itertools::Itertools;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ModeUDF {
     signature: Signature,
 }

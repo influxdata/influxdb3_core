@@ -221,7 +221,7 @@ pub fn selector_max() -> AggregateUDF {
         .clone()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SelectorType {
     First,
     Last,
@@ -230,7 +230,7 @@ enum SelectorType {
 }
 
 /// DataFusion user defined Aggregate Function (UDAF) for Selector functions
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct SelectorUDAFImpl {
     name: String,
     selector_type: SelectorType,

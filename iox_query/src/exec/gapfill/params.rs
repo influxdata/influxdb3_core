@@ -7,6 +7,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::Duration;
+use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::{
     common::exec_err,
@@ -55,6 +56,7 @@ impl GapFillParams {
         time_expr: &Arc<dyn PhysicalExpr>,
         fill_expr: &[PhysicalFillExpr],
         time_range: &Range<Bound<Arc<dyn PhysicalExpr>>>,
+        config_options: Arc<ConfigOptions>,
     ) -> Result<Self> {
         let Some(time_func) = time_expr.as_any().downcast_ref::<ScalarFunctionExpr>() else {
             return Err(DataFusionError::Internal(format!(
@@ -129,6 +131,7 @@ impl GapFillParams {
                     arg_fields: arg_fields(&args),
                     number_rows: 1,
                     return_field: Arc::clone(&return_field),
+                    config_options: Arc::clone(&config_options),
                 })?)
             })
             .transpose()?;
@@ -139,6 +142,7 @@ impl GapFillParams {
                 arg_fields: arg_fields(&args),
                 number_rows: 1,
                 return_field: Arc::clone(&return_field),
+                config_options,
             })?)?;
 
         let gap_expander: Arc<dyn GapExpander + Send + Sync> =
@@ -381,6 +385,7 @@ mod tests {
 
     #[test]
     fn test_params_no_start() {
+        let config_options = Arc::new(ConfigOptions::new());
         let time_range = Range {
             start: Bound::Unbounded,
             end: Bound::Excluded(timestamp(20_000_000_000)),
@@ -395,6 +400,7 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 false,
             )),
+            Arc::clone(&config_options),
         ));
 
         let fill_expr = vec![PhysicalFillExpr {
@@ -402,8 +408,14 @@ mod tests {
             strategy: FillStrategy::Default(ScalarValue::Null),
         }];
 
-        let params =
-            GapFillParams::try_new(schema().into(), &time_expr, &fill_expr, &time_range).unwrap();
+        let params = GapFillParams::try_new(
+            schema().into(),
+            &time_expr,
+            &fill_expr,
+            &time_range,
+            config_options,
+        )
+        .unwrap();
         assert_eq!(
             params.gap_expander.to_string(),
             "DateBinGapExpander [stride=PT1S]"
@@ -443,7 +455,14 @@ mod tests {
         let fill_expr = &gapfill_node.fill_expr;
         let time_range = &gapfill_node.time_range;
         let schema = schema();
-        GapFillParams::try_new(schema.into(), time_expr, fill_expr, time_range)
+        let config_options = Arc::clone(context.inner().state().config_options());
+        GapFillParams::try_new(
+            schema.into(),
+            time_expr,
+            fill_expr,
+            time_range,
+            config_options,
+        )
     }
 
     fn simple_fill_strategy() -> HashMap<usize, FillStrategy> {

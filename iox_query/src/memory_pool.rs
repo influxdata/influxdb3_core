@@ -453,8 +453,8 @@ mod tests {
             regex::Regex::new("#[0-9]+").unwrap().replace_all(result.unwrap_err().to_string().as_str(), ""),
             @r"
         Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as:
-          central_reservation_2(can spill: false) consumed 20.0 B,
-          central_reservation_1(can spill: false) consumed 15.0 B.
+          central_reservation_2(can spill: false) consumed 20.0 B, peak 25.0 B,
+          central_reservation_1(can spill: false) consumed 15.0 B, peak 15.0 B.
         Error: Failed to allocate additional 90.0 B for central_reservation_3 with 0.0 B already allocated for this reservation - 65.0 B remain available for the total pool
         "
         );

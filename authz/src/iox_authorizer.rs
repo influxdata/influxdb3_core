@@ -355,7 +355,7 @@ mod test {
             async fn create() -> Self {
                 let listener = TcpListener::bind("localhost:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
-                let incoming = TcpIncoming::from_listener(listener, false, None).unwrap();
+                let incoming = TcpIncoming::from(listener).with_nodelay(Some(false));
 
                 // start countdown mocking startup delay of sidecar
                 let authz = DelayedAuthorizer::default();

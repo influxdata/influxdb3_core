@@ -48,8 +48,6 @@ third-party = [
     { name = "rustls-pemfile" },
     { name = "rustls-native-certs" },
     { name = "webpki-roots" },
-    { name = "aws-lc-rs" },
-    { name = "aws-lc-sys" },
     { name = "ring" },
 ]
 

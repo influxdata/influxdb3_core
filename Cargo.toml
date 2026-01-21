@@ -24,6 +24,7 @@ members = [
     "iox_query_influxql",
     "iox_query_influxql_rewrite",
     "iox_query_params",
+    "iox_query_udf",
     "iox_system_tables",
     "iox_time",
     "iox_v1_query_api",
@@ -84,15 +85,15 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # If you want to use a local checkout of arrow, see the commented-out "Patching Arrow" section below
-arrow = { version = "55", features = ["prettyprint", "chrono-tz"] }
-arrow-buffer = { version = "55" }
-arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
-arrow-ipc = { version = "55" }
-arrow-schema = { version = "55" }
+arrow = { version = "56.2.0", features = ["prettyprint", "chrono-tz"] }
+arrow-buffer = { version = "56.2.0" }
+arrow-flight = { version = "56.2.0", features = ["flight-sql-experimental"] }
+arrow-ipc = { version = "56.2.0" }
+arrow-schema = { version = "56.2.0" }
 bincode = { version = "2", default-features = false, features = ["alloc", "derive"] }
-# Use DataFusion fork (see below)
-datafusion = { version = "49" }
-datafusion-proto = { version = "49" }
+comfy-table = { version = "7.1.0" }
+datafusion = { version = "50.3.0" }
+datafusion-proto = { version = "50.3.0" }
 hashbrown = { version = "0.14.5" }
 http = { version = "1" }
 http-body = { version = "1" }
@@ -100,9 +101,9 @@ http-body-util = { version = "0.1" }
 hyper = { version = "1" }
 hyper-util = { version = "0.1" }
 object_store = { version = "0.12.4", features = ["aws", "azure", "gcp"] }
-parquet = { version = "55", features = ["object_store"] }
-pbjson = { version = "0.8" }
-pbjson-build = { version = "0.8" }
+parquet = { version = "56.2.0", features = ["object_store"] }
+pbjson = { version = "0.9" }
+pbjson-build = { version = "0.9" }
 pbjson-types = { version = "0.7" }
 proptest = { version = "1", default-features = false, features = ["std"] }
 prost = { version = "0.13" }
@@ -112,6 +113,10 @@ reqwest = { version = "0.12", default-features = false }
 rstest = { version = "0.26" }
 # NOTE(tjh): explicitly add sqlite feature as the `data_types` crate relies on it
 sqlx = { version = "0.8.6", features = ["sqlite"] }
+tonic = { version = "0.13" }
+tonic-build = { version = "0.13" }
+tonic-health = { version = "0.13" }
+tonic-reflection = { version = "0.13" }
 tower = { version = "0.5" }
 tracing = { version = "0.1", features = ["log", "max_level_trace"] }
 tracing-log = { version = "0.2" }
@@ -119,6 +124,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parki
 
 # unify features between workspace-hack members and packages that are excluded from this hack
 smallvec = { version = "1.15.1", features = ["union"] }
+
+datafusion-udf-wasm-host = { git = "https://github.com/influxdata/datafusion-udf-wasm.git", rev = "9b2243ad3305ca3e29af38e8cc9097cb853f1fce", default-features = false }
+datafusion-udf-wasm-query = { git = "https://github.com/influxdata/datafusion-udf-wasm.git", rev = "9b2243ad3305ca3e29af38e8cc9097cb853f1fce" }
 
 [workspace.lints.rust]
 missing_copy_implementations = "deny"
@@ -165,26 +173,24 @@ codegen-units = 16
 lto = false
 incremental = true
 
+[profile.dev.package]
 # Per insta docs: https://insta.rs/docs/quickstart/#optional-faster-runs
-[profile.dev.package.insta]
-opt-level = 3
+insta.opt-level = 3
+similar.opt-level = 3
 
-[profile.dev.package.similar]
-opt-level = 3
-
-# Patching Datafusion
 [patch.crates-io]
 # Use DataFusion fork
-# See https://github.com/influxdata/arrow-datafusion/pull/78 for contents
+# See https://github.com/influxdata/arrow-datafusion/pull/88 for contents
 #
 # NOTE: This is an incomplete list of datafusion dependencies, but enough to get all dependencies to use our forked
 #       version. Should you ever encounter a `datafusion-*` crate that is duplicated (i.e. `Cargo.lock` lists both the
 #       crates.io release and our fork), just add it to this list here.
-datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
-datafusion-common = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
-datafusion-expr = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
-datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
-datafusion-sql = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "ee81b1cc652bde6c131973d091b178836692112d" }
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5f35b8287ea793772c7d89d412908af84af0d901" }
+datafusion-common = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5f35b8287ea793772c7d89d412908af84af0d901" }
+datafusion-execution = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5f35b8287ea793772c7d89d412908af84af0d901" }
+datafusion-expr = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5f35b8287ea793772c7d89d412908af84af0d901" }
+datafusion-proto = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5f35b8287ea793772c7d89d412908af84af0d901" }
+datafusion-sql = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "5f35b8287ea793772c7d89d412908af84af0d901" }
 
 # Patching Arrow
 #

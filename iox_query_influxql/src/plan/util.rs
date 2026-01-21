@@ -228,3 +228,29 @@ where
     .expect("no way to return error during recursion");
     exprs
 }
+
+/// Collect all deeply nested `Expr::AggregateFunction`.
+/// They are returned in order of occurrence (depth
+/// first), with duplicates omitted. along with a count of
+/// the total number of aggregate functions found, with duplicates
+/// included.
+pub(crate) fn find_aggregate_exprs<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+) -> (Vec<Expr>, usize) {
+    let mut count = 0;
+    let mut aggr_exprs = Vec::new();
+    for expr in exprs {
+        expr.apply(|nested_expr| match nested_expr {
+            Expr::AggregateFunction(_) => {
+                count += 1;
+                if !aggr_exprs.contains(nested_expr) {
+                    aggr_exprs.push(nested_expr.clone());
+                }
+                Ok(TreeNodeRecursion::Jump)
+            }
+            _ => Ok(TreeNodeRecursion::Continue),
+        })
+        .expect("applied function cannot error");
+    }
+    (aggr_exprs, count)
+}

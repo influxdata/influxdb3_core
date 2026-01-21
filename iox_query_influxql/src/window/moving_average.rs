@@ -9,7 +9,7 @@ use datafusion::logical_expr::{
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct MovingAverageUDWF {
     signature: Signature,
 }

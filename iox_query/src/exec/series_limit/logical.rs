@@ -1024,7 +1024,7 @@ mod tests {
             assert_snapshot!(format!("{}", LogicalPlan::Extension(Extension{node: Arc::new(series_limit)})), @r"
             SeriesLimit: series=[a], order=[time ASC NULLS LAST], limit_expr=[b RESPECT NULLS (default: Int64(0))]
               Projection: Int64(1) AS a, Int64(2) AS b, Int64(3) AS time
-                EmptyRelation
+                EmptyRelation: rows=1
             ")
         }
 
@@ -1043,7 +1043,7 @@ mod tests {
             assert_snapshot!(format!("{}", LogicalPlan::Extension(Extension{node: Arc::new(series_limit)})), @r"
             SeriesLimit: series=[a], order=[time ASC NULLS LAST], limit_expr=[b RESPECT NULLS (default: Int64(0))]
               Projection: Int64(3) AS a, Int64(2) AS b, Int64(1) AS time
-                EmptyRelation
+                EmptyRelation: rows=1
             ")
         }
 
@@ -1130,7 +1130,7 @@ mod tests {
             assert_snapshot!(format!("{}", LogicalPlan::Extension(Extension{node: Arc::new(series_limit)})), @r"
             SeriesLimit: series=[a], order=[time ASC NULLS LAST, b DESC NULLS FIRST], limit_expr=[c RESPECT NULLS (default: Int64(0))]
               Projection: Int64(1) AS a, Int64(2) AS b, Int64(3) AS c, Int64(4) AS time
-                EmptyRelation
+                EmptyRelation: rows=1
             ")
         }
 
@@ -1211,7 +1211,7 @@ mod tests {
             assert_snapshot!(format!("{}", LogicalPlan::Extension(Extension{node: Arc::new(series_limit)})), @r"
             SeriesLimit: series=[a], order=[time ASC NULLS LAST, b DESC NULLS FIRST], limit_expr=[c RESPECT NULLS (default: Int64(0))]
               Projection: Int64(1) AS a, Int64(2) AS b, Int64(3) AS c, Int64(4) AS time
-                EmptyRelation
+                EmptyRelation: rows=1
             ")
         }
 
@@ -1245,7 +1245,7 @@ mod tests {
             assert_snapshot!(format!("{}", LogicalPlan::Extension(Extension{node: Arc::new(series_limit)})), @r"
             SeriesLimit: series=[a], order=[time ASC NULLS LAST, b DESC NULLS FIRST], limit_expr=[c RESPECT NULLS (default: Int64(0))]
               Projection: Int64(1) AS a, Int64(2) AS b, Int64(3) AS c, Int64(4) AS time
-                EmptyRelation
+                EmptyRelation: rows=1
             ")
         }
     }

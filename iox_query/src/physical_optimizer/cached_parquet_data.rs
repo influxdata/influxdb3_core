@@ -5,7 +5,7 @@ use bytes::Bytes;
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
-use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
@@ -299,7 +299,7 @@ impl ParquetFileReader {
         let file_size = self.meta.size;
         ParquetMetaDataReader::new()
             .with_prefetch_hint(prefetch)
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .load_and_finish(self, file_size)
             .await
     }

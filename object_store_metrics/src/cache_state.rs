@@ -36,10 +36,10 @@ where
     WasCached(CacheRequestResult<V>),
 
     /// Entry was already part of the cache but did not finish loading.
-    AlreadyLoading(BoxFuture<'static, CacheRequestResult<V>>, Option<D>),
+    AlreadyLoading(BoxFuture<'static, CacheRequestResult<V>>, D),
 
     /// A new entry was created.
-    NewEntry(BoxFuture<'static, CacheRequestResult<V>>, Option<D>),
+    NewEntry(BoxFuture<'static, CacheRequestResult<V>>, D),
 }
 
 impl<V, D> CacheState<V, D>
@@ -87,8 +87,8 @@ where
     pub fn early_access_data(&self) -> Option<&D> {
         match self {
             Self::WasCached(_) => None,
-            Self::AlreadyLoading(_, data) => data.as_ref(),
-            Self::NewEntry(_, data) => data.as_ref(),
+            Self::AlreadyLoading(_, data) => Some(data),
+            Self::NewEntry(_, data) => Some(data),
         }
     }
 }

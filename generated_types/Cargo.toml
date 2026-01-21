@@ -14,7 +14,7 @@ pbjson-types = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-tonic = { version = "0.12", features = ["gzip", "tls", "tls-roots", "zstd"] }
+tonic = { workspace = true, features = ["gzip", "tls-ring", "tls-native-roots", "zstd"] }
 tracing = { workspace = true }
 uuid = { version = "1" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
@@ -23,6 +23,5 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 bytes = "1.11"
 
 [build-dependencies] # In alphabetical order
-tonic-build = { version = "0.12" }
-prost-build = { workspace = true }
+tonic-build = { workspace = true }
 pbjson-build = { workspace = true }

@@ -10,7 +10,7 @@ use datafusion::physical_expr::expressions::format_state_name;
 use std::any::Any;
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct PercentileUDF {
     signature: Signature,
 }

@@ -93,7 +93,7 @@ use datafusion::{
 /// The name of the `coalesce_struct` UDF given to DataFusion.
 pub const COALESCE_STRUCT_UDF_NAME: &str = "coalesce_struct";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 /// See [module-level docs](self) for more documentation.
 struct CoalesceStructUDF {
     signature: Signature,

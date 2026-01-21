@@ -5,12 +5,12 @@ use crate::window::difference::window_difference;
 use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray};
 use arrow::datatypes::IntervalUnit::MonthDayNano;
 use arrow::datatypes::TimeUnit::Nanosecond;
-use arrow::datatypes::{DataType, Field, FieldRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Int64Type};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::{PartitionEvaluator, Signature, Volatility, WindowUDFImpl};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct ElapsedUDWF {
     signature: Signature,
 }
@@ -84,7 +84,7 @@ impl PartitionEvaluator for ElapsedPartitionEvaluator {
                 "failed to convert elapsed to requested unit",
             ))?;
 
-        Ok(Arc::new(PrimitiveArray::from_iter(
+        Ok(Arc::new(PrimitiveArray::<Int64Type>::from_iter(
             pr.into_iter()
                 .map(|x| x.unwrap_or(0).checked_div(unit).unwrap_or(0)),
         )))

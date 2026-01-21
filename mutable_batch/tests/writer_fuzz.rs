@@ -24,6 +24,7 @@ use data_types::{
 use hashbrown::HashSet;
 use mutable_batch::{MutableBatch, WritePayload, writer::Writer};
 use partition::PartitionWrite;
+use pretty_assertions::assert_eq;
 use rand::TryRngCore;
 use rand::prelude::*;
 use schema::Projection;
