@@ -10,7 +10,8 @@ use workspace_hack as _;
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 use influxdb_line_protocol::{FieldValue, ParsedLine, parse_lines};
 use mutable_batch::MutableBatch;
-use mutable_batch::writer::{ColumnInsertValidator, Writer};
+use mutable_batch::writer::Writer;
+use schema::builder::ColumnInsertValidator;
 use snafu::{ResultExt, Snafu};
 
 /// A limit on the number of errors to return from a partial LP write.
@@ -140,7 +141,10 @@ impl LinesConverter {
         Ok(line)
     }
 
-    fn add_line_to_batch(
+    /// Push the given line - the timestamp in this line should already be rebased through
+    /// [`Self::rebase_timestamp`]. Part of [`Self::write_lp`], but usable for when you have already
+    /// parsed your line.
+    pub fn add_line_to_batch(
         &mut self,
         line: ParsedLine<'_>,
         line_idx: usize,
@@ -386,15 +390,9 @@ where
         };
 
         match field_value {
-            FieldValue::I64(value) => {
-                writer.write_i64(field_key.as_str(), None, std::iter::once(*value))
-            }
-            FieldValue::U64(value) => {
-                writer.write_u64(field_key.as_str(), None, std::iter::once(*value))
-            }
-            FieldValue::F64(value) => {
-                writer.write_f64(field_key.as_str(), None, std::iter::once(*value))
-            }
+            FieldValue::I64(value) => writer.write_i64s_from_slice(field_key.as_str(), &[*value]),
+            FieldValue::U64(value) => writer.write_u64s_from_slice(field_key.as_str(), &[*value]),
+            FieldValue::F64(value) => writer.write_f64s_from_slice(field_key.as_str(), &[*value]),
             FieldValue::String(value) => {
                 writer.write_string(field_key.as_str(), None, std::iter::once(value.as_str()))
             }

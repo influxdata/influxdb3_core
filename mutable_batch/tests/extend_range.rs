@@ -21,7 +21,7 @@ fn test_extend_range() {
         .unwrap();
 
     writer
-        .write_f64("f64", Some(&[0b00001011]), vec![23., 23., 5.].into_iter())
+        .write_f64("f64", &[0b00001011], vec![23., 23., 5.].into_iter())
         .unwrap();
 
     writer
@@ -112,7 +112,10 @@ fn test_extend_range() {
         &[a.clone().try_into_arrow(Projection::All).unwrap()]
     );
 
-    let stats: BTreeMap<_, _> = a.columns().map(|(k, v)| (k.as_str(), v.stats())).collect();
+    let stats: BTreeMap<_, _> = a
+        .columns()
+        .map(|(_, k, v)| (k.as_str(), v.stats()))
+        .collect();
 
     assert_eq!(
         stats["bool"],

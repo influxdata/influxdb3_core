@@ -1,6 +1,5 @@
 use std::{ops::Range, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
@@ -19,16 +18,10 @@ use datafusion::{
 };
 use executor::spawn_io;
 use futures::{FutureExt, future::Shared, prelude::future::BoxFuture};
-use meta_data_cache::MetaIndexCache;
 use object_store::{DynObjectStore, Error as ObjectStoreError, ObjectMeta};
 use object_store_size_hinting::hint_size;
-use parquet_file::ParquetFilePath;
-use tracing::warn;
 
-use crate::{
-    config::{IoxCacheExt, IoxConfigExt},
-    provider::PartitionedFileExt,
-};
+use crate::{config::IoxConfigExt, provider::PartitionedFileExt};
 
 #[derive(Debug, Default)]
 pub struct CachedParquetData;
@@ -86,19 +79,10 @@ impl PhysicalOptimizerRule for CachedParquetData {
                 return Err(DataFusionError::Plan("lost PartitionFileExt".to_owned()));
             };
 
-            // Only querier has cache ext. The compactor does not have it.
-            // It is useful for querier to cache the file metadat cache for furture file pruning
-            // based on query predicates. The compactor reads file without predicates
-            // and hence won't benefit from caching the file metadata.
-            let iox_cache_ext = config.extensions.get::<IoxCacheExt>();
-            let meta_cache = iox_cache_ext.and_then(|e| e.meta_cache.clone());
-
             let parquet_source = parquet_source
                 .clone()
                 .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
                     Arc::clone(&ext.object_store),
-                    Arc::clone(&ext.table_schema),
-                    meta_cache,
                     config_ext.hint_known_object_size_to_object_store,
                 )));
             Ok(Transformed::yes(DataSourceExec::from_data_source(
@@ -127,23 +111,14 @@ impl PhysicalOptimizerRule for CachedParquetData {
 #[derive(Debug)]
 struct CachedParquetFileReaderFactory {
     object_store: Arc<DynObjectStore>,
-    table_schema: SchemaRef,
-    meta_cache: Option<Arc<MetaIndexCache>>,
     hint_size_to_object_store: bool,
 }
 
 impl CachedParquetFileReaderFactory {
     /// Create new factory based on the given object store.
-    pub(crate) fn new(
-        object_store: Arc<DynObjectStore>,
-        table_schema: SchemaRef,
-        meta_cache: Option<Arc<MetaIndexCache>>,
-        hint_size_to_object_store: bool,
-    ) -> Self {
+    pub(crate) fn new(object_store: Arc<DynObjectStore>, hint_size_to_object_store: bool) -> Self {
         Self {
             object_store,
-            table_schema,
-            meta_cache,
             hint_size_to_object_store,
         }
     }
@@ -187,89 +162,13 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             data,
         };
 
-        // no meta cache available when this is executed by the compactor
-        if let Some(ref meta_cache) = self.meta_cache {
-            Ok(Box::new(CachedParquetFileReader {
-                inner: file_reader,
-                table_schema: Arc::clone(&self.table_schema),
-                meta_cache: Arc::clone(meta_cache),
-            }))
-        } else {
-            Ok(Box::new(file_reader))
-        }
-    }
-}
-
-/// A [`AsyncFileReader`] that fetches file data only onces.
-///
-/// This does NOT support file parts / sub-ranges, we will always fetch the entire file!
-///
-/// This is an implementation detail of [`CachedParquetFileReaderFactory`]
-#[derive(Debug)]
-struct CachedParquetFileReader {
-    inner: ParquetFileReader,
-    table_schema: SchemaRef, // todo(nga): may want to replace this with tableCache
-    meta_cache: Arc<MetaIndexCache>,
-}
-
-impl AsyncFileReader for CachedParquetFileReader {
-    #[inline]
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
-        self.inner.get_bytes(range)
-    }
-
-    #[inline]
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
-        self.inner.get_byte_ranges(ranges)
-    }
-
-    fn get_metadata<'a>(
-        &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>, ParquetError>> {
-        Box::pin(async move {
-            if let Some(file_uuid) = ParquetFilePath::uuid_from_path(&self.inner.meta.location) {
-                let file_reader = self.inner.clone_with_no_metrics();
-                let file_metas = self
-                    .meta_cache
-                    .add_metadata_for_file(
-                        &file_uuid,
-                        Arc::clone(&self.table_schema),
-                        file_reader,
-                        options,
-                    )
-                    .await
-                    // unfortunately there doesn't seem to be a way to downcast the Arc<DynError> into the
-                    // `ParquetError` that DataFusion accepts, so just wrap it as an external error
-                    .map_err(|e| ParquetError::External(Box::new(e)))?;
-                if file_metas.col_metas.is_none() {
-                    warn!(
-                        "Failed to collect statistics for file: {:?}",
-                        self.inner.meta.location
-                    );
-                }
-                Ok(Arc::clone(&file_metas.parquet_metadata))
-            } else {
-                warn!(
-                    "Unable to cache parquet metadata: Failed to find UUID from path: {:?}",
-                    self.inner.meta.location
-                );
-                // no available UUID, try to fetch metadata without caching
-                // NOTE(adam): does this make sense? maybe should throw an error instead?
-                self.inner.get_metadata(options).await
-            }
-        })
+        Ok(Box::new(file_reader))
     }
 }
 
 /// A [`AsyncFileReader`] that fetches file data each time it is invoked (no cache).
 ///
 /// This does NOT support file parts / sub-ranges, we will always fetch the entire file!
-///
-/// This is used as the inner implementation of [`CachedParquetFileReader`]
 #[derive(Debug)]
 struct ParquetFileReader {
     meta: Arc<ObjectMeta>,

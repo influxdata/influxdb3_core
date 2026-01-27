@@ -18,22 +18,14 @@ pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
 pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawMutex, T>;
 pub type MappedMutexGuard<'a, T> = lock_api::MappedMutexGuard<'a, RawMutex, T>;
 
-#[derive(Debug)]
-pub struct LockMetrics {
-    exclusive_count: U64Counter,
-    shared_count: U64Counter,
-    upgradeable_count: U64Counter,
-    upgrade_count: U64Counter,
-    exclusive_wait: DurationCounter,
-    shared_wait: DurationCounter,
-    upgradeable_wait: DurationCounter,
-    upgrade_wait: DurationCounter,
+#[derive(Debug, Default)]
+struct LockMetricsSection {
+    count: U64Counter,
+    wait: DurationCounter,
 }
 
-impl LockMetrics {
-    pub fn new(registry: &metric::Registry, attributes: impl Into<Attributes>) -> Self {
-        let mut attributes = attributes.into();
-
+impl LockMetricsSection {
+    fn new(registry: &metric::Registry, attributes: &Attributes, access: &'static str) -> Self {
         let count: Metric<U64Counter> = registry.register_metric(
             "catalog_lock",
             "number of times the tracked locks have been obtained",
@@ -44,44 +36,42 @@ impl LockMetrics {
             "time spent waiting to acquire any of the tracked locks",
         );
 
-        attributes.insert("access", "exclusive");
-        let exclusive_count = count.recorder(attributes.clone());
-        let exclusive_wait = wait.recorder(attributes.clone());
-
-        attributes.insert("access", "shared");
-        let shared_count = count.recorder(attributes.clone());
-        let shared_wait = wait.recorder(attributes.clone());
-
-        attributes.insert("access", "upgradeable");
-        let upgradeable_count = count.recorder(attributes.clone());
-        let upgradeable_wait = wait.recorder(attributes.clone());
-
-        attributes.insert("access", "upgrade");
-        let upgrade_count = count.recorder(attributes.clone());
-        let upgrade_wait = wait.recorder(attributes);
+        let mut attributes = attributes.clone();
+        attributes.insert("access", access);
 
         Self {
-            exclusive_count,
-            shared_count,
-            upgradeable_count,
-            upgrade_count,
-            exclusive_wait,
-            shared_wait,
-            upgradeable_wait,
-            upgrade_wait,
+            count: count.recorder(attributes.clone()),
+            wait: wait.recorder(attributes.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LockMetrics {
+    exclusive: LockMetricsSection,
+    shared: LockMetricsSection,
+    upgradeable: LockMetricsSection,
+    upgrade: LockMetricsSection,
+}
+
+impl LockMetrics {
+    pub fn new(registry: &metric::Registry, attributes: impl Into<Attributes>) -> Self {
+        let attributes = attributes.into();
+
+        Self {
+            exclusive: LockMetricsSection::new(registry, &attributes, "exclusive"),
+            shared: LockMetricsSection::new(registry, &attributes, "shared"),
+            upgradeable: LockMetricsSection::new(registry, &attributes, "upgradeable"),
+            upgrade: LockMetricsSection::new(registry, &attributes, "upgrade"),
         }
     }
 
     pub fn new_unregistered() -> Self {
         Self {
-            exclusive_count: Default::default(),
-            shared_count: Default::default(),
-            upgradeable_count: Default::default(),
-            upgrade_count: Default::default(),
-            exclusive_wait: Default::default(),
-            shared_wait: Default::default(),
-            upgradeable_wait: Default::default(),
-            upgrade_wait: Default::default(),
+            exclusive: Default::default(),
+            shared: Default::default(),
+            upgradeable: Default::default(),
+            upgrade: Default::default(),
         }
     }
 
@@ -170,8 +160,8 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
                 let now = std::time::Instant::now();
                 self.inner.lock_shared();
                 let elapsed = now.elapsed();
-                shared.shared_count.inc(1);
-                shared.shared_wait.inc(elapsed);
+                shared.shared.count.inc(1);
+                shared.shared.wait.inc(elapsed);
             }
             None => self.inner.lock_shared(),
         }
@@ -183,7 +173,7 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
         if let Some(shared) = &self.metrics
             && ret
         {
-            shared.shared_count.inc(1);
+            shared.shared.count.inc(1);
         }
         ret
     }
@@ -210,8 +200,8 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
                 let now = std::time::Instant::now();
                 self.inner.lock_exclusive();
                 let elapsed = now.elapsed();
-                shared.exclusive_count.inc(1);
-                shared.exclusive_wait.inc(elapsed);
+                shared.exclusive.count.inc(1);
+                shared.exclusive.wait.inc(elapsed);
             }
             None => self.inner.lock_exclusive(),
         }
@@ -223,7 +213,7 @@ unsafe impl<R: lock_api::RawRwLock + Sized> lock_api::RawRwLock for Instrumented
         if let Some(shared) = &self.metrics
             && ret
         {
-            shared.exclusive_count.inc(1);
+            shared.exclusive.count.inc(1);
         }
         ret
     }
@@ -267,8 +257,8 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
                 let now = std::time::Instant::now();
                 self.inner.lock_upgradable();
                 let elapsed = now.elapsed();
-                shared.upgradeable_count.inc(1);
-                shared.upgradeable_wait.inc(elapsed);
+                shared.upgradeable.count.inc(1);
+                shared.upgradeable.wait.inc(elapsed);
             }
             None => self.inner.lock_upgradable(),
         }
@@ -279,7 +269,7 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
         if let Some(shared) = &self.metrics
             && ret
         {
-            shared.upgradeable_count.inc(1);
+            shared.upgradeable.count.inc(1);
         }
         ret
     }
@@ -299,8 +289,8 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
                 let now = std::time::Instant::now();
                 unsafe { self.inner.upgrade() };
                 let elapsed = now.elapsed();
-                shared.upgrade_count.inc(1);
-                shared.upgrade_wait.inc(elapsed);
+                shared.upgrade.count.inc(1);
+                shared.upgrade.wait.inc(elapsed);
             }
             None => unsafe { self.inner.upgrade() },
         }
@@ -311,7 +301,7 @@ unsafe impl<R: lock_api::RawRwLockUpgrade + Sized> lock_api::RawRwLockUpgrade
         if let Some(shared) = &self.metrics
             && ret
         {
-            shared.upgrade_count.inc(1);
+            shared.upgrade.count.inc(1);
         }
         ret
     }
@@ -345,8 +335,8 @@ unsafe impl<R: lock_api::RawMutex + Sized> lock_api::RawMutex for InstrumentedRa
                 let now = std::time::Instant::now();
                 self.inner.lock();
                 let elapsed = now.elapsed();
-                shared.exclusive_count.inc(1);
-                shared.exclusive_wait.inc(elapsed);
+                shared.exclusive.count.inc(1);
+                shared.exclusive.wait.inc(elapsed);
             }
             None => self.inner.lock(),
         }
@@ -357,7 +347,7 @@ unsafe impl<R: lock_api::RawMutex + Sized> lock_api::RawMutex for InstrumentedRa
         if let Some(shared) = &self.metrics
             && ret
         {
-            shared.exclusive_count.inc(1);
+            shared.exclusive.count.inc(1);
         }
         ret
     }
@@ -386,8 +376,8 @@ mod tests {
         let r = lock.read();
         drop(r);
 
-        assert_eq!(metrics.exclusive_count.fetch(), 1);
-        assert_eq!(metrics.shared_count.fetch(), 2);
+        assert_eq!(metrics.exclusive.count.fetch(), 1);
+        assert_eq!(metrics.shared.count.fetch(), 2);
     }
 
     #[test]
@@ -401,8 +391,8 @@ mod tests {
         let g = mutex.lock();
         drop(g);
 
-        assert_eq!(metrics.exclusive_count.fetch(), 2);
-        assert_eq!(metrics.shared_count.fetch(), 0);
+        assert_eq!(metrics.exclusive.count.fetch(), 2);
+        assert_eq!(metrics.shared.count.fetch(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -422,11 +412,11 @@ mod tests {
 
         join.await.unwrap();
 
-        assert_eq!(metrics.exclusive_count.fetch(), 1);
-        assert_eq!(metrics.shared_count.fetch(), 1);
-        assert!(metrics.exclusive_wait.fetch() < Duration::from_micros(100));
-        assert!(metrics.shared_wait.fetch() > Duration::from_millis(80));
-        assert!(metrics.shared_wait.fetch() < Duration::from_millis(200));
+        assert_eq!(metrics.exclusive.count.fetch(), 1);
+        assert_eq!(metrics.shared.count.fetch(), 1);
+        assert!(metrics.exclusive.wait.fetch() < Duration::from_micros(100));
+        assert!(metrics.shared.wait.fetch() > Duration::from_millis(80));
+        assert!(metrics.shared.wait.fetch() < Duration::from_millis(200));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -445,11 +435,11 @@ mod tests {
 
         join.await.unwrap();
 
-        assert_eq!(metrics.exclusive_count.fetch(), 1);
-        assert_eq!(metrics.shared_count.fetch(), 1);
-        assert!(metrics.shared_wait.fetch() < Duration::from_micros(100));
-        assert!(metrics.exclusive_wait.fetch() > Duration::from_millis(80));
-        assert!(metrics.exclusive_wait.fetch() < Duration::from_millis(200));
+        assert_eq!(metrics.exclusive.count.fetch(), 1);
+        assert_eq!(metrics.shared.count.fetch(), 1);
+        assert!(metrics.shared.wait.fetch() < Duration::from_micros(100));
+        assert!(metrics.exclusive.wait.fetch() > Duration::from_millis(80));
+        assert!(metrics.exclusive.wait.fetch() < Duration::from_millis(200));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -468,11 +458,11 @@ mod tests {
 
         join.await.unwrap();
 
-        assert_eq!(metrics.exclusive_count.fetch(), 2);
-        assert_eq!(metrics.shared_count.fetch(), 0);
-        assert_eq!(metrics.shared_wait.fetch(), Duration::ZERO);
-        assert!(metrics.exclusive_wait.fetch() > Duration::from_millis(80));
-        assert!(metrics.exclusive_wait.fetch() < Duration::from_millis(200));
+        assert_eq!(metrics.exclusive.count.fetch(), 2);
+        assert_eq!(metrics.shared.count.fetch(), 0);
+        assert_eq!(metrics.shared.wait.fetch(), Duration::ZERO);
+        assert!(metrics.exclusive.wait.fetch() > Duration::from_millis(80));
+        assert!(metrics.exclusive.wait.fetch() < Duration::from_millis(200));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -496,11 +486,11 @@ mod tests {
 
         join.await.unwrap();
 
-        assert_eq!(metrics.exclusive_count.fetch(), 2);
-        assert_eq!(metrics.shared_count.fetch(), 2);
-        assert!(metrics.shared_wait.fetch() < Duration::from_micros(100));
-        assert!(metrics.exclusive_wait.fetch() > Duration::from_millis(80));
-        assert!(metrics.exclusive_wait.fetch() < Duration::from_millis(200));
+        assert_eq!(metrics.exclusive.count.fetch(), 2);
+        assert_eq!(metrics.shared.count.fetch(), 2);
+        assert!(metrics.shared.wait.fetch() < Duration::from_micros(100));
+        assert!(metrics.exclusive.wait.fetch() > Duration::from_millis(80));
+        assert!(metrics.exclusive.wait.fetch() < Duration::from_millis(200));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -519,16 +509,16 @@ mod tests {
 
         join.await.unwrap();
 
-        assert_eq!(metrics.exclusive_count.fetch(), 1);
-        assert_eq!(metrics.shared_count.fetch(), 0);
-        assert_eq!(metrics.upgradeable_count.fetch(), 1);
-        assert_eq!(metrics.upgrade_count.fetch(), 0);
+        assert_eq!(metrics.exclusive.count.fetch(), 1);
+        assert_eq!(metrics.shared.count.fetch(), 0);
+        assert_eq!(metrics.upgradeable.count.fetch(), 1);
+        assert_eq!(metrics.upgrade.count.fetch(), 0);
 
-        assert_eq!(metrics.upgrade_wait.fetch(), Duration::from_nanos(0));
-        assert_eq!(metrics.shared_wait.fetch(), Duration::from_nanos(0));
-        assert!(metrics.upgradeable_wait.fetch() < Duration::from_micros(100));
-        assert!(metrics.exclusive_wait.fetch() > Duration::from_millis(80));
-        assert!(metrics.exclusive_wait.fetch() < Duration::from_millis(200));
+        assert_eq!(metrics.upgrade.wait.fetch(), Duration::from_nanos(0));
+        assert_eq!(metrics.shared.wait.fetch(), Duration::from_nanos(0));
+        assert!(metrics.upgradeable.wait.fetch() < Duration::from_micros(100));
+        assert!(metrics.exclusive.wait.fetch() > Duration::from_millis(80));
+        assert!(metrics.exclusive.wait.fetch() < Duration::from_millis(200));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -548,15 +538,15 @@ mod tests {
 
         join.await.unwrap();
 
-        assert_eq!(metrics.exclusive_count.fetch(), 0);
-        assert_eq!(metrics.shared_count.fetch(), 1);
-        assert_eq!(metrics.upgradeable_count.fetch(), 1);
-        assert_eq!(metrics.upgrade_count.fetch(), 1);
+        assert_eq!(metrics.exclusive.count.fetch(), 0);
+        assert_eq!(metrics.shared.count.fetch(), 1);
+        assert_eq!(metrics.upgradeable.count.fetch(), 1);
+        assert_eq!(metrics.upgrade.count.fetch(), 1);
 
-        assert_eq!(metrics.exclusive_wait.fetch(), Duration::from_nanos(0));
-        assert!(metrics.shared_wait.fetch() < Duration::from_micros(100));
-        assert!(metrics.upgradeable_wait.fetch() < Duration::from_micros(100));
-        assert!(metrics.upgrade_wait.fetch() > Duration::from_millis(80));
-        assert!(metrics.upgrade_wait.fetch() < Duration::from_millis(200));
+        assert_eq!(metrics.exclusive.wait.fetch(), Duration::from_nanos(0));
+        assert!(metrics.shared.wait.fetch() < Duration::from_micros(100));
+        assert!(metrics.upgradeable.wait.fetch() < Duration::from_micros(100));
+        assert!(metrics.upgrade.wait.fetch() > Duration::from_millis(80));
+        assert!(metrics.upgrade.wait.fetch() < Duration::from_millis(200));
     }
 }

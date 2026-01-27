@@ -33,7 +33,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 serde_urlencoded = "0.7.0"
 schema = { path = "../schema" }
-thiserror = "2.0.16"
+thiserror = "2.0.18"
 trace = { path = "../trace" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

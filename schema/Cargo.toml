@@ -13,7 +13,7 @@ workspace = true
 arrow = { workspace = true }
 base64 = { version = "0.22", optional = true }
 hashbrown = { workspace = true }
-indexmap = { version = "2.12", features = ["std"] }
+indexmap = { version = "2.13", features = ["std"] }
 tracing = { workspace = true }
 snafu = "0.8"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

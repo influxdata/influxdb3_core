@@ -30,7 +30,6 @@ pub struct PartitionedFileExt {
     pub chunk: Arc<dyn QueryChunk>,
     pub output_sort_key_memo: Option<SortKey>,
     pub object_store: Arc<DynObjectStore>,
-    pub table_schema: SchemaRef,
 }
 
 /// Holds a list of chunks that all have the same "URL" and
@@ -282,7 +281,6 @@ pub fn chunks_to_physical_nodes(
                         chunk,
                         output_sort_key_memo: output_sort_key.cloned(),
                         object_store: Arc::clone(&object_store),
-                        table_schema: Arc::clone(&schema_without_chunk_order),
                     })),
                     statistics: Some(Arc::new(chunk_stats)),
                     metadata_size_hint: None,

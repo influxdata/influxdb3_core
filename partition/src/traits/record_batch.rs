@@ -14,12 +14,6 @@ impl PartitioningColumn for Arc<dyn Array> {
         Array::is_valid(&self, idx)
     }
 
-    fn valid_bytes(&self) -> &[u8] {
-        self.nulls()
-            .expect("this RecordBatch's Array should be nullable")
-            .validity()
-    }
-
     fn get_tag_identity_key(&self, idx: usize) -> Option<&Self::TagIdentityKey> {
         debug_assert!(PartitioningColumn::is_valid(self, idx));
         match self.data_type() {

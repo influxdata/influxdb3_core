@@ -76,6 +76,7 @@ pub struct TableSnapshot {
     iceberg_enabled: bool,
     generation: u64,
     deleted_at: Option<Timestamp>,
+    created_at: Option<Timestamp>,
 }
 
 impl TableSnapshot {
@@ -113,6 +114,7 @@ impl TableSnapshot {
             iceberg_enabled: table.iceberg_enabled,
             generation,
             deleted_at: table.deleted_at,
+            created_at: table.created_at,
         })
     }
 
@@ -128,6 +130,7 @@ impl TableSnapshot {
             partition_template: proto.partition_template,
             iceberg_enabled: proto.iceberg_enabled,
             deleted_at: proto.deleted_at.map(Timestamp::new),
+            created_at: proto.created_at.map(Timestamp::new),
         }
     }
 
@@ -147,6 +150,7 @@ impl TableSnapshot {
             partition_template: template,
             iceberg_enabled: self.iceberg_enabled,
             deleted_at: self.deleted_at,
+            created_at: self.created_at,
         })
     }
 
@@ -258,6 +262,7 @@ impl From<TableSnapshot> for proto::Table {
             table_name: value.table_name,
             iceberg_enabled: value.iceberg_enabled,
             deleted_at: value.deleted_at.map(|t| t.get()),
+            created_at: value.created_at.map(|t| t.get()),
         }
     }
 }

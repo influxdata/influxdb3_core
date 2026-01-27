@@ -426,6 +426,7 @@ mod tests {
     use object_store_mem_cache::MemCacheObjectStoreParams;
 
     use object_store_mock::{MockCall::GetOpts, MockStore, get_result_stream, path};
+    use object_store_size_hinting::hint_size;
     use rust_decimal::{Decimal, prelude::FromPrimitive};
     use test_helpers::tracing::TracingCapture;
     use tokio::sync::Barrier;
@@ -436,23 +437,23 @@ mod tests {
         let id2 = Path::from("bar");
         let id3 = Path::from("baz");
 
+        let data = b"be8bytes";
+
         if put {
             // create 3 objects
-            store
-                .put(&id1, PutPayload::from_static(b"be8bytes"))
-                .await?;
+            store.put(&id1, PutPayload::from_static(data)).await?;
             store.copy(&id1, &id2).await?;
             store.copy(&id1, &id3).await?;
         }
 
         // get all 3
-        store.get(&id1).await?;
-        store.get(&id2).await?;
-        store.get(&id3).await?;
+        store.get_opts(&id1, hint_size(data.len() as _)).await?;
+        store.get_opts(&id2, hint_size(data.len() as _)).await?;
+        store.get_opts(&id3, hint_size(data.len() as _)).await?;
 
         // repeat get 2
-        store.get(&id2).await?;
-        store.get(&id3).await?;
+        store.get_opts(&id2, hint_size(data.len() as _)).await?;
+        store.get_opts(&id3, hint_size(data.len() as _)).await?;
 
         Ok(())
     }
@@ -868,80 +869,6 @@ mod tests {
         Ok(())
     }
 
-    // HEAD requests are GET requests
-    #[tokio::test]
-    async fn test_cache_metrics_head_requests() -> Result<()> {
-        let capture = capture();
-        let max_number_of_unique_objects = NonZeroUsize::new(100).unwrap();
-        let false_positive_rate = NonZeroUsize::new(10).unwrap();
-
-        // build inner store & add object
-        let metrics = Arc::new(metric::Registry::default());
-        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let id = Path::from("foo");
-        inner.put(&id, PutPayload::from_static(b"be8bytes")).await?;
-
-        // create cache
-        let cache_store = wrap_in_cache(inner, &metrics);
-        let store = ObjectStoreCacheMetrics::new(
-            cache_store,
-            &metrics,
-            "with_cache".into(),
-            Some(FilterArgs {
-                max_number_of_unique_objects,
-                false_positive_rate,
-            }),
-        );
-
-        // test: fetch HEAD twice
-        store.head(&id).await?;
-        store.head(&id).await?;
-        assert_u64histogram_hits(
-            &metrics,
-            CACHE_METRIC_BYTES,
-            [("store", "with_cache"), ("state", "hit")],
-            1,
-        );
-        assert_u64histogram_hits(
-            &metrics,
-            CACHE_METRIC_BYTES,
-            [
-                ("store", "with_cache"),
-                ("state", "miss"),
-                ("thrashed", "no"),
-            ],
-            1,
-        );
-        assert_u64histogram_hits(
-            &metrics,
-            CACHE_METRIC_BYTES,
-            [
-                ("store", "with_cache"),
-                ("state", "miss"),
-                ("thrashed", "yes"),
-            ],
-            0,
-        );
-
-        insta::assert_yaml_snapshot!(
-            capture.lines_as_maps(),
-            @r#"
-        - level: DEBUG
-          location: foo
-          message: object store cache
-          state: "\"MISS\""
-          store_type: "\"with_cache\""
-          thrashed: false
-        - level: DEBUG
-          location: foo
-          message: object store cache
-          state: "\"HIT\""
-          store_type: "\"with_cache\""
-        "#);
-
-        Ok(())
-    }
-
     fn into_decimal_with_precision(maybe_f: Option<f64>, precision: u32) -> Option<Decimal> {
         maybe_f.and_then(|f| Decimal::from_f64(f).map(|dec| dec.round_dp(precision)))
     }
@@ -1062,7 +989,7 @@ mod tests {
 
         let location = path();
 
-        let mut get_opts = GetOptions::default();
+        let mut get_opts = hint_size(object_store_mock::DATA.len() as _);
         let (tx, _rx) = object_store_mem_cache::buffer_channel::channel();
         get_opts.extensions.insert(tx);
 
@@ -1089,10 +1016,10 @@ mod tests {
             }),
         );
 
-        let mut f1 = store.get(&location);
+        let mut f1 = store.get_opts(&location, hint_size(object_store_mock::DATA.len() as _));
         f1.assert_pending().await;
 
-        let mut f2 = store.get(&location);
+        let mut f2 = store.get_opts(&location, hint_size(object_store_mock::DATA.len() as _));
         f2.assert_pending().await;
 
         let (res1, _) = tokio::join!(f1, barrier.wait());

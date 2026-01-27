@@ -417,6 +417,9 @@ pub struct Namespace {
     /// catalog) to the [`NamespaceConfig`] to enable deterministic
     /// last-writer-wins behaviour.
     pub router_version: NamespaceVersion,
+    /// The time at which this namespace was created, or `None` if this namespace was created before
+    /// this field existed.
+    pub created_at: Option<Timestamp>,
 }
 
 /// Data object for a namespace with storage information
@@ -719,6 +722,9 @@ pub struct Table {
     pub iceberg_enabled: bool,
     /// When this table was marked for deletion
     pub deleted_at: Option<Timestamp>,
+    /// The time at which this table was created, or `None` if this table was created before
+    /// this field existed.
+    pub created_at: Option<Timestamp>,
 }
 
 /// Serialise a [`Table`] object into its protobuf representation.
@@ -1125,6 +1131,7 @@ pub struct ParquetFile {
     /// Set of columns within this parquet file.
     ///
     /// # Relation to Table-wide Column Set
+    ///
     /// Columns within this set may or may not be part of the table-wide schema.
     ///
     /// Columns that are NOT part of the table-wide schema must be ignored. While there is no way
@@ -1132,11 +1139,15 @@ pub struct ParquetFile {
     /// be ways to delete columns in the future.
     ///
     /// # Column Types
+    ///
     /// Column types are identical to the table-wide types.
     ///
     /// # Column Order & Sort Key
+    ///
     /// The columns that are present in the table-wide schema are sorted according to the partition
-    /// sort key. The occur in the parquet file according to this order.
+    /// sort key. This ordering does _not_ preserve the table-wide schema ordering; the `ColumnSet`
+    /// orders columns by their `ColumnId` and the columns occur in the parquet file according to
+    /// this order. See [`ColumnSet`] for more details.
     pub column_set: ColumnSet,
     /// the max of created_at of all L0 files needed for file/chunk ordering for deduplication
     pub max_l0_created_at: Timestamp,
@@ -1855,30 +1866,44 @@ impl<T> StatValues<T> {
         T: Borrow<U>,
         U: ToOwned<Owned = T> + PartialOrd + IsNan + ?Sized,
     {
-        self.total_count += 1;
+        self.add_one_value();
         self.distinct_count = None;
 
         if !other.is_nan() {
-            match &self.min {
-                None => self.min = Some(other.to_owned()),
+            let updated_min = match &self.min {
+                None => {
+                    self.min = Some(other.to_owned());
+                    false
+                }
                 Some(s) => {
-                    if s.borrow() > other {
+                    let update = s.borrow() > other;
+                    if update {
                         self.min = Some(other.to_owned());
                     }
+                    update
                 }
-            }
+            };
 
             match &self.max {
                 None => {
                     self.max = Some(other.to_owned());
                 }
                 Some(s) => {
-                    if other > s.borrow() {
+                    if !updated_min && other > s.borrow() {
                         self.max = Some(other.to_owned());
                     }
                 }
             }
         }
+    }
+
+    /// Add one to the count for these stats. Useful for optimizations where you would normally call
+    /// [`Self::update`], but you know that you've already done so with an equivalent value, so
+    /// calling that function would result in a lot of extra work doing comparisons to try to find a
+    /// new min/max value
+    #[inline(always)]
+    pub fn add_one_value(&mut self) {
+        self.total_count += 1;
     }
 }
 

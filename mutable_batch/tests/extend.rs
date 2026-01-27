@@ -119,7 +119,10 @@ fn test_extend() {
         &[a.clone().try_into_arrow(Projection::All).unwrap()]
     );
 
-    let stats: BTreeMap<_, _> = a.columns().map(|(k, v)| (k.as_str(), v.stats())).collect();
+    let stats: BTreeMap<_, _> = a
+        .columns()
+        .map(|(_, k, v)| (k.as_str(), v.stats()))
+        .collect();
 
     assert_eq!(
         stats["tag1"],

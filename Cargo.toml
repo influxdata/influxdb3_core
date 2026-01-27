@@ -31,7 +31,6 @@ members = [
     "jemalloc_stats",
     "linear_buffer",
     "logfmt",
-    "meta_data_cache",
     "metric",
     "metric_exporters",
     "mutable_batch",

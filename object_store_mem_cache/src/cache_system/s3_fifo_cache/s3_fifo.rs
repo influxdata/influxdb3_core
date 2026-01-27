@@ -205,7 +205,10 @@ where
 {
     /// Create new, empty set.
     pub fn new(config: S3Config<K>, metric_registry: &metric::Registry) -> Self {
-        let lock_metrics = Arc::new(LockMetrics::new(metric_registry, &[("lock", "s3fifo")]));
+        let lock_metrics = Arc::new(LockMetrics::new(
+            metric_registry,
+            &[("lock", "s3fifo"), ("cache", config.cache_name)],
+        ));
         Self {
             locked_state: lock_metrics.new_mutex(LockedState {
                 main: Default::default(),
@@ -262,7 +265,10 @@ where
         }
 
         // Create the S3Fifo instance
-        let lock_metrics = Arc::new(LockMetrics::new(metric_registry, &[("lock", "s3fifo")]));
+        let lock_metrics = Arc::new(LockMetrics::new(
+            metric_registry,
+            &[("lock", "s3fifo"), ("cache", config.cache_name)],
+        ));
         Ok(Self {
             locked_state: lock_metrics.new_mutex(locked_state),
             entries,
@@ -535,6 +541,7 @@ pub struct S3Config<K>
 where
     K: ?Sized,
 {
+    pub cache_name: &'static str,
     pub max_memory_size: usize,
     pub max_ghost_memory_size: usize,
 
@@ -1001,6 +1008,7 @@ mod tests {
     {
         Arc::new(S3Fifo::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 10,
                 max_ghost_memory_size: 10_000,
                 hook: Arc::new(NoOpHook::default()),

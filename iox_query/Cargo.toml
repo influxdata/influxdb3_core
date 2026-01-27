@@ -39,7 +39,6 @@ iox_query_udf = { path = "../iox_query_udf" }
 iox_time = { path = "../iox_time" }
 influxdb_iox_client = { path = "../influxdb_iox_client" }
 jemalloc_stats = { path = "../jemalloc_stats" }
-meta_data_cache = { path = "../meta_data_cache" }
 metric = { path = "../metric" }
 object_store = { workspace = true }
 object_store_size_hinting = { path = "../object_store_size_hinting" }

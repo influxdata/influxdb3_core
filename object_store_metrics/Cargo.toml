@@ -27,6 +27,7 @@ futures_test_utils = { path = "../futures_test_utils" }
 insta = { version = "1", features = ["yaml"] }
 object_store_mem_cache = { path = "../object_store_mem_cache" }
 object_store_mock = { version = "0.1", path = "../object_store_mock" }
+object_store_size_hinting = { path = "../object_store_size_hinting" }
 rust_decimal = "1.40.0"
 tempfile = "3.24.0"
 test_helpers = { path = "../test_helpers" }

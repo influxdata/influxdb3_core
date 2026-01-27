@@ -249,13 +249,7 @@ where
     /// If data is loading, the early access data (`D`) is included in the [`CacheState`].
     ///
     /// The early access data (`D`) may be used by metrics, logging, or other purposes.
-    fn get_or_fetch(
-        &self,
-        k: &K,
-        f: CacheFn<V>,
-        d: D,
-        size_hint: Option<usize>,
-    ) -> CacheState<V, D>;
+    fn get_or_fetch(&self, k: &K, f: CacheFn<V>, d: D, size_hint: usize) -> CacheState<V, D>;
 
     /// Get the cached value and return `None` if was not cached.
     ///

@@ -224,6 +224,59 @@ impl SchemaBuilder {
     }
 }
 
+#[expect(missing_docs)]
+#[derive(Debug, Snafu)]
+pub enum InvalidInsertionError {
+    #[snafu(display(
+        "Existing table schema specifies column {column} is type {table_type}, but type {given} was given"
+    ))]
+    TableSchemaConflict {
+        column: String,
+        table_type: InfluxColumnType,
+        given: InfluxColumnType,
+    },
+}
+
+/// A type capable of checking the validity of a column insertion into a Batch using information
+/// external to the writer.
+pub trait ColumnInsertValidator {
+    /// Validates whether a new column with `col_name` and `col_type` can be added to the writer's
+    /// Batch
+    fn validate_insertion(
+        &self,
+        col_name: &str,
+        col_type: InfluxColumnType,
+    ) -> std::result::Result<(), InvalidInsertionError>;
+}
+
+impl<T> ColumnInsertValidator for &T
+where
+    T: ColumnInsertValidator,
+{
+    fn validate_insertion(
+        &self,
+        col_name: &str,
+        col_type: InfluxColumnType,
+    ) -> std::result::Result<(), InvalidInsertionError> {
+        T::validate_insertion(self, col_name, col_type)
+    }
+}
+
+/// A no-op [`ColumnInsertValidator`] implementation that always allows an
+/// insert to proceed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopColumnInsertValidator;
+
+impl ColumnInsertValidator for NoopColumnInsertValidator {
+    fn validate_insertion(
+        &self,
+        _col_name: &str,
+        _col_type: InfluxColumnType,
+    ) -> Result<(), InvalidInsertionError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use InfluxColumnType::*;

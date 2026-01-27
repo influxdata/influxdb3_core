@@ -110,6 +110,7 @@ fn run_bench(
     let max_memory_size = ((key_size * n_keys) as f64 * size_fraction).ceil() as usize;
     let store = Arc::new(S3Fifo::<Path, Arc<Bytes>>::new(
         S3Config {
+            cache_name: "bench",
             max_memory_size,
             max_ghost_memory_size: 10_000_000,
             hook: Arc::new(NoOpHook::default()),

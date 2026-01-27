@@ -3,14 +3,17 @@
 use crate::{
     MutableBatch,
     column::{Column, ColumnData, NULL_DID},
-    noop_validator::NoopValidator,
 };
-use arrow_util::bitset::{BitSet, iter_set_positions, iter_set_positions_with_offset};
+use arrow::util::bit_iterator::{BitIndexIterator, BitSliceIterator};
+use arrow_util::bitset::BitSet;
 use data_types::{IsNan, StatValues, Statistics};
-use hashbrown::hash_map::RawEntryMut;
-use schema::{InfluxColumnType, InfluxFieldType};
+use hashbrown::hash_map::EntryRef;
+use schema::{
+    InfluxColumnType, InfluxFieldType,
+    builder::{ColumnInsertValidator, InvalidInsertionError, NoopColumnInsertValidator},
+};
 use snafu::{ResultExt, Snafu};
-use std::{num::NonZeroU64, ops::Range};
+use std::{fmt::Debug, iter::repeat_n, num::NonZeroU64, ops::Range};
 
 #[expect(missing_docs)]
 #[derive(Debug, Snafu)]
@@ -34,59 +37,6 @@ pub enum Error {
 
 /// A specialized `Error` for [`Writer`] errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[expect(missing_docs)]
-#[derive(Debug, Snafu)]
-pub enum InvalidInsertionError {
-    #[snafu(display(
-        "Existing table schema specifies column {column} is type {table_type}, but type {given} was given"
-    ))]
-    TableSchemaConflict {
-        column: String,
-        table_type: InfluxColumnType,
-        given: InfluxColumnType,
-    },
-}
-
-/// A type capable of checking the validity of a column insertion into a
-/// [`MutableBatch`] using information external to the writer.
-pub trait ColumnInsertValidator {
-    /// Validates whether a new column with `col_name` and `col_type` can be
-    /// added to the writer's [`MutableBatch`]
-    fn validate_insertion(
-        &self,
-        col_name: &str,
-        col_type: InfluxColumnType,
-    ) -> std::result::Result<(), InvalidInsertionError>;
-}
-
-impl<T> ColumnInsertValidator for &T
-where
-    T: ColumnInsertValidator,
-{
-    fn validate_insertion(
-        &self,
-        col_name: &str,
-        col_type: InfluxColumnType,
-    ) -> std::result::Result<(), InvalidInsertionError> {
-        T::validate_insertion(self, col_name, col_type)
-    }
-}
-
-/// A no-op [`ColumnInsertValidator`] implementation that always allows an
-/// insert to proceed.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopColumnInsertValidator;
-
-impl ColumnInsertValidator for NoopColumnInsertValidator {
-    fn validate_insertion(
-        &self,
-        _col_name: &str,
-        _col_type: schema::InfluxColumnType,
-    ) -> Result<(), InvalidInsertionError> {
-        Ok(())
-    }
-}
 
 /// [`Writer`] provides a panic-safe abstraction to append a number of rows to a [`MutableBatch`]
 ///
@@ -113,12 +63,69 @@ pub struct Writer<'a, T> {
     /// If this Writer committed successfully
     success: bool,
 }
-impl<'a> Writer<'a, NoopValidator> {
+impl<'a> Writer<'a, NoopColumnInsertValidator> {
     /// Create a [`Writer`] for inserting `to_insert` rows to the provided `batch`
     ///
     /// If the writer is dropped without calling commit all changes will be rolled back
     pub fn new(batch: &'a mut MutableBatch, to_insert: usize) -> Self {
         Self::new_with_column_validator(batch, to_insert, Default::default())
+    }
+}
+
+trait ContainedInVecInColumn: Sized {
+    const INFLUX_COL_TY: InfluxColumnType;
+    fn extract(data: &mut ColumnData) -> Option<&mut Vec<Self>>;
+    fn statvalues_to_statistics(vals: StatValues<Self>) -> Statistics;
+}
+
+impl ContainedInVecInColumn for i64 {
+    const INFLUX_COL_TY: InfluxColumnType = InfluxColumnType::Field(InfluxFieldType::Integer);
+
+    #[inline]
+    fn extract(data: &mut ColumnData) -> Option<&mut Vec<Self>> {
+        match data {
+            ColumnData::I64(v, _) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn statvalues_to_statistics(vals: StatValues<Self>) -> Statistics {
+        Statistics::I64(vals)
+    }
+}
+
+impl ContainedInVecInColumn for u64 {
+    const INFLUX_COL_TY: InfluxColumnType = InfluxColumnType::Field(InfluxFieldType::UInteger);
+
+    #[inline]
+    fn extract(data: &mut ColumnData) -> Option<&mut Vec<Self>> {
+        match data {
+            ColumnData::U64(v, _) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn statvalues_to_statistics(vals: StatValues<Self>) -> Statistics {
+        Statistics::U64(vals)
+    }
+}
+
+impl ContainedInVecInColumn for f64 {
+    const INFLUX_COL_TY: InfluxColumnType = InfluxColumnType::Field(InfluxFieldType::Float);
+
+    #[inline]
+    fn extract(data: &mut ColumnData) -> Option<&mut Vec<Self>> {
+        match data {
+            ColumnData::F64(v, _) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn statvalues_to_statistics(vals: StatValues<Self>) -> Statistics {
+        Statistics::F64(vals)
     }
 }
 
@@ -149,6 +156,147 @@ where
         }
     }
 
+    fn write_from_slice_with_mask<V>(
+        &mut self,
+        name: &str,
+        mut values: &[V],
+        valid_mask: &[u8],
+    ) -> Result<()>
+    where
+        V: Copy + IsNan + PartialOrd + Default + Debug + ContainedInVecInColumn,
+    {
+        let initial_rows = self.initial_rows;
+        let to_insert = self.to_insert;
+
+        // get the column that we want to write to
+        let (col_idx, col) = self.column_mut(name, V::INFLUX_COL_TY)?;
+
+        // prepare the statistics for this specific write
+        let mut stats = StatValues::new_empty();
+
+        // and get the vec that we're gonna write our data to. It must, at this point, have a length
+        // of exactly `self.initial_rows`.
+        let Some(col_data) = V::extract(&mut col.data) else {
+            panic!(
+                "Expected {} got {} for column {name}",
+                std::any::type_name::<V>(),
+                col.data
+            );
+        };
+
+        // Then reseve the extra space to be able to push the values that we're gonna push.
+        col_data.reserve(to_insert);
+
+        // `last_value` is necessary to push values to the end of `col_data` when we run out of
+        // values in `values`, since that is allowed per
+        // https://github.com/influxdata/influxdb-pb-data-protocol#optimization-2-trim-repeated-tail-values
+        let last_value = values.last().ok_or(Error::InsufficientValues)?;
+
+        let mut last_valid = 0;
+
+        // here we iterate over all the indices we're gonna push
+        for (start, end) in BitSliceIterator::new(valid_mask, 0, to_insert) {
+            let copy_len = end - start;
+
+            let (slice, copied_final_values) = if copy_len > values.len() {
+                (values, copy_len - values.len())
+            } else {
+                (&values[..copy_len], 0)
+            };
+
+            let num_nulls = start - last_valid;
+            if num_nulls > 0 {
+                col_data.extend(repeat_n(V::default(), num_nulls));
+            }
+
+            // so copy over the values
+            col_data.extend_from_slice(slice);
+
+            // update the stats
+            for value in slice
+                .iter()
+                .chain(repeat_n(last_value, copied_final_values))
+            {
+                stats.update(value);
+            }
+
+            // push the copied final values, if there are any
+            if copied_final_values > 0 {
+                col_data.extend(repeat_n(last_value, copied_final_values));
+            }
+
+            // and then update values to make it easier to slice next time
+            last_valid = end;
+
+            values = &values[copy_len.min(values.len())..]
+        }
+
+        // Fill the remainder with nulls, just in case there were no valid indices at all.
+        col_data.resize(initial_rows + to_insert, V::default());
+
+        append_valid_mask(col, Some(valid_mask), to_insert);
+
+        stats.update_for_nulls(to_insert as u64 - stats.total_count);
+        self.statistics
+            .push((col_idx, V::statvalues_to_statistics(stats)));
+
+        Ok(())
+    }
+
+    fn write_from_slice<V>(&mut self, name: &str, values: &[V]) -> Result<()>
+    where
+        V: Copy + IsNan + PartialOrd + ContainedInVecInColumn,
+    {
+        self.write_from_slice_with_col_ty(name, values, V::INFLUX_COL_TY)
+    }
+
+    fn write_from_slice_with_col_ty<V>(
+        &mut self,
+        name: &str,
+        values: &[V],
+        col_ty: InfluxColumnType,
+    ) -> Result<()>
+    where
+        V: Copy + IsNan + PartialOrd + ContainedInVecInColumn,
+    {
+        let initial_rows = self.initial_rows;
+        let to_insert = self.to_insert;
+
+        let (col_idx, col) = self.column_mut(name, col_ty)?;
+
+        let mut stats = StatValues::new_empty();
+        let Some(col_data) = V::extract(&mut col.data) else {
+            panic!(
+                "Expected {} got {} for column {name}",
+                std::any::type_name::<V>(),
+                col.data
+            );
+        };
+
+        debug_assert_eq!(col_data.len(), initial_rows);
+
+        let extra_times = to_insert.saturating_sub(values.len());
+        let last = values.last().ok_or(Error::InsufficientValues)?;
+
+        // Add each item given to stats
+        for t in values.iter().chain(repeat_n(last, extra_times)) {
+            stats.update(t);
+        }
+
+        // Get the available space that we need and push to it
+        col_data.reserve(to_insert);
+        col_data.extend_from_slice(values);
+        col_data.extend(repeat_n(*last, extra_times));
+
+        append_valid_mask(col, None, to_insert);
+
+        stats.update_for_nulls(to_insert as u64 - stats.total_count);
+        self.statistics
+            .push((col_idx, V::statvalues_to_statistics(stats)));
+
+        Ok(())
+    }
+
     /// Write the f64 typed column identified by `name`
     ///
     /// For each set bit in `valid_mask` an a value from `values` is inserted at the
@@ -158,12 +306,7 @@ where
     ///
     /// - panics if this column has already been written to by this `Writer`
     ///
-    pub fn write_f64<I>(
-        &mut self,
-        name: &str,
-        valid_mask: Option<&[u8]>,
-        mut values: I,
-    ) -> Result<()>
+    pub fn write_f64<I>(&mut self, name: &str, valid_mask: &[u8], mut values: I) -> Result<()>
     where
         I: Iterator<Item = f64>,
     {
@@ -186,12 +329,35 @@ where
             x => unreachable!("expected f64 got {} for column \"{}\"", x, name),
         }
 
-        append_valid_mask(col, valid_mask, to_insert);
+        append_valid_mask(col, Some(valid_mask), to_insert);
 
         stats.update_for_nulls(to_insert as u64 - stats.total_count);
         self.statistics.push((col_idx, Statistics::F64(stats)));
 
         Ok(())
+    }
+
+    /// ALMOST Functionally equivalent to calling [`Self::write_f64`] with an all-valid valid mask,
+    /// but more performant when your values already exist in a slice that can be memcpy'd over.
+    ///
+    /// Functionally different in that it will copy the last value of `values` multiple times to
+    /// fill in the remaining space if `values` doesn't contain at least `self.to_insert` values.
+    pub fn write_f64s_from_slice(&mut self, name: &str, values: &[f64]) -> Result<()> {
+        self.write_from_slice(name, values)
+    }
+
+    /// ALMOST Functionally equivalent to calling [`Self::write_f64`], but more performant when your
+    /// values already exist in a slice that can be memcpy'd over in segments.
+    ///
+    /// Functionally different in that it will copy the last value of `values` multiple times to
+    /// fill in the remaining space if `values` doesn't contain at least `self.to_insert` values.
+    pub fn write_f64s_from_slice_with_mask(
+        &mut self,
+        name: &str,
+        valid_mask: &[u8],
+        values: &[f64],
+    ) -> Result<()> {
+        self.write_from_slice_with_mask(name, values, valid_mask)
     }
 
     /// Write the i64 typed column identified by `name`
@@ -203,12 +369,7 @@ where
     ///
     /// - panics if this column has already been written to by this `Writer`
     ///
-    pub fn write_i64<I>(
-        &mut self,
-        name: &str,
-        valid_mask: Option<&[u8]>,
-        mut values: I,
-    ) -> Result<()>
+    pub fn write_i64<I>(&mut self, name: &str, valid_mask: &[u8], mut values: I) -> Result<()>
     where
         I: Iterator<Item = i64>,
     {
@@ -231,12 +392,35 @@ where
             x => unreachable!("expected i64 got {} for column \"{}\"", x, name),
         }
 
-        append_valid_mask(col, valid_mask, to_insert);
+        append_valid_mask(col, Some(valid_mask), to_insert);
 
         stats.update_for_nulls(to_insert as u64 - stats.total_count);
         self.statistics.push((col_idx, Statistics::I64(stats)));
 
         Ok(())
+    }
+
+    /// ALMOST Functionally equivalent to calling [`Self::write_i64`] with an all-valid valid mask,
+    /// but more performant when your values already exist in a slice that can be memcpy'd over.
+    ///
+    /// Functionally different in that it will copy the last value of `values` multiple times to
+    /// fill in the remaining space if `values` doesn't contain at least `self.to_insert` values.
+    pub fn write_i64s_from_slice(&mut self, name: &str, values: &[i64]) -> Result<()> {
+        self.write_from_slice(name, values)
+    }
+
+    /// ALMOST Functionally equivalent to calling [`Self::write_i64`], but more performant when your
+    /// values already exist in a slice that can be memcpy'd over in segments.
+    ///
+    /// Functionally different in that it will copy the last value of `values` multiple times to
+    /// fill in the remaining space if `values` doesn't contain at least `self.to_insert` values.
+    pub fn write_i64s_from_slice_with_mask(
+        &mut self,
+        name: &str,
+        valid_mask: &[u8],
+        values: &[i64],
+    ) -> Result<()> {
+        self.write_from_slice_with_mask(name, values, valid_mask)
     }
 
     /// Write the u64 typed column identified by `name`
@@ -248,12 +432,7 @@ where
     ///
     /// - panics if this column has already been written to by this `Writer`
     ///
-    pub fn write_u64<I>(
-        &mut self,
-        name: &str,
-        valid_mask: Option<&[u8]>,
-        mut values: I,
-    ) -> Result<()>
+    pub fn write_u64<I>(&mut self, name: &str, valid_mask: &[u8], mut values: I) -> Result<()>
     where
         I: Iterator<Item = u64>,
     {
@@ -276,12 +455,35 @@ where
             x => unreachable!("expected u64 got {} for column \"{}\"", x, name),
         }
 
-        append_valid_mask(col, valid_mask, to_insert);
+        append_valid_mask(col, Some(valid_mask), to_insert);
 
         stats.update_for_nulls(to_insert as u64 - stats.total_count);
         self.statistics.push((col_idx, Statistics::U64(stats)));
 
         Ok(())
+    }
+
+    /// ALMOST Functionally equivalent to calling [`Self::write_u64`] with an all-valid valid mask,
+    /// but more performant when your values already exist in a slice that can be memcpy'd over.
+    ///
+    /// Functionally different in that it will copy the last value of `values` multiple times to
+    /// fill in the remaining space if `values` doesn't contain at least `self.to_insert` values.
+    pub fn write_u64s_from_slice(&mut self, name: &str, values: &[u64]) -> Result<()> {
+        self.write_from_slice(name, values)
+    }
+
+    /// ALMOST Functionally equivalent to calling [`Self::write_u64`], but more performant when your
+    /// values already exist in a slice that can be memcpy'd over in segments.
+    ///
+    /// Functionally different in that it will copy the last value of `values` multiple times to
+    /// fill in the remaining space if `values` doesn't contain at least `self.to_insert` values.
+    pub fn write_u64s_from_slice_with_mask(
+        &mut self,
+        name: &str,
+        valid_mask: &[u8],
+        values: &[u64],
+    ) -> Result<()> {
+        self.write_from_slice_with_mask(name, values, valid_mask)
     }
 
     /// Write the boolean typed column identified by `name`
@@ -312,12 +514,26 @@ where
         match &mut col.data {
             ColumnData::Bool(col_data, _) => {
                 col_data.append_unset(to_insert);
-                for idx in set_position_iterator(valid_mask, to_insert) {
+                let mut push = |idx: usize| {
                     let value = values.next().ok_or(Error::InsufficientValues)?;
                     if value {
                         col_data.set(initial_rows + idx);
                     }
                     stats.update(&value);
+                    Ok::<_, Error>(())
+                };
+
+                match valid_mask {
+                    Some(mask) => {
+                        for idx in set_position_iterator(mask, to_insert) {
+                            push(idx)?;
+                        }
+                    }
+                    None => {
+                        for idx in 0..to_insert {
+                            push(idx)?;
+                        }
+                    }
                 }
             }
             x => unreachable!("expected bool got {} for column \"{}\"", x, name),
@@ -358,12 +574,27 @@ where
         let mut stats = StatValues::new_empty();
         match &mut col.data {
             ColumnData::String(col_data, _) => {
-                for idx in set_position_iterator(valid_mask, to_insert) {
+                let mut push = |idx: usize| {
                     let value = values.next().ok_or(Error::InsufficientValues)?;
                     col_data.extend(initial_rows + idx - col_data.len());
                     col_data.append(value);
                     stats.update(value);
+                    Ok::<(), Error>(())
+                };
+
+                match valid_mask {
+                    Some(mask) => {
+                        for idx in set_position_iterator(mask, to_insert) {
+                            push(idx)?;
+                        }
+                    }
+                    None => {
+                        for idx in 0..to_insert {
+                            push(idx)?;
+                        }
+                    }
                 }
+
                 col_data.extend(initial_rows + to_insert - col_data.len());
             }
             x => unreachable!("expected tag got {} for column \"{}\"", x, name),
@@ -405,10 +636,24 @@ where
             ColumnData::Tag(col_data, dict, _) => {
                 col_data.resize(initial_rows + to_insert, NULL_DID);
 
-                for idx in set_position_iterator(valid_mask, to_insert) {
+                let mut push = |idx: usize| {
                     let value = values.next().ok_or(Error::InsufficientValues)?;
                     col_data[initial_rows + idx] = dict.lookup_value_or_insert(value);
                     stats.update(value);
+                    Ok::<_, Error>(())
+                };
+
+                match valid_mask {
+                    Some(mask) => {
+                        for idx in set_position_iterator(mask, to_insert) {
+                            push(idx)?;
+                        }
+                    }
+                    None => {
+                        for idx in 0..to_insert {
+                            push(idx)?;
+                        }
+                    }
                 }
             }
             x => unreachable!("expected tag got {} for column \"{}\"", x, name),
@@ -440,7 +685,7 @@ where
     ) -> Result<()>
     where
         K: Iterator<Item = usize>,
-        V: Iterator<Item = &'s str>,
+        V: ExactSizeIterator<Item = &'s str>,
     {
         let initial_rows = self.initial_rows;
         let to_insert = self.to_insert;
@@ -453,22 +698,51 @@ where
                 // Lazily compute mappings to handle dictionaries with unused mappings
                 let mut mapping: Vec<_> = values.map(|value| (value, None)).collect();
 
+                // make space for all the values that we need to insert
                 col_data.resize(initial_rows + to_insert, NULL_DID);
 
-                for idx in set_position_iterator(valid_mask, to_insert) {
+                let mut push = |idx: usize| {
+                    // for each index, get the next key to insert...
                     let key = keys.next().ok_or(Error::InsufficientValues)?;
+
+                    // and then get the already-known value for this key and maybe its did
                     let (value, maybe_did) =
                         mapping.get_mut(key).ok_or(Error::KeyNotFound { key })?;
 
-                    match maybe_did {
-                        Some(did) => col_data[initial_rows + idx] = *did,
-                        None => {
-                            let did = dict.lookup_value_or_insert(value);
-                            *maybe_did = Some(did);
-                            col_data[initial_rows + idx] = did
+                    let was_already_known = maybe_did.is_some();
+
+                    // If we don't already have the did, then compute it and insert it. for next
+                    // time.
+                    let did = maybe_did.get_or_insert_with(|| dict.lookup_value_or_insert(value));
+
+                    col_data[initial_rows + idx] = *did;
+
+                    // we know that `update` does a bunch of comparisons to find mins and maxes, but
+                    // if we know that this string value was already seen, we know that the mins and
+                    // maxes won't change. so we can just short-circuit to count one more value
+                    // instead.
+                    if was_already_known {
+                        stats.add_one_value();
+                    } else {
+                        stats.update(*value);
+                    }
+
+                    Ok::<_, Error>(())
+                };
+
+                // then iterate over all the indices that are actually valid, using the given valid
+                // mask.
+                match valid_mask {
+                    Some(mask) => {
+                        for idx in set_position_iterator(mask, to_insert) {
+                            push(idx)?;
                         }
                     }
-                    stats.update(*value);
+                    None => {
+                        for idx in 0..to_insert {
+                            push(idx)?;
+                        }
+                    }
                 }
             }
             x => unreachable!("expected tag got {} for column \"{}\"", x, name),
@@ -519,6 +793,18 @@ where
         self.statistics.push((col_idx, Statistics::I64(stats)));
 
         Ok(())
+    }
+
+    /// Write the time typed column identified by `name`, with no nulls and copying directly from
+    /// the given slice while filling in the spots not covered by the slice with the last value of
+    /// the slice
+    ///
+    /// # Panic
+    ///
+    /// - panics if this column has already been written to by this `Writer`
+    ///
+    pub fn write_time_from_slice(&mut self, name: &str, times: &[i64]) -> Result<()> {
+        self.write_from_slice_with_col_ty(name, times, InfluxColumnType::Timestamp)
     }
 
     /// Write the provided MutableBatch
@@ -697,13 +983,13 @@ where
         // Fetch the index of the column with `name`, inserting a new column
         // into the writer's batch if none exists and the column insert
         // validator allows.
-        let column_idx = *match self.batch.column_names.raw_entry_mut().from_key(name) {
-            RawEntryMut::Occupied(ref v) => v.get(),
-            RawEntryMut::Vacant(v) => {
+        let column_idx = *match self.batch.column_names.entry_ref(name) {
+            EntryRef::Occupied(ref v) => v.get(),
+            EntryRef::Vacant(v) => {
                 self.column_insert_validator
                     .validate_insertion(name, influx_type)
                     .context(ColumnInsertionRejectedSnafu)?;
-                v.insert(name.to_string(), columns_len).1
+                v.insert(columns_len)
             }
         };
 
@@ -805,16 +1091,8 @@ where
     }
 }
 
-fn set_position_iterator(
-    valid_mask: Option<&[u8]>,
-    to_insert: usize,
-) -> impl Iterator<Item = usize> + '_ {
-    match valid_mask {
-        Some(mask) => itertools::Either::Left(
-            iter_set_positions(mask).take_while(move |idx| *idx < to_insert),
-        ),
-        None => itertools::Either::Right(0..to_insert),
-    }
+fn set_position_iterator(valid_mask: &[u8], to_insert: usize) -> BitIndexIterator<'_> {
+    BitIndexIterator::new(valid_mask, 0, to_insert)
 }
 
 fn append_valid_mask(column: &mut Column, valid_mask: Option<&[u8]>, to_insert: usize) {
@@ -831,12 +1109,11 @@ fn compute_bool_stats(
     stats: &mut StatValues<bool>,
 ) {
     // There are likely faster ways to do this
-    let indexes =
-        iter_set_positions_with_offset(valid, range.start).take_while(|idx| *idx < range.end);
+    let index_offsets = BitIndexIterator::new(valid, range.start, range.end - range.start);
 
     let mut non_null_count = 0_u64;
-    for index in indexes {
-        let value = col_data.get(index);
+    for offset in index_offsets {
+        let value = col_data.get(offset + range.start);
         stats.update(&value);
         non_null_count += 1;
     }
@@ -874,12 +1151,11 @@ fn compute_stats<'a, T, U, F>(
     F: Fn(usize) -> &'a U,
     T: std::borrow::Borrow<U>,
 {
-    let values = iter_set_positions_with_offset(valid, range.start)
-        .take_while(|idx| *idx < range.end)
-        .map(accessor);
+    let index_offsets = BitIndexIterator::new(valid, range.start, range.end - range.start);
 
     let mut non_null_count = 0_u64;
-    for value in values {
+    for offset in index_offsets {
+        let value = accessor(offset + range.start);
         stats.update(value);
         non_null_count += 1;
     }
@@ -922,7 +1198,16 @@ impl<T> Drop for Writer<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use core::iter::Copied;
+    use std::slice;
+
+    use arrow::{array::BooleanBufferBuilder, buffer::BooleanBuffer};
     use assert_matches::assert_matches;
+    use proptest::{
+        option,
+        prelude::{Arbitrary, Just, Strategy, any},
+        proptest,
+    };
 
     use super::*;
 
@@ -981,23 +1266,45 @@ mod tests {
             }
         );
         assert_matches!(
-            w.write_f64("foo", None, std::iter::once(4.2)),
+            w.write_f64("foo", &[1], std::iter::once(4.2)),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+
+        assert_matches!(
+            w.write_f64s_from_slice("foo", &[4.2]),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+
+        assert_matches!(
+            w.write_i64("bar", &[1], std::iter::once(-42)),
             Err(Error::ColumnInsertionRejected { source }) => {
                 assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
             }
         );
         assert_matches!(
-            w.write_i64("bar", None, std::iter::once(-42)),
+            w.write_i64s_from_slice("bar", &[-42]),
+            Err(Error::ColumnInsertionRejected { source }) => {
+                assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
+            }
+        );
+
+        assert_matches!(
+            w.write_u64("baz", &[1], std::iter::once(42)),
             Err(Error::ColumnInsertionRejected { source }) => {
                 assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
             }
         );
         assert_matches!(
-            w.write_u64("baz", None, std::iter::once(42)),
+            w.write_u64s_from_slice("baz", &[42]),
             Err(Error::ColumnInsertionRejected { source }) => {
                 assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
             }
         );
+
         assert_matches!(
             w.write_string("bananas", None, std::iter::once("great")),
             Err(Error::ColumnInsertionRejected { source }) => {
@@ -1010,5 +1317,238 @@ mod tests {
                 assert_matches!(source, InvalidInsertionError::TableSchemaConflict { column, .. } if column == COLUMN)
             }
         );
+    }
+
+    /// Iterator wrapper that repeats the last element forever, stolen from
+    /// `mutable_batch_pb::decode` for these tests
+    ///
+    /// This will just yield `None` if the wrapped iterator was empty.
+    struct RepeatLastElement<I>
+    where
+        I: Iterator,
+        I::Item: Clone,
+    {
+        next: Option<I::Item>,
+        inner: I,
+    }
+
+    impl<I> RepeatLastElement<I>
+    where
+        I: Iterator,
+        I::Item: Clone,
+    {
+        fn new(mut inner: I) -> Self {
+            let next = inner.next();
+
+            Self { inner, next }
+        }
+    }
+
+    impl<I> Iterator for RepeatLastElement<I>
+    where
+        I: Iterator,
+        I::Item: Clone,
+    {
+        type Item = I::Item;
+
+        #[inline]
+        fn next(&mut self) -> Option<Self::Item> {
+            match self.inner.next() {
+                None => self.next.clone(),
+                Some(n) => self.next.replace(n),
+            }
+        }
+    }
+
+    // generate a bunch of values (`Vec<A>`), an accompanying valid mask (`Vec<u8>`) and a count of
+    // how many items reside in that value vec and the valid mask combined (when you account for
+    // valid values and nulls)
+    //
+    // This function will never generate an empty value vector, and thus will also never generate a
+    // count that is less than 1 or a mask that is all null.
+    fn generate_values_and_mask<A: Arbitrary + Clone>()
+    -> impl Strategy<Value = (BooleanBuffer, Vec<A>)> {
+        (
+            any::<A>(),
+            proptest::collection::vec(option::of(any::<A>()), 1..80),
+        )
+            .prop_flat_map(|(guaranteed_val, vec)| (Just(guaranteed_val), 0..vec.len(), Just(vec)))
+            .prop_map(|(guaranteed_value, guaranteed_idx, mut maybe_null_vec)| {
+                maybe_null_vec.insert(guaranteed_idx, Some(guaranteed_value));
+
+                let mut mask = BooleanBufferBuilder::new(maybe_null_vec.len());
+
+                let values = maybe_null_vec
+                    .into_iter()
+                    .filter_map(|o| {
+                        match o {
+                            Some(_) => mask.append(true),
+                            None => mask.append(false),
+                        }
+
+                        o
+                    })
+                    .collect();
+
+                (mask.finish(), values)
+            })
+    }
+
+    const COL_NAME: &str = "the_column";
+
+    // A test to make sure some optimized versions of writing values to a `Writer` (which utilize
+    // some better slice copies and such instead of iterators) work exactly the same as the previous
+    // methods. (they should only be more performant, not differing in behavior).
+    fn test_writing_variations<T: Copy>(
+        to_insert: usize,
+        mask: &[u8],
+        values: &[T],
+        write_slice_with_mask_fn: impl Fn(
+            &mut Writer<'_, NoopColumnInsertValidator>,
+            &str,
+            &[u8],
+            &[T],
+        ) -> Result<()>,
+        write_iter_with_mask_fn: impl Fn(
+            &mut Writer<'_, NoopColumnInsertValidator>,
+            &str,
+            &[u8],
+            RepeatLastElement<Copied<slice::Iter<'_, T>>>,
+        ) -> Result<()>,
+        write_slice_fn: impl Fn(&mut Writer<'_, NoopColumnInsertValidator>, &str, &[T]) -> Result<()>,
+    ) {
+        // so first we want to check writing with a valid mask to the slice version and the iter
+        // version
+        let mut slice_mask_batch = MutableBatch::default();
+        let mut slice_mask_writer = Writer::new(&mut slice_mask_batch, to_insert);
+        write_slice_with_mask_fn(&mut slice_mask_writer, COL_NAME, mask, values).unwrap();
+
+        let mut iter_mask_batch = MutableBatch::default();
+        let mut iter_mask_writer = Writer::new(&mut iter_mask_batch, to_insert);
+        write_iter_with_mask_fn(
+            &mut iter_mask_writer,
+            COL_NAME,
+            mask,
+            RepeatLastElement::new(values.iter().copied()),
+        )
+        .unwrap();
+
+        drop(slice_mask_writer);
+        drop(iter_mask_writer);
+
+        // then compare the batches to make sure they act the same
+        assert_eq!(iter_mask_batch, slice_mask_batch);
+
+        // We want to write them all again to make sure it works correctly when there's values
+        // in the batch AND when there's not.
+        let mut slice_mask_writer = Writer::new(&mut slice_mask_batch, to_insert);
+        write_slice_with_mask_fn(&mut slice_mask_writer, COL_NAME, mask, values).unwrap();
+
+        let mut iter_mask_writer = Writer::new(&mut iter_mask_batch, to_insert);
+        write_iter_with_mask_fn(
+            &mut iter_mask_writer,
+            COL_NAME,
+            mask,
+            RepeatLastElement::new(values.iter().copied()),
+        )
+        .unwrap();
+
+        drop(slice_mask_writer);
+        drop(iter_mask_writer);
+
+        // and compare the batches again
+        assert_eq!(iter_mask_batch, slice_mask_batch);
+
+        // Ok and now to test that our fn to write without a mask works the same as if we wrote
+        // with an iterator and an all-valid mask
+
+        let mut all_valid_mask = BooleanBufferBuilder::new(values.len());
+        all_valid_mask.append_n(values.len(), true);
+        let all_valid_mask = all_valid_mask.finish();
+
+        // we're only gonna insert as many values exist in `values` here
+        let to_insert = values.len();
+
+        let mut slice_batch = MutableBatch::default();
+        let mut slice_writer = Writer::new(&mut slice_batch, to_insert);
+        write_slice_fn(&mut slice_writer, COL_NAME, values).unwrap();
+
+        let mut iter_batch = MutableBatch::default();
+        let mut iter_writer = Writer::new(&mut iter_batch, to_insert);
+        write_iter_with_mask_fn(
+            &mut iter_writer,
+            COL_NAME,
+            all_valid_mask.values(),
+            RepeatLastElement::new(values.iter().copied()),
+        )
+        .unwrap();
+
+        drop(slice_writer);
+        drop(iter_writer);
+
+        assert_eq!(iter_batch, slice_batch);
+
+        // We want to write them all again to make sure it works correctly when there's values
+        // in the batch AND when there's not.
+        let mut slice_writer = Writer::new(&mut slice_batch, to_insert);
+        write_slice_fn(&mut slice_writer, COL_NAME, values).unwrap();
+
+        let mut iter_writer = Writer::new(&mut iter_batch, to_insert);
+        write_iter_with_mask_fn(
+            &mut iter_writer,
+            COL_NAME,
+            all_valid_mask.values(),
+            RepeatLastElement::new(values.iter().copied()),
+        )
+        .unwrap();
+
+        drop(slice_writer);
+        drop(iter_writer);
+
+        assert_eq!(iter_batch, slice_batch);
+    }
+
+    proptest! {
+        #[test]
+        fn write_i64s_slice_works_same_as_iter(
+            (mask, values) in generate_values_and_mask::<i64>()
+        ) {
+            test_writing_variations(
+                mask.len(),
+                mask.values(),
+                &values,
+                |writer, name, mask, vals| writer.write_i64s_from_slice_with_mask(name, mask, vals),
+                |writer, name, mask, iter| writer.write_i64(name, mask, iter),
+                |writer, name, vals| writer.write_i64s_from_slice(name, vals)
+            );
+        }
+
+        #[test]
+        fn write_u64s_slice_works_same_as_iter(
+            (mask, values) in generate_values_and_mask::<u64>()
+        ) {
+            test_writing_variations(
+                mask.len(),
+                mask.values(),
+                &values,
+                |writer, name, mask, vals| writer.write_u64s_from_slice_with_mask(name, mask, vals),
+                |writer, name, mask, iter| writer.write_u64(name, mask, iter),
+                |writer, name, vals| writer.write_u64s_from_slice(name, vals)
+            );
+        }
+
+        #[test]
+        fn write_f64s_slice_works_same_as_iter(
+            (mask, values) in generate_values_and_mask::<f64>()
+        ) {
+            test_writing_variations(
+                mask.len(),
+                mask.values(),
+                &values,
+                |writer, name, mask, vals| writer.write_f64s_from_slice_with_mask(name, mask, vals),
+                |writer, name, mask, iter| writer.write_f64(name, mask, iter),
+                |writer, name, vals| writer.write_f64s_from_slice(name, vals)
+            );
+        }
     }
 }

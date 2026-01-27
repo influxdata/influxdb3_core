@@ -97,7 +97,7 @@ pub(crate) async fn test_happy_path(setup: TestSetup) {
             .boxed()
         }),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
@@ -140,7 +140,7 @@ pub(crate) async fn test_panic_loader(setup: TestSetup) {
             .boxed()
         }),
         (),
-        None,
+        1,
     );
     let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
@@ -179,7 +179,7 @@ pub(crate) async fn test_error_path_loader(setup: TestSetup) {
             .boxed()
         }),
         (),
-        None,
+        1,
     );
     let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
@@ -214,7 +214,7 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
         &k1,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let state = cache_state.kind();
     let fut = cache_state.await_inner();
@@ -242,7 +242,7 @@ pub(crate) async fn test_get_keeps_key_alive(setup: TestSetup) {
         &k1,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size))) }.boxed()),
         (),
-        Some(size_hint),
+        size_hint,
     );
     assert_eq!(cache_state.kind(), CacheStateKind::WasCached);
     assert_eq!(
@@ -281,7 +281,7 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
             .boxed()
         }),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let (mut fut_1, state_1) = extract_future_and_state(cache_state_1);
     fut_1.assert_pending().await;
@@ -292,7 +292,7 @@ pub(crate) async fn test_already_loading(setup: TestSetup) {
         &k1,
         Box::new(move || { async move { Ok(Arc::new(TestValue(test_size_2))) } }.boxed()),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let (mut fut_2, state_2) = extract_future_and_state(cache_state_2);
     fut_2.assert_pending().await;
@@ -335,7 +335,7 @@ pub(crate) async fn test_drop_while_load_blocked(setup: TestSetup) {
                 .boxed()
             }),
             (),
-            Some(size_hint),
+            size_hint,
         );
         let (mut fut, _state) = extract_future_and_state(cache_state);
         fut.assert_pending().await;
@@ -368,7 +368,7 @@ pub(crate) async fn test_perfect_waking_one_consumer(setup: TestSetup) {
             .boxed()
         }),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
@@ -420,7 +420,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
             .boxed()
         }),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let (mut fut_1, state_1) = extract_future_and_state(cache_state_1);
     fut_1.assert_pending().await;
@@ -430,7 +430,7 @@ pub(crate) async fn test_perfect_waking_two_consumers(setup: TestSetup) {
         &k1,
         Box::new(|| async move { unreachable!() }.boxed()),
         (),
-        None,
+        size_hint,
     );
     let (mut fut_2, state_2) = extract_future_and_state(cache_state_2);
     fut_2.assert_pending().await;
@@ -489,7 +489,7 @@ pub(crate) fn runtime_shutdown(setup: TestSetup) {
                 .boxed()
             }),
             (),
-            None,
+            1,
         )
     });
     let (mut fut, _state) = extract_future_and_state(cache_state);
@@ -538,7 +538,7 @@ pub(crate) async fn test_get_ok(setup: TestSetup) {
             .boxed()
         }),
         (),
-        Some(size_hint),
+        size_hint,
     );
     let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
@@ -616,7 +616,7 @@ pub(crate) async fn test_get_err(setup: TestSetup) {
             .boxed()
         }),
         (),
-        None,
+        1,
     );
     let (mut fut, state) = extract_future_and_state(cache_state);
     fut.assert_pending().await;
@@ -659,7 +659,7 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
         &k1,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size_1))) }.boxed()),
         (),
-        Some(size_hint),
+        size_hint,
     );
     assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
     assert_eq!(
@@ -672,7 +672,7 @@ pub(crate) async fn test_hook_gen(setup: TestSetup) {
         &k2,
         Box::new(move || async move { Ok(Arc::new(TestValue(test_size_2))) }.boxed()),
         (),
-        Some(size_hint),
+        size_hint,
     );
     assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
     assert_eq!(

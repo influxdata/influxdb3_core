@@ -25,7 +25,6 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use std::{collections::BTreeSet, ops::Range};
 
 pub mod column;
-mod noop_validator;
 pub mod payload;
 pub mod writer;
 
@@ -58,7 +57,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Represents a mutable batch of rows (a horizontal subset of a table) which
 /// can be appended to and converted into an Arrow `RecordBatch`
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct MutableBatch {
     /// Map of column name to index in `MutableBatch::columns`
     column_names: HashMap<String, usize>,
@@ -146,17 +145,17 @@ impl MutableBatch {
     }
 
     /// Returns an iterator over the columns in this batch in no particular order
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = (&String, &Column)> + '_ {
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = (usize, &String, &Column)> + '_ {
         self.column_names
             .iter()
-            .map(move |(name, idx)| (name, &self.columns[*idx]))
+            .map(move |(name, idx)| (*idx, name, &self.columns[*idx]))
     }
 
     /// Yield an iterator of column `(name, type)` tuples for all columns in
     /// this batch.
     pub fn iter_column_types(&self) -> impl ExactSizeIterator<Item = (&String, ColumnType)> + '_ {
         self.columns()
-            .map(|(name, col)| (name, ColumnType::from(col.influx_type())))
+            .map(|(_, name, col)| (name, ColumnType::from(col.influx_type())))
     }
 
     /// Return the set of column names for this table. Used in combination with a write operation's
@@ -279,6 +278,23 @@ impl MutableBatch {
     /// Return the approximate memory size of the data in the batch, in bytes.
     pub fn size_data(&self) -> usize {
         self.columns.iter().map(|c| c.size_data()).sum::<usize>()
+    }
+
+    /// Purely for testing. sort the columns deterministically, so that we can compare two created
+    /// through different methods.
+    pub fn sort_deterministically_for_testing(&mut self) {
+        let mut names_sorted = self.column_names.keys().collect::<Vec<_>>();
+        names_sorted.sort();
+
+        let mut new_names = HashMap::new();
+        let mut new_columns = Vec::with_capacity(self.columns.len());
+        for n in names_sorted {
+            new_names.insert(n.clone(), new_columns.len());
+            new_columns.push(self.columns[self.column_names[n]].clone());
+        }
+
+        self.column_names = new_names;
+        self.columns = new_columns;
     }
 }
 

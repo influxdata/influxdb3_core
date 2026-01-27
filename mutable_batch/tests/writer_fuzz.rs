@@ -320,7 +320,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
             expected.u64_expected.extend(array.iter().cloned());
             let mask = compute_mask(&array);
             writer
-                .write_u64("u1", Some(mask.bytes()), array.iter().filter_map(|x| *x))
+                .write_u64("u1", mask.bytes(), array.iter().filter_map(|x| *x))
                 .unwrap();
         }
         None => expected
@@ -333,7 +333,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
             expected.i64_expected.extend(array.iter().cloned());
             let mask = compute_mask(&array);
             writer
-                .write_i64("i1", Some(mask.bytes()), array.iter().filter_map(|x| *x))
+                .write_i64("i1", mask.bytes(), array.iter().filter_map(|x| *x))
                 .unwrap();
         }
         None => expected
@@ -346,7 +346,7 @@ fn extend_batch(rng: &mut StdRng, batch: &mut MutableBatch) -> Expected {
             expected.f64_expected.extend(array.iter().cloned());
             let mask = compute_mask(&array);
             writer
-                .write_f64("f1", Some(mask.bytes()), array.iter().filter_map(|x| *x))
+                .write_f64("f1", mask.bytes(), array.iter().filter_map(|x| *x))
                 .unwrap();
         }
         None => expected
@@ -411,7 +411,7 @@ fn test_writer_fuzz() {
 
     let actual_statistics: BTreeMap<String, Statistics> = batch
         .columns()
-        .map(|(name, col)| (name.clone(), col.stats()))
+        .map(|(_, name, col)| (name.clone(), col.stats()))
         .collect();
     let expected_statistics = expected.stats();
 

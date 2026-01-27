@@ -13,7 +13,7 @@ workspace = true
 http = { workspace = true }
 iox_http_util = { path = "../iox_http_util" }
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 tonic = { workspace = true, features = ["gzip", "tls-ring", "tls-native-roots", "zstd"] }
 tower = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
