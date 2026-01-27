@@ -103,7 +103,9 @@ pub(crate) fn classify_headers(
                 9 => ("failed precondition".into(), Classification::ClientErr),
                 10 => ("aborted".into(), Classification::ClientErr),
                 11 => ("out of range".into(), Classification::ClientErr),
-                12 => ("unimplemented".into(), Classification::ClientErr),
+                // Treated as PathNotFound to align with HTTP 404 Not Found so that the path is not
+                // included in the metrics to prevent metric cardinality explosion.
+                12 => ("unimplemented".into(), Classification::PathNotFound),
                 13 => ("internal".into(), Classification::ServerErr),
                 14 => ("unavailable".into(), Classification::ServerErr),
                 15 => ("data loss".into(), Classification::ServerErr),
