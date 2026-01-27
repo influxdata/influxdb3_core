@@ -18,7 +18,7 @@ num-integer = { version = "0.1", default-features = false, features = [
     "std",
 ] }
 num-traits = "0.2"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies] # In alphabetical order

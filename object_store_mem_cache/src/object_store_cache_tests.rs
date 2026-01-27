@@ -4,8 +4,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::Extensions;
 use object_store::{
-    DynObjectStore, Error, GetOptions, GetResult, GetResultPayload, ObjectMeta, PutPayload,
-    path::Path,
+    DynObjectStore, Error, GetResult, GetResultPayload, ObjectMeta, PutPayload, path::Path,
 };
 
 /// Abstract test setup.
@@ -60,49 +59,52 @@ where
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
 
-    let get_ops = GetOptions {
-        extensions: setup.extensions(),
-        ..Default::default()
-    };
+    let get_opts_in = hint_size(3);
+    let mut get_opts_out = get_opts_in.clone();
+    get_opts_out.extensions.extend(setup.extensions());
 
     Arc::clone(setup.inner())
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_a.clone(), get_ops.clone().into()),
+            params: (location_a.clone(), get_opts_out.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"foo", &location_a)),
         })
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_b.clone(), get_ops.clone().into()),
+            params: (location_b.clone(), get_opts_out.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"bar", &location_b)),
         });
 
     let etag_a1 = setup
         .outer()
-        .head(&location_a)
+        .get_opts(&location_a, get_opts_in.clone())
         .await
         .unwrap()
+        .meta
         .e_tag
         .unwrap();
     let etag_a2 = setup
         .outer()
-        .head(&location_a)
+        .get_opts(&location_a, get_opts_in.clone())
         .await
         .unwrap()
+        .meta
         .e_tag
         .unwrap();
     let etag_b1 = setup
         .outer()
-        .head(&location_b)
+        .get_opts(&location_b, get_opts_in.clone())
         .await
         .unwrap()
+        .meta
         .e_tag
         .unwrap();
     let etag_b2 = setup
         .outer()
-        .head(&location_b)
+        .get_opts(&location_b, get_opts_in.clone())
         .await
         .unwrap()
+        .meta
         .e_tag
         .unwrap();
     assert_eq!(etag_a1, etag_a2);
@@ -119,26 +121,25 @@ where
     let location_a = Path::parse("x").unwrap();
     let location_b = Path::parse("y").unwrap();
 
-    let get_ops = GetOptions {
-        extensions: setup.extensions(),
-        ..Default::default()
-    };
+    let get_opts_in = hint_size(3);
+    let mut get_opts_out = get_opts_in.clone();
+    get_opts_out.extensions.extend(setup.extensions());
 
     Arc::clone(setup.inner())
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_a.clone(), get_ops.clone().into()),
+            params: (location_a.clone(), get_opts_out.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"foo", &location_a)),
         })
         .mock_next(object_store_mock::MockCall::GetOpts {
-            params: (location_b.clone(), get_ops.clone().into()),
+            params: (location_b.clone(), get_opts_out.clone().into()),
             barriers: vec![],
             res: Ok(get_result(b"bar", &location_b)),
         });
 
     let data_a = setup
         .outer()
-        .get(&location_a)
+        .get_opts(&location_a, get_opts_in.clone())
         .await
         .unwrap()
         .bytes()
@@ -146,7 +147,7 @@ where
         .unwrap();
     let data_b = setup
         .outer()
-        .get(&location_b)
+        .get_opts(&location_b, get_opts_in.clone())
         .await
         .unwrap()
         .bytes()
@@ -164,13 +165,12 @@ where
 
     let location = Path::parse("x").unwrap();
 
-    let get_ops = GetOptions {
-        extensions: setup.extensions(),
-        ..Default::default()
-    };
+    let get_opts_in = hint_size(3);
+    let mut get_opts_out = get_opts_in.clone();
+    get_opts_out.extensions.extend(setup.extensions());
 
     Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
-        params: (location.clone(), get_ops.clone().into()),
+        params: (location.clone(), get_opts_out.clone().into()),
         barriers: vec![],
         res: Err(Error::NotFound {
             path: location.to_string(),
@@ -178,7 +178,11 @@ where
         }),
     });
 
-    let err = setup.outer().get(&location).await.unwrap_err();
+    let err = setup
+        .outer()
+        .get_opts(&location, get_opts_in)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, Error::NotFound { .. }),
         "error should be 'not found' but is: {err}"
@@ -193,17 +197,20 @@ where
 
     let location = Path::parse("x").unwrap();
 
-    let get_ops = GetOptions {
-        extensions: setup.extensions(),
-        ..Default::default()
-    };
+    let get_opts_in = hint_size(3);
+    let mut get_opts_out = get_opts_in.clone();
+    get_opts_out.extensions.extend(setup.extensions());
 
     Arc::clone(setup.inner()).mock_next(object_store_mock::MockCall::GetOpts {
-        params: (location.clone(), get_ops.clone().into()),
+        params: (location.clone(), get_opts_out.clone().into()),
         barriers: vec![],
         res: Ok(get_result(b"foo", &location)),
     });
-    let res_1 = setup.outer().get(&location).await.unwrap();
+    let res_1 = setup
+        .outer()
+        .get_opts(&location, get_opts_in.clone())
+        .await
+        .unwrap();
     assert_eq!(
         CacheStateKind::try_from(res_1.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
         CacheStateKind::NewEntry,
@@ -211,7 +218,11 @@ where
     let data_1 = res_1.bytes().await.unwrap();
     assert_eq!(data_1.as_ref(), b"foo");
 
-    let res_2 = setup.outer().get(&location).await.unwrap();
+    let res_2 = setup
+        .outer()
+        .get_opts(&location, get_opts_in.clone())
+        .await
+        .unwrap();
     assert_ne!(
         CacheStateKind::try_from(res_2.attributes.get(&ATTR_CACHE_STATE).unwrap()).unwrap(),
         CacheStateKind::NewEntry, // should be loading, or in cache

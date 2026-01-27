@@ -52,7 +52,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Stores the actual data for columns in a chunk along with summary
 /// statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub(crate) influx_type: InfluxColumnType,
     pub(crate) valid: BitSet,
@@ -60,7 +60,7 @@ pub struct Column {
 }
 
 /// The data for a column
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[expect(missing_docs)]
 pub enum ColumnData {
     /// These types contain arrays that contain an element for every logical row

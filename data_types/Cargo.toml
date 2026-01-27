@@ -33,7 +33,7 @@ sqlx = { workspace = true, features = [
     "postgres",
     "uuid",
 ] }
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

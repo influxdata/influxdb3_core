@@ -9,6 +9,17 @@ use sha2::Digest;
 use std::{fmt::Display, sync::Arc};
 use thiserror::Error;
 
+/// Just a [`TableBatch`] but without the table id.
+///
+/// [`TableBatch`]: generated_types::influxdata::pbdata::v1::TableBatch
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableBatchWithoutId {
+    /// The columns, same as exist in `TableBatch`
+    pub columns: Vec<generated_types::influxdata::pbdata::v1::Column>,
+    /// The number of rows that should exist in each column, same as `TableBatch`
+    pub row_count: u32,
+}
+
 /// Serialise a [`PartitionHashId`] to the `PartitionHashIdentifier` protobuf representation.
 impl From<&PartitionHashId>
     for generated_types::influxdata::iox::catalog::v1::PartitionHashIdentifier

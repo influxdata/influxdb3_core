@@ -34,6 +34,18 @@ pub struct StringDictionary<K> {
     storage: PackedStringArray<K>,
 }
 
+// Not an ideal implementation, but we need to be able to compare these for tests. We can't
+// `cfg(test)` gate it since libraries aren't compiled with `cfg(test)`. But the `dedup` and `hash`
+// don't really matter, they're just there to help inserting stuff into `storage`, so maybe this is
+// fine?
+impl<K: PartialEq> PartialEq for StringDictionary<K> {
+    fn eq(&self, other: &Self) -> bool {
+        // Can't compare `dedup` 'cause it requires `(): BuildHasher` since we have `()` for the
+        // second and third parameters for the map
+        self.storage == other.storage
+    }
+}
+
 impl<K: AsPrimitive<usize> + FromPrimitive + Zero> Default for StringDictionary<K> {
     fn default() -> Self {
         Self {

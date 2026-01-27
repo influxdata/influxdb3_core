@@ -800,6 +800,9 @@ message Namespace {
   // A monotonically increasing counter tracking the version of this namespace's
   // metadata, as managed by the router.
   int64 router_version = 8;
+  // The time at which this namespace was created, or `None` if this namespace was created before
+  // this field existed.
+  optional int64 created_at = 9;
 }
 
 enum SoftDeletedRows {
@@ -816,6 +819,9 @@ message Table {
   influxdata.iox.partition_template.v1.PartitionTemplate partition_template = 4;
   bool iceberg_enabled = 5;
   optional int64 deleted_at = 6;
+  // The time at which this table was created, or `None` if this table was created before
+  // this field existed.
+  optional int64 created_at = 7;
 }
 
 message Column {

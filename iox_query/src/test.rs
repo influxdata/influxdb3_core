@@ -134,6 +134,7 @@ impl QueryDatabase for TestDatabaseStore {
                 deleted_at: Default::default(),
                 partition_template: Default::default(),
                 router_version: Default::default(),
+                created_at: Default::default(),
             })
             .collect())
     }

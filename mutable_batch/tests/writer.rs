@@ -2,6 +2,7 @@
 #![expect(unused_crate_dependencies)]
 
 use arrow_util::assert_batches_eq;
+use core::iter::empty;
 use data_types::{StatValues, Statistics};
 use mutable_batch::{MutableBatch, TimestampSummary, writer::Writer};
 use schema::Projection;
@@ -10,7 +11,7 @@ use std::num::NonZeroU64;
 fn get_stats(batch: &MutableBatch) -> Vec<(&str, Statistics)> {
     let mut stats: Vec<_> = batch
         .columns()
-        .map(|(name, col)| (name.as_str(), col.stats()))
+        .map(|(_, name, col)| (name.as_str(), col.stats()))
         .collect();
 
     stats.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
@@ -24,63 +25,51 @@ fn test_basic() {
     let mut writer = Writer::new(&mut batch, 5);
 
     writer
-        .write_bool(
-            "b1",
-            None,
-            vec![true, true, false, false, false].into_iter(),
-        )
+        .write_bool("b1", None, [true, true, false, false, false].into_iter())
         .unwrap();
 
     writer
         .write_bool(
             "b2",
             Some(&[0b00011101]),
-            vec![true, false, false, true].into_iter(),
+            [true, false, false, true].into_iter(),
         )
         .unwrap();
 
     writer
-        .write_f64(
-            "f64",
-            Some(&[0b00011011]),
-            vec![343.3, 443., 477., -24.].into_iter(),
-        )
+        .write_f64("f64", &[0b00011011], [343.3, 443., 477., -24.].into_iter())
         .unwrap();
 
     writer
-        .write_i64("i64", None, vec![234, 6, 2, 6, -3].into_iter())
+        .write_i64s_from_slice("i64", &[234, 6, 2, 6, -3])
         .unwrap();
 
     writer
-        .write_i64("i64_2", Some(&[0b00000001]), vec![-8].into_iter())
+        .write_i64("i64_2", &[0b00000001], [-8].into_iter())
         .unwrap();
 
     writer
-        .write_u64("u64", Some(&[0b00001001]), vec![23, 5].into_iter())
+        .write_u64("u64", &[0b00001001], [23, 5].into_iter())
         .unwrap();
 
     writer
-        .write_time("time", vec![7, 5, 7, 3, 5].into_iter())
+        .write_time("time", [7, 5, 7, 3, 5].into_iter())
         .unwrap();
 
     writer
-        .write_tag("tag1", None, vec!["v1", "v1", "v2", "v2", "v1"].into_iter())
+        .write_tag("tag1", None, ["v1", "v1", "v2", "v2", "v1"].into_iter())
         .unwrap();
 
     writer
-        .write_tag(
-            "tag2",
-            Some(&[0b00001011]),
-            vec!["v1", "v2", "v2"].into_iter(),
-        )
+        .write_tag("tag2", Some(&[0b00001011]), ["v1", "v2", "v2"].into_iter())
         .unwrap();
 
     writer
         .write_tag_dict(
             "tag3",
             Some(&[0b00011011]),
-            vec![1, 0, 0, 1].into_iter(),
-            vec!["v1", "v2"].into_iter(),
+            [1, 0, 0, 1].into_iter(),
+            ["v1", "v2"].into_iter(),
         )
         .unwrap();
 
@@ -197,7 +186,7 @@ fn test_basic() {
     );
 
     let err = Writer::new(&mut batch, 1)
-        .write_i64("f64", None, vec![3].into_iter())
+        .write_i64s_from_slice("f64", &[3])
         .unwrap_err()
         .to_string();
 
@@ -239,8 +228,8 @@ fn test_basic() {
     writer
         .write_f64(
             "f64",
-            Some(&[0b01000010, 0b00100100, 0b00000001]),
-            vec![4., 945., -222., 4., 7.].into_iter(),
+            &[0b01000010, 0b00100100, 0b00000001],
+            [4., 945., -222., 4., 7.].into_iter(),
         )
         .unwrap();
 
@@ -252,8 +241,8 @@ fn test_basic() {
         .write_tag_dict(
             "tag2",
             Some(&[0b11011111, 0b11011101, 0b00000000]),
-            vec![0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1].into_iter(),
-            vec!["v4", "v1", "v7"].into_iter(), // Intentional extra key
+            [0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1].into_iter(),
+            ["v4", "v1", "v7"].into_iter(), // Intentional extra key
         )
         .unwrap();
 
@@ -375,29 +364,23 @@ fn test_null_only() {
     let mut writer = Writer::new(&mut batch, 1);
 
     writer
-        .write_bool("b1", Some(&[0b00000000]), vec![].into_iter())
+        .write_bool("b1", Some(&[0b00000000]), empty())
         .unwrap();
 
-    writer
-        .write_f64("f64", Some(&[0b00000000]), vec![].into_iter())
-        .unwrap();
+    writer.write_f64("f64", &[0b00000000], empty()).unwrap();
+
+    writer.write_i64("i64", &[0b00000000], empty()).unwrap();
+
+    writer.write_u64("u64", &[0b00000000], empty()).unwrap();
 
     writer
-        .write_i64("i64", Some(&[0b00000000]), vec![].into_iter())
-        .unwrap();
-
-    writer
-        .write_u64("u64", Some(&[0b00000000]), vec![].into_iter())
-        .unwrap();
-
-    writer
-        .write_string("string", Some(&[0b00000000]), vec![].into_iter())
+        .write_string("string", Some(&[0b00000000]), empty())
         .unwrap();
 
     writer.write_time("time", vec![42].into_iter()).unwrap();
 
     writer
-        .write_tag("tag1", Some(&[0b00000000]), vec![].into_iter())
+        .write_tag("tag1", Some(&[0b00000000]), empty())
         .unwrap();
 
     writer.commit();
@@ -463,7 +446,7 @@ fn test_nan_stats() {
     let mut writer = Writer::new(&mut batch, 3);
 
     writer
-        .write_f64("f64", None, vec![4.2, f64::NAN, 2.4].into_iter())
+        .write_f64s_from_slice("f64", &[4.2, f64::NAN, 2.4])
         .unwrap();
 
     writer.commit();

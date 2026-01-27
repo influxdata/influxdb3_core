@@ -26,9 +26,9 @@ pbjson-types = { workspace = true }
 prost = { workspace = true }
 schema = { path = "../schema" }
 snafu = "0.8"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 thrift = "0.17"
-tokio = { version = "1.48", features = [
+tokio = { version = "1.49", features = [
     "macros",
     "parking_lot",
     "rt",

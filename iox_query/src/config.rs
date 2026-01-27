@@ -1,12 +1,11 @@
-use std::{any::Any, borrow::Cow, str::FromStr, sync::Arc, time::Duration};
+use std::{borrow::Cow, str::FromStr, time::Duration};
 
 use datafusion::{
     common::{Result, extensions_options},
-    config::{ConfigEntry, ConfigExtension, ConfigField, ExtensionOptions, Visit},
+    config::{ConfigExtension, ConfigField, Visit},
     error::DataFusionError,
 };
 use datafusion_udf_wasm_host::HttpRequestMatcher;
-use meta_data_cache::MetaIndexCache;
 
 /// IOx-specific config extension prefix.
 pub const IOX_CONFIG_PREFIX: &str = "iox";
@@ -313,41 +312,6 @@ impl ConfigField for UDFHttpAllowList {
         })?;
         Ok(())
     }
-}
-
-pub const IOX_CACHE_PREFIX: &str = "iox_meta_cache";
-
-/// Cache options for IOx Querier
-#[derive(Debug, Clone)]
-pub struct IoxCacheExt {
-    /// metadata cache
-    pub meta_cache: Option<Arc<MetaIndexCache>>,
-}
-
-impl ExtensionOptions for IoxCacheExt {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn cloned(&self) -> Box<dyn ExtensionOptions> {
-        Box::new(self.clone())
-    }
-
-    fn set(&mut self, _key: &str, _value: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn entries(&self) -> Vec<ConfigEntry> {
-        vec![]
-    }
-}
-
-impl ConfigExtension for IoxCacheExt {
-    const PREFIX: &'static str = IOX_CACHE_PREFIX;
 }
 
 #[cfg(test)]

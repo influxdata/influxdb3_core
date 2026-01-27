@@ -155,6 +155,10 @@ message Table {
 
   // The time, in nanoseconds from epoch, when this table was marked for delete.
   optional int64 deleted_at = 8;
+
+  // The time at which this table was created, or `None` if this table was created before
+  // this field existed.
+  optional int64 created_at = 9;
 }
 
 message TablePartition {
@@ -206,6 +210,10 @@ message Namespace {
   // The router-managed version associated with this instance of the namespace
   // data object.
   int64 router_version = 10;
+
+  // The time at which this namespace was created, or `None` if this namespace was created before
+  // this field existed.
+  optional int64 created_at = 11;
 }
 
 message NamespaceTable {

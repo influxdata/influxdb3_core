@@ -199,6 +199,7 @@ mod tests {
             partition_template: Default::default(),
             retention_period_ns: Default::default(),
             router_version: Default::default(),
+            created_at: Default::default(),
         };
         // Deliberately don't include an `ns_2` with `NamespaceId` 2 to test that indices aren't
         // being conflated with `NamespaceId`s.

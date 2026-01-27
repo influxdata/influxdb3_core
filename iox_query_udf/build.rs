@@ -21,12 +21,12 @@ use sha2::Digest;
 /// GIT hash of the commit in <https://github.com/influxdata/datafusion-udf-wasm>.
 ///
 /// See module level comment on how to update this.
-const COMMIT: &str = "9b2243ad3305ca3e29af38e8cc9097cb853f1fce";
+const COMMIT: &str = "3a1a690a872b44c5aba994c196ef4e039224c6dd";
 
 /// Timestamp of the WASM build.
 ///
 /// See module level comment on how to update this.
-const BUILD_TIMESTAMP: &str = "2026-01-21T01:05:14+00:00";
+const BUILD_TIMESTAMP: &str = "2026-01-05T14:07:35+00:00";
 
 /// SHA256 checksum of the `sha256sum.txt` release artifact.
 ///
@@ -34,7 +34,7 @@ const BUILD_TIMESTAMP: &str = "2026-01-21T01:05:14+00:00";
 ///
 /// See module level comment on how to update this.
 const SHA256_TXT_CHECKSUM: &str =
-    "sha256:b5b6d75035c5041370f113900c1026f2f76449ffba0e559d6418fd8a04780676";
+    "sha256:815429f0c548c66454beba25ae54318f3bdd4b8375600ab78f49f2d9d3519de2";
 
 fn main() {
     let sha256sum_txt_checksum = SHA256_TXT_CHECKSUM.to_lowercase().replace("sha256:", "");

@@ -9,11 +9,12 @@ impl PartitioningColumn for MutableBatchColumn {
     type TagIdentityKey = i32;
 
     fn is_valid(&self, idx: usize) -> bool {
-        self.valid_mask().get(idx)
-    }
-
-    fn valid_bytes(&self) -> &[u8] {
-        self.valid_mask().bytes()
+        let mask = self.valid_mask();
+        if mask.len() <= idx {
+            false
+        } else {
+            mask.get(idx)
+        }
     }
 
     fn get_tag_identity_key(&self, idx: usize) -> Option<&Self::TagIdentityKey> {

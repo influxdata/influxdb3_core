@@ -64,15 +64,8 @@ struct CacheValue {
 }
 
 impl CacheValue {
-    async fn fetch(
-        store: &DynObjectStore,
-        location: &Path,
-        size_hint: Option<u64>,
-    ) -> Result<Self> {
-        let mut options = match size_hint {
-            Some(size) => hint_size(size),
-            None => GetOptions::default(),
-        };
+    async fn fetch(store: &DynObjectStore, location: &Path, size_hint: u64) -> Result<Self> {
+        let mut options = hint_size(size_hint);
 
         let (buffer_tx, buffer_rx) = crate::buffer_channel::channel();
         options.extensions.insert(buffer_tx);
@@ -207,6 +200,7 @@ impl MemCacheObjectStoreParams<'_> {
 
         let cache = Arc::new(S3FifoCache::<_, _, ()>::new(
             S3Config {
+                cache_name: CACHE_NAME,
                 max_memory_size: memory_limit.get(),
                 max_ghost_memory_size: s3_fifo_ghost_memory_limit.get(),
                 move_to_main_threshold: s3fifo_main_threshold as f64 / 100.0,
@@ -239,11 +233,10 @@ impl MemCacheObjectStore {
     async fn get_or_fetch(
         &self,
         location: &Path,
-        size_hint: Option<u64>,
+        size_hint: u64,
     ) -> Result<(Arc<CacheValue>, CacheStateKind)> {
         let captured_store = Arc::clone(&self.store);
         let captured_location = Arc::new(location.clone());
-        let usize_hint = size_hint.and_then(|s| usize::try_from(s).ok());
         let cache_state = self.cache.get_or_fetch(
             &Arc::clone(&captured_location),
             Box::new(move || {
@@ -256,7 +249,7 @@ impl MemCacheObjectStore {
                 .boxed()
             }),
             (),
-            usize_hint,
+            size_hint as _,
         );
 
         let state_kind = cache_state.kind();
@@ -307,12 +300,16 @@ impl ObjectStore for MemCacheObjectStore {
         Err(Error::NotImplemented)
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        self.get_opts(location, Default::default()).await
+    async fn get(&self, _location: &Path) -> Result<GetResult> {
+        Err(Error::NotImplemented)
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let (options, size_hint) = extract_size_hint(options);
+        let size_hint = size_hint.ok_or_else(|| Error::Generic {
+            store: STORE_NAME,
+            source: "object store mem cache requires size hint".into(),
+        })?;
 
         // be rather conservative
         if any_options_set(&options) {
@@ -340,43 +337,12 @@ impl ObjectStore for MemCacheObjectStore {
             .expect("requested one range"))
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let (v, _state) = self.get_or_fetch(location, None).await?;
-        let data = v.data();
-
-        ranges
-            .iter()
-            .map(|range| {
-                if range.end > (data.len() as u64) {
-                    return Err(Error::Generic {
-                        store: STORE_NAME,
-                        source: format!(
-                            "Range end ({}) out of bounds, object size is {}",
-                            range.end,
-                            data.len(),
-                        )
-                        .into(),
-                    });
-                }
-                if range.start > range.end {
-                    return Err(Error::Generic {
-                        store: STORE_NAME,
-                        source: format!(
-                            "Range end ({}) is before range start ({})",
-                            range.end, range.start
-                        )
-                        .into(),
-                    });
-                }
-                Ok(data.slice((range.start as usize)..(range.end as usize)))
-            })
-            .collect()
+    async fn get_ranges(&self, _location: &Path, _ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        Err(Error::NotImplemented)
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let (v, _state) = self.get_or_fetch(location, None).await?;
-
-        Ok(v.meta.clone())
+    async fn head(&self, _location: &Path) -> Result<ObjectMeta> {
+        Err(Error::NotImplemented)
     }
 
     async fn delete(&self, _location: &Path) -> Result<()> {
@@ -430,6 +396,7 @@ mod tests {
     use futures::FutureExt;
     use http::Extensions;
     use linear_buffer::{LinearBuffer, LinearBufferExtend};
+    use object_store::memory::InMemory;
     use object_store_mock::{MockCall, MockParam, MockStore, path};
     use tokio::sync::Barrier;
 
@@ -488,7 +455,7 @@ mod tests {
         let data = Bytes::from(b"foobar".to_vec());
 
         let (tx, _rx) = crate::buffer_channel::channel();
-        let mut get_ops = GetOptions::default();
+        let mut get_ops = hint_size(data.len() as _);
         get_ops.extensions.insert(tx);
 
         let store = MockStore::new()
@@ -506,7 +473,9 @@ mod tests {
             })
             .as_store();
 
-        let mut value = CacheValue::fetch(&store, &location, None).await.unwrap();
+        let mut value = CacheValue::fetch(&store, &location, data.len() as _)
+            .await
+            .unwrap();
         assert!(!value.in_use());
 
         let slice = value.data();
@@ -532,7 +501,7 @@ mod tests {
         buffer.append(&data);
 
         let (tx, _rx) = crate::buffer_channel::channel();
-        let mut get_ops = GetOptions::default();
+        let mut get_ops = hint_size(data.len() as _);
         get_ops.extensions.insert(tx);
 
         let barrier = Arc::new(Barrier::new(2));
@@ -552,7 +521,11 @@ mod tests {
         let mut store_params = store.observed_params();
         let store = store.as_store();
 
-        let fut_value = async { CacheValue::fetch(&store, &location, None).await.unwrap() };
+        let fut_value = async {
+            CacheValue::fetch(&store, &location, data.len() as _)
+                .await
+                .unwrap()
+        };
         let fut_buffer = async {
             let param = store_params.recv().await.unwrap();
             let MockParam::GetOpts((_path, get_options)) = param else {
@@ -585,6 +558,29 @@ mod tests {
 
         drop(slice);
         assert!(!value.in_use());
+    }
+
+    #[tokio::test]
+    async fn test_no_size_hint() {
+        let inner = Arc::new(InMemory::new());
+        let store = MemCacheObjectStoreParams {
+            inner,
+            memory_limit: NonZeroUsize::MAX,
+            s3_fifo_ghost_memory_limit: NonZeroUsize::MAX,
+            metrics: &metric::Registry::new(),
+            s3fifo_main_threshold: 25,
+            inflight_bytes: 1024 * 1024 * 1024, // 1GB
+        }
+        .build();
+
+        assert_eq!(
+            store
+                .get_opts(&path(), Default::default())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Generic mem_cache error: object store mem cache requires size hint",
+        );
     }
 
     fn meta(location: &Path, data: &[u8]) -> ObjectMeta {

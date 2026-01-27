@@ -15,7 +15,6 @@ arrow_util = { path = "../arrow_util" }
 data_types = { path = "../data_types" }
 hashbrown = { workspace = true }
 iox_time = { path = "../iox_time" }
-itertools = "0.13"
 schema = { path = "../schema" }
 snafu = "0.8"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
@@ -25,4 +24,5 @@ assert_matches = "1.5.0"
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 partition = { path = "../partition" }
 pretty_assertions = "1.4.1"
+proptest = "1"
 rand = "0.9"

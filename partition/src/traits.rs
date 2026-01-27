@@ -21,12 +21,6 @@ pub trait PartitioningColumn: std::fmt::Debug {
     /// Whether the value at the given row index is valid or NULL
     fn is_valid(&self, idx: usize) -> bool;
 
-    /// The raw packed validity bytes.
-    ///
-    /// The validity mask MUST follow the Arrow specification for validity masks
-    /// (<https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps>).
-    fn valid_bytes(&self) -> &[u8];
-
     /// Get the identity of the tag at the given row index.
     ///
     /// The return value is only valid if `is_valid(idx)` for the same `idx`

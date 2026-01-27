@@ -77,6 +77,7 @@ pub struct NamespaceSnapshot {
     tables: MessageList<proto::NamespaceTable>,
     table_names: HashBuckets,
     generation: u64,
+    created_at: Option<Timestamp>,
 }
 
 impl NamespaceSnapshot {
@@ -115,6 +116,7 @@ impl NamespaceSnapshot {
             tables: MessageList::encode(tables).context(TableEncodeSnafu)?,
             table_names: table_names.finish(),
             generation,
+            created_at: namespace.created_at,
         })
     }
 
@@ -136,6 +138,7 @@ impl NamespaceSnapshot {
                 .try_into()
                 .context(TableNamesDecodeSnafu)?,
             generation,
+            created_at: proto.created_at.map(Timestamp::new),
         })
     }
 
@@ -163,6 +166,7 @@ impl NamespaceSnapshot {
             deleted_at: self.deleted_at,
             partition_template,
             router_version: self.router_version,
+            created_at: self.created_at,
         })
     }
 
@@ -291,6 +295,7 @@ impl From<NamespaceSnapshot> for proto::Namespace {
             max_columns_per_table: value.max_columns_per_table,
             partition_template: value.partition_template,
             router_version: value.router_version.get(),
+            created_at: value.created_at.map(|t| t.get()),
         }
     }
 }

@@ -59,7 +59,7 @@ where
 
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
             metric_registry,
-            &[("semaphore", "s3_fifo_cache")],
+            &[("semaphore", "s3_fifo_cache"), ("cache", config.cache_name)],
         ));
         let inflight_semaphore = Arc::new(semaphore_metrics.new_semaphore(config.inflight_bytes));
 
@@ -105,7 +105,7 @@ where
 
         let semaphore_metrics = Arc::new(AsyncSemaphoreMetrics::new(
             metric_registry,
-            &[("semaphore", "s3_fifo_cache")],
+            &[("semaphore", "s3_fifo_cache"), ("cache", config.cache_name)],
         ));
         let inflight_semaphore = Arc::new(semaphore_metrics.new_semaphore(config.inflight_bytes));
 
@@ -148,13 +148,7 @@ where
     ///
     /// The value (`V`) is inserted after completion of a future. Some data (`D`) may be accessable earlier,
     /// before the future finishes.
-    fn get_or_fetch_impl<F, Fut>(
-        &self,
-        k: &K,
-        f: F,
-        d: D,
-        size_hint: Option<usize>,
-    ) -> CacheState<V, D>
+    fn get_or_fetch_impl<F, Fut>(&self, k: &K, f: F, d: D, size_hint: usize) -> CacheState<V, D>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = CacheRequestResult<V>> + Send + 'static,
@@ -172,11 +166,8 @@ where
         let semaphore_captured = Arc::clone(&self.inflight_semaphore);
         let fut = move || async move {
             // Acquire insertion permit if size_hint is provided
-            let insertion_permit = if let Some(size) = size_hint {
-                Some(try_acquire_permit(size as u32, &semaphore_captured).await?)
-            } else {
-                None
-            };
+            let insertion_permit =
+                try_acquire_permit(size_hint as u32, &semaphore_captured).await?;
 
             // now we inform the hook of insertion
             let generation = gen_counter_captured.fetch_add(1, Ordering::SeqCst);
@@ -185,16 +176,6 @@ where
             // get the actual value (`V`)
             let fut = f();
             let fetch_res = fut.catch_unwind_dyn_error().await;
-
-            // if we didn't have an explicit size hint before, then at least take the size now in order to get permit.
-            let insertion_permit = if insertion_permit.is_none()
-                && let Ok(fetch_res) = &fetch_res
-            {
-                let size = fetch_res.size();
-                Some(try_acquire_permit(size as u32, &semaphore_captured).await?)
-            } else {
-                insertion_permit
-            };
 
             // insert into cache
             let fetch_res = match fetch_res {
@@ -299,13 +280,7 @@ where
     ///
     /// If a fetch process is already in progress, it will return a different early access (`D`)
     /// which is tied to the ongoing fetch process.
-    fn get_or_fetch(
-        &self,
-        k: &K,
-        f: CacheFn<V>,
-        d: D,
-        size_hint: Option<usize>,
-    ) -> CacheState<V, D> {
+    fn get_or_fetch(&self, k: &K, f: CacheFn<V>, d: D, size_hint: usize) -> CacheState<V, D> {
         self.get_or_fetch_impl(k, f, d, size_hint)
     }
 
@@ -378,6 +353,7 @@ mod tests {
     async fn test_ghost_set_is_limited() {
         let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 10,
                 max_ghost_memory_size: 10,
                 move_to_main_threshold: 0.1,
@@ -394,7 +370,7 @@ mod tests {
             &k1,
             Box::new(|| futures::future::ready(Ok(v1)).boxed()),
             (),
-            Some(size_hint),
+            size_hint,
         );
         assert_eq!(cache_state_k1.kind(), CacheStateKind::NewEntry);
         cache_state_k1.await_inner().await.unwrap();
@@ -409,7 +385,7 @@ mod tests {
                 &k,
                 Box::new(|| futures::future::ready(Ok(v)).boxed()),
                 (),
-                Some(size_hint),
+                size_hint,
             );
             assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
             cache_state.await_inner().await.unwrap();
@@ -423,6 +399,7 @@ mod tests {
         let hook = Arc::new(TestHook::default());
         let cache = S3FifoCache::<Arc<str>, Arc<TestValue>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 10,
                 max_ghost_memory_size: 10,
                 move_to_main_threshold: 0.5,
@@ -441,7 +418,7 @@ mod tests {
                 &k_heavy,
                 Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
                 (),
-                Some(size_hint),
+                size_hint,
             );
             cache_state.await_inner().await.unwrap();
         }
@@ -456,7 +433,7 @@ mod tests {
                 &k_new,
                 Box::new(|| futures::future::ready(Ok(Arc::new(TestValue(5)))).boxed()),
                 (),
-                Some(size_hint),
+                size_hint,
             );
             cache_state.await_inner().await.unwrap();
         }
@@ -483,6 +460,7 @@ mod tests {
         TestSetup {
             cache: Arc::new(S3FifoCache::<_, _, ()>::new(
                 S3Config {
+                    cache_name: "test",
                     max_memory_size: 10_000,
                     max_ghost_memory_size: 10_000,
                     move_to_main_threshold: 0.25,
@@ -568,6 +546,7 @@ mod tests {
         let max_memory_size = ((key_size + value_size) as f32 * 3.5).round() as usize;
         let cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> = S3FifoCache::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size,
                 max_ghost_memory_size: (key_size as f32 * 1.9).round() as usize,
                 move_to_main_threshold: 0.1,
@@ -579,7 +558,7 @@ mod tests {
 
         // Insert all test data
         for (key, value) in &test_data {
-            let size_hint = Some(value.size());
+            let size_hint = value.size();
             let value_clone = value.clone();
             let cache_state = cache.get_or_fetch(
                 key,
@@ -615,6 +594,7 @@ mod tests {
         let restored_cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> =
             S3FifoCache::new_from_snapshot(
                 S3Config {
+                    cache_name: "test",
                     max_memory_size: 1000,
                     max_ghost_memory_size: 500,
                     move_to_main_threshold: 0.1,
@@ -684,6 +664,7 @@ mod tests {
         // Create the cache with all entries.
         let cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> = S3FifoCache::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 10_000,
                 max_ghost_memory_size: 10_000,
                 move_to_main_threshold: 0.1,
@@ -695,7 +676,7 @@ mod tests {
 
         // Insert all test data
         for (key, value) in &test_data {
-            let size_hint = Some(value.size());
+            let size_hint = value.size();
             let value_clone = value.clone();
             let cache_state = cache.get_or_fetch(
                 key,
@@ -764,6 +745,7 @@ mod tests {
         let restored_cache: S3FifoCache<SnapshotTestKey, SnapshotTestValue, ()> =
             S3FifoCache::new_from_snapshot(
                 S3Config {
+                    cache_name: "test",
                     max_memory_size: 10_000,
                     max_ghost_memory_size: 10_000,
                     move_to_main_threshold: 0.1,
@@ -802,6 +784,7 @@ mod tests {
     async fn test_get_or_fetch_with_early_access() {
         let cache = S3FifoCache::<Arc<str>, Arc<str>, Arc<str>>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 1000,
                 max_ghost_memory_size: 500,
                 move_to_main_threshold: 0.1,
@@ -830,7 +813,7 @@ mod tests {
                 .boxed()
             }),
             Arc::clone(&early_access_data),
-            Some(size_hint),
+            size_hint,
         );
         let (got_fut, got_early_access, got_state) = extract_full_state(cache_state);
 
@@ -848,7 +831,7 @@ mod tests {
             &key,
             Box::new(|| async { panic!("should not be called") }.boxed()),
             Arc::from("unused_early_data"),
-            None,
+            size_hint,
         );
 
         // Verify return signature for cached entry
@@ -880,7 +863,7 @@ mod tests {
                 .boxed()
             }),
             Arc::clone(&early_access_data),
-            Some(size_hint),
+            size_hint,
         );
         let (got_fut_1, got_early_access_1, got_state_1) = extract_full_state(cache_state_1);
 
@@ -890,7 +873,7 @@ mod tests {
             &key,
             Box::new(|| async { panic!("should not be called") }.boxed()),
             different_early_access,
-            None,
+            size_hint,
         );
         let (got_fut_2, got_early_access_2, state_2) = extract_full_state(cache_state_2);
 
@@ -914,6 +897,7 @@ mod tests {
     async fn test_list_fn_only_includes_fully_loaded_entries() {
         let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 1000,
                 max_ghost_memory_size: 500,
                 move_to_main_threshold: 0.1,
@@ -931,7 +915,7 @@ mod tests {
             &key1,
             Box::new(|| futures::future::ready(Ok(Arc::from("value1"))).boxed()),
             (),
-            Some((Arc::from("value1") as Arc<str>).size()),
+            (Arc::from("value1") as Arc<str>).size(),
         );
         cache_state1.await_inner().await.unwrap();
 
@@ -946,7 +930,7 @@ mod tests {
                 .boxed()
             }),
             (),
-            Some((Arc::from("value2") as Arc<str>).size()),
+            (Arc::from("value2") as Arc<str>).size(),
         );
 
         // List keys in the cache
@@ -973,6 +957,7 @@ mod tests {
         // Create cache with very limited space - only enough for 1 entry (size 10)
         let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 20, // Only enough space for 1 entry
                 max_ghost_memory_size: 100,
                 move_to_main_threshold: 0.1,
@@ -986,11 +971,13 @@ mod tests {
         let key2 = Arc::from("key2");
 
         // Insert key1 with Arc<V>
+        let value1 = Arc::<str>::from("value1");
+        let size_hint1 = value1.size();
         let cache_state = cache.get_or_fetch(
             &key1,
-            Box::new(|| futures::future::ready(Ok(Arc::from("value1"))).boxed()),
+            Box::new(move || futures::future::ready(Ok(value1)).boxed()),
             (),
-            None,
+            size_hint1,
         );
         assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
         let value1 = cache_state.await_inner().await.unwrap();
@@ -1002,11 +989,13 @@ mod tests {
         let held_value = cache.get(&key1).unwrap().unwrap();
 
         // Insert key2 with Arc<V> - this should try to evict key1 but fail because it's in use
+        let value2 = Arc::<str>::from("value2");
+        let size_hint2 = value2.size();
         let cache_state = cache.get_or_fetch(
             &key2,
-            Box::new(move || futures::future::ready(Ok(Arc::from("value2"))).boxed()),
+            Box::new(move || futures::future::ready(Ok(value2)).boxed()),
             (),
-            None,
+            size_hint2,
         );
         assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
         let (mut res2, _) = extract_future_and_state(cache_state);
@@ -1049,6 +1038,7 @@ mod tests {
         // Create cache with very limited inflight bytes (only 100 bytes)
         let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 10000,
                 max_ghost_memory_size: 5000,
                 move_to_main_threshold: 0.1,
@@ -1075,7 +1065,7 @@ mod tests {
                 .boxed()
             }),
             (),
-            Some(80),
+            80,
         );
         assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
         let (mut res1, _) = extract_future_and_state(cache_state);
@@ -1088,7 +1078,7 @@ mod tests {
                 panic!("should not be called");
             }),
             (),
-            Some(80),
+            80,
         );
         assert_eq!(cache_state.kind(), CacheStateKind::AlreadyLoading);
         let (mut res1_again, _) = extract_future_and_state(cache_state);
@@ -1104,7 +1094,7 @@ mod tests {
                 futures::future::ready(Ok(Arc::from("value2"))).boxed()
             }),
             (),
-            Some(50),
+            50,
         );
         assert_eq!(cache_state_putfirst.kind(), CacheStateKind::NewEntry);
         let (mut res2, _) = extract_future_and_state(cache_state_putfirst);
@@ -1117,7 +1107,7 @@ mod tests {
                 panic!("should not be called");
             }),
             (),
-            Some(50),
+            50,
         );
         assert_eq!(cache_state_putagain.kind(), CacheStateKind::AlreadyLoading);
         let (mut res2_again, _) = extract_future_and_state(cache_state_putagain);
@@ -1142,6 +1132,7 @@ mod tests {
         let hook = Arc::new(TestHook::default());
         let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 1000,
                 max_ghost_memory_size: 500,
                 move_to_main_threshold: 0.1,
@@ -1167,7 +1158,7 @@ mod tests {
                     move || futures::future::ready(Ok(value)).boxed()
                 }),
                 (),
-                Some(value.size()),
+                value.size(),
             );
             assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
             cache_state.await_inner().await.unwrap();
@@ -1251,6 +1242,7 @@ mod tests {
         let hook = Arc::new(TestHook::default());
         let cache = S3FifoCache::<Arc<str>, Arc<str>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: 150 + 100,
                 max_ghost_memory_size: 150,
                 move_to_main_threshold: 0.3,
@@ -1276,7 +1268,7 @@ mod tests {
                     move || futures::future::ready(Ok(value)).boxed()
                 }),
                 (),
-                Some(value.size()),
+                value.size(),
             );
             assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
             cache_state.await_inner().await.unwrap();
@@ -1300,7 +1292,7 @@ mod tests {
                     move || futures::future::ready(Ok(value)).boxed()
                 }),
                 (),
-                Some(value.size()),
+                value.size(),
             );
             assert_eq!(cache_state.kind(), CacheStateKind::NewEntry);
             cache_state.await_inner().await.unwrap();
@@ -1413,6 +1405,7 @@ mod tests {
         let hook = Arc::new(TestHook::default());
         let cache = S3FifoCache::<Arc<str>, Arc<V>, ()>::new(
             S3Config {
+                cache_name: "test",
                 max_memory_size: usize::MAX,
                 max_ghost_memory_size: usize::MAX,
                 move_to_main_threshold: 0.3,
@@ -1439,7 +1432,7 @@ mod tests {
                 })
             }),
             (),
-            None,
+            V.size(),
         );
         let CacheState::NewEntry(mut fut, _data) = state else {
             unreachable!()
