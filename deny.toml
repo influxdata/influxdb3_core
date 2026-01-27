@@ -12,6 +12,9 @@ ignore = [
     # fixed in object_store main: https://github.com/apache/arrow-rs-object-store/pull/565
     # TODO: remove once object_store > 0.12.4 is released
     "RUSTSEC-2025-0134",
+    # bincode is unmaintained; used by object_store_mem_cache.
+    # No known security issues, just development ceased.
+    "RUSTSEC-2025-0141",
 ]
 git-fetch-with-cli = true
 
@@ -67,4 +70,8 @@ deny = [
     { name = "chrono-english" },
     # Use stdlib ( https://doc.rust-lang.org/stable/std/io/trait.IsTerminal.html )
     { name = "atty" },
+    # sqlx-mysql appears in Cargo.lock as an optional dependency of the sqlx crate,
+    # but is NOT actually compiled since we only enable postgres/sqlite features.
+    # Deny it to ensure we never accidentally enable the mysql feature.
+    { name = "sqlx-mysql" },
 ]
