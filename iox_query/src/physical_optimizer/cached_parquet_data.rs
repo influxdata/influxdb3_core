@@ -231,10 +231,10 @@ impl AsyncFileReader for ParquetFileReader {
                 .into_iter()
                 .map(|range| {
                     if range.end > data.len() as u64 {
-                        return Err(ParquetError::IndexOutOfBound(
-                            range.end as usize,
-                            data.len(),
-                        ));
+                        panic!(
+                            "IndexOutOfBound: range.end={}, data.len()={}, range.start={}, file={}",
+                            range.end, data.len(), range.start, self.meta.location
+                        );
                     }
                     if range.start > range.end {
                         return Err(ParquetError::IndexOutOfBound(
